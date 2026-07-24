@@ -19,7 +19,7 @@ use crate::agent_forward;
 use crate::theme::Theme;
 use crate::{ForwardState, JumpConfig, SshAuth};
 
-use super::ctl_streamlocal::{ctl_socket_forward_enabled, new_ctl_socket_path};
+use super::ctl_streamlocal::{ctl_socket_forward_enabled, ctl_var_store, new_ctl_socket_path};
 use super::forward::{
     is_loopback_bind_address, reject_non_loopback_bind, run_dynamic_forward, run_local_forward, teardown_forward,
     ActiveForward,
@@ -69,6 +69,13 @@ pub(crate) enum TransportCommand {
         command: String,
         reply: tokio::sync::oneshot::Sender<Result<ExecOutput, ExecError>>,
     },
+    /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`を、
+    /// このタブの対話シェルPTYチャネルとは別の`exec`チャネル1本として実行する
+    /// (`crate::file_preview::build_command_line`が組み立てた完全なシェルコマンド文字列を
+    /// そのまま渡す——`setvar`/`getvar`と違いctl-socket-forwardは使わない、
+    /// `isekai-pipe/src/ctl_file.rs`のモジュールdoc参照)。結果は`request_id`付きで
+    /// `TransportEvent::FilePreviewExecResult`として返る。
+    FilePreviewExec { request_id: String, command_line: String },
 }
 
 /// [`TransportCommand::RunExec`]の成功結果。「コマンドを実行できたか」と
@@ -150,6 +157,12 @@ pub(crate) enum TransportEvent {
     /// 書き戻される。dropすると(opt-in無効・クリップボード空など)応答無しでチャネルが
     /// 閉じ、`isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」エラーになる。
     ClipboardPullRequestOverCtl(tokio::sync::oneshot::Sender<isekai_protocol::CtlMessage>),
+    /// タスク#17: `TransportCommand::FilePreviewExec`で発行した`exec`チャネル1本分の
+    /// 結果。`exit_status`が`Some(0)`以外・`None`(接続断でExitStatusが届かないまま
+    /// チャネルが閉じた場合)のいずれも「失敗」として`crate::file_preview::parse_result`
+    /// 側で扱う——ここ(transport層)はstdoutバイト列とexit statusをそのまま運ぶだけで
+    /// JSONの中身には関与しない。
+    FilePreviewExecResult { request_id: String, stdout: Vec<u8>, exit_status: Option<u32> },
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）
@@ -163,6 +176,22 @@ pub(crate) enum SessionCmd {
     /// OSのフォーカス変化(タスク#60)。フォーカスレポーティング(`?1004`)が有効な場合のみ
     /// `session_state::SessionState::notify_focus_change`がCSI I/CSI Oへエンコードする。
     FocusChanged(bool),
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」。`from_scroll_offset`/
+    /// `from_showing_scrollback`はKotlin側の現在の表示位置(既存の検索ジャンプ・
+    /// タスク#79と同じ規約)。結果は`OrchestratorCallback::on_prompt_jump`で
+    /// 非同期に返る(`SessionState::jump_to_prompt`参照)。
+    PromptJumpPrevious { from_scroll_offset: u32, from_showing_scrollback: bool },
+    /// [PromptJumpPrevious]の「次」版。
+    PromptJumpNext { from_scroll_offset: u32, from_showing_scrollback: bool },
+    /// OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+    /// 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列をリモートへ
+    /// 送る(Ghostty`cl=line`相当)。対象外なら無音でno-op
+    /// (`SessionState::click_to_prompt_cursor`参照)。
+    ClickToPromptCursor { row: u32, col: u32 },
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+    /// `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+    /// (該当コマンドがまだ無ければ`None`、`SessionState::copy_last_command_output`参照)。
+    CopyLastCommandOutput,
 }
 
 // ── russh Handler ────────────────────────────────────────
@@ -304,31 +333,37 @@ impl client::Handler for RusshEventHandler {
             match reader.read_line(&mut line).await {
                 Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
                 Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
-                    Ok(msg @ isekai_protocol::CtlMessage::ClipboardPullRequest {}) => {
+                    Ok(
+                        msg @ (isekai_protocol::CtlMessage::ClipboardPullRequest {}
+                        | isekai_protocol::CtlMessage::GetVarRequest { .. }),
+                    ) => {
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         if tx.send(CtlInbound { msg, reply: Some(reply_tx) }).is_err() {
                             return;
                         }
-                        // `HostKey`/`AgentSignRequest`同様Kotlin側の同期I/Oを
-                        // `spawn_blocking`越しに待つため、応答が遅れる可能性がある。
+                        // `ClipboardPullRequest`はKotlin側の同期I/Oを`spawn_blocking`
+                        // 越しに待つため応答が遅れうる(タイムアウトあり)。
+                        // `GetVarRequest`(task #16)はメモリ上の`CtlVarStore`参照のみで
+                        // `run_ssh_channel_loop`のctl_rx消費タスクが即座に返すため
+                        // 実質的にすぐ届くが、コードパスは共通で問題ない。
                         // タイムアウトすれば単に何も書かずチャネルを閉じる——
-                        // `isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」
-                        // エラーとして扱う既存の経路にそのまま落ちるので、専用の
-                        // エラー応答を新設する必要は無い。
+                        // `isekai-pipe ctl clip pull`/`getvar`側は「応答前に接続が
+                        // 閉じられた」エラーとして扱う既存の経路にそのまま落ちるので、
+                        // 専用のエラー応答を新設する必要は無い。
                         match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
                             Ok(Ok(response)) => {
                                 let Ok(mut out) = serde_json::to_vec(&response) else {
-                                    warn!("ctl-socket[{socket_path}]: failed to encode clipboard pull response");
+                                    warn!("ctl-socket[{socket_path}]: failed to encode ctl reply");
                                     return;
                                 };
                                 out.push(b'\n');
                                 if let Err(e) = write_half.write_all(&out).await {
-                                    warn!("ctl-socket[{socket_path}]: failed to write clipboard pull response: {e}");
+                                    warn!("ctl-socket[{socket_path}]: failed to write ctl reply: {e}");
                                 }
                                 let _ = write_half.shutdown().await;
                             }
-                            Ok(Err(_)) => debug!("ctl-socket[{socket_path}]: clipboard pull reply sender dropped without a response"),
-                            Err(_) => warn!("ctl-socket[{socket_path}]: clipboard pull response timed out"),
+                            Ok(Err(_)) => debug!("ctl-socket[{socket_path}]: ctl reply sender dropped without a response"),
+                            Err(_) => warn!("ctl-socket[{socket_path}]: ctl reply timed out"),
                         }
                     }
                     Ok(msg) => {
@@ -348,27 +383,47 @@ impl client::Handler for RusshEventHandler {
 /// `session` に対して `auth` で認証する。公開鍵認証が成功した場合はその鍵も返す
 /// （agent forwarding で転送先の署名要求に同じ鍵を使い回すため。鍵の追加受け渡しは
 /// 不要という設計）。
+///
+/// 実際の認証ロジック(パスワード/公開鍵の分岐・エラー処理)は
+/// `russh-stream-session`(M0で切り出した汎用クレート、`isekai-terminal-core`非依存)
+/// の`authenticate_session`に委譲する。ここでは (1) UniFFI公開型`SshAuth`から
+/// クレート側の`Credential`への変換、(2) 呼び出し後の`Credential`即時ゼロ化
+/// (タスク#65と同じ理由、クレート呼び出しのために新たに生じたコピー分)、
+/// (3) 認証成功時のagent forwarding用鍵の再構築(クレート側APIは鍵を返さない設計の
+/// ため、同じPEMをもう一度パースするだけ——鍵自体は既にネットワーク上で使用済みで
+/// 秘匿性の要はもう無い)だけを行う。
 pub(crate) async fn authenticate_session(
     session: &mut client::Handle<RusshEventHandler>,
     username: &str,
     auth: &SshAuth,
 ) -> (bool, Option<Arc<PrivateKey>>) {
-    match auth {
-        SshAuth::Password { password } => {
-            let ok = session.authenticate_password(username, password).await.ok().unwrap_or(false);
-            (ok, None)
+    let mut credential = match auth {
+        SshAuth::Password { password } => russh_stream_session::Credential::Password(password.clone()),
+        SshAuth::PublicKey { private_key_pem } => {
+            russh_stream_session::Credential::PublicKey { private_key_pem: private_key_pem.clone() }
         }
-        SshAuth::PublicKey { private_key_pem } => match PrivateKey::from_openssh(private_key_pem) {
-            Ok(key) => {
-                let key = Arc::new(key);
-                let ok = session.authenticate_publickey(username, key.clone()).await.ok().unwrap_or(false);
-                (ok, ok.then_some(key))
-            }
-            Err(e) => {
-                warn!("ssh: private key parse failed: {}", e);
-                (false, None)
-            }
-        },
+    };
+    let result = russh_stream_session::authenticate_session(session, username, &credential).await;
+    credential.zeroize();
+
+    match result {
+        Ok(true) => {
+            let key = match auth {
+                SshAuth::PublicKey { private_key_pem } => PrivateKey::from_openssh(private_key_pem)
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        warn!("ssh: agent-forwarding key re-parse failed after successful auth (should be unreachable): {e}")
+                    })
+                    .ok(),
+                SshAuth::Password { .. } => None,
+            };
+            (true, key)
+        }
+        Ok(false) => (false, None),
+        Err(e) => {
+            warn!("ssh: authenticate_session failed: {}", e);
+            (false, None)
+        }
     }
 }
 
@@ -735,13 +790,34 @@ pub(crate) async fn run_ssh_channel_loop(
             Ok(()) => {
                 info!("ctl-socket: forwarding {} (Epic M)", path);
                 let forward_event_tx = event_tx.clone();
+                // `setvar`/`getvar`(task #16)のこのタブ専用ストア(`VarScope::Tab`/
+                // `Session`用)。`VarScope::Global`は`ctl_var_store`が
+                // `GLOBAL_CTL_VARS`(プロセス全体で共有)を返すのでここでは触らない。
+                // Kotlin側の非同期往復が要らない(メモリ上の参照のみ)ため、
+                // `ClipboardPullRequest`と違い`TransportEvent`を経由させず
+                // このタスク内で完結させる。
+                let tab_vars = isekai_protocol::CtlVarStore::new();
                 tokio::spawn(async move {
                     while let Some(CtlInbound { msg, reply }) = ctl_rx.recv().await {
-                        let event = match reply {
-                            Some(reply) => TransportEvent::ClipboardPullRequestOverCtl(reply),
-                            None => TransportEvent::CtlMessage(msg),
-                        };
-                        forward_event_tx.send(event).await.ok();
+                        match (msg, reply) {
+                            (isekai_protocol::CtlMessage::SetVar { scope, key, value }, _) => {
+                                ctl_var_store(scope, &tab_vars).set(key, value);
+                            }
+                            (isekai_protocol::CtlMessage::GetVarRequest { scope, key }, Some(reply)) => {
+                                let value = ctl_var_store(scope, &tab_vars).get(&key);
+                                let _ = reply.send(isekai_protocol::CtlMessage::GetVarResponse { value });
+                            }
+                            (msg, Some(reply)) => {
+                                // 現状ここに来るのは`ClipboardPullRequest`だけ
+                                // (Kotlin側の同期I/Oが要るのでTransportEvent経由に
+                                // 委ねる)。`msg`自体はフィールドが無いので不要。
+                                let _ = msg;
+                                forward_event_tx.send(TransportEvent::ClipboardPullRequestOverCtl(reply)).await.ok();
+                            }
+                            (msg, None) => {
+                                forward_event_tx.send(TransportEvent::CtlMessage(msg)).await.ok();
+                            }
+                        }
                     }
                 });
                 // タスク#59: このタブに既にtmuxロケータが分かっていれば
@@ -931,6 +1007,12 @@ pub(crate) async fn run_ssh_channel_loop(
                             // キャンセル/タイムアウトした等)無視してよい。
                             let _ = reply.send(result);
                         });
+                    }
+                    Some(TransportCommand::FilePreviewExec { request_id, command_line }) => {
+                        info!("file-preview[{}]: exec", request_id);
+                        tokio::spawn(super::file_preview_exec::run_file_preview_exec(
+                            request_id, command_line, session.clone(), event_tx.clone(),
+                        ));
                     }
                     Some(TransportCommand::Disconnect) | None => {
                         info!("ssh: disconnect requested");
@@ -1177,6 +1259,9 @@ mod pooling_e2e_tests {
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
         fn on_notify(&self, _kind: crate::NotifyKind) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
@@ -1243,6 +1328,28 @@ mod pooling_e2e_tests {
                 session.close(channel)?;
                 return Ok(());
             }
+            // 高速flood(catで巨大ファイルを吐き出すシナリオ相当)を模す特殊トリガー。
+            // `__test_flood__:<N>`を受けたらN行を1行=1回の`session.data()`呼び出しで
+            // 個別に送り返す——クライアント側で多数の独立した`TransportEvent::Stdout`
+            // として届かせ、RepaintThrottle(kittyのrepaint_delay相当)のcoalescing
+            // 挙動を検証する負荷を生成する。`__test_flood_sync__:<N>`はDEC同期出力
+            // (`?2026h`/`?2026l`)で挟んだ版。
+            if let Some(n) = parse_test_flood_trigger(data, b"__test_flood__:") {
+                for i in 0..n {
+                    let line = format!("flood-line-{i:05}\r\n");
+                    session.data(channel, CryptoVec::from(line.into_bytes()))?;
+                }
+                return Ok(());
+            }
+            if let Some(n) = parse_test_flood_trigger(data, b"__test_flood_sync__:") {
+                session.data(channel, CryptoVec::from(b"\x1b[?2026h".to_vec()))?;
+                for i in 0..n {
+                    let line = format!("sync-line-{i:05}\r\n");
+                    session.data(channel, CryptoVec::from(line.into_bytes()))?;
+                }
+                session.data(channel, CryptoVec::from(b"\x1b[?2026l".to_vec()))?;
+                return Ok(());
+            }
             session.data(channel, CryptoVec::from(data.to_vec()))?;
             Ok(())
         }
@@ -1267,6 +1374,12 @@ mod pooling_e2e_tests {
             session.close(channel)?;
             Ok(())
         }
+    }
+
+    /// `prefix:<N>`形式のテスト用トリガーを解析する(`__test_flood__:500`等)。
+    fn parse_test_flood_trigger(data: &[u8], prefix: &[u8]) -> Option<usize> {
+        let rest = data.strip_prefix(prefix)?;
+        std::str::from_utf8(rest).ok()?.trim().parse().ok()
     }
 
     async fn spawn_counting_echo_server(auth_count: Arc<AtomicUsize>) -> SocketAddr {
@@ -1745,6 +1858,163 @@ mod pooling_e2e_tests {
             wait_echo(&mut rx_b, b"still-here").await;
 
             orch_b.disconnect();
+        });
+    }
+
+    // ── 高速flood時のScreenUpdate間引き(RepaintThrottle)のe2eテスト ──────
+
+    /// [FloodTestCallback]用の`on_screen_update`呼び出し記録。実SSH接続(このモジュールの
+    /// in-processサーバ)からTransportEvent経由でsession_event_loopまで通した状態で、
+    /// `RepaintThrottle`による間引きが実際に効くこと・最終画面が壊れないことを検証する
+    /// ためのテスト専用コールバック(既存の`TestCallback`は`on_screen_update`を無視する
+    /// ので、フィールド追加による他テストへの影響を避けて別構造体にした)。
+    struct FloodTestCallback {
+        tx: UnboundedSender<TestEvent>,
+        screen_update_count: Arc<AtomicUsize>,
+        last_screen_update: Arc<Mutex<Option<ScreenUpdate>>>,
+    }
+
+    impl OrchestratorCallback for FloodTestCallback {
+        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            let _ = self.tx.send(TestEvent::Connection(state));
+        }
+        fn on_screen_update(&self, update: ScreenUpdate) {
+            self.screen_update_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_screen_update.lock() = Some(update);
+        }
+        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
+        fn on_data(&self, data: Vec<u8>) {
+            let _ = self.tx.send(TestEvent::Data(data));
+        }
+        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
+        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_notify(&self, _kind: crate::NotifyKind) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
+    }
+
+    /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで
+    /// 待つ。最後の行のマーカー文字列が`on_data`経由の生ログに出現するのを待つだけで、
+    /// `on_screen_update`側のタイミングには依存しない(間引きの検証はそちらで別途行う)。
+    async fn wait_flood_done(rx: &mut UnboundedReceiver<TestEvent>, last_line_marker: &str) {
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            if String::from_utf8_lossy(&got).contains(last_line_marker) {
+                return;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(TestEvent::Data(data))) => got.extend_from_slice(&data),
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { reason, .. }))) => {
+                    panic!("connection disconnected while waiting for flood to finish: {reason:?}");
+                }
+                _ => continue,
+            }
+        }
+        panic!(
+            "did not observe flood terminator {:?} within timeout, got {} bytes",
+            last_line_marker, got.len(),
+        );
+    }
+
+    /// 高速flood(catで巨大ファイルを吐き出すシナリオ相当)を実SSH接続(この
+    /// モジュールのin-processサーバ)からsession_event_loopまで通し、`on_screen_update`
+    /// の呼び出し回数が投入行数を大きく下回ること、かつ最終的な可視画面の内容が
+    /// 正しい(floodの最終行が画面に反映されている)ことを検証する。
+    #[test]
+    fn flood_output_coalesces_screen_updates_but_final_screen_is_correct() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let screen_update_count = Arc::new(AtomicUsize::new(0));
+            let last_screen_update: Arc<Mutex<Option<ScreenUpdate>>> = Arc::new(Mutex::new(None));
+            let orch = create_session_orchestrator(Box::new(FloodTestCallback {
+                tx,
+                screen_update_count: screen_update_count.clone(),
+                last_screen_update: last_screen_update.clone(),
+            }));
+            orch.connect(ssh_config(addr, key_auth(200))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+
+            let n: usize = 500;
+            orch.send(format!("__test_flood__:{n}").into_bytes());
+            wait_flood_done(&mut rx, &format!("flood-line-{:05}", n - 1)).await;
+            // 間引かれた最後のフレームがタイマー発火で発行されるのを待つ(仮想時間では
+            // なく実時間のテストなので、REPAINT_MIN_INTERVAL(16ms)に対して十分な余裕
+            // ―― 並列テスト実行下でのスレッド飢餓を見込んだ余裕(rust-quic-test-flakiness
+            // の教訓に倣う)――を持って待つ)。
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let calls = screen_update_count.load(Ordering::SeqCst);
+            assert!(
+                calls < n,
+                "expected far fewer on_screen_update calls ({calls}) than flooded lines ({n})"
+            );
+            assert!(calls >= 1, "at least the final coalesced frame must be emitted");
+
+            let last = last_screen_update.lock().clone().expect("at least one ScreenUpdate must have been captured");
+            let visible: String = last.cells.iter().map(|c| c.ch.as_str()).collect();
+            assert!(
+                visible.contains(&format!("flood-line-{:05}", n - 1)),
+                "final visible screen must contain the last flooded line, got: {visible:?}"
+            );
+            assert!((last.cursor_row as usize) < last.rows as usize, "cursor_row must stay within the grid");
+            assert!((last.cursor_col as usize) <= last.cols as usize, "cursor_col must stay within the grid");
+
+            orch.disconnect();
+        });
+    }
+
+    /// DEC同期出力(`?2026h`/`?2026l`)区間をまたぐfloodでも、RepaintThrottleの
+    /// 間引きと衝突せず最終画面が正しく反映されることを検証する(safety-netタイマー
+    /// との共存確認)。
+    #[test]
+    fn flood_output_wrapped_in_synchronized_output_still_flushes_correctly() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let screen_update_count = Arc::new(AtomicUsize::new(0));
+            let last_screen_update: Arc<Mutex<Option<ScreenUpdate>>> = Arc::new(Mutex::new(None));
+            let orch = create_session_orchestrator(Box::new(FloodTestCallback {
+                tx,
+                screen_update_count: screen_update_count.clone(),
+                last_screen_update: last_screen_update.clone(),
+            }));
+            orch.connect(ssh_config(addr, key_auth(201))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+
+            let n: usize = 300;
+            orch.send(format!("__test_flood_sync__:{n}").into_bytes());
+            wait_flood_done(&mut rx, &format!("sync-line-{:05}", n - 1)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let calls = screen_update_count.load(Ordering::SeqCst);
+            assert!(calls >= 1, "at least one ScreenUpdate must be emitted after ?2026l flushes");
+
+            let last = last_screen_update.lock().clone().expect("at least one ScreenUpdate must have been captured");
+            let visible: String = last.cells.iter().map(|c| c.ch.as_str()).collect();
+            assert!(
+                visible.contains(&format!("sync-line-{:05}", n - 1)),
+                "final visible screen must contain the last synchronized-output line, got: {visible:?}"
+            );
+
+            orch.disconnect();
         });
     }
 

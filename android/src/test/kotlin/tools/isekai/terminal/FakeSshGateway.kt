@@ -178,6 +178,31 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         return ensureTmuxTabWindowResult
     }
 
+    // タスク#13(OSC 133)。呼び出し引数を記録するだけ(判断ロジックはRust側にあるため、
+    // Fakeは配線されているかどうかのみ確認できればよい)。
+    val jumpToPreviousPromptCalls = mutableListOf<Pair<UInt, Boolean>>()
+    override fun jumpToPreviousPrompt(fromScrollOffset: UInt, fromShowingScrollback: Boolean) {
+        jumpToPreviousPromptCalls.add(fromScrollOffset to fromShowingScrollback)
+    }
+    val jumpToNextPromptCalls = mutableListOf<Pair<UInt, Boolean>>()
+    override fun jumpToNextPrompt(fromScrollOffset: UInt, fromShowingScrollback: Boolean) {
+        jumpToNextPromptCalls.add(fromScrollOffset to fromShowingScrollback)
+    }
+    val clickToPromptCursorCalls = mutableListOf<Pair<UInt, UInt>>()
+    override fun clickToPromptCursor(row: UInt, col: UInt) {
+        clickToPromptCursorCalls.add(row to col)
+    }
+    var copyLastCommandOutputCallCount = 0
+    override fun copyLastCommandOutput() { copyLastCommandOutputCallCount++ }
+
+    // タスク#17(ファイルプレビュー機能)。実際の`request_id`↔要求種別のペアを記録するだけ
+    // (パース/デコードロジックはRust側にあるためFakeは検証しない)。テストは
+    // `simulateFilePreviewResult`で任意の[FilePreviewOutcome]を返せる。
+    val filePreviewRequests = mutableListOf<Pair<String, FilePreviewRequestKind>>()
+    override fun filePreviewRequest(requestId: String, kind: FilePreviewRequestKind) {
+        filePreviewRequests.add(requestId to kind)
+    }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {
@@ -229,6 +254,13 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     /** タスク#57: tmux hook発火(Rust側の抑制判断済みという前提で、届いたものとして再現)。 */
     fun simulateNotify(kind: NotifyKind) = callback!!.onNotify(kind)
+
+    fun simulatePromptJump(target: PromptJumpTarget?) = callback!!.onPromptJump(target)
+
+    fun simulatePromptOutputCopyReady(text: String?) = callback!!.onPromptOutputCopyReady(text)
+
+    fun simulateFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) =
+        callback!!.onFilePreviewResult(requestId, outcome)
 }
 
 /** テスト用フェイク HostKeyChecker。デフォルトは常に信頼。 */

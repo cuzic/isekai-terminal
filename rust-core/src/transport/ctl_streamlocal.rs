@@ -8,8 +8,31 @@
 //! 依存先。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+
+use isekai_protocol::{CtlVarStore, VarScope};
 
 static CTL_SOCKET_FORWARD_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The `setvar`/`getvar` store backing `VarScope::Global` (task #16): unlike
+/// `VarScope::Tab`/`VarScope::Session` (a store per tab, owned by
+/// `ssh_handler::run_ssh_channel_loop`), `Global` is meant to span every tab
+/// in this one Android app process, so it's a single process-wide instance
+/// here — this crate's one-process-many-tabs shape is exactly what makes
+/// `Global` meaningfully different from `Tab`/`Session` here, unlike
+/// `isekai-ssh`'s one-process-per-tab CLI wrapper (see that crate's
+/// `ctl_forward.rs` for the same trade-off spelled out there).
+static GLOBAL_CTL_VARS: LazyLock<CtlVarStore> = LazyLock::new(CtlVarStore::new);
+
+/// Resolves which `CtlVarStore` a `setvar`/`getvar` should read/write:
+/// `tab_store` (this tab's own store) for `Tab`/`Session`, or the
+/// process-wide `GLOBAL_CTL_VARS` for `Global`.
+pub(super) fn ctl_var_store(scope: VarScope, tab_store: &CtlVarStore) -> &CtlVarStore {
+    match scope {
+        VarScope::Tab | VarScope::Session => tab_store,
+        VarScope::Global => &GLOBAL_CTL_VARS,
+    }
+}
 
 pub(crate) fn set_ctl_socket_forward_enabled(enabled: bool) {
     CTL_SOCKET_FORWARD_ENABLED.store(enabled, Ordering::Relaxed);
@@ -61,5 +84,26 @@ mod ctl_socket_tests {
         assert!(ctl_socket_forward_enabled());
         set_ctl_socket_forward_enabled(false);
         assert!(!ctl_socket_forward_enabled());
+    }
+
+    #[test]
+    fn ctl_var_store_resolves_tab_and_session_to_the_tab_store() {
+        let tab_store = CtlVarStore::new();
+        tab_store.set("k", "tab-value");
+        assert_eq!(ctl_var_store(VarScope::Tab, &tab_store).get("k"), Some("tab-value".to_string()));
+        assert_eq!(ctl_var_store(VarScope::Session, &tab_store).get("k"), Some("tab-value".to_string()));
+    }
+
+    #[test]
+    fn ctl_var_store_resolves_global_to_the_shared_process_wide_store_across_distinct_tab_stores() {
+        let tab_store_a = CtlVarStore::new();
+        let tab_store_b = CtlVarStore::new();
+        // Use a key unlikely to collide with other tests sharing this process-wide static.
+        ctl_var_store(VarScope::Global, &tab_store_a).set("ctl_var_store_global_test_key", "global-value");
+        assert_eq!(
+            ctl_var_store(VarScope::Global, &tab_store_b).get("ctl_var_store_global_test_key"),
+            Some("global-value".to_string()),
+            "Global scope must be visible from a different tab's store reference"
+        );
     }
 }

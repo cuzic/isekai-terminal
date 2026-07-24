@@ -76,6 +76,14 @@ isekai-ssh myhost
   ターゲットをビルド)を公式サポートする。**接続先ホストは以下に関わらず常に Linux 固定**
   (下記参照)——Windows/macOS サーバー対応は対象外([`PLAN.md`](../../PLAN.md) の該当 Phase
   参照)。
+- **クライアント側で実 `ssh(1)` が必要かどうかはプラットフォームで異なる**:
+  - Linux / macOS では従来通り、実 `ssh(1)`(OpenSSH クライアント)を子プロセスとして
+    起動し `ProxyCommand` を差し込む薄いラッパーとして動く——**実 `ssh(1)` が必要**。
+  - **Windows では実 `ssh(1)`(Win32-OpenSSH の `ssh.exe`)を一切必要としない**。
+    Windows 上の `isekai-ssh` は `russh` ベースの SSH クライアント**本体**であり、
+    外部の `ssh`/`ssh.exe` を起動することも `ProxyCommand` を差し込むこともしない。
+    `ssh.exe` をインストールしなくてよい。詳細・非互換事項は下記「Windows
+    (ネイティブ SSH クライアント経路)」を参照。
 - 接続先ホストに `ssh` で(パスワードでも鍵でも)ログインできること。`isekai-ssh init` は
   この既存の SSH 接続を使って `isekai-pipe`(serve として起動)を配置する。
 - 接続先ホストが到達可能な isekai-link relay(`isekai-pipe serve --relay` が張るトンネル先)の
@@ -214,11 +222,15 @@ isekai-ssh -L 5432:127.0.0.1:5432 myhost
 isekai-ssh myhost 'journalctl -f'
 ```
 
-`isekai-ssh` は短命な `ConnectionIntent` をユーザー専用 runtime directory に保存してから
-OpenSSH を起動し、`ProxyCommand isekai-pipe connect --profile <host> --service ssh --stdio` を
-自動で差し込む。OpenSSH へ渡すのは `ISEKAI_INTENT_ID` だけで、session secret は argv/env には
-載せない。OpenSSH のパスを変えたい場合は `--isekai-ssh-path PATH`、`isekai-pipe` のパスを
-変えたい場合は `--isekai-pipe-path PATH` を使う。
+**Linux / macOS では**、`isekai-ssh` は短命な `ConnectionIntent` をユーザー専用 runtime
+directory に保存してから OpenSSH を起動し、`ProxyCommand isekai-pipe connect --profile
+<host> --service ssh --stdio` を自動で差し込む。OpenSSH へ渡すのは `ISEKAI_INTENT_ID`
+だけで、session secret は argv/env には載せない。OpenSSH のパスを変えたい場合は
+`--isekai-ssh-path PATH`、`isekai-pipe` のパスを変えたい場合は `--isekai-pipe-path PATH`
+を使う。**Windows では OpenSSH を起動せず**、`isekai-ssh` 自身が `isekai-pipe connect`
+の出力バイトストリームの上に `russh` で直接 SSH セッションを張る(下記「Windows
+(ネイティブ SSH クライアント経路)」)。この場合 `--isekai-ssh-path` は無関係で、
+`--isekai-pipe-path` のみ意味を持つ。
 
 既存の `~/.ssh/config` へ直接書く互換運用も残している。
 
@@ -301,7 +313,7 @@ Host production
 | `candidate-race-delay` | 同上の duration 表記 | `150ms` | 複数 candidate を同時に試す際の後発 candidate の遅延 |
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
 | `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |
-| `ctl-socket` | `yes`\|`no` | `no` | `yes` にすると、リモートの対話シェルから `isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push --mime <mime>` を実行することで、tmux を経由せず直接ローカルのタブ/ターミナルのタイトルやクリップボードへ反映できるよう per-タブの UNIX domain socket forward(`-R`)を張る(`ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。明示的なリモートコマンドを指定した呼び出し(`isekai-ssh host 'some command'`)や unix 系以外の OS では黙って無効化される(opportunistic fallback) |
+| `ctl-socket` | `yes`\|`no` | `no` | `yes` にすると、リモートの対話シェルから `isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push --mime <mime>` を実行することで、tmux を経由せず直接ローカルのタブ/ターミナルのタイトルやクリップボードへ反映できるよう per-タブのリモートフォワードを張る(`ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。Unix は実 `ssh(1)` の `-R` + UNIX domain socket、Windows ネイティブ経路は `russh` の streamlocal forward を in-process で消費する(下記「Windows(ネイティブ SSH クライアント経路)」)。明示的なリモートコマンドを指定した呼び出し(`isekai-ssh host 'some command'`)では黙って無効化される(opportunistic fallback) |
 | `remote-log-level` | `error`\|`warn`\|`info`\|`debug`\|`trace` | `info` | 自動 bootstrap で起動するリモート側 `isekai-pipe serve` の `--log-level`。接続不良の切り分け時だけ `debug`/`trace` に上げ、常用ホストでは既定(`info`)のままにしておくのが推奨(ホストごとに設定できる) |
 | `remote-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | 自動 bootstrap で起動するリモート側 `isekai-pipe serve --bind-port-range`。この範囲だけをホスト側ファイアウォールで許可すればよくなる(既定は Linux の ephemeral port range 全体を開ける必要がある) |
 | `local-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | `isekai-ssh`(`isekai-pipe connect`)自身がこのマシンで張るQUICソケットのbindポート範囲。手元のファイアウォール/NATが outbound UDP を特定範囲にしか通さない場合に使う。`remote-bind-port-range` とは独立した設定(片方だけ・両方同時に設定してよい) |
@@ -324,6 +336,209 @@ relay モードと違い、**セッション中に NAT マッピングが失わ�
 resume できず、その場でセッションが終了する**。低遅延を優先する代わりにこのリスクを受け入れる
 場合にのみ使う(既定は常に relay モード)。
 
+## Windows(ネイティブ SSH クライアント経路)
+
+**Windows 上だけ**、`isekai-ssh` は実 `ssh(1)`(Win32-OpenSSH の `ssh.exe`)を一切
+起動せず、`russh` ベースのネイティブ SSH クライアントとして直接動作する
+(`isekai-ssh/src/native/`、入口は `isekai-ssh/src/main.rs` の
+`#[cfg(windows)] native::mux::run`)。Linux / macOS は今まで通り実 `ssh(1)` の
+`ProxyCommand` 方式のままで、この節の内容は Windows にのみ当てはまる。`ssh.exe` の
+インストールは不要で、`isekai-ssh doctor` を含めどのコマンドも `ssh.exe` の有無を
+確認しない。
+
+`~/.ssh/config` の解決には、実 `ssh(1)` の `ssh -G` を呼ぶ代わりに専用の
+`openssh-config` クレートを使う(実 `ssh(1)` が無い環境で `ssh -G` に頼れないため)。
+`~` の展開もこのクレートが `%USERPROFILE%`/`$HOME` を基準に自分で行うので、MSYS2/Cygwin
+版 `ssh(1)` に固有の `~` 展開の癖(passwd データベース経由)には影響されない。
+
+### 対応していない・非互換の事項
+
+Windows ネイティブ経路は `isekai-ssh <host>` の**対話的接続に特化**しており、`ssh(1)` の
+完全なドロップイン代替ではない。以下は明示的にスコープ外・非対応:
+
+- **`ssh_config(5)` の一部キーワードのみ対応**。`openssh-config` クレートが解決するのは
+  `HostName` / `User` / `Port` / `IdentityFile` / `CertificateFile` / `ProxyJump` /
+  `ForwardAgent` / `IdentityAgent` だけで、それ以外のキーワードは黙って無視される。
+  特に次は非対応:
+  - `ProxyCommand`(`isekai-ssh` 自身が接続経路を持つため無関係)
+  - `Match` ブロックの `all`/`host`/`user`/`localuser` 条件は評価される(AND 意味論、
+    `!` 否定・カンマ区切り pattern-list 対応)。`exec`/`canonical`/`final`/
+    `originalhost` はプロセス実行やssh(1)のcanonicalization実行時状態を要するため、
+    このクレートは意見を持たず常に不成立として扱う(推測しない)
+  - `CertificateFile`(SSH 証明書認証)は対応済み。明示的な`CertificateFile`は
+    `IdentityFile`と同じインデックスで位置的にペアリングされ(未設定時は
+    `ssh(1)`標準の`<IdentityFile>-cert.pub`という既定の探索規約にフォールバック)、
+    パスフレーズ付き鍵と組み合わせても正しく復号→証明書認証される
+    (`private_key::resolve_certificate_file`)。既知の簡略化: 位置的ペアリングは
+    「設定済みの`IdentityFile`」に対してのみ有効で、既定探索順(id_ed25519等)から
+    来た候補には適用されない(既定の`-cert.pub`探索自体はどちらにも適用される)
+  - `IdentitiesOnly`
+  - パスフレーズ付き秘密鍵は対応済み——`IdentityFile` が暗号化されている場合、対話的
+    接続では no-echo でパスフレーズを最大3回まで再試行プロンプトする
+    (`native::connect::try_encrypted_identity`)。サイレント/自動再試行(always-connects
+    の黙示的再bootstrap)時は、答えの来ないstdinでブロックしないようプロンプトせず
+    次の候補(または SSH agent)へ進む
+  - `known_hosts` ファイルとの直接互換——ホスト鍵の TOFU は `isekai-trust` の専用ストア
+    (`host:port` キー)に記録し、OpenSSH の `~/.ssh/known_hosts` は読み書きしない
+- **認証方式**: 公開鍵(パスフレーズ付き含む)・SSH agent・パスワード・
+  keyboard-interactive(PAM/OTP/2FA 等、`password` を直接ネゴシエートしない sshd 向け、
+  `russh_stream_session::authenticate_keyboard_interactive` 経由)に対応。
+  サイレント/自動再試行時はどちらもプロンプトせず即座に諦める(上と同じ理由)。
+  **GSSAPI・PKCS11/ハードウェアトークン認証は対象外**——このプロジェクトが想定する
+  利用者層(個人/小規模チームのWindows→Linuxワークフロー)にはKerberosドメインや
+  スマートカード必須の環境は想定されず、実装コスト・追加の依存/攻撃対象面に見合わないと
+  判断した。
+- **X11 forwarding は対象外**。
+- **他ツールからの `ssh` 呼び出し互換は対象外**。git / rsync / VS Code Remote-SSH /
+  Ansible 等が内部で `ssh` を起動する用途のドロップイン代替にはならない。`isekai-ssh`
+  はあくまで `isekai-ssh <host>` の対話的接続に特化しており、汎用の `ssh` コマンド
+  代替ではない。
+- **非対話のリモートコマンド実行**(`isekai-ssh <host> 'cmd'`)は native 経路でも対応済み
+  (`native/connect.rs`が`plan.remote_command()`の有無で`SessionKind::Exec`/`Shell`を
+  切り替える。`-t`指定時はPTY+exec)。
+
+### マルチプレクサ(ControlMaster/ControlPersist 相当)
+
+複数のタブが**同じ接続設定**(host / port / user / identity / agent forward / route
+設定など、`native/mux/naming.rs` がハッシュ化する接続関連の要素すべて)で
+`isekai-ssh <host>` を実行すると、認証済みの `russh` 接続を1つだけ保持する **holder**
+プロセスへ、各タブ(常に client)がローカルの named pipe(`local-ipc-mux`)経由で
+リレーしてもらう。各 client は自分専用のリモートシェルチャネルを持ち、接続・認証を毎回
+やり直さずに済む(`native/mux/`)。
+
+**`ControlPersist` 相当の実装**(旧「既知の制限」を解消): holder はどのタブの前面
+プロセスでもない——最初のタブがholderをまだ見つけられなかったとき、自分自身を
+detached(`DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW`)で
+再exec して起動し(`native/mux/holder.rs`)、以降は自分もただの client として振る舞う。
+holder はフォアグラウンドshellを一切開かず、`serve_clients`のaccept loopだけを回す
+(`native/mux/owner.rs`)。クライアント数が0になってから`IDLE_GRACE`(既定10秒、
+初回接続待ちのみ`WARMUP_GRACE`30秒)経過すると自発的に終了する——タブを閉じても
+接続は生き続け、次のタブが来なければ静かに畳まれる、という `ControlPersist` の
+生存期間ポリシーそのもの。holder起動の失敗・タイムアウトはいずれも
+「常に接続できる」原則によりその場で直結フォールバックする(`native/mux/mod.rs::dispatch`)。
+
+**パスフレーズ付き秘密鍵のハンドオフ**: detached holder は console を持たないため、
+パスフレーズ付き `IdentityFile` を自分でプロンプトすることは原理的にできない。
+holderをまだ起動していない側(まだ対話可能なプロセス)が、holder起動前に
+設定済みの暗号化identityを**一括で**復号し(`native/mux/handoff.rs::resolve_handoff_credentials`)、
+平文PEMをholderの子プロセスstdin経由で(argv/環境変数には一切載せず)手渡す。
+holderの認証がそれでも失敗した場合、手渡し元のclient自身のフォールバック直結でも
+同じ復号済みセットを再利用するため、同一セッション内でパスフレーズを二度尋ねられることはない
+(手渡し用の子プロセスstdinへの書き込みは専用OSスレッドで行い、`dispatch`側の非同期タスクを
+ブロックしない——パイプのカーネルバッファを超える大きさのペイロードでもフリーズしない)。
+
+**同時起動の競合対策**: 同じ未trust済み・未接続の宛先へ複数タブをほぼ同時に開くと、
+holderをまだ見つけられない全タブが「ハンドオフ解決+spawn」に殺到し得る。これを
+`SpawnLock`(exclusive-create一時ロックファイル、`native/mux/mod.rs`)で調停し、
+最初にロックを取ったタブだけがパスフレーズ解決・holder起動を行う。ロックが立ったまま
+クラッシュした場合に永久に詰まらないよう、`HOLDER_STARTUP_TIMEOUT`より古いロックは
+陳腐化とみなして再取得する。また、holderがまだ`accept()`を開始していない
+(SSH認証の途中でpipeインスタンスが埋まっている)間に別タブが繋ごうとすると
+`ERROR_PIPE_BUSY`相当の`ConnectError::Io`が返り得るが、これも`NotFound`と同じ
+リトライ予算(既定10秒)の対象にしており、数百ミリ秒で直結フォールバックへ
+即座に諦めることはない。
+
+### ctl-socket(`#@isekai ctl-socket yes`)
+
+`#@isekai ctl-socket yes` は Windows ネイティブ経路でも**配線済み**で機能する
+(`native/connect.rs` → `native/mux/ctl_forward.rs`)。リモートの対話シェルから
+`isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push` を実行すると、ローカルの
+タブのタイトル・クリップボードへ反映される(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。
+
+ただし Windows native の実現方式は Unix とは異なる。Unix は実 `ssh(1)` の `-R` が
+リモート UNIX ソケットの forward を*ローカルソケット*にしか届けられないため、`isekai-ssh`
+がそのローカルソケットで待ち受ける。native 経路は `isekai-ssh` 自身が SSH クライアント
+なので、**ローカルの受け口(TCP ループバックや named pipe)を一切介さない**:
+
+- `russh` の `streamlocal_forward(remote_path)` でリモート UNIX ソケットの forward を
+  直接張り、サーバー発の `forwarded-streamlocal` チャネルをハンドラ経由で**そのまま
+  in-process で受け取る**。
+- リモートのシェルには Unix と同じく `export ISEKAI_CTL_SOCK=...; exec "$SHELL" -i -l` を
+  pty+exec で渡し、socket path を知らせる。
+- **owner / 単一プロセス**のタブは、受信した ctl メッセージを自プロセスの stderr へ OSC
+  (タイトル OSC 0 / クリップボード OSC 52)として直接適用する。
+- **mux クライアント**のタブは、owner がそのクライアント専用の forward を張り、受信 ctl を
+  M4 の既存 `local-ipc-mux` 接続上で `Frame::Ctl` として当該クライアントへ中継する
+  (クライアント同士で混ざらない)。
+- アクセス制御: `forwarded-streamlocal` チャネルは SSH プロトコル層の in-process オブジェクト
+  で他のローカルプロセスが接続できないため、Unix の TCP 用に検討された「TCP ポート +
+  128bit トークン」は native では不要(廃止)。
+
+**検証レベル(正直な現状)**: `x86_64-pc-windows-gnu` でのコンパイルと、mock sshd を使った
+unit/統合テスト(`streamlocal_forward` の往復・`Frame::Ctl` 中継・OSC 適用)で検証済み
+(Linux CI)。**実 Windows 機での実接続 e2e はまだ未確認**。
+
+Unix(実 `ssh(1)` の `ProxyCommand` 経路)の ctl-socket は従来どおり `-R` + UNIX ドメイン
+ソケットで変わらない。
+
+### リモートビルドトリガー(`build-profile`、Unix/macOS クライアントのみ)
+
+`#@isekai ctl-socket yes` の上に乗る形で、リモートの対話シェルから**このマシン(クライアント)
+側**でビルドコマンドを実行させ、ログをリアルタイムでリモートの端末に流し、成果物ファイルを
+リモートへ送り返せる(`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。Windows でしかコンパイルできない
+アプリを Linux 側の作業セッションから起動して結果を確認する、といった用途を想定している。
+
+まずクライアント側でプロファイルを登録する(`<HOST>` は `~/.ssh/config` の `Host` エイリアス
+と一致させる):
+
+```bash
+isekai-ssh build-profile add myhost win \
+  --dir     /path/to/repo \
+  --command "cargo build --release --target x86_64-pc-windows-msvc" \
+  --result-glob "target/x86_64-pc-windows-msvc/release/*.exe" \
+  --dest-dir    "~/isekai-build-results/win"
+```
+
+`--result-glob`/`--dest-dir` は成果物を送り返さないプロファイルなら両方省略してよい(片方
+だけの指定はエラーになる)。登録前に `isekai-ssh build-profile test myhost win` で、ctl-socket
+を一切使わずローカルでコマンドを試し実行できる。`isekai-ssh build-profile list`/`remove` で
+一覧・削除。
+
+登録後、`myhost` へ `isekai-ssh myhost` で接続した対話シェルの中から:
+
+```bash
+isekai-pipe ctl build win
+```
+
+を叩くと、クライアント側で `cargo build ...` が実行され、その stdout/stderr がそのまま
+このコマンドの stdout/stderr として流れる(=リモートの端末にそのまま表示される)。終了後は
+ビルドの exit code がこのコマンド自身の終了コードになるので、`isekai-pipe ctl build win &&
+scp ...` のようなシェルチェインもそのまま効く。`--result-glob`/`--dest-dir` を設定していれば、
+成功後にマッチしたファイルがバックグラウンドで `dest-dir` へ送られる(失敗時はクライアント
+側のログにのみ記録され、リモートへの通知はない——既知の制限)。
+
+**セキュリティ上の要点**: リモートが送れるのはプロファイル**名**だけで、実行される中身
+(`--dir`/`--command`)は一切 wire に乗らない。プロファイル自体が空(既定)なら、リモートから
+何を送っても何も実行されない。設定はプロファイル追加時に人間が明示的に行う。
+
+**Windows クライアント**: `native/mux/`(owner/client mux)経路にも同じ機能を実装済み
+(`ISEKAI_PIPE_DESIGN.md` §8 Epic P Phase 2)。このプロジェクトの開発環境には実機
+Windows が無いため、この機能自体はモックSSHサーバーでのユニットテストと
+`x86_64-pc-windows-gnu` へのクロスコンパイル確認までしか検証できていない——named pipe
+実体・`cmd.exe` 固有の挙動・実 `isekai-ssh.exe` での実際のビルドは未検証(既知の制限)。
+
+### 新規クレートの位置づけ
+
+Windows ネイティブ経路の中核は、`isekai-` 固有の型に依存しない汎用クレートとして切り出して
+ある(将来 isekai-terminal の外へ公開しやすい形):
+
+- **`russh-stream-session`** — 任意の `AsyncRead + AsyncWrite` バイトストリームの上に
+  `russh` で SSH クライアントセッションを張り認証する。ホスト鍵確認は差し替え可能で、
+  単一踏み台(jump host)トンネルにも対応。
+- **`openssh-config`** — `HostName` / `User` / `Port` / `IdentityFile` / `ProxyJump` /
+  `ForwardAgent` / `IdentityAgent` という `~/.ssh/config` の限定サブセットを、`ssh(1)` と
+  同じ `Host` / `Include` セマンティクスで解決する(`Match` ブロックは構文認識のみで
+  評価しない)。
+- **`local-ipc-mux`** — 同一マシン上の兄弟プロセス群のうち1つだけが排他的に named channel
+  を保持し(owner)、他はその channel に client として接続する、という SSH 非依存の汎用
+  パターン。上記マルチプレクサはこの上に SSH 用のフレームプロトコルを乗せている。
+  **Windows(named pipe)実装のみ提供**し、Unix 実装は trait 境界(`ExclusiveChannel`)
+  だけ用意して未実装(Unix は実 `ssh(1)` の ControlMaster で同じ役割を既に得ているため)。
+
+これらの汎用クレートに対し、プロファイル解決・`#@isekai` ディレクティブ・trust store の
+ファイル形式など isekai 固有のグルーは従来通り `isekai-` 接頭辞のクレート側に残り、上記に
+依存する側に回る。
+
 ## 既知の制限
 
 - **`--isekai-helper-binary`/`--helper-binary` を省略した際の自動ダウンロードは、実際には
@@ -343,16 +558,13 @@ resume できず、その場でセッションが終了する**。低遅延を�
   完全に独立している。
 - 複数ネットワーク環境(宅内 Wi-Fi NAT 配下 ↔ モバイル回線)をまたいだ実機ローミング検証は
   未実施。
-- Windows は上記「前提」の通りクライアントプラットフォームとして公式サポートするが、
+- Windows は上記「前提」「Windows(ネイティブ SSH クライアント経路)」の通り、実 `ssh(1)`
+  に依存しないネイティブ経路で公式サポートする(`ssh.exe` 不要)。ただし
   trust store・token ファイル・helper cache の保存先パスは `%LOCALAPPDATA%` ではなく
   `resolve_home_dir()`(`$HOME` → `%USERPROFILE%`)ベースの XDG 風パス
   (`%USERPROFILE%\.config\isekai-ssh` 等)のままで、Windows 流(`%LOCALAPPDATA%`)には
-  なっていない(動作はするが非イディオマティック、今のところ意図的に未対応)。
-  また、ネイティブ Windows(cmd.exe/PowerShell)・MSYS2/Git for Windows のいずれの `ssh(1)`
-  上での実行も動作するが、以下は isekai-ssh 側では踏み込んで対処していない、ホスト環境
-  (MSYS2/Cygwin)由来の既知のハマりどころ——下記「トラブルシューティング」の該当項目を参照:
-  - `~/.ssh/config` の `IdentityFile ~/...` が期待通りのホームディレクトリに展開されない
-    (`no such identity: ...` エラー)。
+  なっていない(動作はするが非イディオマティック、今のところ意図的に未対応)。native 経路の
+  非対応・非互換事項は「Windows(ネイティブ SSH クライアント経路)」節を参照。
 
 ## トラブルシューティング
 
@@ -380,16 +592,8 @@ resume できず、その場でセッションが終了する**。低遅延を�
   扱われるため、これらと同名のホスト(`doctor`/`init`/`login`/`logout` という名前のホスト)は
   `isekai-ssh <host>` の1コマンドでは接続できない(`~/.ssh/config` で別名を付けるか、
   `ssh <host>` を直接使うこと)。
-- (Windows/MSYS2)`no such identity: C:\Users\<user>/.ssh/id_ed25519.xxx: No such file or
-  directory` のように、`~/.ssh/config` に書いた `IdentityFile ~/.ssh/...` が意図しない
-  ホームディレクトリ(Windows のユーザープロファイル `C:\Users\<user>`)に展開されて
-  鍵が見つからない → これは isekai-ssh 自身のバグではなく、実際に起動された `ssh`
-  (MSYS2/Cygwin 版)の `~` 展開が `$HOME` 環境変数ではなく passwd データベース経由
-  (`/etc/nsswitch.conf` の `db_home`、既定は `windows`)で解決されるために起きる、
-  MSYS2/Cygwin 側の既知の挙動。bash の `.bashrc` で `$HOME` を上書きしていても、ssh の
-  `~` 展開には反映されないことがある。回避策は次のいずれか:
-  - `~/.ssh/config` の `IdentityFile` をホームディレクトリのフルパス(例:
-    `IdentityFile C:\Users\<username>\scoop\persist\msys2\home\<username>\.ssh\id_ed25519.xxx`)
-    で直接書く(`~` を使わない)。
-  - MSYS2 側の `/etc/nsswitch.conf` の `db_home` を変更し、`~` の展開先を実際に使いたい
-    ホームディレクトリに揃える。
+- (Windows)`~/.ssh/config` の `IdentityFile ~/.ssh/...` の `~` は、native 経路では
+  `openssh-config` クレートが `%USERPROFILE%`/`$HOME` を基準に展開する。以前の実 `ssh(1)`
+  (MSYS2/Cygwin 版)経由で起きていた passwd データベース由来の `~` 展開の食い違いは、
+  native 経路では発生しない(実 `ssh(1)` を起動しないため)。それでも鍵が見つからない
+  場合は、`~/.ssh/config` に `IdentityFile` のフルパスを直接書けば確実。

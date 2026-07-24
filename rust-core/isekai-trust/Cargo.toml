@@ -14,3 +14,15 @@ isekai-fs-guard = { path = "../isekai-fs-guard" }
 # Used for atomic writes (write to a sibling temp file, then rename) in
 # store.rs. Also reused by tests as a scratch directory factory.
 tempfile = "3"
+# host_key_verifier.rs: implements russh_stream_session::HostKeyVerifier,
+# runs the blocking locked-store I/O on tokio's blocking pool, and logs
+# mismatch/failure context.
+russh-stream-session = { path = "../russh-stream-session" }
+async-trait = "0.1.89"
+tokio = { version = "1", features = ["rt"] }
+log = "0.4"
+
+[dev-dependencies]
+# host_key_verifier.rs tests need the multi-thread runtime + timers to prove
+# a pending new-host confirmation doesn't block a different host's check.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

@@ -25,7 +25,7 @@ use std::io::Write as _;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};
 use isekai_pipe_core::{default_profiles_dir, write_persistent_profile, PersistentProfile};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use sha2::{Digest, Sha256};
@@ -37,14 +37,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let target = parse_host_spec(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
     let via = parse_via_chain(&target, &args.via)?;
-    let backend = match &args.ssh_path {
-        Some(ssh_path) => OpenSshBackend::new().with_ssh_program(ssh_path.to_string_lossy().into_owned()),
-        None => OpenSshBackend::new(),
-    };
+    // `isekai-ssh init` is inherently a manual, interactive command — never silent.
+    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(args.ssh_path.as_deref(), false)?;
 
     let helper_binary = crate::helper_download::resolve_helper_binary(
         args.helper_binary.as_deref(),
-        &backend,
+        backend.as_ref(),
         &target,
         &via,
         &crate::helper_download::ReleaseSource { repo: args.helper_release_repo.clone(), tag: args.helper_release_tag.clone() },

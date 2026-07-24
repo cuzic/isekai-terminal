@@ -11,6 +11,17 @@
 //! from accumulating garbage left behind by abnormal exits (crash,
 //! `kill -9`, a network drop that skipped the normal
 //! `ssh -O cancel -R`/unlink path).
+//!
+//! **Plain-ssh gap (closed, `ISEKAI_PIPE_DESIGN.md` §8 Epic M follow-up
+//! #3)**: `isekai-pipe serve` starting up used to be the *only* trigger for
+//! the remote-side sweep, but a plain-ssh (`isekai-pipe`非経由) session never
+//! starts that process on the remote host at all, so its orphaned
+//! `/tmp/isekai-pipe-ctl-*.sock` files were never swept by anything.
+//! `isekai-pipe ctl` itself (`isekai-pipe/src/ctl.rs::sweep_stale_ctl_sockets_on_remote`)
+//! now also sweeps before every invocation — it's the one binary that always
+//! runs remotely regardless of topology, since it's what the interactive
+//! shell's `$PROMPT_COMMAND`/manual call actually invokes over the
+//! ctl-socket forward.
 
 use std::io;
 use std::path::{Path, PathBuf};

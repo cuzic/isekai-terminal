@@ -26,11 +26,12 @@
 use std::collections::HashMap;
 
 /// 1軸(幅/高さ)あたりの上限(ピクセル)。これを超えたら即座にデコードを諦める。
-const MAX_SIXEL_DIM: usize = 4096;
+/// Kitty graphics(`kitty_graphics.rs`、#53)も同じ上限を共有する。
+pub(crate) const MAX_SIXEL_DIM: usize = 4096;
 /// バウンディングボックス面積(幅×高さ)の概算上限。ジャグ配列のため正確な
 /// ピクセル数ではないが、モバイル端末で許容できるメモリ量(4M pixel * 4bytes
-/// = 16MiB)へ確実に収めるための粗いガード。
-const MAX_SIXEL_AREA: usize = 4_000_000;
+/// = 16MiB)へ確実に収めるための粗いガード。Kitty graphicsも共有する。
+pub(crate) const MAX_SIXEL_AREA: usize = 4_000_000;
 
 pub(crate) struct SixelImage {
     pub(crate) width: usize,

@@ -9,12 +9,11 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{
-    BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec, RelayTransportKind,
-};
+use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
     claim_connect_outcome, default_log_file, default_profiles_dir, default_runtime_dir, load_persistent_profile,
@@ -35,11 +34,13 @@ use config::resolve_isekai_config;
 
 /// Reserved words that `should_run_wrapper` never treats as an SSH
 /// destination — the interactive trust-store subcommands (`init`/`login`/
-/// `logout`, all pre-existing) plus `doctor` (manual diagnostic,
-/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N). Not purely "legacy" any more, but
-/// kept as one flat list since `should_run_wrapper`'s only job is "is the
-/// first arg one of these known subcommand names or an SSH destination".
-const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor"];
+/// `logout`, all pre-existing), `doctor` (manual diagnostic,
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N), and `build-profile` (Epic P's local
+/// build-profile config management, `build_profile_cli.rs`). Not purely
+/// "legacy" any more, but kept as one flat list since `should_run_wrapper`'s
+/// only job is "is the first arg one of these known subcommand names or an
+/// SSH destination".
+const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor", "build-profile"];
 
 /// Matches `isekai-ssh init`'s own default (`cli::InitArgs::idle_lifetime`):
 /// the auto-bootstrapped helper is expected to keep running across many
@@ -47,14 +48,50 @@ const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor"];
 /// apart, unlike `isekai-terminal-core`'s (Android's) per-session bootstrap.
 const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
 
+/// Bounds `resolve_stun_servers`'s DNS fallback per entry. `getaddrinfo` is
+/// already self-bounding (glibc's own `resolv.conf` timeout × attempts ×
+/// nameserver count), but that budget can still run to tens of seconds for
+/// one bad hostname — matching the rest of this crate's practice of wrapping
+/// bootstrap I/O in an explicit `tokio::time::timeout` (e.g.
+/// `russh_backend.rs`'s command execution) rather than trusting an
+/// OS-level bound alone. STUN entries are an opt-in, best-effort NAT
+/// traversal hint, not something worth blocking a connection attempt over.
+const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether the caller requested a PTY for the remote session, mirroring
+/// `ssh(1)`'s `-t`/`-T`/`-tt` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTty {
+    /// No explicit `-t`/`-T` given: allocate a PTY for an interactive
+    /// (no-remote-command) session, skip it for a one-shot remote command.
+    Auto,
+    /// `-t`: force PTY allocation even for a remote command.
+    Yes,
+    /// `-T`: never allocate a PTY.
+    No,
+    /// `-tt`: force PTY allocation even when local stdin is not a tty
+    /// (ssh(1) uses this for batch-mode PTY-forcing).
+    Force,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperPlan {
     openssh_path: PathBuf,
     pipe_path: PathBuf,
+    /// The raw `ssh(1)`-style destination token (e.g. `cuzic@vpsmart`).
     destination: String,
+    /// The host part of the destination, with `user@` stripped (e.g. `vpsmart`).
+    /// Used for config resolution (`Host` block matching) and host key
+    /// verification, which don't understand `user@host` syntax.
+    destination_host: String,
+    /// The user part of the destination, if present (e.g. `Some("cuzic")` from
+    /// `cuzic@vpsmart`). Takes precedence over `ssh_config`'s `User` and the
+    /// local username — matching `ssh(1)`'s own precedence.
+    destination_user: Option<String>,
     destination_index: usize,
     ssh_args: Vec<String>,
     isekai: WrapperIsekaiOptions,
+    pub(crate) request_tty: RequestTty,
 }
 
 impl WrapperPlan {
@@ -64,6 +101,57 @@ impl WrapperPlan {
     /// binary the wrapper itself would use for `ProxyCommand`.
     pub(crate) fn pipe_path(&self) -> &Path {
         &self.pipe_path
+    }
+
+    /// The `ssh(1)`-style destination token (e.g. `production`, not the
+    /// `ssh -G`/`openssh-config`-resolved `HostName`) — `native/connect.rs`'s
+    /// only other direct read of `WrapperPlan` besides `pipe_path()`.
+    pub(crate) fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    /// The host part of the destination with `user@` stripped. Used for
+    /// config resolution and host key verification.
+    pub(crate) fn destination_host(&self) -> &str {
+        &self.destination_host
+    }
+
+    /// The user part of the `user@host` destination, if any.
+    pub(crate) fn destination_user(&self) -> Option<&str> {
+        self.destination_user.as_deref()
+    }
+
+    /// `--isekai-log-file <PATH>` (`log_file.rs`), if given. The native
+    /// connect path (`native/connect.rs::run`) reads this to call
+    /// `crate::log_file::init` itself, mirroring the `crate::log_file::init`
+    /// call `wrapper::run` (the Unix path) already makes — without this the
+    /// flag was silently ignored on Windows. Mirrors the existing
+    /// `destination()`/`pipe_path()` getters.
+    pub(crate) fn log_file(&self) -> Option<&Path> {
+        self.isekai.log_file.as_deref()
+    }
+
+    /// Number of parsed `ssh(1)`-style args (options + destination + any
+    /// trailing remote command). The native ctl-socket path
+    /// (`native/mux/ctl_forward.rs`) feeds this to
+    /// [`crate::ctl_forward::should_attempt_ctl_forward`] to skip the forward
+    /// for a one-shot remote command, exactly as the Unix path does.
+    pub(crate) fn ssh_args_len(&self) -> usize {
+        self.ssh_args.len()
+    }
+
+    /// Index of the destination token within the parsed ssh args — anything
+    /// *after* it is a remote command. Paired with [`Self::ssh_args_len`] for
+    /// the native ctl-socket interactive-session check.
+    pub(crate) fn destination_index(&self) -> usize {
+        self.destination_index
+    }
+
+    /// The remote command (everything after the destination in the ssh args),
+    /// if any. `None` means an interactive login shell.
+    pub(crate) fn remote_command(&self) -> Option<&[String]> {
+        let tail = &self.ssh_args[self.destination_index + 1..];
+        if tail.is_empty() { None } else { Some(tail) }
     }
 }
 
@@ -228,6 +316,53 @@ impl WrapperResolution {
     pub(crate) fn profile(&self) -> &str {
         &self.isekai.profile
     }
+
+    /// Whether `#@isekai` routing applies to this destination at all — the
+    /// native connect path (`native/connect.rs`) needs this to decide
+    /// between routing through `isekai-pipe connect --stdio` and a plain
+    /// direct connect, the same branch `run()` makes via `run_openssh_direct`.
+    pub(crate) fn isekai_enabled(&self) -> bool {
+        self.isekai.enabled
+    }
+
+    /// `#@isekai ctl-socket yes` (Epic M): whether the per-tab title/clipboard
+    /// control-plane forward is opted in. The native path
+    /// (`native/mux/ctl_forward.rs`) reads this to decide whether to request a
+    /// streamlocal forward on its `russh` handle; the Unix path reads the
+    /// private field directly (same module).
+    pub(crate) fn ctl_socket_enabled(&self) -> bool {
+        self.isekai.ctl_socket_enabled
+    }
+
+    /// `{hostname}:{port}` for this destination, using the same
+    /// `HostName`/`port` fallback `resolve_isekai_config`'s own
+    /// `default_target` uses (destination literal, port 22) — the native
+    /// path's SSH TCP target and `HostKeyVerifier` trust-store key.
+    pub(crate) fn native_host_port(&self, destination: &str) -> (String, u16) {
+        let host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
+        let port = self.openssh.port.unwrap_or(22);
+        (host, port)
+    }
+
+    /// A canonical string of the connection-relevant `#@isekai` directives,
+    /// hashed into the mux channel name (`native/mux/naming.rs`) alongside the
+    /// OpenSSH-resolved fields so two tabs whose isekai routing differs (a
+    /// different profile, relay set, bootstrap policy, …) never share an
+    /// owner.
+    ///
+    /// This is deliberately the `Debug` rendering of the whole resolved
+    /// `IsekaiConfig`: every field is connection-relevant, and folding them
+    /// through `Debug` means a *newly added* field is automatically included
+    /// rather than silently forgotten (a missed field would be a
+    /// wrong-sharing bug). `Debug` output is deterministic within one binary
+    /// build, which is all the channel-naming hash needs; if two differing
+    /// binary versions ever rendered it differently they would simply compute
+    /// different names and not share (over-isolation, always safe — see
+    /// `naming.rs`'s "fail-safe direction" note), with the protocol version
+    /// handshake as the final backstop.
+    pub(crate) fn mux_identity_material(&self) -> String {
+        format!("{:?}", self.isekai)
+    }
 }
 
 /// Resolves `destination` (a bare host, no other `ssh` args) into the same
@@ -372,8 +507,10 @@ async fn run_ssh_with_connect_failure_recovery(
 
 /// Human-readable lead-in for the two `eprintln!`s above, branching on
 /// `ConnectOutcomeClass` purely for message accuracy — both classes drive
-/// the exact same [`ConnectFailureRecoveryAction`].
-fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
+/// the exact same [`ConnectFailureRecoveryAction`]. `pub(crate)` so the
+/// Windows-native connect path (`native/connect.rs`) can reuse the exact
+/// same message wording for its own mirror of this recovery flow.
+pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
     match class {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
@@ -387,8 +524,13 @@ fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static st
 /// currently allowed. Pure decision, no I/O — split out from the
 /// surrounding async function so each branch is unit-testable without
 /// spawning a real `ssh`/bootstrap process.
+///
+/// `pub(crate)` so the Windows-native connect path (`native/connect.rs`)
+/// drives its own connect-failure recovery through the exact same decision
+/// (rather than duplicating the two-condition branch), keeping the
+/// "always-connects" policy single-sourced across the Unix and native paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectFailureRecoveryAction {
+pub(crate) enum ConnectFailureRecoveryAction {
     /// No connect-failure signal for this attempt — return the exit code
     /// as-is (e.g. the remote shell command itself exited non-zero; that
     /// never touches `isekai-pipe connect`'s own error path at all).
@@ -402,7 +544,7 @@ enum ConnectFailureRecoveryAction {
     RebootstrapAndRetry,
 }
 
-fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
+pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
     if !connect_failure_signaled {
         ConnectFailureRecoveryAction::NoRecoverableSignal
     } else if !should_bootstrap {
@@ -419,23 +561,27 @@ fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootst
 /// `ProxyCommand` grandchild, has exited, which is what makes inspecting a
 /// side-channel file in `runtime_dir` immediately afterward both correct
 /// and zero-cost to this stdio wiring (`run_ssh_with_connect_failure_recovery`).
-async fn run_ssh_once(
+/// Prepares the opportunistic `#@isekai ctl-socket` `-R` forward (if enabled
+/// and the session is interactive) and appends the ssh(1) args in the right
+/// order: any `-R` option *before* the destination, then the destination and
+/// its args, then the `export ISEKAI_CTL_SOCK=...` remote command *after* it.
+/// Unix-only — this is the `ssh(1)` ProxyCommand path; the Windows-native path
+/// handles ctl-socket on its own `russh` handle (`native/mux/ctl_forward.rs`).
+#[cfg(unix)]
+async fn apply_ctl_socket_forward(
+    command: &mut Command,
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
-    intent: &ConnectionIntent,
     runtime_dir: &Path,
-) -> Result<(std::process::ExitStatus, String)> {
-    write_connection_intent(runtime_dir, intent)?;
-    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile, &plan.openssh_path);
-
+) {
     let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
         resolution.isekai.ctl_socket_enabled,
         plan.ssh_args.len(),
         plan.destination_index,
     ) {
-        match crate::ctl_forward::prepare_ctl_forward(&runtime_dir) {
+        match crate::ctl_forward::prepare_ctl_forward(runtime_dir) {
             Ok(mut forward) => {
-                crate::ctl_forward::spawn_ctl_listener(&mut forward).await;
+                crate::ctl_forward::spawn_ctl_listener(&mut forward, resolution.profile().to_string()).await;
                 Some(forward)
             }
             Err(e) => {
@@ -448,6 +594,28 @@ async fn run_ssh_once(
     } else {
         None
     };
+
+    if let Some(forward) = &ctl_forward {
+        // `-R` is an ssh(1) option, so it must precede the destination
+        // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`).
+        command.args(crate::ctl_forward::forward_option_args(forward));
+    }
+    command.args(&plan.ssh_args);
+    if let Some(forward) = &ctl_forward {
+        // Anything appended after the destination is the remote command, not
+        // an option, to ssh(1).
+        command.arg(crate::ctl_forward::remote_command_arg(forward));
+    }
+}
+
+async fn run_ssh_once(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    intent: &ConnectionIntent,
+    runtime_dir: &Path,
+) -> Result<(std::process::ExitStatus, String)> {
+    write_connection_intent(runtime_dir, intent)?;
+    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile, &plan.openssh_path);
 
     let mut command = Command::new(&plan.openssh_path);
     command
@@ -469,17 +637,15 @@ async fn run_ssh_once(
             command.env("ISEKAI_PIPE_LOG_FILE", verbose_log_file);
         }
     }
-    if let Some(forward) = &ctl_forward {
-        // `-R` is an ssh(1) option, so it must precede the destination
-        // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`)
-        // — anything appended after the destination is the remote command,
-        // not an option, to ssh(1).
-        command.args(crate::ctl_forward::forward_option_args(forward));
-    }
+    // The `#@isekai ctl-socket` `-R` forward needs a real local UNIX-socket
+    // listener bound before the destination arg, so it is Unix-only. The
+    // Windows-native path never reaches this function — it's `russh`-based and
+    // forwards streamlocal in-process (see `ctl_forward.rs`'s module docs and
+    // `native/mux/ctl_forward.rs`).
+    #[cfg(unix)]
+    apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
+    #[cfg(not(unix))]
     command.args(&plan.ssh_args);
-    if let Some(forward) = &ctl_forward {
-        command.arg(crate::ctl_forward::remote_command_arg(forward));
-    }
     // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
     // break `ssh(1)`'s own `isatty()`-based PTY/interactive-terminal
     // behavior (`log_file.rs`'s module docs). stderr is the one stream this
@@ -684,6 +850,41 @@ pub(crate) enum TofuConfirmation {
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
+/// Resolves `#@isekai stun` directives (collected as plain strings without
+/// socket-address validation — `resolve_isekai_config`'s `append_args` just
+/// accumulates whatever text follows the directive, `#20b`) into
+/// `SocketAddr`s to pass to `install_and_start`. A malformed entry is
+/// skipped with a warning rather than failing the whole auto-bootstrap over
+/// one bad directive.
+///
+/// Well-known public STUN servers (e.g. Google's `stun.l.google.com`) are
+/// conventionally referenced by hostname, not a literal IP — `.parse::
+/// <SocketAddr>()` alone rejects those as "malformed" even though they're
+/// exactly the kind of entry users are most likely to configure. Falls back
+/// to DNS resolution (`tokio::net::lookup_host`, which — like `SocketAddr`'s
+/// own `FromStr` — requires the `host:port` form) before giving up on an
+/// entry.
+async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Ok(addr) = entry.parse::<SocketAddr>() {
+            resolved.push(addr);
+            continue;
+        }
+        match tokio::time::timeout(STUN_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host(entry.as_str())).await {
+            Ok(Ok(mut addrs)) => match addrs.next() {
+                Some(addr) => resolved.push(addr),
+                None => log_line_verbose!("isekai-ssh: ignoring #@isekai stun entry {entry:?}: DNS lookup returned no addresses"),
+            },
+            Ok(Err(e)) => log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}"),
+            Err(_) => log_line_verbose!(
+                "isekai-ssh: ignoring #@isekai stun entry {entry:?}: DNS lookup timed out after {STUN_DNS_LOOKUP_TIMEOUT:?}"
+            ),
+        }
+    }
+    resolved
+}
+
 pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
     let candidate = resolution
         .isekai
@@ -745,11 +946,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     // found by `Command::new("ssh")`'s bare-name resolution (only `.exe` is
     // implicit), so an explicit path is the only way either call site can
     // ever reach it.
-    let backend = OpenSshBackend::new().with_ssh_program(plan.openssh_path.to_string_lossy().into_owned());
+    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(
+        Some(&plan.openssh_path),
+        matches!(confirmation, TofuConfirmation::Silent),
+    )?;
     let helper_binary_was_explicit = plan.isekai.helper_binary.is_some();
     let helper_binary = crate::helper_download::resolve_helper_binary(
         plan.isekai.helper_binary.as_deref(),
-        &backend,
+        backend.as_ref(),
         &target,
         &via,
         &crate::helper_download::ReleaseSource { repo: plan.isekai.helper_release_repo.clone(), tag: plan.isekai.helper_release_tag.clone() },
@@ -768,23 +972,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     })?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
-    // `#@isekai stun` directives are collected as plain strings without
-    // socket-address validation (`resolve_isekai_config`'s `append_args`
-    // just accumulates whatever text follows the directive) — a malformed
-    // entry is skipped with a warning here rather than failing the whole
-    // auto-bootstrap over one bad directive (`#20b`).
-    let stun_servers: Vec<SocketAddr> = resolution
-        .isekai
-        .stun_servers
-        .iter()
-        .filter_map(|entry| match entry.parse::<SocketAddr>() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
-                None
-            }
-        })
-        .collect();
+    let stun_servers = resolve_stun_servers(&resolution.isekai.stun_servers).await;
 
     let launch = match &resolution.isekai.bootstrap_relay {
         Some(relay_target) => {
@@ -987,7 +1175,7 @@ pub(crate) fn should_bootstrap(plan: &WrapperPlan, resolution: &WrapperResolutio
         )
 }
 
-fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
+pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let mut openssh_path = PathBuf::from("ssh");
     let mut pipe_path = default_pipe_path();
     let mut ssh_args = Vec::new();
@@ -1032,21 +1220,360 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let destination_index = find_destination_index(&ssh_args)
         .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?;
     let destination = ssh_args[destination_index].clone();
+    let request_tty = extract_request_tty(&ssh_args, destination_index);
+    let (destination_user, destination_host) = split_user_host(&destination);
 
     Ok(WrapperPlan {
         openssh_path,
         pipe_path,
         destination,
+        destination_host,
+        destination_user,
         destination_index,
         ssh_args,
         isekai,
+        request_tty,
     })
+}
+
+/// Extracts the `-t`/`-T`/`-tt` flags from ssh args (before the destination)
+/// and returns the caller's PTY-request intent.
+pub(crate) fn extract_request_tty(ssh_args: &[String], destination_index: usize) -> RequestTty {
+    let mut tty = RequestTty::Auto;
+    let mut i = 0;
+    while i < destination_index {
+        match ssh_args[i].as_str() {
+            "-t" => {
+                tty = if tty == RequestTty::Yes { RequestTty::Force } else { RequestTty::Yes };
+            }
+            "-tt" => tty = RequestTty::Force,
+            "-T" => tty = RequestTty::No,
+            arg if arg.starts_with("-t") && arg.len() > 2 && arg.chars().skip(1).all(|c| c == 't') => {
+                // Multiple -t in one token: -ttt, -tttt, etc.
+                tty = RequestTty::Force;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tty
+}
+
+/// Splits `user@host` into `(Some(user), host)`. If no `@` is present,
+/// returns `(None, host)`.
+pub(crate) fn split_user_host(destination: &str) -> (Option<String>, String) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => {
+            (Some(user.to_string()), host.to_string())
+        }
+        _ => (None, destination.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod extract_request_tty_tests {
+    use super::*;
+
+    #[test]
+    fn split_user_host_with_user() {
+        assert_eq!(split_user_host("cuzic@vpsmart"), (Some("cuzic".to_string()), "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_without_user() {
+        assert_eq!(split_user_host("vpsmart"), (None, "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_user() {
+        assert_eq!(split_user_host("@vpsmart"), (None, "@vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_host() {
+        assert_eq!(split_user_host("cuzic@"), (None, "cuzic@".to_string()));
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(extract_request_tty(&s(&["host"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_forces_pty() {
+        assert_eq!(extract_request_tty(&s(&["-t", "host"]), 1), RequestTty::Yes);
+    }
+
+    #[test]
+    fn dash_twice_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-t", "-t", "host"]), 2), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_tt_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-tt", "host"]), 1), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_upper_t_suppresses_pty() {
+        assert_eq!(extract_request_tty(&s(&["-T", "host"]), 1), RequestTty::No);
+    }
+
+    #[test]
+    fn dash_t_after_destination_is_ignored() {
+        // -t after the destination is a remote command argument, not a flag
+        assert_eq!(extract_request_tty(&s(&["host", "-t"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_before_destination_with_other_flags() {
+        assert_eq!(
+            extract_request_tty(&s(&["-p", "2222", "-t", "host", "cmd"]), 3),
+            RequestTty::Yes
+        );
+    }
 }
 
 async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
     let openssh = resolve_openssh_effective_config(plan).await?;
     let isekai = resolve_isekai_config(plan, &openssh)?;
     Ok(WrapperResolution { openssh, isekai })
+}
+
+/// The `native/` module's equivalent of [`resolve_wrapper`]: resolves
+/// `~/.ssh/config` via the dependency-free `openssh-config` crate (M1)
+/// instead of shelling out to `ssh -G` (`resolve_openssh_effective_config`),
+/// since the native path exists specifically for machines that may not have
+/// `ssh.exe` at all. `#@isekai` directive resolution (`resolve_isekai_config`)
+/// is unchanged and shared verbatim with the Unix wrapper path — it only
+/// ever reads `openssh.hostname`/`openssh.port` (see its own doc comment),
+/// both of which `openssh_config::HostConfig` provides just as well as
+/// `ssh -G` did.
+///
+/// Returns the full `openssh_config::HostConfig` alongside `WrapperResolution`
+/// because the native path needs fields (`identity_file`, `identity_agent`,
+/// `forward_agent`) that `OpenSshEffectiveConfig` deliberately doesn't carry
+/// (the Unix wrapper path never needs them — real `ssh(1)` resolves those
+/// itself from the same config file).
+pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
+    let explicit_f = dash_f_config_path(&plan.ssh_args);
+    log_line!("isekai-ssh: dash_f={:?}, destination={:?}, dest_host={:?}, dest_user={:?}", explicit_f, plan.destination, plan.destination_host, plan.destination_user);
+    let host_config = match explicit_f {
+        Some(config_path) => {
+            log_line!("isekai-ssh: resolving config from {}", config_path.display());
+            openssh_config::resolve(&config_path, &plan.destination_host).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from {}: {e}",
+                    plan.destination,
+                    config_path.display()
+                )
+            })
+        }
+        None => {
+            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", plan.destination_host);
+            openssh_config::resolve_default(&plan.destination_host).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
+                    plan.destination
+                )
+            })
+        }
+    }?;
+    log_line!(
+        "isekai-ssh: resolved host_config: hostname={:?}, user={:?}, port={:?}, identity_file={:?}",
+        host_config.host_name,
+        host_config.user,
+        host_config.port,
+        host_config.identity_file,
+    );
+    let mut host_config = host_config;
+    // Command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) beat the config
+    // file, matching real `ssh(1)` precedence. The Unix path gets this for
+    // free by forwarding every arg to `ssh -G`; the native path resolves the
+    // config file directly, so it has to re-apply the overrides itself or it
+    // would silently connect to the config-file (or default) host/port/user.
+    apply_cli_overrides(&mut host_config, &plan.ssh_args)?;
+    let openssh = OpenSshEffectiveConfig {
+        hostname: host_config.host_name.clone(),
+        user: host_config.user.clone(),
+        port: host_config.port,
+        proxy_jump: host_config.proxy_jump.clone(),
+        proxy_command: None,
+    };
+    let isekai = resolve_isekai_config(plan, &openssh)?;
+    Ok((WrapperResolution { openssh, isekai }, host_config))
+}
+
+/// Command-line overrides collected from `ssh_args` (the portion before the
+/// destination), to be layered on top of a config-file-resolved `HostConfig`.
+/// First value wins per keyword — mirroring `ssh(1)`, where the earliest
+/// command-line occurrence of an option takes precedence.
+#[derive(Default)]
+struct CliOverrides {
+    host_name: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    proxy_jump: Option<String>,
+    identity_file: Vec<PathBuf>,
+    forward_agent: Option<openssh_config::ForwardAgent>,
+    identity_agent: Option<PathBuf>,
+}
+
+/// Applies command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) from
+/// `ssh_args` onto `host_config`, so they win over the resolved config file —
+/// the ordering real `ssh(1)` uses (command-line options beat matched
+/// `Host`/`Match` blocks). Only the keywords `openssh_config::HostConfig`
+/// already models are handled; every other `-o Key` is ignored, exactly as
+/// `openssh-config` ignores config-file keywords outside its subset.
+fn apply_cli_overrides(host_config: &mut openssh_config::HostConfig, ssh_args: &[String]) -> Result<()> {
+    let overrides = collect_cli_overrides(ssh_args)?;
+    if let Some(host_name) = overrides.host_name {
+        host_config.host_name = Some(host_name);
+    }
+    if let Some(user) = overrides.user {
+        host_config.user = Some(user);
+    }
+    if let Some(port) = overrides.port {
+        host_config.port = Some(port);
+    }
+    if let Some(proxy_jump) = overrides.proxy_jump {
+        host_config.proxy_jump = Some(proxy_jump);
+    }
+    if let Some(forward_agent) = overrides.forward_agent {
+        host_config.forward_agent = Some(forward_agent);
+    }
+    if let Some(identity_agent) = overrides.identity_agent {
+        host_config.identity_agent = Some(identity_agent);
+    }
+    if !overrides.identity_file.is_empty() {
+        // `IdentityFile` accumulates in `ssh(1)`, with command-line entries
+        // taking priority — prepend so they're tried first.
+        let mut merged = overrides.identity_file;
+        merged.append(&mut host_config.identity_file);
+        host_config.identity_file = merged;
+    }
+    Ok(())
+}
+
+/// Walks `ssh_args` up to the destination (same scope and option-width logic
+/// as `dash_f_config_path`) collecting the overrides expressible through
+/// `openssh_config::HostConfig`. First occurrence wins per keyword.
+fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
+    let mut overrides = CliOverrides::default();
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = ssh_args[i].as_str();
+        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
+            break;
+        }
+        let value = ssh_args.get(i + 1).map(String::as_str);
+        match (arg, value) {
+            ("-p", Some(v)) => {
+                let port = v
+                    .parse::<u16>()
+                    .with_context(|| format!("isekai-ssh: invalid -p port: {v}"))?;
+                overrides.port.get_or_insert(port);
+            }
+            ("-l", Some(v)) => {
+                overrides.user.get_or_insert_with(|| v.to_string());
+            }
+            ("-J", Some(v)) => {
+                overrides.proxy_jump.get_or_insert_with(|| v.to_string());
+            }
+            ("-i", Some(v)) => {
+                overrides.identity_file.push(openssh_config::expand_tilde(v));
+            }
+            ("-o", Some(v)) => {
+                apply_dash_o_override(&mut overrides, v)?;
+            }
+            _ => {}
+        }
+        i += ssh_option_width(arg);
+    }
+    Ok(overrides)
+}
+
+/// Applies one `-o Key=Value` (or `-o "Key Value"`, or `-o "Key = Value"`)
+/// token to `overrides`. Keyword matching is case-insensitive, following
+/// `ssh_config(5)`. Keywords outside `openssh_config::HostConfig`'s modeled
+/// subset are silently ignored.
+fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()> {
+    // Split at the first delimiter (whitespace or `=`), then strip a leading
+    // `=` (plus any whitespace after it) from what remains — matching
+    // `openssh_config::split_keyword`'s own two-step approach, so
+    // `Key=Value`, `"Key Value"`, and `"Key = Value"` (spaces *around* the
+    // `=`) all parse the same way a naive single `split_once` on `[=\s]`
+    // doesn't (that would leave a stray leading `=` in `val` for the
+    // spaced-`=` form and fail e.g. `Port`'s `u16` parse).
+    let Some(end) = token.find(|c: char| c == '=' || c.is_whitespace()) else {
+        return Ok(());
+    };
+    let key = &token[..end];
+    let mut val = token[end..].trim_start();
+    if let Some(stripped) = val.strip_prefix('=') {
+        val = stripped.trim_start();
+    }
+    let val = openssh_config::strip_quotes(val.trim());
+    match key.trim().to_ascii_lowercase().as_str() {
+        "hostname" => {
+            overrides.host_name.get_or_insert_with(|| val.to_string());
+        }
+        "user" => {
+            overrides.user.get_or_insert_with(|| val.to_string());
+        }
+        "port" => {
+            let port = val
+                .parse::<u16>()
+                .with_context(|| format!("isekai-ssh: invalid -o Port: {val}"))?;
+            overrides.port.get_or_insert(port);
+        }
+        "proxyjump" => {
+            overrides.proxy_jump.get_or_insert_with(|| val.to_string());
+        }
+        "identityfile" => {
+            overrides.identity_file.push(openssh_config::expand_tilde(val));
+        }
+        "identityagent" => {
+            overrides.identity_agent.get_or_insert_with(|| openssh_config::expand_tilde(val));
+        }
+        "forwardagent" => {
+            overrides.forward_agent.get_or_insert_with(|| match val.to_ascii_lowercase().as_str() {
+                "yes" => openssh_config::ForwardAgent::Yes,
+                "no" => openssh_config::ForwardAgent::No,
+                _ => openssh_config::ForwardAgent::Socket(val.to_string()),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Finds an explicit `-F <path>` in `ssh_args` (the portion before the
+/// destination — mirroring `ssh_args_through_destination`'s scope, since a
+/// `-F` appearing *after* the destination is a remote command argument, not
+/// an option). Walks option widths the same way `find_destination_index`
+/// does so this stays in sync with `ssh_option_width` if that list of
+/// value-taking flags ever changes. Only recognizes the spaced `-F value`
+/// form (matching this function's only two callers/tests) — a concatenated
+/// `-Fvalue` isn't handled by `find_destination_index` either, so this is
+/// consistent with the wrapper's existing `-F` support, not a new gap.
+fn dash_f_config_path(ssh_args: &[String]) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = ssh_args[i].as_str();
+        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
+            return None;
+        }
+        if arg == "-F" {
+            return ssh_args.get(i + 1).map(PathBuf::from);
+        }
+        i += ssh_option_width(arg);
+    }
+    None
 }
 
 async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {
@@ -1442,14 +1969,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_stun_servers_accepts_a_literal_socket_addr() {
+        let resolved = resolve_stun_servers(&["203.0.113.9:3478".to_string()]).await;
+        assert_eq!(resolved, vec!["203.0.113.9:3478".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_resolves_a_hostname_via_dns() {
+        // `localhost:PORT` resolves via the OS resolver without needing
+        // external network access (loopback is always in `/etc/hosts` or
+        // equivalent) — a stand-in for a real-world hostname entry like
+        // `stun.l.google.com:19302`, which `.parse::<SocketAddr>()` alone
+        // always rejects as "malformed" since it requires a literal IP.
+        let resolved = resolve_stun_servers(&["localhost:3478".to_string()]).await;
+        assert_eq!(resolved.len(), 1, "expected localhost:3478 to resolve to exactly one address");
+        assert_eq!(resolved[0].port(), 3478);
+        assert!(resolved[0].ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_skips_an_unresolvable_entry() {
+        let resolved = resolve_stun_servers(&["not a valid host or addr".to_string()]).await;
+        assert!(resolved.is_empty());
+    }
+
+    #[tokio::test]
     async fn bootstrap_and_register_classifies_missing_helper_binary() {
         let plan = WrapperPlan {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         let resolution = WrapperResolution {
             openssh: OpenSshEffectiveConfig::default(),
@@ -1506,9 +2061,12 @@ mod tests {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         // A nonexistent path is enough: chain validation runs, and fails
         // closed, before this path is ever read from disk.
@@ -2104,6 +2662,179 @@ Host *
         assert_eq!(resolved.candidate_race_delay_ms, 250);
         assert_eq!(resolved.relay_delay_ms, 900);
         assert_eq!(resolved.install_mode, InstallMode::User);
+    }
+
+    #[test]
+    fn dash_f_config_path_finds_an_explicit_dash_f_before_the_destination() {
+        assert_eq!(
+            dash_f_config_path(&s(&["-F", "/tmp/cfg", "production"])),
+            Some(PathBuf::from("/tmp/cfg"))
+        );
+    }
+
+    #[test]
+    fn dash_f_config_path_skips_over_other_value_taking_flags() {
+        assert_eq!(
+            dash_f_config_path(&s(&["-p", "2222", "-F", "/tmp/cfg", "production"])),
+            Some(PathBuf::from("/tmp/cfg"))
+        );
+    }
+
+    #[test]
+    fn dash_f_config_path_returns_none_without_dash_f() {
+        assert_eq!(dash_f_config_path(&s(&["-p", "2222", "production"])), None);
+    }
+
+    /// Codex review finding: `resolve_for_native` used to always read
+    /// `~/.ssh/config`, silently ignoring an explicit `-F <path>` — the same
+    /// flag `resolve_openssh_effective_config` already forwards to real
+    /// `ssh -G` on the Unix path. This never touches the real `$HOME` (the
+    /// `-F` branch calls `openssh_config::resolve` directly on the given
+    /// path), so it's deterministic regardless of what's in the sandbox's
+    /// own `~/.ssh/config`.
+    #[test]
+    fn resolve_for_native_honors_an_explicit_dash_f_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    User deploy\n    Port 2222\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "production"])).unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        assert_eq!(host_config.host_name.as_deref(), Some("10.20.0.15"));
+        assert_eq!(host_config.user.as_deref(), Some("deploy"));
+        assert_eq!(host_config.port, Some(2222));
+        assert_eq!(resolution.native_host_port("production"), ("10.20.0.15".to_string(), 2222));
+    }
+
+    /// Codex review finding: `resolve_for_native` used to ignore every
+    /// command-line override except `-F` — `-p`/`-l`/`-J`/`-o` were silently
+    /// dropped, so `isekai-ssh -p 2222 host` on the native path connected to
+    /// the config-file (or default) port instead. Command-line options must
+    /// beat the config file, matching real `ssh(1)` precedence.
+    #[test]
+    fn resolve_for_native_applies_command_line_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    User deploy\n    Port 2222\n    ProxyJump bastion\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&[
+            "-F",
+            config.to_str().unwrap(),
+            "-p",
+            "2200",
+            "-l",
+            "root",
+            "-J",
+            "gateway",
+            "production",
+        ]))
+        .unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        // Config file supplies HostName; -p/-l/-J win over Port/User/ProxyJump.
+        assert_eq!(host_config.host_name.as_deref(), Some("10.20.0.15"));
+        assert_eq!(host_config.port, Some(2200));
+        assert_eq!(host_config.user.as_deref(), Some("root"));
+        assert_eq!(host_config.proxy_jump.as_deref(), Some("gateway"));
+        assert_eq!(resolution.native_host_port("production"), ("10.20.0.15".to_string(), 2200));
+    }
+
+    /// `-o Key=Value` overrides the matched config-file keyword too, and
+    /// command-line entries win when both name the same key (`-p` set first
+    /// beats a later `-o Port=`, following `ssh(1)`'s first-wins ordering).
+    #[test]
+    fn resolve_for_native_applies_dash_o_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    Port 22\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&[
+            "-F",
+            config.to_str().unwrap(),
+            "-p",
+            "2200",
+            "-o",
+            "Port=3300",
+            "-o",
+            "User=admin",
+            "-o",
+            "HostName=192.0.2.7",
+            "production",
+        ]))
+        .unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        // -p 2200 was seen before -o Port=3300, so it wins (first occurrence).
+        assert_eq!(host_config.port, Some(2200));
+        assert_eq!(host_config.user.as_deref(), Some("admin"));
+        assert_eq!(host_config.host_name.as_deref(), Some("192.0.2.7"));
+        assert_eq!(resolution.native_host_port("production"), ("192.0.2.7".to_string(), 2200));
+    }
+
+    /// Regression (ultrareview): `-i <keyfile>` was silently dropped on the
+    /// native path (no arm in `collect_cli_overrides`'s match), even though
+    /// `ssh_option_width` already knew it takes a value — the Unix path
+    /// forwards `-i` to real `ssh(1)` and it worked there, making this a
+    /// native-only regression for a very common flag. Tilde must also expand.
+    #[test]
+    fn resolve_for_native_applies_dash_i_identity_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "-i", "~/.ssh/deploy_key", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        let home = isekai_fs_guard::resolve_home_dir().unwrap();
+        assert_eq!(host_config.identity_file, vec![home.join(".ssh/deploy_key")], "-i must be tilde-expanded and added as a candidate");
+    }
+
+    /// Regression (ultrareview): `apply_dash_o_override` split on the first
+    /// `=` *or* whitespace, so `-o "Port = 2222"` (spaces around `=`) split
+    /// into key="Port", val="= 2222" — the stray leading `=` then failed
+    /// `Port`'s `u16` parse. Must match `openssh_config::split_keyword`'s
+    /// two-step handling (split, then strip a leading `=`).
+    #[test]
+    fn resolve_for_native_dash_o_tolerates_spaces_around_equals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "-o", "Port = 2222", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        assert_eq!(host_config.port, Some(2222));
+    }
+
+    /// Regression (ultrareview): `-o IdentityFile=~/...` was pushed verbatim
+    /// (including a literal leading `~`), so `read_credential`'s `fs::read`
+    /// on a path beginning with `~` always failed — unlike the config-file
+    /// path, which does expand `~` via `openssh_config`'s own resolver.
+    #[test]
+    fn resolve_for_native_dash_o_identity_file_expands_tilde() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan =
+            parse_wrapper(s(&["-F", config.to_str().unwrap(), "-o", "IdentityFile=~/.ssh/deploy_key", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        let home = isekai_fs_guard::resolve_home_dir().unwrap();
+        assert_eq!(host_config.identity_file, vec![home.join(".ssh/deploy_key")]);
     }
 
     // parse_bootstrap_relay_*: moved to `wrapper/config.rs`'s own test

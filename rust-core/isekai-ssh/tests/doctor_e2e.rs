@@ -168,9 +168,19 @@ impl server::Handler for FakeShellHandler {
     }
 }
 
-async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> SocketAddr {
+/// Returns the mock sshd's address *and* its host key's SHA256 fingerprint
+/// (`russh_keys::PublicKey::fingerprint`, the same format
+/// `isekai_trust::SshHostKeyTrust::fingerprint` stores) — callers that
+/// exercise a `TofuConfirmation::Silent` flow need the fingerprint to
+/// pre-seed `known_ssh_hosts.toml` via [`seed_ssh_host_key_trust`], since
+/// `RusshBackend`'s own host-key TOFU prompt (distinct from the app-level
+/// `[y/N]` trust-registration prompt `TofuConfirmation` controls) has no
+/// silent/non-interactive mode and would otherwise block forever on the
+/// `Stdio::null()` stdin these tests use.
+async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> (SocketAddr, String) {
     let keypair = Ed25519Keypair::from_seed(&[17u8; 32]);
     let host_key = PrivateKey::from(keypair);
+    let fingerprint = host_key.public_key().fingerprint(russh_keys::HashAlg::Sha256).to_string();
     let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -179,7 +189,26 @@ async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) ->
         use server::Server as _;
         let _ = sh.run_on_socket(config, &listener).await;
     });
-    addr
+    (addr, fingerprint)
+}
+
+/// Seeds `known_ssh_hosts.toml` under `home/.config/isekai-ssh/` with a
+/// pre-trusted entry for `host_port`, mirroring the on-disk state a *real*
+/// prior interactive bootstrap (`isekai-ssh init`) would have left behind —
+/// see [`spawn_fake_ssh_server`]'s docs for why a `TofuConfirmation::Silent`
+/// e2e test needs this instead of feeding a stdin answer.
+fn seed_ssh_host_key_trust(home: &std::path::Path, host_port: &str, fingerprint: &str) {
+    let path = home.join(".config").join(isekai_trust::store::CONFIG_DIR_NAME).join(isekai_trust::store::SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+    let mut store = isekai_trust::SshHostKeyTrustStore::default();
+    store.insert(
+        host_port.to_string(),
+        isekai_trust::SshHostKeyTrust {
+            fingerprint: fingerprint.to_string(),
+            trusted_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+    );
+    isekai_trust::save_ssh_host_key_trust_store(&path, &store).unwrap();
 }
 
 fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
@@ -234,8 +263,17 @@ fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Pa
     }
 }
 
-fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
-    let config_path = tmp.join("ssh_config_bootstrap");
+/// Also writes the identical `Host` blocks to `home/.ssh/config`, not just the
+/// shim-only throwaway config: the Windows-native path
+/// (`isekai-bootstrap::russh_backend::resolve_hop`, reached via `doctor
+/// --fix`'s `bootstrap_and_register`) does its own `openssh_config::
+/// resolve_default` directly against `$HOME/.ssh/config` — it never shells
+/// out to `ssh(1)`, so it never sees the shim-only config the `-F` flag
+/// points at. Without this, `RusshBackend` finds no `HostName` for the fake
+/// test alias and falls back to DNS-resolving the literal alias string
+/// (confirmed via a real `test-windows` CI failure on the sibling
+/// `wrapper_auto_bootstrap_e2e.rs` fixture, which this mirrors).
+fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, home: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
@@ -256,7 +294,12 @@ fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+    let config_path = tmp.join("ssh_config_bootstrap");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &config).unwrap();
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -446,11 +489,16 @@ async fn doctor_fixes_stale_trust_when_given_fix_flag() {
     let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
     let remote_home = tmp.path().join("remote-home");
     std::fs::create_dir_all(&remote_home).unwrap();
-    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
+    let (mock_sshd_addr, mock_sshd_fingerprint) = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "doctor-fix-host", mock_sshd_addr, &key_path);
+    // `doctor --fix` uses `TofuConfirmation::Silent` for the app-level
+    // trust-registration prompt, but `RusshBackend`'s underlying SSH
+    // host-key TOFU (a separate, non-silenceable prompt) still needs this
+    // host key pre-trusted — see `seed_ssh_host_key_trust`'s docs.
+    seed_ssh_host_key_trust(&home, &format!("127.0.0.1:{}", mock_sshd_addr.port()), &mock_sshd_fingerprint);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "doctor-fix-host", mock_sshd_addr, &key_path);
 
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();

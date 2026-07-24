@@ -1,5 +1,6 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
+use crate::kitty_graphics::{ApcInterceptor, ApcStep};
 use crate::{CellData, CursorShape, LineDamage, ScreenUpdate};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
@@ -22,6 +23,11 @@ pub(crate) enum SideEffect {
     Finished { transfer_id: String, success: bool, message: Option<String> },
 }
 
+/// タスク#13でフィールドが4つ増え、各コンストラクタサイトで毎回全フィールドを
+/// 書き下すのが煩雑になったため`Default`を導出する(全フィールドが空/falseを
+/// 自然な既定値として持つ)。各メソッドは`ProcessResult { pending_rows, screen_dirty:
+/// true, ..Default::default() }`のように必要なフィールドだけ明示すればよい。
+#[derive(Default)]
 pub(crate) struct ProcessResult {
     pub(crate) timer_cmds: Vec<TimerCommand<TrzszTimer>>,
     pub(crate) side_effects: Vec<SideEffect>,
@@ -35,6 +41,20 @@ pub(crate) struct ProcessResult {
     /// 実際の応答送出には非同期のKotlin往復が要るため、ここではフラグを立てるだけで
     /// `session.rs`のevent loopが処理する(`dispatch_result`は同期関数のまま)。
     pub(crate) clipboard_pull_requested: bool,
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」が要求されたか。
+    /// `pending_clipboard_write`と違い結果が`None`(ジャンプ先なし)でも「要求は
+    /// あった」ことを呼び出し元(`dispatch_result`)へ伝える必要があるため、
+    /// 専用のbooleanで分離する(`clipboard_pull_requested`と同型のパターン)。
+    pub(crate) prompt_jump_requested: bool,
+    /// [prompt_jump_requested]が`true`の場合の実際のジャンプ先。ジャンプ対象が
+    /// 見つからなければ`None`。
+    pub(crate) prompt_jump_target: Option<crate::PromptJumpTarget>,
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」が要求されたか。
+    /// [prompt_jump_requested]と同じ理由で専用のbooleanにする。
+    pub(crate) prompt_output_copy_requested: bool,
+    /// [prompt_output_copy_requested]が`true`の場合の実際のテキスト。まだ完了した
+    /// コマンドが無ければ`None`。
+    pub(crate) prompt_output_copy_text: Option<String>,
 }
 
 /// カーソルが乗る行(`row`)の損傷レンジに、少なくともカーソル列(`col`)を含める
@@ -60,6 +80,9 @@ fn force_cursor_row_dirty(damages: &mut Vec<LineDamage>, row: usize, col: usize,
 pub(crate) struct SessionState {
     terminal: Terminal,
     parser: Parser,
+    /// Kitty graphics(#53)のAPC文字列を、vteへ渡す前にバイトストリームから切り出す
+    /// 前段。vteはAPCを配送しないため必要(`kitty_graphics.rs`モジュールdoc参照)。
+    apc: ApcInterceptor,
     fsm: TrzszTransferFsm,
     /// 前回発行した`ScreenUpdate`のグリッドセル・寸法・カーソル位置のスナップショット
     /// (タスク#92、行単位のdamage tracking用)。次に`make_screen_update`が呼ばれたとき、
@@ -82,6 +105,11 @@ pub(crate) struct SessionState {
     /// 前回発行時のカーソル形状(DECSCUSR)。可視性と同じ理由(位置不変でも下地セルが
     /// 不変なコンテンツ差分では検出できない)でカーソル行の強制dirty化条件に含める。
     last_cursor_shape: CursorShape,
+    /// 前回発行時のカーソル点滅モード(`CSI ?12h`/`l`・DECSCUSR)。可視性・形状と同じ
+    /// 理由(Opusレビュー指摘: `CSI ?12l`/`CSI 2 q`で位置・形状不変のまま点滅だけ
+    /// 切り替わるケースが可視性・形状の強制dirty化だけでは漏れていた)でカーソル行の
+    /// 強制dirty化条件に含める。
+    last_cursor_blink: bool,
     /// 発行するたびに単調増加する`ScreenUpdate`の連番(タスク#97/#99のCodexならぬ
     /// セルフレビューで発覚: UI層への配信チャネルが`Channel.CONFLATED`(Android)
     /// 等でconflateされる場合、中間の発行が読み飛ばされうる。`dirty_rows`は
@@ -97,6 +125,7 @@ impl SessionState {
         SessionState {
             terminal: Terminal::new(cols, rows, theme),
             parser: Parser::new(),
+            apc: ApcInterceptor::new(),
             fsm: TrzszTransferFsm::new(),
             last_emitted_cells: None,
             last_emitted_cols: 0,
@@ -105,6 +134,7 @@ impl SessionState {
             last_cursor_col: 0,
             last_cursor_visible: true,
             last_cursor_shape: CursorShape::Block,
+            last_cursor_blink: true,
             update_seq: 0,
         }
     }
@@ -132,6 +162,7 @@ impl SessionState {
         let cursor_col = self.terminal.cursor_col().min(cols.saturating_sub(1));
         let cursor_visible = self.terminal.cursor_visible();
         let cursor_shape = self.terminal.cursor_shape();
+        let cursor_blink = self.terminal.cursor_blink();
 
         // 現在のグリッドを1度だけ所有スナップショットへ複製する。行差分の比較コストは
         // O(rows×cols)のセル等価判定で、下の`to_cell_data`変換が毎フレーム払うコストと
@@ -167,15 +198,22 @@ impl SessionState {
             // カーソル行の強制dirty化(タスク#94)。iOSはカーソルをセル内容と同じ描画
             // パスで描くため、カーソルが動いたら下地セルが不変でも「離れた行(前回位置、
             // 古いカーソルを消す)」と「乗った行(今回位置、新しいカーソルを描く)」を
-            // 再描画させる。位置に加えて可視性(DECTCEM)・形状(DECSCUSR)も比較する——
-            // `CSI ?25l`/`?25h`や`CSI q`(形状変更)は位置が不変のままカーソルの見た目
-            // だけが切り替わるケースで、下地セルも不変なのでコンテンツ差分では検出
-            // できない。可視性・形状を見落とすとiOS側で消し忘れ/描き忘れが起きる
-            // (セルフレビューで検出)。動いても可視性・形状も変わっていなければ
-            // 前回フレームで既に正しく描かれているので何も足さない——これにより
-            // 「画面が完全に同一の連続フレーム」は空の`dirty_rows`になる(タスク#101)。
-            if (cursor_row, cursor_col, cursor_visible, cursor_shape)
-                != (self.last_cursor_row, self.last_cursor_col, self.last_cursor_visible, self.last_cursor_shape)
+            // 再描画させる。位置に加えて可視性(DECTCEM)・形状(DECSCUSR)・点滅
+            // (`CSI ?12h`/`l`)も比較する——`CSI ?25l`/`?25h`・形状変更・点滅切替は
+            // いずれも位置が不変のままカーソルの見た目だけが切り替わるケースで、下地
+            // セルも不変なのでコンテンツ差分では検出できない。これらを見落とすとiOS側
+            // で消し忘れ/描き忘れが起きる(可視性・形状はセルフレビュー、点滅はOpus
+            // レビューで検出)。動いても見た目が何も変わっていなければ前回フレームで
+            // 既に正しく描かれているので何も足さない——これにより「画面が完全に同一の
+            // 連続フレーム」は空の`dirty_rows`になる(タスク#101)。
+            if (cursor_row, cursor_col, cursor_visible, cursor_shape, cursor_blink)
+                != (
+                    self.last_cursor_row,
+                    self.last_cursor_col,
+                    self.last_cursor_visible,
+                    self.last_cursor_shape,
+                    self.last_cursor_blink,
+                )
             {
                 force_cursor_row_dirty(&mut damages, self.last_cursor_row, self.last_cursor_col, cols, rows);
                 force_cursor_row_dirty(&mut damages, cursor_row, cursor_col, cols, rows);
@@ -194,6 +232,7 @@ impl SessionState {
         self.last_cursor_col = cursor_col;
         self.last_cursor_visible = cursor_visible;
         self.last_cursor_shape = cursor_shape;
+        self.last_cursor_blink = cursor_blink;
         self.update_seq = self.update_seq.wrapping_add(1);
 
         let t = &self.terminal;
@@ -210,6 +249,8 @@ impl SessionState {
             bracketed_paste_mode: t.bracketed_paste_mode(),
             mouse_reporting_mode: t.mouse_reporting_mode(),
             sgr_mouse_mode: t.sgr_mouse_mode(),
+            alternate_scroll: t.alternate_scroll(),
+            urxvt_mouse_mode: t.urxvt_mouse_mode(),
             cursor_visible: t.cursor_visible(),
             bell_generation: t.bell_generation(),
             cursor_shape: t.cursor_shape(),
@@ -233,14 +274,7 @@ impl SessionState {
     /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
     pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
         self.terminal.set_title(title);
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows: Vec::new(),
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
     /// リサイズ時に画面内容・scrollback・カーソル位置・SGR属性・scroll region等の
@@ -256,14 +290,7 @@ impl SessionState {
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) -> ProcessResult {
         self.terminal.resize_preserving_state(cols, rows);
         let pending_rows = self.terminal.take_scrollback();
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows,
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { pending_rows, screen_dirty: true, ..Default::default() }
     }
 
     /// OSのフォーカス変化(タスク#60: タブ/split pane切替・アプリのbackground/foreground等)
@@ -277,14 +304,7 @@ impl SessionState {
     /// force_end_synchronized_output`のdocコメント参照)。
     pub(crate) fn force_end_synchronized_output(&mut self) -> ProcessResult {
         self.terminal.force_end_synchronized_output();
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows: Vec::new(),
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
     pub(crate) fn notify_focus_change(&mut self, focused: bool) -> ProcessResult {
@@ -292,14 +312,45 @@ impl SessionState {
         if let Some(bytes) = self.terminal.encode_focus_event(focused) {
             side_effects.push(SideEffect::SendStdin(bytes));
         }
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects,
-            pending_rows: Vec::new(),
-            screen_dirty: false,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
+        ProcessResult { side_effects, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」。`want_previous`は
+    /// true=前・false=次。`from_scroll_offset`/`from_showing_scrollback`は
+    /// Kotlin側が現在表示している位置(既存の検索ジャンプ・タスク#79と同じ規約)、
+    /// `scrollback_len`は呼び出し元(`session.rs`)が`scrollback`ロックから読んだ
+    /// 現在のscrollback長([Terminal]自身は`SessionCore`側のトリミング後の長さを
+    /// 知らないため、呼び出し元が渡す)。判断ロジック自体は
+    /// [Terminal::prompt_jump_target]に一元化されている。
+    pub(crate) fn jump_to_prompt(
+        &self,
+        want_previous: bool,
+        from_scroll_offset: u32,
+        from_showing_scrollback: bool,
+        scrollback_len: u32,
+    ) -> ProcessResult {
+        let target = self.terminal.prompt_jump_target(
+            want_previous, from_scroll_offset, from_showing_scrollback, scrollback_len,
+        );
+        ProcessResult { prompt_jump_requested: true, prompt_jump_target: target, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13): タップされたセルが現在アクティブな入力行上であれば、
+    /// そこへカーソルを移動する矢印キー相当のバイト列を送る(Ghostty`cl=line`相当)。
+    /// 判断ロジックは[Terminal::cursor_move_bytes_for_click]に一元化されている。
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) -> ProcessResult {
+        let mut side_effects = Vec::new();
+        if let Some(bytes) = self.terminal.cursor_move_bytes_for_click(row, col) {
+            side_effects.push(SideEffect::SendStdin(bytes));
         }
+        ProcessResult { side_effects, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。判断ロジックは
+    /// [Terminal::last_command_output_text]に一元化されている。
+    pub(crate) fn copy_last_command_output(&self) -> ProcessResult {
+        let text = self.terminal.last_command_output_text();
+        ProcessResult { prompt_output_copy_requested: true, prompt_output_copy_text: text, ..Default::default() }
     }
 
     pub(crate) fn on_stdout(&mut self, bytes: Vec<u8>) -> ProcessResult {
@@ -344,7 +395,19 @@ impl SessionState {
         for effect in resp.actions {
             match effect {
                 TrzszEffect::FlushVte(bytes) => {
-                    for byte in &bytes { self.parser.advance(&mut self.terminal, *byte); }
+                    // Kitty graphics(#53)のAPCだけを`ApcInterceptor`で抜き取り、それ以外の
+                    // バイトはバイト等価でvteへ渡す(vteはAPCを配送しないため必要)。
+                    for byte in &bytes {
+                        match self.apc.feed(*byte) {
+                            ApcStep::Pass(b) => self.parser.advance(&mut self.terminal, b),
+                            ApcStep::PassTwo(a, b) => {
+                                self.parser.advance(&mut self.terminal, a);
+                                self.parser.advance(&mut self.terminal, b);
+                            }
+                            ApcStep::Consume => {}
+                            ApcStep::Apc(payload) => self.terminal.dispatch_kitty_apc(&payload),
+                        }
+                    }
                     screen_dirty = true;
                 }
                 TrzszEffect::SendStdin(bytes) => {
@@ -389,6 +452,7 @@ impl SessionState {
             screen_dirty,
             pending_clipboard_write,
             clipboard_pull_requested,
+            ..Default::default()
         }
     }
 }

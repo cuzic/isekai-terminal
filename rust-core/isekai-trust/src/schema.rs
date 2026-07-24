@@ -100,6 +100,44 @@ impl TrustStore {
     }
 }
 
+/// One trusted SSH host key (TOFU), keyed by `host:port`
+/// (`normalize::normalize_host_port`). Deliberately a separate store/file
+/// from [`TrustStore`]/`HelperTrust`: this is the *SSH protocol* host key
+/// (what a native, non-`ssh(1)` client verifies during the SSH handshake,
+/// `ssh_config(5)`'s `known_hosts` equivalent), not the isekai-helper
+/// QUIC/relay endpoint identity `HelperTrust` tracks — a corrupted or
+/// tampered-with file for one must not threaten the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHostKeyTrust {
+    /// SHA-256 fingerprint, matching the format
+    /// `russh_stream_session::HostKeyVerifier::verify`'s `fingerprint`
+    /// argument (`PublicKey::fingerprint(HashAlg::Sha256).to_string()`).
+    pub fingerprint: String,
+    pub trusted_at: String,
+    pub last_seen_at: String,
+}
+
+/// The whole `known_ssh_hosts.toml` document.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHostKeyTrustStore {
+    #[serde(default)]
+    pub hosts: BTreeMap<String, SshHostKeyTrust>,
+}
+
+impl SshHostKeyTrustStore {
+    pub fn get(&self, host_port: &str) -> Option<&SshHostKeyTrust> {
+        self.hosts.get(host_port)
+    }
+
+    pub fn insert(&mut self, host_port: String, trust: SshHostKeyTrust) {
+        self.hosts.insert(host_port, trust);
+    }
+
+    pub fn remove(&mut self, host_port: &str) -> Option<SshHostKeyTrust> {
+        self.hosts.remove(host_port)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +217,42 @@ last_seen_at = "2026-07-04T00:00:00Z"
         // Fail closed: an unrecognized update_policy is a parse error, not a
         // value that silently deserializes to some default variant.
         assert!(err.to_string().contains("signed-compatible") || err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn ssh_host_key_trust_store_serializes_and_parses_back_via_toml() {
+        let mut store = SshHostKeyTrustStore::default();
+        store.insert(
+            "example.com:22".to_string(),
+            SshHostKeyTrust {
+                fingerprint: "SHA256:abcdef1234567890".to_string(),
+                trusted_at: "2026-07-17T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-17T00:00:00Z".to_string(),
+            },
+        );
+
+        let serialized = toml::to_string_pretty(&store).unwrap();
+        let parsed: SshHostKeyTrustStore = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, store);
+    }
+
+    #[test]
+    fn ssh_host_key_trust_store_get_insert_remove() {
+        let mut store = SshHostKeyTrustStore::default();
+        assert_eq!(store.get("example.com:22"), None);
+
+        store.insert(
+            "example.com:22".to_string(),
+            SshHostKeyTrust {
+                fingerprint: "SHA256:abc".to_string(),
+                trusted_at: "2026-07-17T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-17T00:00:00Z".to_string(),
+            },
+        );
+        assert_eq!(store.get("example.com:22").unwrap().fingerprint, "SHA256:abc");
+
+        let removed = store.remove("example.com:22").unwrap();
+        assert_eq!(removed.fingerprint, "SHA256:abc");
+        assert_eq!(store.get("example.com:22"), None);
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::Mutex;
@@ -6,6 +7,7 @@ use crate::{
     CellData, ClipboardPayload, ConnectionIssueHint, ConnectionPublicState, ForwardState, OrchestratorCallback,
     ScreenUpdate, ScrollbackSearchMatch, SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
 };
+use crate::file_preview::{self, FilePreviewOutcome, FilePreviewRequestKind};
 use crate::net_health_policy;
 use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::isekai_pipe_quic_transport::{IsekaiPipeQuicConfig, IsekaiPipeQuicSession};
@@ -110,6 +112,26 @@ impl ActiveSession {
     }
     fn trzsz_cancel(&self, transfer_id: String) {
         dispatch_all!(self, trzsz_cancel, transfer_id)
+    }
+    /// タスク#13(OSC 133): 全トランスポート共通で`SessionCore`まで委譲する
+    /// (`notify_focus_change`と同じくトランスポート非依存のため対象外の分岐は無い)。
+    fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        dispatch_all!(self, jump_to_previous_prompt, from_scroll_offset, from_showing_scrollback)
+    }
+    fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        dispatch_all!(self, jump_to_next_prompt, from_scroll_offset, from_showing_scrollback)
+    }
+    fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+        dispatch_all!(self, click_to_prompt_cursor, row, col)
+    }
+    fn copy_last_command_output(&self) {
+        dispatch_all!(self, copy_last_command_output)
+    }
+    /// タスク#17: `run_ssh_channel_loop`は6トランスポート共通の実体なので
+    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、`add_local_forward`と違い
+    /// トランスポート別の対応可否分岐は無い——全バリアントで同じ委譲でよい。
+    fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        dispatch_all!(self, file_preview_exec, request_id, command_line)
     }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
         match self {
@@ -307,6 +329,15 @@ struct OrchestratorState {
     /// 届くのは少し後になる。その届いた際にこのIDが一致すれば、汎用文言ではなく
     /// ユーザーに分かりやすい「大きすぎる」メッセージへ差し替える。
     size_limit_exceeded_for: Option<String>,
+
+    /// タスク#17: `file_preview_request`が発行した`request_id`→要求種別のマップ。
+    /// `TransportEvent::FilePreviewExecResult`が届いた時点でここから取り出して
+    /// `crate::file_preview::parse_result`に渡す(execチャネル自体は「どのサブコマンドを
+    /// 要求したか」を知らずstdoutを運ぶだけなので、パースにはこの対応が要る)。
+    /// 複数の要求が同時に in-flight でも(例: ディレクトリ一覧中に別ファイルをcat)
+    /// `request_id`ごとに独立して解決できるようMapにしている(trzszの
+    /// `current_transfer_id`のような単一スロットでは足りない)。
+    pending_file_previews: HashMap<String, FilePreviewRequestKind>,
 
     // ── 自動再接続(tssh風reconnect) ──────────────────────
     /// セッションオブジェクト1つ生成するごとにインクリメントする世代カウンタ。
@@ -636,6 +667,33 @@ impl SessionCallback for OrchestratorAdapter {
         if should_deliver {
             self.shared.callback.on_notify(kind);
         }
+    }
+
+    fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
+        if !self.is_current() { return; }
+        self.shared.callback.on_prompt_jump(target);
+    }
+
+    fn on_prompt_output_copy_ready(&self, text: Option<String>) {
+        if !self.is_current() { return; }
+        self.shared.callback.on_prompt_output_copy_ready(text);
+    }
+
+    /// タスク#17: `pending_file_previews`から`request_id`に対応する要求種別を取り出し、
+    /// `crate::file_preview::parse_result`でJSON/base64をデコード済みの
+    /// `FilePreviewOutcome`へ変換してから`OrchestratorCallback`へ渡す。対応する要求が
+    /// 見つからない(二重配送・古い世代からの遅延イベント等)場合はエラーとして扱う
+    /// (呼び出し元がKotlin側で待っているリクエストを永遠に待たせたままにしない)。
+    fn on_file_preview_exec_result(&self, request_id: String, stdout: Vec<u8>, exit_status: Option<u32>) {
+        if !self.is_current() { return; }
+        let kind = self.shared.state.lock().pending_file_previews.remove(&request_id);
+        let outcome = match kind {
+            Some(kind) => file_preview::parse_result(&kind, exit_status, &stdout),
+            None => FilePreviewOutcome::Error {
+                message: format!("file_preview: unknown or already-resolved request_id {request_id}"),
+            },
+        };
+        self.shared.callback.on_file_preview_result(request_id, outcome);
     }
 }
 
@@ -1060,6 +1118,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             trzsz_mode: None,
             download_buf: Vec::new(),
             size_limit_exceeded_for: None,
+            pending_file_previews: HashMap::new(),
             session_generation: 0,
             reconnect_epoch: 0,
             reconnect_loop_active: false,
@@ -1393,6 +1452,42 @@ impl SessionOrchestrator {
             .map_or_else(Vec::new, |s| s.search_scrollback(query, case_sensitive))
     }
 
+    /// OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+    /// (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+    /// `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+    /// `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+    /// `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+    pub fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+        }
+    }
+
+    /// [jump_to_previous_prompt]の「次」版。
+    pub fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+        }
+    }
+
+    /// OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+    /// 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+    /// (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+    pub fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.click_to_prompt_cursor(row, col);
+        }
+    }
+
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+    /// `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+    /// (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+    pub fn copy_last_command_output(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.copy_last_command_output();
+        }
+    }
+
     pub fn trzsz_accept_download(&self) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
@@ -1536,6 +1631,32 @@ impl SessionOrchestrator {
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Error { message }
         );
+    }
+
+    /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+    /// ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+    /// on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+    /// 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+    /// in-flightでも取り違えないようにするため。
+    ///
+    /// 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+    /// 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+    /// `FilePreviewOutcome::Error`で応答する。
+    pub fn file_preview_request(&self, request_id: String, kind: FilePreviewRequestKind) {
+        let command_line = file_preview::build_command_line(&kind);
+        self.shared.state.lock().pending_file_previews.insert(request_id.clone(), kind);
+
+        let queued = self.shared.session.lock().as_ref()
+            .map(|s| s.file_preview_exec(request_id.clone(), command_line))
+            .unwrap_or(false);
+
+        if !queued {
+            self.shared.state.lock().pending_file_previews.remove(&request_id);
+            self.shared.callback.on_file_preview_result(
+                request_id,
+                FilePreviewOutcome::Error { message: "not connected".to_string() },
+            );
+        }
     }
 }
 
@@ -1693,6 +1814,14 @@ mod tests {
         trzsz_states: StdMutex<Vec<TrzszPublicState>>,
         downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
         notifications: StdMutex<Vec<crate::NotifyKind>>,
+        file_preview_outcomes: StdMutex<Vec<FilePreviewOutcome>>,
+        agent_sign_requests: StdMutex<Vec<String>>,
+        clipboard_writes: StdMutex<Vec<ClipboardPayload>>,
+        clipboard_pull_requests: StdMutex<u32>,
+        wifi_fd_requests: StdMutex<u32>,
+        cellular_fd_requests: StdMutex<u32>,
+        rebind_states: StdMutex<Vec<crate::rebind_manager::RebindPublicState>>,
+        prompt_jumps: StdMutex<Vec<Option<crate::PromptJumpTarget>>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1712,14 +1841,35 @@ mod tests {
         }
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
+        fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
+            self.agent_sign_requests.lock().unwrap().push(key_fingerprint);
             true
         }
-        fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
-        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_clipboard_write(&self, payload: ClipboardPayload) {
+            self.clipboard_writes.lock().unwrap().push(payload);
+        }
+        fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
+            *self.clipboard_pull_requests.lock().unwrap() += 1;
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
+            *self.wifi_fd_requests.lock().unwrap() += 1;
+            Some(crate::PlatformFd { fd: 42, local_ip: "10.0.0.1".to_string() })
+        }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
+            *self.cellular_fd_requests.lock().unwrap() += 1;
+            Some(crate::PlatformFd { fd: 43, local_ip: "10.0.0.2".to_string() })
+        }
+        fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
+            self.rebind_states.lock().unwrap().push(state);
+        }
+        fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
+            self.prompt_jumps.lock().unwrap().push(target);
+        }
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, outcome: FilePreviewOutcome) {
+            self.file_preview_outcomes.lock().unwrap().push(outcome);
+        }
         fn on_notify(&self, kind: crate::NotifyKind) {
             self.notifications.lock().unwrap().push(kind);
         }
@@ -1737,6 +1887,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -1798,6 +1949,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -2082,6 +2234,61 @@ mod tests {
             jump: None,
             bind_port: None,
         }
+    }
+
+    #[test]
+    fn host_port_is_quic_reports_the_right_host_port_and_transport_kind_per_variant() {
+        // `connect_via`(自動再接続)がここから`(host, port, is_quic)`を取り出して
+        // `OrchestratorState`へ反映するので、6腕のmatch(`IsekaiPipeQuic`/
+        // `IsekaiPipeQuicAuto`は共有)それぞれのhost/port/is_quicがずれていないことを
+        // 直接確認する。プレーンSSHだけが`is_quic == false`。
+        assert_eq!(
+            LastConnectAttempt::Ssh(test_ssh_config()).host_port_is_quic(),
+            ("example.com".to_string(), 22, false)
+        );
+        assert_eq!(
+            LastConnectAttempt::Quic(QuicConfig {
+                tsshd_host: "100.100.1.1".to_string(), tsshd_port: 9999,
+                ssh_host: "quic.example.com".to_string(), ssh_port: 2222,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, skip_cert_verify: true,
+            }).host_port_is_quic(),
+            ("quic.example.com".to_string(), 2222, true)
+        );
+        let ipq_config = IsekaiPipeQuicConfig {
+            ssh_host: "ipq.example.com".to_string(), ssh_port: 3333,
+            username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+            cols: 80, rows: 24, jump: None, bind_port: None,
+        };
+        assert_eq!(
+            LastConnectAttempt::IsekaiPipeQuic(ipq_config.clone()).host_port_is_quic(),
+            ("ipq.example.com".to_string(), 3333, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiPipeQuicAuto(ipq_config).host_port_is_quic(),
+            ("ipq.example.com".to_string(), 3333, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::MultipathIsekaiPipeQuic(test_multipath_config()).host_port_is_quic(),
+            ("example.com".to_string(), 22, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiStunP2p(IsekaiStunP2pConfig {
+                ssh_host: "stun.example.com".to_string(), ssh_port: 4444,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, jump: None, stun_servers: vec!["stun.l.google.com:19302".to_string()],
+            }).host_port_is_quic(),
+            ("stun.example.com".to_string(), 4444, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiLinkRelay(IsekaiLinkRelayConfig {
+                ssh_host: "relay.example.com".to_string(), ssh_port: 5555,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, jump: None,
+                relay_addr: "relay:443".to_string(), relay_sni: "relay.example.com".to_string(), relay_jwt: "jwt".to_string(),
+            }).host_port_is_quic(),
+            ("relay.example.com".to_string(), 5555, true)
+        );
     }
 
     #[test]
@@ -2371,6 +2578,118 @@ mod tests {
         assert!(!stale.on_host_key("aa:bb:cc".to_string()));
     }
 
+    // ── OrchestratorAdapter (SessionCallback) の単純委譲群 ──────
+    //
+    // 以下はいずれも「is_current()なら`shared.callback`へそのまま委譲、staleなら
+    // 何もしない/既定値を返す」という同型のパターン。1テストで両方(委譲される値の
+    // 正しさ・staleになった後は委譲が止まること)を確認する。
+
+    #[test]
+    fn on_agent_sign_request_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_agent_sign_request("aa:bb".to_string()));
+        assert_eq!(cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(!current.on_agent_sign_request("cc:dd".to_string()), "staleなadapterはfalseを返すべき");
+        assert_eq!(
+            cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()],
+            "staleなadapterからのforwardは発生しないはず"
+        );
+    }
+
+    #[test]
+    fn on_clipboard_write_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let payload = ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"hello".to_vec() };
+        current.on_clipboard_write(payload.clone());
+        assert_eq!(cb.clipboard_writes.lock().unwrap().as_slice(), &[payload]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_clipboard_write(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"stale".to_vec() });
+        assert_eq!(
+            cb.clipboard_writes.lock().unwrap().len(), 1,
+            "staleなadapterからのon_clipboard_writeは転送されないはず"
+        );
+    }
+
+    #[test]
+    fn on_clipboard_pull_request_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(
+            current.on_clipboard_pull_request(),
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        );
+        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(current.on_clipboard_pull_request(), None, "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_request_wifi_fd_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let fd = current.on_request_wifi_fd().expect("current adapter should forward");
+        assert_eq!((fd.fd, fd.local_ip.as_str()), (42, "10.0.0.1"));
+        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_request_wifi_fd().is_none(), "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_request_cellular_fd_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let fd = current.on_request_cellular_fd().expect("current adapter should forward");
+        assert_eq!((fd.fd, fd.local_ip.as_str()), (43, "10.0.0.2"));
+        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_request_cellular_fd().is_none(), "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_rebind_state_changed_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular);
+        assert_eq!(
+            cb.rebind_states.lock().unwrap().as_slice(),
+            &[crate::rebind_manager::RebindPublicState::FailedOverToCellular]
+        );
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::OnWifi);
+        assert_eq!(
+            cb.rebind_states.lock().unwrap().len(), 1,
+            "staleなadapterからのon_rebind_state_changedは転送されないはず"
+        );
+    }
+
+    #[test]
+    fn on_prompt_jump_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let target = Some(crate::PromptJumpTarget { scroll_offset: 5, is_live: false });
+        current.on_prompt_jump(target);
+        assert_eq!(cb.prompt_jumps.lock().unwrap().as_slice(), &[target]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_prompt_jump(None);
+        assert_eq!(
+            cb.prompt_jumps.lock().unwrap().len(), 1,
+            "staleなadapterからのon_prompt_jumpは転送されないはず"
+        );
+    }
+
     // ── 自動再接続ループ ──────────────────────────────────
 
     fn fast_test_policy() -> ReconnectPolicy {
@@ -2465,6 +2784,29 @@ mod tests {
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(backfill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         let _ = orch;
+    }
+
+    #[test]
+    fn handle_unexpected_disconnect_suppresses_when_a_reconnect_loop_is_already_active() {
+        // 自動再接続ループの1リトライ試行自体が失敗して起きる切断(=既に
+        // reconnect_loop_activeがtrue)は、二重にループを起動せず・Disconnectedも
+        // 通知せず、ループ自身のtickに任せるはず(`Action::Suppress`)。
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.shared.state.lock().reconnect_loop_active = true;
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+
+        adapter.on_disconnected(Some("retry attempt itself failed".to_string()));
+
+        assert!(
+            cb.connection_states.lock().unwrap().is_empty(),
+            "Suppress時はDisconnectedを通知してはいけない(ループ自身のtickに任せる)"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "handle_unexpected_disconnect自身は新しいループを二重起動してはいけない"
+        );
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle, "phase自体は他の分岐と同様Idleへ戻るはず");
     }
 
     #[test]
@@ -2881,6 +3223,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -3004,5 +3347,811 @@ mod tests {
         let _fresh = OrchestratorAdapter::new(shared.clone());
         adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 1);
         assert!(cb.notifications.lock().unwrap().is_empty());
+    }
+
+    // ── タスク#17: ファイルプレビュー ────────────────────
+
+    #[test]
+    fn on_file_preview_exec_result_resolves_a_pending_ls_request() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().pending_file_previews.insert(
+            "req-1".to_string(),
+            FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+        );
+
+        let stdout = br#"{"entries":[{"name":"a.txt","is_dir":false,"is_symlink":false,"size":3,"modified_unix":null}]}"#;
+        adapter.on_file_preview_exec_result("req-1".to_string(), stdout.to_vec(), Some(0));
+
+        assert!(
+            !shared.state.lock().pending_file_previews.contains_key("req-1"),
+            "解決済みのrequest_idはpendingマップから取り除かれるべき"
+        );
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            FilePreviewOutcome::Ls { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, "a.txt");
+            }
+            other => panic!("expected Ls outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_file_preview_exec_result_for_unknown_request_id_reports_error() {
+        let (adapter, _shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_file_preview_exec_result("never-requested".to_string(), b"{}".to_vec(), Some(0));
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], FilePreviewOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn on_file_preview_exec_result_ignored_when_adapter_is_stale() {
+        // #10/#22と同じ「古い世代からの遅延コールバックは無視する」パターン。
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let stale = OrchestratorAdapter::new(shared.clone());
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        shared.state.lock().pending_file_previews.insert(
+            "req-1".to_string(),
+            FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+        );
+
+        stale.on_file_preview_exec_result("req-1".to_string(), b"{\"entries\":[]}".to_vec(), Some(0));
+
+        assert!(cb.file_preview_outcomes.lock().unwrap().is_empty());
+        // 古いadapterからの呼び出しは無視されるので、pendingエントリも消費されずに残る。
+        assert!(shared.state.lock().pending_file_previews.contains_key("req-1"));
+    }
+
+    #[test]
+    fn file_preview_request_when_not_connected_reports_error_immediately() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.file_preview_request("req-1".to_string(), FilePreviewRequestKind::Ls { path: "/tmp".to_string() });
+
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], FilePreviewOutcome::Error { .. }));
+        assert!(
+            !orch.shared.state.lock().pending_file_previews.contains_key("req-1"),
+            "即座にエラー応答した場合はpendingマップに残してはいけない"
+        );
+    }
+
+    /// `SessionOrchestrator`の公開API(resize/disconnect/scrollback_*)が、実際に
+    /// `session.lock()`へ格納された`ActiveSession`まで届いているかを検証するe2eテスト群。
+    ///
+    /// 既存のテストヘルパー(`orchestrator_with_phase`等)は`session: Mutex::new(None)`
+    /// で固定されており、これらのメソッドが呼ぶ`self.shared.session.lock().as_ref()`が
+    /// 常に`None`のまま——つまり委譲先のコードが一度も実行されない。これがcargo-mutants
+    /// (2026-07-24、orchestrator.rs全218ミュータント走査)でSessionOrchestrator本体の
+    /// 公開メソッドの大半がmissed判定になった直接の原因。ここでは
+    /// `transport::ssh_handler::pooling_e2e_tests`と同じパターン(in-process russh
+    /// serverへの実接続)で`SessionOrchestrator::connect()`を実際に呼び、`session`へ
+    /// 本物の`ActiveSession::Ssh`が格納された状態を作ってから各メソッドを検証する
+    /// (`isekai-ssh-e2e-test-self-containment-convention`に倣い、モックサーバーは
+    /// このモジュール内に自己完結させ、`ssh_handler.rs`側とは共有しない)。
+    mod session_orchestrator_e2e_tests {
+        use super::*;
+        use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
+        use russh::{Channel as RusshChannel, ChannelId, CryptoVec, Pty};
+        use russh_keys::ssh_key::private::Ed25519Keypair;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::net::TcpListener as TokioTcpListener;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+        use crate::SshAuth;
+
+        #[allow(dead_code)]
+        enum TestEvent {
+            Connection(ConnectionPublicState),
+            Data(Vec<u8>),
+            Forward(String, ForwardState),
+            FilePreview(String, FilePreviewOutcome),
+        }
+
+        struct TestCallback {
+            tx: UnboundedSender<TestEvent>,
+        }
+
+        impl OrchestratorCallback for TestCallback {
+            fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+                let _ = self.tx.send(TestEvent::Connection(state));
+            }
+            fn on_screen_update(&self, _update: ScreenUpdate) {}
+            fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
+            fn on_data(&self, data: Vec<u8>) {
+                let _ = self.tx.send(TestEvent::Data(data));
+            }
+            fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
+            fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+            fn on_no_viable_path(&self) {}
+            fn on_forward_state_changed(&self, id: String, state: ForwardState) {
+                let _ = self.tx.send(TestEvent::Forward(id, state));
+            }
+            fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+            fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
+            fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
+            fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+            fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+            fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+            fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+            fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+            fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
+                let _ = self.tx.send(TestEvent::FilePreview(request_id, outcome));
+            }
+        }
+
+        /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
+        /// 記録しつつ、受信データをそのままechoし返す最小SSHサーバ。
+        #[derive(Clone)]
+        struct RecordingServer {
+            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
+            channel_closed: Arc<AtomicBool>,
+        }
+
+        impl server::Server for RecordingServer {
+            type Handler = RecordingHandler;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> RecordingHandler {
+                RecordingHandler {
+                    window_changes: self.window_changes.clone(),
+                    channel_closed: self.channel_closed.clone(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct RecordingHandler {
+            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
+            channel_closed: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl server::Handler for RecordingHandler {
+            type Error = russh::Error;
+
+            async fn auth_publickey(
+                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+            ) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+
+            async fn pty_request(
+                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
+                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn shell_request(
+                &mut self, channel: ChannelId, session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn window_change_request(
+                &mut self, _channel: ChannelId, col_width: u32, row_height: u32,
+                _pix_width: u32, _pix_height: u32, _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.window_changes.lock().unwrap().push((col_width, row_height));
+                Ok(())
+            }
+
+            async fn data(
+                &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.data(channel, CryptoVec::from(data.to_vec()))?;
+                Ok(())
+            }
+
+            async fn channel_close(
+                &mut self, _channel: ChannelId, _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.channel_closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            /// `file_preview_exec`(タスク#17)が開く別チャネルでの`isekai-pipe ctl file`
+            /// exec要求。コマンド内容は見ず、常に`ctl_file.rs`の`ls`成功レスポンス
+            /// (JSON)を1件返す——本テストで検証したいのは`SessionOrchestrator::
+            /// file_preview_request`が実transportまで委譲されるかどうかであり、
+            /// exec先の実際のコマンド分岐はこのモジュールの対象外。
+            async fn exec_request(
+                &mut self, channel: ChannelId, _data: &[u8], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                let stdout = br#"{"entries":[{"name":"a.txt","is_dir":false,"is_symlink":false,"size":5,"modified_unix":1700000000}]}"#;
+                session.data(channel, CryptoVec::from(stdout.to_vec()))?;
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
+                Ok(())
+            }
+        }
+
+        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
+            let host_key = russh_keys::PrivateKey::from(keypair);
+            let config = Arc::new(server::Config {
+                keys: vec![host_key],
+                ..Default::default()
+            });
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let window_changes = Arc::new(StdMutex::new(Vec::new()));
+            let channel_closed = Arc::new(AtomicBool::new(false));
+            let mut sh = RecordingServer {
+                window_changes: window_changes.clone(),
+                channel_closed: channel_closed.clone(),
+            };
+            tokio::spawn(async move {
+                use server::Server as _;
+                let _ = sh.run_on_socket(config, &listener).await;
+            });
+            (addr, window_changes, channel_closed)
+        }
+
+        fn key_auth(seed: u8) -> SshAuth {
+            let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+            let key = russh_keys::PrivateKey::from(keypair);
+            SshAuth::PublicKey {
+                private_key_pem: key.to_openssh(Default::default()).unwrap().as_bytes().to_vec(),
+            }
+        }
+
+        fn ssh_config(host: SocketAddr, auth: SshAuth) -> SshConfig {
+            SshConfig {
+                host: host.ip().to_string(),
+                port: host.port(),
+                username: "tester".into(),
+                auth,
+                cols: 80,
+                rows: 24,
+                forwards: Vec::new(),
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            }
+        }
+
+        async fn wait_connected(rx: &mut UnboundedReceiver<TestEvent>) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Connected { .. }))) => return,
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Error { message }))) => {
+                        panic!("connection reported Error before Connected: {message}");
+                    }
+                    _ => continue,
+                }
+            }
+            panic!("did not become Connected within timeout");
+        }
+
+        async fn wait_disconnected(rx: &mut UnboundedReceiver<TestEvent>) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { .. }))) => return,
+                    _ => continue,
+                }
+            }
+            panic!("did not become Disconnected within timeout");
+        }
+
+        async fn wait_echo(rx: &mut UnboundedReceiver<TestEvent>, expected: &[u8]) {
+            let mut got = Vec::new();
+            for _ in 0..50 {
+                if got.windows(expected.len().max(1)).any(|w| w == expected) {
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Data(data))) => got.extend_from_slice(&data),
+                    _ => continue,
+                }
+            }
+            panic!("did not observe expected echo {:?} within timeout, got {:?}", expected, got);
+        }
+
+        async fn wait_file_preview_result(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str) -> FilePreviewOutcome {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::FilePreview(id, outcome))) if id == expected_id => return outcome,
+                    _ => continue,
+                }
+            }
+            panic!("did not observe a FilePreviewOutcome for id={} within timeout", expected_id);
+        }
+
+        async fn wait_forward_state(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str, expect_listening: bool) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(id, state))) if id == expected_id => {
+                        match (&state, expect_listening) {
+                            (ForwardState::Listening, true) => return,
+                            (ForwardState::Stopped, false) => return,
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            panic!(
+                "did not observe expected ForwardState for id={} (listening={}) within timeout",
+                expected_id, expect_listening
+            );
+        }
+
+        async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let (addr, window_changes, channel_closed) = spawn_recording_server().await;
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+            (orch, rx, addr, window_changes, channel_closed)
+        }
+
+        #[test]
+        fn resize_forwards_window_change_to_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, _addr, window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.resize(100, 40);
+
+                // window_change_requestはchannelの非同期送信なので、サーバー側での
+                // 記録が届くまで短時間ポーリングする。
+                for _ in 0..50 {
+                    if !window_changes.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(
+                    window_changes.lock().unwrap().as_slice(),
+                    &[(100, 40)],
+                    "SessionOrchestrator::resize()が実際のトランスポートまで届いていない \
+                     (ActiveSession::resizeがno-opに変異してもこのテストは検知できる)"
+                );
+            });
+        }
+
+        #[test]
+        fn disconnect_tears_down_the_real_transport_and_notifies_disconnected() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.disconnect();
+                // ActiveSession::disconnectが実際に呼ばれない(no-opに変異する)限り、
+                // 実コネクションは生きたままなのでDisconnectedコールバックは発火しない
+                // ——wait_disconnectedのタイムアウトpanicがこの変異を検知する。
+                wait_disconnected(&mut rx).await;
+            });
+        }
+
+        #[test]
+        fn scrollback_len_and_cells_reflect_real_terminal_output() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                // 80x24の画面をあふれさせるのに十分な行数を送り、実際にscrollbackへ
+                // 積ませる。各行末で改行しechoさせる。
+                for i in 0..60 {
+                    orch.send(format!("line-{i:03}\r\n").into_bytes());
+                }
+                wait_echo(&mut rx, b"line-059").await;
+                // VTEでの画面反映は非同期(on_screen_updateコールバック駆動)なので、
+                // scrollbackへの反映が追いつくまで短時間ポーリングする。
+                let mut len = 0u32;
+                for _ in 0..50 {
+                    len = orch.scrollback_len();
+                    if len > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    len > 0,
+                    "SessionOrchestrator::scrollback_len()が実際のtransport/terminal状態を \
+                     反映していない(ActiveSession::scrollback_lenが0固定に変異してもこのテストは検知できる)"
+                );
+
+                let cells = orch.scrollback_cells(0, 1);
+                assert!(
+                    !cells.is_empty(),
+                    "SessionOrchestrator::scrollback_cells()が実際のterminal状態を反映していない \
+                     (ActiveSession::scrollback_cellsがvec![]に変異してもこのテストは検知できる)"
+                );
+            });
+        }
+
+        // ── trzsz_accept_download / trzsz_accept_upload / trzsz_cancel ──
+        //
+        // 上のRecordingServerはクライアントからのデータを無条件にechoするだけなので、
+        // サーバー側が任意タイミングで能動的にバイトを送れる`ScriptedServer`を別途
+        // 用意する(`session.handle()`を`shell_request`時に保存し、テストコードから
+        // `Handle::data()`で直接送り込む)。これにより実物のtrzszトリガー/CFG/NUM
+        // フレームをワイヤ上に流し、`SessionOrchestrator::trzsz_accept_download`等の
+        // 委譲がno-opに変異した場合に実際に検知できるテストを組む。
+
+        #[derive(Clone)]
+        struct ScriptedServer {
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
+        }
+
+        impl server::Server for ScriptedServer {
+            type Handler = ScriptedHandler;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> ScriptedHandler {
+                ScriptedHandler {
+                    channel_handle: self.channel_handle.clone(),
+                    received: self.received.clone(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct ScriptedHandler {
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl server::Handler for ScriptedHandler {
+            type Error = russh::Error;
+
+            async fn auth_publickey(
+                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+            ) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+
+            async fn pty_request(
+                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
+                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn shell_request(
+                &mut self, channel: ChannelId, session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
+                Ok(())
+            }
+
+            async fn data(
+                &mut self, _channel: ChannelId, data: &[u8], _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.received.lock().unwrap().extend_from_slice(data);
+                Ok(())
+            }
+        }
+
+        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
+            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
+            let host_key = russh_keys::PrivateKey::from(keypair);
+            let config = Arc::new(server::Config {
+                keys: vec![host_key],
+                ..Default::default()
+            });
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let channel_handle = Arc::new(StdMutex::new(None));
+            let received = Arc::new(StdMutex::new(Vec::new()));
+            let mut sh = ScriptedServer {
+                channel_handle: channel_handle.clone(),
+                received: received.clone(),
+            };
+            tokio::spawn(async move {
+                use server::Server as _;
+                let _ = sh.run_on_socket(config, &listener).await;
+            });
+            (addr, channel_handle, received)
+        }
+
+        async fn connect_scripted_orchestrator() -> (
+            Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>,
+            Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>,
+        ) {
+            let (addr, channel_handle, received) = spawn_scripted_server().await;
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+            (orch, rx, channel_handle, received)
+        }
+
+        /// `shell_request`が届き`ScriptedHandler`が`Handle`を保存するまで待ってから、
+        /// テストコードから能動的にバイトをクライアントへ送り込む
+        /// (実物のtrzszトリガー/CFG/NUMフレームをそのままワイヤに流すために使う)。
+        async fn send_from_server(slot: &Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, bytes: Vec<u8>) {
+            let (id, handle) = {
+                let mut found = None;
+                for _ in 0..50 {
+                    if let Some(v) = slot.lock().unwrap().clone() {
+                        found = Some(v);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                found.expect("shell was not requested within timeout")
+            };
+            handle.data(id, CryptoVec::from(bytes)).await.expect("failed to send scripted bytes to client");
+        }
+
+        async fn wait_received_contains(received: &Arc<StdMutex<Vec<u8>>>, needle: &[u8]) {
+            for _ in 0..50 {
+                if received.lock().unwrap().windows(needle.len().max(1)).any(|w| w == needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "did not observe expected bytes {:?} arriving at the server within timeout, got {:?}",
+                String::from_utf8_lossy(needle), String::from_utf8_lossy(&received.lock().unwrap())
+            );
+        }
+
+        fn trzsz_trigger(mode: &str) -> Vec<u8> {
+            format!("::TRZSZ:TRANSFER:{mode}:1.1.7:0000004e\n").into_bytes()
+        }
+
+        fn trzsz_frame(typ: &str, payload: &str) -> Vec<u8> {
+            format!("#{typ}:{payload}\n").into_bytes()
+        }
+
+        fn trzsz_encode_bytes(buf: &[u8]) -> String {
+            use std::io::Write;
+            use base64::Engine;
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let _ = enc.write_all(buf);
+            let compressed = enc.finish().unwrap_or_default();
+            base64::engine::general_purpose::STANDARD.encode(compressed)
+        }
+
+        fn trzsz_frame_bin(typ: &str, buf: &[u8]) -> Vec<u8> {
+            trzsz_frame(typ, &trzsz_encode_bytes(buf))
+        }
+
+        fn trzsz_frame_int(typ: &str, val: u64) -> Vec<u8> {
+            trzsz_frame(typ, &val.to_string())
+        }
+
+        fn trzsz_cfg_frame() -> Vec<u8> {
+            let json = r#"{"lang":"go","version":"1.1.5","binary":false,"directory":false,"bufsize":1048576,"timeout":10}"#;
+            trzsz_frame_bin("CFG", json.as_bytes())
+        }
+
+        #[test]
+        fn trzsz_accept_download_then_cancel_drive_the_real_transfer_fsm() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // 1. サーバー(送信側)から実物のdownloadトリガーを送る。クライアントは
+                //    トリガー検出直後に自動でACTを実transport経由で送り返す。
+                send_from_server(&channel_handle, trzsz_trigger("S")).await;
+                wait_received_contains(&received, b"#ACT:").await;
+
+                // 2. CFGを先行して送っておく。この時点ではまだWaitingKotlin状態なので
+                //    proto_bufにバッファされるだけで応答は起きない。
+                send_from_server(&channel_handle, trzsz_cfg_frame()).await;
+
+                // 3. accept_downloadを呼ぶ。ActiveSession::trzsz_accept_downloadが
+                //    no-opに変異していれば状態はWaitingKotlinのまま変わらず、
+                //    バッファされたCFGは永遠に処理されない。
+                orch.trzsz_accept_download();
+
+                // 4. accept_downloadが実transportまで届いていれば、バッファ済みCFGが
+                //    即座に処理されWaitNum状態になっているはず。ここでNUMを送り、
+                //    クライアントがSUCC:1で応答することを確認する
+                //    (mutantが生きていればこのSUCCは永遠に届かずタイムアウトする)。
+                send_from_server(&channel_handle, trzsz_frame_int("NUM", 1)).await;
+                wait_received_contains(&received, b"#SUCC:1\n").await;
+
+                // 5. trzsz_cancel()が実transportにCtrl+C(0x03)を送ることを確認する
+                //    (ActiveSession::trzsz_cancelがno-opに変異してもこのテストは検知できる)。
+                orch.trzsz_cancel();
+                wait_received_contains(&received, &[0x03]).await;
+            });
+        }
+
+        #[test]
+        fn trzsz_accept_upload_drives_the_real_transfer_fsm() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // 1. サーバーから実物のuploadトリガー("R")を送る → クライアントは
+                //    ACTを実transport経由で送り返す。
+                send_from_server(&channel_handle, trzsz_trigger("R")).await;
+                wait_received_contains(&received, b"#ACT:").await;
+
+                // 2. accept_uploadを呼ぶ。ActiveSession::trzsz_accept_uploadがno-opに
+                //    変異していれば状態はWaitingKotlinのまま変わらない。
+                orch.trzsz_accept_upload("scripted.bin".to_string(), 5, 0o644);
+
+                // 3. accept_uploadが実transportまで届いていれば、次にCFGを受け取った
+                //    瞬間にNUM/NAME/SIZEを能動的に送り返してくるはず
+                //    (mutantが生きていればCFGはWaitingKotlinのproto_bufに積まれるだけで
+                //    何も送り返されずタイムアウトする)。
+                send_from_server(&channel_handle, trzsz_cfg_frame()).await;
+                wait_received_contains(&received, b"#NUM:1\n").await;
+                wait_received_contains(&received, b"#NAME:").await;
+                wait_received_contains(&received, b"#SIZE:5\n").await;
+
+                orch.trzsz_cancel();
+                wait_received_contains(&received, &[0x03]).await;
+            });
+        }
+
+        // ── add_local_forward / remove_forward ──
+
+        #[test]
+        fn add_local_forward_then_remove_forward_drive_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                // bind_port=0でOSにポートを選ばせる(このテストは実際に転送先へ
+                // 接続するのではなく、実transportまでコマンドが届いて本当に
+                // リスナーが立ち上がった/畳まれたことをForwardStateコールバックで
+                // 確認するだけなので、具体的なポート番号は不要)。
+                orch.add_local_forward(
+                    "fwd-1".to_string(), "127.0.0.1".to_string(), 0,
+                    "example.invalid".to_string(), 80,
+                );
+                // ActiveSession::add_local_forwardがno-opに変異していれば
+                // TransportCommandが送られず、リスナーも立ち上がらないため
+                // ForwardState::Listeningは永遠に届かずタイムアウトする。
+                wait_forward_state(&mut rx, "fwd-1", true).await;
+
+                orch.remove_forward("fwd-1".to_string());
+                // 同様にActiveSession::remove_forwardがno-opに変異していれば
+                // リスナーは立ったままでForwardState::Stoppedは届かない。
+                wait_forward_state(&mut rx, "fwd-1", false).await;
+            });
+        }
+
+        // ── notify_focus_change ──
+
+        #[test]
+        fn notify_focus_change_forwards_focus_events_to_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // フォーカスレポーティング(CSI ?1004h、タスク#60)はterminalの
+                // 明示的なDECSETが無い限り既定offなので、まずサーバーから有効化させる。
+                send_from_server(&channel_handle, b"\x1b[?1004h".to_vec()).await;
+
+                // DECSETのVTE処理は`on_data`コールバック駆動の非同期パスなので、
+                // 有効化が反映されるまで`notify_focus_change`を無害に(有効化前は
+                // encode_focus_eventがNoneを返すだけで何も送られない)ポーリングする。
+                // ActiveSession::notify_focus_changeがno-opに変異していれば、
+                // 有効化後もずっとバイトが届かずタイムアウトする。
+                for _ in 0..50 {
+                    orch.notify_focus_change(true);
+                    if received.lock().unwrap().windows(3).any(|w| w == b"\x1b[I") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                wait_received_contains(&received, b"\x1b[I").await;
+
+                orch.notify_focus_change(false);
+                wait_received_contains(&received, b"\x1b[O").await;
+            });
+        }
+
+        // ── set_session_theme ──
+
+        #[test]
+        fn set_session_theme_recolors_newly_written_cells_via_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                const CUSTOM_FG: u32 = 0xFF123456;
+                const CUSTOM_BG: u32 = 0xFF654321;
+                orch.set_session_theme(Vec::new(), CUSTOM_FG, CUSTOM_BG);
+
+                // 80x24をあふれさせるのに十分な行数を送り、テーマ変更後に書かれた
+                // セルを実際にscrollbackへ積ませる(既存のscrollback_len_and_cellsテストと
+                // 同じ手法。set_session_themeは「以降書かれるセルにのみ反映され、
+                // 既にscrollbackへ積まれたセルは遡って再着色されない」設計なので、
+                // テーマ変更を送信より先に行う必要がある)。
+                //
+                // SGR属性の実効色は「実行時点」でtheme.default_fg/bgから解決されて
+                // cur_attrsにスナップショットされる(以降テーマが変わっても、明示的な
+                // SGRリセットが無い限り再解決されない)。RecordingServerが素通しで
+                // echoする性質を利用し、`\x1b[0m`をecho往復させてからテキストを送ることで
+                // 新テーマでの解決を強制する。
+                orch.send(b"\x1b[0m".to_vec());
+                for i in 0..60 {
+                    orch.send(format!("line-{i:03}\r\n").into_bytes());
+                }
+                wait_echo(&mut rx, b"line-059").await;
+
+                let mut len = 0u32;
+                for _ in 0..50 {
+                    len = orch.scrollback_len();
+                    if len > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(len > 0, "scrollbackへの反映を待つ準備ができていない");
+
+                let cells = orch.scrollback_cells(0, 1);
+                assert!(!cells.is_empty());
+                assert_eq!(
+                    cells[0].fg, CUSTOM_FG,
+                    "SessionOrchestrator::set_session_themeが実transportまで届いていない \
+                     (ActiveSession::set_themeがno-opに変異してもこのテストは検知できる)"
+                );
+                assert_eq!(cells[0].bg, CUSTOM_BG);
+            });
+        }
+
+        // ── file_preview_request ──
+
+        #[test]
+        fn file_preview_request_execs_over_the_real_transport_and_reports_the_result() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.file_preview_request(
+                    "req-1".to_string(),
+                    crate::file_preview::FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+                );
+
+                // SessionOrchestrator::file_preview_requestがno-op(session.file_preview_execを
+                // 呼ばない)に変異していれば、`queued`は常にfalseとなり即座に
+                // FilePreviewOutcome::Error{"not connected"}が同期的に返る。実transportまで
+                // 委譲されていれば、RecordingServerのexec_requestが返す実物のls JSONが
+                // 非同期に届くはず。
+                let outcome = wait_file_preview_result(&mut rx, "req-1").await;
+                match outcome {
+                    FilePreviewOutcome::Ls { entries } => {
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].name, "a.txt");
+                    }
+                    other => panic!(
+                        "expected a real FilePreviewOutcome::Ls from the exec channel, got {:?} \
+                         (ActiveSession::file_preview_execがno-opに変異すると即座に \
+                         Error{{\"not connected\"}}が返る)",
+                        other
+                    ),
+                }
+            });
+        }
     }
 }

@@ -945,7 +945,7 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
 - Android側プールとCLI側の共通brokerが必要になった。
 - 「1 connection = 1 stream」制約を廃止するprotocol revisionを行う。
 
-### Epic M: リモート発 control-plane(タブごとの title/clipboard 同期)— 実装中(P3、独立)
+### Epic M: リモート発 control-plane(タブごとの title/clipboard 同期)— 実装中(P3、独立、iOS移植のみ残)
 
 **実装状況(2026-07-10)**:
 - ✅ ワイヤーフォーマット: `isekai-protocol::ctl`(`CtlMessage`/`ClipboardMime`、サイズcap込み)。
@@ -963,7 +963,7 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   内で動くため`#[cfg(unix)]`(`UnixStream`)のみで問題ない。
 - ✅ stale UNIX domain socketのlazy sweep GC(`isekai-pipe-core::sweep_stale_sockets`、
   ローカル(`isekai-ssh`)・リモート(`isekai-pipe serve`起動時)双方から呼ぶ)。
-- ✅(部分)isekai-terminal本体アプリ(Android)側: `#4.3 isekai-terminal本体アプリ(Android/iOS)側は
+- ✅ isekai-terminal本体アプリ(Android)側(iOS側は未着手、後述)。`#4.3 isekai-terminal本体アプリ(Android/iOS)側は
   素直`の通り、ctl-socket forwardのようなSSHチャンネルの仕掛けは不要で、既存のOSC 0/2/52
   パース(`terminal.rs`)をUIへ配線するだけで済んだ。
   - **タイトル**: 追加の配線は不要だった——`ScreenUpdate.title`は既に
@@ -1013,24 +1013,59 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
       SharedPreferencesから読んで一度だけ反映するプロセスグローバル状態」の形)を
       新設し、`enable_ctl_socket_forward`(既定false)を`MainActivity.kt`起動時と
       `ProfileListScreen.kt`のトグルの両方から呼ぶ。
-    - **未実装のまま(この経路固有のスコープ外)**: `ClipboardPullRequest`を
-      この新チャンネル経由で受けた場合、応答の書き込み(このチャンネルへの
-      書き戻し)は未実装(`session.rs`は受信をログするだけで無視する)。
-      device→hostのpullは今のところ上記OSC 52経路でのみ動く。また、
-      異常切断時にリモート側へ残る可能性がある`/tmp/isekai-pipe-ctl-*.sock`は、
-      このタブの接続がプレーンSSH(isekai-pipe非経由)だった場合、それを掃除する
-      `isekai-pipe serve`プロセスがリモートに存在しないため未回収のまま残りうる
-      (sshd自身による正常切断時のunlinkは効くが、異常終了時の残骸は拾われない、
-      という既知の残課題)。
-  - **未実装のまま(スコープ外として明示)**:
-    - Android `ClipData`の画像対応(`FileProvider`経由のcontent:// URI化、
-      §「クリップボードは双方向・opt-in」参照)。OSC 52自体がテキストのみの
-      プロトコルであるため、画像は上記の`CtlMessage::ClipboardPush`(tmux迂回
-      チャンネル)経由でしか運べない——チャンネル自体は実装済みなので、
-      Android側の`FileProvider`実装だけが残っている。
-    - iOS側は未着手(Android側の実装を踏まえて後日移植。Rust側は共通なので
+    - **実装済み(2026-07-10、`ClipboardPayload`化と同時)**: `ClipboardPullRequest`を
+      この新チャンネル経由で受けた場合の応答書き込み。`transport.rs`(現
+      `src/transport/ssh_handler.rs`)に`CtlInbound`(msg + 応答用
+      `oneshot::Sender`)を導入し、`server_channel_open_forwarded_streamlocal`を
+      `tokio::io::split`で読み書き分離、`ClipboardPullRequest`受信時は
+      Kotlin側の応答(`on_host_key`/`on_agent_sign_request`と同じ
+      `spawn_blocking`パターン)を待ってから`ClipboardPullResponse`を同じ
+      チャネルへ書き戻す。device→hostのpullはOSC 52経路・tmux迂回チャンネル
+      経由の両方で動く(`TransportEvent::ClipboardPullRequestOverCtl`、
+      `session.rs`)。
+    - **実装済み(2026-07-19)**: 異常切断時にリモート側へ残る可能性がある
+      `/tmp/isekai-pipe-ctl-*.sock`のうち、このタブの接続がプレーンSSH
+      (isekai-pipe非経由)だった場合の未回収問題。それを掃除する
+      `isekai-pipe serve`プロセスがリモートに存在しないケースのために、
+      `isekai-pipe ctl`(このバイナリ自体はトポロジに関わらず常にリモートで
+      実行される)の呼び出しごとに同じ`isekai_pipe_core::sweep_stale_sockets`
+      スイープを追加で走らせるようにした(`isekai-pipe/src/ctl.rs::
+      sweep_stale_ctl_sockets_on_remote`、`isekai-pipe serve`起動時の
+      スイープと同じprefix/閾値を共有)。sshd自身による正常切断時のunlinkは
+      従来通り効く。
+  - **実装済み(2026-07-11、Android側)**: Android `ClipData`の画像対応
+      (`FileProvider`経由のcontent:// URI化)。OSC 52自体がテキストのみの
+      プロトコルであるため、画像は上記の`CtlMessage::ClipboardPush`/
+      `ClipboardPullResponse`(tmux迂回チャンネル)経由でのみ運ばれる。
+      `RemoteClipboardImagePolicy`(`android/src/main/kotlin/tools/isekai/
+      terminal/RemoteClipboardImagePolicy.kt`)が判定・エンコード/デコードを
+      担い、push側はキャッシュディレクトリへの一時ファイル書き出し+
+      `FileProvider.getUriForFile`+`ClipData.newUri`(`newRawUri`ではなく
+      パーミッション付与が必要な`content://`)、pull側は`BitmapFactory`で
+      デコードしPNGへ再エンコードする。デコード前の画素数上限
+      (`MAX_IMAGE_PIXELS`)でdecompression bombを、書き込み前のPNG
+      シグネチャ検証(`isValidPngPayload`)で不正ペイロードを弾く
+      (codexレビュー対応、`4949ea80`)。一時ファイルは次回書き込み前に
+      全削除する(`isekai-pipe-core::sweep_stale_sockets`と同じ
+      「常駐GCなし、次回書き込み前に掃除する」パターン)。
+  - **未着手のまま(スコープ外として明示)**:
+    - iOS側(Android側の実装を踏まえて後日移植。Rust側は共通なので
       UniFFI Swiftバインディング再生成だけで済むが、Swift側のUI配線と
-      Xcodeでのビルド確認はこの開発環境では行えない)。
+      Xcodeでのビルド確認はこの開発環境では行えない——タスク#15のPRでも
+      明示的にスコープ外とした)。
+- ✅(タスク#16、2026-07-19)`isekai-pipe ctl setvar|getvar`: 同じ`CtlMessage`/
+  tmux迂回UDSチャネル上に`SetVar`(fire-and-forget)・`GetVarRequest`/
+  `GetVarResponse`(`ClipboardPullRequest`/`Response`と同じ応答待ちパターン)を
+  追加。`VarScope`(`tab`/`session`/`global`)ごとの`CtlVarStore`(プロセスメモリの
+  みで永続化なし)は受信側(チャネルのリスナー)が持つ。
+  **`--scope global`のリーチはリスナー側のプロセス形状に依存し、プラットフォーム間で
+  意味が異なる**: isekai-terminal Android アプリは1プロセスが全タブを抱えるため
+  `global`は本当にアプリ全体でタブ横断共有されるが、`ssh(1)`CLIラッパー
+  (`isekai-ssh`)は**1タブ=1プロセス**なので、そこでは`global`も`tab`/`session`と
+  同じ単一プロセス内ストアに縮退し、他の`isekai-ssh`呼び出しへは伝播しない
+  (`isekai-pipe ctl --help`にも明記)。ディスク永続化すればCLIラッパー側でも
+  真にクロスプロセス共有できるが、初期実装ではタスク側の「セッション終了で消える
+  プロセスメモリ方式で十分」という判断に従い意図的に未実装。
 
 **動機**: リモートの対話シェルが出す OSC 0/2(タイトル変更)・OSC 52(クリップボード)は、
 tmux配下だと既定でtmuxに横取りされ、外側のターミナル(Windows Terminalの`ssh`+`isekai-ssh`
@@ -1602,3 +1637,181 @@ Windows対応のみが対象。
   乖離の一因だった実装)
 - `rust-core/isekai-pipe-core/src/profile.rs`: `write_persistent_profile`/`ProfileLock`
   (Windows版は`LockFileEx`)
+
+### Epic P: リモート発ビルドトリガー(remote-triggered client build)— Phase 1(Unix/macOSクライアント)・Phase 2(Windows-native)完了(2026-07-22)
+
+**動機**: `isekai-ssh`でリモートホストに接続している最中に、そのリモートの対話シェルから
+「クライアント(`isekai-ssh`を実際に実行しているマシン)側でビルドコマンドを走らせ、ログを
+リアルタイムでリモートの端末に流し、成果物ファイルを最終的にリモートへ送り返す」機能。
+具体的な動機は、Windowsでしかコンパイル・実行確認ができないアプリ(`cargo`/`dx bundle`の
+Windowsターゲットビルド)を、Linux側の作業セッションから起動して結果を確認したい、という
+もの。Wave Terminalの`wsh`に着想を得た相談から出発したが、調査の結果`wsh`的な「リモート→
+ローカル制御チャンネル」は既にEpic M(`isekai-pipe ctl`、title/clipboard/setvar/getvar/
+file preview)として実装済みで、本Epicはその延長として位置づけられる。
+
+ただしEpic Mは実装時に明示的に「`isekai-pipe ctl`が受け付ける操作は`title`/`clip_push`/
+`clip_pull`のみに限定した固定ホワイトリストとし、任意コマンド実行のような汎用RPCには
+しない」と設計判断していた。本Epicはこの判断を**意図的に、かつ安全策込みで拡張**する:
+リモートが`CtlMessage::BuildRequest`で送れるのは事前にクライアント側でローカルに登録された
+**プロファイル名だけ**であり、実行される中身(ディレクトリ・シェルコマンド)は一切wireに
+乗らない。Epic Mの「同一SSH接続内のトラスト境界を前提にしても、対応するsocketに書き込めれば
+誰でも操作できてしまう、という副作用を避ける」という原則は、「操作の中身をクライアント側の
+ローカル設定だけが決める」という形でそのまま維持されている。
+
+**設計協議で確定した3つの決定**:
+1. プロファイル設定の置き場は`.ssh/config`の`#@isekai`ディレクティブではなく専用TOML
+   (`~/.config/isekai-ssh/build_profiles.toml`)。ディレクティブに複雑なシェルコマンドを
+   書くとクォーティングが煩雑になり、また「接続設定」と「ローカル自動化設定」は別種の
+   関心事なため。
+2. 設定編集用のGUI(Tauri等)は過剰投資と判断し見送り、CLIサブコマンド
+   (`isekai-ssh build-profile add/list/remove/test`)のみとした——build profileの数は
+   現実的に数個〜十数個程度で、GUIが解決する主な価値(発見性・入力補助)にしては投資が
+   重すぎる。
+3. 成果物の送信先は呼び出し時の`--dest`上書きではなく、profile設定の`dest_dir`固定。
+   リモートは`ctl build <profile>`のように名前しか送れないため、送信先もクライアント側の
+   ローカル設定に閉じ込める方がシンプルで一貫している。
+
+**ワイヤーフォーマット**(`isekai-protocol::ctl::CtlMessage`への追加):
+
+```rust
+BuildRequest { profile: String },
+BuildOutputChunk { stream: BuildOutputStream /* Stdout | Stderr */, data_b64: String },
+BuildFinished { exit_code: i32, result_paths: Vec<String> },
+```
+
+Epic Mの「1接続=1メッセージで完結する」という設計(`send_ctl_message_and_read_response`が
+`read_line`を1回呼んで即終了、受信側`handle_ctl_connection`も1メッセージmatchしたら即
+returnする)を、`BuildRequest`だけ例外的に緩和する: 1回の`isekai-pipe ctl build <profile>`
+呼び出しの間、同じ接続上で`BuildOutputChunk`が0回以上ストリームされ、最後に
+`BuildFinished`で終端する長寿命の接続になる。チャンクは行単位ではなく固定8KiBの生バイト列
+読み取り(ビルドツールの出力はUTF-8保証も改行保証も無い——キャリッジリターンで上書きする
+プログレスバー等——ため)で、`MAX_BUILD_CHUNK_DECODED_LEN`(64KiB)に余裕を持って収まる
+サイズにしてある。
+
+**リモート側CLI**: 新規バイナリは作らず(Epic Mと同じ判断)、`isekai-pipe ctl build
+<profile>`として`isekai-pipe`に相乗り。受信した`BuildOutputChunk`を都度自分自身の
+stdout/stderrへ書き出すだけで、追加の表示経路なしにリモートの対話シェルにそのままビルド
+ログが流れる(このプロセス自体がリモートの対話シェルの中でただのコマンドとして動いている
+ため)。`BuildFinished`の`exit_code`をこのプロセス自身の終了コードにするので、リモート側の
+`&&`チェインもそのまま効く。
+
+**クライアント側(Unixのみ、`ctl_forward.rs::run_build`)**:
+- 接続元のホストエイリアス(`resolution.profile()`)とリクエストされたプロファイル名の
+  組でローカル設定を検索。見つからなければ`exit_code: 127`の`BuildFinished`を返す。
+- 見つかれば`sh -c "<command>"`を`dir`をカレントディレクトリにしてspawn、stdout/stderrを
+  それぞれ独立したタスクで読み取ってmpsc経由で1本のwriter taskに集約し、都度
+  `BuildOutputChunk`として書き込む。
+- **切断時の後始末を保証する**: ctl接続への書き込みが失敗した時点(リモートが`Ctrl-C`等で
+  切断した場合)で即座に子プロセスをkillする。これは`.claude/rules/always-connects.md`の
+  fencing slot教訓(「どんな破棄経路であってもクリーンアップが必ず呼ばれることを保証する」)
+  を、リモートセッション状態ではなくローカル子プロセスに適用したもの。無限に出力し続ける
+  子プロセスを使い、切断後にkillされない限り絶対に返らないはずの呼び出しがタイムアウトせず
+  完了することをテストで確認済み(`run_build_kills_the_child_when_the_connection_breaks_mid_build`)。
+- 子プロセス終了後、`result_glob`が設定されていれば`dir`基準でglob展開して`result_paths`を
+  集め、`BuildFinished`を送る。
+
+**成果物の送り返し**: `result_paths`が非空かつ`dest_dir`設定済みの場合、新しい転送
+プロトコルは作らず、既に確立している「`isekai-ssh <host>`は常に接続できる」を再利用する
+形で、`isekai-ssh <host> -- mkdir -p <dest_dir> && cat > <dest_dir>/<basename>`を子
+プロセスとして**再帰spawn**し、成果物のバイト列をstdin経由で流し込む。ctl接続はブロック
+せずバックグラウンドでpushする。`dest_dir`/ファイル名はリモートが指定できない完全に
+ローカルな信頼済み設定(`profile.command`と同じ信頼境界)なのでシェルクォートしない——
+クォートすると`~`展開が壊れるため、というのがまさにその理由。失敗はisekai-ssh自身の
+ログに残すのみで、リモートへは通知しない(v1の既知の制限)。
+
+**テスト**: `run_build`はデュプレックスストリーム越しの直接呼び出しで(実際のUNIXドメイン
+ソケット越しではないが、`handle_ctl_connection`/`run_build`自体は本番と同じ関数)、正常系
+(出力ストリーミング・exit code・result_paths)・異常系(未登録プロファイル・切断時kill)の
+両方をカバー。`push_result_file`は`std::env::current_exe()`で自分自身(実`isekai-ssh`
+バイナリ)を再帰spawnするため、単体テストの対象にはできない(`cargo test`下では
+`current_exe()`がテストバイナリを指してしまう)——実sshdを立てて実バイナリ
+(`CARGO_BIN_EXE_isekai-ssh`)を`--isekai-direct`で叩く専用のe2eテスト
+(`tests/build_result_push_e2e.rs`)で検証した。
+
+**Phase 2: Windows-native(`native/mux/`、owner/client mux)対応** — 2026-07-22、
+`~/1on1-recorder`(Dioxusデスクトップアプリ、Windows/macOSのみサポート対象)を実際に
+クライアント側でビルド・起動確認したいという具体的動機から着手。
+
+- **owner自身の前景シェル**(`native/mux/build_relay.rs::run_build_over_channel`、
+  `ctl_forward.rs::pump_to_stderr`から分岐): 同一プロセスが実SSH channelを保持し
+  かつビルドを実行する側でもあるため、プロセス間中継は不要——Unix版`run_build`とほぼ
+  同じ構造。ただし`tokio::select!`で「子プロセス出力のmpsc」と「`channel.wait()`
+  (リモート切断検知)」を同時に待つぶん、Unix版(次の書き込み失敗でしか切断を検知
+  できない)より早く切断を検知できる。
+- **mux client**(実装が難しい方): decode/spawn(実際に子プロセスを起動する)はclient
+  側の責務とした——既存の非対称設計(owner自身の前景シェルはその場でOSC適用、mux
+  clientは生バイトを中継されclient側でOSC適用する)の一貫した延長で、「そのタブを
+  実際に操作しているプロセスがそのタブに対する作用を行う」という既存原則に従う。
+  ただし実チャネル(SSH channel)はowner内にしか存在しないため、client→リモートの
+  返信バイト列はowner経由でnamed pipe上を中継する必要がある。
+  - `Frame`(`native/mux/protocol.rs`)のワイヤーエンコードは元々方向対称(タグ+
+    ペイロードのみを見る)だったため、双方向化にワイヤーフォーマットの変更は不要
+    だった。方向の制約は`owner.rs::relay_loop`/`client.rs::run_inner`という
+    呼び出し側ロジックだけが課していたので、そこだけ変更した。
+  - **`CtlRelayEvent`**(`native/mux/ctl_forward.rs`)という新しい中継用enum
+    (`Message(Vec<u8>)`/`BuildStarted{reply_tx}`)を導入。`pump_to_frames`の各
+    forwarded channel用タスクは、`BuildRequest`を検知するとchannelをdropせず
+    保持し続け、`reply_tx`(client発の返信を受け取るチャネル)を`owner.rs::
+    relay_loop`へ登録する。`relay_loop`は`active_build_reply_tx`という新しい
+    状態を持ち、client発の`Frame::Ctl`をこの`reply_tx`へ中継する(既存の
+    「unexpected frame from client」無条件エラーの前に専用アームを追加)。
+    `BuildFinished`かどうかの判定(いつ`active_build_reply_tx`をクリアするか)は
+    `relay_loop`側に一元化し、pumpタスク自身はデコードしない(reply_txがdrop
+    されればpumpタスクの`reply_rx.recv()`が自然に`None`を返し終了するため)。
+  - **中断シグナル**: リモート側のctl channelが切断された場合、新しいワイヤー
+    メッセージは作らず`CtlMessage::BuildFinished{exit_code: i32::MIN, ...}`
+    (`build_relay::BUILD_ABORTED_SENTINEL`)を合成し、既存のowner→client中継
+    経路でclientへ送る。`exit_code`は元々ただの`i32`で範囲制限が無いため、
+    ワイヤーフォーマット自体の変更は不要だった(実プロセス終了コードは0〜255の
+    範囲に収まるため衝突しない)。
+  - client側(`client.rs::run_inner`)は新設`build_relay::spawn_client_build`で
+    ビルド子プロセスをバックグラウンドspawnし、`build_out_tx`(新設mpsc)経由で
+    `Frame::Ctl`としてownerへ送り返す(Stdin/Resizeと同じsend-then-fail-on-err
+    パターン)。owner接続を失った場合・中断シグナルを受けた場合のどちらでも
+    `ActiveBuild::abort()`で子プロセスを即kill。1タブ1ビルドの制約とし、
+    ビルド中の2重`BuildRequest`はログのみで無視する。
+- **成果物push-back**: Unix限定だった`push_result_file`/`build_push_remote_command`/
+  `spawn_result_push`(および`pump_bytes`・エンコードヘルパー)を、cfg gate無しの
+  `build_exec.rs`へ移設し、Windows側の両経路からも同じ関数を再利用する。
+- **検証**: この開発環境(実機Windows無し)では、モックSSHサーバー+in-memory mux
+  接続によるユニットテスト(owner前景シェル・owner↔client双方向中継・mux client
+  ビルドタスクの3層それぞれ)と`x86_64-pc-windows-gnu`へのクロスコンパイル確認まで。
+  named pipe実体・`cmd.exe`固有挙動・実`isekai-ssh.exe`での実際のビルドは実機
+  Windowsでの検証が必要(ユーザー自身に委ねる)。
+- **実装完了後のopusレビューで発見・修正**(いずれもコード直接確認のうえ修正、
+  回帰テスト追加済み):
+  1. `client.rs::run_inner`の`active_build`が正常完了時に`None`へ戻っておらず、
+     mux clientタブは生涯1回しかビルドを実行できなかった(2回目以降の
+     `BuildRequest`が恒久的に無視される)。`build_out_rx`分岐が送信するバイト列を
+     `BuildFinished`としてデコードできた時点で`active_build = None`に戻すよう修正。
+  2. `owner.rs::relay_loop`が2つ目の`BuildStarted`で`active_build_reply_tx`を
+     無条件上書きしており、同一タブへほぼ同時に2つの`BuildRequest`が来た場合
+     1つ目のビルド出力が2つ目の無関係なリモートchannelへ誤配されうる欠陥が
+     あった。既に`Some`なら上書きせず、2つ目自身のchannelへ直接
+     「a build is already running」+`BuildFinished{exit_code:125}`を返して
+     拒否するよう修正(プロファイル未登録時の`BuildFinished{exit_code:127}`応答
+     と同型のパターン)。
+
+**参照実装**:
+- `rust-core/isekai-protocol/src/ctl.rs`: `CtlMessage::BuildRequest`/`BuildOutputChunk`/
+  `BuildFinished`、`BuildOutputStream`
+- `rust-core/isekai-ssh/src/build_profile.rs`: `BuildProfile`/`BuildProfileStore`、
+  TOML読み書き(`~/.config/isekai-ssh/build_profiles.toml`)
+- `rust-core/isekai-ssh/src/build_profile_cli.rs` / `cli.rs`の`BuildProfileCommand`:
+  `isekai-ssh build-profile add/list/remove/test`
+- `rust-core/isekai-ssh/src/build_exec.rs`: `spawn_shell_command`/`glob_results`/
+  `pump_bytes`/`encode_build_output_chunk`/`encode_build_finished`/
+  `spawn_result_push`(Unix・Windows-native双方・`build-profile test`が共有)
+- `rust-core/isekai-ssh/src/native/mux/build_relay.rs`: `run_build_over_channel`
+  (owner前景シェル用)・`spawn_client_build`/`ActiveBuild`(mux client用)・
+  `BUILD_ABORTED_SENTINEL`
+- `rust-core/isekai-ssh/src/native/mux/ctl_forward.rs`: `CtlRelayEvent`、
+  `pump_to_stderr`/`pump_to_frames`
+- `rust-core/isekai-ssh/src/native/mux/owner.rs`: `relay_loop`の
+  `active_build_reply_tx`
+- `rust-core/isekai-ssh/src/native/mux/client.rs`: `run_inner`の`active_build`/
+  `build_out_tx`
+- `rust-core/isekai-ssh/src/ctl_forward.rs`: `run_build`/`pump_bytes`/`send_build_output`/
+  `send_build_finished`/`spawn_result_push`/`push_result_file`/`build_push_remote_command`
+- `rust-core/isekai-pipe/src/ctl.rs`: `CtlLaunch::Build`/`stream_build`
+- `rust-core/isekai-ssh/tests/build_result_push_e2e.rs`

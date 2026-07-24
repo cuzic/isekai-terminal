@@ -889,6 +889,94 @@ async fn install_and_start_reuses_a_still_alive_helper_without_relaunching() {
     kill_if_recorded(&home, &launch_fingerprint(&launch));
 }
 
+/// A second `install_and_start` against the *same* `LaunchSpec` (so pid,
+/// `/proc/<pid>/exe` path, and fingerprint would all say "reuse") but with
+/// *different binary bytes* — standing in for a bugfix release of
+/// `isekai-pipe serve` landing while an old build is still alive on the
+/// remote host — must not reuse the stale helper: reusing it would silently
+/// keep running whatever bug the new build was meant to fix, indefinitely
+/// (the concrete motivation for this check — see `crate::reuse`'s and
+/// `install_and_launch`'s module docs). It must deploy and launch a fresh
+/// helper alongside it instead, exactly as it already does for a different
+/// topology (previous test) — the stale helper is never killed here either,
+/// for the same "some other client may still be mid-session on it" reason.
+#[tokio::test]
+async fn install_and_start_redeploys_when_the_alive_helpers_binary_is_stale() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("fake-pipe-handshake.json"), VALID_BOOTSTRAP_REPORT_JSON).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let launch = LaunchSpec::Relay(dummy_relay_spec());
+    let fingerprint = launch_fingerprint(&launch);
+
+    let old_binary = fake_pipe_binary();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &old_binary, &launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let first_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
+    assert!(is_pid_alive(first_pid), "the first deployment's helper should still be running");
+
+    // Same executable behavior, different content/sha256 — stands in for a
+    // newer `isekai-pipe` build. A Linux ELF loader ignores bytes appended
+    // past the last mapped segment, so this still runs identically to
+    // `old_binary` while hashing differently.
+    let mut new_binary = old_binary.clone();
+    new_binary.push(0);
+    assert_ne!(old_binary, new_binary, "the two binaries must actually differ for this test to mean anything");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &new_binary, &launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed with a fresh launch");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        is_pid_alive(first_pid),
+        "detecting a stale binary must not kill the still-alive old helper"
+    );
+
+    let second_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
+    assert_ne!(first_pid, second_pid, "a stale binary must trigger a fresh launch, not a reuse");
+    assert!(is_pid_alive(second_pid), "the fresh deployment's helper should be running");
+
+    let invocations = std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
+    assert_eq!(invocations.lines().count(), 2, "a stale binary must force a real launch, not a reuse");
+
+    kill_if_recorded(&home, &fingerprint);
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(first_pid.to_string())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null())
+        .status();
+}
+
 /// A second `install_and_start` with a *different* `LaunchSpec` (a
 /// materially different topology — Direct vs. Relay — not just a settings
 /// tweak) must *not* kill the still-alive first deployment's helper: a

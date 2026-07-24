@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux", "russh-stream-session"]
+members = [".", "uniffi-bindgen", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux", "russh-stream-session", "openssh-config", "local-ipc-mux"]
 resolver = "2"
 
 # noq-multipath-spike(実機検証用の使い捨てコード、CLAUDE.md参照)は意図的に
@@ -46,6 +46,7 @@ uniffi = { version = "0.31", features = ["tokio"] }
 timed-fsm = { version = "0.4.0", features = ["tokio"] }
 russh = "0.48"
 russh-keys = "0.48"
+russh-stream-session = { path = "russh-stream-session" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 parking_lot = "0.12"
@@ -56,6 +57,13 @@ vte = "0.13"
 unicode-width = "0.1"
 base64 = "0.22"
 flate2 = "1"
+# Kitty graphics(#53): f=100(PNG転送形式)のデコード用。純Rust実装
+# (miniz_oxide/fdeflate/crc32fast — いずれも既にツリーにあり、Cで書かれた
+# バインディングを持たないためAndroid向けクロスコンパイルも他と同様に通る)。
+# chafa --format=kitty / kitty +kitten icat 等の実ツールが既定でPNGを送るため、
+# 生RGBA(f=32/24)だけでは実用的な互換性が得られない(kitty_graphics.rsのモジュール
+# doc「実装範囲」参照)。
+png = "0.17"
 md5 = "0.8"
 # タスク#65: パスワード・復号済み秘密鍵PEMをdrop時にゼロ化するために使う
 # (`SshAuth`のDrop実装、`src/lib.rs`参照)。

@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
+use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
 use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, TerminalKeyModifiers};
 
@@ -43,6 +44,40 @@ const MAX_TOTAL_IMAGE_RGBA_BYTES: usize = 64 * 1024 * 1024;
 /// する——既存id(=既存セルの`link_id`参照)はscrollback保護のため削除・再利用
 /// しない。
 pub(crate) const MAX_LINK_TABLE: usize = 4096;
+/// OSC 133(タスク#13、セマンティックプロンプト)のマーク履歴上限。500プロンプト
+/// サイクル分(A/B/C/Dの4マーク)を目安に選んだ値——`link_table`(タスク#40)と同じ
+/// 理由(相異なるURLを大量に流されてもメモリが際限なく増えないようにする)で、
+/// 上限到達後は最も古いマークから捨てる(`Terminal::prompt_marks`フィールド参照)。
+const MAX_PROMPT_MARKS: usize = 2000;
+
+/// OSC 133(`ESC]133;<Ps>...ST`、タスク#13)の1マークが表す区切りの種類。
+/// <https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md>
+/// のA/B/C/Dにそれぞれ対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptMarkKind {
+    /// `ESC]133;A`: プロンプト描画の開始。
+    PromptStart,
+    /// `ESC]133;B`: プロンプト終了・コマンド入力開始。
+    CommandStart,
+    /// `ESC]133;C`: コマンド実行開始(以降の出力がそのコマンドの出力)。
+    CommandExecuted,
+    /// `ESC]133;D[;<exit_code>]`: コマンド終了。`exit_code`は数値としてパースできた
+    /// 場合のみ`Some`(シェルによってはexit codeを送らない、または`aid=`等の
+    /// 数値以外のパラメータを送ることがあるため、パース失敗は単に`None`として扱う)。
+    CommandFinished { exit_code: Option<i32> },
+}
+
+/// OSC 133の1マーク(`PromptMarkKind`+発生した絶対行番号)。`row`は
+/// `Terminal::total_scrolled_lines`基準の単調増加座標——scrollbackが後から
+/// トリミングされてもマーク自身の値は変わらず、参照する側(`prompt_jump_target`等)が
+/// 呼び出し時点の`total_scrolled_lines`/scrollback長と突き合わせて現在の
+/// 表示位置へ変換する(`ScrollbackSearchMatch`の「offsetはスナップショット時点限定」
+/// という制約と違い、こちらは絶対座標なので長期保持しても意味が変わらない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptMark {
+    pub(crate) kind: PromptMarkKind,
+    pub(crate) row: u64,
+}
 /// 1セルへ結合文字(combining character、幅0文字)として追記できるUTF-8バイト数の
 /// 上限(タスク#78)。`print()`のwidth==0分岐(タスク#39)は結合文字を直前セルの
 /// `cell.ch`へ無条件で連結する実装だったため、`a` + `U+0301`(2バイト)を大量に
@@ -456,6 +491,13 @@ pub(crate) struct Terminal {
     /// DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)。既定は`false`
     /// (レガシーX10形式)。`encode_pointer_event`がこの値でエンコード形式を切り替える。
     sgr_mouse_mode: bool,
+    /// DECSET/DECRST `?1007`(Alternate Scroll): alt screen でホイールを矢印キーに
+    /// 変換する。既定は`false`。
+    alternate_scroll: bool,
+    /// DECSET/DECRST `?1015`(URXVTマウスエンコーディング): マウスレポートを
+    /// `CSI Cb ; Cx ; Cy M`形式でエンコードする。`?1006`(SGR)と排他ではない。
+    /// 既定は`false`。
+    urxvt_mouse_mode: bool,
     /// OSC 8(`ESC]8;params;URIST`、タスク#40)で現在開いているハイパーリンクの
     /// intern id(`link_table`の index)。`None`はリンクなし。`print()`が書き込む
     /// 全セルへそのまま付与する——SGR属性(`cur_attrs`)とは独立な状態であり、
@@ -494,6 +536,21 @@ pub(crate) struct Terminal {
     /// 同じ理由で、過去に呼び出し側へ渡したidを再利用すると別画像との衝突が
     /// 起こりうるため単調増加を保つ。
     next_image_id: u64,
+    /// Kitty graphics protocol(#53)のAPCデコード状態(チャンク分割転送の途中組み立て
+    /// を保持する)。実際のAPC切り出しは`session_state.rs`の`ApcInterceptor`が行い、
+    /// 完成したペイロードを`dispatch_kitty_apc`経由でここへ渡す。
+    kitty: KittyGraphics,
+    /// `images`内のKitty画像について、内部placement id → Kitty client image id(`i=`)の
+    /// 対応表。`i=`を伴わないKitty画像はここに載らない(client idが無いため)。
+    /// `d=i`/`d=I`(id指定削除)の対象特定にのみ使う——`d=a`(全削除)は代わりに
+    /// [Self::kitty_placement_ids] を使う(Opusレビュー指摘: このmapのkeysだけを
+    /// 全削除対象にすると、`i=`を送らないクライアント[chafa等]が置いた画像が
+    /// 永久に消せなくなる)。
+    kitty_id_by_placement: HashMap<u64, u64>,
+    /// `images`内の、Kitty経由(`i=`の有無を問わず)で置かれた全placement idの集合。
+    /// `d=a`(全削除)の対象特定に使う。sixel画像はここに載らない(=Kittyの全削除が
+    /// sixelを巻き込まない)。
+    kitty_placement_ids: std::collections::HashSet<u64>,
     /// Kitty keyboard protocol(タスク#54、
     /// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)の progressive
     /// enhancement flags スタック(main画面用)。各要素はその時点でpushされた
@@ -520,6 +577,48 @@ pub(crate) struct Terminal {
     main_kitty_flags_stack: Vec<u16>,
     /// [Terminal::main_kitty_flags_stack]のalt画面版。
     alt_kitty_flags_stack: Vec<u16>,
+    /// OSC 133(タスク#13)の絶対行番号カウンタ。`Terminal`の生存期間を通じて、
+    /// scrollbackへ実際に押し出された行数(`pending_scrollback`へpushした回数と
+    /// 常に一致する——`scroll_up_region`/`resize_preserving_state`の該当箇所で
+    /// 同時にインクリメントする)を単調増加でカウントする。ある時点のカーソル行の
+    /// 「絶対行番号」は`total_scrolled_lines + cursor_row`で求まり、後から
+    /// scrollbackが`SCROLLBACK_LIMIT`でトリミングされても(`total_scrolled_lines`
+    /// 自体はトリミングの影響を受けないため)位置を再計算できる。RIS(`reset_all`)
+    /// でも`link_table`と同じ理由でリセットしない——scrollbackへ既に流れた過去の
+    /// プロンプトマークの`row`がこのカウンタを基準にしているため。
+    total_scrolled_lines: u64,
+    /// OSC 133(タスク#13)のマーク履歴。`MAX_PROMPT_MARKS`件を超えたら最も古い
+    /// ものから捨てる(`link_table`と異なりRIS(`reset_all`)ではクリアしない——
+    /// `total_scrolled_lines`と同じ理由)。「前/次のプロンプトへジャンプ」
+    /// (`prompt_jump_target`)・「直前コマンド出力コピー」の判定に使う。
+    prompt_marks: VecDeque<PromptMark>,
+    /// 現在「コマンド入力中」(OSC 133;Bは来たが;Cがまだ来ていない区間)かどうか。
+    /// タップでのカーソル移動(`cursor_move_bytes_for_click`、タスク#13)が
+    /// 対象とする行を絞り込むために使う——タップされた行が現在のカーソル行と
+    /// 一致し、かつこのフラグが立っている場合のみ有効なタップとみなす(入力行の
+    /// 絶対行番号を別途保持する必要はない——現在のカーソル行が常に「今アクティブな
+    /// 入力行」を指すため)。
+    input_line_active: bool,
+    /// OSC 133;C(コマンド実行開始)〜;D(コマンド終了)の間、`true`の間だけ
+    /// `print()`で書かれた文字を[current_output_line]/[current_output_lines]へ
+    /// そのまま貯める(タスク#13「直前コマンドの出力だけをコピー」)。
+    ///
+    /// スコープ外(意図的な制約): カーソル移動を伴う書き換え(`\r`によるプログレス
+    /// バー上書き・`top`等のフルスクリーンTUI)はそのまま連結されてしまい、見た目の
+    /// 最終状態を再現しない。グリッド上の実際の表示内容を都度読み直す設計にすれば
+    /// 正確になるが、scrollbackと現在画面をまたぐ座標変換が必要になり複雑化するため、
+    /// タスク#13ではストリームをそのまま捕捉する単純な実装に留めた(単純な行指向の
+    /// 出力——`ls`/`cat`/`git log`等の大半のユースケース——では正しく動く)。
+    capturing_command_output: bool,
+    /// [capturing_command_output]中に貯めている、まだ改行(LF/VT/FF)が来ていない
+    /// 現在行のテキスト。
+    current_output_line: String,
+    /// [capturing_command_output]中に確定した行の列。
+    current_output_lines: Vec<String>,
+    /// 直近に完了した1コマンド分の出力(タスク#13)。新しいコマンドが
+    /// `OSC 133;C`で始まると、次の`;D`到達時にこの値が上書きされる——「直前の」
+    /// 1件のみを保持する設計(複数コマンド分の履歴は持たない)。
+    last_command_output: Option<Vec<String>>,
 }
 
 /// Kitty keyboard protocolのflagsスタック(タスク#54)の最大深さ。仕様は
@@ -563,6 +662,8 @@ fn mouse_button_base_code(button: Option<MouseButton>) -> u8 {
         None => 3,
         Some(MouseButton::WheelUp) => 64,
         Some(MouseButton::WheelDown) => 65,
+        Some(MouseButton::WheelLeft) => 66,
+        Some(MouseButton::WheelRight) => 67,
     }
 }
 
@@ -615,6 +716,7 @@ pub(crate) fn encode_pointer_event_bytes(
     rows: usize,
     mode: MouseReportingMode,
     sgr: bool,
+    urxvt: bool,
 ) -> Option<Vec<u8>> {
     let reportable = match event.kind {
         MouseEventKind::Press | MouseEventKind::Release => mode != MouseReportingMode::Off,
@@ -642,7 +744,13 @@ pub(crate) fn encode_pointer_event_bytes(
     let col = event.col.min(cols.saturating_sub(1));
     let row = event.row.min(rows.saturating_sub(1));
 
-    if sgr {
+    if urxvt && !sgr {
+        // URXVT encoding: `CSI Cb ; Cx ; Cy M` (press) / `CSI Cb ; Cx ; Cy m` (release).
+        // Cb is button+modifiers+motion, Cx/Cy are 1-based decimal coordinates.
+        let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
+        let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
+        Some(format!("\x1b[{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
+    } else if sgr {
         let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
         let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
         Some(format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
@@ -701,6 +809,8 @@ impl Terminal {
             gl_is_g1: false,
             mouse_reporting_mode: MouseReportingMode::Off,
             sgr_mouse_mode: false,
+            alternate_scroll: false,
+            urxvt_mouse_mode: false,
             active_link_id: None,
             link_table: Vec::new(),
             link_ids: HashMap::new(),
@@ -708,8 +818,18 @@ impl Terminal {
             sixel_decoder: None,
             images: Vec::new(),
             next_image_id: 0,
+            kitty: KittyGraphics::new(),
+            kitty_id_by_placement: HashMap::new(),
+            kitty_placement_ids: std::collections::HashSet::new(),
             main_kitty_flags_stack: Vec::new(),
             alt_kitty_flags_stack: Vec::new(),
+            total_scrolled_lines: 0,
+            prompt_marks: VecDeque::new(),
+            input_line_active: false,
+            capturing_command_output: false,
+            current_output_line: String::new(),
+            current_output_lines: Vec::new(),
+            last_command_output: None,
         }
     }
 
@@ -788,6 +908,8 @@ impl Terminal {
     pub(crate) fn focus_reporting_mode(&self) -> bool { self.focus_reporting_mode }
     pub(crate) fn mouse_reporting_mode(&self) -> MouseReportingMode { self.mouse_reporting_mode }
     pub(crate) fn sgr_mouse_mode(&self) -> bool { self.sgr_mouse_mode }
+    pub(crate) fn alternate_scroll(&self) -> bool { self.alternate_scroll }
+    pub(crate) fn urxvt_mouse_mode(&self) -> bool { self.urxvt_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
@@ -831,6 +953,8 @@ impl Terminal {
     /// 取り残されるより消える方が安全側という判断)。
     fn clear_images(&mut self) {
         self.images.clear();
+        self.kitty_id_by_placement.clear();
+        self.kitty_placement_ids.clear();
     }
 
     /// 現在ライブな全Sixel画像の`rgba`バイト列の合計サイズ(バイト)。
@@ -844,10 +968,18 @@ impl Terminal {
     /// (`ImagePlacement`のdocコメント「実装範囲」参照——画像による自動スクロールは
     /// 発生させず、画面下端でクリップする)。
     fn place_sixel_image(&mut self, img: SixelImage) {
+        self.push_image(img.width, img.height, img.rgba);
+    }
+
+    /// デコード済みビットマップ(sixel/Kitty共通)をカーソル位置を左上としてグリッドへ
+    /// 配置し、発行したplacement idを返す(タスク#42/#53)。行・列方向とも画面の残り
+    /// サイズへクランプする(`ImagePlacement`のdocコメント「実装範囲」参照——画像による
+    /// 自動スクロールは発生させず、画面下端でクリップする)。
+    fn push_image(&mut self, width: usize, height: usize, rgba: Vec<u8>) -> u64 {
         let col = self.cursor_col.min(self.cols.saturating_sub(1));
         let row = self.cursor_row.min(self.rows.saturating_sub(1));
-        let cols_span = (img.width + SIXEL_CELL_WIDTH_PX - 1) / SIXEL_CELL_WIDTH_PX;
-        let rows_span = (img.height + SIXEL_CELL_HEIGHT_PX - 1) / SIXEL_CELL_HEIGHT_PX;
+        let cols_span = (width + SIXEL_CELL_WIDTH_PX - 1) / SIXEL_CELL_WIDTH_PX;
+        let rows_span = (height + SIXEL_CELL_HEIGHT_PX - 1) / SIXEL_CELL_HEIGHT_PX;
         let cols_span = cols_span.max(1).min(self.cols - col);
         let rows_span = rows_span.max(1).min(self.rows - row);
 
@@ -859,9 +991,9 @@ impl Terminal {
             col: col as u32,
             rows_span: rows_span as u32,
             cols_span: cols_span as u32,
-            width_px: img.width as u32,
-            height_px: img.height as u32,
-            rgba: img.rgba,
+            width_px: width as u32,
+            height_px: height as u32,
+            rgba,
         });
         // 個数(`MAX_LIVE_IMAGES`)と合計バイト数(`MAX_TOTAL_IMAGE_RGBA_BYTES`)の
         // 両方を満たすまで、最も古い画像から順に捨てる(タスク#90)。新しく
@@ -871,13 +1003,51 @@ impl Terminal {
         while self.images.len() > MAX_LIVE_IMAGES
             || self.total_image_rgba_bytes() > MAX_TOTAL_IMAGE_RGBA_BYTES
         {
-            self.images.remove(0);
+            let removed = self.images.remove(0);
+            self.kitty_id_by_placement.remove(&removed.id);
+            self.kitty_placement_ids.remove(&removed.id);
         }
 
         // カーソルは画像の左下(次行の先頭)へ移動する(近似——実端末実装は分かれる
         // が、xterm等広く使われる実装の挙動に合わせる)。
         self.cursor_row = (row + rows_span).min(self.rows.saturating_sub(1));
         self.cursor_col = 0;
+        id
+    }
+
+    /// [crate::kitty_graphics::ApcInterceptor]が切り出した完成APCペイロード1件を処理
+    /// する(#53)。デコード・削除の判断は`KittyGraphics`側で完結しており、ここでは
+    /// その結果(配置/削除)を`images`へ反映するだけ(rust-ssot)。
+    pub(crate) fn dispatch_kitty_apc(&mut self, payload: &[u8]) {
+        match self.kitty.dispatch(payload) {
+            KittyCommand::Place(img) => {
+                let id = self.push_image(img.width, img.height, img.rgba);
+                // `i=`(client image id)の有無によらず、Kitty経由の全placementを
+                // ここへ記録する(`d=a`全削除の対象特定用。Opusレビュー指摘:
+                // 以前はkitty_idが無い画像がここに載らず、d=aで永久に消せなかった)。
+                self.kitty_placement_ids.insert(id);
+                if let Some(kid) = img.kitty_id {
+                    self.kitty_id_by_placement.insert(id, kid);
+                }
+            }
+            KittyCommand::DeleteAll => {
+                let ids = std::mem::take(&mut self.kitty_placement_ids);
+                self.images.retain(|img| !ids.contains(&img.id));
+                self.kitty_id_by_placement.clear();
+            }
+            KittyCommand::DeleteId(kid) => {
+                let placements: std::collections::HashSet<u64> = self
+                    .kitty_id_by_placement
+                    .iter()
+                    .filter(|(_, v)| **v == kid)
+                    .map(|(k, _)| *k)
+                    .collect();
+                self.images.retain(|img| !placements.contains(&img.id));
+                self.kitty_id_by_placement.retain(|k, _| !placements.contains(k));
+                self.kitty_placement_ids.retain(|k| !placements.contains(k));
+            }
+            KittyCommand::None => {}
+        }
     }
 
     /// HT(0x09)/CHT(`CSI Ps I`、タスク#61)共通: `col`より右にある最も近いタブストップを
@@ -943,6 +1113,8 @@ impl Terminal {
         self.gl_is_g1 = false;
         self.mouse_reporting_mode = MouseReportingMode::Off;
         self.sgr_mouse_mode = false;
+        self.alternate_scroll = false;
+        self.urxvt_mouse_mode = false;
         // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
         // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
         self.active_link_id = None;
@@ -957,6 +1129,13 @@ impl Terminal {
         // 仕様上の制約とは矛盾しない(両方を初期化するだけ)。
         self.main_kitty_flags_stack.clear();
         self.alt_kitty_flags_stack.clear();
+        // OSC 133(タスク#13): `total_scrolled_lines`/`prompt_marks`/`last_command_output`
+        // は`link_table`と同じ理由でRISでもクリアしない(過去マークの絶対行番号の
+        // 意味が変わってしまうため)。「今」の一時的な状態のみリセットする。
+        self.input_line_active = false;
+        self.capturing_command_output = false;
+        self.current_output_line.clear();
+        self.current_output_lines.clear();
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -1049,6 +1228,11 @@ impl Terminal {
         let main_removed = top_removed_for(main_reference_row);
         let alt_removed = top_removed_for(alt_reference_row);
 
+        // OSC 133(タスク#13): `resize_grid`はmain側の押し出し行を`pending_scrollback`へ
+        // 直接pushする(内部で何行押し出すか決まる)ため、呼び出し前後の長さ差分で
+        // `total_scrolled_lines`を増やす([scroll_up_region]と違い、ここでは押し出す
+        // 行数を呼び出し元が事前に知らないため差分方式にする)。
+        let scrollback_before = self.pending_scrollback.len();
         self.main_cells = Self::resize_grid(
             &self.main_cells, old_cols, old_rows, new_cols, new_rows, main_removed, &blank,
             Some(&mut self.pending_scrollback),
@@ -1057,6 +1241,7 @@ impl Terminal {
             &self.alt_cells, old_cols, old_rows, new_cols, new_rows, alt_removed, &blank,
             None,
         );
+        self.total_scrolled_lines += (self.pending_scrollback.len() - scrollback_before) as u64;
 
         let max_row = new_rows.saturating_sub(1);
         let shift_row = |row: usize, removed: usize| -> usize {
@@ -1302,6 +1487,10 @@ impl Terminal {
                 let row = self.main_cells[row_start..row_start + cols].to_vec();
                 self.pending_scrollback.push(row);
             }
+            // OSC 133(タスク#13): 実際にscrollbackへ押し出された行数だけ
+            // `total_scrolled_lines`を進める(`Terminal::total_scrolled_lines`
+            // フィールドdocコメント参照)。
+            self.total_scrolled_lines += n as u64;
         }
 
         if n < region_size {
@@ -1624,7 +1813,7 @@ impl Terminal {
     /// 直接呼べる`#[uniffi::export]`関数(`lib.rs::terminal_pointer_event_bytes`)
     /// からも再利用するため(タスク#51)。
     pub(crate) fn encode_pointer_event(&self, event: PointerEvent) -> Option<Vec<u8>> {
-        encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode)
+        encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode, self.urxvt_mouse_mode)
     }
 
     /// フォーカスレポーティング(`?1004`、タスク#60)が有効な場合のみ、OS由来のフォーカス
@@ -1749,6 +1938,199 @@ impl Terminal {
         self.link_table.push(uri.clone());
         self.link_ids.insert(uri, id);
         Some(id)
+    }
+
+    // ── OSC 133 セマンティックプロンプト(タスク#13) ──────────
+
+    /// OSC 133;A/B/C/Dの1マークを処理する。`sub`はA/B/C/Dのバイト、`extra`は
+    /// `D`の場合に付く可能性のあるexit code(`params[2]`、他のフォーマットの
+    /// 追加パラメータ——例えば`B;aid=1`の`aid=1`——ならパース失敗として無視する)。
+    /// A/B/C以外の未知の`sub`(将来のOSC 133拡張等)は無視する。
+    fn handle_osc133_prompt_mark(&mut self, sub: &[u8], extra: Option<&[u8]>) {
+        let row = self.total_scrolled_lines + self.cursor_row as u64;
+        let kind = match sub {
+            b"A" => PromptMarkKind::PromptStart,
+            b"B" => PromptMarkKind::CommandStart,
+            b"C" => PromptMarkKind::CommandExecuted,
+            b"D" => {
+                let exit_code = extra
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                PromptMarkKind::CommandFinished { exit_code }
+            }
+            _ => return,
+        };
+
+        // 「今コマンド入力中か」(タップでのカーソル移動、`cursor_move_bytes_for_click`
+        // が参照する)。Bで開始し、それ以外の全マークで終了する——次にAが来て
+        // 新しいプロンプトサイクルが始まった場合も含む。
+        self.input_line_active = matches!(kind, PromptMarkKind::CommandStart);
+
+        // 「直前コマンドの出力だけをコピー」(タスク#13)向けのキャプチャ制御。
+        match kind {
+            PromptMarkKind::CommandExecuted => {
+                self.capturing_command_output = true;
+                self.current_output_line.clear();
+                self.current_output_lines.clear();
+            }
+            PromptMarkKind::CommandFinished { .. } => {
+                if self.capturing_command_output {
+                    if !self.current_output_line.is_empty() {
+                        self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                    }
+                    self.last_command_output = Some(std::mem::take(&mut self.current_output_lines));
+                }
+                self.capturing_command_output = false;
+            }
+            _ => {}
+        }
+
+        self.prompt_marks.push_back(PromptMark { kind, row });
+        if self.prompt_marks.len() > MAX_PROMPT_MARKS {
+            self.prompt_marks.pop_front();
+        }
+    }
+
+    /// [prompt_marks]から「ジャンプ対象」となる行番号の列を、古い→新しい順で返す。
+    /// 各プロンプトサイクルにつき1件——`PromptStart`(A)を優先し、そのサイクルで
+    /// Aが来ていない場合のみ`CommandStart`(B)をフォールバックとして使う(シェルに
+    /// よってはAを送らずBのみのものがある)。`CommandExecuted`/`CommandFinished`が
+    /// 来ると次のサイクルとみなし、次のA/Bが改めてアンカーになる。
+    fn prompt_anchor_rows(&self) -> Vec<u64> {
+        let mut anchors = Vec::with_capacity(self.prompt_marks.len());
+        let mut cycle_anchored = false;
+        for mark in &self.prompt_marks {
+            match mark.kind {
+                PromptMarkKind::PromptStart => {
+                    anchors.push(mark.row);
+                    cycle_anchored = true;
+                }
+                PromptMarkKind::CommandStart => {
+                    if !cycle_anchored {
+                        anchors.push(mark.row);
+                        cycle_anchored = true;
+                    }
+                }
+                PromptMarkKind::CommandExecuted | PromptMarkKind::CommandFinished { .. } => {
+                    cycle_anchored = false;
+                }
+            }
+        }
+        anchors
+    }
+
+    /// 絶対行番号`abs_row`が、呼び出し時点で実際に表示可能(ライブ画面上、または
+    /// まだ`scrollback_len`件のscrollback内に残っている)かどうか。SCROLLBACK_LIMIT
+    /// によるトリミングで既に失われた行はfalseを返す——「前/次のプロンプトへ
+    /// ジャンプ」がそのような行を飛ばして次の候補を探せるようにするための判定。
+    fn is_prompt_row_reachable(&self, abs_row: u64, scrollback_len: u32) -> bool {
+        if abs_row >= self.total_scrolled_lines {
+            // ライブ画面上。リサイズ直後等で万一画面外を指していたら不可視。
+            return abs_row - self.total_scrolled_lines < self.rows as u64;
+        }
+        let offset = self.total_scrolled_lines - 1 - abs_row;
+        offset < scrollback_len as u64
+    }
+
+    /// 到達可能であることが確認済みの絶対行番号`abs_row`を、呼び出し元
+    /// (`session.rs`/Kotlin側)がそのまま使える[crate::PromptJumpTarget]へ変換する。
+    /// `scroll_offset`は既存の検索ジャンプ(タスク#37、[crate::ScrollbackSearchMatch]の
+    /// `row`と[SessionCore::scrollback_cells]の`offset`)と同じ規約——scrollback側なら
+    /// そのままoffsetとして使える値。
+    fn resolve_prompt_row_target(&self, abs_row: u64) -> crate::PromptJumpTarget {
+        if abs_row >= self.total_scrolled_lines {
+            crate::PromptJumpTarget { scroll_offset: 0, is_live: true }
+        } else {
+            let offset = (self.total_scrolled_lines - 1 - abs_row).min(u32::MAX as u64) as u32;
+            crate::PromptJumpTarget { scroll_offset: offset, is_live: false }
+        }
+    }
+
+    /// 「前/次のプロンプトへジャンプ」(タスク#13)。`from_scroll_offset`/
+    /// `from_showing_scrollback`は呼び出し時点でKotlin側が表示している位置
+    /// (既存の検索ジャンプ・タスク#79の`scrollOffset`/`showingScrollback`と同じ規約
+    /// ——`.claude/rules/rust-ssot.md`が「UI表示だけに閉じた状態」として許容する
+    /// スクロール位置そのものを渡す)。`scrollback_len`は呼び出し時点の
+    /// `SessionCore::scrollback_len()`(トリミングで実際に残っている行数)。
+    ///
+    /// - ライブ画面表示中(`from_showing_scrollback == false`)の基準点は現在の
+    ///   カーソル行の絶対行番号(`total_scrolled_lines + cursor_row`)——ライブ画面上に
+    ///   複数のプロンプトが同時に見えている場合(小さい端末・短いコマンド列)でも、
+    ///   現在位置より上にある直近のプロンプトへ正しくジャンプできる。
+    /// - `want_previous`が偽(「次」)で、scrollback内に候補が無い場合は、ライブ画面
+    ///   ([PromptJumpTarget::is_live] = true)へ「戻る」ジャンプ先を返す(ライブ表示中に
+    ///   「次」を呼んだ場合は既に最新なので`None`)。
+    pub(crate) fn prompt_jump_target(
+        &self,
+        want_previous: bool,
+        from_scroll_offset: u32,
+        from_showing_scrollback: bool,
+        scrollback_len: u32,
+    ) -> Option<crate::PromptJumpTarget> {
+        let reference = if from_showing_scrollback {
+            self.total_scrolled_lines.saturating_sub(1).saturating_sub(from_scroll_offset as u64)
+        } else {
+            self.total_scrolled_lines + self.cursor_row as u64
+        };
+        let anchors = self.prompt_anchor_rows();
+        if want_previous {
+            anchors.into_iter()
+                .filter(|&r| r < reference && self.is_prompt_row_reachable(r, scrollback_len))
+                .max()
+                .map(|r| self.resolve_prompt_row_target(r))
+        } else {
+            let next = anchors.into_iter()
+                .filter(|&r| r > reference && self.is_prompt_row_reachable(r, scrollback_len))
+                .min();
+            match next {
+                Some(r) => Some(self.resolve_prompt_row_target(r)),
+                None if from_showing_scrollback => {
+                    Some(crate::PromptJumpTarget { scroll_offset: 0, is_live: true })
+                }
+                None => None,
+            }
+        }
+    }
+
+    /// タップされたセル(`row`/`col`、0-indexed画面座標)が現在アクティブな入力行
+    /// (OSC 133;Bは来たが;Cがまだの区間、かつタップ行が現在のカーソル行と一致する
+    /// ——`input_line_active`フィールドdocコメント参照)上であれば、そこへカーソルを
+    /// 移動する矢印キー相当のバイト列を返す(Ghostty`cl=line`相当、タスク#13)。
+    /// 対象外(未アクティブ・別の行・移動量ゼロ)なら`None`——呼び出し元は
+    /// 何も送らない。
+    ///
+    /// 実際にリモートのシェル(readline等)のカーソル位置を動かすには、ターミナル側の
+    /// 表示カーソルを直接動かすのではなく、物理キーボードで矢印キーを`delta`回
+    /// 押したのと同じバイト列を送る必要がある——readlineはパラメータ付きCSI
+    /// (`ESC[5C`等)を「5回分の移動」として解釈しないため([crate::terminal_arrow_bytes]
+    /// と同じエンコード関数を使い、修飾キー無しの単純な矢印キー入力を`delta`回分
+    /// 生成する)。
+    pub(crate) fn cursor_move_bytes_for_click(&self, row: u32, col: u32) -> Option<Vec<u8>> {
+        if !self.input_line_active {
+            return None;
+        }
+        if row as usize != self.cursor_row {
+            return None;
+        }
+        let target_col = (col as usize).min(self.cols.saturating_sub(1));
+        let delta = target_col as i64 - self.cursor_col as i64;
+        if delta == 0 {
+            return None;
+        }
+        let letter = if delta > 0 { b'C' } else { b'D' };
+        let modifiers = crate::TerminalKeyModifiers::default();
+        let mut bytes = Vec::new();
+        for _ in 0..delta.unsigned_abs() {
+            bytes.extend_from_slice(&crate::terminal_arrow_bytes(letter, self.application_cursor_mode, modifiers));
+        }
+        Some(bytes)
+    }
+
+    /// 直前に完了したコマンド(OSC 133;C〜Dの区間)の出力をテキストとして返す
+    /// (タスク#13「直前コマンドの出力だけをコピー」)。まだ完了したコマンドが
+    /// 無ければ`None`。複数行は`\n`で結合する。
+    pub(crate) fn last_command_output_text(&self) -> Option<String> {
+        self.last_command_output.as_ref().map(|lines| lines.join("\n"))
     }
 }
 
@@ -1972,6 +2354,14 @@ impl Perform for Terminal {
         } else {
             c
         };
+        // OSC 133(タスク#13)「直前コマンドの出力だけをコピー」向けのテキスト
+        // キャプチャ。ここは`print_mapped`のグリッド書き込み(結合文字・折り返し等)
+        // より前でよい——vteが呼ぶ`print()`はデコード済みの1文字ずつなので、
+        // ここでの単純な文字列連結がそのまま結合文字を含む正しいUnicodeテキストになる
+        // (`capturing_command_output`フィールドdocコメントのスコープ外事項も参照)。
+        if self.capturing_command_output {
+            self.current_output_line.push(c);
+        }
         self.print_mapped(c);
     }
 
@@ -1983,7 +2373,16 @@ impl Perform for Terminal {
             // (フィールドdoc参照)を壊してしまう(Codexレビュー: タスク#24)。
             0x07 => { self.bell_generation = self.bell_generation.saturating_add(1); }
             0x0D => { self.cursor_col = 0; }
-            0x0A | 0x0B | 0x0C => { self.newline(); }
+            0x0A | 0x0B | 0x0C => {
+                // OSC 133(タスク#13)出力キャプチャ: 明示的なLF/VT/FFのみを論理行の
+                // 区切りとして扱う(`print_mapped`の自動折り返しも内部で`newline()`を
+                // 呼ぶが、あれは表示上の折り返しであり論理行の区切りではないため、
+                // ここ[execute、実際のC0制御バイト経由の呼び出し]でのみ確定させる)。
+                if self.capturing_command_output {
+                    self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                }
+                self.newline();
+            }
             0x08 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
             // SO(Shift Out)/SI(Shift In、タスク#41): GL(印字に使われる文字集合)を
             // G1/G0へ切り替える。実際の写像先(ASCIIかDEC Special Graphicsか)は
@@ -2098,6 +2497,10 @@ impl Perform for Terminal {
                     // 選ぶ、という順序も許容する必要があるため)。
                     ('h', 1006) => { self.sgr_mouse_mode = true; }
                     ('l', 1006) => { self.sgr_mouse_mode = false; }
+                    ('h', 1007) => { self.alternate_scroll = true; }
+                    ('l', 1007) => { self.alternate_scroll = false; }
+                    ('h', 1015) => { self.urxvt_mouse_mode = true; }
+                    ('l', 1015) => { self.urxvt_mouse_mode = false; }
                     ('h', 47) | ('h', 1047) => { self.switch_to_alt(false); }
                     ('h', 1049) => { self.switch_to_alt(true); }
                     ('l', 47) | ('l', 1047) => { self.switch_to_main(false); }
@@ -2460,6 +2863,12 @@ impl Perform for Terminal {
             // として扱う)。
             (Some(&b"8"), _) => {
                 self.handle_osc8_hyperlink(params);
+            }
+            // OSC 133(`ESC]133;<Ps>[;...]ST`、タスク#13): セマンティックプロンプト
+            // (A=プロンプト開始/B=コマンド入力開始/C=コマンド実行開始/D=コマンド終了)。
+            // 詳細は`handle_osc133_prompt_mark`参照。
+            (Some(&b"133"), Some(&sub)) => {
+                self.handle_osc133_prompt_mark(sub, params.get(2).copied());
             }
             // OSC 52 (`ESC]52;<selection>;<base64|?>BEL`): clipboard set.
             // `<selection>` (params[1], conventionally `c`/`p`/...) is not
@@ -5748,6 +6157,259 @@ mod tests {
         assert!(up.is_some());
     }
 
+    #[test]
+    fn test_encode_pointer_event_urxvt_press_and_release() {
+        // URXVT (?1015) uses `CSI Cb ; Cx ; Cy M` (no `<` prefix, unlike SGR).
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[0;10;5M");
+        let release = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Release,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(release, b"\x1b[0;10;5m");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_with_modifiers() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let mods = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Right), modifiers: mods,
+        }).unwrap();
+        // Right=2, Shift(4)+Ctrl(16)=20 → Cb=22
+        assert_eq!(press, b"\x1b[22;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_wheel() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let up = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelUp), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(up, b"\x1b[64;1;1M");
+        let down = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelDown), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(down, b"\x1b[65;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_drag_motion() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1002h\x1b[?1015h");
+        let drag = t.encode_pointer_event(PointerEvent {
+            row: 1, col: 1, kind: MouseEventKind::Motion,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        // motionビット(32)がCbに加算: 0(Left) + 32 = 32
+        assert_eq!(drag, b"\x1b[32;2;2M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_sgr_takes_precedence_over_urxvt() {
+        // When both ?1006 (SGR) and ?1015 (URXVT) are enabled, SGR wins.
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h\x1b[?1015h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[<0;1;1M", "SGR has `<` prefix, URXVT does not");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_horizontal_wheel_sgr() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(left, b"\x1b[<66;1;1M");
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(right, b"\x1b[<67;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_horizontal_wheel_legacy() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h"); // legacy X10
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        // WheelLeft=66, +32 = 98
+        assert_eq!(left, vec![0x1B, b'[', b'M', 32 + 66, 32 + 1, 32 + 1]);
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        // WheelRight=67, +32 = 99
+        assert_eq!(right, vec![0x1B, b'[', b'M', 32 + 67, 32 + 1, 32 + 1]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_middle_button_sgr() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Middle), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[<1;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_right_button_legacy() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Right), modifiers: no_mods(),
+        }).unwrap();
+        // Right=2, +32 = 34
+        assert_eq!(press, vec![0x1B, b'[', b'M', 32 + 2, 32 + 1, 32 + 1]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_horizontal_wheel() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(left, b"\x1b[66;1;1M");
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(right, b"\x1b[67;1;1M");
+    }
+
+    // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
+
+    #[test]
+    fn test_cursor_forward_cuf() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // Place cursor at col 5, then move forward 3
+        t.cursor_col = 5;
+        feed(&mut t, b"\x1b[3C");
+        assert_eq!(t.cursor_col, 8);
+        assert_eq!(t.cursor_row, 0);
+    }
+
+    #[test]
+    fn test_cursor_forward_cuf_clamps_at_last_column() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 78;
+        feed(&mut t, b"\x1b[5C");
+        assert_eq!(t.cursor_col, 79); // cols-1
+    }
+
+    #[test]
+    fn test_cursor_backward_cub() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[4D");
+        assert_eq!(t.cursor_col, 6);
+    }
+
+    #[test]
+    fn test_cursor_backward_cub_clamps_at_zero() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 2;
+        feed(&mut t, b"\x1b[10D");
+        assert_eq!(t.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_cursor_next_line_cnl() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 3;
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[2E");
+        assert_eq!(t.cursor_row, 5);
+        assert_eq!(t.cursor_col, 0, "CNL moves to column 0 after moving down");
+    }
+
+    #[test]
+    fn test_cursor_previous_line_cpl() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 5;
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[2F");
+        assert_eq!(t.cursor_row, 3);
+        assert_eq!(t.cursor_col, 0, "CPL moves to column 0 after moving up");
+    }
+
+    #[test]
+    fn test_cursor_key_mode_decckm() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.application_cursor_mode());
+        feed(&mut t, b"\x1b[?1h");
+        assert!(t.application_cursor_mode());
+        feed(&mut t, b"\x1b[?1l");
+        assert!(!t.application_cursor_mode());
+    }
+
+    #[test]
+    fn test_su_with_scroll_region() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // Fill rows 0-5 with identifiable content
+        for row in 0..6 {
+            let ch = (b'A' + row as u8) as char;
+            t.print(ch);
+            t.cursor_col = 0;
+            t.newline();
+        }
+        // Set scroll region to rows 1-4 (1-indexed: 2;5)
+        feed(&mut t, b"\x1b[2;5r");
+        // Move cursor into the region and scroll up 1
+        t.cursor_row = 2;
+        feed(&mut t, b"\x1b[1S");
+        // Row 0 (outside region) should be unchanged ('A')
+        assert_eq!(t.screen_cells()[0 * 80].ch.as_str(), "A");
+        // Row 1 (top of region) should now have 'C' (scrolled from row 2)
+        assert_eq!(t.screen_cells()[1 * 80].ch.as_str(), "C");
+        // Row 4 (bottom of region) should be blank
+        assert_eq!(t.screen_cells()[4 * 80].ch.as_str(), " ");
+    }
+
+    #[test]
+    fn test_reverse_index_ri() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 5;
+        feed(&mut t, b"\x1bM"); // Reverse Index
+        assert_eq!(t.cursor_row, 4);
+    }
+
+    #[test]
+    fn test_reverse_index_ri_at_top_scrolls_down() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.print('X');
+        t.cursor_row = 0;
+        t.cursor_col = 0;
+        feed(&mut t, b"\x1bM"); // RI at top of screen
+        // Row 0 should have been scrolled down, cursor stays at 0
+        assert_eq!(t.cursor_row, 0);
+        // Content 'X' that was at row 0 should now be at row 1
+        assert_eq!(t.screen_cells()[1 * 80].ch.as_str(), "X");
+    }
+
     // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
 
     #[test]
@@ -5842,6 +6504,63 @@ mod tests {
         let img = &images[0];
         assert_eq!(img.width_px, 500);
         assert_eq!(img.cols_span, 5, "画面の残り列数(5)にクランプされること");
+    }
+
+    // ── Kitty graphics(APC、タスク#53) ─────────────
+    // ApcInterceptorはsession_state.rs層にあるため、ここではdispatch_kitty_apcに
+    // 抽出済みAPCペイロードを直接渡す(kitty_graphics.rsのKittyGraphics単体テストと
+    // 同じ流儀)。
+
+    #[test]
+    fn test_kitty_delete_all_removes_placement_without_client_id() {
+        // Opusレビュー指摘: `i=`(client image id)を送らない画像(chafa等が実際に
+        // そうする)が`d=a`(全削除)で消せなかった不具合の回帰テスト。
+        use base64::Engine;
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let payload = format!(
+            "Gf=32,s=1,v=1,a=T;{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4])
+        );
+        t.dispatch_kitty_apc(payload.as_bytes());
+        assert_eq!(t.images().len(), 1, "i=無しでも画像は配置される");
+        t.dispatch_kitty_apc(b"Ga=d,d=A");
+        assert!(t.images().is_empty(), "i=無しの画像もd=aで削除されること");
+    }
+
+    #[test]
+    fn test_kitty_delete_all_does_not_remove_sixel_images() {
+        use base64::Engine;
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\"); // sixel画像を1枚配置
+        let payload = format!(
+            "Gf=32,s=1,v=1,a=T;{}",
+            base64::engine::general_purpose::STANDARD.encode([9u8, 9, 9, 9])
+        );
+        t.dispatch_kitty_apc(payload.as_bytes());
+        assert_eq!(t.images().len(), 2);
+        t.dispatch_kitty_apc(b"Ga=d,d=A");
+        assert_eq!(t.images().len(), 1, "Kittyのd=aはsixel画像を巻き込まない");
+    }
+
+    #[test]
+    fn test_kitty_delete_by_id_removes_only_matching_placement() {
+        use base64::Engine;
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let img_a = format!(
+            "Gf=32,s=1,v=1,a=T,i=1;{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8, 1, 1, 1])
+        );
+        let img_b = format!(
+            "Gf=32,s=1,v=1,a=T,i=2;{}",
+            base64::engine::general_purpose::STANDARD.encode([2u8, 2, 2, 2])
+        );
+        t.dispatch_kitty_apc(img_a.as_bytes());
+        t.dispatch_kitty_apc(img_b.as_bytes());
+        assert_eq!(t.images().len(), 2);
+        t.dispatch_kitty_apc(b"Ga=d,d=I,i=1");
+        let images = t.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].rgba, vec![2, 2, 2, 2]);
     }
 
     #[test]
@@ -5979,6 +6698,247 @@ mod tests {
             t.place_sixel_image(SixelImage { width: 1, height: 1, rgba: vec![0, 0, 0, 255] });
         }
         assert_eq!(t.images().len(), MAX_LIVE_IMAGES, "小さい画像では従来通りMAX_LIVE_IMAGES(32)枚に収まること");
+    }
+
+    // ── OSC 133 セマンティックプロンプト(タスク#13) ──────────
+
+    #[test]
+    fn test_osc133_abcd_sequence_does_not_affect_screen_content() {
+        // OSC 133自体は不可視のマーカーであり、画面内容(セル)には一切影響しない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n");
+        feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
+        feed(&mut t, b"\x1b]133;D;0\x07");
+        assert_eq!(cell(&t, 0, 0), "$");
+        assert_eq!(cell(&t, 0, 2), "l");
+        assert_eq!(cell(&t, 1, 0), "f");
+    }
+
+    #[test]
+    fn test_osc133_jump_to_previous_prompt_finds_prompt_pushed_into_scrollback() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        // 十分な行を流してこのプロンプトをscrollbackへ押し出す(rows=3の端末で
+        // これだけ流せば必ずスクロールする)。
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        assert!(t.total_scrolled_lines > 0);
+
+        // ライブ画面表示中(showing_scrollback=false)から「前」へジャンプすると、
+        // scrollbackへ押し出されたこのプロンプトが見つかる。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        let target = target.expect("scrollbackへ押し出されたプロンプトが見つかるはず");
+        assert!(!target.is_live);
+    }
+
+    #[test]
+    fn test_osc133_jump_previous_among_multiple_live_prompts_finds_nearest_before_cursor() {
+        // 端末が十分大きく(rows=10)、2つのプロンプトが両方ともスクロールせずライブ画面上に
+        // 同時に見えているケース。カーソル位置(現在位置)より前にある直近のプロンプトが
+        // 見つかることを確認する(単に「ライブ画面最上行より上か」だけでは、この
+        // ケースを正しく扱えない——docコメント参照)。
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n"); // mark row=0
+        feed(&mut t, b"\x1b]133;A\x07$ cmd2\r\n"); // mark row=1、カーソルはこの後row=2
+        assert_eq!(t.total_scrolled_lines, 0, "rows=10なのでこのテストでは一切スクロールしない前提");
+
+        let prev = t.prompt_jump_target(true, 0, false, 0)
+            .expect("カーソル位置より前の直近プロンプト(cmd2)が見つかるはず");
+        assert!(prev.is_live);
+        assert_eq!(prev.scroll_offset, 0, "is_live=trueの場合scroll_offsetは意味を持たない(0固定)");
+    }
+
+    #[test]
+    fn test_osc133_jump_next_falls_back_to_live_when_no_later_prompt_exists() {
+        // scrollback表示中(showing_scrollback=true)に「次」を呼んだが、それより後の
+        // プロンプトマークが1つも無い場合は、ライブ画面へ「戻る」ジャンプ先を返す。
+        let t = Terminal::new(10, 5, Theme::default());
+        let next = t.prompt_jump_target(false, 0, true, 0)
+            .expect("ライブへ戻るフォールバックが返るはず");
+        assert!(next.is_live);
+    }
+
+    #[test]
+    fn test_osc133_jump_next_returns_none_when_already_live_and_no_later_prompt() {
+        // ライブ画面表示中(showing_scrollback=false)に「次」を呼んだ場合、フォール
+        // バックは行わない(既にライブより後は無いため)。
+        let t = Terminal::new(10, 5, Theme::default());
+        assert!(t.prompt_jump_target(false, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_previous_returns_none_when_no_earlier_prompt() {
+        // カーソルがまだそのプロンプト自身の行にいる(=マーク直後、何も出力していない)
+        // 場合、「前」は見つからない——前の絶対行番号(reference)自体がこのマークの行と
+        // 同じで、`want_previous`の`r < reference`(厳密未満)を満たさないため。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07");
+        assert!(t.prompt_jump_target(true, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_next_returns_none_when_already_live_with_no_more_prompts() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ only\r\n");
+        assert!(t.prompt_jump_target(false, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_falls_back_to_command_start_when_prompt_start_absent() {
+        // 一部のシェルはAを送らずBのみを送る——その場合Bをアンカーとして使う。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07$ cmd1\r\n");
+        feed(&mut t, b"\x1b]133;B\x07$ cmd2\r\n");
+        let prev = t.prompt_jump_target(true, 0, false, 0);
+        assert!(prev.is_some(), "Aが無くてもBをアンカーとしてジャンプできるはず");
+    }
+
+    #[test]
+    fn test_osc133_jump_unreachable_evicted_row_is_skipped() {
+        // scrollback_lenを実際より小さく(=evicted扱いに)すると、scrollbackへ既に
+        // 押し出された唯一の候補がジャンプ対象から外れる。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n"); // mark1をscrollbackへ押し出す
+        assert!(t.total_scrolled_lines > 0, "rows=3の端末でこれだけ流せば必ずスクロールする");
+
+        // scrollback_len=0は「1つ目のプロンプト行は既にscrollbackから追い出された」
+        // ことを意味する。
+        assert!(t.prompt_jump_target(true, 0, false, 0).is_none());
+        // 十分なscrollback_lenを渡せば、同じ絶対行番号のマークが見つかる。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        assert!(target.is_some(), "scrollback_lenが十分ならreachableと判定されるはず");
+    }
+
+    #[test]
+    fn test_osc133_click_moves_cursor_forward_on_active_input_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        // カーソルは(0,2)。同じ行の列5をタップ -> 3回分right矢印。
+        let bytes = t.cursor_move_bytes_for_click(0, 5).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1b[C\x1b[C\x1b[C".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_moves_cursor_backward_on_active_input_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07abcde");
+        // カーソルは(0,5)。列1をタップ -> 4回分left矢印。
+        let bytes = t.cursor_move_bytes_for_click(0, 1).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1b[D\x1b[D\x1b[D\x1b[D".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_uses_ss3_form_when_application_cursor_mode_active() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1h"); // DECCKM on
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        let bytes = t.cursor_move_bytes_for_click(0, 3).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1bOC".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_before_command_start() {
+        // OSC 133;Bがまだ来ていない(=入力行がアクティブでない)状態のタップは無視する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"ab");
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_after_command_executed() {
+        // ;Cが来た後(出力フェーズ)はもう入力行ではないので無視する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab\x1b]133;C\x07");
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_on_a_different_row() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        assert!(t.cursor_move_bytes_for_click(1, 0).is_none(), "カーソル行以外のタップは無視するはず");
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_when_tapped_column_equals_cursor_column() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        assert!(t.cursor_move_bytes_for_click(0, 2).is_none(), "移動量ゼロは送信しない");
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_single_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
+        feed(&mut t, b"\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output_text(), Some("file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_multi_line_joins_with_newline() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07line1\r\nline2\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        assert_eq!(t.last_command_output_text(), Some("line1\nline2".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_none_before_any_command_finished() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.last_command_output_text(), None);
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_is_overwritten_by_newer_command() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07old\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        feed(&mut t, b"\x1b]133;C\x07new\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        assert_eq!(t.last_command_output_text(), Some("new".to_string()), "直前の1件のみを保持する");
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_ignores_bytes_outside_c_to_d_window() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07prompt-not-output\r\n");
+        feed(&mut t, b"\x1b]133;C\x07actual-output\r\n");
+        feed(&mut t, b"\x1b]133;D\x07next-prompt-not-output\r\n");
+        assert_eq!(t.last_command_output_text(), Some("actual-output".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_d_exit_code_parses_when_present_and_numeric() {
+        // exit codeそのものは`last_command_output_text`からは見えないが、パース失敗
+        // (数値以外)でもpanicしない/後続の処理を壊さないことを確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07out\r\n");
+        feed(&mut t, b"\x1b]133;D;127\x07");
+        assert_eq!(t.last_command_output_text(), Some("out".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_d_with_non_numeric_extra_param_does_not_panic() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07out\r\n");
+        feed(&mut t, b"\x1b]133;D;aid=1\x07");
+        assert_eq!(t.last_command_output_text(), Some("out".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_reset_all_clears_transient_state_but_keeps_history_addressable() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n"); // cmd1をscrollbackへ押し出す
+        feed(&mut t, b"\x1b]133;B\x07partial-input");
+        feed(&mut t, b"\x1bc"); // RIS
+        // RIS後は「今入力中」ではなくなる(タップは無効化)。
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+        // だが過去のプロンプト(scrollbackへ押し出し済み)への絶対行番号ベースの
+        // ジャンプ判断は壊れない(`total_scrolled_lines`/`prompt_marks`はRISで
+        // クリアしないため)。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        assert!(target.is_some());
     }
 
     // ── Proptest: 不変量 ────────────────────────────────

@@ -31,8 +31,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod file_lock;
+mod identity_file;
 #[cfg(windows)]
 mod windows_acl;
+
+pub use file_lock::with_exclusive_lock;
+pub use identity_file::identity_file_candidates;
 
 /// A permission-guard failure, deliberately without a `path` field: callers
 /// already know which path they passed in and attach it to their own error

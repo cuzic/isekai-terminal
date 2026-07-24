@@ -47,4 +47,7 @@ pub enum TrustError {
 
     #[error("invalid port in host spec {spec:?}: {reason}")]
     InvalidPort { spec: String, reason: String },
+
+    #[error("failed to acquire exclusive lock for {path}: {source}")]
+    Lock { path: PathBuf, #[source] source: std::io::Error },
 }

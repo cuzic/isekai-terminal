@@ -43,6 +43,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
@@ -70,9 +71,11 @@ import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
 import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
+import tools.isekai.terminal.ui.shouldRevealAuxDrawer
 import tools.isekai.terminal.ui.shouldReportMouseMotion
 import tools.isekai.terminal.ui.shouldUseMouseTouch
 import tools.isekai.terminal.ui.wheelButtonForDelta
+import tools.isekai.terminal.ui.wheelButtonForHorizontalDelta
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.ui.synthesizeDisplayUpdate
 import tools.isekai.terminal.util.RemoteLogger
@@ -96,6 +99,18 @@ data class TerminalScreenActions(
     /** タスク#66: スクロールバック検索。マッチ計算は一切Kotlin側で行わず、Rust側
      *  `SessionCore::search_scrollback`(#37)の結果をそのまま返すだけ(rust-ssot)。 */
     val onSearchScrollback: (String, Boolean) -> List<ScrollbackSearchMatch> = { _, _ -> emptyList() },
+    /** タスク#13(OSC 133): 「前/次のプロンプトへジャンプ」。既存のスクロールバック検索
+     *  ([onSearchScrollback])とは独立した機能。引数は現在の(scrollOffset, showingScrollback)。
+     *  結果は[TerminalUiState.promptJumpResult]で非同期に届く。 */
+    val onJumpToPreviousPrompt: (Int, Boolean) -> Unit = { _, _ -> },
+    val onJumpToNextPrompt: (Int, Boolean) -> Unit = { _, _ -> },
+    /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
+    val onClickToPromptCursor: (Int, Int) -> Unit = { _, _ -> },
+    /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
+     *  [TerminalUiState.promptOutputCopyResult]で非同期に届く。 */
+    val onCopyLastCommandOutput: () -> Unit = {},
     val onTrustUpdatedHostKey: () -> Unit,
     val onDismissHostKeyWarning: () -> Unit,
     val onTrustNewHostKey: () -> Unit,
@@ -120,6 +135,11 @@ data class TerminalScreenActions(
      *  そのまま呼ばれる。フォーカスレポーティング(`CSI ?1004`)が有効かどうかの判断は
      *  Rust側が持つため、ここでは生の値を渡すだけでよい。 */
     val onFocusChanged: (Boolean) -> Unit = {},
+    /** タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモートで
+     *  1回実行して結果を待つ。`TerminalSession.filePreviewRequest`への薄い委譲
+     *  (パース/デコードは全てRust側で完結しており、ここは中継するだけ)。 */
+    val onFilePreviewRequest: suspend (FilePreviewRequestKind) -> FilePreviewOutcome =
+        { FilePreviewOutcome.Error("not connected") },
 )
 
 /**
@@ -203,10 +223,43 @@ fun TerminalScreenBody(
     // `showingScrollback`と対称。「UI表示だけに閉じた状態」として`scrollOffset`と
     // 同じくrust-ssot.mdの例外)。
     var showingScrollback by remember { mutableStateOf(false) }
+
+    // タスク#13(OSC 133)「前/次のプロンプトへジャンプ」の結果を反映する。
+    // `PromptJumpResult.seq`が変化するたびに1回だけ実行される(既存のスクロールバック検索
+    // ジャンプ[jumpToCurrentSearchMatch]と同じ規約——`PromptJumpTarget.isLive`が
+    // タスク#79の`showingScrollback`/`scrollOffset==0`衝突を明示的に区別する)。
+    // ジャンプ先が無かった場合([target]が`null`)は何もしない(将来的な視覚フィードバックは
+    // スコープ外)。
+    LaunchedEffect(uiState.promptJumpResult.seq) {
+        if (uiState.promptJumpResult.seq == 0L) return@LaunchedEffect
+        val target = uiState.promptJumpResult.target ?: return@LaunchedEffect
+        if (target.isLive) {
+            scrollOffset = 0
+            showingScrollback = false
+        } else {
+            scrollOffset = target.scrollOffset.toInt()
+            showingScrollback = true
+        }
+    }
+    // タスク#13(OSC 133)「直前コマンドの出力だけをコピー」の結果をクリップボードへ書く。
+    // 選択範囲コピー([performCopy])と同じ`ClipboardManager`経路。
+    LaunchedEffect(uiState.promptOutputCopyResult.seq) {
+        if (uiState.promptOutputCopyResult.seq == 0L) return@LaunchedEffect
+        val text = uiState.promptOutputCopyResult.text ?: return@LaunchedEffect
+        if (text.isNotEmpty()) {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal command output", text))
+        }
+    }
+
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
     var showKeySequenceSheet by remember { mutableStateOf(false) }
+    // タスク#17(ファイルプレビュー機能): ブラウザ/ビューアシートの開閉。中の内容
+    // (現在のパス・開いているビューア)は`FilePreviewSheet`自身が保持するナビゲーション
+    // 専用のUI状態であり(rust-ssot.mdの例外)、ここでは「開いているかどうか」だけを持つ。
+    var showFileBrowser by remember { mutableStateOf(false) }
     // タスク#66: スクロールバック検索バーの開閉・クエリ・大小文字区別・マッチ結果一覧・
     // 「今何件目を見ているか」。いずれも「UI表示だけに閉じた状態」(rust-ssot.mdの例外、
     // scrollOffset/selectionと同じ扱い)であり、マッチの計算自体(部分一致検索・combining
@@ -310,6 +363,8 @@ fun TerminalScreenBody(
         onDismissSnippetSheet = { showSnippetSheet = false },
         showKeySequenceSheet = showKeySequenceSheet,
         onDismissKeySequenceSheet = { showKeySequenceSheet = false },
+        showFileBrowser = showFileBrowser,
+        onDismissFileBrowser = { showFileBrowser = false },
         visible = isActive && hasFocus,
     )
 
@@ -378,6 +433,11 @@ fun TerminalScreenBody(
                             },
                             contentPadding = PaddingValues(0.dp),
                         ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
+                        // タスク#17: ファイルブラウザ/プレビューシートを開く。
+                        TextButton(
+                            onClick = { showFileBrowser = true },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("ファイル", color = AppColors.SecondaryText, fontSize = 11.sp) }
                     }
                     // #14: セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
                     // 表示可否の判定はRebindPublicState(Rust側が発火するcallback経由)だけを
@@ -484,6 +544,26 @@ fun TerminalScreenBody(
 
                 var panAccumY by remember { mutableStateOf(0f) }
 
+                // 補助操作ドロワー(キーボード表示・ローカル履歴ページ送り・PgUp/PgDn・マウス
+                // ホイール送信のアイコン)の表示状態。指の本数を問わない上向き垂直ドラッグ
+                // (下のpointerInputで検出、他の経路のジェスチャー消費とは独立)で表示し、
+                // 無操作が続くと自動的に隠れる。「UI表示だけに閉じた状態」としてComposeローカルで
+                // 保持する(選択範囲・スクロール位置と同じ扱い、rust-ssot原則の対象外)。
+                var auxDrawerVisible by remember { mutableStateOf(false) }
+                // ドロワーのボタン操作のたびに増やす。auto-hideの`LaunchedEffect`のkeyに使い、
+                // 操作中は毎回タイマーをリセットして消えないようにする。
+                var auxDrawerActivityTick by remember { mutableStateOf(0) }
+                val onAuxDrawerActivity: () -> Unit = {
+                    auxDrawerVisible = true
+                    auxDrawerActivityTick++
+                }
+                LaunchedEffect(auxDrawerVisible, auxDrawerActivityTick) {
+                    if (auxDrawerVisible) {
+                        delay(3000)
+                        auxDrawerVisible = false
+                    }
+                }
+
                 // IME フォーカス要求（単純タップ用）。AndroidView 生成前は no-op。
                 val requestImeFocus: () -> Unit = {
                     inputView?.let { view ->
@@ -569,6 +649,7 @@ fun TerminalScreenBody(
                         rows = u.rows,
                         mouseReportingMode = u.mouseReportingMode,
                         sgrMouseMode = u.sgrMouseMode,
+                        urxvtMouseMode = u.urxvtMouseMode,
                     )
                     if (bytes != null) actions.onSend(bytes)
                 }
@@ -783,6 +864,17 @@ fun TerminalScreenBody(
                                             if (tappedUrl != null && isOpenableHyperlinkScheme(tappedUrl)) {
                                                 pendingHyperlinkUrl = tappedUrl
                                             } else {
+                                                // タスク#13(OSC 133): タップ位置が現在アクティブな入力行上
+                                                // なら、そこへカーソルを移動する(Ghostty`cl=line`相当)。
+                                                // ライブ画面表示中(scrollback表示中でない)の場合のみ意味を
+                                                // 持つ——scrollback表示中はタップされたセルが実際に入力中の
+                                                // 行と無関係な過去ログであり、判定はRust側
+                                                // (`Terminal::cursor_move_bytes_for_click`)が行うが、そもそも
+                                                // ライブ画面座標でない値を渡すこと自体を避ける。無効なタップ
+                                                // (対象外の行・移動量ゼロ)はRust側で無音のno-opになる。
+                                                if (scrollOffset == 0 && !showingScrollback) {
+                                                    actions.onClickToPromptCursor(tapCell.row, tapCell.col)
+                                                }
                                                 // 画面分割時はこのペインへフォーカスを切り替え、その上でIMEフォーカスを要求する
                                                 // (このペインがまだフォーカス外の場合、入力欄自体がこの呼び出し時点では
                                                 // 未生成[inputViewがnull]のため即時には効かないが、onRequestFocus()による
@@ -811,12 +903,9 @@ fun TerminalScreenBody(
                             // 届くため`awaitFirstDown`では捕捉できない)ため、別のpointerInputで待ち受ける。
                             //
                             // 対象外(Fableレビューで明示を求められたスコープ判断): alt-screenでの
-                            // wheel→矢印キー変換(xterm `?1007` Alternate Scroll Mode相当)は実装しない。
-                            // rust-core(タスク#36)は`?1007`のモード状態を保持しておらず、`ScreenUpdate`も
-                            // 「現在alt screenかどうか」を公開していない — この判断はターミナル状態の
-                            // SSOTであるRust側に持たせるべきで(rust-ssot)、Kotlin側で代替の判定
-                            // (例えばESCシーケンスの目視パース)を持つのは避ける。実装するならまず
-                            // rust-core側に`?1007`状態とalt-screen可視性を追加する別タスクが必要。
+                            // wheel→矢印キー変換(xterm `?1007` Alternate Scroll Mode相当)は
+                            // rust-core側に`alternate_scroll`状態が実装されたため、今後の
+                            // タスクで対応可能。
                             .pointerInput(Unit) {
                                 awaitPointerEventScope {
                                     while (true) {
@@ -825,19 +914,55 @@ fun TerminalScreenBody(
                                         if (!isPointerReportingActive()) continue
                                         val change = event.changes.firstOrNull() ?: continue
                                         val deltaY = change.scrollDelta.y
-                                        // Composeのスクロール系API(Modifier.scrollable等)と同じ符号規約:
-                                        // 正のdeltaY = コンテンツを上へ送る(=下方向へスクロール、xtermの
-                                        // wheel down/button 65)。実機(Bluetoothマウス等)未検証のため、
-                                        // 符号が逆であれば実機確認時に反転させる。判定自体は
-                                        // `wheelButtonForDelta`(タスク#87、`MouseGestureArbiter.kt`)へ抽出済み
-                                        // ——`deltaY == 0f`の場合は`null`が返るのでcontinueする。
-                                        val button = wheelButtonForDelta(deltaY) ?: continue
+                                        val deltaX = change.scrollDelta.x
                                         change.consume()
-                                        sendPointerEventAt(
-                                            MouseEventKind.PRESS, button, change.position.x, change.position.y,
-                                            latestCellDims.value.first, latestCellDims.value.second,
-                                            latestCols.value, latestRows.value,
-                                        )
+                                        // Vertical wheel
+                                        val vButton = wheelButtonForDelta(deltaY)
+                                        if (vButton != null) {
+                                            sendPointerEventAt(
+                                                MouseEventKind.PRESS, vButton, change.position.x, change.position.y,
+                                                latestCellDims.value.first, latestCellDims.value.second,
+                                                latestCols.value, latestRows.value,
+                                            )
+                                        }
+                                        // Horizontal wheel
+                                        val hButton = wheelButtonForHorizontalDelta(deltaX)
+                                        if (hButton != null) {
+                                            sendPointerEventAt(
+                                                MouseEventKind.PRESS, hButton, change.position.x, change.position.y,
+                                                latestCellDims.value.first, latestCellDims.value.second,
+                                                latestCols.value, latestRows.value,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            // タスク#89: 補助操作ドロワー(キーボード表示/ローカル履歴ページ送り/
+                            // PgUp・PgDn/マウスホイール送信)を出す上向き垂直ドラッグの検出。
+                            // 上のマウスタッチ/ピンチ/ホイール経路とは独立した別系統の
+                            // `pointerInput`で、`change.consume()`を一切呼ばないため、
+                            // どの経路が同時にジェスチャーを処理していても(マウスモードの
+                            // クリック転送中でも、ピンチ中でも)検出できる。指の本数は問わない
+                            // (最初にdownした指[down.id]のY移動だけを見る——複数指が揃って
+                            // 動く通常のドラッグでは十分)。
+                            .pointerInput(Unit) {
+                                val thresholdPx = with(density) { 32.dp.toPx() }
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+                                        val startY = down.position.y
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id }
+                                            if (change == null || !change.pressed) break
+                                            if (shouldRevealAuxDrawer(startY, change.position.y, thresholdPx)) {
+                                                onAuxDrawerActivity()
+                                                break
+                                            }
+                                        }
+                                        // 全ての指が離れるまで待ってから次のジェスチャー検出を始める
+                                        // (このgestureの残りのドラッグ量で連続再発火しないように)。
+                                        while (currentEvent.changes.any { it.pressed }) awaitPointerEvent()
                                     }
                                 }
                             },
@@ -905,6 +1030,72 @@ fun TerminalScreenBody(
                                 color = Color.Cyan,
                                 fontSize = 11.sp,
                             )
+                        }
+                    }
+
+                    // タスク#89: 補助操作ドロワー。マウスレポーティング有効時は1本指タップが
+                    // クリック転送に使われ`requestImeFocus()`を呼ばない(=キーボードを
+                    // 呼び出す手段が無くなる)ため、ジェスチャー状態に依存しない常設の
+                    // 迂回路として、上向き垂直ドラッグで一時的に表示する(無操作3秒でオート
+                    // ハイド)。ローカル履歴ページ送り・マウスホイール送信は、以前検討した
+                    // 「指の本数で分岐」案がOEM各社(Xiaomi/OnePlus/Huawei/Oppo)のスクリーン
+                    // ショットジェスチャーやTalkBackの2本指/3本指スワイプと衝突するため、
+                    // ドラッグではなく通常のボタンタップに倒した(タップはTalkBackにも
+                    // 標準的に認識される)。
+                    // Box(BoxScope)の中だが外側の`Column`(ColumnScope)がまだ暗黙のレシーバー
+                    // として到達可能で、`ColumnScope.AnimatedVisibility`拡張とトップレベル関数
+                    // の間で解決が曖昧になる(実機ビルドで確認済みのコンパイルエラー)ため、
+                    // 完全修飾名で明示的にトップレベル版を呼ぶ。
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = auxDrawerVisible,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp),
+                    ) {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.medium)
+                                .padding(6.dp),
+                        ) {
+                            CtrlBtn("⌨") { onAuxDrawerActivity(); requestImeFocus() }
+                            CtrlBtn("履歴▲") {
+                                onAuxDrawerActivity()
+                                scrollOffset = (scrollOffset + renderRows).coerceIn(0, scrollbackLen)
+                            }
+                            CtrlBtn("履歴▼") {
+                                onAuxDrawerActivity()
+                                scrollOffset = (scrollOffset - renderRows).coerceIn(0, scrollbackLen)
+                                // タスク#79: 手動でライブ方向へ0まで戻したら`showingScrollback`も
+                                // 解除する(「ライブへ戻る」ボタン・2本指パンと同じ扱い)。
+                                if (scrollOffset == 0) showingScrollback = false
+                            }
+                            CtrlBtn("PgUp") {
+                                onAuxDrawerActivity()
+                                actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP)!!)
+                            }
+                            CtrlBtn("PgDn") {
+                                onAuxDrawerActivity()
+                                actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN)!!)
+                            }
+                            // マウスホイール送信: リモートがマウスレポーティング未対応(モードOff)
+                            // の場合は`sendPointerEvent`内部の`terminalPointerEventBytes`(Rust側)が
+                            // nullを返して無送信になる(rust-ssot: 送るべきか否かの判断はRust側の
+                            // 状態を見るだけで、ここでKotlin側のミラー判定は行わない)。ボタン1回
+                            // タップ = ホイール1ノッチ(xtermのwheel up/downは1ノッチごとに独立した
+                            // PRESSイベントで、release不要)。3倍速ボタンは同じイベントを3回連続で
+                            // 送るだけ(vim/htop/less等、ノッチ数だけ行送りするアプリでの高速ページ
+                            // 送り用)。
+                            val sendWheel: (MouseButton, Int) -> Unit = { button, notches ->
+                                onAuxDrawerActivity()
+                                repeat(notches) {
+                                    sendPointerEvent(MouseEventKind.PRESS, button, latestRows.value / 2, latestCols.value / 2)
+                                }
+                            }
+                            CtrlBtn("Wheel▲") { sendWheel(MouseButton.WHEEL_UP, 1) }
+                            CtrlBtn("Wheel▼") { sendWheel(MouseButton.WHEEL_DOWN, 1) }
+                            CtrlBtn("Wheel▲3x") { sendWheel(MouseButton.WHEEL_UP, 3) }
+                            CtrlBtn("Wheel▼3x") { sendWheel(MouseButton.WHEEL_DOWN, 3) }
                         }
                     }
 
@@ -1019,11 +1210,21 @@ fun TerminalScreenBody(
                     CtrlBtn("↓") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_DOWN, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("←") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_LEFT, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("→") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_RIGHT, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("PgUp") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP)!!) }
+                    CtrlBtn("PgDn") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN)!!) }
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }
                     // タスク#66: スクロールバック検索バーを開く。
                     CtrlBtn("検索") { showSearchBar = true }
+                    // タスク#13(OSC 133): 前/次のプロンプトへジャンプ。物理キーボードの
+                    // 無いAndroidでコマンド履歴を辿る手段として特に価値が高い。現在の
+                    // (scrollOffset, showingScrollback)をそのまま渡し、判断はRust側
+                    // (`Terminal::prompt_jump_target`)に委ねる。
+                    CtrlBtn("前のプロンプト") { actions.onJumpToPreviousPrompt(scrollOffset, showingScrollback) }
+                    CtrlBtn("次のプロンプト") { actions.onJumpToNextPrompt(scrollOffset, showingScrollback) }
+                    // タスク#13: 直前コマンドの出力だけをクリップボードへコピーする。
+                    CtrlBtn("出力コピー") { actions.onCopyLastCommandOutput() }
                 }
 
                 // F1〜F12 行（横スクロール、Ctrl キー行を圧迫しないよう別行にする）
@@ -1120,6 +1321,9 @@ private fun TerminalModalHost(
     onDismissSnippetSheet: () -> Unit,
     showKeySequenceSheet: Boolean,
     onDismissKeySequenceSheet: () -> Unit,
+    /** タスク#17: ファイルブラウザ/プレビューシートの開閉。 */
+    showFileBrowser: Boolean,
+    onDismissFileBrowser: () -> Unit,
     visible: Boolean,
 ) {
     if (!visible) return
@@ -1180,6 +1384,18 @@ private fun TerminalModalHost(
                 onDismissKeySequenceSheet()
             },
             onDismiss = onDismissKeySequenceSheet,
+        )
+    }
+
+    // タスク#17(ファイルプレビュー機能): リモートのディレクトリブラウザ + Markdown/画像/
+    // CSV/シンタックスハイライト付きテキストビューア。実データの取得(`ls`/`cat`)は
+    // `actions.onFilePreviewRequest`経由でRust側`SessionOrchestrator::filePreviewRequest`
+    // (`isekai-pipe ctl file`のexec)にそのまま委譲する。
+    if (showFileBrowser) {
+        tools.isekai.terminal.filepreview.FilePreviewSheet(
+            onRequest = actions.onFilePreviewRequest,
+            onDismiss = onDismissFileBrowser,
+            onOpenTerminalForTransfer = onDismissFileBrowser,
         )
     }
 }

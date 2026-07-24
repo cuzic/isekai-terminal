@@ -92,6 +92,10 @@ dependencies {
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    // タスク#17(ファイルプレビュー機能): ディレクトリブラウザのフォルダ/ファイルアイコン
+    // (`Folder`/`Description`)がmaterial-icons-core(既定で入っている少数の定番アイコンのみ)
+    // に無いため追加。バージョンはandroidx-compose-bomが管理する。
+    implementation(libs.androidx.material.icons.extended)
     implementation(libs.kmp.terminal.input)
     implementation("net.java.dev.jna:jna:5.14.0@aar")
     implementation(libs.room.runtime)

@@ -435,6 +435,14 @@ private fun TerminalPaneScreen(
                     onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
                     onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
                     onSearchScrollback = { query, caseSensitive -> tabsVm.searchScrollbackForPane(address, query, caseSensitive) },
+                    onJumpToPreviousPrompt = { fromScrollOffset, fromShowingScrollback ->
+                        tabsVm.jumpToPreviousPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                    },
+                    onJumpToNextPrompt = { fromScrollOffset, fromShowingScrollback ->
+                        tabsVm.jumpToNextPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                    },
+                    onClickToPromptCursor = { row, col -> tabsVm.clickToPromptCursorForPane(address, row, col) },
+                    onCopyLastCommandOutput = { tabsVm.copyLastCommandOutputForPane(address) },
                     onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
                     onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
                     onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
@@ -455,6 +463,9 @@ private fun TerminalPaneScreen(
                     onPreviousTab = { tabsVm.previousTab() },
                     onForceReturnToWifi = { pane.session.forceReturnToWifi() },
                     onFocusChanged = { focused -> pane.session.notifyFocusChange(focused) },
+                    // タスク#17(ファイルプレビュー機能): `TerminalSession.filePreviewRequest`への
+                    // 薄い委譲(パース/デコードはRust側で完結、Kotlin側は中継のみ)。
+                    onFilePreviewRequest = { kind -> pane.session.filePreviewRequest(kind) },
                 ),
             )
 

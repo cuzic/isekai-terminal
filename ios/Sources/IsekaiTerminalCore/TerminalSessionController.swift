@@ -963,4 +963,21 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     public func onRebindStateChanged(state: RebindPublicState) {
         Task { @MainActor in self.uiState.rebindState = state }
     }
+
+    // タスク#13(OSC 133): 「前/次のプロンプトへジャンプ」・「直前コマンドの出力だけを
+    // コピー」はAndroid版(`TerminalSession.kt`)でのみUI実装済みで、iOS側にはまだ対応する
+    // UIが無い(`onNoViablePath`/`onData`と同じくno-op)。`OrchestratorCallback`はKotlin/iOS
+    // 共有のプロトコルのため、UI未実装でも準拠のためのメソッド自体は必要。iOS側にUIを
+    // 追加する際はAndroid版と同じくRust側(`Terminal::prompt_jump_target`/
+    // `last_command_output_text`)の判断結果をそのまま反映するだけでよい。
+    public func onPromptJump(target: PromptJumpTarget?) {}
+
+    public func onPromptOutputCopyReady(text: String?) {}
+
+    // タスク#17(ファイルプレビュー機能): Android版(`TerminalSession.kt`の
+    // `filePreviewRequest`/`onFilePreviewResult`)でのみUI実装済みで、iOS側にはまだ
+    // 対応するUIが無い(`onPromptJump`と同じくno-op)。iOS側にディレクトリブラウザ/
+    // ファイルビューアを追加する際は、Android版と同じく`request_id`→`CompletableDeferred`
+    // 相当の待ち合わせでこのコールバックを解決すればよい。
+    public func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
 }

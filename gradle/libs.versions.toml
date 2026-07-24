@@ -18,6 +18,7 @@ androidx-ui = { group = "androidx.compose.ui", name = "ui" }
 androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
 androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
 androidx-material3 = { group = "androidx.compose.material3", name = "material3" }
+androidx-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 kmp-terminal-input = { group = "io.github.isseikz", name = "kmp-terminal-input", version.ref = "kmpTerminalInput" }
 jna-android = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }

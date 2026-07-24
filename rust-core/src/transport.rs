@@ -5,6 +5,7 @@
 //! アクセスできるよう、外部から参照される型・関数はここで re-export する。
 
 mod ctl_streamlocal;
+mod file_preview_exec;
 mod forward;
 mod ssh_handler;
 

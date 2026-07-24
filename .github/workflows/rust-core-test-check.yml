@@ -240,6 +240,28 @@ jobs:
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
 
+      # `mux_holder_windows_e2e.rs`: unlike the 5 files below, this doesn't
+      # shell out to real `ssh(1)`/`ssh_test_shim` at all — it drives
+      # `main.rs`'s other `#[cfg(windows)]` arm (`native::mux::run`), which
+      # never touches `ssh(1)`, so it needs neither `--isekai-ssh-path` nor
+      # `ssh_test_shim`. It spawns real `isekai-ssh.exe`/`isekai-pipe.exe`
+      # processes (including a real detached mux holder) against each other
+      # instead, and one of its 3 tests deliberately sleeps ~20s past
+      # `owner::IDLE_GRACE` (10s, not test-overridable — see that file's
+      # module docs on why a real wait beats adding a test-only knob to
+      # production code), so it's kept as its own step rather than folded
+      # into the loop below. TEMPORARILY moved ahead of that loop (2026-07-23)
+      # so it gets validated independently of an unrelated, still-open
+      # classification bug in `wrapper_stale_trust_auto_recovery_e2e.rs`
+      # (Windows misclassifies an unreachable QUIC endpoint as `StaleTrust` —
+      # tracked separately, several layers down in `isekai-transport`/
+      # `quicmux`, not this crate) that currently fails that loop — revert
+      # this ordering once that's fixed.
+      - name: cargo test -p isekai-ssh --test mux_holder_windows_e2e (Windows, real detached mux holder e2e)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test mux_holder_windows_e2e
+
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim
       # (コンパイル済み.exeパススルー、`wrapper_auto_bootstrap_e2e.rs::
@@ -249,12 +271,26 @@ jobs:
       # `--tests`一括拡張ではなくファイル単位で明示実行しているのは、上の
       # 「対象外のまま残すもの」に挙げたUnix専用の統合テストを誤って
       # 巻き込まないため。
+      # `set +e` + 個別exit code集計: bash -e(GitHub Actionsのデフォルト)だと
+      # 最初の`cargo test`が失敗した時点でステップ全体が打ち切られ、残り4ファイルが
+      # 一度も実行されないまま「1本失敗」としか報告されない(実際に発生した見落とし
+      # ——native経路の未登録ホスト自動bootstrap不具合を1本のFAILEDでしか検出できず、
+      # 残り4ファイルが同じ原因で落ちるかどうか一度のCI実行で分からなかった)。
+      # 5本全部を必ず実行し、失敗があれば最後にまとめて報告する。
       - name: cargo test -p isekai-ssh (Windows, ssh_test_shim対応e2eファイル5本)
         shell: bash
         working-directory: rust-core
         run: |
-          cargo test -p isekai-ssh --test wrapper_auto_bootstrap_e2e
-          cargo test -p isekai-ssh --test doctor_e2e
-          cargo test -p isekai-ssh --test init_e2e
-          cargo test -p isekai-ssh --test wrapper_auto_download_relay_bootstrap_e2e
-          cargo test -p isekai-ssh --test wrapper_stale_trust_auto_recovery_e2e
+          set +e
+          failed=0
+          for t in wrapper_auto_bootstrap_e2e doctor_e2e init_e2e wrapper_auto_download_relay_bootstrap_e2e wrapper_stale_trust_auto_recovery_e2e; do
+            echo "::group::cargo test -p isekai-ssh --test $t"
+            cargo test -p isekai-ssh --test "$t"
+            if [ $? -ne 0 ]; then
+              echo "FAILED: $t"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+          exit $failed

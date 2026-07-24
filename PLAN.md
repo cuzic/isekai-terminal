@@ -3080,6 +3080,16 @@ Sixel対応（タスク#42）とは独立に検討したが、**現行の `vte` 
 - 上記理由により、Kitty graphics対応は実装せず対象外(won't do)としてタスク#53を完了扱いとする。
   将来vteの置き換え（別parser crateへの移行、または独自fork）を行う機会があれば再検討する。
 
+**2026-07-20追記: 上記判断は覆り、実装済み。** 「vte fork または独自プリプロセッサが必要」
+という制約自体は正しかったが、想定していたほど大規模ではなかった——vteを置き換えず、
+バイトフィードループの前段に`ESC _ … ST`だけを抜き取る軽量な`ApcInterceptor`
+（`rust-core/src/kitty_graphics.rs`、約130行）を挟むだけで実現できた。それ以外の全バイトは
+バイト等価で素通しするため、CSI/OSC/DCS/sixel等の既存シーケンス処理には無干渉
+（Opusエージェントによるアドバーサリブレビュー済み、不正/非整形入力時のみ顕在化する
+既知の限界がモジュールdocに明記されている）。対応範囲はMVP（`f=32`/`f=24`/`f=100`の
+転送・チャンク分割・`a=T`・`a=d`のみ、`a=p`/アニメーション/Unicodeプレースホルダ等は
+引き続き対象外）。詳細は`kitty_graphics.rs`のモジュールdoc参照。
+
 ### alt-screenでのwheel→矢印キー変換（xterm `?1007` Alternate Scroll Mode相当、タスク#50の範囲外）
 
 タスク#50（Android側マウスレポーティング配線）のFableレビュー2次で、「マウスレポーティングが
@@ -3242,3 +3252,113 @@ Phase 8-4: 実機検証（長時間圏外・大量出力中切断・keepalive境
 - rust-core/src/debug_fault.rs + android/src/debug/kotlin/.../FaultInjectionReceiver.kt: 実機での上記フォルト注入をライブに有効化する adb 経由のデバッグフック（release ビルドには含まれない）
 - rust-core/scripts/phase7-5-roaming-test.sh: 実機ローミング耐性検証のシナリオ関数集（ライブフォルト注入 / 実ネットワーク切替 / 組み合わせ）
 - quinn の rebind 前例: `quinn-0.11.11/src/endpoint.rs` の `Endpoint::rebind`/`rebind_abstract`、および quinn 自身のテスト `quinn-0.11.11/src/tests.rs: rebind_recv`（同じ手法の公式前例）
+
+---
+
+## セッション出力のフレーム駆動レンダリング/バッチ処理（2026-07-19、Alacritty/kitty調査に基づく設計）
+
+**背景**: `session_event_loop`（`rust-core/src/session.rs`）は、1 SSHパケット（`TransportEvent::Stdout`）
+を受け取るたびに無条件で `make_screen_update`（セル単位diff計算）＋`on_screen_update` UniFFIコールバック
+を発行していた。高速flood（`cat`で巨大ファイルを吐き出す等）時、Kotlin側 `TerminalSession.kt` の
+`Channel.CONFLATED` が中間フレームを受信後に捨てるだけで、Rust側のdiff計算・FFI呼び出し自体は律儀に
+全部実行してしまっており、モバイル端末のCPU/バッテリーの無駄遣いになっていた。
+
+**調査**: Alacritty（damage tracking + PR #6585 のユーザー空間タイマーベーススケジューリング、
+PTY読み取りは1MB固定バッファに蓄積してから一括パース）と kitty（`input_delay`/`repaint_delay`の
+2段間引きノブ、I/Oスレッドとレンダリングスレッドの分離）の実装を一次情報（各リポジトリの
+ソースコード・公式ドキュメント・PR/issue）で調査し、Opusエージェントとの設計相談を経てこの
+プロジェクトの既存構造（tokio非同期ループ、既存の`LineDamage`/`update_seq` damage機構、Kotlin側
+`Channel.CONFLATED`）にどうマッピングするかを検討した。
+
+**設計判断**:
+- kittyの2段ノブを、それぞれ別の実装手段にマッピングした。「読み取り→パースのバッチ化」
+  （`input_delay`相当）はタイマーではなく `event_rx.try_recv()` によるノンブロッキングdrain
+  （このプロジェクトは既にmpscでイベント化済みなので、キューに積まれている分を遅延ゼロで束ねれば
+  十分）。「画面反映の間引き」（`repaint_delay`相当）だけが本物のタイマー（`RepaintThrottle`、
+  リーディングエッジ＋トレーリングエッジ、既定16ms）。
+- VTEパース自体（`state.on_stdout`）は間引かない。端末状態は常に最新でなければならない
+  （DA/DSR応答・カーソル位置等の前提）。間引いてよいのは「画面をUniFFI越しに反映する頻度」だけ。
+- 既存の `LineDamage`/`dirty_rows`/`update_seq`（damage tracking）は不要にならない。
+  `make_screen_update`の差分は「前回**発行**したスナップショットとの差」であり、間引きで発行回数が
+  減っても次回発行時の`dirty_rows`が累積差分を自然に含む。Kotlin側`Channel.CONFLATED`とも役割が
+  異なり（Rust側は生産量そのものの削減、Kotlin側はUIスレッド失速時の最終フレーム優先）多層防御
+  として共存する。
+- DEC同期出力（`?2026`）safety-netタイマー・trzsz転送の即時性とは競合しない。`?2026`アクティブ中は
+  `screen_dirty`自体が立たないためthrottleに乗らず、`?2026l`でまとめてflushされた時点で初めて
+  throttle対象になる。trzsz側のside effects/timer/scrollbackは`dispatch_result`で従来どおり
+  即時処理を維持し、画面反映の発行だけを`emit_screen_update`ヘルパーへ分離した。
+- UniFFI公開API・`ScreenUpdate`型は無変更。判定ロジックは全て`session.rs`内に閉じ、
+  Kotlin側は無変更（`.claude/rules/rust-ssot.md`のRust-SSOT原則に準拠）。バインディング再生成は不要。
+
+**実装**（`rust-core/src/session.rs`、`rust-core/src/transport/ssh_handler.rs`）:
+- `RepaintThrottle`/`RepaintDecision`: tokio非依存の純粋な間引き判定ロジック（単体テスト付き）。
+- `dispatch_result`から`on_screen_update`呼び出しを分離し、`emit_screen_update`ヘルパーへ集約。
+- `session_event_loop`にpinした`tokio::time::sleep`をrepaintタイマーとして`select!`へ統合
+  （spawn-per-timerパターンは避け、`reset()`で使い回す）。
+- `TransportEvent`処理を`dispatch_transport_event`へ切り出し、`Stdout`受信時に`try_recv`で
+  連続する後続`Stdout`をdrain・連結。drain中に非`Stdout`を引いた場合は`pending_event`スロットへ
+  退避し、次ループ先頭で`select!`より先に処理して到着順序を厳密に保つ。
+- `ssh_handler.rs`の`pooling_e2e_tests`に`__test_flood__:<N>`/`__test_flood_sync__:<N>`トリガーを
+  追加し、実SSH接続経由での高速flood時の`on_screen_update`間引き・最終画面の正しさ・`?2026`区間との
+  非衝突をe2eテストで検証。
+
+**参照実装**: `rust-core/src/session.rs`の`RepaintThrottle`/`dispatch_transport_event`/
+`emit_screen_update`/`session_event_loop`、`rust-core/src/transport/ssh_handler.rs`の
+`pooling_e2e_tests::flood_output_coalesces_screen_updates_but_final_screen_is_correct`。
+
+## タスク#13: OSC 133セマンティックプロンプト統合（2026-07-19、Ghostty由来機能の移植）
+
+**背景**: Ghosttyの人気機能であるOSC 133(A=プロンプト開始/B=コマンド入力開始/C=コマンド実行開始/
+D=コマンド終了)ベースのセマンティックプロンプト追跡を移植し、(1)前/次のプロンプトへジャンプ、
+(2)タップでプロンプト行の入力位置へカーソル移動(Ghostty `cl=line`相当)、(3)直前コマンドの
+出力だけをコピー、の3機能を実装した。物理キーボードの無いAndroidでは(1)が特に価値が高い。
+既存のスクロールバック検索(`search_scrollback`、タスク#37)とは独立した機能として実装した
+(混同・重複させない)。
+
+**設計判断**:
+- **絶対行番号による座標系**: `Terminal`(`rust-core/src/terminal.rs`)に、生存期間を通じて
+  scrollbackへ実際に押し出された行数を単調増加でカウントする`total_scrolled_lines: u64`を
+  新設した。OSC 133マークは`total_scrolled_lines + cursor_row`という「絶対行番号」で記録する
+  (`prompt_marks: VecDeque<PromptMark>`、`link_table`と同じくRISでもクリアしない)。既存の
+  `scrollback_cells`/`ScrollbackSearchMatch`が使う「offsetは呼び出し時点のスナップショット
+  限定」という規約と異なり、絶対行番号は後からscrollbackがトリミングされても位置を再計算
+  できるため、プロンプト位置のような長期保持が必要な参照に向く。クエリ時(`prompt_jump_target`)
+  にのみ、呼び出し元が渡す現在の`scrollback_len`と突き合わせて現在の表示位置
+  (`PromptJumpTarget{scroll_offset, is_live}`)へ変換する。
+- **ジャンプの基準点**: ライブ画面表示中の基準点は画面最上行ではなく現在のカーソル行の絶対行
+  番号にした。画面最上行を基準にすると、小さい端末で複数プロンプトが同一画面内に同時に見えて
+  いる場合に「前」が正しく機能しない(ライブ画面上に見えているという理由だけで除外されてしまう)
+  ため。
+- **click-to-cursor(Ghostty `cl=line`相当)**: パラメータ付きCSI(`ESC[5C`等)はreadline側が
+  「5回分の移動」と解釈しないため、単純な矢印キー入力(`ESC[C`/`ESC OC`、DECCKMに応じて切替、
+  既存の`terminal_arrow_bytes`をそのまま再利用)を移動量ぶん繰り返し送る設計にした。対象は
+  「現在のカーソル行と同じ行、かつOSC 133;Bは来たが;Cがまだの区間(`input_line_active`)」に
+  限定——複数行にまたがる入力(折り返しコマンド等)への対応はスコープ外。
+- **「直前コマンドの出力だけをコピー」の実装方式**: 当初はグリッド座標(ライブ画面+scrollback
+  をまたぐ範囲)から出力範囲を切り出す設計を検討したが、ライブ画面のセル内容を保持しない
+  `SessionCore`側からも参照する必要があり座標変換が複雑化するため採用しなかった。代わりに、
+  OSC 133;C〜Dの間に`print()`で書かれた文字をそのまま`Terminal`内でテキストとして直接キャプチャ
+  する方式にした(`capturing_command_output`/`current_output_line`/`current_output_lines`)。
+  この方式は`\r`によるプログレスバー上書きや`top`等のフルスクリーンTUIの出力を正しく再現
+  できない(意図的なスコープ外、`capturing_command_output`フィールドのdocコメント参照)が、
+  `ls`/`cat`/`git log`等の大半のユースケースでは正しく動作し、実装・検証コストと価値のバランスが
+  良いと判断した。
+- **Kotlin側との配線**: 3機能とも`SessionCmd`(`transport/ssh_handler.rs`)経由の非同期
+  fire-and-forgetコマンドとして実装し、結果は新設した`OrchestratorCallback::onPromptJump`/
+  `onPromptOutputCopyReady`で返す。ジャンプ先が見つからない場合の`target=null`と「まだ一度も
+  要求されていない」を区別する必要があるため、Kotlin側`TerminalUiState`は`PromptJumpResult`/
+  `PromptOutputCopyResult`という単調増加`seq`付きのラッパーで結果を保持し、Compose
+  `LaunchedEffect(uiState.promptJumpResult.seq)`で確実に反応できるようにした
+  (`target`/`text`の値だけをキーにすると「見つからなかった」が連続した場合に変化なしと
+  誤認され再発火しない)。
+
+**実装**: `rust-core/src/terminal.rs`(`PromptMark`/`PromptMarkKind`/`prompt_jump_target`/
+`cursor_move_bytes_for_click`/`last_command_output_text`、OSC 133;A/B/C/Dパース一式)、
+`rust-core/src/session_state.rs`(`SessionState::jump_to_prompt`/`click_to_prompt_cursor`/
+`copy_last_command_output`、`ProcessResult`に4フィールド追加)、`rust-core/src/session.rs`
+(`SessionCore`の4メソッド、`dispatch_result`でのコールバック発火)、
+`rust-core/src/transport/ssh_handler.rs`(`SessionCmd`に4バリアント追加)、`rust-core/src/lib.rs`
+(`PromptJumpTarget`、`SessionCallback`/`OrchestratorCallback`双方に2メソッド追加)、
+`rust-core/src/orchestrator.rs`(`SessionOrchestrator`の4公開メソッド、`OrchestratorAdapter`)、
+Android側`TerminalSession.kt`/`TerminalTabsViewModel.kt`/`TerminalHostScreen.kt`/
+`TerminalScreen.kt`(前/次プロンプトジャンプボタン・出力コピーボタン・タップでのカーソル移動)。

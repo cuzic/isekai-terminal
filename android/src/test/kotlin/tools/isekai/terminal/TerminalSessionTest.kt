@@ -16,6 +16,7 @@ import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.NotifyKind
+import uniffi.isekai_terminal_core.PromptJumpTarget
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 import uniffi.isekai_terminal_core.SshAuth
@@ -63,7 +64,7 @@ class TerminalSessionTest {
      *  既存テストと同じ最小値で埋める。 */
     private fun bellUpdate(bellGeneration: ULong, cursorCol: UInt = 0u) = ScreenUpdate(
         0u, 80u, 24u, emptyList(), 0u, cursorCol, "title", false, false, false,
-        MouseReportingMode.OFF, false, true, bellGeneration, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
+        MouseReportingMode.OFF, false, false, false, true, bellGeneration, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
     )
 
     // ── 初期状態 ──────────────────────────────────────────────────
@@ -379,7 +380,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
         assertEquals("title1", session.state.value.screenUpdate?.title)
@@ -391,9 +392,9 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
 
         fakeOrchestrator.simulateScreenUpdate(update1)
         fakeOrchestrator.simulateScreenUpdate(update2)
@@ -409,7 +410,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
 
@@ -418,7 +419,7 @@ class TerminalSessionTest {
         assertNull("screenUpdate should be cleared on disconnect", session.state.value.screenUpdate)
 
         // 切断後に simulateScreenUpdate が来ても無視される
-        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
@@ -432,7 +433,7 @@ class TerminalSessionTest {
 
         repeat(50) { i ->
             fakeOrchestrator.simulateScreenUpdate(
-                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
             )
         }
 
@@ -1007,5 +1008,69 @@ class TerminalSessionTest {
     @Test
     fun searchScrollback_beforeConnecting_returnsEmptyList() {
         assertEquals(emptyList<ScrollbackSearchMatch>(), session.searchScrollback("abc", caseSensitive = false))
+    }
+
+    // ── OSC 133(タスク#13) ──────────────────────────────────
+
+    /** 判断ロジック(どのプロンプトが「前/次」か)は全てRust側
+     *  ([Terminal::prompt_jump_target]、`rust-core/src/terminal.rs`)にあるため、
+     *  ここでは[TerminalSession.jumpToPreviousPrompt]/[jumpToNextPrompt]が引数を
+     *  そのまま中継していることだけを確認する([searchScrollback_delegatesQueryAndResultToOrchestrator]
+     *  と同型のテスト)。 */
+    @Test
+    fun jumpToPreviousPrompt_delegatesArgsToOrchestrator() {
+        session.jumpToPreviousPrompt(fromScrollOffset = 5, fromShowingScrollback = true)
+
+        assertEquals(listOf(5u to true), fakeOrchestrator.jumpToPreviousPromptCalls)
+    }
+
+    @Test
+    fun jumpToNextPrompt_delegatesArgsToOrchestrator() {
+        session.jumpToNextPrompt(fromScrollOffset = 0, fromShowingScrollback = false)
+
+        assertEquals(listOf(0u to false), fakeOrchestrator.jumpToNextPromptCalls)
+    }
+
+    @Test
+    fun clickToPromptCursor_delegatesArgsToOrchestrator() {
+        session.clickToPromptCursor(row = 3, col = 7)
+
+        assertEquals(listOf(3u to 7u), fakeOrchestrator.clickToPromptCursorCalls)
+    }
+
+    @Test
+    fun copyLastCommandOutput_delegatesToOrchestrator() {
+        session.copyLastCommandOutput()
+
+        assertEquals(1, fakeOrchestrator.copyLastCommandOutputCallCount)
+    }
+
+    /** `onPromptJump`コールバックの結果が[TerminalUiState.promptJumpResult]へ反映される
+     *  こと、および`seq`が呼び出しごとに単調増加すること
+     *  ([PromptJumpResult]のdocコメント参照——`target`が同じ`null`のまま連続しても
+     *  Compose側の`LaunchedEffect`が確実に再発火できるようにするための設計)。 */
+    @Test
+    fun onPromptJump_updatesStateWithTargetAndIncrementingSeq() {
+        val target = PromptJumpTarget(scrollOffset = 12u, isLive = false)
+
+        fakeOrchestrator.simulatePromptJump(target)
+        assertEquals(target, session.state.value.promptJumpResult.target)
+        assertEquals(1L, session.state.value.promptJumpResult.seq)
+
+        // 見つからなかった(null)場合でもseqは進む。
+        fakeOrchestrator.simulatePromptJump(null)
+        assertNull(session.state.value.promptJumpResult.target)
+        assertEquals(2L, session.state.value.promptJumpResult.seq)
+    }
+
+    @Test
+    fun onPromptOutputCopyReady_updatesStateWithTextAndIncrementingSeq() {
+        fakeOrchestrator.simulatePromptOutputCopyReady("line1\nline2")
+        assertEquals("line1\nline2", session.state.value.promptOutputCopyResult.text)
+        assertEquals(1L, session.state.value.promptOutputCopyResult.seq)
+
+        fakeOrchestrator.simulatePromptOutputCopyReady(null)
+        assertNull(session.state.value.promptOutputCopyResult.text)
+        assertEquals(2L, session.state.value.promptOutputCopyResult.seq)
     }
 }

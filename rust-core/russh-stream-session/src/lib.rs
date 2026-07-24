@@ -1,21 +1,29 @@
 //! Establish and authenticate an SSH client session (built on [`russh`]) over
 //! any `AsyncRead + AsyncWrite` byte stream — not just a raw TCP socket.
 //!
-//! Host-key verification is delegated to [`HostKeyVerifier`], so this crate
-//! has no opinion on how (or whether) a caller persists a trust-on-first-use
-//! store. Port forwarding, SSH agent forwarding, and any other
-//! application-specific channel protocol are deliberately out of scope —
-//! this crate covers exactly "authenticate a `russh::client::Handle` and
-//! open one session channel (shell or exec)"; the I/O loop past that point
-//! is left to the caller.
+//! The connect/handshake functions are generic over the `russh`
+//! `client::Handler` a caller supplies, so callers that need more than
+//! host-key verification (agent forwarding, remote port forwards, other
+//! server-initiated channel requests) can plug in their own handler.
+//! Callers that only need host-key verification can use the bundled
+//! [`VerifyingHandler`] (via [`verifying_handler`]) instead of writing one —
+//! it delegates to a small [`HostKeyVerifier`] trait, so this crate has no
+//! opinion on how (or whether) a caller persists a trust-on-first-use store.
+//! Port forwarding, SSH agent forwarding, and any other
+//! application-specific channel protocol are otherwise deliberately out of
+//! scope — this crate covers exactly "authenticate a `russh::client::Handle`
+//! and open one session channel (shell or exec)"; the I/O loop past that
+//! point is left to the caller.
 //!
 //! [`russh`]: https://docs.rs/russh
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use russh::client;
-use russh_keys::{HashAlg, PrivateKey, PublicKey};
+use russh_keys::{ssh_key::Certificate, HashAlg, PrivateKey, PublicKey};
+use tokio::sync::mpsc;
 
 /// Errors that can occur while connecting, authenticating, or opening a
 /// channel. None of these variants carry credential material.
@@ -35,17 +43,66 @@ pub enum SessionError {
     Channel(russh::Error),
     #[error("private key could not be parsed as OpenSSH format: {0}")]
     InvalidPrivateKey(russh_keys::ssh_key::Error),
+    #[error("private key is passphrase-protected and needs to be decrypted before use")]
+    EncryptedPrivateKey,
+    #[error("certificate could not be parsed as OpenSSH format: {0}")]
+    InvalidCertificate(russh_keys::ssh_key::Error),
     #[error("authentication request failed: {0}")]
     Auth(russh::Error),
+    #[error("agent-backed authentication failed: {0}")]
+    AgentAuth(russh::AgentAuthError),
+}
+
+/// The result of a [`HostKeyVerifier::verify`] call. Unlike a plain `bool`,
+/// a rejection carries a human-readable reason — `VerifyingHandler` stores it
+/// in a caller-supplied [`RejectionReason`] slot, since `check_server_key`'s
+/// `Result<bool, russh::Error>` return has no room for one (`russh::Error` is
+/// a closed enum with no caller-message-carrying variant).
+#[derive(Debug, Clone)]
+pub enum VerifyOutcome {
+    Accepted,
+    Rejected(String),
 }
 
 /// Verifies a server's host-key fingerprint (SHA-256, as produced by
-/// `PublicKey::fingerprint(HashAlg::Sha256)`). Return `true` to accept the
-/// connection, `false` to abort the handshake. Implementations typically
+/// `PublicKey::fingerprint(HashAlg::Sha256)`). Implementations typically
 /// consult a trust-on-first-use store and/or prompt the user.
 #[async_trait]
 pub trait HostKeyVerifier: Send + Sync {
-    async fn verify(&self, fingerprint: &str) -> bool;
+    async fn verify(&self, fingerprint: &str) -> VerifyOutcome;
+}
+
+/// A shared slot a caller can inspect *after* a handshake fails, to recover
+/// the human-readable reason a [`HostKeyVerifier::verify`] rejection carried
+/// — see [`VerifyOutcome`]'s docs for why this indirection exists instead of
+/// threading the reason through `check_server_key`'s return type directly.
+///
+/// Follows the same `Arc`-backed, `Clone`-shares-state shape as
+/// [`ForwardRoutes`]: construct one, pass `&reason` into
+/// [`verifying_handler_with_reason`]/[`verifying_handler_with_routes_and_reason`],
+/// and keep your own clone to call [`take`](Self::take) on once the
+/// handshake has failed — the clone installed inside the (otherwise
+/// unreachable, once handed to `new_handler`) handler and the clone the
+/// caller kept refer to the same slot.
+#[derive(Clone, Default)]
+pub struct RejectionReason(Arc<Mutex<Option<String>>>);
+
+impl RejectionReason {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set(&self, reason: String) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+    }
+
+    /// Takes (and clears) the last recorded rejection reason, if any. `None`
+    /// if no `verify` call on this slot's handler ever rejected — e.g. the
+    /// handshake failed for an unrelated reason (network error, auth
+    /// failure past the host-key step).
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
 }
 
 /// Authentication material for one `authenticate_session` call. Callers are
@@ -54,6 +111,12 @@ pub trait HostKeyVerifier: Send + Sync {
 pub enum Credential {
     Password(String),
     PublicKey { private_key_pem: Vec<u8> },
+    /// `ssh_config(5)` `CertificateFile` authentication: `private_key_pem`
+    /// signs the challenge, `certificate_pem` (OpenSSH text format, e.g.
+    /// `id_ed25519-cert.pub`) is presented alongside the public key so the
+    /// server can validate it against its trusted CA instead of (or in
+    /// addition to) the bare key.
+    PublicKeyWithCertificate { private_key_pem: Vec<u8>, certificate_pem: Vec<u8> },
 }
 
 impl Credential {
@@ -62,8 +125,47 @@ impl Credential {
         match self {
             Credential::Password(password) => password.zeroize(),
             Credential::PublicKey { private_key_pem } => private_key_pem.zeroize(),
+            // The certificate itself is public data (no secret material), but
+            // zeroizing it too costs nothing and keeps this match exhaustive
+            // without a special case to remember not to touch it.
+            Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+                private_key_pem.zeroize();
+                certificate_pem.zeroize();
+            }
         }
     }
+}
+
+/// Zeroizes automatically on every drop, not just when a caller remembers to
+/// call [`Credential::zeroize`] explicitly — a caller that does call it
+/// first just makes this a harmless no-op pass over an already-zeroed
+/// buffer (defense in depth: minimizes the exposure *window* on the happy
+/// path, while this `Drop` impl closes the gap on every early-return error
+/// path a caller might not have covered, e.g. a `?` between constructing a
+/// `Credential` and its own explicit `zeroize()` call — a real instance of
+/// exactly this gap was found by Codex review in `isekai-bootstrap::
+/// RusshBackend::connect_and_authenticate`).
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// Which leg of a connection [`connect_via_jump_or_direct`] is asking a
+/// caller's handler factory to build a `client::Handler` for. Passed
+/// explicitly (rather than left for the caller to infer from call order) so
+/// that a caller that needs a *different* handler per leg — e.g. a distinct
+/// host-key trust-store entry for the jump host vs. the target — can never
+/// silently desync if this function's internal connection sequence ever
+/// changes (adds a retry, a probe, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLeg {
+    /// The jump host itself (only ever constructed when a `JumpHost` is
+    /// passed).
+    Jump,
+    /// The final target — the only leg in a direct (no-jump) connection, and
+    /// the second leg when tunneling through a jump host.
+    Target,
 }
 
 /// A single-hop jump host (`ssh -J` equivalent) to tunnel through before
@@ -75,14 +177,124 @@ pub struct JumpHost {
     pub credential: Credential,
 }
 
-/// A minimal `client::Handler` that does nothing but delegate host-key
-/// verification to a [`HostKeyVerifier`]. All other `client::Handler`
-/// methods use russh's defaults (reject/no-op), so this handler is only
-/// suitable for sessions that don't need agent forwarding, remote port
-/// forwards, or other server-initiated channel requests — callers that need
-/// those should implement their own `client::Handler`.
+/// A registry of *forwarded-streamlocal* routes: maps a remote socket path
+/// (the routing key a caller passed to
+/// [`russh::client::Handle::streamlocal_forward`]) to a sink that receives
+/// each server-initiated `forwarded-streamlocal@openssh.com` channel opened
+/// for that path.
+///
+/// This is how a caller consumes remote UNIX-domain-socket forwards
+/// (`ssh -R <remote-sock>:...`) *in-process*, without this crate taking any
+/// opinion on what the forwarded bytes mean. The usual sequence is:
+///
+/// 1. build [`ForwardRoutes::new`],
+/// 2. [`register`](ForwardRoutes::register) each remote socket path (keeping
+///    the returned receiver),
+/// 3. install the routes on the handler with [`verifying_handler_with_routes`],
+/// 4. request the forward with `handle.streamlocal_forward(path)`.
+///
+/// Each incoming channel for a registered path is delivered to that path's
+/// receiver; a channel whose path has no live route is dropped (which closes
+/// it), matching what an `ssh -R` peer would see for a cancelled forward.
+///
+/// Cloning shares the same underlying table (it is `Arc`-backed), so the copy
+/// held inside the handler and the copy a caller keeps for registration stay
+/// in sync.
+#[derive(Clone, Default)]
+pub struct ForwardRoutes {
+    inner: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<russh::Channel<client::Msg>>>>>,
+}
+
+impl ForwardRoutes {
+    /// An empty route table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `key` (a remote socket path) and returns the receiving end
+    /// for channels routed to it. Any previously-registered sender for the
+    /// same key is replaced.
+    pub fn register(&self, key: impl Into<String>) -> mpsc::UnboundedReceiver<russh::Channel<client::Msg>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.lock().insert(key.into(), tx);
+        rx
+    }
+
+    /// Removes `key`'s route, if any. Call this after
+    /// `handle.cancel_streamlocal_forward(key)` so a channel that races in for
+    /// an already-cancelled forward is dropped (closed) rather than routed.
+    pub fn unregister(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
+    /// Routes `channel` to `key`'s registered sink. Returns `true` if a live
+    /// route consumed it; `false` (the channel is dropped, and thus closed) if
+    /// there was no route or its receiver had already been dropped — in which
+    /// case the stale entry is pruned.
+    fn dispatch(&self, key: &str, channel: russh::Channel<client::Msg>) -> bool {
+        let mut guard = self.lock();
+        let Some(tx) = guard.get(key) else {
+            return false;
+        };
+        if tx.send(channel).is_ok() {
+            true
+        } else {
+            guard.remove(key);
+            false
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<russh::Channel<client::Msg>>>> {
+        // A poisoned lock means a caller panicked mid-registration; the map is
+        // still structurally intact, so recover the guard rather than
+        // cascading the panic into every later route operation.
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A minimal `client::Handler` that delegates host-key verification to a
+/// [`HostKeyVerifier`] and, optionally, routes server-initiated
+/// `forwarded-streamlocal@openssh.com` channels to a caller-supplied
+/// [`ForwardRoutes`]. All other `client::Handler` methods use russh's defaults
+/// (reject/no-op), so this handler is suitable for sessions that need only
+/// host-key verification and (optionally) remote UNIX-socket forwards —
+/// callers that need agent forwarding or other server-initiated channel
+/// requests should implement their own `client::Handler`.
 pub struct VerifyingHandler<V> {
     verifier: Arc<V>,
+    forward_routes: Option<ForwardRoutes>,
+    rejection: Option<RejectionReason>,
+}
+
+impl<V: HostKeyVerifier + 'static> VerifyingHandler<V> {
+    /// A handler that does only host-key verification — no forward routing,
+    /// no rejection-reason capture. `verifier` is cloned once (cheap: it's
+    /// an `Arc`). Chain [`with_forward_routes`](Self::with_forward_routes)/
+    /// [`with_rejection_reason`](Self::with_rejection_reason) to opt into
+    /// either (or both) of the optional features — simplification (Codex
+    /// review finding): this replaces what would otherwise be a combinatorial
+    /// explosion of `verifying_handler_with_x_and_y` free functions as more
+    /// optional features are added.
+    pub fn new(verifier: &Arc<V>) -> Self {
+        Self { verifier: verifier.clone(), forward_routes: None, rejection: None }
+    }
+
+    /// Routes server-initiated `forwarded-streamlocal@openssh.com` channels
+    /// (from an `ssh -R <remote-sock>:...` this session requests via
+    /// `handle.streamlocal_forward(...)`) to `routes` instead of dropping
+    /// them.
+    pub fn with_forward_routes(mut self, routes: &ForwardRoutes) -> Self {
+        self.forward_routes = Some(routes.clone());
+        self
+    }
+
+    /// Installs `reason` so a caller can recover a rejected [`VerifyOutcome`]'s
+    /// human-readable message after the handshake fails — see
+    /// [`RejectionReason`]'s docs.
+    pub fn with_rejection_reason(mut self, reason: &RejectionReason) -> Self {
+        self.rejection = Some(reason.clone());
+        self
+    }
 }
 
 #[async_trait]
@@ -91,7 +303,34 @@ impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
 
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
-        Ok(self.verifier.verify(&fingerprint).await)
+        match self.verifier.verify(&fingerprint).await {
+            VerifyOutcome::Accepted => Ok(true),
+            VerifyOutcome::Rejected(reason) => {
+                if let Some(slot) = &self.rejection {
+                    slot.set(reason);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// The server opened a channel for a new connection to a remote socket
+    /// this session had requested via `streamlocal_forward` (`ssh -R` over a
+    /// UNIX domain socket). If a [`ForwardRoutes`] was installed and has a
+    /// live route for `socket_path`, the channel is handed to that route's
+    /// receiver (fire-and-forget); otherwise the channel is dropped, which
+    /// closes it — the same thing the peer sees for a forward that was never
+    /// requested or has since been cancelled.
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        socket_path: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(routes) = &self.forward_routes {
+            let _ = routes.dispatch(socket_path, channel);
+        }
+        Ok(())
     }
 }
 
@@ -99,9 +338,9 @@ impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
 /// through a jump host. The jump host's own `client::Handle` (if any) is
 /// kept alive internally for as long as this session is in use — dropping
 /// [`Session`] tears down the tunnel too.
-pub struct Session<V: HostKeyVerifier + 'static> {
-    pub handle: client::Handle<VerifyingHandler<V>>,
-    _jump_handle: Option<client::Handle<VerifyingHandler<V>>>,
+pub struct Session<H: client::Handler + 'static> {
+    pub handle: client::Handle<H>,
+    _jump_handle: Option<client::Handle<H>>,
 }
 
 /// Connects to `target_host:target_port`, either directly or (if `jump` is
@@ -109,28 +348,40 @@ pub struct Session<V: HostKeyVerifier + 'static> {
 /// `direct-tcpip` channel (`ssh -J` equivalent, single hop). The returned
 /// [`Session`] is connected but not yet authenticated to the target —
 /// call [`authenticate_session`] next.
-pub async fn connect_via_jump_or_direct<V>(
+///
+/// Generic over the `client::Handler` type `H` so callers that need more
+/// than host-key verification (agent forwarding, remote port forwards,
+/// other server-initiated channel requests) can plug in their own handler —
+/// `new_handler` is called once per connection leg (twice total when a jump
+/// host is used: once with [`ConnectionLeg::Jump`], then once with
+/// [`ConnectionLeg::Target`]; exactly once with [`ConnectionLeg::Target`]
+/// for a direct connection). The leg is passed explicitly so a caller that
+/// needs a per-leg handler (e.g. a distinct host-key verifier for the jump
+/// host vs. the target) selects it from the `ConnectionLeg` argument rather
+/// than counting calls — see [`ConnectionLeg`]'s own docs. Callers that only
+/// need host-key verification can use [`VerifyingHandler`] via
+/// [`verifying_handler`] instead of writing their own `client::Handler`.
+pub async fn connect_via_jump_or_direct<H, F>(
     jump: Option<&JumpHost>,
     russh_config: Arc<client::Config>,
     target_host: &str,
     target_port: u16,
-    verifier: Arc<V>,
-) -> Result<Session<V>, SessionError>
+    mut new_handler: F,
+) -> Result<Session<H>, SessionError>
 where
-    V: HostKeyVerifier + 'static,
+    H: client::Handler<Error = russh::Error> + Send + 'static,
+    F: FnMut(ConnectionLeg) -> H,
 {
     let Some(jump) = jump else {
         let addr = format!("{target_host}:{target_port}");
-        let handler = VerifyingHandler { verifier };
-        let handle = client::connect(russh_config, addr.as_str(), handler)
+        let handle = client::connect(russh_config, addr.as_str(), new_handler(ConnectionLeg::Target))
             .await
             .map_err(|source| SessionError::Connect { addr, source })?;
         return Ok(Session { handle, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
-    let jump_handler = VerifyingHandler { verifier: verifier.clone() };
-    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), jump_handler)
+    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), new_handler(ConnectionLeg::Jump))
         .await
         .map_err(|source| SessionError::Connect { addr: jump_addr.clone(), source })?;
 
@@ -145,8 +396,7 @@ where
         .map_err(|source| SessionError::JumpTunnel { host: target_host.to_string(), port: target_port, source })?;
     let stream = channel.into_stream();
 
-    let target_handler = VerifyingHandler { verifier };
-    let handle = client::connect_stream(russh_config, stream, target_handler)
+    let handle = client::connect_stream(russh_config, stream, new_handler(ConnectionLeg::Target))
         .await
         .map_err(|source| SessionError::JumpHandshake { host: target_host.to_string(), port: target_port, source })?;
 
@@ -158,17 +408,55 @@ where
 /// callers that have their own way of reaching the target and just need SSH
 /// layered on top. Not yet authenticated — call [`authenticate_session`]
 /// next.
-pub async fn establish_over_stream<S, V>(
+pub async fn establish_over_stream<S, H>(
     russh_config: Arc<client::Config>,
     stream: S,
-    verifier: Arc<V>,
-) -> Result<client::Handle<VerifyingHandler<V>>, SessionError>
+    handler: H,
+) -> Result<client::Handle<H>, SessionError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    V: HostKeyVerifier + 'static,
+    H: client::Handler<Error = russh::Error> + Send + 'static,
 {
-    let handler = VerifyingHandler { verifier };
     client::connect_stream(russh_config, stream, handler).await.map_err(SessionError::Handshake)
+}
+
+/// Builds a [`VerifyingHandler`] for `verifier` — a convenience for the
+/// common case of [`connect_via_jump_or_direct`]'s `new_handler` argument
+/// when a caller only needs host-key verification and nothing else
+/// (no agent forwarding, no remote forwards). `verifier` is cloned once per
+/// call (cheap: it's an `Arc`).
+pub fn verifying_handler<V: HostKeyVerifier + 'static>(verifier: &Arc<V>) -> VerifyingHandler<V> {
+    VerifyingHandler::new(verifier)
+}
+
+/// Like [`verifying_handler`], but also installs `routes` — see
+/// [`VerifyingHandler::with_forward_routes`].
+pub fn verifying_handler_with_routes<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    routes: &ForwardRoutes,
+) -> VerifyingHandler<V> {
+    VerifyingHandler::new(verifier).with_forward_routes(routes)
+}
+
+/// Like [`verifying_handler`], but also installs `reason` — see
+/// [`VerifyingHandler::with_rejection_reason`].
+pub fn verifying_handler_with_reason<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    reason: &RejectionReason,
+) -> VerifyingHandler<V> {
+    VerifyingHandler::new(verifier).with_rejection_reason(reason)
+}
+
+/// Combines [`verifying_handler_with_routes`] and
+/// [`verifying_handler_with_reason`] for callers that need both (e.g. the
+/// day-to-day native connect path, which routes ctl-socket forwards *and*
+/// wants a host-key-rejection reason for its top-level error).
+pub fn verifying_handler_with_routes_and_reason<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    routes: &ForwardRoutes,
+    reason: &RejectionReason,
+) -> VerifyingHandler<V> {
+    VerifyingHandler::new(verifier).with_forward_routes(routes).with_rejection_reason(reason)
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`
@@ -177,6 +465,14 @@ where
 /// private key) or the underlying SSH request itself failed (transport
 /// error). Does not zeroize `credential` — call [`Credential::zeroize`]
 /// once you're done with it.
+///
+/// A passphrase-protected `Credential::PublicKey` is detected (via
+/// `PrivateKey::is_encrypted`) *before* ever attempting to authenticate with
+/// it, and reported as `Err(SessionError::EncryptedPrivateKey)` rather than
+/// `SessionError::InvalidPrivateKey` — the caller can react to that
+/// specifically (e.g. prompt for a passphrase and retry via
+/// [`authenticate_publickey_with_passphrase`]) instead of treating an
+/// encrypted key exactly like a malformed one.
 pub async fn authenticate_session<H: client::Handler>(
     session: &mut client::Handle<H>,
     username: &str,
@@ -188,15 +484,142 @@ pub async fn authenticate_session<H: client::Handler>(
         }
         Credential::PublicKey { private_key_pem } => {
             let key = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+            if key.is_encrypted() {
+                return Err(SessionError::EncryptedPrivateKey);
+            }
             session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
         }
+        Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+            let key = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+            if key.is_encrypted() {
+                return Err(SessionError::EncryptedPrivateKey);
+            }
+            // Lossy: an invalid-UTF-8 certificate file is malformed either way,
+            // and `Certificate::from_openssh` itself will reject the resulting
+            // (possibly replacement-charred) text with a proper parse error —
+            // no need for a separate encoding-failure branch here.
+            let cert = Certificate::from_openssh(&String::from_utf8_lossy(certificate_pem))
+                .map_err(SessionError::InvalidCertificate)?;
+            session.authenticate_openssh_cert(username, Arc::new(key), cert).await.map_err(SessionError::Auth)
+        }
     }
+}
+
+/// Like [`authenticate_session`]'s `Credential::PublicKey` arm, but for a key
+/// that [`authenticate_session`] has already reported as
+/// [`SessionError::EncryptedPrivateKey`] — decrypts `private_key_pem` with
+/// `passphrase` first, then authenticates with the decrypted key.
+/// `Err(SessionError::InvalidPrivateKey)` covers both an unparseable key and
+/// a wrong passphrase (`ssh_key`'s `decrypt` doesn't distinguish the two any
+/// further) — either way the right caller action is the same: ask for a
+/// different passphrase (or give up on this candidate).
+pub async fn authenticate_publickey_with_passphrase<H: client::Handler>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    private_key_pem: &[u8],
+    passphrase: &str,
+) -> Result<bool, SessionError> {
+    let encrypted = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+    let key = encrypted.decrypt(passphrase).map_err(SessionError::InvalidPrivateKey)?;
+    session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
+}
+
+/// Like [`authenticate_publickey_with_passphrase`], but for a
+/// `CertificateFile`-paired key (see [`Credential::PublicKeyWithCertificate`]):
+/// decrypts `private_key_pem` with `passphrase`, then authenticates with the
+/// decrypted key and `certificate_pem` together via
+/// `authenticate_openssh_cert`.
+pub async fn authenticate_openssh_cert_with_passphrase<H: client::Handler>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    private_key_pem: &[u8],
+    certificate_pem: &[u8],
+    passphrase: &str,
+) -> Result<bool, SessionError> {
+    let encrypted = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+    let key = encrypted.decrypt(passphrase).map_err(SessionError::InvalidPrivateKey)?;
+    let cert = Certificate::from_openssh(&String::from_utf8_lossy(certificate_pem)).map_err(SessionError::InvalidCertificate)?;
+    session.authenticate_openssh_cert(username, Arc::new(key), cert).await.map_err(SessionError::Auth)
+}
+
+/// One server-issued prompt during a keyboard-interactive authentication
+/// round ("Password:", "Verification code:", ...). `echo` mirrors what the
+/// server told the client — `false` for anything sensitive (a password/OTP),
+/// `true` for e.g. a plain yes/no confirmation question — a caller reading
+/// from a real console should honor it (no local echo when `false`).
+#[derive(Debug, Clone)]
+pub struct KeyboardInteractivePrompt {
+    pub prompt: String,
+    pub echo: bool,
+}
+
+/// Authenticates `session` as `username` via `keyboard-interactive` — the
+/// method PAM-backed `sshd` configs and OTP/2FA setups typically negotiate
+/// instead of (or in addition to) plain `password`, which
+/// [`authenticate_session`]'s `Credential::Password` can't reach. A server
+/// may issue any number of rounds (zero, one, or several — e.g. a password
+/// round followed by a separate OTP round); `respond` is called once per
+/// round with that round's prompts and must return exactly one answer per
+/// prompt, in order. `Ok(false)` means the server rejected every round's
+/// answers (a clean "no", not an error); `Err` means the underlying SSH
+/// request itself failed (transport error).
+pub async fn authenticate_keyboard_interactive<H, F>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    mut respond: F,
+) -> Result<bool, SessionError>
+where
+    H: client::Handler,
+    F: FnMut(&[KeyboardInteractivePrompt]) -> Vec<String>,
+{
+    let mut response =
+        session.authenticate_keyboard_interactive_start(username, None).await.map_err(SessionError::Auth)?;
+    loop {
+        match response {
+            client::KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            client::KeyboardInteractiveAuthResponse::Failure => return Ok(false),
+            client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                let prompts: Vec<KeyboardInteractivePrompt> =
+                    prompts.into_iter().map(|p| KeyboardInteractivePrompt { prompt: p.prompt, echo: p.echo }).collect();
+                let answers = respond(&prompts);
+                response = session
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(SessionError::Auth)?;
+            }
+        }
+    }
+}
+
+/// Authenticates `session` as `username` by asking `signer` — typically a
+/// [`russh_keys::agent::client::AgentClient`] (russh provides a blanket
+/// [`russh::Signer`] impl for it, over any `AsyncRead + AsyncWrite`
+/// transport: a Unix socket, a Windows named pipe, or Pageant) — to sign the
+/// server's challenge for `public_key`, instead of holding private key
+/// material in this process at all. `Ok(false)` means the server declined
+/// (`public_key` isn't authorized); `Err` means the signer itself failed
+/// (agent connection dropped mid-request, agent declined to sign, ...).
+///
+/// Callers are responsible for choosing *which* `public_key` to try (e.g.
+/// via the agent's own `request_identities()`) — this function attempts
+/// exactly one.
+pub async fn authenticate_with_signer<H, S>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    public_key: PublicKey,
+    signer: &mut S,
+) -> Result<bool, SessionError>
+where
+    H: client::Handler,
+    S: russh::Signer<Error = russh::AgentAuthError>,
+{
+    session.authenticate_publickey_with(username, public_key, signer).await.map_err(SessionError::AgentAuth)
 }
 
 /// What kind of session channel to open: an interactive PTY+shell, or a
 /// single non-interactive command (`ssh host 'command'` equivalent).
 pub enum SessionKind {
-    Shell { term: String, cols: u32, rows: u32 },
+    Shell { term: String, cols: u32, rows: u32, terminal_modes: Vec<(russh::Pty, u32)> },
     Exec { command: String },
 }
 
@@ -210,8 +633,8 @@ pub async fn open_channel<H: client::Handler>(
 ) -> Result<russh::Channel<client::Msg>, SessionError> {
     let channel = handle.channel_open_session().await.map_err(SessionError::Channel)?;
     match kind {
-        SessionKind::Shell { term, cols, rows } => {
-            channel.request_pty(false, term, *cols, *rows, 0, 0, &[]).await.map_err(SessionError::Channel)?;
+        SessionKind::Shell { term, cols, rows, terminal_modes } => {
+            channel.request_pty(false, term, *cols, *rows, 0, 0, terminal_modes).await.map_err(SessionError::Channel)?;
             channel.request_shell(false).await.map_err(SessionError::Channel)?;
         }
         SessionKind::Exec { command } => {
@@ -234,8 +657,8 @@ mod tests {
 
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 
@@ -358,7 +781,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 1).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -407,7 +831,8 @@ mod tests {
 
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(), verifier,
+            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("jump connect should succeed");
@@ -429,7 +854,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 4).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -451,7 +877,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 5).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -469,7 +896,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 6).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -485,12 +913,432 @@ mod tests {
         );
     }
 
+    /// Generates a fresh ed25519 key encrypted with `passphrase`, returning
+    /// its OpenSSH PEM bytes — a real encrypted key, not a hand-rolled
+    /// fixture, so `is_encrypted()`/`decrypt()` exercise the same `ssh_key`
+    /// code path a real user's `~/.ssh/id_ed25519` would.
+    fn write_encrypted_ed25519_pem(seed: u8, passphrase: &str) -> Vec<u8> {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let key = PrivateKey::from(keypair);
+        let encrypted = key.encrypt(&mut rand::rngs::OsRng, passphrase).expect("encrypt a freshly generated key");
+        encrypted.to_openssh(Default::default()).unwrap().as_bytes().to_vec()
+    }
+
+    /// Generates a fresh ed25519 "subject" keypair, signs it with a freshly
+    /// generated CA key (`ca_seed`) into an OpenSSH user certificate valid
+    /// for `principal`, and returns (unencrypted subject key PEM,
+    /// certificate PEM, CA public key) — a real signed certificate, not a
+    /// hand-rolled fixture, exercising the same `ssh_key::certificate` code
+    /// path a real `ssh-keygen -s ca_key -I id -n user id_ed25519.pub` cert
+    /// would produce.
+    fn write_signed_certificate(seed: u8, ca_seed: u8, principal: &str) -> (Vec<u8>, Vec<u8>, russh_keys::ssh_key::PublicKey) {
+        let ca_key = PrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
+        let subject_key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+        let subject_pem = subject_key.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+
+        let mut builder = russh_keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rngs::OsRng,
+            subject_key.public_key().key_data().clone(),
+            0,
+            u32::MAX as u64, // valid "forever" (2106), avoids a SystemTime dependency in tests
+        )
+        .expect("build certificate builder");
+        builder.cert_type(russh_keys::ssh_key::certificate::CertType::User).unwrap();
+        builder.valid_principal(principal).unwrap();
+        let cert = builder.sign(&ca_key).expect("sign certificate with CA key");
+        let cert_pem = cert.to_openssh().unwrap().into_bytes();
+
+        (subject_pem, cert_pem, ca_key.public_key().clone())
+    }
+
+    /// Accepts an OpenSSH certificate authentication iff it's signed by
+    /// `trusted_ca` — the minimal real-world check a cert-aware sshd does
+    /// (russh itself already verified the signature/expiry/principal before
+    /// calling this handler, per `auth_openssh_certificate`'s doc comment).
+    #[derive(Clone)]
+    struct CertificateServer {
+        trusted_ca: russh_keys::ssh_key::PublicKey,
+    }
+
+    impl server::Server for CertificateServer {
+        type Handler = CertificateHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CertificateHandler {
+            CertificateHandler { trusted_ca: self.trusted_ca.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CertificateHandler {
+        trusted_ca: russh_keys::ssh_key::PublicKey,
+    }
+
+    #[async_trait]
+    impl server::Handler for CertificateHandler {
+        type Error = russh::Error;
+
+        async fn auth_openssh_certificate(
+            &mut self, _user: &str, certificate: &Certificate,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if certificate.signature_key() == self.trusted_ca.key_data() {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_succeeds_when_signed_by_the_trusted_ca() {
+        let (subject_pem, cert_pem, ca_public) = write_signed_certificate(40, 140, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 23).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate { private_key_pem: subject_pem, certificate_pem: cert_pem },
+        )
+        .await
+        .expect("a certificate signed by the server's trusted CA must authenticate cleanly");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_is_rejected_cleanly_when_signed_by_an_untrusted_ca() {
+        let (subject_pem, cert_pem, _untrusted_ca_public) = write_signed_certificate(41, 141, "tester");
+        // The server trusts a *different* CA than the one that actually signed this cert.
+        let (_other_subject_pem, _other_cert_pem, some_other_ca_public) = write_signed_certificate(42, 142, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: some_other_ca_public }, 24).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate { private_key_pem: subject_pem, certificate_pem: cert_pem },
+        )
+        .await
+        .expect("a rejected credential is Ok(false), not an error");
+        assert!(!authed, "a cert signed by an untrusted CA must be rejected, not accepted");
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_reports_a_malformed_certificate_distinctly() {
+        let (subject_pem, _real_cert_pem, ca_public) = write_signed_certificate(43, 143, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 25).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let result = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate {
+                private_key_pem: subject_pem,
+                certificate_pem: b"not a real openssh certificate".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::InvalidCertificate(_))),
+            "malformed certificate data should surface as InvalidCertificate, not a silent false: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_openssh_cert_with_passphrase_succeeds_with_an_encrypted_subject_key() {
+        let (subject_pem, cert_pem, ca_public) = write_signed_certificate(44, 144, "tester");
+        let subject_key = PrivateKey::from_openssh(&subject_pem).unwrap();
+        let encrypted_subject_pem =
+            subject_key.encrypt(&mut rand::rngs::OsRng, "hunter2").unwrap().to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 26).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_openssh_cert_with_passphrase(
+            &mut session.handle, "tester", &encrypted_subject_pem, &cert_pem, "hunter2",
+        )
+        .await
+        .expect("the right passphrase should decrypt the subject key and authenticate via the certificate");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_reports_encrypted_private_key_without_ever_dialing_auth() {
+        let addr = spawn_server(EchoExecServer, 20).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(101, "correct horse battery staple");
+        let result = authenticate_session(
+            &mut session.handle, "tester", &Credential::PublicKey { private_key_pem: pem },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::EncryptedPrivateKey)),
+            "an encrypted key must be reported distinctly from a malformed one: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_publickey_with_passphrase_succeeds_with_the_right_passphrase() {
+        let addr = spawn_server(EchoExecServer, 21).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(102, "correct horse battery staple");
+        let authed = authenticate_publickey_with_passphrase(
+            &mut session.handle, "tester", &pem, "correct horse battery staple",
+        )
+        .await
+        .expect("the right passphrase should decrypt and authenticate cleanly");
+        assert!(authed, "the server accepts any public key");
+    }
+
+    #[tokio::test]
+    async fn authenticate_publickey_with_passphrase_fails_cleanly_with_the_wrong_passphrase() {
+        let addr = spawn_server(EchoExecServer, 22).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(103, "correct horse battery staple");
+        let result = authenticate_publickey_with_passphrase(&mut session.handle, "tester", &pem, "wrong passphrase").await;
+        assert!(
+            matches!(result, Err(SessionError::InvalidPrivateKey(_))),
+            "a wrong passphrase must fail cleanly as InvalidPrivateKey, not panic or silently succeed: {result:?}"
+        );
+    }
+
+    /// One-round keyboard-interactive server: on the first call (`response
+    /// == None`) issues a single non-echoed "Password:" prompt via
+    /// `Auth::Partial`; on the second call (the client's answer) accepts iff
+    /// it equals `accepted_answer`. Stands in for a typical PAM-backed sshd
+    /// negotiating `keyboard-interactive` instead of plain `password`.
+    #[derive(Clone)]
+    struct OneRoundKeyboardInteractiveServer {
+        accepted_answer: String,
+    }
+
+    impl server::Server for OneRoundKeyboardInteractiveServer {
+        type Handler = OneRoundKeyboardInteractiveHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> OneRoundKeyboardInteractiveHandler {
+            OneRoundKeyboardInteractiveHandler { accepted_answer: self.accepted_answer.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneRoundKeyboardInteractiveHandler {
+        accepted_answer: String,
+    }
+
+    #[async_trait]
+    impl server::Handler for OneRoundKeyboardInteractiveHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match response {
+                None => Ok(Auth::Partial {
+                    name: "".into(),
+                    instructions: "".into(),
+                    prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                }),
+                Some(resp) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// Two-round keyboard-interactive server (password, then a separate OTP
+    /// round) — proves `authenticate_keyboard_interactive`'s loop actually
+    /// keeps going past the first `InfoRequest` rather than assuming exactly
+    /// one round.
+    #[derive(Clone)]
+    struct TwoRoundKeyboardInteractiveServer;
+
+    impl server::Server for TwoRoundKeyboardInteractiveServer {
+        type Handler = TwoRoundKeyboardInteractiveHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> TwoRoundKeyboardInteractiveHandler {
+            TwoRoundKeyboardInteractiveHandler { round: 0 }
+        }
+    }
+
+    struct TwoRoundKeyboardInteractiveHandler {
+        round: u32,
+    }
+
+    #[async_trait]
+    impl server::Handler for TwoRoundKeyboardInteractiveHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match (self.round, response) {
+                (0, None) => {
+                    self.round = 1;
+                    Ok(Auth::Partial {
+                        name: "".into(),
+                        instructions: "".into(),
+                        prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                    })
+                }
+                (1, Some(resp)) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    if answers.first().map(|a| a.as_slice()) != Some(b"correct-password") {
+                        return Ok(Auth::Reject { proceed_with_methods: None });
+                    }
+                    self.round = 2;
+                    Ok(Auth::Partial {
+                        name: "".into(),
+                        instructions: "".into(),
+                        prompts: std::borrow::Cow::Owned(vec![("OTP: ".into(), true)]),
+                    })
+                }
+                (2, Some(resp)) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(b"123456");
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+                _ => Ok(Auth::Reject { proceed_with_methods: None }),
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_succeeds_with_the_right_answer() {
+        let addr = spawn_server(OneRoundKeyboardInteractiveServer { accepted_answer: "hunter2".to_string() }, 30).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let mut calls = 0u32;
+        let authed = authenticate_keyboard_interactive(&mut session.handle, "tester", |prompts| {
+            calls += 1;
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].echo, "a password-style prompt must not echo");
+            vec!["hunter2".to_string()]
+        })
+        .await
+        .expect("keyboard-interactive request itself must not error");
+        assert!(authed);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_is_rejected_cleanly_with_the_wrong_answer() {
+        let addr = spawn_server(OneRoundKeyboardInteractiveServer { accepted_answer: "hunter2".to_string() }, 31).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed =
+            authenticate_keyboard_interactive(&mut session.handle, "tester", |_prompts| vec!["wrong".to_string()])
+                .await
+                .expect("a rejected credential is Ok(false), not an error");
+        assert!(!authed);
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_handles_multiple_rounds() {
+        let addr = spawn_server(TwoRoundKeyboardInteractiveServer, 32).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let mut round = 0u32;
+        let authed = authenticate_keyboard_interactive(&mut session.handle, "tester", |prompts| {
+            round += 1;
+            match round {
+                1 => {
+                    assert!(!prompts[0].echo);
+                    vec!["correct-password".to_string()]
+                }
+                2 => {
+                    assert!(prompts[0].echo, "the OTP round in this test server echoes");
+                    vec!["123456".to_string()]
+                }
+                _ => panic!("unexpected third round"),
+            }
+        })
+        .await
+        .expect("keyboard-interactive request itself must not error");
+        assert!(authed, "both rounds answered correctly must authenticate");
+        assert_eq!(round, 2, "the loop must keep going past the first InfoRequest");
+    }
+
     struct RejectAllHostKeys;
 
     #[async_trait]
     impl HostKeyVerifier for RejectAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            false
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Rejected("rejected by test double".to_string())
         }
     }
 
@@ -499,12 +1347,252 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 7).await;
         let verifier = Arc::new(RejectAllHostKeys);
         let result = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
         )
         .await;
         assert!(
             result.is_err(),
             "a HostKeyVerifier that always returns false must abort the connection, not silently proceed"
+        );
+    }
+
+    /// A `russh::Signer` that signs locally with an in-memory key instead of
+    /// talking to a real external agent process — this test's whole point is
+    /// to prove `authenticate_with_signer` correctly drives russh's
+    /// `authenticate_publickey_with`/`Signer` flow, which is identical
+    /// whether the signer on the other end is a real
+    /// `russh_keys::agent::client::AgentClient` (Unix socket, Windows named
+    /// pipe, or Pageant — russh provides the `Signer` impl for all of them)
+    /// or, as here, anything else implementing the same trait. No real OS
+    /// agent process needed to exercise this.
+    struct FakeSigner {
+        key: PrivateKey,
+    }
+
+    #[async_trait]
+    impl russh::Signer for FakeSigner {
+        type Error = russh::AgentAuthError;
+
+        async fn auth_publickey_sign(
+            &mut self,
+            _key: &PublicKey,
+            mut to_sign: russh::CryptoVec,
+        ) -> Result<russh::CryptoVec, Self::Error> {
+            use signature::Signer as _;
+            use ssh_encoding::Encode;
+
+            // Reproduces exactly the wire format a real agent's
+            // `SIGN_RESPONSE` produces (russh-keys'
+            // `AgentClient::write_signature`): the original challenge bytes,
+            // followed by a 4-byte length prefix, followed by the
+            // signature blob (`Signature`'s own `Encode` impl already
+            // writes `[string algorithm][string raw_bytes]`, which is that
+            // same blob).
+            let signature = self.key.try_sign(&to_sign).expect("signing with a known-good in-memory test key must not fail");
+            let mut sig_bytes = Vec::new();
+            signature.encode(&mut sig_bytes).expect("encoding a signature must not fail");
+            (sig_bytes.len() as u32).encode(&mut to_sign).expect("encoding a length prefix must not fail");
+            for byte in sig_bytes {
+                to_sign.push(byte);
+            }
+            Ok(to_sign)
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticate_with_signer_succeeds_against_a_real_server() {
+        let addr = spawn_server(EchoExecServer, 8).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let keypair = Ed25519Keypair::from_seed(&[42u8; 32]);
+        let private_key = PrivateKey::from(keypair);
+        let public_key = private_key.public_key().clone();
+        let mut signer = FakeSigner { key: private_key };
+
+        let authed = authenticate_with_signer(&mut session.handle, "tester", public_key, &mut signer)
+            .await
+            .expect("authenticate_with_signer should not error against a server that accepts any public key");
+        assert!(authed, "the server accepts any public key, so a correctly-signed challenge must succeed");
+    }
+
+    #[tokio::test]
+    async fn direct_connection_constructs_exactly_one_target_leg_handler() {
+        let addr = spawn_server(EchoExecServer, 9).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let legs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let legs_recorder = legs.clone();
+        let _session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            move |leg| {
+                legs_recorder.lock().unwrap().push(leg);
+                verifying_handler(&verifier)
+            },
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        assert_eq!(
+            *legs.lock().unwrap(),
+            vec![ConnectionLeg::Target],
+            "a direct connection must build exactly one handler, for the target leg"
+        );
+    }
+
+    /// A server that accepts any password and, when a `streamlocal_forward`
+    /// (`ssh -R <sock>`) is requested, immediately opens a
+    /// `forwarded-streamlocal@openssh.com` channel back for that exact socket
+    /// path, writes a fixed payload, and closes it — standing in for a real
+    /// sshd delivering a remote-forward connection to the client.
+    #[derive(Clone)]
+    struct StreamlocalForwardServer;
+
+    impl server::Server for StreamlocalForwardServer {
+        type Handler = StreamlocalForwardHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> StreamlocalForwardHandler {
+            StreamlocalForwardHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamlocalForwardHandler;
+
+    #[async_trait]
+    impl server::Handler for StreamlocalForwardHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let handle = session.handle();
+            let path = socket_path.to_string();
+            // Open the forwarded channel off-thread: doing it inline would
+            // deadlock, since the client is still awaiting this request's
+            // reply and can't process the channel-open until it arrives.
+            tokio::spawn(async move {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path).await {
+                    let _ = channel.data(&b"ctl-payload\n"[..]).await;
+                    let _ = channel.eof().await;
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    /// A `streamlocal_forward` request must round-trip: the server opens a
+    /// `forwarded-streamlocal` channel back for that socket path, and a
+    /// [`ForwardRoutes`] installed via [`verifying_handler_with_routes`] must
+    /// deliver that channel to the matching receiver so the caller can read
+    /// the forwarded bytes in-process.
+    #[tokio::test]
+    async fn streamlocal_forward_delivers_channels_to_registered_routes() {
+        use tokio::time::{timeout, Duration};
+
+        let addr = spawn_server(StreamlocalForwardServer, 12).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let routes = ForwardRoutes::new();
+        let remote_path = "/tmp/isekai-pipe-ctl-roundtrip.sock";
+        let mut rx = routes.register(remote_path);
+
+        let mut handle = establish_over_stream(
+            Arc::new(client::Config::default()),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            verifying_handler_with_routes(&verifier, &routes),
+        )
+        .await
+        .expect("handshake should succeed");
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("x".into())).await.unwrap();
+        assert!(authed, "the forward server accepts any password");
+
+        handle.streamlocal_forward(remote_path).await.expect("streamlocal_forward should be accepted");
+
+        let mut channel = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a forwarded channel should arrive before the timeout")
+            .expect("the route sender must not have been dropped");
+
+        let mut got = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => got.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(got, b"ctl-payload\n", "the forwarded channel's bytes must reach the registered route");
+    }
+
+    /// A forwarded channel whose socket path has no registered route is simply
+    /// dropped (closed): [`ForwardRoutes::dispatch`] returns `false`, and the
+    /// handler's default is to close the channel rather than error the session.
+    /// Registering a *different* path proves the un-routed one never arrives.
+    #[tokio::test]
+    async fn streamlocal_forward_without_a_matching_route_is_dropped() {
+        use tokio::time::{timeout, Duration};
+
+        let addr = spawn_server(StreamlocalForwardServer, 13).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let routes = ForwardRoutes::new();
+        // Register some *other* path; the server will forward for the path we
+        // actually request, which has no route.
+        let mut rx = routes.register("/tmp/some-other-path.sock");
+
+        let mut handle = establish_over_stream(
+            Arc::new(client::Config::default()),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            verifying_handler_with_routes(&verifier, &routes),
+        )
+        .await
+        .expect("handshake should succeed");
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".into())).await.unwrap());
+
+        handle.streamlocal_forward("/tmp/isekai-pipe-ctl-unrouted.sock").await.expect("forward accepted");
+
+        // The unrouted channel must not be misdelivered to the other path's
+        // receiver; a short wait that times out is the expected outcome.
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            "a forwarded channel for an unregistered path must not reach an unrelated route"
+        );
+    }
+
+    #[tokio::test]
+    async fn jump_connection_constructs_jump_then_target_legs_in_order() {
+        let target_addr = spawn_server(EchoExecServer, 10).await;
+        let jump_addr = spawn_server(JumpServer, 11).await;
+
+        let jump = JumpHost {
+            host: jump_addr.ip().to_string(),
+            port: jump_addr.port(),
+            username: "jumper".into(),
+            credential: Credential::Password("correct-password".into()),
+        };
+
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let legs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let legs_recorder = legs.clone();
+        let _session = connect_via_jump_or_direct(
+            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(),
+            move |leg| {
+                legs_recorder.lock().unwrap().push(leg);
+                verifying_handler(&verifier)
+            },
+        )
+        .await
+        .expect("jump connect should succeed");
+
+        assert_eq!(
+            *legs.lock().unwrap(),
+            vec![ConnectionLeg::Jump, ConnectionLeg::Target],
+            "a jump connection must build the jump-leg handler first, then the target-leg handler"
         );
     }
 }

@@ -27,7 +27,7 @@ pub(super) fn resolve_isekai_config(
         openssh
             .hostname
             .as_deref()
-            .unwrap_or(plan.destination.as_str()),
+            .unwrap_or(plan.destination_host()),
         openssh.port.unwrap_or(22)
     );
     let mut builder = IsekaiConfigBuilder {
@@ -63,7 +63,7 @@ pub(super) fn resolve_isekai_config(
                 .map(parse_jump_chain)
                 .unwrap_or_default(),
             priority: 100,
-            alias: Some(plan.destination.clone()),
+            alias: Some(plan.destination_host().to_string()),
         });
     }
     if builder.services.is_empty() {
@@ -91,7 +91,7 @@ pub(super) fn resolve_isekai_config(
     Ok(IsekaiConfig {
         enabled: builder.enabled.unwrap_or(true),
         bootstrap_policy: builder.bootstrap_policy.unwrap_or(BootstrapPolicy::Auto),
-        profile: builder.profile.unwrap_or_else(|| plan.destination.clone()),
+        profile: builder.profile.unwrap_or_else(|| plan.destination_host().to_string()),
         remote_path: builder.remote_path,
         services: builder.services,
         bootstrap_candidates: builder.bootstrap_candidates,

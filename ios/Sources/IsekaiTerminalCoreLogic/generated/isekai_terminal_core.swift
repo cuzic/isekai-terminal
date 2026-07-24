@@ -505,6 +505,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -1088,6 +1104,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func cancelReconnect() 
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+    func clickToPromptCursor(row: UInt32, col: UInt32) 
+    
     func connect(config: SshConfig) throws 
     
     /**
@@ -1124,27 +1147,27 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     func connectQuic(config: QuicConfig) throws 
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+    func copyLastCommandOutput() 
+    
     func disconnect() 
     
     /**
-     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
-     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
-     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
-     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
-     * (`.claude/rules/rust-ssot.md`)。
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
      *
-     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
-     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
-     * 決定論的に解決される。
-     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
-     * 生成し`SharedPreferences`等に保存、以後使い回す)。
-     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
-     * 無ければ`None`(新規タブ)。
-     *
-     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
-     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
      */
-    func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) async throws  -> TmuxTabWindowInfo
+    func filePreviewRequest(requestId: String, kind: FilePreviewRequestKind) 
     
     /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
@@ -1155,6 +1178,20 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func forceReturnToWifi() 
     
     func isQuic()  -> Bool
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+    func jumpToNextPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) 
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+    func jumpToPreviousPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) 
     
     /**
      * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
@@ -1182,13 +1219,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
-     *
-     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
-     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
-     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
-     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
-     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
-     * フォーカス状態は独立に変化し得るため)。
      */
     func notifyFocusChange(focused: Bool) 
     
@@ -1353,6 +1383,20 @@ open func cancelReconnect()  {try! rustCall() {
 }
 }
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+open func clickToPromptCursor(row: UInt32, col: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(row),
+        FfiConverterUInt32.lower(col),$0
+    )
+}
+}
+    
 open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(
             self.uniffiCloneHandle(),
@@ -1431,6 +1475,18 @@ open func connectQuic(config: QuicConfig)throws   {try rustCallWithError(FfiConv
 }
 }
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+open func copyLastCommandOutput()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
 open func disconnect()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
             self.uniffiCloneHandle(),$0
@@ -1439,38 +1495,23 @@ open func disconnect()  {try! rustCall() {
 }
     
     /**
-     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
-     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
-     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
-     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
-     * (`.claude/rules/rust-ssot.md`)。
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
      *
-     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
-     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
-     * 決定論的に解決される。
-     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
-     * 生成し`SharedPreferences`等に保存、以後使い回す)。
-     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
-     * 無ければ`None`(新規タブ)。
-     *
-     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
-     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
      */
-open func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?)async throws  -> TmuxTabWindowInfo  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
-                    self.uniffiCloneHandle(),
-                    FfiConverterString.lower(profileIdentity),FfiConverterString.lower(clientId),FfiConverterOptionString.lower(existingTag)
-                )
-            },
-            pollFunc: ffi_isekai_terminal_core_rust_future_poll_rust_buffer,
-            completeFunc: ffi_isekai_terminal_core_rust_future_complete_rust_buffer,
-            freeFunc: ffi_isekai_terminal_core_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeTmuxTabWindowInfo_lift,
-            errorHandler: FfiConverterTypeTmuxSessionError_lift
-        )
+open func filePreviewRequest(requestId: String, kind: FilePreviewRequestKind)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(requestId),
+        FfiConverterTypeFilePreviewRequestKind_lower(kind),$0
+    )
+}
 }
     
     /**
@@ -1492,6 +1533,34 @@ open func isQuic() -> Bool  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+open func jumpToNextPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(fromScrollOffset),
+        FfiConverterBool.lower(fromShowingScrollback),$0
+    )
+}
+}
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+open func jumpToPreviousPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(fromScrollOffset),
+        FfiConverterBool.lower(fromShowingScrollback),$0
+    )
+}
 }
     
     /**
@@ -1537,13 +1606,6 @@ open func notifyError(message: String)  {try! rustCall() {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
-     *
-     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
-     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
-     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
-     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
-     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
-     * フォーカス状態は独立に変化し得るため)。
      */
 open func notifyFocusChange(focused: Bool)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
@@ -2132,6 +2194,75 @@ public func FfiConverterTypeDiagnosticEventEnvelope_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeDiagnosticEventEnvelope_lower(_ value: DiagnosticEventEnvelope) -> RustBuffer {
     return FfiConverterTypeDiagnosticEventEnvelope.lower(value)
+}
+
+
+/**
+ * ディレクトリエントリ1件(`isekai-pipe ctl file ls`の結果)。
+ */
+public struct FilePreviewEntry: Equatable, Hashable {
+    public var name: String
+    public var isDir: Bool
+    public var isSymlink: Bool
+    public var size: UInt64
+    public var modifiedUnix: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, isDir: Bool, isSymlink: Bool, size: UInt64, modifiedUnix: Int64?) {
+        self.name = name
+        self.isDir = isDir
+        self.isSymlink = isSymlink
+        self.size = size
+        self.modifiedUnix = modifiedUnix
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FilePreviewEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewEntry {
+        return
+            try FilePreviewEntry(
+                name: FfiConverterString.read(from: &buf), 
+                isDir: FfiConverterBool.read(from: &buf), 
+                isSymlink: FfiConverterBool.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                modifiedUnix: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FilePreviewEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterBool.write(value.isDir, into: &buf)
+        FfiConverterBool.write(value.isSymlink, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterOptionInt64.write(value.modifiedUnix, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewEntry_lift(_ buf: RustBuffer) throws -> FilePreviewEntry {
+    return try FfiConverterTypeFilePreviewEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewEntry_lower(_ value: FilePreviewEntry) -> RustBuffer {
+    return FfiConverterTypeFilePreviewEntry.lower(value)
 }
 
 
@@ -3098,6 +3229,74 @@ public func FfiConverterTypePortForward_lower(_ value: PortForward) -> RustBuffe
 }
 
 
+/**
+ * OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+ * ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+ * 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+ *
+ * - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+ * `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+ * (`scrollback_cells`を呼ぶ必要はない)。
+ * - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+ * `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+ * 代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+ * ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+ * 検索ジャンプと同型のパターン)。
+ */
+public struct PromptJumpTarget: Equatable, Hashable {
+    public var scrollOffset: UInt32
+    public var isLive: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(scrollOffset: UInt32, isLive: Bool) {
+        self.scrollOffset = scrollOffset
+        self.isLive = isLive
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PromptJumpTarget: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptJumpTarget: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptJumpTarget {
+        return
+            try PromptJumpTarget(
+                scrollOffset: FfiConverterUInt32.read(from: &buf), 
+                isLive: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PromptJumpTarget, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.scrollOffset, into: &buf)
+        FfiConverterBool.write(value.isLive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptJumpTarget_lift(_ buf: RustBuffer) throws -> PromptJumpTarget {
+    return try FfiConverterTypePromptJumpTarget.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptJumpTarget_lower(_ value: PromptJumpTarget) -> RustBuffer {
+    return FfiConverterTypePromptJumpTarget.lower(value)
+}
+
+
 public struct QuicConfig: Equatable, Hashable {
     /**
      * tsshd の QUIC エンドポイント (e.g. "100.100.45.36")
@@ -3244,6 +3443,17 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var sgrMouseMode: Bool
     /**
+     * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+     * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+     */
+    public var alternateScroll: Bool
+    /**
+     * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+     * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+     * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+     */
+    public var urxvtMouseMode: Bool
+    /**
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     public var cursorVisible: Bool
@@ -3355,6 +3565,15 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 将来のプロトコル分岐のために公開しておく。
          */sgrMouseMode: Bool, 
         /**
+         * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+         * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+         */alternateScroll: Bool, 
+        /**
+         * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+         * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+         * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+         */urxvtMouseMode: Bool, 
+        /**
          * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
          */cursorVisible: Bool, 
         /**
@@ -3439,6 +3658,8 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.bracketedPasteMode = bracketedPasteMode
         self.mouseReportingMode = mouseReportingMode
         self.sgrMouseMode = sgrMouseMode
+        self.alternateScroll = alternateScroll
+        self.urxvtMouseMode = urxvtMouseMode
         self.cursorVisible = cursorVisible
         self.bellGeneration = bellGeneration
         self.cursorShape = cursorShape
@@ -3477,6 +3698,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
                 mouseReportingMode: FfiConverterTypeMouseReportingMode.read(from: &buf), 
                 sgrMouseMode: FfiConverterBool.read(from: &buf), 
+                alternateScroll: FfiConverterBool.read(from: &buf), 
+                urxvtMouseMode: FfiConverterBool.read(from: &buf), 
                 cursorVisible: FfiConverterBool.read(from: &buf), 
                 bellGeneration: FfiConverterUInt64.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
@@ -3501,6 +3724,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
         FfiConverterTypeMouseReportingMode.write(value.mouseReportingMode, into: &buf)
         FfiConverterBool.write(value.sgrMouseMode, into: &buf)
+        FfiConverterBool.write(value.alternateScroll, into: &buf)
+        FfiConverterBool.write(value.urxvtMouseMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
@@ -3887,109 +4112,6 @@ public func FfiConverterTypeTerminalKeyModifiers_lower(_ value: TerminalKeyModif
     return FfiConverterTypeTerminalKeyModifiers.lower(value)
 }
 
-
-/**
- * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
- * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
- * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
- * `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
- * キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
- */
-public struct TmuxTabWindowInfo: Equatable, Hashable {
-    /**
-     * tmuxウィンドウを長期的に指すタグ値。
-     */
-    public var tag: String
-    /**
-     * このタグ解決時点でのウィンドウインデックス。
-     */
-    public var windowIndex: UInt32
-    /**
-     * このクライアントがattachしたセッション名(グループ内で一意)。
-     */
-    public var sessionName: String
-    /**
-     * tmux session groupの名前。
-     */
-    public var groupName: String
-    /**
-     * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
-     */
-    public var isNewWindow: Bool
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * tmuxウィンドウを長期的に指すタグ値。
-         */tag: String, 
-        /**
-         * このタグ解決時点でのウィンドウインデックス。
-         */windowIndex: UInt32, 
-        /**
-         * このクライアントがattachしたセッション名(グループ内で一意)。
-         */sessionName: String, 
-        /**
-         * tmux session groupの名前。
-         */groupName: String, 
-        /**
-         * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
-         */isNewWindow: Bool) {
-        self.tag = tag
-        self.windowIndex = windowIndex
-        self.sessionName = sessionName
-        self.groupName = groupName
-        self.isNewWindow = isNewWindow
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension TmuxTabWindowInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxTabWindowInfo {
-        return
-            try TmuxTabWindowInfo(
-                tag: FfiConverterString.read(from: &buf), 
-                windowIndex: FfiConverterUInt32.read(from: &buf), 
-                sessionName: FfiConverterString.read(from: &buf), 
-                groupName: FfiConverterString.read(from: &buf), 
-                isNewWindow: FfiConverterBool.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: TmuxTabWindowInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.tag, into: &buf)
-        FfiConverterUInt32.write(value.windowIndex, into: &buf)
-        FfiConverterString.write(value.sessionName, into: &buf)
-        FfiConverterString.write(value.groupName, into: &buf)
-        FfiConverterBool.write(value.isNewWindow, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTmuxTabWindowInfo_lift(_ buf: RustBuffer) throws -> TmuxTabWindowInfo {
-    return try FfiConverterTypeTmuxTabWindowInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTmuxTabWindowInfo_lower(_ value: TmuxTabWindowInfo) -> RustBuffer {
-    return FfiConverterTypeTmuxTabWindowInfo.lower(value)
-}
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -4335,6 +4457,213 @@ public func FfiConverterTypeCursorShape_lower(_ value: CursorShape) -> RustBuffe
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * `file_preview_request`の非同期結果。`OrchestratorCallback::on_file_preview_result`で
+ * 届く。
+ */
+
+public enum FilePreviewOutcome: Equatable, Hashable {
+    
+    case ls(entries: [FilePreviewEntry]
+    )
+    case cat(offset: UInt64, length: UInt64, totalSize: UInt64, eof: Bool, data: Data
+    )
+    case info(name: String, path: String, isDir: Bool, isSymlink: Bool, size: UInt64, modifiedUnix: Int64?, permissionsUnix: UInt32?
+    )
+    /**
+     * I/Oエラー(`ctl_file.rs`の`{"ok":false,"error":...}`)・exec自体の失敗
+     * (未接続・チャネルオープン失敗)・JSONパース失敗のいずれか。呼び出し元は
+     * 種別を区別する必要が無いので単一のバリアントにまとめている。
+     */
+    case error(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FilePreviewOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FilePreviewOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ls(entries: try FfiConverterSequenceTypeFilePreviewEntry.read(from: &buf)
+        )
+        
+        case 2: return .cat(offset: try FfiConverterUInt64.read(from: &buf), length: try FfiConverterUInt64.read(from: &buf), totalSize: try FfiConverterUInt64.read(from: &buf), eof: try FfiConverterBool.read(from: &buf), data: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 3: return .info(name: try FfiConverterString.read(from: &buf), path: try FfiConverterString.read(from: &buf), isDir: try FfiConverterBool.read(from: &buf), isSymlink: try FfiConverterBool.read(from: &buf), size: try FfiConverterUInt64.read(from: &buf), modifiedUnix: try FfiConverterOptionInt64.read(from: &buf), permissionsUnix: try FfiConverterOptionUInt32.read(from: &buf)
+        )
+        
+        case 4: return .error(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FilePreviewOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ls(entries):
+            writeInt(&buf, Int32(1))
+            FfiConverterSequenceTypeFilePreviewEntry.write(entries, into: &buf)
+            
+        
+        case let .cat(offset,length,totalSize,eof,data):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(offset, into: &buf)
+            FfiConverterUInt64.write(length, into: &buf)
+            FfiConverterUInt64.write(totalSize, into: &buf)
+            FfiConverterBool.write(eof, into: &buf)
+            FfiConverterData.write(data, into: &buf)
+            
+        
+        case let .info(name,path,isDir,isSymlink,size,modifiedUnix,permissionsUnix):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(name, into: &buf)
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterBool.write(isDir, into: &buf)
+            FfiConverterBool.write(isSymlink, into: &buf)
+            FfiConverterUInt64.write(size, into: &buf)
+            FfiConverterOptionInt64.write(modifiedUnix, into: &buf)
+            FfiConverterOptionUInt32.write(permissionsUnix, into: &buf)
+            
+        
+        case let .error(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewOutcome_lift(_ buf: RustBuffer) throws -> FilePreviewOutcome {
+    return try FfiConverterTypeFilePreviewOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewOutcome_lower(_ value: FilePreviewOutcome) -> RustBuffer {
+    return FfiConverterTypeFilePreviewOutcome.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * `SessionOrchestrator::file_preview_request`への要求種別。`ctl_file.rs`の
+ * `ls`/`cat`/`info`サブコマンドに対応する(`cp`/`rm`はこのタスクのスコープ外
+ * — プレビューは読み取り専用、削除/コピーはtrzsz転送シート等の既存導線に任せる)。
+ */
+
+public enum FilePreviewRequestKind: Equatable, Hashable {
+    
+    case ls(path: String
+    )
+    /**
+     * `length`が`None`なら「ファイル末尾まで(ただし8MiB上限でクランプ)」を要求する。
+     * 大きなファイルはKotlin側が`offset += 返ってきたlength`でページングし続ける
+     * (`ctl_file.rs`のドキュメント通り)。
+     */
+    case cat(path: String, offset: UInt64, length: UInt64?
+    )
+    case info(path: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FilePreviewRequestKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewRequestKind: FfiConverterRustBuffer {
+    typealias SwiftType = FilePreviewRequestKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewRequestKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ls(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .cat(path: try FfiConverterString.read(from: &buf), offset: try FfiConverterUInt64.read(from: &buf), length: try FfiConverterOptionUInt64.read(from: &buf)
+        )
+        
+        case 3: return .info(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FilePreviewRequestKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ls(path):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case let .cat(path,offset,length):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterUInt64.write(offset, into: &buf)
+            FfiConverterOptionUInt64.write(length, into: &buf)
+            
+        
+        case let .info(path):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(path, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewRequestKind_lift(_ buf: RustBuffer) throws -> FilePreviewRequestKind {
+    return try FfiConverterTypeFilePreviewRequestKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewRequestKind_lower(_ value: FilePreviewRequestKind) -> RustBuffer {
+    return FfiConverterTypeFilePreviewRequestKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 
@@ -4521,6 +4850,8 @@ public enum MouseButton: Equatable, Hashable {
     case right
     case wheelUp
     case wheelDown
+    case wheelLeft
+    case wheelRight
 
 
 
@@ -4552,6 +4883,10 @@ public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
         
         case 5: return .wheelDown
         
+        case 6: return .wheelLeft
+        
+        case 7: return .wheelRight
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -4578,6 +4913,14 @@ public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
         
         case .wheelDown:
             writeInt(&buf, Int32(5))
+        
+        
+        case .wheelLeft:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .wheelRight:
+            writeInt(&buf, Int32(7))
         
         }
     }
@@ -4791,93 +5134,6 @@ public func FfiConverterTypeMouseReportingMode_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeMouseReportingMode_lower(_ value: MouseReportingMode) -> RustBuffer {
     return FfiConverterTypeMouseReportingMode.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
- * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
- * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
- * なので、その型をUniFFI境界越しにそのまま公開できない)。
- */
-
-public enum NotifyKind: Equatable, Hashable {
-    
-    case bell
-    case activity
-    case silence
-    case jobDone
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension NotifyKind: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
-    typealias SwiftType = NotifyKind
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NotifyKind {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .bell
-        
-        case 2: return .activity
-        
-        case 3: return .silence
-        
-        case 4: return .jobDone
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: NotifyKind, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .bell:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .activity:
-            writeInt(&buf, Int32(2))
-        
-        
-        case .silence:
-            writeInt(&buf, Int32(3))
-        
-        
-        case .jobDone:
-            writeInt(&buf, Int32(4))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeNotifyKind_lift(_ buf: RustBuffer) throws -> NotifyKind {
-    return try FfiConverterTypeNotifyKind.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeNotifyKind_lower(_ value: NotifyKind) -> RustBuffer {
-    return FfiConverterTypeNotifyKind.lower(value)
 }
 
 
@@ -5484,103 +5740,6 @@ public func FfiConverterTypeTerminalSpecialKey_lower(_ value: TerminalSpecialKey
 }
 
 
-
-/**
- * [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
- * (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
- * このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
- * `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
- * 切断)はメッセージにまとめて運ぶだけに留める。
- */
-public enum TmuxSessionError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
-
-    
-    
-    /**
-     * tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
-     */
-    case Command(String
-    )
-    /**
-     * tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
-     */
-    case UnexpectedOutput(String
-    )
-
-    
-
-    
-
-    
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-    
-}
-
-#if compiler(>=6)
-extension TmuxSessionError: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeTmuxSessionError: FfiConverterRustBuffer {
-    typealias SwiftType = TmuxSessionError
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxSessionError {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        
-
-        
-        case 1: return .Command(
-            try FfiConverterString.read(from: &buf)
-            )
-        case 2: return .UnexpectedOutput(
-            try FfiConverterString.read(from: &buf)
-            )
-
-         default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: TmuxSessionError, into buf: inout [UInt8]) {
-        switch value {
-
-        
-
-        
-        
-        case let .Command(v1):
-            writeInt(&buf, Int32(1))
-            FfiConverterString.write(v1, into: &buf)
-            
-        
-        case let .UnexpectedOutput(v1):
-            writeInt(&buf, Int32(2))
-            FfiConverterString.write(v1, into: &buf)
-            
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTmuxSessionError_lift(_ buf: RustBuffer) throws -> TmuxSessionError {
-    return try FfiConverterTypeTmuxSessionError.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeTmuxSessionError_lower(_ value: TmuxSessionError) -> RustBuffer {
-    return FfiConverterTypeTmuxSessionError.lower(value)
-}
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -6173,16 +6332,23 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
     func onRebindStateChanged(state: RebindPublicState) 
     
     /**
-     * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
-     * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
-     * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
-     * 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
-     * から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
-     * per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
-     * (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
-     * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+     * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+     * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
      */
-    func onNotify(kind: NotifyKind) 
+    func onPromptJump(target: PromptJumpTarget?) 
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+     * 結果。該当コマンドがまだ無ければ`None`。
+     */
+    func onPromptOutputCopyReady(text: String?) 
+    
+    /**
+     * タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+     * 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+     * パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+     */
+    func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) 
     
 }
 
@@ -6545,9 +6711,9 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 writeReturn: writeReturn
             )
         },
-        onNotify: { (
+        onPromptJump: { (
             uniffiHandle: UInt64,
-            kind: RustBuffer,
+            target: RustBuffer,
             uniffiOutReturn: UnsafeMutableRawPointer,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
         ) in
@@ -6556,8 +6722,58 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return uniffiObj.onNotify(
-                     kind: try FfiConverterTypeNotifyKind_lift(kind)
+                return uniffiObj.onPromptJump(
+                     target: try FfiConverterOptionTypePromptJumpTarget.lift(target)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onPromptOutputCopyReady: { (
+            uniffiHandle: UInt64,
+            text: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onPromptOutputCopyReady(
+                     text: try FfiConverterOptionString.lift(text)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onFilePreviewResult: { (
+            uniffiHandle: UInt64,
+            requestId: RustBuffer,
+            outcome: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onFilePreviewResult(
+                     requestId: try FfiConverterString.lift(requestId),
+                     outcome: try FfiConverterTypeFilePreviewOutcome_lift(outcome)
                 )
             }
 
@@ -6771,6 +6987,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -6883,6 +7123,30 @@ fileprivate struct FfiConverterOptionTypePlatformFd: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePlatformFd.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePromptJumpTarget: FfiConverterRustBuffer {
+    typealias SwiftType = PromptJumpTarget?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePromptJumpTarget.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePromptJumpTarget.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7104,6 +7368,31 @@ fileprivate struct FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverter
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeDiagnosticEventEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFilePreviewEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [FilePreviewEntry]
+
+    public static func write(_ value: [FilePreviewEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFilePreviewEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FilePreviewEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FilePreviewEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFilePreviewEntry.read(from: &buf))
         }
         return seq
     }
@@ -7437,7 +7726,7 @@ public func terminalNumpadKeyBytes(key: TerminalNumpadKey, applicationKeypadMode
  * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
  * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
  */
-public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool) -> Data?  {
+public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool, urxvtMouseMode: Bool) -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
         FfiConverterTypeMouseEventKind_lower(kind),
@@ -7448,7 +7737,8 @@ public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),
         FfiConverterTypeMouseReportingMode_lower(mouseReportingMode),
-        FfiConverterBool.lower(sgrMouseMode),$0
+        FfiConverterBool.lower(sgrMouseMode),
+        FfiConverterBool.lower(urxvtMouseMode),$0
     )
 })
 }
@@ -7558,6 +7848,33 @@ public func createSessionOrchestrator(callback: OrchestratorCallback) -> Session
     )
 })
 }
+/**
+ * [`AUTO_REATTACH_GRACE_SECS`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
+ * Kotlin側にハードコードで複製させないための単純なgetter。
+ */
+public func reattachGraceWindowSecs() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs($0
+    )
+})
+}
+/**
+ * 永続化された「直近アクティブだったセッション」記録が、黙示的な自動再接続を
+ * 試みるにあたってまだ新鮮かどうかを判定する。`saved_at_unix_secs`は記録時刻、
+ * `now_unix_secs`は判定時刻(いずれもUnix epoch秒)。
+ *
+ * `now_unix_secs`が`saved_at_unix_secs`より前(端末の時計調整等で稀に起こりうる)の
+ * 場合は`saturating_sub`により経過時間0として扱い、freshと判定する——「保存した
+ * 直後なのに古いと誤判定される」という直感に反する挙動を避けるための意図的な選択。
+ */
+public func reattachRecordIsFresh(savedAtUnixSecs: UInt64, nowUnixSecs: UInt64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(
+        FfiConverterUInt64.lower(savedAtUnixSecs),
+        FfiConverterUInt64.lower(nowUnixSecs),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -7598,7 +7915,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 7470) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
@@ -7623,6 +7940,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs() != 34671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh() != 47307) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
@@ -7652,6 +7975,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor() != 45047) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7673,16 +7999,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output() != 30171) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt() != 53496) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
@@ -7694,7 +8029,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -7802,7 +8137,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
         return InitializationResult.apiChecksumMismatch
     }
 

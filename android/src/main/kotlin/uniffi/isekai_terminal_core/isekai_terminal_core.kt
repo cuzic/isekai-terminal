@@ -669,7 +669,17 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod13 : com.sun
     fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod14 : com.sun.jna.Callback {
+<<<<<<< HEAD
     fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+=======
+    fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod15 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod16 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+>>>>>>> main
 }
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
@@ -709,7 +719,11 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
+<<<<<<< HEAD
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onNotify")
+=======
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult")
+>>>>>>> main
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -727,7 +741,13 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
     @JvmField internal var `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
     @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
+<<<<<<< HEAD
     @JvmField internal var `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+=======
+    @JvmField internal var `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+    @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+    @JvmField internal var `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+>>>>>>> main
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -746,8 +766,15 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
         `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
         `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
+<<<<<<< HEAD
         `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
     ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onNotify`,), Structure.ByValue
+=======
+        `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+        `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+        `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,), Structure.ByValue
+>>>>>>> main
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -766,7 +793,13 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd` = other.`onRequestWifiFd`
         `onRequestCellularFd` = other.`onRequestCellularFd`
         `onRebindStateChanged` = other.`onRebindStateChanged`
+<<<<<<< HEAD
         `onNotify` = other.`onNotify`
+=======
+        `onPromptJump` = other.`onPromptJump`
+        `onPromptOutputCopyReady` = other.`onPromptOutputCopyReady`
+        `onFilePreviewResult` = other.`onFilePreviewResult`
+>>>>>>> main
     }
 
 }
@@ -827,6 +860,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_push(
@@ -845,6 +882,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
@@ -859,13 +898,23 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
+<<<<<<< HEAD
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window(
+=======
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request(
+>>>>>>> main
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired(
     ): Int
@@ -945,7 +994,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(
     ): Int
+<<<<<<< HEAD
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify(
+=======
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result(
+>>>>>>> main
     ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
@@ -1008,6 +1065,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(`ptr`: Long,`row`: Int,`col`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1022,14 +1081,25 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_m
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+<<<<<<< HEAD
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(`ptr`: Long,`profileIdentity`: RustBuffer.ByValue,`clientId`: RustBuffer.ByValue,`existingTag`: RustBuffer.ByValue,
 ): Long
+=======
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(`ptr`: Long,`requestId`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+>>>>>>> main
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_background_budget_expired(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1092,7 +1162,11 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_ke
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(`key`: RustBuffer.ByValue,`applicationKeypadMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+<<<<<<< HEAD
 external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+=======
+external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,`urxvtMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+>>>>>>> main
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,`kittyFlags`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1110,6 +1184,10 @@ external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permil
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
+external fun uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(`savedAtUnixSecs`: Long,`nowUnixSecs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 external fun ffi_isekai_terminal_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun ffi_isekai_terminal_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1253,7 +1331,11 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+<<<<<<< HEAD
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+=======
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 7470) {
+>>>>>>> main
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
@@ -1278,6 +1360,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs() != 34671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh() != 47307) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
@@ -1307,6 +1395,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor() != 45047) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1328,16 +1419,29 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output() != 30171) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+<<<<<<< HEAD
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
+=======
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
+>>>>>>> main
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt() != 53496) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
@@ -1349,7 +1453,11 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+<<<<<<< HEAD
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
+=======
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+>>>>>>> main
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -1457,7 +1565,17 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+<<<<<<< HEAD
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
+=======
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
+>>>>>>> main
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1808,6 +1926,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 
     override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
     }
 }
 
@@ -2919,6 +3060,13 @@ public interface SessionOrchestratorInterface {
      */
     fun `cancelReconnect`()
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+    fun `clickToPromptCursor`(`row`: kotlin.UInt, `col`: kotlin.UInt)
+    
     fun `connect`(`config`: SshConfig)
     
     /**
@@ -2955,9 +3103,17 @@ public interface SessionOrchestratorInterface {
     
     fun `connectQuic`(`config`: QuicConfig)
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+    fun `copyLastCommandOutput`()
+    
     fun `disconnect`()
     
     /**
+<<<<<<< HEAD
      * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
      * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
      * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
@@ -2976,6 +3132,19 @@ public interface SessionOrchestratorInterface {
      * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
      */
     suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?): TmuxTabWindowInfo
+=======
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */
+    fun `filePreviewRequest`(`requestId`: kotlin.String, `kind`: FilePreviewRequestKind)
+>>>>>>> main
     
     /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
@@ -2986,6 +3155,20 @@ public interface SessionOrchestratorInterface {
     fun `forceReturnToWifi`()
     
     fun `isQuic`(): kotlin.Boolean
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+    fun `jumpToNextPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+    fun `jumpToPreviousPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
     
     /**
      * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
@@ -3013,6 +3196,7 @@ public interface SessionOrchestratorInterface {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+<<<<<<< HEAD
      *
      * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
      * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
@@ -3020,6 +3204,8 @@ public interface SessionOrchestratorInterface {
      * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
      * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
      * フォーカス状態は独立に変化し得るため)。
+=======
+>>>>>>> main
      */
     fun `notifyFocusChange`(`focused`: kotlin.Boolean)
     
@@ -3235,6 +3421,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     
 
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */override fun `clickToPromptCursor`(`row`: kotlin.UInt, `col`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(
+        it,
+        FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(SshException::class)override fun `connect`(`config`: SshConfig)
         = 
     callWithHandle {
@@ -3347,6 +3550,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     
     
 
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */override fun `copyLastCommandOutput`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(
+        it,
+        _status)
+}
+    }
+    
+    
+
     override fun `disconnect`()
         = 
     callWithHandle {
@@ -3361,6 +3581,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
 
     
     /**
+<<<<<<< HEAD
      * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
      * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
      * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
@@ -3397,6 +3618,28 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         TmuxSessionException.ErrorHandler,
     )
     }
+=======
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */override fun `filePreviewRequest`(`requestId`: kotlin.String, `kind`: FilePreviewRequestKind)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(
+        it,
+        FfiConverterString.lower(`requestId`),FfiConverterTypeFilePreviewRequestKind.lower(`kind`),_status)
+}
+    }
+    
+    
+>>>>>>> main
 
     
     /**
@@ -3427,6 +3670,40 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     }
     )
     }
+    
+
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */override fun `jumpToNextPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(
+        it,
+        FfiConverterUInt.lower(`fromScrollOffset`),FfiConverterBoolean.lower(`fromShowingScrollback`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */override fun `jumpToPreviousPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(
+        it,
+        FfiConverterUInt.lower(`fromScrollOffset`),FfiConverterBoolean.lower(`fromShowingScrollback`),_status)
+}
+    }
+    
     
 
     
@@ -3486,6 +3763,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+<<<<<<< HEAD
      *
      * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
      * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
@@ -3493,6 +3771,8 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
      * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
      * フォーカス状態は独立に変化し得るため)。
+=======
+>>>>>>> main
      */override fun `notifyFocusChange`(`focused`: kotlin.Boolean)
         = 
     callWithHandle {
@@ -4067,6 +4347,65 @@ public object FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<Di
 
 
 /**
+<<<<<<< HEAD
+=======
+ * ディレクトリエントリ1件(`isekai-pipe ctl file ls`の結果)。
+ */
+data class FilePreviewEntry (
+    var `name`: kotlin.String
+    , 
+    var `isDir`: kotlin.Boolean
+    , 
+    var `isSymlink`: kotlin.Boolean
+    , 
+    var `size`: kotlin.ULong
+    , 
+    var `modifiedUnix`: kotlin.Long?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewEntry: FfiConverterRustBuffer<FilePreviewEntry> {
+    override fun read(buf: ByteBuffer): FilePreviewEntry {
+        return FilePreviewEntry(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FilePreviewEntry) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterBoolean.allocationSize(value.`isDir`) +
+            FfiConverterBoolean.allocationSize(value.`isSymlink`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterOptionalLong.allocationSize(value.`modifiedUnix`)
+    )
+
+    override fun write(value: FilePreviewEntry, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterBoolean.write(value.`isDir`, buf)
+            FfiConverterBoolean.write(value.`isSymlink`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterOptionalLong.write(value.`modifiedUnix`, buf)
+    }
+}
+
+
+
+/**
+>>>>>>> main
  * Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)でデコードされた画像1枚の配置情報。
  * `Terminal`(rust-core)がデコード・配置・寿命管理を一元的に行う(rust-ssot:
  * Android/iOSはこの構造体が指す矩形へ`rgba`をそのままビットマップ描画するだけで
@@ -4818,6 +5157,58 @@ public object FfiConverterTypePortForward: FfiConverterRustBuffer<PortForward> {
 
 
 
+/**
+ * OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+ * ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+ * 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+ *
+ * - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+ * `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+ * (`scrollback_cells`を呼ぶ必要はない)。
+ * - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+ * `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+ * 代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+ * ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+ * 検索ジャンプと同型のパターン)。
+ */
+data class PromptJumpTarget (
+    var `scrollOffset`: kotlin.UInt
+    , 
+    var `isLive`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptJumpTarget: FfiConverterRustBuffer<PromptJumpTarget> {
+    override fun read(buf: ByteBuffer): PromptJumpTarget {
+        return PromptJumpTarget(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PromptJumpTarget) = (
+            FfiConverterUInt.allocationSize(value.`scrollOffset`) +
+            FfiConverterBoolean.allocationSize(value.`isLive`)
+    )
+
+    override fun write(value: PromptJumpTarget, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`scrollOffset`, buf)
+            FfiConverterBoolean.write(value.`isLive`, buf)
+    }
+}
+
+
+
 data class QuicConfig (
     /**
      * tsshd の QUIC エンドポイント (e.g. "100.100.45.36")
@@ -4955,6 +5346,22 @@ data class ScreenUpdate (
     var `sgrMouseMode`: kotlin.Boolean
     , 
     /**
+<<<<<<< HEAD
+=======
+     * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+     * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+     */
+    var `alternateScroll`: kotlin.Boolean
+    , 
+    /**
+     * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+     * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+     * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+     */
+    var `urxvtMouseMode`: kotlin.Boolean
+    , 
+    /**
+>>>>>>> main
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     var `cursorVisible`: kotlin.Boolean
@@ -5071,6 +5478,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterTypeMouseReportingMode.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+<<<<<<< HEAD
+=======
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+>>>>>>> main
             FfiConverterULong.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
@@ -5094,6 +5506,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
             FfiConverterTypeMouseReportingMode.allocationSize(value.`mouseReportingMode`) +
             FfiConverterBoolean.allocationSize(value.`sgrMouseMode`) +
+<<<<<<< HEAD
+=======
+            FfiConverterBoolean.allocationSize(value.`alternateScroll`) +
+            FfiConverterBoolean.allocationSize(value.`urxvtMouseMode`) +
+>>>>>>> main
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
@@ -5117,6 +5534,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
             FfiConverterTypeMouseReportingMode.write(value.`mouseReportingMode`, buf)
             FfiConverterBoolean.write(value.`sgrMouseMode`, buf)
+<<<<<<< HEAD
+=======
+            FfiConverterBoolean.write(value.`alternateScroll`, buf)
+            FfiConverterBoolean.write(value.`urxvtMouseMode`, buf)
+>>>>>>> main
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
@@ -5423,6 +5845,7 @@ public object FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer<Termi
 
 
 /**
+<<<<<<< HEAD
  * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
  * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
  * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
@@ -5498,6 +5921,8 @@ public object FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer<TmuxTabW
 
 
 /**
+=======
+>>>>>>> main
  * OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
  * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
  * 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
@@ -5789,6 +6214,314 @@ public object FfiConverterTypeCursorShape: FfiConverterRustBuffer<CursorShape> {
 
 
 /**
+<<<<<<< HEAD
+=======
+ * `file_preview_request`の非同期結果。`OrchestratorCallback::on_file_preview_result`で
+ * 届く。
+ */
+sealed class FilePreviewOutcome {
+    
+    data class Ls(
+        val `entries`: List<uniffi.isekai_terminal_core.FilePreviewEntry>) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Cat(
+        val `offset`: kotlin.ULong, 
+        val `length`: kotlin.ULong, 
+        val `totalSize`: kotlin.ULong, 
+        val `eof`: kotlin.Boolean, 
+        val `data`: kotlin.ByteArray) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Info(
+        val `name`: kotlin.String, 
+        val `path`: kotlin.String, 
+        val `isDir`: kotlin.Boolean, 
+        val `isSymlink`: kotlin.Boolean, 
+        val `size`: kotlin.ULong, 
+        val `modifiedUnix`: kotlin.Long?, 
+        val `permissionsUnix`: kotlin.UInt?) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    /**
+     * I/Oエラー(`ctl_file.rs`の`{"ok":false,"error":...}`)・exec自体の失敗
+     * (未接続・チャネルオープン失敗)・JSONパース失敗のいずれか。呼び出し元は
+     * 種別を区別する必要が無いので単一のバリアントにまとめている。
+     */
+    data class Error(
+        val `message`: kotlin.String) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewOutcome : FfiConverterRustBuffer<FilePreviewOutcome>{
+    override fun read(buf: ByteBuffer): FilePreviewOutcome {
+        return when(buf.getInt()) {
+            1 -> FilePreviewOutcome.Ls(
+                FfiConverterSequenceTypeFilePreviewEntry.read(buf),
+                )
+            2 -> FilePreviewOutcome.Cat(
+                FfiConverterULong.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            3 -> FilePreviewOutcome.Info(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterOptionalLong.read(buf),
+                FfiConverterOptionalUInt.read(buf),
+                )
+            4 -> FilePreviewOutcome.Error(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FilePreviewOutcome) = when(value) {
+        is FilePreviewOutcome.Ls -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceTypeFilePreviewEntry.allocationSize(value.`entries`)
+            )
+        }
+        is FilePreviewOutcome.Cat -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`offset`)
+                + FfiConverterULong.allocationSize(value.`length`)
+                + FfiConverterULong.allocationSize(value.`totalSize`)
+                + FfiConverterBoolean.allocationSize(value.`eof`)
+                + FfiConverterByteArray.allocationSize(value.`data`)
+            )
+        }
+        is FilePreviewOutcome.Info -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`name`)
+                + FfiConverterString.allocationSize(value.`path`)
+                + FfiConverterBoolean.allocationSize(value.`isDir`)
+                + FfiConverterBoolean.allocationSize(value.`isSymlink`)
+                + FfiConverterULong.allocationSize(value.`size`)
+                + FfiConverterOptionalLong.allocationSize(value.`modifiedUnix`)
+                + FfiConverterOptionalUInt.allocationSize(value.`permissionsUnix`)
+            )
+        }
+        is FilePreviewOutcome.Error -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`message`)
+            )
+        }
+    }
+
+    override fun write(value: FilePreviewOutcome, buf: ByteBuffer) {
+        when(value) {
+            is FilePreviewOutcome.Ls -> {
+                buf.putInt(1)
+                FfiConverterSequenceTypeFilePreviewEntry.write(value.`entries`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Cat -> {
+                buf.putInt(2)
+                FfiConverterULong.write(value.`offset`, buf)
+                FfiConverterULong.write(value.`length`, buf)
+                FfiConverterULong.write(value.`totalSize`, buf)
+                FfiConverterBoolean.write(value.`eof`, buf)
+                FfiConverterByteArray.write(value.`data`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Info -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`name`, buf)
+                FfiConverterString.write(value.`path`, buf)
+                FfiConverterBoolean.write(value.`isDir`, buf)
+                FfiConverterBoolean.write(value.`isSymlink`, buf)
+                FfiConverterULong.write(value.`size`, buf)
+                FfiConverterOptionalLong.write(value.`modifiedUnix`, buf)
+                FfiConverterOptionalUInt.write(value.`permissionsUnix`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Error -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * `SessionOrchestrator::file_preview_request`への要求種別。`ctl_file.rs`の
+ * `ls`/`cat`/`info`サブコマンドに対応する(`cp`/`rm`はこのタスクのスコープ外
+ * — プレビューは読み取り専用、削除/コピーはtrzsz転送シート等の既存導線に任せる)。
+ */
+sealed class FilePreviewRequestKind {
+    
+    data class Ls(
+        val `path`: kotlin.String) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+    /**
+     * `length`が`None`なら「ファイル末尾まで(ただし8MiB上限でクランプ)」を要求する。
+     * 大きなファイルはKotlin側が`offset += 返ってきたlength`でページングし続ける
+     * (`ctl_file.rs`のドキュメント通り)。
+     */
+    data class Cat(
+        val `path`: kotlin.String, 
+        val `offset`: kotlin.ULong, 
+        val `length`: kotlin.ULong?) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Info(
+        val `path`: kotlin.String) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewRequestKind : FfiConverterRustBuffer<FilePreviewRequestKind>{
+    override fun read(buf: ByteBuffer): FilePreviewRequestKind {
+        return when(buf.getInt()) {
+            1 -> FilePreviewRequestKind.Ls(
+                FfiConverterString.read(buf),
+                )
+            2 -> FilePreviewRequestKind.Cat(
+                FfiConverterString.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterOptionalULong.read(buf),
+                )
+            3 -> FilePreviewRequestKind.Info(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FilePreviewRequestKind) = when(value) {
+        is FilePreviewRequestKind.Ls -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+            )
+        }
+        is FilePreviewRequestKind.Cat -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+                + FfiConverterULong.allocationSize(value.`offset`)
+                + FfiConverterOptionalULong.allocationSize(value.`length`)
+            )
+        }
+        is FilePreviewRequestKind.Info -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+            )
+        }
+    }
+
+    override fun write(value: FilePreviewRequestKind, buf: ByteBuffer) {
+        when(value) {
+            is FilePreviewRequestKind.Ls -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+            is FilePreviewRequestKind.Cat -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`path`, buf)
+                FfiConverterULong.write(value.`offset`, buf)
+                FfiConverterOptionalULong.write(value.`length`, buf)
+                Unit
+            }
+            is FilePreviewRequestKind.Info -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+>>>>>>> main
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 sealed class ForwardState {
@@ -5945,7 +6678,13 @@ enum class MouseButton {
     MIDDLE,
     RIGHT,
     WHEEL_UP,
+<<<<<<< HEAD
     WHEEL_DOWN;
+=======
+    WHEEL_DOWN,
+    WHEEL_LEFT,
+    WHEEL_RIGHT;
+>>>>>>> main
 
     
 
@@ -6087,6 +6826,7 @@ public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseRe
 
 
 /**
+<<<<<<< HEAD
  * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
  * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
  * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
@@ -6129,6 +6869,8 @@ public object FfiConverterTypeNotifyKind: FfiConverterRustBuffer<NotifyKind> {
 
 
 /**
+=======
+>>>>>>> main
  * UI(Compose/SwiftUI)へ公開する簡略化された状態。
  */
 
@@ -7215,6 +7957,7 @@ public interface OrchestratorCallback {
     fun `onRebindStateChanged`(`state`: RebindPublicState)
     
     /**
+<<<<<<< HEAD
      * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
      * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
      * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
@@ -7225,6 +7968,25 @@ public interface OrchestratorCallback {
      * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
      */
     fun `onNotify`(`kind`: NotifyKind)
+=======
+     * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+     * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
+     */
+    fun `onPromptJump`(`target`: PromptJumpTarget?)
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+     * 結果。該当コマンドがまだ無ければ`None`。
+     */
+    fun `onPromptOutputCopyReady`(`text`: kotlin.String?)
+    
+    /**
+     * タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+     * 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+     * パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+     */
+    fun `onFilePreviewResult`(`requestId`: kotlin.String, `outcome`: FilePreviewOutcome)
+>>>>>>> main
     
     companion object
 }
@@ -7401,12 +8163,46 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+<<<<<<< HEAD
     internal object `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
         override fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`onNotify`(
                     FfiConverterTypeNotifyKind.lift(`kind`),
+=======
+    internal object `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
+        override fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onPromptJump`(
+                    FfiConverterOptionalTypePromptJumpTarget.lift(`target`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15 {
+        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onPromptOutputCopyReady`(
+                    FfiConverterOptionalString.lift(`text`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16 {
+        override fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onFilePreviewResult`(
+                    FfiConverterString.lift(`requestId`),
+                    FfiConverterTypeFilePreviewOutcome.lift(`outcome`),
+>>>>>>> main
                 )
             }
             val writeReturn = { _: Unit -> Unit }
@@ -7443,7 +8239,13 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onRequestWifiFd`,
         `onRequestCellularFd`,
         `onRebindStateChanged`,
+<<<<<<< HEAD
         `onNotify`,
+=======
+        `onPromptJump`,
+        `onPromptOutputCopyReady`,
+        `onFilePreviewResult`,
+>>>>>>> main
     )
 
     // Registers the foreign callback with the Rust side.
@@ -7626,6 +8428,38 @@ public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
 /**
  * @suppress
  */
+public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
+    override fun read(buf: ByteBuffer): kotlin.Long? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterLong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Long?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterLong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Long?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterLong.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
@@ -7776,6 +8610,38 @@ public object FfiConverterOptionalTypePlatformFd: FfiConverterRustBuffer<Platfor
         } else {
             buf.put(1)
             FfiConverterTypePlatformFd.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypePromptJumpTarget: FfiConverterRustBuffer<PromptJumpTarget?> {
+    override fun read(buf: ByteBuffer): PromptJumpTarget? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypePromptJumpTarget.read(buf)
+    }
+
+    override fun allocationSize(value: PromptJumpTarget?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypePromptJumpTarget.allocationSize(value)
+        }
+    }
+
+    override fun write(value: PromptJumpTarget?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypePromptJumpTarget.write(value, buf)
         }
     }
 }
@@ -8054,6 +8920,37 @@ public object FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverterRustB
 /**
  * @suppress
  */
+<<<<<<< HEAD
+=======
+public object FfiConverterSequenceTypeFilePreviewEntry: FfiConverterRustBuffer<List<FilePreviewEntry>> {
+    override fun read(buf: ByteBuffer): List<FilePreviewEntry> {
+        val len = buf.getInt()
+        return List<FilePreviewEntry>(len) {
+            FfiConverterTypeFilePreviewEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FilePreviewEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFilePreviewEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FilePreviewEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFilePreviewEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+>>>>>>> main
 public object FfiConverterSequenceTypeImagePlacement: FfiConverterRustBuffer<List<ImagePlacement>> {
     override fun read(buf: ByteBuffer): List<ImagePlacement> {
         val len = buf.getInt()
@@ -8365,12 +9262,20 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
          *
          * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
          * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+<<<<<<< HEAD
          */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
+=======
+         */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean, `urxvtMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
+>>>>>>> main
             return FfiConverterOptionalByteArray.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
     
+<<<<<<< HEAD
         FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),_status)
+=======
+        FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),FfiConverterBoolean.lower(`urxvtMouseMode`),_status)
+>>>>>>> main
 }
     )
     }
@@ -8501,6 +9406,39 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(
     
         FfiConverterTypeOrchestratorCallback.lower(`callback`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * [`AUTO_REATTACH_GRACE_SECS`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
+         * Kotlin側にハードコードで複製させないための単純なgetter。
+         */ fun `reattachGraceWindowSecs`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(
+    
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * 永続化された「直近アクティブだったセッション」記録が、黙示的な自動再接続を
+         * 試みるにあたってまだ新鮮かどうかを判定する。`saved_at_unix_secs`は記録時刻、
+         * `now_unix_secs`は判定時刻(いずれもUnix epoch秒)。
+         *
+         * `now_unix_secs`が`saved_at_unix_secs`より前(端末の時計調整等で稀に起こりうる)の
+         * 場合は`saturating_sub`により経過時間0として扱い、freshと判定する——「保存した
+         * 直後なのに古いと誤判定される」という直感に反する挙動を避けるための意図的な選択。
+         */ fun `reattachRecordIsFresh`(`savedAtUnixSecs`: kotlin.ULong, `nowUnixSecs`: kotlin.ULong): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(
+    
+        FfiConverterULong.lower(`savedAtUnixSecs`),FfiConverterULong.lower(`nowUnixSecs`),_status)
 }
     )
     }

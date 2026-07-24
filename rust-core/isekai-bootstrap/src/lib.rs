@@ -24,10 +24,12 @@ pub mod client_candidates;
 pub mod error;
 pub mod openssh;
 mod reuse;
+pub mod russh_backend;
 pub mod types;
 
 pub use backend::BootstrapBackend;
 pub use error::BootstrapError;
 pub use openssh::OpenSshBackend;
 pub use reuse::launch_fingerprint;
+pub use russh_backend::RusshBackend;
 pub use types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};

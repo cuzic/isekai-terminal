@@ -1,10 +1,12 @@
 uniffi::setup_scaffolding!("isekai_terminal_core");
 
 pub mod trzsz;
+pub mod file_preview;
 pub mod quic_transport;
 pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod sixel;
+pub(crate) mod kitty_graphics;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
@@ -42,6 +44,7 @@ pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
+pub mod reattach_persistence;
 
 pub use quic_transport::QuicConfig;
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
@@ -894,6 +897,24 @@ pub struct ScrollbackSearchMatch {
     pub len: u32,
 }
 
+/// OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+/// ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+/// 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+///
+/// - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+///   `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+///   (`scrollback_cells`を呼ぶ必要はない)。
+/// - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+///   `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+///   代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+///   ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+///   検索ジャンプと同型のパターン)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PromptJumpTarget {
+    pub scroll_offset: u32,
+    pub is_live: bool,
+}
+
 /// DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
 /// (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
 /// `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
@@ -945,6 +966,8 @@ pub enum MouseButton {
     Right,
     WheelUp,
     WheelDown,
+    WheelLeft,
+    WheelRight,
 }
 
 /// マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
@@ -989,6 +1012,7 @@ pub fn terminal_pointer_event_bytes(
     rows: u32,
     mouse_reporting_mode: MouseReportingMode,
     sgr_mouse_mode: bool,
+    urxvt_mouse_mode: bool,
 ) -> Option<Vec<u8>> {
     terminal::encode_pointer_event_bytes(
         terminal::PointerEvent {
@@ -1002,6 +1026,7 @@ pub fn terminal_pointer_event_bytes(
         rows as usize,
         mouse_reporting_mode,
         sgr_mouse_mode,
+        urxvt_mouse_mode,
     )
 }
 
@@ -1091,6 +1116,13 @@ pub struct ScreenUpdate {
     /// レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
     /// 将来のプロトコル分岐のために公開しておく。
     pub sgr_mouse_mode: bool,
+    /// DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+    /// マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+    pub alternate_scroll: bool,
+    /// DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+    /// マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+    /// エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+    pub urxvt_mouse_mode: bool,
     /// DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
     pub cursor_visible: bool,
     /// BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
@@ -1336,6 +1368,16 @@ pub trait OrchestratorCallback: Send + Sync {
     /// (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
     /// per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
     fn on_notify(&self, kind: NotifyKind);
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+    /// `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
+    fn on_prompt_jump(&self, target: Option<PromptJumpTarget>);
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+    /// 結果。該当コマンドがまだ無ければ`None`。
+    fn on_prompt_output_copy_ready(&self, text: Option<String>);
+    /// タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+    /// 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+    /// パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+    fn on_file_preview_result(&self, request_id: String, outcome: crate::file_preview::FilePreviewOutcome);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -1367,6 +1409,13 @@ pub(crate) trait SessionCallback: Send + Sync {
     /// このタブ表示中の抑制判断に使う。既定は他のオプショナルコールバックと同じく
     /// no-op(`OrchestratorAdapter`だけが実際にオーバーライドする)。
     fn on_notify(&self, _kind: crate::NotifyKind, _tmux_tag: String, _seq: u64) {}
+    /// タスク#13。デフォルトはno-op(`OrchestratorAdapter`だけが実際に
+    /// `OrchestratorCallback::on_prompt_jump`へ委譲する——#10/#22と同じパターン)。
+    fn on_prompt_jump(&self, _target: Option<PromptJumpTarget>) {}
+    fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+    /// タスク#17。デフォルトはno-op(`OrchestratorAdapter`だけが実際に
+    /// `OrchestratorCallback::on_file_preview_result`へ委譲する——#10/#22と同じパターン)。
+    fn on_file_preview_exec_result(&self, _request_id: String, _stdout: Vec<u8>, _exit_status: Option<u32>) {}
 }
 
 // ── SshSession ──────────────────────────────────────────
@@ -1458,6 +1507,16 @@ impl SshSession {
     /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
     pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
 
+    /// タスク#13(OSC 133)。
+    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) { self.core.click_to_prompt_cursor(row, col); }
+    pub(crate) fn copy_last_command_output(&self) { self.core.copy_last_command_output(); }
+
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
     pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
@@ -1500,6 +1559,14 @@ impl SshSession {
                 log::warn!("ssh: remove_forward command dropped (channel full)");
             }
         }
+    }
+
+    /// タスク#17: ファイルプレビュー用の`isekai-pipe ctl file`execを1本キューイングする。
+    /// `command_sender()`が無い(未接続/切断済み)場合は`false`を返し、呼び出し元
+    /// (`SessionOrchestrator::file_preview_request`)がその場で`FilePreviewOutcome::Error`を
+    /// 合成する。
+    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        self.core.file_preview_exec(request_id, command_line)
     }
 
     /// Phase 12: per-session theme。SessionOrchestrator からのみ呼ばれる内部API。
@@ -1913,6 +1980,38 @@ mod terminal_key_mapping_tests {
         assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false, NO_MODS, 0), Vec::<u8>::new());
     }
 
+    #[test]
+    fn function_key_f2_is_ss3() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 2 }, false, NO_MODS, 0), b"\x1BOQ".to_vec());
+    }
+
+    #[test]
+    fn function_key_f3_is_ss3() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 3 }, false, NO_MODS, 0), b"\x1BOR".to_vec());
+    }
+
+    #[test]
+    fn function_keys_f6_to_f11_use_csi_tilde() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 6 }, false, NO_MODS, 0), b"\x1B[17~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 7 }, false, NO_MODS, 0), b"\x1B[18~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 8 }, false, NO_MODS, 0), b"\x1B[19~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 9 }, false, NO_MODS, 0), b"\x1B[20~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 10 }, false, NO_MODS, 0), b"\x1B[21~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 11 }, false, NO_MODS, 0), b"\x1B[23~".to_vec());
+    }
+
+    #[test]
+    fn function_key_f1_with_shift_uses_csi_form() {
+        let mods = TerminalKeyModifiers { shift: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, mods, 0), b"\x1B[1;2P".to_vec());
+    }
+
+    #[test]
+    fn function_key_f12_with_ctrl_uses_csi_form() {
+        let mods = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, mods, 0), b"\x1B[24;5~".to_vec());
+    }
+
     // ── 修飾キー付きシーケンス(#29) ──────────────────────────
 
     #[test]
@@ -1947,6 +2046,101 @@ mod terminal_key_mapping_tests {
     fn arrow_key_shift_uses_modifier_2() {
         let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
         assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, shift, 0), b"\x1B[1;2A".to_vec());
+    }
+
+    #[test]
+    fn arrow_keys_with_all_modifier_combinations() {
+        // modifier param: Shift=2, Alt=3, Shift+Alt=4, Ctrl=5,
+        // Shift+Ctrl=6, Alt+Ctrl=7, Shift+Alt+Ctrl=8
+        let no_mods = NO_MODS;
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, no_mods, 0),
+            b"\x1B[A".to_vec(),
+            "ArrowUp no mods → CSI A"
+        );
+        let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false, shift, 0),
+            b"\x1B[1;2B".to_vec(),
+            "ArrowDown+Shift → CSI 1;2 B"
+        );
+        let alt = TerminalKeyModifiers { alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false, alt, 0),
+            b"\x1B[1;3C".to_vec(),
+            "ArrowRight+Alt → CSI 1;3 C"
+        );
+        let shift_alt = TerminalKeyModifiers { shift: true, alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false, shift_alt, 0),
+            b"\x1B[1;4D".to_vec(),
+            "ArrowLeft+Shift+Alt → CSI 1;4 D"
+        );
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, ctrl, 0),
+            b"\x1B[1;5A".to_vec(),
+            "ArrowUp+Ctrl → CSI 1;5 A"
+        );
+        let shift_ctrl = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false, shift_ctrl, 0),
+            b"\x1B[1;6B".to_vec(),
+            "ArrowDown+Shift+Ctrl → CSI 1;6 B"
+        );
+        let alt_ctrl = TerminalKeyModifiers { alt: true, ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false, alt_ctrl, 0),
+            b"\x1B[1;7C".to_vec(),
+            "ArrowRight+Alt+Ctrl → CSI 1;7 C"
+        );
+        let all = TerminalKeyModifiers { shift: true, alt: true, ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false, all, 0),
+            b"\x1B[1;8D".to_vec(),
+            "ArrowLeft+Shift+Alt+Ctrl → CSI 1;8 D"
+        );
+    }
+
+    #[test]
+    fn home_end_with_all_modifier_combinations() {
+        let alt = TerminalKeyModifiers { alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::Home, false, alt, 0),
+            b"\x1B[1;3H".to_vec()
+        );
+        let shift_ctrl = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::End, false, shift_ctrl, 0),
+            b"\x1B[1;6F".to_vec()
+        );
+        let ctrl_alt = TerminalKeyModifiers { ctrl: true, alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::Home, false, ctrl_alt, 0),
+            b"\x1B[1;7H".to_vec()
+        );
+    }
+
+    #[test]
+    fn function_keys_with_alt_modifier() {
+        let alt = TerminalKeyModifiers { alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, alt, 0),
+            b"\x1B[1;3P".to_vec()
+        );
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, alt, 0),
+            b"\x1B[15;3~".to_vec()
+        );
+    }
+
+    #[test]
+    fn function_keys_with_shift_alt_modifier() {
+        let shift_alt = TerminalKeyModifiers { shift: true, alt: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, shift_alt, 0),
+            b"\x1B[1;4P".to_vec()
+        );
     }
 
     #[test]
@@ -2174,7 +2368,7 @@ mod terminal_pointer_event_bytes_tests {
         assert_eq!(
             terminal_pointer_event_bytes(
                 MouseEventKind::Press, Some(MouseButton::Left), 0, 0, NO_MODS,
-                80, 24, MouseReportingMode::Off, false,
+                80, 24, MouseReportingMode::Off, false, false,
             ),
             None
         );
@@ -2184,7 +2378,7 @@ mod terminal_pointer_event_bytes_tests {
     fn sgr_press_matches_terminal_encode_pointer_event() {
         let bytes = terminal_pointer_event_bytes(
             MouseEventKind::Press, Some(MouseButton::Left), 4, 9, NO_MODS,
-            80, 24, MouseReportingMode::Normal, true,
+            80, 24, MouseReportingMode::Normal, true, false,
         );
         assert_eq!(bytes, Some(b"\x1b[<0;10;5M".to_vec()));
     }
@@ -2193,7 +2387,7 @@ mod terminal_pointer_event_bytes_tests {
     fn legacy_x10_release_always_reports_no_button() {
         let bytes = terminal_pointer_event_bytes(
             MouseEventKind::Release, Some(MouseButton::Left), 4, 9, NO_MODS,
-            80, 24, MouseReportingMode::Normal, false,
+            80, 24, MouseReportingMode::Normal, false, false,
         );
         assert_eq!(bytes, Some(vec![0x1B, b'[', b'M', 32 + 3, 32 + 10, 32 + 5]));
     }
@@ -2202,7 +2396,7 @@ mod terminal_pointer_event_bytes_tests {
     fn out_of_bounds_coordinates_clamp_to_terminal_size() {
         let bytes = terminal_pointer_event_bytes(
             MouseEventKind::Press, Some(MouseButton::Left), 1000, 1000, NO_MODS,
-            80, 24, MouseReportingMode::Normal, true,
+            80, 24, MouseReportingMode::Normal, true, false,
         );
         assert_eq!(bytes, Some(b"\x1b[<0;80;24M".to_vec()));
     }
@@ -2212,7 +2406,7 @@ mod terminal_pointer_event_bytes_tests {
         assert_eq!(
             terminal_pointer_event_bytes(
                 MouseEventKind::Motion, None, 1, 1, NO_MODS,
-                80, 24, MouseReportingMode::ButtonEvent, true,
+                80, 24, MouseReportingMode::ButtonEvent, true, false,
             ),
             None
         );
@@ -2222,7 +2416,7 @@ mod terminal_pointer_event_bytes_tests {
     fn motion_without_button_is_reported_in_any_event_mode() {
         let bytes = terminal_pointer_event_bytes(
             MouseEventKind::Motion, None, 2, 2, NO_MODS,
-            80, 24, MouseReportingMode::AnyEvent, true,
+            80, 24, MouseReportingMode::AnyEvent, true, false,
         );
         assert_eq!(bytes, Some(b"\x1b[<35;3;3M".to_vec()));
     }

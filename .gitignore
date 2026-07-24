@@ -32,3 +32,4 @@ Thumbs.db
 # Claude Code session-local state (agent worktrees, lock files)
 /.claude/worktrees/
 /.claude/scheduled_tasks.lock
+.env

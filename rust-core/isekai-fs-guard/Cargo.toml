@@ -6,15 +6,22 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 
+[target.'cfg(unix)'.dependencies]
+# with_exclusive_lock's Unix backend (flock(2)). Same crate+version
+# isekai-pipe-core's ProfileLock (this module's origin) already uses.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # ACL enforcement for check_not_world_writable/set_private_file_permissions
-# (windows_acl.rs). Same crate+version isekai-netmon/quicsock already use for
-# their own Win32 API access.
+# (windows_acl.rs), plus with_exclusive_lock's Windows backend (LockFileEx,
+# Win32_System_IO for OVERLAPPED). Same crate+version isekai-netmon/quicsock/
+# isekai-pipe-core already use for their own Win32 API access.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }
 

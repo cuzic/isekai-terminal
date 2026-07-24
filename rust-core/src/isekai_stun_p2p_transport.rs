@@ -144,11 +144,25 @@ impl IsekaiStunP2pSession {
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    /// タスク#17: `SessionCore::file_preview_exec`参照。
+    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        self.core.file_preview_exec(request_id, command_line)
+    }
 
     pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
     /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
     pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
+
+    /// タスク#13(OSC 133)。
+    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) { self.core.click_to_prompt_cursor(row, col); }
+    pub(crate) fn copy_last_command_output(&self) { self.core.copy_last_command_output(); }
 
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 

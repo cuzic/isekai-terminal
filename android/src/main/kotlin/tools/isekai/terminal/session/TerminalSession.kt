@@ -1,6 +1,8 @@
 package tools.isekai.terminal.session
 
 import tools.isekai.terminal.HostKeyChangedWarning
+import tools.isekai.terminal.PromptJumpResult
+import tools.isekai.terminal.PromptOutputCopyResult
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import tools.isekai.terminal.util.RemoteLogger
@@ -22,9 +24,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import uniffi.isekai_terminal_core.*
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * SSH セッションのドメインオブジェクト。
@@ -86,6 +91,12 @@ class TerminalSession(
         // Rust 側（agent_forward.rs の SIGN_CONFIRM_TIMEOUT）の 30 秒より短くして、
         // 先に Kotlin 側が拒否応答を確定できるようにする。
         private const val AGENT_SIGN_CONFIRM_TIMEOUT_MS = 25_000L
+
+        // タスク#17: ファイルプレビュー要求のタイムアウト。`isekai-pipe ctl file`は
+        // execチャネル1本の単純な往復に過ぎないため、trzsz転送のような長時間ブロックは
+        // 想定しない(大きなファイルは`--length`でチャンク化される)が、接続が死んでいる
+        // 状態で呼ばれた場合でも呼び出し元をいつまでもsuspendさせないための保険。
+        private const val FILE_PREVIEW_TIMEOUT_MS = 20_000L
     }
 
     private val _state = MutableStateFlow(TerminalUiState())
@@ -138,6 +149,17 @@ class TerminalSession(
     // ここで CompletableDeferred + runBlocking を使い、UI（respondAgentSignRequest 経由）から
     // 応答が来るまでそのスレッドをブロックする（RealHostKeyChecker.check() と同じ設計）。
     private val pendingAgentSignRequest = AtomicReference<CompletableDeferred<Boolean>?>(null)
+
+    /**
+     * タスク#17(ファイルプレビュー機能): [filePreviewRequest]が発行した`requestId`→
+     * 結果待ちの[CompletableDeferred]。`onAgentSignRequest`と違い呼び出し元スレッドを
+     * ブロックする必要は無い(Rust側の`spawn_blocking`同期コールバックではなく、
+     * `SessionOrchestrator::filePreviewRequest`は非ブロッキングにキューイングして返り、
+     * 結果は後から`onFilePreviewResult`で非同期に届く)ため、素直に`suspend`関数として
+     * 公開する。複数のディレクトリ一覧/catチャンク要求が同時に in-flight でも
+     * `requestId`ごとに独立して解決できるよう`ConcurrentHashMap`にしている。
+     */
+    private val pendingFilePreviewRequests = ConcurrentHashMap<String, CompletableDeferred<FilePreviewOutcome>>()
 
     private val callback = object : OrchestratorCallback {
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
@@ -245,6 +267,22 @@ class TerminalSession(
             onNotifyRequested(kind)
         }
 
+        // タスク#13(OSC 133)。判断ロジック(どのプロンプトが「前/次」か・出力範囲の
+        // 切り出し)は全てRust側(`Terminal::prompt_jump_target`/`last_command_output_text`)
+        // に一元化されており、ここでは結果を[TerminalUiState]へそのまま反映するだけ。
+        // `seq`を単調増加させるのは、「見つからなかった(target=null)」という同じ結果が
+        // 連続した場合でも[TerminalUiState]の値が変化し、Compose側の`LaunchedEffect`
+        // (値の変化でのみ再発火する)が確実に反応できるようにするため
+        // (`hostKeyChangedWarning`等の「一度きりのプロンプト」系フィールドと異なり、
+        // こちらは`null`自体が有効な結果でありうるため単純な値比較では区別できない)。
+        override fun onPromptJump(target: PromptJumpTarget?) {
+            _state.update { it.copy(promptJumpResult = PromptJumpResult(target, it.promptJumpResult.seq + 1)) }
+        }
+
+        override fun onPromptOutputCopyReady(text: String?) {
+            _state.update { it.copy(promptOutputCopyResult = PromptOutputCopyResult(text, it.promptOutputCopyResult.seq + 1)) }
+        }
+
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
         // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
         // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
@@ -266,6 +304,13 @@ class TerminalSession(
                 pendingAgentSignRequest.set(null)
                 _state.update { it.copy(agentSignRequestFingerprint = null) }
             }
+        }
+
+        // タスク#17: `pendingFilePreviewRequests`から該当する`Deferred`を取り出して解決する。
+        // 対応する要求が見つからない(タイムアウト等で既に諦められた後に遅れて届いた)場合は
+        // 単に無視する。
+        override fun onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {
+            pendingFilePreviewRequests.remove(requestId)?.complete(outcome)
         }
     }
 
@@ -363,6 +408,27 @@ class TerminalSession(
      *  [scrollbackCells]と同じ規約(タスク#37のドキュメント参照)。 */
     fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
         orchestrator.searchScrollback(query, caseSensitive)
+
+    /** タスク#13(OSC 133)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     *  ([searchScrollback])とは独立した機能。`fromScrollOffset`/`fromShowingScrollback`
+     *  は呼び出し時点でKotlin側が表示している位置(タスク#79と同じ規約)をそのまま渡す。
+     *  結果は[promptJumpEvent]で非同期に届く。 */
+    fun jumpToPreviousPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        orchestrator.jumpToPreviousPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+
+    /** [jumpToPreviousPrompt]の「次」版。 */
+    fun jumpToNextPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        orchestrator.jumpToNextPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+
+    /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
+    fun clickToPromptCursor(row: Int, col: Int) =
+        orchestrator.clickToPromptCursor(row.toUInt(), col.toUInt())
+
+    /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
+     *  [promptOutputCopyEvent]で非同期に届く。 */
+    fun copyLastCommandOutput() = orchestrator.copyLastCommandOutput()
 
     /** Phase 12: このタブだけの配色テーマを差し替える(per-session theme)。
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
@@ -472,6 +538,31 @@ class TerminalSession(
     fun trzszDismiss() = orchestrator.trzszDismiss()
 
     fun consumeDownloadFile() { _pendingDownloadFile.value = null }
+
+    // ── ファイルプレビュー(タスク#17) ────────────────────────────────
+
+    /**
+     * `isekai-pipe ctl file ls|cat|info`をリモートホストで1回実行し、結果を待つ。
+     * パース(JSON/base64デコード)は全てRust側(`crate::file_preview`)で完結しており、
+     * ここで受け取る[FilePreviewOutcome]は既にデコード済みの構造体。
+     *
+     * [FILE_PREVIEW_TIMEOUT_MS]以内に応答が無ければ(未接続のまま呼ばれた・
+     * セッションが切断された等)`FilePreviewOutcome.Error`を合成して返す——
+     * 呼び出し元(ディレクトリブラウザ/各種ビューア)がsuspendしたまま無期限に
+     * 待たされないようにするための防御。
+     */
+    suspend fun filePreviewRequest(kind: FilePreviewRequestKind): FilePreviewOutcome {
+        val requestId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<FilePreviewOutcome>()
+        pendingFilePreviewRequests[requestId] = deferred
+        orchestrator.filePreviewRequest(requestId, kind)
+        return try {
+            withTimeoutOrNull(FILE_PREVIEW_TIMEOUT_MS) { deferred.await() }
+                ?: FilePreviewOutcome.Error("file preview request timed out")
+        } finally {
+            pendingFilePreviewRequests.remove(requestId)
+        }
+    }
 
     // ── Log ───────────────────────────────────────────────────────────
 

@@ -117,11 +117,16 @@ mod tests {
         addr
     }
 
-    async fn dead_stun_server() -> SocketAddr {
+    /// Binds a UDP socket that never answers, to simulate an unreachable STUN
+    /// server. The caller must keep the returned socket alive for as long as
+    /// the "dead" address needs to stay dead: dropping it immediately frees
+    /// the ephemeral port, which the OS can then hand to the very next
+    /// `bind("127.0.0.1:0")` call in the same test (observed on real Windows
+    /// CI, `#33`) — silently turning the "dead" address into a live one.
+    async fn dead_stun_server() -> (SocketAddr, tokio::net::UdpSocket) {
         let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
-        drop(probe);
-        addr
+        (addr, probe)
     }
 
     #[tokio::test]
@@ -142,7 +147,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_client_stun_candidates_skips_unreachable_servers_without_failing() {
-        let dead = dead_stun_server().await;
+        let (dead, _dead_socket) = dead_stun_server().await;
         let real = spawn_mock_stun_server().await;
 
         let candidates = collect_client_stun_candidates(&[dead, real]).await;

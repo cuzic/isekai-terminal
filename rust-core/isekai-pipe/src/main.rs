@@ -1,4 +1,5 @@
 mod ctl;
+mod ctl_file;
 mod datagram_relay;
 mod engine;
 mod connect;
@@ -16,6 +17,11 @@ use isekai_pipe_core::ServiceSpec;
 
 pub(crate) const EX_USAGE: u8 = 64;
 pub(crate) const EX_UNAVAILABLE: u8 = 69;
+/// `sysexits.h`'s `EX_IOERR`: an I/O error unrelated to how the command was
+/// invoked (`ctl_file`'s ls/cat/info/cp/rm operations, task #16) — distinct
+/// from `EX_USAGE` (bad arguments) and `EX_UNAVAILABLE` (ctl-socket-forward
+/// specific: stale/missing socket, timeout).
+pub(crate) const EX_IOERR: u8 = 74;
 
 /// Serializes tests (across `main.rs`/`ctl.rs`) that mutate process-global
 /// env vars (`ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_CTL_SOCK`). `cargo test`
@@ -43,7 +49,7 @@ fn print_help() {
     println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
-    println!("    ctl        title/clipboard control-plane client (see `isekai-pipe ctl --help`)");
+    println!("    ctl        title/clipboard/setvar/getvar/file control-plane client (see `isekai-pipe ctl --help`)");
     println!("    version    print version");
     println!();
     println!(
@@ -145,33 +151,6 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
     }))
 }
 
-/// The `-R` remote path convention `isekai-ssh`'s `ctl_forward.rs` uses
-/// (`/tmp/isekai-pipe-ctl-<128bit hex>.sock`, opt-in `#@isekai ctl-socket
-/// yes`, `ISEKAI_PIPE_DESIGN.md` §8 Epic M). `sshd` owns cleaning up the
-/// actual streamlocal forward bind on a normal disconnect; this sweep only
-/// catches what's left behind by abnormal exits (crash, `kill -9`, a
-/// network drop that skipped `ssh -O cancel -R`).
-const CTL_SOCKET_REMOTE_PREFIX: &str = "isekai-pipe-ctl-";
-const CTL_SOCKET_STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Best-effort, non-fatal: a sweep failure (e.g. `/tmp` unreadable for
-/// some reason) should never block `serve` from starting.
-fn sweep_stale_ctl_sockets_on_remote() {
-    match isekai_pipe_core::sweep_stale_sockets(
-        std::path::Path::new("/tmp"),
-        CTL_SOCKET_REMOTE_PREFIX,
-        CTL_SOCKET_STALE_THRESHOLD,
-    ) {
-        Ok(removed) if !removed.is_empty() => {
-            log::info!("isekai-pipe serve: swept {} stale ctl-socket file(s) under /tmp", removed.len());
-        }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("isekai-pipe serve: failed to sweep stale ctl-socket files under /tmp: {e}");
-        }
-    }
-}
-
 async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_serve(args) {
         Ok(Some(launch)) => launch,
@@ -179,7 +158,11 @@ async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
         Err(code) => return code,
     };
 
-    sweep_stale_ctl_sockets_on_remote();
+    // `ctl::sweep_stale_ctl_sockets_on_remote` is also called from `isekai-pipe
+    // ctl` itself (see that module's doc comment) so plain-ssh sessions — which
+    // never start this `serve` process on the remote host — still get their
+    // orphaned `/tmp/isekai-pipe-ctl-*.sock` files swept eventually.
+    ctl::sweep_stale_ctl_sockets_on_remote();
 
     let mut helper_args = launch.helper_args;
     helper_args.push("--service-name".to_string());
