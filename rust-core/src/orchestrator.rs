@@ -3283,5 +3283,56 @@ mod tests {
                 wait_received_contains(&received, b"\x1b[O").await;
             });
         }
+
+        // ── set_session_theme ──
+
+        #[test]
+        fn set_session_theme_recolors_newly_written_cells_via_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                const CUSTOM_FG: u32 = 0xFF123456;
+                const CUSTOM_BG: u32 = 0xFF654321;
+                orch.set_session_theme(Vec::new(), CUSTOM_FG, CUSTOM_BG);
+
+                // 80x24をあふれさせるのに十分な行数を送り、テーマ変更後に書かれた
+                // セルを実際にscrollbackへ積ませる(既存のscrollback_len_and_cellsテストと
+                // 同じ手法。set_session_themeは「以降書かれるセルにのみ反映され、
+                // 既にscrollbackへ積まれたセルは遡って再着色されない」設計なので、
+                // テーマ変更を送信より先に行う必要がある)。
+                //
+                // SGR属性の実効色は「実行時点」でtheme.default_fg/bgから解決されて
+                // cur_attrsにスナップショットされる(以降テーマが変わっても、明示的な
+                // SGRリセットが無い限り再解決されない)。RecordingServerが素通しで
+                // echoする性質を利用し、`\x1b[0m`をecho往復させてからテキストを送ることで
+                // 新テーマでの解決を強制する。
+                orch.send(b"\x1b[0m".to_vec());
+                for i in 0..60 {
+                    orch.send(format!("line-{i:03}\r\n").into_bytes());
+                }
+                wait_echo(&mut rx, b"line-059").await;
+
+                let mut len = 0u32;
+                for _ in 0..50 {
+                    len = orch.scrollback_len();
+                    if len > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(len > 0, "scrollbackへの反映を待つ準備ができていない");
+
+                let cells = orch.scrollback_cells(0, 1);
+                assert!(!cells.is_empty());
+                assert_eq!(
+                    cells[0].fg, CUSTOM_FG,
+                    "SessionOrchestrator::set_session_themeが実transportまで届いていない \
+                     (ActiveSession::set_themeがno-opに変異してもこのテストは検知できる)"
+                );
+                assert_eq!(cells[0].bg, CUSTOM_BG);
+            });
+        }
     }
 }
