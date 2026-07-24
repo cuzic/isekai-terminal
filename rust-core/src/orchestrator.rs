@@ -2662,4 +2662,543 @@ mod tests {
             "即座にエラー応答した場合はpendingマップに残してはいけない"
         );
     }
+
+    /// `SessionOrchestrator`の公開API(resize/disconnect/scrollback_*)が、実際に
+    /// `session.lock()`へ格納された`ActiveSession`まで届いているかを検証するe2eテスト群。
+    ///
+    /// 既存のテストヘルパー(`orchestrator_with_phase`等)は`session: Mutex::new(None)`
+    /// で固定されており、これらのメソッドが呼ぶ`self.shared.session.lock().as_ref()`が
+    /// 常に`None`のまま——つまり委譲先のコードが一度も実行されない。これがcargo-mutants
+    /// (2026-07-24、orchestrator.rs全218ミュータント走査)でSessionOrchestrator本体の
+    /// 公開メソッドの大半がmissed判定になった直接の原因。ここでは
+    /// `transport::ssh_handler::pooling_e2e_tests`と同じパターン(in-process russh
+    /// serverへの実接続)で`SessionOrchestrator::connect()`を実際に呼び、`session`へ
+    /// 本物の`ActiveSession::Ssh`が格納された状態を作ってから各メソッドを検証する
+    /// (`isekai-ssh-e2e-test-self-containment-convention`に倣い、モックサーバーは
+    /// このモジュール内に自己完結させ、`ssh_handler.rs`側とは共有しない)。
+    mod session_orchestrator_e2e_tests {
+        use super::*;
+        use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
+        use russh::{Channel as RusshChannel, ChannelId, CryptoVec, Pty};
+        use russh_keys::ssh_key::private::Ed25519Keypair;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::net::TcpListener as TokioTcpListener;
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+        use crate::SshAuth;
+
+        #[allow(dead_code)]
+        enum TestEvent {
+            Connection(ConnectionPublicState),
+            Data(Vec<u8>),
+        }
+
+        struct TestCallback {
+            tx: UnboundedSender<TestEvent>,
+        }
+
+        impl OrchestratorCallback for TestCallback {
+            fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+                let _ = self.tx.send(TestEvent::Connection(state));
+            }
+            fn on_screen_update(&self, _update: ScreenUpdate) {}
+            fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
+            fn on_data(&self, data: Vec<u8>) {
+                let _ = self.tx.send(TestEvent::Data(data));
+            }
+            fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
+            fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+            fn on_no_viable_path(&self) {}
+            fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+            fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+            fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
+            fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
+            fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+            fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+            fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+            fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+            fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+            fn on_file_preview_result(&self, _request_id: String, _outcome: FilePreviewOutcome) {}
+        }
+
+        /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
+        /// 記録しつつ、受信データをそのままechoし返す最小SSHサーバ。
+        #[derive(Clone)]
+        struct RecordingServer {
+            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
+            channel_closed: Arc<AtomicBool>,
+        }
+
+        impl server::Server for RecordingServer {
+            type Handler = RecordingHandler;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> RecordingHandler {
+                RecordingHandler {
+                    window_changes: self.window_changes.clone(),
+                    channel_closed: self.channel_closed.clone(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct RecordingHandler {
+            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
+            channel_closed: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl server::Handler for RecordingHandler {
+            type Error = russh::Error;
+
+            async fn auth_publickey(
+                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+            ) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+
+            async fn pty_request(
+                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
+                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn shell_request(
+                &mut self, channel: ChannelId, session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn window_change_request(
+                &mut self, _channel: ChannelId, col_width: u32, row_height: u32,
+                _pix_width: u32, _pix_height: u32, _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.window_changes.lock().unwrap().push((col_width, row_height));
+                Ok(())
+            }
+
+            async fn data(
+                &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.data(channel, CryptoVec::from(data.to_vec()))?;
+                Ok(())
+            }
+
+            async fn channel_close(
+                &mut self, _channel: ChannelId, _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.channel_closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
+            let host_key = russh_keys::PrivateKey::from(keypair);
+            let config = Arc::new(server::Config {
+                keys: vec![host_key],
+                ..Default::default()
+            });
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let window_changes = Arc::new(StdMutex::new(Vec::new()));
+            let channel_closed = Arc::new(AtomicBool::new(false));
+            let mut sh = RecordingServer {
+                window_changes: window_changes.clone(),
+                channel_closed: channel_closed.clone(),
+            };
+            tokio::spawn(async move {
+                use server::Server as _;
+                let _ = sh.run_on_socket(config, &listener).await;
+            });
+            (addr, window_changes, channel_closed)
+        }
+
+        fn key_auth(seed: u8) -> SshAuth {
+            let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+            let key = russh_keys::PrivateKey::from(keypair);
+            SshAuth::PublicKey {
+                private_key_pem: key.to_openssh(Default::default()).unwrap().as_bytes().to_vec(),
+            }
+        }
+
+        fn ssh_config(host: SocketAddr, auth: SshAuth) -> SshConfig {
+            SshConfig {
+                host: host.ip().to_string(),
+                port: host.port(),
+                username: "tester".into(),
+                auth,
+                cols: 80,
+                rows: 24,
+                forwards: Vec::new(),
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            }
+        }
+
+        async fn wait_connected(rx: &mut UnboundedReceiver<TestEvent>) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Connected { .. }))) => return,
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Error { message }))) => {
+                        panic!("connection reported Error before Connected: {message}");
+                    }
+                    _ => continue,
+                }
+            }
+            panic!("did not become Connected within timeout");
+        }
+
+        async fn wait_disconnected(rx: &mut UnboundedReceiver<TestEvent>) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { .. }))) => return,
+                    _ => continue,
+                }
+            }
+            panic!("did not become Disconnected within timeout");
+        }
+
+        async fn wait_echo(rx: &mut UnboundedReceiver<TestEvent>, expected: &[u8]) {
+            let mut got = Vec::new();
+            for _ in 0..50 {
+                if got.windows(expected.len().max(1)).any(|w| w == expected) {
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Data(data))) => got.extend_from_slice(&data),
+                    _ => continue,
+                }
+            }
+            panic!("did not observe expected echo {:?} within timeout, got {:?}", expected, got);
+        }
+
+        async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let (addr, window_changes, channel_closed) = spawn_recording_server().await;
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+            (orch, rx, addr, window_changes, channel_closed)
+        }
+
+        #[test]
+        fn resize_forwards_window_change_to_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, _addr, window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.resize(100, 40);
+
+                // window_change_requestはchannelの非同期送信なので、サーバー側での
+                // 記録が届くまで短時間ポーリングする。
+                for _ in 0..50 {
+                    if !window_changes.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(
+                    window_changes.lock().unwrap().as_slice(),
+                    &[(100, 40)],
+                    "SessionOrchestrator::resize()が実際のトランスポートまで届いていない \
+                     (ActiveSession::resizeがno-opに変異してもこのテストは検知できる)"
+                );
+            });
+        }
+
+        #[test]
+        fn disconnect_tears_down_the_real_transport_and_notifies_disconnected() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.disconnect();
+                // ActiveSession::disconnectが実際に呼ばれない(no-opに変異する)限り、
+                // 実コネクションは生きたままなのでDisconnectedコールバックは発火しない
+                // ——wait_disconnectedのタイムアウトpanicがこの変異を検知する。
+                wait_disconnected(&mut rx).await;
+            });
+        }
+
+        #[test]
+        fn scrollback_len_and_cells_reflect_real_terminal_output() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                // 80x24の画面をあふれさせるのに十分な行数を送り、実際にscrollbackへ
+                // 積ませる。各行末で改行しechoさせる。
+                for i in 0..60 {
+                    orch.send(format!("line-{i:03}\r\n").into_bytes());
+                }
+                wait_echo(&mut rx, b"line-059").await;
+                // VTEでの画面反映は非同期(on_screen_updateコールバック駆動)なので、
+                // scrollbackへの反映が追いつくまで短時間ポーリングする。
+                let mut len = 0u32;
+                for _ in 0..50 {
+                    len = orch.scrollback_len();
+                    if len > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    len > 0,
+                    "SessionOrchestrator::scrollback_len()が実際のtransport/terminal状態を \
+                     反映していない(ActiveSession::scrollback_lenが0固定に変異してもこのテストは検知できる)"
+                );
+
+                let cells = orch.scrollback_cells(0, 1);
+                assert!(
+                    !cells.is_empty(),
+                    "SessionOrchestrator::scrollback_cells()が実際のterminal状態を反映していない \
+                     (ActiveSession::scrollback_cellsがvec![]に変異してもこのテストは検知できる)"
+                );
+            });
+        }
+
+        // ── trzsz_accept_download / trzsz_accept_upload / trzsz_cancel ──
+        //
+        // 上のRecordingServerはクライアントからのデータを無条件にechoするだけなので、
+        // サーバー側が任意タイミングで能動的にバイトを送れる`ScriptedServer`を別途
+        // 用意する(`session.handle()`を`shell_request`時に保存し、テストコードから
+        // `Handle::data()`で直接送り込む)。これにより実物のtrzszトリガー/CFG/NUM
+        // フレームをワイヤ上に流し、`SessionOrchestrator::trzsz_accept_download`等の
+        // 委譲がno-opに変異した場合に実際に検知できるテストを組む。
+
+        #[derive(Clone)]
+        struct ScriptedServer {
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
+        }
+
+        impl server::Server for ScriptedServer {
+            type Handler = ScriptedHandler;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> ScriptedHandler {
+                ScriptedHandler {
+                    channel_handle: self.channel_handle.clone(),
+                    received: self.received.clone(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct ScriptedHandler {
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl server::Handler for ScriptedHandler {
+            type Error = russh::Error;
+
+            async fn auth_publickey(
+                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+            ) -> Result<Auth, Self::Error> {
+                Ok(Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+
+            async fn pty_request(
+                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
+                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn shell_request(
+                &mut self, channel: ChannelId, session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
+                Ok(())
+            }
+
+            async fn data(
+                &mut self, _channel: ChannelId, data: &[u8], _session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                self.received.lock().unwrap().extend_from_slice(data);
+                Ok(())
+            }
+        }
+
+        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
+            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
+            let host_key = russh_keys::PrivateKey::from(keypair);
+            let config = Arc::new(server::Config {
+                keys: vec![host_key],
+                ..Default::default()
+            });
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let channel_handle = Arc::new(StdMutex::new(None));
+            let received = Arc::new(StdMutex::new(Vec::new()));
+            let mut sh = ScriptedServer {
+                channel_handle: channel_handle.clone(),
+                received: received.clone(),
+            };
+            tokio::spawn(async move {
+                use server::Server as _;
+                let _ = sh.run_on_socket(config, &listener).await;
+            });
+            (addr, channel_handle, received)
+        }
+
+        async fn connect_scripted_orchestrator() -> (
+            Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>,
+            Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>,
+        ) {
+            let (addr, channel_handle, received) = spawn_scripted_server().await;
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+            (orch, rx, channel_handle, received)
+        }
+
+        /// `shell_request`が届き`ScriptedHandler`が`Handle`を保存するまで待ってから、
+        /// テストコードから能動的にバイトをクライアントへ送り込む
+        /// (実物のtrzszトリガー/CFG/NUMフレームをそのままワイヤに流すために使う)。
+        async fn send_from_server(slot: &Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, bytes: Vec<u8>) {
+            let (id, handle) = {
+                let mut found = None;
+                for _ in 0..50 {
+                    if let Some(v) = slot.lock().unwrap().clone() {
+                        found = Some(v);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                found.expect("shell was not requested within timeout")
+            };
+            handle.data(id, CryptoVec::from(bytes)).await.expect("failed to send scripted bytes to client");
+        }
+
+        async fn wait_received_contains(received: &Arc<StdMutex<Vec<u8>>>, needle: &[u8]) {
+            for _ in 0..50 {
+                if received.lock().unwrap().windows(needle.len().max(1)).any(|w| w == needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "did not observe expected bytes {:?} arriving at the server within timeout, got {:?}",
+                String::from_utf8_lossy(needle), String::from_utf8_lossy(&received.lock().unwrap())
+            );
+        }
+
+        fn trzsz_trigger(mode: &str) -> Vec<u8> {
+            format!("::TRZSZ:TRANSFER:{mode}:1.1.7:0000004e\n").into_bytes()
+        }
+
+        fn trzsz_frame(typ: &str, payload: &str) -> Vec<u8> {
+            format!("#{typ}:{payload}\n").into_bytes()
+        }
+
+        fn trzsz_encode_bytes(buf: &[u8]) -> String {
+            use std::io::Write;
+            use base64::Engine;
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let _ = enc.write_all(buf);
+            let compressed = enc.finish().unwrap_or_default();
+            base64::engine::general_purpose::STANDARD.encode(compressed)
+        }
+
+        fn trzsz_frame_bin(typ: &str, buf: &[u8]) -> Vec<u8> {
+            trzsz_frame(typ, &trzsz_encode_bytes(buf))
+        }
+
+        fn trzsz_frame_int(typ: &str, val: u64) -> Vec<u8> {
+            trzsz_frame(typ, &val.to_string())
+        }
+
+        fn trzsz_cfg_frame() -> Vec<u8> {
+            let json = r#"{"lang":"go","version":"1.1.5","binary":false,"directory":false,"bufsize":1048576,"timeout":10}"#;
+            trzsz_frame_bin("CFG", json.as_bytes())
+        }
+
+        #[test]
+        fn trzsz_accept_download_then_cancel_drive_the_real_transfer_fsm() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // 1. サーバー(送信側)から実物のdownloadトリガーを送る。クライアントは
+                //    トリガー検出直後に自動でACTを実transport経由で送り返す。
+                send_from_server(&channel_handle, trzsz_trigger("S")).await;
+                wait_received_contains(&received, b"#ACT:").await;
+
+                // 2. CFGを先行して送っておく。この時点ではまだWaitingKotlin状態なので
+                //    proto_bufにバッファされるだけで応答は起きない。
+                send_from_server(&channel_handle, trzsz_cfg_frame()).await;
+
+                // 3. accept_downloadを呼ぶ。ActiveSession::trzsz_accept_downloadが
+                //    no-opに変異していれば状態はWaitingKotlinのまま変わらず、
+                //    バッファされたCFGは永遠に処理されない。
+                orch.trzsz_accept_download();
+
+                // 4. accept_downloadが実transportまで届いていれば、バッファ済みCFGが
+                //    即座に処理されWaitNum状態になっているはず。ここでNUMを送り、
+                //    クライアントがSUCC:1で応答することを確認する
+                //    (mutantが生きていればこのSUCCは永遠に届かずタイムアウトする)。
+                send_from_server(&channel_handle, trzsz_frame_int("NUM", 1)).await;
+                wait_received_contains(&received, b"#SUCC:1\n").await;
+
+                // 5. trzsz_cancel()が実transportにCtrl+C(0x03)を送ることを確認する
+                //    (ActiveSession::trzsz_cancelがno-opに変異してもこのテストは検知できる)。
+                orch.trzsz_cancel();
+                wait_received_contains(&received, &[0x03]).await;
+            });
+        }
+
+        #[test]
+        fn trzsz_accept_upload_drives_the_real_transfer_fsm() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // 1. サーバーから実物のuploadトリガー("R")を送る → クライアントは
+                //    ACTを実transport経由で送り返す。
+                send_from_server(&channel_handle, trzsz_trigger("R")).await;
+                wait_received_contains(&received, b"#ACT:").await;
+
+                // 2. accept_uploadを呼ぶ。ActiveSession::trzsz_accept_uploadがno-opに
+                //    変異していれば状態はWaitingKotlinのまま変わらない。
+                orch.trzsz_accept_upload("scripted.bin".to_string(), 5, 0o644);
+
+                // 3. accept_uploadが実transportまで届いていれば、次にCFGを受け取った
+                //    瞬間にNUM/NAME/SIZEを能動的に送り返してくるはず
+                //    (mutantが生きていればCFGはWaitingKotlinのproto_bufに積まれるだけで
+                //    何も送り返されずタイムアウトする)。
+                send_from_server(&channel_handle, trzsz_cfg_frame()).await;
+                wait_received_contains(&received, b"#NUM:1\n").await;
+                wait_received_contains(&received, b"#NAME:").await;
+                wait_received_contains(&received, b"#SIZE:5\n").await;
+
+                orch.trzsz_cancel();
+                wait_received_contains(&received, &[0x03]).await;
+            });
+        }
+    }
 }
