@@ -1,9 +1,21 @@
 name: Android debug build (on-demand)
 
-# 手動実行専用: 実機に入れて動作確認したいだけの時に、ローカル/spot instanceを
-# 用意せずGitHub-hosted runner上でAPKをビルドしてartifactとして出力する。
-# push/PR毎には走らせない(既存のroom-migration-check.yml等の必須チェックとは
-# 別枠、単発の「今すぐ実機に入れたい」用途)。
+# 手動実行専用: 実機に入れて動作確認したいだけの時に、ローカルサンドボックスを
+# 使わずにAPKをビルドしてartifactとして出力する。push/PR毎には走らせない
+# (既存のroom-migration-check.yml等の必須チェックとは別枠、単発の
+# 「今すぐ実機に入れたい」用途)。
+#
+# runner_type で実行環境を選べる:
+#   - github-hosted(既定): GitHub-hosted ubuntu-latest。public repoなので無料、
+#     Android SDK/NDKプリインストール済み。依存のインストール・キャッシュ復元を
+#     毎回行う。
+#   - self-hosted-gcp-spot: cargo-ci-gcp-spot-instanceスキルで用意したGCP Spot VMを
+#     ephemeral self-hosted runnerとして登録して使う(事前にrunner登録が必要、
+#     詳細はそのスキルのSKILL.md参照)。ツールチェーン・SDK/NDK・Gradle/cargo依存が
+#     永続ディスクに常駐しているため、依存インストール・キャッシュ復元が丸ごと
+#     不要になり、より速く/より重いビルドにも耐えられる。GitHub Actionsの
+#     job時間・並列度では非効率な重いジョブでのみ選ぶこと(通常はgithub-hostedで
+#     十分)。
 #
 # isekai-terminal-core は isekai-pipe の musl 静的バイナリ(x86_64/aarch64)を
 # include_bytes! でソースに埋め込む設計のため、cargoBuildRustCore(aarch64-linux-android
@@ -13,6 +25,13 @@ name: Android debug build (on-demand)
 on:
   workflow_dispatch:
     inputs:
+      runner_type:
+        description: "実行環境"
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted-gcp-spot
+        default: github-hosted
       build_type:
         description: "assembleDebug に加えて testDebugUnitTest も回すか"
         type: boolean
@@ -27,39 +46,75 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_type == 'self-hosted-gcp-spot' && fromJSON('["self-hosted", "android-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
 
+      # ── self-hosted-gcp-spot専用: 永続ディスク側のキャッシュ済み環境を指す
+      #    環境変数を$GITHUB_ENVへ書く。/etc/environmentのソースだけでは
+      #    子プロセスにexportされない不具合を過去に踏んでいるため
+      #    (cargo-ci-gcp-spot-instanceスキル参照)、GitHub Actions自体が保証する
+      #    $GITHUB_ENV/$GITHUB_PATHの伝播機構を使い、同じ地雷を避ける。
+      - name: Point at persistent-disk toolchain caches (self-hosted only)
+        if: inputs.runner_type == 'self-hosted-gcp-spot'
+        run: |
+          echo "CARGO_HOME=/mnt/cargo-cache/cargo-home" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/mnt/cargo-cache/rustup-home" >> "$GITHUB_ENV"
+          echo "GRADLE_USER_HOME=/mnt/cargo-cache/gradle-home" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=/mnt/cargo-cache/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=/mnt/cargo-cache/android-sdk" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "/mnt/cargo-cache/cargo-home/bin" >> "$GITHUB_PATH"
+          echo "/mnt/cargo-cache/zig" >> "$GITHUB_PATH"
+          echo "/mnt/cargo-cache/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "/mnt/cargo-cache/android-sdk/platform-tools" >> "$GITHUB_PATH"
+
+      # rust-core/targetはinclude_bytes!がCARGO_MANIFEST_DIRからの相対パスを
+      # ハードコードしているため、CARGO_TARGET_DIRでは永続化できない
+      # (cargo-ci-gcp-spot-instanceスキル参照)。actions/checkoutで作られる
+      # 毎回新しいワークスペースの中で、都度シンボリックリンクを張り直す。
+      - name: Symlink rust-core/target to persistent cache (self-hosted only)
+        if: inputs.runner_type == 'self-hosted-gcp-spot'
+        run: |
+          mkdir -p /mnt/cargo-cache/target-gha-runner
+          rm -rf rust-core/target
+          ln -sfn /mnt/cargo-cache/target-gha-runner rust-core/target
+
       - name: Set up JDK 17
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Show Android SDK/NDK already on the runner image
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           ls "$ANDROID_HOME/ndk" 2>/dev/null || echo "(no NDK preinstalled, will install one below)"
 
       - name: Install an NDK if the runner image doesn't ship one
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         run: |
           if [ -z "$(ls -A "$ANDROID_HOME/ndk" 2>/dev/null)" ]; then
             yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.1.12297006"
           fi
 
       - name: Add rust targets (Android NDK cross-compile + musl embed binaries)
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         run: rustup target add aarch64-linux-android x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
       - name: Install zig (mlugg/setup-zig)
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         uses: mlugg/setup-zig@v2
         with:
           version: latest
 
       - name: Cache Gradle and Cargo
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         uses: actions/cache@v4
         with:
           path: |
@@ -73,6 +128,7 @@ jobs:
             build-android-${{ runner.os }}-
 
       - name: Install cargo-zigbuild
+        if: inputs.runner_type != 'self-hosted-gcp-spot'
         run: |
           if ! command -v cargo-zigbuild >/dev/null; then
             cargo install cargo-zigbuild

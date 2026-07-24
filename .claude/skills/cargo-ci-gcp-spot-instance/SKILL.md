@@ -62,7 +62,9 @@ load averageがコア数の2〜3倍になることが実際にあった)かど�
 6. 重いジョブをリモート側で`nohup`+`disown`してdetach起動する
 7. SSH越しに進捗をpollする(**preemptionで落ちていたら再起動して`--iterate`等で再開する**)
 8. 結果を回収する
-9. instanceだけ削除する(キャッシュディスク・ネットワークは残す)
+9. (オプション)`build-android.yml`から使いたい場合は、GitHub Actions self-hosted
+   runnerとしてephemeral登録する(恒常的なrunnerにはしない)
+10. instanceだけ削除する(キャッシュディスク・ネットワークは残す)
 
 ## 0. どのGCPプロジェクト/アカウントを使うか、ユーザーに確認する
 
@@ -731,7 +733,94 @@ gcloud compute scp <INSTANCE_NAME>:~/work/rust-core/mutants.out/missed.txt /tmp/
 # 必要なファイルを同様にscpで持ち帰る
 ```
 
-## 9. 後片付け
+## 9. (オプション)GitHub Actions self-hosted runnerとして登録して使う
+
+`android-ci-deploy`スキル(`build-android.yml`)から`runner_type: self-hosted-gcp-spot`を
+選んで実行したい場合、事前にこのinstanceをGitHub Actionsのself-hosted runnerとして
+登録しておく必要がある。**ephemeral(1ジョブ限りで自動的に登録解除される)runnerとして
+登録する**——常駐runnerにしない(公開リポジトリのself-hosted runnerを常駐させると、
+外部からのPRトリガーで悪用され得る攻撃面になるため。今回は`workflow_dispatch`専用の
+ワークフローからしか使わない設計だが、それでも「使い終わったら消える」原則は保つ)。
+
+### a. instanceを起動し、登録トークンを取得する
+
+登録トークンは1時間だけ有効・1回登録すると失効する。**Bashコマンドの文字列に
+生の値を直接タイプしない**(ステップ4.5「秘密情報の扱い」と同じ理由)。
+
+```bash
+gcloud compute instances start <INSTANCE_NAME> --zone=<ZONE> --project=<PROJECT_ID> \
+  --account=<personal-account> 2>&1 | grep -v "already running" || true
+
+gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token \
+  > /tmp/gha-runner-token.txt
+chmod 600 /tmp/gha-runner-token.txt
+```
+
+### b. runnerエージェントを永続ディスクへ展開する(初回のみ)
+
+エージェント本体(tarball)も`/mnt/cargo-cache`側に置き、instanceを作り直しても
+再ダウンロード不要にする。
+
+```bash
+scp /tmp/gha-runner-token.txt <INSTANCE_NAME>:/tmp/gha-runner-token.txt
+ssh <INSTANCE_NAME> '
+set -e
+mkdir -p /mnt/cargo-cache/actions-runner
+cd /mnt/cargo-cache/actions-runner
+if [ ! -f run.sh ]; then
+  RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | python3 -c "import json,sys; print(json.load(sys.stdin)[\"tag_name\"].lstrip(\"v\"))")
+  curl -o actions-runner.tar.gz -L \
+    "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+  tar xzf actions-runner.tar.gz
+  rm actions-runner.tar.gz
+fi
+'
+```
+
+(Tailscale経由でSSH済みの前提。IAP tunnelしか無い場合は`gcloud compute scp`/
+`gcloud compute ssh --tunnel-through-iap`に読み替える。)
+
+### c. ephemeral runnerとして登録し、detach起動する
+
+```bash
+ssh <INSTANCE_NAME> '
+set -e
+cd /mnt/cargo-cache/actions-runner
+./config.sh --url https://github.com/<owner>/<repo> \
+  --token "$(cat /tmp/gha-runner-token.txt)" \
+  --labels android-ci --ephemeral --unattended --replace \
+  --name spot-android-ci --work _work
+shred -u /tmp/gha-runner-token.txt 2>/dev/null || rm -f /tmp/gha-runner-token.txt
+nohup ./run.sh > ~/gha-runner.log 2>&1 < /dev/null &
+disown
+echo "started pid=$!"
+'
+rm -f /tmp/gha-runner-token.txt
+```
+
+`--ephemeral`により、1回ジョブを処理すると`run.sh`が自動的に終了しGitHub側からも
+登録解除される(次に使うときはa〜cを繰り返す)。`--replace`は同名runnerが残って
+いた場合に上書きする(preemption等で前回のrunnerがクリーンに登録解除されずに
+終わった場合の保険)。
+
+### d. ワークフローを実行する
+
+```bash
+gh workflow run build-android.yml -f runner_type=self-hosted-gcp-spot
+```
+
+runnerがジョブを拾うまで数秒〜数十秒かかることがある(`gh run watch`で待てばよい)。
+
+### 実際にrunnerが上がっているか確認する
+
+```bash
+gh api repos/<owner>/<repo>/actions/runners --jq '.runners[] | {name, status, busy}'
+```
+
+`status: "online"`にならない場合、`ssh <INSTANCE_NAME> 'tail -50 ~/gha-runner.log'`で
+`run.sh`側のログを確認する。
+
+## 10. 後片付け
 
 **instanceは自動削除されない。** 完了後、明示的に:
 

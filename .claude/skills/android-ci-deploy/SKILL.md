@@ -1,6 +1,6 @@
 ---
 name: android-ci-deploy
-description: android/のAPKをGitHub Actions(build-android.yml、GitHub-hosted runner)でビルドし、成果物をダウンロードして、android-adb-remoteスキル経由でWindows PC越しの実機にインストール・起動する。ローカルサンドボックスでビルドせず「トリガー→待機→ダウンロード→インストール」を一気通貫で行う。
+description: android/のAPKをGitHub Actions(build-android.yml)でビルドし、成果物をダウンロードして、android-adb-remoteスキル経由でWindows PC越しの実機にインストール・起動する。既定はGitHub-hosted runner、より重い/速いビルドが要るときはcargo-ci-gcp-spot-instanceのGCP Spot VMをephemeral self-hosted runnerとして使う選択肢もある。ローカルサンドボックスでビルドせず「トリガー→待機→ダウンロード→インストール」を一気通貫で行う。
 argument-hint: "[build|deploy|build-and-deploy]"
 keywords:
   - android
@@ -51,6 +51,18 @@ gh workflow run build-android.yml
 ```bash
 gh workflow run build-android.yml -f build_type=true
 ```
+
+**既定はGitHub-hosted runner(無料・無制限)。** より速い/より重いビルドが必要な場合のみ、
+事前に`cargo-ci-gcp-spot-instance`スキルでGCP Spot VMをephemeral self-hosted runnerとして
+登録した上で(そのスキルのステップ9参照)、以下で明示的に指定する:
+
+```bash
+gh workflow run build-android.yml -f runner_type=self-hosted-gcp-spot
+```
+
+runnerが未登録の状態でこれを実行すると、ジョブは`self-hosted`ラベルのrunnerが
+現れるまで無期限にキュー待ちになる(失敗はしない)ので注意。まずrunnerを登録してから
+ワークフローを起動すること。
 
 ### 2. 完了を待つ
 
