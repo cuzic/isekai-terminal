@@ -2693,6 +2693,7 @@ mod tests {
             Connection(ConnectionPublicState),
             Data(Vec<u8>),
             Forward(String, ForwardState),
+            FilePreview(String, FilePreviewOutcome),
         }
 
         struct TestCallback {
@@ -2722,7 +2723,9 @@ mod tests {
             fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
             fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
             fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-            fn on_file_preview_result(&self, _request_id: String, _outcome: FilePreviewOutcome) {}
+            fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
+                let _ = self.tx.send(TestEvent::FilePreview(request_id, outcome));
+            }
         }
 
         /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
@@ -2799,6 +2802,22 @@ mod tests {
                 &mut self, _channel: ChannelId, _session: &mut ServerSession,
             ) -> Result<(), Self::Error> {
                 self.channel_closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            /// `file_preview_exec`(タスク#17)が開く別チャネルでの`isekai-pipe ctl file`
+            /// exec要求。コマンド内容は見ず、常に`ctl_file.rs`の`ls`成功レスポンス
+            /// (JSON)を1件返す——本テストで検証したいのは`SessionOrchestrator::
+            /// file_preview_request`が実transportまで委譲されるかどうかであり、
+            /// exec先の実際のコマンド分岐はこのモジュールの対象外。
+            async fn exec_request(
+                &mut self, channel: ChannelId, _data: &[u8], session: &mut ServerSession,
+            ) -> Result<(), Self::Error> {
+                session.channel_success(channel)?;
+                let stdout = br#"{"entries":[{"name":"a.txt","is_dir":false,"is_symlink":false,"size":5,"modified_unix":1700000000}]}"#;
+                session.data(channel, CryptoVec::from(stdout.to_vec()))?;
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
                 Ok(())
             }
         }
@@ -2883,6 +2902,16 @@ mod tests {
                 }
             }
             panic!("did not observe expected echo {:?} within timeout, got {:?}", expected, got);
+        }
+
+        async fn wait_file_preview_result(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str) -> FilePreviewOutcome {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::FilePreview(id, outcome))) if id == expected_id => return outcome,
+                    _ => continue,
+                }
+            }
+            panic!("did not observe a FilePreviewOutcome for id={} within timeout", expected_id);
         }
 
         async fn wait_forward_state(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str, expect_listening: bool) {
@@ -3332,6 +3361,41 @@ mod tests {
                      (ActiveSession::set_themeがno-opに変異してもこのテストは検知できる)"
                 );
                 assert_eq!(cells[0].bg, CUSTOM_BG);
+            });
+        }
+
+        // ── file_preview_request ──
+
+        #[test]
+        fn file_preview_request_execs_over_the_real_transport_and_reports_the_result() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                orch.file_preview_request(
+                    "req-1".to_string(),
+                    crate::file_preview::FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+                );
+
+                // SessionOrchestrator::file_preview_requestがno-op(session.file_preview_execを
+                // 呼ばない)に変異していれば、`queued`は常にfalseとなり即座に
+                // FilePreviewOutcome::Error{"not connected"}が同期的に返る。実transportまで
+                // 委譲されていれば、RecordingServerのexec_requestが返す実物のls JSONが
+                // 非同期に届くはず。
+                let outcome = wait_file_preview_result(&mut rx, "req-1").await;
+                match outcome {
+                    FilePreviewOutcome::Ls { entries } => {
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].name, "a.txt");
+                    }
+                    other => panic!(
+                        "expected a real FilePreviewOutcome::Ls from the exec channel, got {:?} \
+                         (ActiveSession::file_preview_execがno-opに変異すると即座に \
+                         Error{{\"not connected\"}}が返る)",
+                        other
+                    ),
+                }
             });
         }
     }
