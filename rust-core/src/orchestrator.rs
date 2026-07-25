@@ -896,10 +896,11 @@ impl RemoteTmuxCommandRunner for ActiveSessionTmuxRunner {
         let cmd = cmd.to_string();
         async move {
             let output = session.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
-            if let Some(status) = output.exit_status {
-                if status != 0 {
-                    return Err(TmuxRunError(format!("tmux command exited with status {status}")));
-                }
+            if !crate::tmux_locator::tmux_exit_status_is_success(output.exit_status) {
+                return Err(TmuxRunError(format!(
+                    "tmux command exited with status {:?}",
+                    output.exit_status
+                )));
             }
             String::from_utf8(output.stdout)
                 .map_err(|e| TmuxRunError(format!("tmux output was not valid UTF-8: {e}")))
@@ -1708,7 +1709,7 @@ impl<'a> crate::tmux_locator::RemoteTmuxCommandRunner for OrchestratorTmuxRunner
         async move {
             use crate::tmux_locator::TmuxRunError;
             let output = orchestrator.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
-            if output.exit_status != Some(0) {
+            if !crate::tmux_locator::tmux_exit_status_is_success(output.exit_status) {
                 return Err(TmuxRunError(format!(
                     "tmux command exited with status {:?} (stdout: {:?})",
                     output.exit_status,
