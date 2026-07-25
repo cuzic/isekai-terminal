@@ -1170,11 +1170,16 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * 生成し`SharedPreferences`等に保存、以後使い回す)。
      * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
      * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
      *
      * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
      * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
      */
-    func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) async throws  -> TmuxTabWindowInfo
+    func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Bool) async throws  -> TmuxTabWindowInfo
     
     /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
@@ -1535,17 +1540,22 @@ open func disconnect()  {try! rustCall() {
      * 生成し`SharedPreferences`等に保存、以後使い回す)。
      * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
      * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
      *
      * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
      * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
      */
-open func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?)async throws  -> TmuxTabWindowInfo  {
+open func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Bool)async throws  -> TmuxTabWindowInfo  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
                     self.uniffiCloneHandle(),
-                    FfiConverterString.lower(profileIdentity),FfiConverterString.lower(clientId),FfiConverterOptionString.lower(existingTag)
+                    FfiConverterString.lower(profileIdentity),FfiConverterString.lower(clientId),FfiConverterOptionString.lower(existingTag),FfiConverterBool.lower(enableNotifications)
                 )
             },
             pollFunc: ffi_isekai_terminal_core_rust_future_poll_rust_buffer,
@@ -8397,7 +8407,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 4218) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {

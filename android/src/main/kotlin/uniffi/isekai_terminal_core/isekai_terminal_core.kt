@@ -1066,7 +1066,7 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(`ptr`: Long,`profileIdentity`: RustBuffer.ByValue,`clientId`: RustBuffer.ByValue,`existingTag`: RustBuffer.ByValue,
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(`ptr`: Long,`profileIdentity`: RustBuffer.ByValue,`clientId`: RustBuffer.ByValue,`existingTag`: RustBuffer.ByValue,`enableNotifications`: Byte,
 ): Long
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(`ptr`: Long,`requestId`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1395,7 +1395,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 4218) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
@@ -3090,11 +3090,16 @@ public interface SessionOrchestratorInterface {
      * 生成し`SharedPreferences`等に保存、以後使い回す)。
      * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
      * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
      *
      * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
      * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
      */
-    suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?): TmuxTabWindowInfo
+    suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?, `enableNotifications`: kotlin.Boolean): TmuxTabWindowInfo
     
     /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
@@ -3554,18 +3559,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * 生成し`SharedPreferences`等に保存、以後使い回す)。
      * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
      * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
      *
      * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
      * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
      */
     @Throws(TmuxSessionException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?) : TmuxTabWindowInfo {
+    override suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?, `enableNotifications`: kotlin.Boolean) : TmuxTabWindowInfo {
         return uniffiRustCallAsync(
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
                 uniffiHandle,
-                FfiConverterString.lower(`profileIdentity`),FfiConverterString.lower(`clientId`),FfiConverterOptionalString.lower(`existingTag`),
+                FfiConverterString.lower(`profileIdentity`),FfiConverterString.lower(`clientId`),FfiConverterOptionalString.lower(`existingTag`),FfiConverterBoolean.lower(`enableNotifications`),
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_poll_rust_buffer(future, callback, continuation) },
