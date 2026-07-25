@@ -1736,6 +1736,11 @@ impl SessionOrchestrator {
     ///   生成し`SharedPreferences`等に保存、以後使い回す)。
     /// - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
     ///   無ければ`None`(新規タブ)。
+    /// - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+    ///   `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+    ///   tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+    ///   サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+    ///   ため、`tmux_notify.rs`のモジュールdoc参照)。
     ///
     /// 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
     /// 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
@@ -1744,12 +1749,20 @@ impl SessionOrchestrator {
         profile_identity: String,
         client_id: String,
         existing_tag: Option<String>,
+        enable_notifications: bool,
     ) -> Result<crate::TmuxTabWindowInfo, crate::TmuxSessionError> {
         let runner = OrchestratorTmuxRunner { orchestrator: self };
         let (group_name, session_name, outcome) =
             crate::tmux_session::ensure_tab_window(runner, &profile_identity, &client_id, existing_tag)
                 .await
                 .map_err(crate::TmuxSessionError::from)?;
+        // タスク#59/#57が読む`TMUX_LOCATOR_REGISTRY`(push_ctl_socket_to_tmux/
+        // install_notify_hooksの参照先)へ、解決/新規作成したロケータを登録する。
+        // ここを配線し忘れると両者は「ロケータ未登録」として黙ってno-opになり
+        // (ssh_handler.rsのコメント参照)、tmux統合機能が本番で一切発火しない。
+        let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
+        registry.lock().register(self.shared.app_pane_id.clone(), outcome.locator.clone(), None);
+        registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         Ok(crate::TmuxTabWindowInfo {
             tag: outcome.locator.tag.0,
             window_index: outcome.coords.window_index,

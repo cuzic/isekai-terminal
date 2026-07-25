@@ -418,6 +418,14 @@ pub(crate) struct TmuxTabEntry {
     /// (`transport::ctl_streamlocal::new_ctl_socket_path`が発行する、
     /// 接続のたびに変わるランダムパス)。まだ確立していなければ`None`。
     pub(crate) ctl_socket_path: Option<String>,
+    /// このタブのプロファイルで`ConnectionProfile.enableTabNotifications`が
+    /// 有効かどうか(既定false)。`install_notify_hooks`(タスク#57)がこれを見て、
+    /// 無効なタブに対してはリモートtmuxサーバーへ一切書き込まない
+    /// (`set-option -g remain-on-exit on`のようなサーバー全体への恒久的な
+    /// 副作用を、通知opt-inしていないユーザーにまで強制しないため)。
+    /// `register`ではなく`set_notify_hooks_enabled`で別途設定する
+    /// (`ctl_socket_path`と同じ「まず登録、後から値を確定」という構成)。
+    pub(crate) notify_hooks_enabled: bool,
 }
 
 /// アプリのタブ/ペインID ⟷ tmuxロケータ ⟷ ctl-socketパスを相互に対応付ける
@@ -451,7 +459,31 @@ impl TmuxLocatorRegistry {
             self.by_locator.remove(&old.locator);
         }
         self.by_locator.insert(locator.clone(), app_pane.clone());
-        self.by_app_pane.insert(app_pane.clone(), TmuxTabEntry { app_pane, locator, ctl_socket_path });
+        self.by_app_pane.insert(
+            app_pane.clone(),
+            TmuxTabEntry { app_pane, locator, ctl_socket_path, notify_hooks_enabled: false },
+        );
+    }
+
+    /// `app_pane`の通知フックopt-in状態を更新する(`ConnectionProfile.enableTabNotifications`
+    /// 由来、`SessionOrchestrator::ensure_tmux_tab_window`参照)。`register`が常に
+    /// `false`で新規作成するため、有効化したい場合は`register`の直後にこれを呼ぶ想定
+    /// (`set_ctl_socket_path`と同じ「まず登録、後から値を確定」という構成)。
+    /// `app_pane`が未登録なら何もせず`false`を返す。
+    pub(crate) fn set_notify_hooks_enabled(&mut self, app_pane: &AppPaneId, enabled: bool) -> bool {
+        match self.by_app_pane.get_mut(app_pane) {
+            Some(entry) => {
+                entry.notify_hooks_enabled = enabled;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `app_pane`について通知フックがopt-inされているかどうか。未登録なら`false`
+    /// (opportunistic機能の既定は常にoffと同じ扱い)。
+    pub(crate) fn notify_hooks_enabled_for(&self, app_pane: &AppPaneId) -> bool {
+        self.by_app_pane.get(app_pane).is_some_and(|e| e.notify_hooks_enabled)
     }
 
     /// `app_pane`に対応するtmuxロケータを引く。
