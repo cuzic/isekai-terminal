@@ -716,6 +716,12 @@ class TerminalTabsViewModel(
                 pane.upstreamFailoverMonitorHandle?.close()
                 pane.upstreamFailoverMonitorHandle = null
                 pane.upstreamFailoverEnabledForCurrentSession = false
+                // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
+                // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
+                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
+                if (pane.paneId == tab.primaryPane.paneId) {
+                    tab.tmuxWindowLabel.value = null
+                }
             }
             prevConnected = connected
         }
@@ -875,16 +881,32 @@ class TerminalTabsViewModel(
      * opportunisticな補助機能: 失敗してもタブ自体は通常のシェルとして使い続けられる
      * ため、ログのみ残して無視する(接続やUIをブロックしない)。プロファイルを
      * 持たない、または未保存(id=0、理論上のみ)のタブでは何もしない。
+     *
+     * `tmux_tab_locators`(Room)は`profile_id`単位でしかタグを永続化できない
+     * (`TmuxTabLocator.kt`のdoc参照、タブ単位の永続識別子が現状無い設計)ため、
+     * 同一プロファイルを複数タブで同時に開くと、後から開いたタブが先のタブと
+     * 同じtmuxウィンドウを`select-window`で奪う・先のタブのタグを上書きする
+     * 事故になり得る。これを避けるため、既に他のタブがこのプロファイルで
+     * tmux連携済み(`tmuxWindowLabel`が非null)なら、このタブはtmux連携自体を
+     * スキップする(通常のシェルタブとして使い続けられる、上のopportunistic方針
+     * と同じ扱い)。
      */
     private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
         val profile = tab.profile ?: return
         if (profile.id == 0L) return
+        if (_tabs.value.any { it.tabId != tab.tabId && it.profile?.id == profile.id && it.tmuxWindowLabel.value != null }) {
+            RemoteLogger.i(
+                "IsekaiTerminalTmux",
+                "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already owns tmux window for profile ${profile.id}",
+            )
+            return
+        }
         viewModelScope.launch(ioDispatcher) {
             try {
                 val profileIdentity = "profile:${profile.id}"
                 val clientId = ClientIdentity.getOrCreate(getApplication())
                 val existingTag = Repositories.tmuxTabLocators.findTagForProfile(profile.id)
-                val info = pane.session.ensureTmuxTabWindow(profileIdentity, clientId, existingTag)
+                val info = pane.session.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, profile.enableTabNotifications)
                 Repositories.tmuxTabLocators.saveTag(profile.id, info.tag)
                 tab.tmuxWindowLabel.value = "tmux:${info.windowIndex}"
                 RemoteLogger.i(

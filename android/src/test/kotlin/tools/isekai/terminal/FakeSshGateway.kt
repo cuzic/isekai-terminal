@@ -161,7 +161,12 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     }
 
     // ── タスク#60: tmux session group ensure/attach + ウィンドウcreate-or-select ──
-    data class EnsureTmuxTabWindowCall(val profileIdentity: String, val clientId: String, val existingTag: String?)
+    data class EnsureTmuxTabWindowCall(
+        val profileIdentity: String,
+        val clientId: String,
+        val existingTag: String?,
+        val enableNotifications: Boolean,
+    )
     val ensureTmuxTabWindowCalls = mutableListOf<EnsureTmuxTabWindowCall>()
     var ensureTmuxTabWindowResult: TmuxTabWindowInfo = TmuxTabWindowInfo(
         tag = "fake-tag",
@@ -172,8 +177,13 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     )
     var ensureTmuxTabWindowThrows: TmuxSessionException? = null
 
-    override suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?): TmuxTabWindowInfo {
-        ensureTmuxTabWindowCalls.add(EnsureTmuxTabWindowCall(profileIdentity, clientId, existingTag))
+    override suspend fun ensureTmuxTabWindow(
+        profileIdentity: String,
+        clientId: String,
+        existingTag: String?,
+        enableNotifications: Boolean,
+    ): TmuxTabWindowInfo {
+        ensureTmuxTabWindowCalls.add(EnsureTmuxTabWindowCall(profileIdentity, clientId, existingTag, enableNotifications))
         ensureTmuxTabWindowThrows?.let { throw it }
         return ensureTmuxTabWindowResult
     }

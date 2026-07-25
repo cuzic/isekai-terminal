@@ -914,34 +914,36 @@ class TerminalTabsViewModelTest {
     }
 
     @Test
-    fun maybeEnsureTmuxTabWindow_twoTabsOnSameProfile_secondTabReceivesFirstTabsFreshlyPersistedTagAsExistingTag() = runBlocking {
+    fun maybeEnsureTmuxTabWindow_twoTabsOnSameProfile_secondTabSkipsEnsureAndKeepsFirstTabsWindow() = runBlocking {
         // タスク#60のRoom永続化キーはタブ単位ではなくプロファイル単位(TmuxTabLocatorの
-        // docコメント参照)。そのため、同一プロファイルの2つ目のタブを開くと、1つ目の
-        // タブがConnected直後に書き戻したタグをそのままexistingTagとして受け取る。
-        // rust-core/src/tmux_session.rs::ensure_tab_window は existing_tag が解決できれば
-        // 同じウィンドウを選択する(is_new_window=false)ため、これは実質的に「2つ目のタブは
-        // 1つ目のタブと同じtmuxウィンドウに丸め込まれ、独立したウィンドウにはならない」
-        // という設計上の既知のギャップを示す(#60スコープ外/未対応、production修正は
-        // このタスクの対象外なのでレポートで指摘するに留める)。
+        // docコメント参照)。以前は同一プロファイルの2つ目のタブが1つ目のタブと同じ
+        // tmuxウィンドウを奪い合っていた(select-window/タグ上書き事故)。これを防ぐため、
+        // 既に他のタブがこのプロファイルでtmux連携済み(tmuxWindowLabelが非null)なら、
+        // 後から開いたタブはensureTmuxTabWindow自体をスキップする
+        // (通常のシェルタブとして使い続けられる、opportunistic方針)。
         val p = savedProfile("web")
-        vm.openTab(p, "pass")
+        val idA = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected("host-a")
         awaitEnsureTmuxTabWindowCalled(orchestrators[0])
-        withTimeout(3000) { while (Repositories.tmuxTabLocators.findTagForProfile(p.id) == null) delay(10) }
+        withTimeout(3000) { while (tab(idA).tmuxWindowLabel.value == null) delay(10) }
         val tagFromTabA = Repositories.tmuxTabLocators.findTagForProfile(p.id)
 
-        vm.openTab(p, "pass")
+        val idB = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[1])
         orchestrators[1].simulateConnected("host-a-2")
-        awaitEnsureTmuxTabWindowCalled(orchestrators[1])
+        withTimeout(3000) { while (!tab(idB).session.state.value.connected) delay(10) }
+        delay(50)
 
-        val callB = orchestrators[1].ensureTmuxTabWindowCalls.single()
+        assertTrue(
+            "second tab on an already-tmux-linked profile must not call ensureTmuxTabWindow at all",
+            orchestrators[1].ensureTmuxTabWindowCalls.isEmpty(),
+        )
+        assertNull("second tab must not show a tmux window label of its own", tab(idB).tmuxWindowLabel.value)
         assertEquals(
-            "second tab on the same profile ends up passing the first tab's own tag back as existingTag " +
-                "(same-profile-two-tabs collision, see TmuxTabLocator.kt doc comment)",
+            "first tab's persisted tag must be left untouched by the second tab",
             tagFromTabA,
-            callB.existingTag,
+            Repositories.tmuxTabLocators.findTagForProfile(p.id),
         )
     }
 

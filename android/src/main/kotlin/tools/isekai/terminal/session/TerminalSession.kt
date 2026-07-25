@@ -441,8 +441,8 @@ class TerminalSession(
      * そのまま委譲する薄いパススルー(`.claude/rules/rust-ssot.md`)。呼び出し元
      * ([TerminalTabsViewModel])はprimary paneについてのみ呼ぶこと(split pane非対応)。
      */
-    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) =
-        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag)
+    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Boolean) =
+        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, enableNotifications)
 
     // ── Network ───────────────────────────────────────────────────────
 
