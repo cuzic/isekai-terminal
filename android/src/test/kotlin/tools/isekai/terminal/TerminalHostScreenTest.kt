@@ -34,6 +34,7 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalThemes
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -62,11 +63,12 @@ class TerminalHostScreenTest {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
-            val fake = FakeOrchestrator()
-            orchestrators.add(fake)
-            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
-        }
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, tools.isekai.terminal.data.ConnectionProfile) -> TerminalSession =
+            { _, _, _ ->
+                val fake = FakeOrchestrator()
+                orchestrators.add(fake)
+                TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+            }
         vm = TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
 
@@ -100,7 +102,7 @@ class TerminalHostScreenTest {
         // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
         // 先にconnectedにしてからタイトル更新を送る。
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("Remote Title").assertExists()
@@ -112,7 +114,7 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("alpha").assertExists()
@@ -198,5 +200,51 @@ class TerminalHostScreenTest {
 
         composeTestRule.waitUntil(3000) { orchestrators.size > 1 && orchestrators[1].connectCalled }
         assertTrue("パスワード入力後はsplit pane側のセッションも接続を試みるべき", orchestrators[1].connectCalled)
+    }
+
+    // ── タスク#60: tmuxウィンドウ紐付けの " · tmux:N" タブラベルサフィックス ──────
+    // maybeEnsureTmuxTabWindow()は未保存(id=0)のプロファイルでは何もしないため、
+    // ここでは他のTerminalHostScreenTestテストが使う未保存profile()ではなく、
+    // Repositories.profiles.save()で実IDを払い出したプロファイルを使う
+    // (TerminalTabsViewModelTestの同種テストと同じ前提)。
+
+    @Test fun tabLabel_appendsTmuxWindowSuffix_onceEnsureTmuxTabWindowResolves() {
+        val profileId = runBlocking { Repositories.profiles.save(profile("alpha")) }
+        val savedProfile = runBlocking { Repositories.profiles.findById(profileId)!! }
+        // password authTypeなのでpasswordを渡さないとresolveAuth()が早期returnしconnect()自体が
+        // 一度も呼ばれない(=connectCalledが永遠にtrueにならない)。TerminalTabsViewModelTestの
+        // tmuxテスト群と同じ理由でここでもpasswordを渡す。
+        vm.openTab(savedProfile, "pass")
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.onNodeWithText("alpha").assertExists()
+
+        composeTestRule.waitUntil(10_000) { orchestrators.isNotEmpty() && orchestrators[0].connectCalled }
+        orchestrators[0].simulateConnected()
+        composeTestRule.waitUntil(10_000) { orchestrators[0].ensureTmuxTabWindowCalls.isNotEmpty() }
+        // ensureTmuxTabWindowCalls記録後、Repositories.tmuxTabLocators.saveTag()(実Room書き込み、
+        // composeTestRuleのidling対象外の実スレッドで完了する)を経てtab.tmuxWindowLabelが
+        // 更新されるまでにもう一段ラグがあるため、ラベル自体のテキストが実際に現れるまで
+        // 明示的にポーリングする(waitForIdle()だけでは足りない)。
+        composeTestRule.waitUntil(10_000) {
+            composeTestRule.onAllNodesWithText("alpha · tmux:0").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // FakeOrchestrator.ensureTmuxTabWindowResultの既定値(windowIndex=0u)通り
+        // " · tmux:0" がプロファイル名に付け足されて表示されるはず。
+        composeTestRule.onNodeWithText("alpha · tmux:0").assertExists()
+        composeTestRule.onNodeWithText("alpha").assertDoesNotExist()
+    }
+
+    @Test fun tabLabel_hasNoTmuxSuffix_whenEnsureTmuxTabWindowNeverResolves() {
+        // 未保存(id=0)プロファイル: maybeEnsureTmuxTabWindowは早期リターンするので
+        // tmuxサフィックスは一切付かない(既存のtabBar_rendersOneLabelPerOpenTab等の
+        // 前提を明示的にテストとして固定する)。
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        orchestrators[0].simulateConnected()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("alpha").assertExists()
+        assertTrue(orchestrators[0].ensureTmuxTabWindowCalls.isEmpty())
     }
 }

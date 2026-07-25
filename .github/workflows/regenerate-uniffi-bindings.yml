@@ -42,15 +42,14 @@ jobs:
           restore-keys: |
             regenerate-uniffi-bindings-${{ runner.os }}-
 
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           set -euo pipefail
-          curl -fL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          mkdir -p "$HOME/zig-toolchain"
-          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
-          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
-          export PATH="$HOME/zig-toolchain:$PATH"
           if ! command -v cargo-zigbuild >/dev/null; then
             cargo install cargo-zigbuild --locked
           fi

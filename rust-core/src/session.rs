@@ -6,14 +6,21 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
-use crate::{CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
+use crate::{
+    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback,
+    RUNTIME,
+};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::TermCell;
 use crate::theme::Theme;
-use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
+use crate::transport::{ExecError, ExecOutput, SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
-const SCROLLBACK_LIMIT: usize = 1000;
+/// ローカルscrollbackの保持上限(行数)。タスク#58のtmux capture-paneベースの
+/// scrollback backfillも、独自の上限を新設せずこの値を再利用する
+/// (`tmux_scrollback::fetch_tmux_scrollback_history`の呼び出し元
+/// `orchestrator.rs::spawn_tmux_scrollback_backfill`参照)。
+pub(crate) const SCROLLBACK_LIMIT: usize = 1000;
 
 /// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
 /// `CSI ?2026h`を送ったまま`CSI ?2026l`を送らずハングした場合、これだけ経過
@@ -173,6 +180,56 @@ pub(crate) fn to_cell_data(c: &TermCell) -> CellData {
         invisible: c.invisible,
         link_id: c.link_id,
     }
+}
+
+/// タスク#58: tmux capture-paneが返したプレーンテキスト1行を、ローカル
+/// scrollbackが持つ`Vec<TermCell>`行表現に変換する。`cols`を超える分は
+/// 切り詰め、`cols`に満たない分は現在のテーマの既定色の空白セルで埋める
+/// (`Terminal::new`の`blank`セルと同じ組み立て方)。
+///
+/// opusレビューM4: 以前は`chars()`の個数(=文字コードポイント数)でしか列を
+/// 消費しておらず、CJK等の全角文字も半角と同じ1セル扱いになっていた
+/// (`is_wide_placeholder`も常にfalse)。日本語IME完全対応を差別化点に掲げる
+/// プロダクトのbackfillとしては桁ズレが致命的なため、`terminal.rs`の
+/// `cell_display_width`/`sanitize_wide_cells`が使うのと同じ`unicode_width`で
+/// 各文字の表示幅(1/2)を見て、全角文字は「本体セル(幅2) + 直後の
+/// `is_wide_placeholder`セル」の対で書き込む。
+fn plain_text_to_scrollback_row(line: &str, cols: usize, theme: Theme) -> Vec<TermCell> {
+    use unicode_width::UnicodeWidthChar;
+
+    let blank_cell = |ch: &str, is_wide_placeholder: bool| TermCell {
+        ch: smol_str::SmolStr::new(ch),
+        fg: theme.default_fg,
+        bg: theme.default_bg,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+        blink: false,
+        invisible: false,
+        is_wide_placeholder,
+        link_id: None,
+    };
+    let mut row = vec![blank_cell(" ", false); cols];
+    let mut col = 0usize;
+    for ch in line.chars() {
+        if col >= cols {
+            break;
+        }
+        let width = ch.width().unwrap_or(1);
+        // 全角文字が最終列1つにしか収まらない場合は`sanitize_wide_cells`同様
+        // 片割れを持てないため書き込まず、そこで打ち切る(残りは既定の空白のまま)。
+        if width == 2 && col + 1 >= cols {
+            break;
+        }
+        row[col] = blank_cell(ch.encode_utf8(&mut [0u8; 4]), false);
+        if width == 2 {
+            row[col + 1] = blank_cell(" ", true);
+        }
+        col += width.max(1);
+    }
+    row
 }
 
 // ── TokioTimerRuntime ────────────────────────────────────
@@ -519,6 +576,70 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::FocusChanged(focused));
     }
 
+    /// タスク#58: フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、
+    /// ライブのPTY出力(`TransportEvent::Stdout`)がまだ1バイトも届いていない
+    /// うちに、tmux自身のscrollback履歴(`tmux_scrollback::fetch_tmux_scrollback_history`
+    /// がcapture-pane経由で取得したプレーンテキスト行)をこのタブのローカル
+    /// scrollbackへバッチ注入する。
+    ///
+    /// `lines`はtmux capture-paneの出力そのまま(古い→新しい、画面に一番近い行が
+    /// 最後)の順序で渡すこと —— `dispatch_result`が`Terminal::take_scrollback`の
+    /// 結果(同じく古い→新しい順)を`push_front`していく既存の規約とまったく同じ
+    /// 順序規約で積む(=`lines`の各行を出現順に`push_front`していく)ため、
+    /// 呼び出し順を変えてはいけない。
+    ///
+    /// この関数は「まだ何も積まれていない空のscrollback」(フル再接続直後、
+    /// まだライブ出力が1バイトも届いていない新規`SessionCore`)への初回バッチ
+    /// 注入だけを想定している。既存のscrollbackが空でない状態で呼ぶと、
+    /// `lines`はどれだけ古い履歴であっても既存の行より*前*(=ライブ画面に
+    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元
+    /// (`orchestrator.rs::spawn_tmux_scrollback_backfill`)は必ず`connect_via`
+    /// 直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。既存状態自体を
+    /// 破棄することはない(クリアはしない)という意味でのみ「加算的」。
+    ///
+    /// ANSI装飾(色・太字等)は再現しない —— tmuxの`capture-pane -e`は行ごとの
+    /// SGRシーケンスを再現できるが、行をまたいだ色の持ち越し状態の復元が
+    /// 煩雑な割に得られる価値が小さいと判断し、`-e`なし(プレーンテキスト)の
+    /// 出力を前提にしている(呼び出し元`orchestrator.rs`のコメント参照)。
+    /// 各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
+    /// 現在のテーマの既定前景/背景で塗る。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        let theme = *self.current_theme.lock();
+        let cols = *self.screen_cols.lock() as usize;
+        let mut sb = self.scrollback.lock();
+        for line in &lines {
+            sb.push_front(plain_text_to_scrollback_row(line, cols, theme));
+        }
+        let overflow = sb.len().saturating_sub(SCROLLBACK_LIMIT);
+        if overflow > 0 {
+            for _ in 0..overflow {
+                sb.pop_back();
+            }
+            debug!("scrollback: backfill dropped {} row(s) past the limit, total={}", overflow, sb.len());
+        }
+        info!("scrollback: backfilled {} row(s) of tmux history", lines.len());
+    }
+
+    /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには触れず、この
+    /// セッションが今使っている同じ(プール済み)SSH接続上で短命なコマンドを
+    /// 実行し、stdoutと終了ステータスを回収する。`connect()`前/`disconnect()`後
+    /// (=`handle_tx`が`None`)は`ExecError::NotConnected`を返す。
+    ///
+    /// UniFFIへは意図的に公開しない(タスク#61のスコープ: 他のRust側機能
+    /// 〈将来のtmux管理コマンド等〉から呼ばれる想定で、Kotlin/Swiftからの
+    /// 直接呼び出しは対象外)。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        let tx = self.handle_tx.lock().clone().ok_or(ExecError::NotConnected)?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(TransportCommand::RunExec { command, reply: reply_tx })
+            .await
+            .map_err(|_| ExecError::NotConnected)?;
+        reply_rx.await.map_err(|_| ExecError::NotConnected)?
+    }
+
     /// OSC 133(タスク#13)「前のプロンプトへジャンプ」。`from_scroll_offset`/
     /// `from_showing_scrollback`はKotlin側の現在の表示位置(既存の検索ジャンプ・
     /// タスク#79と同じ規約)。判断ロジックは`session_event_loop`側
@@ -607,10 +728,16 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
 }
 
 /// `isekai_protocol::NotifyKind`(uniffiに依存しないpure crate側の型)と`crate::NotifyKind`
-/// (UniFFI境界を越える側の型)は同じ3種を表す別々の型なので、`clipboard_mime_kind_*`と
-/// 同じ理由でこの関数が要る(host→deviceの一方向のみなので変換関数も1つでよい)。
+/// (UniFFI境界を越える側の型)は同じ7種(tmux hook由来の4種+AI/汎用の3種、統合の経緯は
+/// `isekai_protocol::ctl::NotifyKind`のdocコメント参照)を表す別々の型なので、
+/// `clipboard_mime_kind_*`と同じ理由でこの関数が要る(host→deviceの一方向のみなので
+/// 変換関数も1つでよい)。
 fn notify_kind_from_protocol(kind: isekai_protocol::NotifyKind) -> NotifyKind {
     match kind {
+        isekai_protocol::NotifyKind::Bell => NotifyKind::Bell,
+        isekai_protocol::NotifyKind::Activity => NotifyKind::Activity,
+        isekai_protocol::NotifyKind::Silence => NotifyKind::Silence,
+        isekai_protocol::NotifyKind::JobDone => NotifyKind::JobDone,
         isekai_protocol::NotifyKind::Waiting => NotifyKind::Waiting,
         isekai_protocol::NotifyKind::Done => NotifyKind::Done,
         isekai_protocol::NotifyKind::Info => NotifyKind::Info,
@@ -691,9 +818,6 @@ fn dispatch_transport_event(
             isekai_protocol::CtlMessage::SetTitle { value } => {
                 EventOutcome::Continue(Some(state.set_title_from_ctl(value)))
             }
-            isekai_protocol::CtlMessage::Notify { kind, title, body } => {
-                EventOutcome::Continue(Some(state.notify_from_ctl(notify_kind_from_protocol(kind), title, body)))
-            }
             isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
                 if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
                     let cb = Arc::clone(callback);
@@ -733,6 +857,31 @@ fn dispatch_transport_event(
             | isekai_protocol::CtlMessage::BuildRequest { .. }
             | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
             | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
+            // `Notify`は2つの独立した系統を1つのワイヤーメッセージ・型として共有する
+            // (統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
+            // 2026-07-25)。kindでどちらの系統かを判別し、それぞれ既存の(互いに
+            // 独立な)配送経路へそのまま振り分ける——両者を無理に1つの配送経路へ
+            // 統合すると、片方がテスト済みの`orchestrator.rs`側dedup/抑制ロジックを
+            // 書き換えるリスクを負うため、ワイヤー形式のみ共有しRust側の内部配送は
+            // 意図的に分離したまま維持する:
+            // - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md`
+            //   §6.1): `title`/`body`を`Terminal`へ反映し`ScreenUpdate`経由でUIへ
+            //   届ける(`bell_generation`と同型の`notify_generation`カウンタ)。
+            // - tmux hook由来の通知(`Bell`/`Activity`/`Silence`/`JobDone`、#57):
+            //   フォアグラウンド+このタブ表示中の抑制判断・`(tmux_tag, seq)`重複排除は
+            //   `orchestrator.rs`の`OrchestratorAdapter::on_notify`が行うため、ここでは
+            //   変換して素通しするだけでよい。
+            isekai_protocol::CtlMessage::Notify { kind, tmux_tag, seq, title, body } => {
+                match notify_kind_from_protocol(kind) {
+                    ai_kind @ (NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info) => {
+                        EventOutcome::Continue(Some(state.notify_from_ctl(ai_kind, title, body)))
+                    }
+                    tmux_kind => {
+                        callback.on_notify(tmux_kind, tmux_tag, seq);
+                        EventOutcome::Continue(None)
+                    }
+                }
+            }
         },
         TransportEvent::ClipboardPullRequestOverCtl(reply) => {
             // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
@@ -1308,6 +1457,44 @@ mod tests {
         );
     }
 
+    // ── タスク#58: plain_text_to_scrollback_rowの全角文字幅(opusレビューM4) ──
+
+    #[test]
+    fn plain_text_to_scrollback_row_ascii_uses_one_cell_per_char() {
+        let row = plain_text_to_scrollback_row("abc", 5, Theme::default());
+        assert_eq!(row.len(), 5);
+        assert_eq!(row[0].ch.as_str(), "a");
+        assert_eq!(row[1].ch.as_str(), "b");
+        assert_eq!(row[2].ch.as_str(), "c");
+        assert_eq!(row[3].ch.as_str(), " ");
+        assert!(row.iter().all(|c| !c.is_wide_placeholder));
+    }
+
+    #[test]
+    fn plain_text_to_scrollback_row_cjk_consumes_two_cells_with_placeholder() {
+        // "あ"(U+3042)は全角(表示幅2)。以前はchars()の個数だけで列を消費しており
+        // 半角と同じ1セル扱いになっていた(is_wide_placeholderも常にfalse)ため、
+        // 続く文字がすべて1列ずれていた。
+        let row = plain_text_to_scrollback_row("あx", 5, Theme::default());
+        assert_eq!(row[0].ch.as_str(), "あ");
+        assert!(!row[0].is_wide_placeholder);
+        assert!(row[1].is_wide_placeholder, "全角本体の直後はplaceholderセルであるべき");
+        assert_eq!(row[1].ch.as_str(), " ");
+        assert_eq!(row[2].ch.as_str(), "x", "全角文字は2列消費するので、次の文字は列2から始まるべき");
+        assert_eq!(row[3].ch.as_str(), " ");
+    }
+
+    #[test]
+    fn plain_text_to_scrollback_row_cjk_at_last_column_is_dropped_not_split() {
+        // 全角文字の片割れ(is_wide_placeholder)を置く列が無い場合、
+        // sanitize_wide_cells(terminal.rs)と同じく孤立した本体セルを残さない
+        // ——書き込まずに空白のままにする。
+        let row = plain_text_to_scrollback_row("xあ", 2, Theme::default());
+        assert_eq!(row[0].ch.as_str(), "x");
+        assert_eq!(row[1].ch.as_str(), " ", "最終列1つにしか収まらない全角文字は書き込まれないはず");
+        assert!(!row[1].is_wide_placeholder);
+    }
+
     #[test]
     fn make_screen_update_link_table_stays_bounded_when_remote_floods_distinct_urls() {
         // タスク#70: `make_screen_update`は`Terminal::link_table()`を`to_vec()`で
@@ -1549,6 +1736,70 @@ mod tests {
         assert_eq!(cells[2].ch, " ");
         assert_eq!(cells[3].ch, " ");
         assert_eq!(cells[4].ch, " ");
+    }
+
+    // ── タスク#58: inject_scrollback_history (tmux scrollback backfill) ──
+
+    #[test]
+    fn inject_scrollback_history_orders_oldest_to_newest_same_as_live_scrolling() {
+        // tmux capture-paneの出力順(古い→新しい、可視画面に一番近い行が最後)で
+        // 渡すと、`scrollback_cells`から見て「新しいほどライブ画面に近い」という
+        // 既存の並び規約(`scrollback_cells_orders_oldest_to_newest_top_to_bottom`
+        // 参照)と矛盾しないことを確認する。
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = 3;
+        core.inject_scrollback_history(vec!["old".to_string(), "mid".to_string(), "new".to_string()]);
+
+        assert_eq!(core.scrollback_len(), 3);
+        let cells = core.scrollback_cells(0, 3);
+        // viewport最下段(ライブ画面に一番近い) = 一番新しい行("new")
+        assert_eq!(cells[2 * 3].ch, "n");
+        // viewport最上段(一番過去) = 一番古い行("old")
+        assert_eq!(cells[0 * 3].ch, "o");
+    }
+
+    #[test]
+    fn inject_scrollback_history_pads_short_lines_with_theme_blank() {
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = 5;
+        core.inject_scrollback_history(vec!["ab".to_string()]);
+        let cells = core.scrollback_cells(0, 1);
+        let theme = Theme::default();
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[0].ch, "a");
+        assert_eq!(cells[1].ch, "b");
+        for c in &cells[2..] {
+            assert_eq!(c.ch, " ");
+            assert_eq!(c.fg, theme.default_fg);
+            assert_eq!(c.bg, theme.default_bg);
+        }
+    }
+
+    #[test]
+    fn inject_scrollback_history_truncates_lines_longer_than_screen_cols() {
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = 3;
+        core.inject_scrollback_history(vec!["abcdef".to_string()]);
+        let cells = core.scrollback_cells(0, 1);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells.iter().map(|c| c.ch.as_str()).collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn inject_scrollback_history_respects_scrollback_limit_by_dropping_the_oldest() {
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = 1;
+        let lines: Vec<String> = (0..SCROLLBACK_LIMIT + 10).map(|i| format!("{}", i % 10)).collect();
+        core.inject_scrollback_history(lines);
+        assert_eq!(core.scrollback_len() as usize, SCROLLBACK_LIMIT, "must be capped, not left over the limit");
+    }
+
+    #[test]
+    fn inject_scrollback_history_of_empty_batch_is_a_noop() {
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = 3;
+        core.inject_scrollback_history(Vec::new());
+        assert_eq!(core.scrollback_len(), 0);
     }
 
     // ── search_scrollback(タスク#37) ────────────────────────

@@ -36,8 +36,10 @@ use isekai_protocol::attach::{
     attach_hello_proof_transcript, encode_attach_activate, encode_attach_hello, AttachActivate, AttachHello,
     AttachProof, AttachResponse, ConnectionGeneration,
 };
-use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
-use crate::{init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::transport::{run_ssh_channel_loop, ExecError, ExecOutput, TransportCommand, TransportEvent};
+use crate::{
+    init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME,
+};
 use crate::session::SessionCore;
 use base64::Engine as _;
 use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
@@ -246,6 +248,11 @@ impl MultipathIsekaiPipeQuicSession {
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
+    /// タスク#58: フル再接続直後のtmux scrollback backfill。
+    /// `SessionCore::inject_scrollback_history`参照。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        self.core.inject_scrollback_history(lines)
+    }
 
     pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
         self.core.search_scrollback(&query, case_sensitive)
@@ -288,6 +295,12 @@ impl MultipathIsekaiPipeQuicSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     /// Phase 12: per-session theme。
@@ -1120,7 +1133,12 @@ async fn run_over_stream(
     };
 
     // MultipathIsekaiPipeQuicConfig は agent forwarding 未対応（IsekaiPipeQuicConfig と同様）。
-    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
+    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない(follow-up、
+    // `transport/ssh_handler.rs`の`run_ssh_channel_loop`引数doc参照)。実質no-op。
+    run_ssh_channel_loop(
+        &pooled, config.cols, config.rows, false, false, cmd_rx, event_tx,
+        crate::tmux_locator::AppPaneId::generate_process_local(),
+    ).await;
 }
 
 #[cfg(test)]

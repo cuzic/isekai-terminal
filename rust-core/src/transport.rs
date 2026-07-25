@@ -12,6 +12,6 @@ mod ssh_handler;
 pub(crate) use ctl_streamlocal::set_ctl_socket_forward_enabled;
 pub(crate) use ssh_handler::{
     authenticate_session, connect_via_jump_or_direct, establish_ssh_handle, establish_ssh_handle_over_stream,
-    run_ssh_channel_loop, zeroize_ssh_auth, PooledSshHandle, RusshEventHandler, SessionCmd, TransportCommand,
-    TransportEvent,
+    run_ssh_channel_loop, zeroize_ssh_auth, ExecError, ExecOutput, PooledSshHandle, RusshEventHandler, SessionCmd,
+    TransportCommand, TransportEvent,
 };

@@ -1,5 +1,9 @@
 package tools.isekai.terminal
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -40,6 +44,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontWeight
@@ -200,6 +205,23 @@ fun ProfileEditScreen(
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
+    // タスク#57: tmux hook(bell/activity/silence/pane-died)通知の既定OFF opt-in。
+    var enableTabNotifications by remember { mutableStateOf(profile?.enableTabNotifications ?: false) }
+    // トグルをONにした際、Android 13+ならその場で`POST_NOTIFICATIONS`実行時権限を要求する
+    // (マニフェストの宣言だけでは足りない)。ユーザーが拒否してもトグル自体はONのままにし
+    // (設定意図は尊重する)、実際の通知表示は権限が無ければ`TabAlertNotifier.hasPermission`が
+    // 黙ってスキップする(既に付与済みなら再要求しても即座に何もしないコールバックが返るだけ)。
+    val notificationContext = LocalContext.current
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) {}
+    fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !TabAlertNotifier.hasPermission(notificationContext)
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
     var allowNonLoopbackForwardBind by remember { mutableStateOf(profile?.allowNonLoopbackForwardBind ?: false) }
     var useJumpHost by remember { mutableStateOf(profile?.usesJumpHost ?: false) }
     var jumpHost by remember { mutableStateOf(profile?.jumpHost ?: "") }
@@ -899,6 +921,33 @@ fun ProfileEditScreen(
             }
         }
 
+        Spacer(Modifier.height(4.dp))
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("tmux通知(bell/activity/silence/コマンド終了)", modifier = Modifier.align(Alignment.CenterVertically))
+                Switch(
+                    checked = enableTabNotifications,
+                    onCheckedChange = { checked ->
+                        enableTabNotifications = checked
+                        if (checked) requestNotificationPermissionIfNeeded()
+                    },
+                    modifier = Modifier.testTag("tabNotificationsSwitch"),
+                )
+            }
+            if (enableTabNotifications) {
+                Text(
+                    "tmuxセッション内でベル・アクティビティ・無音・コマンド終了(pane-died)が発生した際、" +
+                        "アプリがバックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -926,6 +975,7 @@ fun ProfileEditScreen(
                         allowNonLoopbackForwardBind = allowNonLoopbackForwardBind,
                         themeName = themeName,
                         enableAgentForward = enableAgentForward,
+                        enableTabNotifications = enableTabNotifications,
                         jumpHost = if (useJumpHost) jumpHost.trim() else null,
                         jumpPort = jumpPort.toIntOrNull() ?: 22,
                         jumpUsername = if (useJumpHost) jumpUsername.trim() else null,
