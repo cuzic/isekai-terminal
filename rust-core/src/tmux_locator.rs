@@ -202,6 +202,18 @@ pub(crate) trait RemoteTmuxCommandRunner: Send + Sync {
 #[error("{0}")]
 pub(crate) struct TmuxRunError(pub(crate) String);
 
+/// tmux管理コマンド(`RemoteTmuxCommandRunner`の各実装)の`exit_status: Option<u32>`
+/// を成功/失敗どちらとして扱うかを1箇所に集約する。opusレビューM5: 以前は
+/// `ActiveSessionTmuxRunner`/`SshHandleTmuxRunner`が`None`(終了コードを受け取れ
+/// なかった)を成功扱いする一方、`OrchestratorTmuxRunner`は同じ`None`を失敗扱いする
+/// という、3つの実装がばらばらの意味論を持っていた。ここでは`None`(不明)を
+/// 楽観的に成功とはみなさない——`tmux`管理コマンドは常に短命かつexecチャンネルの
+/// 正常終了で終了コードを返すはずで、それが取れない状態は「何かおかしい」に
+/// 倒すのが安全側の判断。
+pub(crate) fn tmux_exit_status_is_success(exit_status: Option<u32>) -> bool {
+    exit_status == Some(0)
+}
+
 /// [`TmuxLocatorResolver::resolve`]/[`TmuxLocatorResolver::assign_tag`]の失敗。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum TmuxLocatorError {
