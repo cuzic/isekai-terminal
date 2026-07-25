@@ -1066,6 +1066,15 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   (`isekai-pipe ctl --help`にも明記)。ディスク永続化すればCLIラッパー側でも
   真にクロスプロセス共有できるが、初期実装ではタスク側の「セッション終了で消える
   プロセスメモリ方式で十分」という判断に従い意図的に未実装。
+- ✅(2026-07-24)`isekai-pipe ctl tab-color <rrggbb>`: `title`と同じfire-and-forget
+  パターンで`CtlMessage::SetTabColor { r, g, b }`を追加し、Windows Terminal限定の
+  OSC 4;264(タブ背景色パレットのプライベート拡張、`microsoft/terminal` PR #13058、
+  元の機能要望は#6574)へマッピングする(`isekai-ssh::ctl_forward::osc_sequence_for`)。
+  Android/iOS本体アプリ側は対応するタブ色UIが無いため無視する(黙って無視、
+  `session.rs`)。設計判断の詳細は下記「tab-colorの設計判断」を参照。
+  **未着手のまま(スコープ外として明示)**: この呼び出し元となるClaude Code
+  hook連携(`Notification`/`Stop`での色変更、タイムアウトでの自動リセット)。
+  段階的実装として、まずこのプリミティブのみ追加した。
 
 **動機**: リモートの対話シェルが出す OSC 0/2(タイトル変更)・OSC 52(クリップボード)は、
 tmux配下だと既定でtmuxに横取りされ、外側のターミナル(Windows Terminalの`ssh`+`isekai-ssh`
@@ -1215,11 +1224,27 @@ tmux.conf設定で直る範囲もあるが、それに頼らずリモートか�
     対象に含める想定(タスク#82、未実装)。
 - **セキュリティ**: ローカル/リモートどちらのsocketもディレクトリ・socket自体を
   ユーザー専用パーミッション(0700/0600)にする。`isekai-pipe ctl`が受け付ける操作は
-  `title`/`clip_push`/`clip_pull`のみに限定した固定ホワイトリストとし、任意コマンド実行の
-  ような汎用RPCにはしない(同一SSH接続内のトラスト境界を前提にしても、対応するsocketに
-  書き込めれば誰でもタイトル/クリップボードを書き換えられる、という副作用は残るため)。
+  `title`/`tab-color`/`clip_push`/`clip_pull`/`setvar`/`getvar`/`build`のみに限定した
+  固定ホワイトリストとし、任意コマンド実行のような汎用RPCにはしない(同一SSH接続内の
+  トラスト境界を前提にしても、対応するsocketに書き込めれば誰でもタイトル/タブ色/
+  クリップボードを書き換えられる、という副作用は残るため。`build`は名前だけを渡す
+  プロファイル参照であり生コマンドを運ばない、この方針は§8 Epic P参照)。
   `clip_push`(クリップボードハイジャックの踏み台になりうる)・`clip_pull`
   (デバイス側の機密情報流出になりうる)は別々の設定でopt-inさせ、両方無効が既定値とする。
+
+- **tab-colorの設計判断**:
+  - tmuxの`allow-passthrough`(DCSラップでの素通し)は既定OFFのopt-in設定に依存する
+    ため採用しない——tmux配下でも確実に届く既存のctlソケット経由に統一する
+    (`SetTitle`/`ClipboardPush`と同じ理由、本節冒頭の「動機」参照)。
+  - 色が実際に反映されたかのクエリ確認(OSC 4;264;? への応答読み取り、
+    `microsoft/terminal` #3718で対応済み)はあえて実装しない: CLIラッパー
+    (`isekai-ssh`)経由の場合、応答は共有ptyの標準入力に多重化されて戻ってくるため、
+    フォアグラウンドで対話的にstdinを読んでいる別プロセス(例: リモートのClaude Code)
+    の入力処理と衝突しうる。clipboard pull(`ClipboardPullResponse`)がOS APIに
+    すり替えることで同種の問題を回避しているのと異なり、タブ色にはWindows Terminal側の
+    代替クエリAPIが無いため、この手が使えない。呼び出し側(将来のClaude Code
+    hook連携)は再送で頑健性を確保する方針にする(hook連携自体のスコープは上記
+    実装状況チェックリストの「未着手」注記を参照)。
 
 **この設計で解決すること**: ControlMasterでの接続共有(CLI)・接続プーリング(Android)の
 どちらとも両立する。識別はisekai-transport/QUICの層ではなく、OpenSSH自身が管理する

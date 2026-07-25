@@ -719,8 +719,13 @@ fn dispatch_transport_event(
             // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
             // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
             //
+            // `SetTabColor`もAndroid/iOS本体アプリでは未サポート
+            // (タブバーはisekai-ssh CLIラッパーのようなWindows Terminal依存の
+            // OSC 4;264ではなく、将来アプリ独自のUIで表現する想定)。
+            //
             // すべて到達したら無視するだけの防御的なアーム。
-            isekai_protocol::CtlMessage::ClipboardPullRequest {}
+            isekai_protocol::CtlMessage::SetTabColor { .. }
+            | isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
             | isekai_protocol::CtlMessage::SetVar { .. }
             | isekai_protocol::CtlMessage::GetVarRequest { .. }

@@ -416,6 +416,10 @@ async fn send_build_finished(
 ///   inventing one" choice as `SetTitle`/OSC 0 and `ClipboardPush`/OSC 52).
 ///   `title`/`body` are joined into OSC 9's single message argument since it
 ///   has no separate title/body fields.
+/// - `SetTabColor` → OSC 4 palette-index 264, Windows Terminal's private
+///   convention for the tab background color (`microsoft/terminal` PR #13058,
+///   which closed the original feature request #6574).
+///   A harmless no-op on terminals that don't recognize that index.
 /// - `ClipboardPush` → OSC 52 clipboard-set. `data_b64` is already the
 ///   base64 encoding OSC 52 itself expects — no re-encoding needed.
 /// - `ClipboardPullRequest` → reading the local system clipboard back
@@ -442,6 +446,7 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
             let message = if body.is_empty() { title.clone() } else { format!("{title}: {body}") };
             Some(format!("\x1b]9;{message}\x07"))
         }
+        CtlMessage::SetTabColor { r, g, b } => Some(format!("\x1b]4;264;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")),
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {}
         | CtlMessage::ClipboardPullResponse { .. }
@@ -531,6 +536,12 @@ mod tests {
     fn osc_sequence_for_set_title_is_osc_0() {
         let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_tab_color_is_osc_4_264() {
+        let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }).unwrap();
+        assert_eq!(seq, "\x1b]4;264;rgb:ff/00/00\x1b\\");
     }
 
     #[test]
