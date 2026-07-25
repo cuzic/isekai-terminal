@@ -51,7 +51,8 @@ fn print_ctl_help() {
     println!("USAGE:");
     println!("    isekai-pipe ctl title <text> [--sock <path>]");
     println!("    isekai-pipe ctl tab-color <rrggbb> [--sock <path>]");
-    println!("        (6 hex digits, optionally prefixed with '#', e.g. ff0000 or #ff0000;");
+    println!("        (6 hex digits, optionally prefixed with '#', e.g. ff0000 or '#ff0000' —");
+    println!("        quote the '#' form, unquoted it starts a shell comment;");
     println!("        Windows Terminal only — see ISEKAI_PIPE_DESIGN.md §8 Epic M)");
     println!("    isekai-pipe ctl clip push --mime <text/plain|text/html|image/png> [--sock <path>]");
     println!("        (reads the payload from stdin)");
@@ -108,7 +109,7 @@ fn parse_hex_color(value: &str) -> Result<(u8, u8, u8), String> {
     let hex = value.strip_prefix('#').unwrap_or(value);
     if hex.len() != 6 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "isekai-pipe ctl tab-color: {value:?} is not a valid color (expected 6 hex digits, e.g. ff0000 or #ff0000)"
+            "isekai-pipe ctl tab-color: {value:?} is not a valid color (expected 6 hex digits, e.g. ff0000 or '#ff0000')"
         ));
     }
     let r = u8::from_str_radix(&hex[0..2], 16).expect("validated hex digits");

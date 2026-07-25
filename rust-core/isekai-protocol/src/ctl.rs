@@ -387,6 +387,16 @@ mod tests {
         );
     }
 
+    fn set_tab_color_json() -> Vec<u8> {
+        br#"{"op":"tab_color","r":255,"g":0,"b":128}"#.to_vec()
+    }
+
+    #[test]
+    fn decodes_set_tab_color() {
+        let msg = decode_ctl_message(&set_tab_color_json()).unwrap();
+        assert_eq!(msg, CtlMessage::SetTabColor { r: 255, g: 0, b: 128 });
+    }
+
     #[test]
     fn rejects_empty_title() {
         let json = br#"{"op":"title","value":""}"#;

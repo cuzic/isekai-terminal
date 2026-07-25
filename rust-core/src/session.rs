@@ -707,8 +707,7 @@ fn dispatch_transport_event(
             //
             // `SetTabColor`もAndroid/iOS本体アプリでは未サポート
             // (タブバーはisekai-ssh CLIラッパーのようなWindows Terminal依存の
-            // OSC 4;264ではなく、AI_INTEGRATION_DESIGN.md §6.1の状態ドット等
-            // 独自のUIで表現する想定)。
+            // OSC 4;264ではなく、将来アプリ独自のUIで表現する想定)。
             //
             // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::SetTabColor { .. }

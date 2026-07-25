@@ -411,7 +411,8 @@ async fn send_build_finished(
 ///
 /// - `SetTitle` → OSC 0 (icon name + window title).
 /// - `SetTabColor` → OSC 4 palette-index 264, Windows Terminal's private
-///   convention for the tab background color (`microsoft/terminal` #6574).
+///   convention for the tab background color (`microsoft/terminal` PR #13058,
+///   which closed the original feature request #6574).
 ///   A harmless no-op on terminals that don't recognize that index.
 /// - `ClipboardPush` → OSC 52 clipboard-set. `data_b64` is already the
 ///   base64 encoding OSC 52 itself expects — no re-encoding needed.
