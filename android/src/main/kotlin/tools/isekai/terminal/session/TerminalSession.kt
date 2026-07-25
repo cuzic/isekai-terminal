@@ -75,6 +75,14 @@ class TerminalSession(
      * 持ち込まない)。既定は no-op。
      */
     private val onBell: () -> Unit = {},
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由でリモートから届いた注目通知
+     * (`CtlMessage::Notify`)を受信した時に呼ばれる。判断ロジック(取りこぼし無く1回だけ
+     * 発火させる`notifyGeneration`の単調増加チェック)はこのクラス内で完結させ、ここでは
+     * タブバッジ更新・システム通知等の副作用注入のみを行う(`onBell`と同じ構成)。
+     * 呼び出し元は[ioScope]のコルーチン上(メインスレッド保証なし)。既定はno-op。
+     */
+    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit = { _, _, _ -> },
 ) : AutoCloseable {
 
     companion object {
@@ -123,6 +131,11 @@ class TerminalSession(
      */
     private val lastFiredBellGeneration = AtomicLong(0)
 
+    /** [lastFiredBellGeneration]と同じ理由・同じ対処(再接続時のリセット・conflated
+     *  チャネルドレイン)が要る、`notifyGeneration`版のdedupe記憶(`AI_INTEGRATION_DESIGN.md`
+     *  §6.1)。 */
+    private val lastFiredNotifyGeneration = AtomicLong(0)
+
     /** [onScreenUpdate]の消費ループから呼ぶ。`bellGeneration`が進んでいれば[onBell]を1回だけ
      *  発火する(同一世代の`ScreenUpdate`がconflatedチャネル経由で再適用されても二重発火
      *  しない)。 */
@@ -131,6 +144,15 @@ class TerminalSession(
         if (update.bellGeneration > prev.toULong()) {
             lastFiredBellGeneration.set(update.bellGeneration.toLong())
             onBell()
+        }
+    }
+
+    /** [maybeFireBell]と同じdedupeパターンの`notifyGeneration`版。 */
+    private fun maybeFireNotify(update: ScreenUpdate) {
+        val prev = lastFiredNotifyGeneration.get()
+        if (update.notifyGeneration > prev.toULong()) {
+            lastFiredNotifyGeneration.set(update.notifyGeneration.toLong())
+            onNotify(update.notifyKind, update.notifyTitle, update.notifyBody)
         }
     }
 
@@ -306,6 +328,7 @@ class TerminalSession(
                 if (_state.value.connected) {
                     _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
                     maybeFireBell(update)
+                    maybeFireNotify(update)
                 }
             }
         }
@@ -329,6 +352,8 @@ class TerminalSession(
         // リセットすることで、この直後の`connect()`が(ハンドシェイクを経て)新しい
         // `Terminal`での最初の`ScreenUpdate`を届け始めるより確実に先行させる。
         lastFiredBellGeneration.set(0)
+        // `AI_INTEGRATION_DESIGN.md` §6.1: notifyGenerationも同じ理由でリセットする。
+        lastFiredNotifyGeneration.set(0)
         // CONFLATEDチャネルに旧セッションの`ScreenUpdate`(高い`bellGeneration`)が
         // まだ未消費のまま残っている稀なケース(旧`onScreenUpdate`が切断直後の一瞬
         // `_state.value.connected`の古い読み取りで滑り込んだ場合)に備え、ここで

@@ -6,7 +6,7 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
-use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
+use crate::{CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::TermCell;
 use crate::theme::Theme;
@@ -606,6 +606,17 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
     }
 }
 
+/// `isekai_protocol::NotifyKind`(uniffiに依存しないpure crate側の型)と`crate::NotifyKind`
+/// (UniFFI境界を越える側の型)は同じ3種を表す別々の型なので、`clipboard_mime_kind_*`と
+/// 同じ理由でこの関数が要る(host→deviceの一方向のみなので変換関数も1つでよい)。
+fn notify_kind_from_protocol(kind: isekai_protocol::NotifyKind) -> NotifyKind {
+    match kind {
+        isekai_protocol::NotifyKind::Waiting => NotifyKind::Waiting,
+        isekai_protocol::NotifyKind::Done => NotifyKind::Done,
+        isekai_protocol::NotifyKind::Info => NotifyKind::Info,
+    }
+}
+
 /// `dispatch_transport_event`の戻り値。`TransportEvent::Disconnected`/
 /// event_rx正常close相当のケースを`break 'outer`できるよう、通常の
 /// `Option<ProcessResult>`とは別に`Break`を持つ。
@@ -679,6 +690,9 @@ fn dispatch_transport_event(
         TransportEvent::CtlMessage(msg) => match msg {
             isekai_protocol::CtlMessage::SetTitle { value } => {
                 EventOutcome::Continue(Some(state.set_title_from_ctl(value)))
+            }
+            isekai_protocol::CtlMessage::Notify { kind, title, body } => {
+                EventOutcome::Continue(Some(state.notify_from_ctl(notify_kind_from_protocol(kind), title, body)))
             }
             isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
                 if let Some(payload) = decode_clipboard_push(mime, &data_b64) {

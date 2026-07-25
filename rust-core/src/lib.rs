@@ -1068,6 +1068,19 @@ pub struct ScreenUpdate {
     /// フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
     /// (`ESC]0;title BEL`)はカウントされない。
     pub bell_generation: u64,
+    /// ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+    /// 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+    /// 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+    /// 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+    /// 通知(タブバッジ・システム通知)を1回発火させること。
+    pub notify_generation: u64,
+    /// 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
+    pub notify_kind: NotifyKind,
+    /// 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+    /// (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
+    pub notify_title: String,
+    /// 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
+    pub notify_body: String,
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     pub cursor_shape: CursorShape,
     /// カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
@@ -1156,6 +1169,16 @@ pub enum TransportPreference {
     /// `isekai_link_relay_transport.rs` 参照。`IsekaiStunP2pQuic` と異なり relay が常時
     /// 経路に残るため NAT の種類に左右されないが、relay サーバー・JWT が必要。
     IsekaiLinkRelayQuic,
+}
+
+/// `isekai_protocol::ctl::NotifyKind`(uniffiに依存しないpure crate側の型)をUniFFI
+/// 境界越しに公開するための同型(`AI_INTEGRATION_DESIGN.md` §6.1、`ClipboardMimeKind`と
+/// 同じ理由でミラーが必要)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotifyKind {
+    Waiting,
+    Done,
+    Info,
 }
 
 /// OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル

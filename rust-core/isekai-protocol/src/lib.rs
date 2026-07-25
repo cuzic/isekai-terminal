@@ -27,10 +27,10 @@ pub use attach::{
     CancelAttach, ConnectionGeneration,
 };
 pub use ctl::{
-    decode_ctl_message, validate_ctl_message, BuildOutputStream, ClipboardMime, CtlMessage, VarScope,
+    decode_ctl_message, validate_ctl_message, BuildOutputStream, ClipboardMime, CtlMessage, NotifyKind, VarScope,
     MAX_BUILD_CHUNK_DECODED_LEN, MAX_BUILD_PROFILE_NAME_LEN, MAX_BUILD_RESULT_PATHS, MAX_BUILD_RESULT_PATH_LEN,
-    MAX_CLIPBOARD_IMAGE_DECODED_LEN, MAX_CLIPBOARD_TEXT_DECODED_LEN, MAX_CTL_MESSAGE_LINE_LEN, MAX_VAR_KEY_LEN,
-    MAX_VAR_VALUE_LEN,
+    MAX_CLIPBOARD_IMAGE_DECODED_LEN, MAX_CLIPBOARD_TEXT_DECODED_LEN, MAX_CTL_MESSAGE_LINE_LEN, MAX_NOTIFY_BODY_LEN,
+    MAX_NOTIFY_TITLE_LEN, MAX_VAR_KEY_LEN, MAX_VAR_VALUE_LEN,
 };
 pub use ctl_vars::CtlVarStore;
 pub use bootstrap_request::{

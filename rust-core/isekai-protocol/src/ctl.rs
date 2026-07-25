@@ -77,6 +77,16 @@ pub const MAX_BUILD_RESULT_PATHS: usize = 64;
 /// Cap on a single `result_paths` entry's byte length.
 pub const MAX_BUILD_RESULT_PATH_LEN: usize = 4 * 1024;
 
+/// Cap on a `notify`'s `title` byte length (`AI_INTEGRATION_DESIGN.md` §6.1).
+/// Shares `MAX_VAR_KEY_LEN`'s order of magnitude: this is a short
+/// notification-bar-style label, not body text.
+pub const MAX_NOTIFY_TITLE_LEN: usize = 256;
+
+/// Cap on a `notify`'s `body` byte length. Shares `MAX_CLIPBOARD_TEXT_DECODED_LEN`'s
+/// order of magnitude — enough for a few lines of hook output, not a full
+/// screen dump (which would defeat the point of a short attention ping).
+pub const MAX_NOTIFY_BODY_LEN: usize = 64 * 1024;
+
 /// Scope a `setvar`/`getvar` key is stored/looked up under. Resolved by
 /// whichever process hosts the receiving end of the ctl-socket-forward
 /// channel (the `isekai-ssh` CLI wrapper, or the isekai-terminal Android app's
@@ -109,6 +119,25 @@ pub enum BuildOutputStream {
     Stderr,
 }
 
+/// The kind of attention a `notify` message is asking for
+/// (`AI_INTEGRATION_DESIGN.md` §6.1). Distinct from an arbitrary free-text
+/// field so the receiving device can pick a consistent icon/color per kind
+/// without parsing `title`/`body`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotifyKind {
+    /// The remote side is blocked on user input (e.g. a Claude Code
+    /// `Notification` hook firing for a permission prompt).
+    #[serde(rename = "waiting")]
+    Waiting,
+    /// The remote side finished what it was doing (e.g. a Claude Code `Stop`
+    /// hook).
+    #[serde(rename = "done")]
+    Done,
+    /// Anything that doesn't fit `Waiting`/`Done`.
+    #[serde(rename = "info")]
+    Info,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardMime {
     #[serde(rename = "text/plain")]
@@ -138,6 +167,19 @@ impl ClipboardMime {
 pub enum CtlMessage {
     #[serde(rename = "title")]
     SetTitle { value: String },
+    /// host → device: ask the device to surface an attention notification
+    /// (`AI_INTEGRATION_DESIGN.md` §6.1, `isekai-pipe ctl notify`). Intended
+    /// for hooks (e.g. Claude Code's `UserPromptSubmit`/`Stop`/`Notification`)
+    /// running in a tab the user isn't currently looking at. Fire-and-forget,
+    /// same as `SetTitle` — no response is expected or sent. Deliberately
+    /// carries no execution privilege: the device only ever renders `title`/
+    /// `body` as text, never evaluates them.
+    #[serde(rename = "notify")]
+    Notify {
+        kind: NotifyKind,
+        title: String,
+        body: String,
+    },
     /// host → device: write to the device's clipboard.
     #[serde(rename = "clip_push")]
     ClipboardPush {
@@ -227,6 +269,33 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
                 return Err(ProtocolError::CtlMessageField {
                     field: "value",
                     reason: "must be non-empty".to_string(),
+                });
+            }
+            Ok(())
+        }
+        CtlMessage::Notify { title, body, .. } => {
+            if title.is_empty() {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "title",
+                    reason: "must be non-empty".to_string(),
+                });
+            }
+            if title.len() > MAX_NOTIFY_TITLE_LEN {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "title",
+                    reason: format!(
+                        "is {} bytes, exceeding the {MAX_NOTIFY_TITLE_LEN} byte limit",
+                        title.len()
+                    ),
+                });
+            }
+            if body.len() > MAX_NOTIFY_BODY_LEN {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "body",
+                    reason: format!(
+                        "is {} bytes, exceeding the {MAX_NOTIFY_BODY_LEN} byte limit",
+                        body.len()
+                    ),
                 });
             }
             Ok(())
@@ -386,6 +455,83 @@ mod tests {
         assert!(matches!(
             err,
             ProtocolError::CtlMessageField { field: "value", .. }
+        ));
+    }
+
+    #[test]
+    fn decodes_notify() {
+        let json = br#"{"op":"notify","kind":"waiting","title":"needs input","body":"sudo password?"}"#;
+        let msg = decode_ctl_message(json).unwrap();
+        assert_eq!(
+            msg,
+            CtlMessage::Notify {
+                kind: NotifyKind::Waiting,
+                title: "needs input".to_string(),
+                body: "sudo password?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_notify_done_and_info_kinds() {
+        let done = br#"{"op":"notify","kind":"done","title":"finished","body":""}"#;
+        assert_eq!(
+            decode_ctl_message(done).unwrap(),
+            CtlMessage::Notify {
+                kind: NotifyKind::Done,
+                title: "finished".to_string(),
+                body: String::new(),
+            }
+        );
+
+        let info = br#"{"op":"notify","kind":"info","title":"fyi","body":"just an fyi"}"#;
+        assert_eq!(
+            decode_ctl_message(info).unwrap(),
+            CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                title: "fyi".to_string(),
+                body: "just an fyi".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_notify_with_empty_title() {
+        let json = br#"{"op":"notify","kind":"info","title":"","body":"x"}"#;
+        let err = decode_ctl_message(json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_notify_with_oversized_title() {
+        let json = serde_json::to_vec(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            title: "x".repeat(MAX_NOTIFY_TITLE_LEN + 1),
+            body: String::new(),
+        })
+        .unwrap();
+        let err = decode_ctl_message(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_notify_with_oversized_body() {
+        let json = serde_json::to_vec(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            title: "t".to_string(),
+            body: "x".repeat(MAX_NOTIFY_BODY_LEN + 1),
+        })
+        .unwrap();
+        let err = decode_ctl_message(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "body", .. }
         ));
     }
 
