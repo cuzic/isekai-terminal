@@ -253,16 +253,14 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
             parse_bind_port_range(one_arg(&directive)?)?,
             "local-bind-port-range",
         ),
-        "tab-idle-color" => set_once(
-            &mut builder.tab_idle_color,
-            parse_tab_color(one_arg(&directive)?, "tab-idle-color")?,
-            "tab-idle-color",
-        ),
-        "tab-attention-color" => set_once(
-            &mut builder.tab_attention_color,
-            parse_tab_color(one_arg(&directive)?, "tab-attention-color")?,
-            "tab-attention-color",
-        ),
+        "tab-idle-color" => {
+            apply_optional_tab_color(&mut builder.tab_idle_color, "tab-idle-color", &directive);
+            Ok(())
+        }
+        "tab-attention-color" => {
+            apply_optional_tab_color(&mut builder.tab_attention_color, "tab-attention-color", &directive);
+            Ok(())
+        }
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -347,14 +345,51 @@ fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
 /// Parses `#@isekai tab-idle-color`/`tab-attention-color <rrggbb>` using the
 /// same validator `isekai-pipe ctl tab-color` and `claude-hookd` use
 /// (`isekai_pipe_core::parse_hex_color`, `ISEKAI_PIPE_DESIGN.md` §8 Epic Q).
-/// Failing closed here — at config-resolution time — matters more than for
-/// most directives: an unvalidated value would otherwise reach
+/// A caller in this file must **not** propagate this `Err` out of
+/// `apply_isekai_directive` via `?` (see [`apply_optional_tab_color`],
+/// the only caller) — that would abort config resolution, and therefore the
+/// whole `isekai-ssh <host>` connection attempt, over a typo in a purely
+/// cosmetic feature. Validating the *syntax* here still matters even though
+/// a failure is non-fatal: an unvalidated value would otherwise reach
 /// `ctl_forward.rs::remote_command_arg`, which embeds it directly into the
 /// shell command line `isekai-ssh` execs on the remote to establish the
 /// session (see that function's doc comment on why bare validated hex,
-/// never arbitrary text, is required there).
+/// never arbitrary text, is required there) — this function is what
+/// guarantees only a validated `(u8, u8, u8)` or nothing ever reaches that
+/// point, regardless of how the caller handles the error.
 fn parse_tab_color(value: &str, field: &str) -> Result<(u8, u8, u8)> {
     isekai_pipe_core::parse_hex_color(value).map_err(|e| anyhow!("isekai-ssh: invalid #@isekai {field}: {e}"))
+}
+
+fn parse_tab_color_directive(directive: &IsekaiDirective, field: &str) -> Result<(u8, u8, u8)> {
+    parse_tab_color(one_arg(directive)?, field)
+}
+
+/// Applies a `tab-idle-color`/`tab-attention-color` directive leniently:
+/// unlike every other directive in this file (which fail closed via `?`,
+/// aborting config resolution on a syntax error), a malformed value here
+/// logs a warning to stderr and leaves `slot` unset — `claude-hookd` then
+/// falls back to its own built-in default color, and the connection
+/// proceeds normally. This is deliberately inconsistent with the rest of
+/// this file: those directives change *how* or *whether* the connection is
+/// established, so failing fast on a typo protects the user from a silently
+/// wrong connection; this one only changes a decorative tab color, and
+/// `.claude/rules/always-connects.md` — this feature's own design doc cites
+/// the same principle `apply_ctl_socket_forward` already applies to a
+/// failed ctl-socket forward — is unambiguous that a cosmetic feature must
+/// never be the reason `isekai-ssh <host>` refuses to connect at all.
+/// (Found by Codex code review, 2026-07-25: the original `?`-propagating
+/// version did exactly that.)
+fn apply_optional_tab_color(slot: &mut Option<(u8, u8, u8)>, field: &str, directive: &IsekaiDirective) {
+    if slot.is_some() {
+        // `set_once` semantics: first match wins, matching every other
+        // directive in this file.
+        return;
+    }
+    match parse_tab_color_directive(directive, field) {
+        Ok(color) => *slot = Some(color),
+        Err(e) => eprintln!("isekai-ssh: ignoring #@isekai {field}: {e} — claude-hookd will use its built-in default color instead"),
+    }
 }
 
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
@@ -525,6 +560,29 @@ mod tests {
         // first, matching `ssh(1)`'s own "first match wins" semantics.
         apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-idle-color".to_string(), args: s(&["ffffff"]) }).unwrap();
         assert_eq!(builder.tab_idle_color, Some((0x20, 0x20, 0x20)));
+    }
+
+    /// Pins the fix for the bug Codex code review found (2026-07-25): a
+    /// malformed `tab-idle-color`/`tab-attention-color` value used to
+    /// propagate its parse error out of `apply_isekai_directive` via `?`,
+    /// which `resolve_isekai_config` would in turn propagate out as a
+    /// connection-resolution failure — a typo in this purely cosmetic
+    /// directive used to abort the entire `isekai-ssh <host>` connection
+    /// attempt, violating `.claude/rules/always-connects.md`. It must
+    /// instead be a no-op (`Ok(())`, `slot` stays `None`) so the connection
+    /// proceeds and `claude-hookd` just falls back to its default color.
+    #[test]
+    fn invalid_tab_color_directive_does_not_abort_config_resolution() {
+        let mut builder = empty_builder();
+        let result = apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-idle-color".to_string(), args: s(&["not-a-color"]) });
+        assert!(result.is_ok(), "a cosmetic directive's typo must never fail config resolution");
+        assert_eq!(builder.tab_idle_color, None);
+
+        // Same for the wrong-argument-count case (`one_arg`'s own failure
+        // mode), not just `parse_hex_color`'s.
+        let result = apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-attention-color".to_string(), args: s(&[]) });
+        assert!(result.is_ok());
+        assert_eq!(builder.tab_attention_color, None);
     }
 
     fn empty_builder() -> IsekaiConfigBuilder {

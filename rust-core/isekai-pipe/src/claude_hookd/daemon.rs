@@ -127,20 +127,46 @@ async fn run(config: DaemonConfig) {
     // attention color with nothing left to revert it.
     send_tab_color(&config.ctl_sock_path, config.idle_color).await;
 
+    // Accepting and reading each connection happens on its own spawned task,
+    // separate from the main loop below (found by Codex code review,
+    // 2026-07-25): the original version called `read_one_event(stream).await`
+    // directly inside the `listener.accept()` branch of the `tokio::select!`
+    // below, so a connection that opens and then never sends a complete line
+    // — a broken client, or even just `nc -U <sock>` left open by a human
+    // poking at the socket — blocked that whole `select!` (and therefore the
+    // attention timeout, idle-exit, and every other pending connection) for
+    // as long as it stayed open. Each spawned task only does I/O and forwards
+    // the parsed `(session_id, event)` to `event_rx`; all state mutation and
+    // `ctl` sends stay serialized on the single task below, so events are
+    // still applied one at a time in arrival order.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _addr)) = listener.accept().await else { continue };
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                if let Some(event) = read_one_event(stream).await {
+                    let _ = event_tx.send(event);
+                }
+            });
+        }
+    });
+
     let mut state = TabState::new();
     let mut idle_exit_deadline = Instant::now() + config.idle_exit;
     loop {
         let idle_exit_sleep = tokio::time::sleep(idle_exit_deadline.saturating_duration_since(Instant::now()));
         tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((stream, _addr)) = accepted else { continue };
+            received = event_rx.recv() => {
+                // `None` only if `accept_task` itself died (e.g. panicked) —
+                // nothing further can ever arrive, so stop like `idle_exit`
+                // would rather than spin on a closed channel.
+                let Some((session_id, event)) = received else { break };
                 idle_exit_deadline = Instant::now() + config.idle_exit;
-                if let Some((session_id, event)) = read_one_event(stream).await {
-                    let now = Instant::now();
-                    let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout);
-                    state = next_state;
-                    execute_actions(&config, &actions).await;
-                }
+                let now = Instant::now();
+                let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout);
+                state = next_state;
+                execute_actions(&config, &actions).await;
             }
             () = attention_sleep(&state) => {
                 let (next_state, actions) = apply_timeout(&state, Instant::now());
@@ -152,6 +178,7 @@ async fn run(config: DaemonConfig) {
             }
         }
     }
+    accept_task.abort();
     // Graceful-exit cleanup. Not load-bearing for correctness (the sweep in
     // the next `claude-hookd event`/`__serve` invocation would reclaim this
     // file regardless, via the same `is_abandoned` check that protects
@@ -351,5 +378,52 @@ mod tests {
         .await;
         assert!(result.is_ok(), "the losing daemon must return promptly, not hang");
         assert!(hookd_sock_path.exists(), "the losing daemon must not remove the winner's live socket");
+    }
+
+    /// Pins the fix for the bug Codex code review found (2026-07-25): a
+    /// connection that opens and never sends a complete line used to block
+    /// the whole `select!` loop (attention timeout, idle-exit, and every
+    /// *other* connection) for as long as it stayed open, because
+    /// `read_one_event(stream).await` used to run directly inside the
+    /// `listener.accept()` branch's body instead of a separately spawned
+    /// task. A well-behaved second client's event must still get through —
+    /// and get through quickly — while the first, silent connection is still
+    /// open.
+    #[tokio::test]
+    async fn a_hung_connection_does_not_block_other_connections_or_timers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl_sock_path = dir.path().join("ctl.sock");
+        let hookd_sock_path = dir.path().join("hookd.sock");
+        let mut ctl_messages = spawn_fake_ctl_socket(ctl_sock_path.clone()).await;
+
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            ctl_sock_path,
+            idle_color: (0x20, 0x20, 0x20),
+            attention_color: (0xff, 0x88, 0x00),
+            attention_timeout: Duration::from_millis(100),
+            idle_exit: Duration::from_secs(30),
+        }));
+        assert_eq!(next_message(&mut ctl_messages).await, isekai_protocol::CtlMessage::SetTabColor { r: 0x20, g: 0x20, b: 0x20 });
+
+        // Opens a connection and deliberately never writes anything, never
+        // closes it — kept alive for the rest of the test by holding `_hung`.
+        let _hung = UnixStream::connect(&hookd_sock_path).await.unwrap();
+
+        // A second, well-behaved client must still be served promptly.
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify\"}\n").await.unwrap();
+        drop(client);
+        assert_eq!(
+            next_message(&mut ctl_messages).await,
+            isekai_protocol::CtlMessage::SetTabColor { r: 0xff, g: 0x88, b: 0x00 }
+        );
+        assert!(matches!(next_message(&mut ctl_messages).await, isekai_protocol::CtlMessage::Notify { .. }));
+
+        // The attention timeout must still fire on schedule too, not just
+        // new connections.
+        assert_eq!(next_message(&mut ctl_messages).await, isekai_protocol::CtlMessage::SetTabColor { r: 0x20, g: 0x20, b: 0x20 });
+
+        drop(daemon); // stop the still-running daemon task; nothing left to assert.
     }
 }
