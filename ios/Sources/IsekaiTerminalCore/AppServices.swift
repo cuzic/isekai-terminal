@@ -11,6 +11,9 @@ public final class AppServices {
     public let vault: CredentialVault
     public let trustStore: SshHostTrustStore
     public let relayVault = RelayCredentialVault()
+    /// タスク#3: Android版`ClientIdentity.getOrCreate(context)`が読む
+    /// `SharedPreferences("isekai_terminal_ui")`と対称の永続ストア。
+    public let clientIdentityStore: ClientIdentityStore = UserDefaultsClientIdentityStore()
 
     private init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

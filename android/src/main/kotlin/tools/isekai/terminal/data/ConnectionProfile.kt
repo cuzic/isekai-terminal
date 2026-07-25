@@ -145,6 +145,14 @@ data class ConnectionProfile(
     // しておけば運用側はそのポートだけ開ければよくなる。Rust側(IsekaiPipeQuicConfig)への
     // 配線は別途対応(現時点ではプロファイルへの保存のみ)。
     @ColumnInfo(name = "helper_bind_port") val helperBindPort: Int? = null,
+    // タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火を
+    // Android通知として見せるかのプロファイル単位opt-in設定。既定OFF(通知の急な追加は
+    // ユーザーを驚かせ得るため、他の実験的機能と同じ既定OFFのopt-in方針、CLAUDE.md参照)。
+    // 「今この瞬間ユーザーが見ているか」の抑制判断はRust側(`orchestrator.rs`の
+    // `OrchestratorAdapter::on_notify`)が行うが、この設定自体は純粋なUI opt-inであり
+    // セッション/プロトコル状態ではないため`rust-ssot.md`の対象外(Kotlin側に置いてよい)。
+    @ColumnInfo(name = "enable_tab_notifications", defaultValue = "0")
+    val enableTabNotifications: Boolean = false,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {

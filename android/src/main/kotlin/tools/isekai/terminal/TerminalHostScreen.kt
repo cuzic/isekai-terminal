@@ -162,6 +162,7 @@ private fun TabLabel(
     val uiState by tab.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
     val currentTheme by tab.currentTheme.collectAsStateWithLifecycle()
     val splitPane by tab.splitPane.collectAsStateWithLifecycle()
+    val tmuxWindowLabel by tab.tmuxWindowLabel.collectAsStateWithLifecycle()
     var showThemeDialog by remember { mutableStateOf(false) }
     var showSplitDialog by remember { mutableStateOf(false) }
     // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
@@ -188,7 +189,11 @@ private fun TabLabel(
             // タイトルを送っていない接続直後は tab.label (プロファイル名) にフォールバックする
             // (ISEKAI_PIPE_DESIGN.md Epic M: 「tmuxに握りつぶされたときのフォールバック」の逆で、
             // ここは「OSCが届く環境ではそれを使う」通常経路)。
-            text = uiState.screenUpdate?.title?.takeIf { it.isNotBlank() } ?: tab.label,
+            // タスク#60: tmux session groupのウィンドウ紐付けが解決していれば
+            // (`tmuxWindowLabel`、primary paneのみ)、末尾に最小限のサフィックスとして
+            // 付け足す(独立した判断ロジックはRust側、ここは値の素通し表示のみ)。
+            text = (uiState.screenUpdate?.title?.takeIf { it.isNotBlank() } ?: tab.label) +
+                (tmuxWindowLabel?.let { " · $it" } ?: ""),
             modifier = Modifier.padding(start = 6.dp, end = 4.dp),
             maxLines = 1,
         )

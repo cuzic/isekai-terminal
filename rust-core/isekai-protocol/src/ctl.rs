@@ -49,6 +49,13 @@ pub const MAX_CLIPBOARD_TEXT_DECODED_LEN: usize = 64 * 1024;
 /// Cap on the *decoded* byte length of an `image/png` clipboard payload.
 pub const MAX_CLIPBOARD_IMAGE_DECODED_LEN: usize = 4 * 1024 * 1024;
 
+/// Cap on the byte length of `Notify`'s `tmux_tag` field. Real tags
+/// (`tmux_locator::TmuxTag::new_random`, in the top-level `rust-core`
+/// crate) are 32-char lowercase-hex strings; this cap is generous headroom
+/// against a hostile/broken peer rather than a tight fit to that format,
+/// matching the style of the clipboard payload caps above.
+pub const MAX_NOTIFY_TAG_LEN: usize = 256;
+
 /// Cap on a `setvar`/`getvar` key's byte length.
 pub const MAX_VAR_KEY_LEN: usize = 256;
 
@@ -119,25 +126,6 @@ pub enum BuildOutputStream {
     Stderr,
 }
 
-/// The kind of attention a `notify` message is asking for
-/// (`AI_INTEGRATION_DESIGN.md` §6.1). Distinct from an arbitrary free-text
-/// field so the receiving device can pick a consistent icon/color per kind
-/// without parsing `title`/`body`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NotifyKind {
-    /// The remote side is blocked on user input (e.g. a Claude Code
-    /// `Notification` hook firing for a permission prompt).
-    #[serde(rename = "waiting")]
-    Waiting,
-    /// The remote side finished what it was doing (e.g. a Claude Code `Stop`
-    /// hook).
-    #[serde(rename = "done")]
-    Done,
-    /// Anything that doesn't fit `Waiting`/`Done`.
-    #[serde(rename = "info")]
-    Info,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardMime {
     #[serde(rename = "text/plain")]
@@ -157,6 +145,66 @@ impl ClipboardMime {
     }
 }
 
+/// Reason a `Notify` fired. Modeled as a typed enum rather than a bare
+/// string (this crate's existing convention — see `ClipboardMime`): #57's
+/// Android-side consumer maps each kind to a distinct notification
+/// channel/icon, and a free-form string would make new spellings silently
+/// fall through to "unrecognized" instead of failing to compile.
+///
+/// Two independent families share this one enum/wire message
+/// (`AI_INTEGRATION_DESIGN.md` §6.1で当初別々に設計されていたが、#57のtmux hook通知
+/// と`op":"notify"`ワイヤータグ・型名が衝突したため統合した、2026-07-25):
+/// `Bell`/`Activity`/`Silence`/`JobDone`(tmux hook由来、`CtlMessage::Notify`の
+/// `tmux_tag`/`seq`と対で意味を持つ)と`Waiting`/`Done`/`Info`(AI/汎用の注目通知、
+/// `title`/`body`と対で意味を持つ)。`validate_ctl_message`のこの enum に対する
+/// 分岐がどちらの組かで検証対象フィールドを切り替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotifyKind {
+    /// tmux `alert-bell` hook (BEL / visual bell in a pane; NOT a hook named
+    /// `bell` — that name does not exist in tmux, confirmed against real
+    /// tmux 3.3a's `man tmux(1)` HOOKS section during #57's implementation).
+    /// Session-scoped only (`rust-core/src/tmux_notify.rs`'s module doc
+    /// documents why — this and the two hooks below can only be installed
+    /// with session scope, verified empirically, not per-window/pane).
+    #[serde(rename = "bell")]
+    Bell,
+    /// tmux `alert-activity` hook (output in a `monitor-activity` window).
+    /// Session-scoped only, same as `Bell`.
+    #[serde(rename = "activity")]
+    Activity,
+    /// tmux `alert-silence` hook (a `monitor-silence` timeout elapsed with
+    /// no output). Session-scoped only, same as `Bell`.
+    #[serde(rename = "silence")]
+    Silence,
+    /// tmux `pane-died` hook (the pane's program exited, but `remain-on-exit`
+    /// kept the pane itself from closing so the hook could still fire —
+    /// `rust-core/src/tmux_notify.rs` sets `remain-on-exit` globally before
+    /// installing this, since setting it per-window after creation loses a
+    /// race against fast-exiting commands, confirmed against real tmux
+    /// 3.3a). Unlike `Bell`/`Activity`/`Silence` above, `pane-died` can only
+    /// be installed with *window* scope (also confirmed empirically) —
+    /// which conveniently means it does *not* multiply when several tmux
+    /// session-group members (multiple devices attached to the same host
+    /// profile, #60) each install it, since window-scoped state belongs to
+    /// the shared window object itself rather than to whichever session
+    /// name addressed it.
+    #[serde(rename = "job_done")]
+    JobDone,
+    /// The remote side is blocked on user input (e.g. a Claude Code
+    /// `Notification` hook firing for a permission prompt). AI/汎用の注目通知
+    /// (`AI_INTEGRATION_DESIGN.md` §6.1)——`tmux_tag`/`seq`でなく`title`/`body`と
+    /// 対で意味を持つ。
+    #[serde(rename = "waiting")]
+    Waiting,
+    /// The remote side finished what it was doing (e.g. a Claude Code `Stop`
+    /// hook).
+    #[serde(rename = "done")]
+    Done,
+    /// Anything that doesn't fit `Waiting`/`Done`.
+    #[serde(rename = "info")]
+    Info,
+}
+
 /// One message exchanged over a tab's control-plane UNIX domain socket.
 /// `ClipboardPush`/`ClipboardPullRequest`/`ClipboardPullResponse` are each
 /// independently opt-in on the receiving side (`ISEKAI_PIPE_DESIGN.md`
@@ -167,19 +215,68 @@ impl ClipboardMime {
 pub enum CtlMessage {
     #[serde(rename = "title")]
     SetTitle { value: String },
-    /// host → device: ask the device to surface an attention notification
-    /// (`AI_INTEGRATION_DESIGN.md` §6.1, `isekai-pipe ctl notify`). Intended
-    /// for hooks (e.g. Claude Code's `UserPromptSubmit`/`Stop`/`Notification`)
-    /// running in a tab the user isn't currently looking at. Fire-and-forget,
-    /// same as `SetTitle` — no response is expected or sent. Deliberately
-    /// carries no execution privilege: the device only ever renders `title`/
-    /// `body` as text, never evaluates them.
+    /// host → device: ask the device to surface an attention notification.
+    /// Two independent families share this one variant (統合の経緯は`NotifyKind`
+    /// のdocコメント参照、2026-07-25):
+    /// - tmux hook由来(`Bell`/`Activity`/`Silence`/`JobDone`、#57): something
+    ///   happened in a tmux pane/window the device isn't currently viewing.
+    ///   `tmux_tag`/`seq`が意味を持ち、`title`/`body`は空。
+    /// - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md`
+    ///   §6.1): Intended for hooks (e.g. Claude Code's
+    ///   `UserPromptSubmit`/`Stop`/`Notification`) running in a tab the user
+    ///   isn't currently looking at. `title`/`body`が意味を持ち、`tmux_tag`/`seq`
+    ///   は空/0。Deliberately carries no execution privilege: the device only
+    ///   ever renders `title`/`body` as text, never evaluates them.
+    ///
+    /// Fire-and-forget, same as `SetTitle` — no response is expected or sent.
+    /// Never sent device → host — there's no response variant.
     #[serde(rename = "notify")]
     Notify {
         kind: NotifyKind,
+        /// The stable tag identifying which pane/window this fired in
+        /// (tmux kinds only, see `NotifyKind`). This is the *same* tag string
+        /// `tmux_locator::TmuxTag` already mints and stores as a tmux
+        /// user-option — deliberately not a new identifier scheme. Carried as
+        /// a plain `String` rather than the `TmuxTag` newtype itself:
+        /// `TmuxTag` lives in the top-level `rust-core` crate, which depends
+        /// on `isekai-protocol` (not the reverse), so reusing it here would
+        /// be a cyclic dependency. Callers convert at the boundary, the same
+        /// way `session.rs` already converts between
+        /// `isekai_protocol::ClipboardMime` and `crate::ClipboardMimeKind`.
+        /// Empty for AI kinds — `#[serde(default)]` so an AI-only sender
+        /// (`isekai-pipe ctl notify --kind waiting <title> <body>`, no
+        /// `--tag`) can omit it entirely.
+        #[serde(default)]
+        tmux_tag: String,
+        /// Sender-maintained counter, monotonically increasing per
+        /// `tmux_tag` (tmux kinds only, see `NotifyKind`; not global, and
+        /// deliberately not wall-clock-based: host and device don't share a
+        /// clock, and re-running a test twice should produce identical
+        /// bytes). Lets a receiver that already saw the same
+        /// `(tmux_tag, seq)` pair drop a duplicate delivery — tmux can
+        /// re-fire a hook (e.g. re-attaching a session re-runs
+        /// `set-hook`-installed triggers) and #57's transport may itself
+        /// retry — without needing any per-connection state to detect it.
+        /// `0` (meaningless) for AI kinds — `#[serde(default)]`, same reason
+        /// as `tmux_tag`.
+        #[serde(default)]
+        seq: u64,
+        /// AI kinds only, see `NotifyKind`. Empty for tmux kinds —
+        /// `#[serde(default)]` so a tmux hook sender (`isekai-pipe ctl notify
+        /// --kind bell --tag <tag> --seq <n>`) can omit it entirely.
+        #[serde(default)]
         title: String,
+        /// AI kinds only, see `NotifyKind`. Empty for tmux kinds, same
+        /// `#[serde(default)]` reason as `title`.
+        #[serde(default)]
         body: String,
     },
+    /// host → device: set this tab's background color (Windows Terminal via
+    /// OSC 4 palette-index 264, see `isekai-ssh::ctl_forward::osc_sequence_for`;
+    /// a harmless no-op on platforms/terminals with no equivalent). Fire-and-
+    /// forget, same pattern as `SetTitle` — no response is expected or sent.
+    #[serde(rename = "tab_color")]
+    SetTabColor { r: u8, g: u8, b: u8 },
     /// host → device: write to the device's clipboard.
     #[serde(rename = "clip_push")]
     ClipboardPush {
@@ -273,38 +370,47 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
             }
             Ok(())
         }
-        CtlMessage::Notify { title, body, .. } => {
-            if title.is_empty() {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "title",
-                    reason: "must be non-empty".to_string(),
-                });
-            }
-            if title.len() > MAX_NOTIFY_TITLE_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "title",
-                    reason: format!(
-                        "is {} bytes, exceeding the {MAX_NOTIFY_TITLE_LEN} byte limit",
-                        title.len()
-                    ),
-                });
-            }
-            if body.len() > MAX_NOTIFY_BODY_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "body",
-                    reason: format!(
-                        "is {} bytes, exceeding the {MAX_NOTIFY_BODY_LEN} byte limit",
-                        body.len()
-                    ),
-                });
-            }
-            Ok(())
-        }
+        // r/g/b are u8, already bounded to 0..=255 by the type itself.
+        CtlMessage::SetTabColor { .. } => Ok(()),
         CtlMessage::ClipboardPush { mime, data_b64 }
         | CtlMessage::ClipboardPullResponse { mime, data_b64 } => {
             validate_clipboard_payload(*mime, data_b64)
         }
         CtlMessage::ClipboardPullRequest {} => Ok(()),
+        // kindがtmux由来かAI/汎用かで検証対象フィールドを切り替える
+        // (`NotifyKind`/`CtlMessage::Notify`のdocコメント参照、統合の経緯)。
+        CtlMessage::Notify { kind, tmux_tag, title, body, .. } => match kind {
+            NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => {
+                validate_notify_tag(tmux_tag)
+            }
+            NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
+                if title.is_empty() {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "title",
+                        reason: "must be non-empty".to_string(),
+                    });
+                }
+                if title.len() > MAX_NOTIFY_TITLE_LEN {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "title",
+                        reason: format!(
+                            "is {} bytes, exceeding the {MAX_NOTIFY_TITLE_LEN} byte limit",
+                            title.len()
+                        ),
+                    });
+                }
+                if body.len() > MAX_NOTIFY_BODY_LEN {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "body",
+                        reason: format!(
+                            "is {} bytes, exceeding the {MAX_NOTIFY_BODY_LEN} byte limit",
+                            body.len()
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        },
         CtlMessage::SetVar { key, value, .. } => {
             validate_var_key(key)?;
             if value.len() > MAX_VAR_VALUE_LEN {
@@ -429,6 +535,25 @@ fn validate_clipboard_payload(mime: ClipboardMime, data_b64: &str) -> Result<(),
     Ok(())
 }
 
+fn validate_notify_tag(tmux_tag: &str) -> Result<(), ProtocolError> {
+    if tmux_tag.is_empty() {
+        return Err(ProtocolError::CtlMessageField {
+            field: "tmux_tag",
+            reason: "must be non-empty".to_string(),
+        });
+    }
+    if tmux_tag.len() > MAX_NOTIFY_TAG_LEN {
+        return Err(ProtocolError::CtlMessageField {
+            field: "tmux_tag",
+            reason: format!(
+                "is {} bytes, exceeding the {MAX_NOTIFY_TAG_LEN} byte limit",
+                tmux_tag.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +571,16 @@ mod tests {
                 value: "my-tab".to_string()
             }
         );
+    }
+
+    fn set_tab_color_json() -> Vec<u8> {
+        br#"{"op":"tab_color","r":255,"g":0,"b":128}"#.to_vec()
+    }
+
+    #[test]
+    fn decodes_set_tab_color() {
+        let msg = decode_ctl_message(&set_tab_color_json()).unwrap();
+        assert_eq!(msg, CtlMessage::SetTabColor { r: 255, g: 0, b: 128 });
     }
 
     #[test]
@@ -466,6 +601,8 @@ mod tests {
             msg,
             CtlMessage::Notify {
                 kind: NotifyKind::Waiting,
+                tmux_tag: String::new(),
+                seq: 0,
                 title: "needs input".to_string(),
                 body: "sudo password?".to_string(),
             }
@@ -479,6 +616,8 @@ mod tests {
             decode_ctl_message(done).unwrap(),
             CtlMessage::Notify {
                 kind: NotifyKind::Done,
+                tmux_tag: String::new(),
+                seq: 0,
                 title: "finished".to_string(),
                 body: String::new(),
             }
@@ -489,6 +628,8 @@ mod tests {
             decode_ctl_message(info).unwrap(),
             CtlMessage::Notify {
                 kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
                 title: "fyi".to_string(),
                 body: "just an fyi".to_string(),
             }
@@ -509,6 +650,8 @@ mod tests {
     fn rejects_notify_with_oversized_title() {
         let json = serde_json::to_vec(&CtlMessage::Notify {
             kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
             title: "x".repeat(MAX_NOTIFY_TITLE_LEN + 1),
             body: String::new(),
         })
@@ -524,6 +667,8 @@ mod tests {
     fn rejects_notify_with_oversized_body() {
         let json = serde_json::to_vec(&CtlMessage::Notify {
             kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
             title: "t".to_string(),
             body: "x".repeat(MAX_NOTIFY_BODY_LEN + 1),
         })
@@ -653,6 +798,24 @@ mod tests {
         assert!(matches!(err, ProtocolError::CtlMessageJson(_)));
     }
 
+    // ── Notify (#57 wire type; see module doc on `CtlMessage::Notify`) ──
+
+    #[test]
+    fn decodes_notify_bell() {
+        let json = br#"{"op":"notify","kind":"bell","tmux_tag":"abc123","seq":0}"#;
+        let msg = decode_ctl_message(json).unwrap();
+        assert_eq!(
+            msg,
+            CtlMessage::Notify {
+                kind: NotifyKind::Bell,
+                tmux_tag: "abc123".to_string(),
+                seq: 0,
+                title: String::new(),
+                body: String::new(),
+            }
+        );
+    }
+
     #[test]
     fn decodes_setvar_for_each_scope() {
         for (scope_json, scope) in [
@@ -736,6 +899,134 @@ mod tests {
                 profile: "win".to_string()
             }
         );
+    }
+
+    #[test]
+    fn round_trips_all_notify_kinds() {
+        for (kind, rendered) in [
+            (NotifyKind::Bell, "bell"),
+            (NotifyKind::Activity, "activity"),
+            (NotifyKind::Silence, "silence"),
+            (NotifyKind::JobDone, "job_done"),
+        ] {
+            let msg = CtlMessage::Notify {
+                kind,
+                tmux_tag: "tag".to_string(),
+                seq: 7,
+                title: String::new(),
+                body: String::new(),
+            };
+            let encoded = serde_json::to_string(&msg).unwrap();
+            assert!(
+                encoded.contains(&format!("\"kind\":\"{rendered}\"")),
+                "expected {rendered:?} in encoded form, got {encoded}"
+            );
+            let decoded = decode_ctl_message(encoded.as_bytes()).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn rejects_notify_with_empty_tag() {
+        let msg = CtlMessage::Notify {
+            kind: NotifyKind::Bell,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: String::new(),
+            body: String::new(),
+        };
+        let err = validate_ctl_message(&msg).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "tmux_tag", .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_notify_tag_exceeding_cap() {
+        let msg = CtlMessage::Notify {
+            kind: NotifyKind::Activity,
+            tmux_tag: "a".repeat(MAX_NOTIFY_TAG_LEN + 1),
+            seq: 0,
+            title: String::new(),
+            body: String::new(),
+        };
+        let err = validate_ctl_message(&msg).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "tmux_tag", .. }
+        ));
+    }
+
+    #[test]
+    fn accepts_notify_tag_at_cap() {
+        let msg = CtlMessage::Notify {
+            kind: NotifyKind::Silence,
+            tmux_tag: "a".repeat(MAX_NOTIFY_TAG_LEN),
+            seq: 0,
+            title: String::new(),
+            body: String::new(),
+        };
+        validate_ctl_message(&msg).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_notify_kind() {
+        let json = br#"{"op":"notify","kind":"made_up","tmux_tag":"abc123","seq":0}"#;
+        let err = decode_ctl_message(json).unwrap_err();
+        assert!(matches!(err, ProtocolError::CtlMessageJson(_)));
+    }
+
+    /// Simulates a *pre-#63* binary's `CtlMessage` — one without the
+    /// `Notify` variant — receiving today's `"op":"notify"` line on the
+    /// wire, to pin down exactly how an old decoder fails.
+    ///
+    /// Epic M's wire contract (`ssh_handler::server_channel_open_forwarded_streamlocal`
+    /// doc comment) is "1 connection = 1 message": each `CtlMessage` is
+    /// forwarded over its own dedicated streamlocal channel, one
+    /// `read_line` is attempted, and the *channel* is closed afterward
+    /// regardless of whether decoding succeeded. So when an old decoder
+    /// can't recognize `"op":"notify"`, `serde_json` fails with a normal
+    /// per-message "unknown variant" error — the same failure category
+    /// `rejects_unknown_op` above already covers for any unrecognized
+    /// `op` — which the old binary's handler logs
+    /// (`warn!("...: malformed ctl message: {e}")`) and drops by closing
+    /// that one channel. It cannot corrupt or desync any other message,
+    /// tab, or the shared SSH connection, because there is no shared
+    /// framing/length-prefix state that spans multiple `CtlMessage`s for
+    /// a decode failure to leave inconsistent.
+    ///
+    /// This is a property of the *existing* one-message-per-connection
+    /// design, not something this task added — flagged here as the
+    /// documented backward-compat behavior for the new variant rather
+    /// than a new mechanism, since the wire format has no "unknown
+    /// variant, skip it" framing of its own to fall back on if that
+    /// one-message-per-connection contract ever changes.
+    #[test]
+    fn old_decoder_without_notify_variant_fails_without_desyncing() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "op")]
+        #[allow(dead_code)]
+        enum OldCtlMessage {
+            #[serde(rename = "title")]
+            SetTitle { value: String },
+            #[serde(rename = "clip_push")]
+            ClipboardPush { mime: ClipboardMime, data_b64: String },
+            #[serde(rename = "clip_pull_request")]
+            ClipboardPullRequest {},
+            #[serde(rename = "clip_pull_response")]
+            ClipboardPullResponse { mime: ClipboardMime, data_b64: String },
+        }
+
+        let json = br#"{"op":"notify","kind":"bell","tmux_tag":"abc123","seq":0}"#;
+        // The "old" decoder can't parse it...
+        let err = serde_json::from_slice::<OldCtlMessage>(json).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unknown variant"));
+        // ...while today's decoder (with the new variant) parses the very
+        // same bytes just fine — confirming the failure above is purely
+        // "old code doesn't know this variant yet", not a malformed
+        // message.
+        decode_ctl_message(json).unwrap();
     }
 
     #[test]

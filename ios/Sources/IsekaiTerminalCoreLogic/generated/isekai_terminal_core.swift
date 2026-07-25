@@ -1157,6 +1157,31 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func disconnect() 
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Bool) async throws  -> TmuxTabWindowInfo
+    
+    /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
      * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
      * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
@@ -1219,6 +1244,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
     func notifyFocusChange(focused: Bool) 
     
@@ -1495,6 +1527,46 @@ open func disconnect()  {try! rustCall() {
 }
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+open func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Bool)async throws  -> TmuxTabWindowInfo  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(profileIdentity),FfiConverterString.lower(clientId),FfiConverterOptionString.lower(existingTag),FfiConverterBool.lower(enableNotifications)
+                )
+            },
+            pollFunc: ffi_isekai_terminal_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_isekai_terminal_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_isekai_terminal_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTmuxTabWindowInfo_lift,
+            errorHandler: FfiConverterTypeTmuxSessionError_lift
+        )
+}
+    
+    /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
      * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
      * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
@@ -1606,6 +1678,13 @@ open func notifyError(message: String)  {try! rustCall() {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
 open func notifyFocusChange(focused: Bool)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
@@ -3468,27 +3547,6 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var bellGeneration: UInt64
     /**
-     * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
-     * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
-     * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
-     * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
-     * 通知(タブバッジ・システム通知)を1回発火させること。
-     */
-    public var notifyGeneration: UInt64
-    /**
-     * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
-     */
-    public var notifyKind: NotifyKind
-    /**
-     * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
-     * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
-     */
-    public var notifyTitle: String
-    /**
-     * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
-     */
-    public var notifyBody: String
-    /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
      */
     public var cursorShape: CursorShape
@@ -3607,23 +3665,6 @@ public struct ScreenUpdate: Equatable, Hashable {
          * (`ESC]0;title BEL`)はカウントされない。
          */bellGeneration: UInt64, 
         /**
-         * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
-         * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
-         * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
-         * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
-         * 通知(タブバッジ・システム通知)を1回発火させること。
-         */notifyGeneration: UInt64, 
-        /**
-         * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
-         */notifyKind: NotifyKind, 
-        /**
-         * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
-         * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
-         */notifyTitle: String, 
-        /**
-         * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
-         */notifyBody: String, 
-        /**
          * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
          */cursorShape: CursorShape, 
         /**
@@ -3700,10 +3741,6 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.urxvtMouseMode = urxvtMouseMode
         self.cursorVisible = cursorVisible
         self.bellGeneration = bellGeneration
-        self.notifyGeneration = notifyGeneration
-        self.notifyKind = notifyKind
-        self.notifyTitle = notifyTitle
-        self.notifyBody = notifyBody
         self.cursorShape = cursorShape
         self.cursorBlink = cursorBlink
         self.linkTable = linkTable
@@ -3744,10 +3781,6 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 urxvtMouseMode: FfiConverterBool.read(from: &buf), 
                 cursorVisible: FfiConverterBool.read(from: &buf), 
                 bellGeneration: FfiConverterUInt64.read(from: &buf), 
-                notifyGeneration: FfiConverterUInt64.read(from: &buf), 
-                notifyKind: FfiConverterTypeNotifyKind.read(from: &buf), 
-                notifyTitle: FfiConverterString.read(from: &buf), 
-                notifyBody: FfiConverterString.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
                 cursorBlink: FfiConverterBool.read(from: &buf), 
                 linkTable: FfiConverterSequenceString.read(from: &buf), 
@@ -3774,10 +3807,6 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.urxvtMouseMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
-        FfiConverterUInt64.write(value.notifyGeneration, into: &buf)
-        FfiConverterTypeNotifyKind.write(value.notifyKind, into: &buf)
-        FfiConverterString.write(value.notifyTitle, into: &buf)
-        FfiConverterString.write(value.notifyBody, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
         FfiConverterBool.write(value.cursorBlink, into: &buf)
         FfiConverterSequenceString.write(value.linkTable, into: &buf)
@@ -4160,6 +4189,109 @@ public func FfiConverterTypeTerminalKeyModifiers_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypeTerminalKeyModifiers_lower(_ value: TerminalKeyModifiers) -> RustBuffer {
     return FfiConverterTypeTerminalKeyModifiers.lower(value)
+}
+
+
+/**
+ * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+ * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+ * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+ * `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+ * キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+ */
+public struct TmuxTabWindowInfo: Equatable, Hashable {
+    /**
+     * tmuxウィンドウを長期的に指すタグ値。
+     */
+    public var tag: String
+    /**
+     * このタグ解決時点でのウィンドウインデックス。
+     */
+    public var windowIndex: UInt32
+    /**
+     * このクライアントがattachしたセッション名(グループ内で一意)。
+     */
+    public var sessionName: String
+    /**
+     * tmux session groupの名前。
+     */
+    public var groupName: String
+    /**
+     * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+     */
+    public var isNewWindow: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * tmuxウィンドウを長期的に指すタグ値。
+         */tag: String, 
+        /**
+         * このタグ解決時点でのウィンドウインデックス。
+         */windowIndex: UInt32, 
+        /**
+         * このクライアントがattachしたセッション名(グループ内で一意)。
+         */sessionName: String, 
+        /**
+         * tmux session groupの名前。
+         */groupName: String, 
+        /**
+         * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+         */isNewWindow: Bool) {
+        self.tag = tag
+        self.windowIndex = windowIndex
+        self.sessionName = sessionName
+        self.groupName = groupName
+        self.isNewWindow = isNewWindow
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TmuxTabWindowInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxTabWindowInfo {
+        return
+            try TmuxTabWindowInfo(
+                tag: FfiConverterString.read(from: &buf), 
+                windowIndex: FfiConverterUInt32.read(from: &buf), 
+                sessionName: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
+                isNewWindow: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TmuxTabWindowInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.tag, into: &buf)
+        FfiConverterUInt32.write(value.windowIndex, into: &buf)
+        FfiConverterString.write(value.sessionName, into: &buf)
+        FfiConverterString.write(value.groupName, into: &buf)
+        FfiConverterBool.write(value.isNewWindow, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxTabWindowInfo_lift(_ buf: RustBuffer) throws -> TmuxTabWindowInfo {
+    return try FfiConverterTypeTmuxTabWindowInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxTabWindowInfo_lower(_ value: TmuxTabWindowInfo) -> RustBuffer {
+    return FfiConverterTypeTmuxTabWindowInfo.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -5190,16 +5322,18 @@ public func FfiConverterTypeMouseReportingMode_lower(_ value: MouseReportingMode
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * `isekai_protocol::ctl::NotifyKind`(uniffiに依存しないpure crate側の型)をUniFFI
- * 境界越しに公開するための同型(`AI_INTEGRATION_DESIGN.md` §6.1、`ClipboardMimeKind`と
- * 同じ理由でミラーが必要)。
+ * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+ * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
+ * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
+ * なので、その型をUniFFI境界越しにそのまま公開できない)。
  */
 
 public enum NotifyKind: Equatable, Hashable {
     
-    case waiting
-    case done
-    case info
+    case bell
+    case activity
+    case silence
+    case jobDone
 
 
 
@@ -5221,11 +5355,13 @@ public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .waiting
+        case 1: return .bell
         
-        case 2: return .done
+        case 2: return .activity
         
-        case 3: return .info
+        case 3: return .silence
+        
+        case 4: return .jobDone
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -5235,16 +5371,20 @@ public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
         switch value {
         
         
-        case .waiting:
+        case .bell:
             writeInt(&buf, Int32(1))
         
         
-        case .done:
+        case .activity:
             writeInt(&buf, Int32(2))
         
         
-        case .info:
+        case .silence:
             writeInt(&buf, Int32(3))
+        
+        
+        case .jobDone:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -5869,6 +6009,103 @@ public func FfiConverterTypeTerminalSpecialKey_lower(_ value: TerminalSpecialKey
 }
 
 
+
+/**
+ * [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+ * (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+ * このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+ * `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+ * 切断)はメッセージにまとめて運ぶだけに留める。
+ */
+public enum TmuxSessionError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+     */
+    case Command(String
+    )
+    /**
+     * tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+     */
+    case UnexpectedOutput(String
+    )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension TmuxSessionError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTmuxSessionError: FfiConverterRustBuffer {
+    typealias SwiftType = TmuxSessionError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxSessionError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Command(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .UnexpectedOutput(
+            try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TmuxSessionError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .Command(v1):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .UnexpectedOutput(v1):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(v1, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxSessionError_lift(_ buf: RustBuffer) throws -> TmuxSessionError {
+    return try FfiConverterTypeTmuxSessionError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxSessionError_lower(_ value: TmuxSessionError) -> RustBuffer {
+    return FfiConverterTypeTmuxSessionError.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -6461,6 +6698,18 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
     func onRebindStateChanged(state: RebindPublicState) 
     
     /**
+     * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+     * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+     * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+     * 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+     * から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+     * per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+     * (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+     * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+     */
+    func onNotify(kind: NotifyKind) 
+    
+    /**
      * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
      * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
      */
@@ -6829,6 +7078,30 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 }
                 return uniffiObj.onRebindStateChanged(
                      state: try FfiConverterTypeRebindPublicState_lift(state)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onNotify: { (
+            uniffiHandle: UInt64,
+            kind: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onNotify(
+                     kind: try FfiConverterTypeNotifyKind_lift(kind)
                 )
             }
 
@@ -8134,6 +8407,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 4218) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8158,7 +8434,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -8266,13 +8542,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 20924) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 29419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 797) {
         return InitializationResult.apiChecksumMismatch
     }
 
