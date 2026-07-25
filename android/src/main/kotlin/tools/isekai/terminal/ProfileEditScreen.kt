@@ -207,6 +207,9 @@ fun ProfileEditScreen(
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
     // タスク#57: tmux hook(bell/activity/silence/pane-died)通知の既定OFF opt-in。
     var enableTabNotifications by remember { mutableStateOf(profile?.enableTabNotifications ?: false) }
+    // `AI_INTEGRATION_DESIGN.md` §3/§6.2: リモートAPC経由の構造化パネル
+    // (presentDocument/presentForm)を受け付けるかの既定OFF opt-in。
+    var enableAiPanel by remember { mutableStateOf(profile?.enableAiPanel ?: false) }
     // トグルをONにした際、Android 13+ならその場で`POST_NOTIFICATIONS`実行時権限を要求する
     // (マニフェストの宣言だけでは足りない)。ユーザーが拒否してもトグル自体はONのままにし
     // (設定意図は尊重する)、実際の通知表示は権限が無ければ`TabAlertNotifier.hasPermission`が
@@ -948,6 +951,30 @@ fun ProfileEditScreen(
             }
         }
 
+        Spacer(Modifier.height(4.dp))
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("AIパネル(構造化ドキュメント/フォーム)", modifier = Modifier.align(Alignment.CenterVertically))
+                Switch(
+                    checked = enableAiPanel,
+                    onCheckedChange = { enableAiPanel = it },
+                    modifier = Modifier.testTag("aiPanelSwitch"),
+                )
+            }
+            if (enableAiPanel) {
+                Text(
+                    "リモート側(Claude Code等)が送ってくるドキュメント・フォームをアプリ内に表示できるように" +
+                        "します。信頼できるホストのみで有効にしてください。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -976,6 +1003,7 @@ fun ProfileEditScreen(
                         themeName = themeName,
                         enableAgentForward = enableAgentForward,
                         enableTabNotifications = enableTabNotifications,
+                        enableAiPanel = enableAiPanel,
                         jumpHost = if (useJumpHost) jumpHost.trim() else null,
                         jumpPort = jumpPort.toIntOrNull() ?: 22,
                         jumpUsername = if (useJumpHost) jumpUsername.trim() else null,

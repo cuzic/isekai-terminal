@@ -193,6 +193,11 @@ impl IsekaiStunP2pSession {
     pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
         self.core.set_theme(theme);
     }
+
+    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート。
+    pub(crate) fn set_panel_enabled(&self, enabled: bool) {
+        self.core.set_panel_enabled(enabled);
+    }
 }
 
 // ── STUN 問い合わせ・ブートストラップ ─────────────────────

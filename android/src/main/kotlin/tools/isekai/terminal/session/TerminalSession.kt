@@ -519,6 +519,11 @@ class TerminalSession(
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
         orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
 
+    /** `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(presentDocument/
+     *  presentForm)opt-inを設定する。`setTheme`と同じくRust側は値を保持しないため、
+     *  接続のたびに(再接続を含め)呼び出し側が送り直す必要がある。 */
+    fun setAiPanelEnabled(enabled: Boolean) = orchestrator.setAiPanelEnabled(enabled)
+
     /**
      * タスク#60: tmux session groupのensure/attach + タブ用ウィンドウのcreate-or-select。
      * 判断は一切ここでは行わず、Rust側(`SessionOrchestrator::ensure_tmux_tab_window`)へ

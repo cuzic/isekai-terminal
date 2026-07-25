@@ -352,6 +352,15 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::SetTheme(theme));
     }
 
+    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲートを設定する。呼び出し側
+    /// (`SessionOrchestrator::set_ai_panel_enabled`、Kotlin `TerminalTabsViewModel`が
+    /// 接続確立後に`ConnectionProfile.enableAiPanel`を渡す)は接続ごとに毎回呼ぶこと——
+    /// `set_theme`と異なりここでは値を保持しないため、再接続で新しい`session_event_loop`
+    /// (新しい`Terminal`、既定`panel_enabled=false`)が立つたびに送り直す必要がある。
+    pub(crate) fn set_panel_enabled(&self, enabled: bool) {
+        self.send_session_cmd(SessionCmd::SetPanelEnabled(enabled));
+    }
+
     /// [session_tx]が張られていれば(=`start`後かつ`disconnect`前なら)`cmd`を投げる。
     /// 未接続/切断済みなら黙って無視する(呼び出し側は都度存在確認しなくてよい)。
     fn send_session_cmd(&self, cmd: SessionCmd) {
@@ -694,6 +703,10 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd, scrollback_len: u
             state.on_kotlin_cancel(transfer_id),
         SessionCmd::SetTheme(theme) => {
             state.set_theme(theme);
+            ProcessResult::default()
+        }
+        SessionCmd::SetPanelEnabled(enabled) => {
+            state.set_panel_enabled(enabled);
             ProcessResult::default()
         }
         SessionCmd::FocusChanged(focused) => state.notify_focus_change(focused),

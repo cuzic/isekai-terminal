@@ -1186,4 +1186,166 @@ class AppDatabaseMigrationTest {
             ctx.deleteDatabase(dbName)
         }
     }
+
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §3/§6.2: MIGRATION_21_22 が
+     * `connection_profiles.enable_ai_panel`(AIパネル機能のプロファイル単位opt-in、
+     * 既定OFF)を追加し、既存データを保持することを確認する
+     * (`migrate20To21_addsEnableTabNotificationsColumn...`と同じパターン。
+     * v21のスキーマ = v20のCREATE TABLEに`enable_tab_notifications`列を加えたもの)。
+     */
+    @Test
+    fun migrate21To22_addsEnableAiPanelColumn_defaultsFalse_preservesExistingData() {
+        val dbName = "migration-test-21-22.db"
+        ctx.deleteDatabase(dbName)
+
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val config = SupportSQLiteOpenHelper.Configuration.builder(ctx)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(21) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE connection_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL DEFAULT 22,
+                            username TEXT NOT NULL,
+                            authType TEXT NOT NULL,
+                            keyId INTEGER,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            use_tsshd INTEGER NOT NULL DEFAULT 0,
+                            tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                            transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                            direct_address TEXT,
+                            enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                            cellular_remote_address TEXT,
+                            enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                            post_connect_commands TEXT,
+                            forwards TEXT NOT NULL DEFAULT '[]',
+                            enable_agent_forward INTEGER NOT NULL DEFAULT 0,
+                            jump_host TEXT,
+                            jump_port INTEGER NOT NULL DEFAULT 22,
+                            jump_username TEXT,
+                            jump_auth_type TEXT,
+                            jump_key_id INTEGER,
+                            stun_server TEXT,
+                            relay_addr TEXT,
+                            relay_sni TEXT,
+                            relay_jwt TEXT,
+                            allow_non_loopback_forward_bind INTEGER NOT NULL DEFAULT 0,
+                            theme_name TEXT,
+                            helper_bind_port INTEGER,
+                            enable_tab_notifications INTEGER NOT NULL DEFAULT 0
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE known_hosts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            keyType TEXT NOT NULL,
+                            fingerprintSha256 TEXT NOT NULL,
+                            firstSeenAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX index_known_hosts_host_port ON known_hosts (host, port)"
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            publicKey TEXT NOT NULL,
+                            encryptedPrivateKeyPath TEXT NOT NULL,
+                            kekAlias TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE snippets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            command TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER,
+                            append_newline INTEGER NOT NULL DEFAULT 1
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_sequences (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            steps_json TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_sequence_pack_installations (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            pack_id TEXT NOT NULL,
+                            version INTEGER NOT NULL,
+                            param_values_json TEXT NOT NULL,
+                            profile_id INTEGER
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE tmux_tab_locators (
+                            profile_id INTEGER PRIMARY KEY NOT NULL,
+                            tag TEXT NOT NULL,
+                            updated_at INTEGER NOT NULL DEFAULT 0
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "INSERT INTO connection_profiles (label, host, username, authType) " +
+                            "VALUES ('legacy', 'example.com', 'user', 'password')"
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+            })
+            .build()
+        val rawHelper = factory.create(config)
+        rawHelper.writableDatabase // force onCreate
+        rawHelper.close()
+
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_21_22)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("legacy", profiles[0].label)
+            assertEquals(
+                "既存行は既定OFF(false)に落ちるはず",
+                false,
+                profiles[0].enableAiPanel,
+            )
+
+            val profileId = profiles[0].id
+            val updated = profiles[0].copy(enableAiPanel = true)
+            runBlocking { db.connectionProfileDao().upsert(updated) }
+            val reloaded = runBlocking { db.connectionProfileDao().findById(profileId) }
+            assertTrue(reloaded?.enableAiPanel == true)
+        } finally {
+            db.close()
+            ctx.deleteDatabase(dbName)
+        }
+    }
 }

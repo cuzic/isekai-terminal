@@ -53,6 +53,12 @@ pub(crate) const MAX_LINK_TABLE: usize = 4096;
 /// 上限到達後は最も古いマークから捨てる(`Terminal::prompt_marks`フィールド参照)。
 const MAX_PROMPT_MARKS: usize = 2000;
 
+/// `AI_INTEGRATION_DESIGN.md` §6.2「表示レート/頻度を制限し、偽装スパム通知経路に
+/// なることを防ぐ」の実際の間隔。1回のパネル表示で伝えたい情報を読み終える前に
+/// 次のパネルへ差し替わらない程度の値として選んだ(厳密な仕様値ではなく、実害の
+/// あるスパムを機械的に間引ける程度の保守的な下限)。
+const PANEL_MIN_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// OSC 133(`ESC]133;<Ps>...ST`、タスク#13)の1マークが表す区切りの種類。
 /// <https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md>
 /// のA/B/C/Dにそれぞれ対応する。
@@ -454,6 +460,21 @@ pub(crate) struct Terminal {
     panel_title: String,
     panel_markdown: String,
     panel_fields: Vec<PanelField>,
+    /// `AI_INTEGRATION_DESIGN.md` §3「AI機能はすべて既定OFF(opt-in)」を満たすための
+    /// フラグ。既定`false`——このフラグが立つまで`dispatch_apc`はAIパネルAPCを
+    /// 一切反映しない(Kitty graphics等の既存APC処理には影響しない)。
+    /// `set_panel_enabled`(`SessionOrchestrator::set_ai_panel_enabled`から
+    /// `SessionCmd::SetPanelEnabled`経由で配線される、`set_theme`と同じ経路)で
+    /// のみ変わる。
+    panel_enabled: bool,
+    /// `AI_INTEGRATION_DESIGN.md` §6.2「表示レート/頻度を制限し、偽装スパム通知経路に
+    /// なることを防ぐ」ためのレート制限状態。直近許可した時刻を覚えておき、
+    /// `PANEL_MIN_UPDATE_INTERVAL`未満の間隔で来た新しいパネルは(エラーにはせず)
+    /// 黙って破棄する——リモート側の一時的なバーストで接続自体に影響させない
+    /// `always-connects.md`と同じ「サイレントフォールバック」方針。テスト容易性の
+    /// ため`Instant::now()`をここでは呼ばず、呼び出し元(`dispatch_apc`)から
+    /// 現在時刻を受け取る(`net_health_policy.rs`と同じ「純粋ロジック」方針)。
+    last_panel_update_at: Option<std::time::Instant>,
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     cursor_shape: CursorShape,
     /// カーソルが点滅すべきか。DECSCUSRのパラメータ(奇数=blink/偶数=steady、
@@ -830,6 +851,8 @@ impl Terminal {
             panel_title: String::new(),
             panel_markdown: String::new(),
             panel_fields: Vec::new(),
+            panel_enabled: false,
+            last_panel_update_at: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             autowrap_mode: true,
@@ -966,6 +989,30 @@ impl Terminal {
     pub(crate) fn panel_markdown(&self) -> &str { &self.panel_markdown }
     pub(crate) fn panel_fields(&self) -> &[PanelField] { &self.panel_fields }
 
+    /// `AI_INTEGRATION_DESIGN.md` §3のopt-in既定OFFを満たすためのゲート。既定`false`の
+    /// 間は`dispatch_apc`がAIパネルAPCを一切反映しない。`SessionOrchestrator::
+    /// set_ai_panel_enabled`(`set_theme`と同じ`SessionCmd`経由の配線)からのみ変わる。
+    pub(crate) fn set_panel_enabled(&mut self, enabled: bool) {
+        self.panel_enabled = enabled;
+    }
+
+    /// リモートAPCパネル1件分を許可してよいかを判定する(`AI_INTEGRATION_DESIGN.md`
+    /// §6.2の表示レート制限)。`now`を呼び出し元から受け取ることで`Instant::now()`に
+    /// 依存させず、テストで間隔を確定的に検証できるようにする
+    /// (`net_health_policy.rs`と同じ「純粋ロジック」方針)。許可した場合のみ
+    /// `last_panel_update_at`を更新する(拒否した回はカウントに入れない=次の許可済み
+    /// 時刻からの間隔でのみ判定する)。
+    fn panel_rate_limit_allows(&mut self, now: std::time::Instant) -> bool {
+        let allowed = match self.last_panel_update_at {
+            Some(last) => now.saturating_duration_since(last) >= PANEL_MIN_UPDATE_INTERVAL,
+            None => true,
+        };
+        if allowed {
+            self.last_panel_update_at = Some(now);
+        }
+        allowed
+    }
+
     /// [crate::ai_panel::parse_ai_panel_apc]が解析した内容を反映する
     /// (`AI_INTEGRATION_DESIGN.md` §6.2)。`set_notify`/`set_title`と同じパターン:
     /// OSC/エスケープシーケンスの通常パースを経由せず、APCインターセプタから
@@ -984,9 +1031,32 @@ impl Terminal {
     /// 新規APCチャンネルの増設ではなく、既存の1つの出口を内容ベースで分岐させる設計)。
     /// `{`始まり(生JSON)ならAIパネルエンベロープ(`ai_panel.rs`)、それ以外(`G`始まりの
     /// Kitty graphics等)は[Self::dispatch_kitty_apc]へフォールバックする。
+    ///
+    /// AIパネルエンベロープと解釈できた場合でも、(a) `panel_enabled`(opt-in、既定
+    /// false)が立っていない、または (b) `panel_rate_limit_allows`が偽(表示レート
+    /// 超過)であれば、エラーにはせず黙って破棄する(コードレビュー2026-07-25で指摘:
+    /// 以前はこの2つのチェックが一切無く、opt-inしていないユーザーにも任意のリモート
+    /// バイト列由来のダイアログが無制限に表示され得た——`AI_INTEGRATION_DESIGN.md`
+    /// §3/§6.2の必須制約に違反していた)。
     pub(crate) fn dispatch_apc(&mut self, payload: &[u8]) {
         if let Some(parsed) = crate::ai_panel::parse_ai_panel_apc(payload) {
-            self.set_panel_from_ai_apc(parsed);
+            if self.panel_enabled && self.panel_rate_limit_allows(std::time::Instant::now()) {
+                self.set_panel_from_ai_apc(parsed);
+            }
+            return;
+        }
+        self.dispatch_kitty_apc(payload);
+    }
+
+    /// [dispatch_apc]のテスト専用版: レート制限の判定に使う現在時刻を注入できる
+    /// (`Instant::now()`の実時間経過を待たずに間隔超過/未超過の両方を確定的に
+    /// 検証するため)。
+    #[cfg(test)]
+    pub(crate) fn dispatch_apc_at(&mut self, payload: &[u8], now: std::time::Instant) {
+        if let Some(parsed) = crate::ai_panel::parse_ai_panel_apc(payload) {
+            if self.panel_enabled && self.panel_rate_limit_allows(now) {
+                self.set_panel_from_ai_apc(parsed);
+            }
             return;
         }
         self.dispatch_kitty_apc(payload);
@@ -6594,6 +6664,7 @@ mod tests {
     #[test]
     fn dispatch_apc_present_document_updates_panel_fields_and_generation() {
         let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_panel_enabled(true);
         assert_eq!(t.panel_generation(), 0, "既定は0");
         assert_eq!(t.panel_kind(), PanelKind::None);
 
@@ -6609,6 +6680,7 @@ mod tests {
     #[test]
     fn dispatch_apc_present_form_populates_fields() {
         let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_panel_enabled(true);
         t.dispatch_apc(
             br#"{"type":"presentForm","title":"confirm","fields":[{"id":"a","label":"A","kind":"text"},{"id":"b","label":"B","kind":"choice","options":["x","y"]}]}"#,
         );
@@ -6619,17 +6691,25 @@ mod tests {
 
     #[test]
     fn dispatch_apc_panel_generation_is_monotonic_and_does_not_reset_on_malformed_input() {
+        // `PANEL_MIN_UPDATE_INTERVAL`のレート制限に引っかからないよう、各呼び出しの
+        // 現在時刻を`dispatch_apc_at`で明示的に間隔を空けて注入する(`dispatch_apc`
+        // 自体の実時間待ちはしない)。
         let mut t = Terminal::new(80, 24, Theme::default());
-        t.dispatch_apc(br#"{"type":"presentDocument","title":"first","markdown":""}"#);
+        t.set_panel_enabled(true);
+        let t0 = std::time::Instant::now();
+        t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
         assert_eq!(t.panel_generation(), 1);
 
         // 不正なJSONは黙って無視され、直近のパネル状態・世代は変化しない
         // (`ai_panel.rs`のopportunisticな方針)。
-        t.dispatch_apc(b"not a valid ai panel envelope");
+        t.dispatch_apc_at(b"not a valid ai panel envelope", t0 + PANEL_MIN_UPDATE_INTERVAL);
         assert_eq!(t.panel_generation(), 1);
         assert_eq!(t.panel_title(), "first");
 
-        t.dispatch_apc(br#"{"type":"presentDocument","title":"second","markdown":""}"#);
+        t.dispatch_apc_at(
+            br#"{"type":"presentDocument","title":"second","markdown":""}"#,
+            t0 + PANEL_MIN_UPDATE_INTERVAL,
+        );
         assert_eq!(t.panel_generation(), 2);
         assert_eq!(t.panel_title(), "second");
     }
@@ -6648,6 +6728,73 @@ mod tests {
         t.dispatch_apc(payload.as_bytes());
         assert_eq!(t.images().len(), 1, "Kitty graphicsは従来通り動くこと");
         assert_eq!(t.panel_generation(), 0, "Kitty graphicsペイロードはパネル世代を進めない");
+    }
+
+    #[test]
+    fn dispatch_apc_ignores_ai_panel_envelope_when_not_opted_in() {
+        // コードレビュー2026-07-25で指摘された回帰の再発防止テスト:
+        // `set_panel_enabled(true)`を呼ぶまでは、有効なAIパネルエンベロープが
+        // 来ても黙って無視される(`AI_INTEGRATION_DESIGN.md` §3の既定OFF)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.panel_generation(), 0);
+        t.dispatch_apc(br#"{"type":"presentDocument","title":"t","markdown":"m"}"#);
+        assert_eq!(t.panel_generation(), 0, "opt-inするまでパネル世代は進まない");
+        assert_eq!(t.panel_kind(), PanelKind::None, "opt-inするまでパネル種別も既定のまま");
+    }
+
+    #[test]
+    fn dispatch_apc_rate_limits_panel_updates_within_min_interval() {
+        // `AI_INTEGRATION_DESIGN.md` §6.2の表示レート制限: 直近許可した更新から
+        // `PANEL_MIN_UPDATE_INTERVAL`未満の間隔で来た新しいパネルは黙って破棄される。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_panel_enabled(true);
+        let t0 = std::time::Instant::now();
+        t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
+        assert_eq!(t.panel_generation(), 1);
+
+        // 間隔未満(1ns後)の2件目は破棄される。
+        t.dispatch_apc_at(
+            br#"{"type":"presentDocument","title":"second","markdown":""}"#,
+            t0 + std::time::Duration::from_nanos(1),
+        );
+        assert_eq!(t.panel_generation(), 1, "最小間隔未満の更新は破棄される");
+        assert_eq!(t.panel_title(), "first");
+
+        // ちょうど最小間隔経過後なら許可される。
+        t.dispatch_apc_at(
+            br#"{"type":"presentDocument","title":"third","markdown":""}"#,
+            t0 + PANEL_MIN_UPDATE_INTERVAL,
+        );
+        assert_eq!(t.panel_generation(), 2, "最小間隔経過後は許可される");
+        assert_eq!(t.panel_title(), "third");
+    }
+
+    #[test]
+    fn dispatch_apc_rate_limit_rejection_does_not_reset_the_window() {
+        // 拒否された呼び出しは`last_panel_update_at`を更新しない——直近「許可した」
+        // 時刻からの間隔でのみ判定されることを確認する(拒否のたびに時計がリセット
+        // されるとレート制限が実質無効化されてしまう)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_panel_enabled(true);
+        let t0 = std::time::Instant::now();
+        t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
+        assert_eq!(t.panel_generation(), 1);
+
+        // 間隔未満の更新を連続で送っても、いずれも破棄される。
+        for i in 1..5u32 {
+            t.dispatch_apc_at(
+                br#"{"type":"presentDocument","title":"rejected","markdown":""}"#,
+                t0 + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        assert_eq!(t.panel_generation(), 1, "拒否が続いても世代は進まない");
+
+        // 最初に許可した時刻(t0)から最小間隔経過後なら許可される。
+        t.dispatch_apc_at(
+            br#"{"type":"presentDocument","title":"second","markdown":""}"#,
+            t0 + PANEL_MIN_UPDATE_INTERVAL,
+        );
+        assert_eq!(t.panel_generation(), 2);
     }
 
     // ── Kitty graphics(APC、タスク#53) ─────────────

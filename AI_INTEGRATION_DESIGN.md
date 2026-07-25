@@ -142,6 +142,14 @@ BEL受信を取りこぼし無く検知するカウンタ)は、現状`TerminalT
     プロンプト誘発は不可)。
   - パネルは常に「リモート由来」であることをUI上明示する(枠線色・ラベル等)。
   - 表示レート/頻度を制限し、偽装スパム通知経路になることを防ぐ。
+  - **実装(2026-07-25追記)**: 上記2点(opt-in既定OFF、表示レート制限)は当初
+    `Terminal::dispatch_apc`に実装されておらず、opt-inしていないユーザーにも任意の
+    リモートバイト列由来のダイアログが無制限に表示され得るバグとして
+    コードレビューで指摘された。`Terminal::panel_enabled`(既定`false`、
+    `ConnectionProfile.enableAiPanel` → `SessionOrchestrator::set_ai_panel_enabled`
+    → `SessionCmd::SetPanelEnabled`という`set_theme`と同じ配線経由でのみ変わる)と
+    `PANEL_MIN_UPDATE_INTERVAL`(2秒、`Terminal::panel_rate_limit_allows`)で
+    `dispatch_apc`をゲートすることで修正済み。
 - **フィードバック**: フォーム送信結果はPTYへの通常stdin文字列書き込みで返す
   (MulmoTerminal自身の`docs/gui-protocol-spike.md`で実機検証済みの方式: Claude
   CodeのTUIがテキスト+CRをペーストと誤認しないよう、CRを遅延させる実装上の工夫が
