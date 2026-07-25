@@ -927,6 +927,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_ai_panel_enabled(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_download(
@@ -1105,6 +1107,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollbac
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(`ptr`: Long,`query`: RustBuffer.ByValue,`caseSensitive`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_ai_panel_enabled(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1453,6 +1457,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_ai_panel_enabled() != 22331) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme() != 37038) {
@@ -3231,6 +3238,15 @@ public interface SessionOrchestratorInterface {
     fun `send`(`data`: kotlin.ByteArray)
     
     /**
+     * `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(`presentDocument`/
+     * `presentForm`)を有効化/無効化する。既定はOFFで、Kotlin側
+     * (`TerminalTabsViewModel`)が`ConnectionProfile.enableAiPanel`を接続確立ごとに
+     * ここへ渡す(`set_session_theme`と同じ「値を保持せず接続ごとに送り直す」設計、
+     * `SessionCore::set_panel_enabled`のdocコメント参照)。未接続時は無視される。
+     */
+    fun `setAiPanelEnabled`(`enabled`: kotlin.Boolean)
+    
+    /**
      * Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
      * アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
      * 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
@@ -3906,6 +3922,25 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(`presentDocument`/
+     * `presentForm`)を有効化/無効化する。既定はOFFで、Kotlin側
+     * (`TerminalTabsViewModel`)が`ConnectionProfile.enableAiPanel`を接続確立ごとに
+     * ここへ渡す(`set_session_theme`と同じ「値を保持せず接続ごとに送り直す」設計、
+     * `SessionCore::set_panel_enabled`のdocコメント参照)。未接続時は無視される。
+     */override fun `setAiPanelEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_ai_panel_enabled(
+        it,
+        FfiConverterBoolean.lower(`enabled`),_status)
 }
     }
     

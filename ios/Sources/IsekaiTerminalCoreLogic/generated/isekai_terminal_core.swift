@@ -1311,6 +1311,15 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func send(data: Data) 
     
     /**
+     * `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(`presentDocument`/
+     * `presentForm`)を有効化/無効化する。既定はOFFで、Kotlin側
+     * (`TerminalTabsViewModel`)が`ConnectionProfile.enableAiPanel`を接続確立ごとに
+     * ここへ渡す(`set_session_theme`と同じ「値を保持せず接続ごとに送り直す」設計、
+     * `SessionCore::set_panel_enabled`のdocコメント参照)。未接続時は無視される。
+     */
+    func setAiPanelEnabled(enabled: Bool) 
+    
+    /**
      * Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
      * アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
      * 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
@@ -1810,6 +1819,21 @@ open func send(data: Data)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(`presentDocument`/
+     * `presentForm`)を有効化/無効化する。既定はOFFで、Kotlin側
+     * (`TerminalTabsViewModel`)が`ConnectionProfile.enableAiPanel`を接続確立ごとに
+     * ここへ渡す(`set_session_theme`と同じ「値を保持せず接続ごとに送り直す」設計、
+     * `SessionCore::set_panel_enabled`のdocコメント参照)。未接続時は無視される。
+     */
+open func setAiPanelEnabled(enabled: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_ai_panel_enabled(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),$0
     )
 }
 }
@@ -8852,6 +8876,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_ai_panel_enabled() != 22331) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme() != 37038) {
