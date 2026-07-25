@@ -239,11 +239,11 @@ pub(crate) fn build_list_command(scope: &TmuxSessionScope, kind: TmuxTargetKind)
     let session = shell_quote(scope.addressable_session_name());
     match kind {
         TmuxTargetKind::Window => format!(
-            "tmux list-windows -t {session} -F '#{{window_index}}\\t#{{{}}}'",
+            "tmux list-windows -t {session} -F '#{{window_index}}\t#{{{}}}'",
             WINDOW_TAG_OPTION
         ),
         TmuxTargetKind::Pane => format!(
-            "tmux list-panes -s -t {session} -F '#{{window_index}}\\t#{{pane_index}}\\t#{{{}}}'",
+            "tmux list-panes -s -t {session} -F '#{{window_index}}\t#{{pane_index}}\t#{{{}}}'",
             PANE_TAG_OPTION
         ),
     }
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn build_list_command_window_uses_list_windows() {
         let cmd = build_list_command(&standalone("main"), TmuxTargetKind::Window);
-        assert_eq!(cmd, "tmux list-windows -t 'main' -F '#{window_index}\\t#{@isekai_tab_id}'");
+        assert_eq!(cmd, "tmux list-windows -t 'main' -F '#{window_index}\t#{@isekai_tab_id}'");
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
         let cmd = build_list_command(&standalone("main"), TmuxTargetKind::Pane);
         assert_eq!(
             cmd,
-            "tmux list-panes -s -t 'main' -F '#{window_index}\\t#{pane_index}\\t#{@isekai_pane_id}'"
+            "tmux list-panes -s -t 'main' -F '#{window_index}\t#{pane_index}\t#{@isekai_pane_id}'"
         );
     }
 
