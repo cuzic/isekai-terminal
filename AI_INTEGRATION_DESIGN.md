@@ -214,13 +214,14 @@ Warpが「セッション内容を同意なくLLMに送っている」とHNで�
 
 - **Epic AI-1: Claude(Anthropicアカウント)OAuthの実現可能性・規約 — 未着手**:
   §4参照。結論が出るまで方式A/Bの両方を設計上並行させる。
-- **Epic AI-2: リモートへのhook配置主体 — 未調査**: §6.1のCtl Notify送出を
-  ユーザー自身の`.claude/settings.json`に手動追加してもらうか、`isekai-ssh`側の
-  自動配布を検討するか。自動配布は`isekai-protocol/src/ctl.rs`の
-  「no general-purpose exec RPC」方針(設定ファイル書き込みはexec RPCに隣接する
-  懸念がある、Opusレビュー指摘)との整合を要検討。
-- **Epic AI-3: env var伝播 — 未調査**: hookからctlソケットへ到達するための
-  環境変数・ソケットパスが、tmux・sudo・docker越しでも伝播するか。
+- **Epic AI-2: リモートへのhook配置主体 — v1方針決定(2026-07-25、`ISEKAI_PIPE_DESIGN.md`
+  Epic Q参照)**: 自動配布はしない、ユーザー自身が`.claude/settings.json`に手動追加する
+  方針で確定(「no general-purpose exec RPC」方針との整合を優先)。将来の増分として
+  自動配布は引き続き検討候補。
+- **Epic AI-3: env var伝播 — 部分的に回答(2026-07-25、`ISEKAI_PIPE_DESIGN.md` Epic Q参照)**:
+  `$ISEKAI_CTL_SOCK`と同じexport機構に相乗りする`$ISEKAI_TAB_IDLE_COLOR`について、
+  tmuxの別接続跨ぎ再アタッチ時に古い値が残る既知の制限はEpic Mと同じ扱い(サイレント
+  失敗、次の新規ペインで解決)と整理した。sudo/docker越しの伝播は未調査のまま。
 - **Epic AI-4: Claude Codeのバージョン検出とhookスキーマ変動 — 未調査**。
 - **Epic AI-5: Doze中のトークンrefresh — 未調査**: Android Doze modeでの
   バックグラウンドOAuthトークン更新の扱い。
