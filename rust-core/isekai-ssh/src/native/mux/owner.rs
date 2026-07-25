@@ -75,6 +75,8 @@ pub(crate) async fn serve_clients<C, H>(
     handle: Arc<Mutex<client::Handle<H>>>,
     token: Arc<Vec<u8>>,
     ctl_routes: Option<ForwardRoutes>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 ) -> Result<()>
 where
     C: ExclusiveChannel,
@@ -119,7 +121,10 @@ where
                 let active_clients = active_clients.clone();
                 let count_changed = count_changed.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref()).await {
+                    if let Err(e) =
+                        relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref(), tab_idle_color, tab_attention_color)
+                            .await
+                    {
                         // One client's session ending badly must not disturb the
                         // owner or its other clients (session isolation).
                         log_line!("isekai-ssh mux owner: a client session ended with an error: {e:#}");
@@ -169,6 +174,8 @@ pub(crate) async fn relay_client<Conn, H>(
     handle: &Mutex<client::Handle<H>>,
     expected_token: &[u8],
     ctl_routes: Option<&ForwardRoutes>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 ) -> Result<()>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -215,9 +222,17 @@ where
         // cleanup below re-locks the handle.
         let guard = handle.lock().await;
         match &ctl {
-            Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols as u32, rows as u32, &fwd.remote_path)
-                .await
-                .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client"),
+            Some(fwd) => ctl_forward::open_login_shell(
+                &guard,
+                &term,
+                cols as u32,
+                rows as u32,
+                &fwd.remote_path,
+                tab_idle_color,
+                tab_attention_color,
+            )
+            .await
+            .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client"),
             None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32, terminal_modes: vec![] })
                 .await
                 .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
@@ -579,7 +594,7 @@ mod tests {
         tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
-        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
 
         // One client connects, sends Hello, then immediately disconnects
         // (drops without Shutdown) — `relay_client`'s per-client task ends
@@ -621,7 +636,7 @@ mod tests {
         tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
-        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
 
         // First client connects then disconnects immediately.
         {
@@ -730,7 +745,7 @@ mod tests {
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         // Client sends Hello, then some stdin, then Shutdown.
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"correct-horse-battery-staple".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
@@ -772,7 +787,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION + 1, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
 
@@ -790,7 +805,7 @@ mod tests {
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"a-wrong-token".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
 
@@ -810,7 +825,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");
@@ -891,7 +906,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await
@@ -1001,7 +1016,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await
@@ -1188,7 +1203,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await
@@ -1327,7 +1342,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await

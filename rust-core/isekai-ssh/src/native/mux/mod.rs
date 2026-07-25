@@ -292,9 +292,16 @@ where
 {
     let token = Arc::new(write_owner_token(token_path)?);
     let cleanup_path = token_path.to_path_buf();
+    // Captured before `prepared` moves into `connect::run_prepared` below —
+    // `Option<(u8, u8, u8)>` is `Copy`, so this is a cheap read, not a clone
+    // of anything expensive.
+    let tab_idle_color = prepared.resolution().tab_idle_color();
+    let tab_attention_color = prepared.resolution().tab_attention_color();
     let hook: OwnerHook = Box::new(move |handle, ctl_routes| {
         tokio::spawn(async move {
-            if let Err(e) = owner::serve_clients(holder_channel, handle, token, ctl_routes).await {
+            if let Err(e) =
+                owner::serve_clients(holder_channel, handle, token, ctl_routes, tab_idle_color, tab_attention_color).await
+            {
                 log_line!("isekai-ssh mux holder: the client accept loop ended: {e:#}");
             }
         })
@@ -555,7 +562,9 @@ mod tests {
         let owner_channel = InMemoryChannel::try_claim(name).await.unwrap();
         let serve_token = token.clone();
         tokio::spawn(async move {
-            let _ = owner::serve_clients(owner_channel, Arc::new(tokio::sync::Mutex::new(handle)), serve_token, None).await;
+            let _ =
+                owner::serve_clients(owner_channel, Arc::new(tokio::sync::Mutex::new(handle)), serve_token, None, None, None)
+                    .await;
         });
 
         // A second try_claim must fail (owner exists) — the real dispatch's

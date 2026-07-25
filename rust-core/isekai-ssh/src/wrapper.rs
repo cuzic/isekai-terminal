@@ -344,6 +344,20 @@ impl WrapperResolution {
         self.isekai.ctl_socket_enabled
     }
 
+    /// `#@isekai tab-idle-color <rrggbb>` (Epic Q), already validated and
+    /// parsed at config-resolution time. Both the Unix (`ctl_forward.rs`,
+    /// same module) and native (`native/connect.rs`, `native/mux/owner.rs`)
+    /// paths need this to build the login-shell command's `export` clauses.
+    pub(crate) fn tab_idle_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_idle_color
+    }
+
+    /// `#@isekai tab-attention-color <rrggbb>` (Epic Q), `tab_idle_color`'s
+    /// counterpart.
+    pub(crate) fn tab_attention_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_attention_color
+    }
+
     /// `{hostname}:{port}` for this destination, using the same
     /// `HostName`/`port` fallback `resolve_isekai_config`'s own
     /// `default_target` uses (destination literal, port 22) — the native
@@ -614,7 +628,11 @@ async fn apply_ctl_socket_forward(
     if let Some(forward) = &ctl_forward {
         // Anything appended after the destination is the remote command, not
         // an option, to ssh(1).
-        command.arg(crate::ctl_forward::remote_command_arg(forward));
+        command.arg(crate::ctl_forward::remote_command_arg(
+            forward,
+            resolution.isekai.tab_idle_color,
+            resolution.isekai.tab_attention_color,
+        ));
     }
 }
 
