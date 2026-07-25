@@ -110,6 +110,16 @@ pub(crate) enum ExecError {
     /// 終了ステータスを受け取る前にチャネル/接続が閉じられた(実行中の切断)。
     #[error("ssh exec: connection closed before command completed")]
     ConnectionClosed,
+    /// [`RUN_EXEC_TIMEOUT`]以内に完了しなかった(リモートコマンドがハングした等)。
+    /// `ensure_tmux_tab_window`のような`#[uniffi::export]`のasyncメソッドが
+    /// これを挟まずに無期限にawaitし続けるのを防ぐ(opusレビューM2)。
+    #[error("ssh exec: timed out after {0:?}")]
+    Timeout(std::time::Duration),
+    /// 出力が[`RUN_EXEC_MAX_OUTPUT_BYTES`]を超えた(暴走したリモートコマンド等から
+    /// 無制限にメモリを確保し続けるのを防ぐ、`file_preview.rs`の
+    /// `FILE_PREVIEW_MAX_CAT_CHUNK_LEN`と同じ考え方)。
+    #[error("ssh exec: output exceeded {0} bytes")]
+    OutputTooLarge(usize),
 }
 
 /// tmux迂回control-plane(Epic M)のSSH streamlocal forwardチャネル1本から届いた
@@ -639,7 +649,25 @@ where
 /// `handle`のロックは新チャネルを開く一瞬だけ保持し、以降のI/O
 /// (`channel.exec`/`channel.wait`等)は取得済みの`Channel`に対して行う——
 /// インタラクティブシェル用の別チャネル(同じ`handle`を共有)には一切触れない。
+/// [`run_exec_on_handle`]の出力上限(`file_preview.rs`の
+/// `FILE_PREVIEW_MAX_CAT_CHUNK_LEN`と同じ考え方、こちらはtmux管理コマンド等の
+/// 短い出力しか想定していないため小さめの値にしてある)。
+pub(crate) const RUN_EXEC_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// [`run_exec_on_handle`]全体(チャネルオープン〜終了ステータス受信)のタイムアウト。
+pub(crate) const RUN_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) async fn run_exec_on_handle(
+    handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    command: &str,
+) -> Result<ExecOutput, ExecError> {
+    match tokio::time::timeout(RUN_EXEC_TIMEOUT, run_exec_on_handle_inner(handle, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(ExecError::Timeout(RUN_EXEC_TIMEOUT)),
+    }
+}
+
+async fn run_exec_on_handle_inner(
     handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     command: &str,
 ) -> Result<ExecOutput, ExecError> {
@@ -663,7 +691,12 @@ pub(crate) async fn run_exec_on_handle(
     let mut exit_status = None;
     loop {
         match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+            Some(ChannelMsg::Data { data }) => {
+                if stdout.len() + data.len() > RUN_EXEC_MAX_OUTPUT_BYTES {
+                    return Err(ExecError::OutputTooLarge(RUN_EXEC_MAX_OUTPUT_BYTES));
+                }
+                stdout.extend_from_slice(&data);
+            }
             Some(ChannelMsg::ExtendedData { data, .. }) => {
                 // stderrはログ用途のみ(呼び出し側にはstdoutのみ返す、タスク#61のスコープ)。
                 if let Ok(s) = std::str::from_utf8(&data) {
@@ -709,7 +742,7 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
         async move {
             match run_exec_on_handle(&handle, &cmd).await {
                 Ok(ExecOutput { stdout, exit_status }) => {
-                    if exit_status.is_some_and(|status| status != 0) {
+                    if !crate::tmux_locator::tmux_exit_status_is_success(exit_status) {
                         return Err(crate::tmux_locator::TmuxRunError(format!(
                             "command {cmd:?} exited with status {:?}",
                             exit_status
