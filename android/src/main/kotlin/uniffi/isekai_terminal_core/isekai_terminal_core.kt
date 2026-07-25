@@ -5238,6 +5238,31 @@ data class ScreenUpdate (
     var `bellGeneration`: kotlin.ULong
     , 
     /**
+     * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+     * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+     * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+     * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+     * 通知(タブバッジ・システム通知)を1回発火させること。
+     */
+    var `notifyGeneration`: kotlin.ULong
+    , 
+    /**
+     * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
+     */
+    var `notifyKind`: NotifyKind
+    , 
+    /**
+     * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+     * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
+     */
+    var `notifyTitle`: kotlin.String
+    , 
+    /**
+     * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
+     */
+    var `notifyBody`: kotlin.String
+    , 
+    /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
      */
     var `cursorShape`: CursorShape
@@ -5341,6 +5366,10 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterTypeNotifyKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5367,6 +5396,10 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`urxvtMouseMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
+            FfiConverterULong.allocationSize(value.`notifyGeneration`) +
+            FfiConverterTypeNotifyKind.allocationSize(value.`notifyKind`) +
+            FfiConverterString.allocationSize(value.`notifyTitle`) +
+            FfiConverterString.allocationSize(value.`notifyBody`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
             FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
             FfiConverterSequenceString.allocationSize(value.`linkTable`) +
@@ -5392,6 +5425,10 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`urxvtMouseMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
+            FfiConverterULong.write(value.`notifyGeneration`, buf)
+            FfiConverterTypeNotifyKind.write(value.`notifyKind`, buf)
+            FfiConverterString.write(value.`notifyTitle`, buf)
+            FfiConverterString.write(value.`notifyBody`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
             FfiConverterBoolean.write(value.`cursorBlink`, buf)
             FfiConverterSequenceString.write(value.`linkTable`, buf)
@@ -6583,6 +6620,46 @@ public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseRe
     override fun allocationSize(value: MouseReportingMode) = 4UL
 
     override fun write(value: MouseReportingMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * `isekai_protocol::ctl::NotifyKind`(uniffiに依存しないpure crate側の型)をUniFFI
+ * 境界越しに公開するための同型(`AI_INTEGRATION_DESIGN.md` §6.1、`ClipboardMimeKind`と
+ * 同じ理由でミラーが必要)。
+ */
+
+enum class NotifyKind {
+    
+    WAITING,
+    DONE,
+    INFO;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNotifyKind: FfiConverterRustBuffer<NotifyKind> {
+    override fun read(buf: ByteBuffer) = try {
+        NotifyKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: NotifyKind) = 4UL
+
+    override fun write(value: NotifyKind, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
