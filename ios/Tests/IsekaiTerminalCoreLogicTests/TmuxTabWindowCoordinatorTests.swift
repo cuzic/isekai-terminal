@@ -46,7 +46,8 @@ final class TmuxTabWindowCoordinatorTests: XCTestCase {
         func ensureTmuxTabWindow(
             profileIdentity: String,
             clientId: String,
-            existingTag: String?
+            existingTag: String?,
+            enableNotifications: Bool
         ) async throws -> TmuxTabWindowInfo {
             callCount += 1
             lastProfileIdentity = profileIdentity
@@ -202,7 +203,7 @@ final class TmuxTabWindowCoordinatorTests: XCTestCase {
 
     private final class FakeResolverThatThrows: TmuxTabWindowResolving {
         struct Failure: Error {}
-        func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) async throws -> TmuxTabWindowInfo {
+        func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Bool) async throws -> TmuxTabWindowInfo {
             throw Failure()
         }
     }

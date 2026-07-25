@@ -68,7 +68,8 @@ public protocol TmuxTabWindowResolving {
     func ensureTmuxTabWindow(
         profileIdentity: String,
         clientId: String,
-        existingTag: String?
+        existingTag: String?,
+        enableNotifications: Bool
     ) async throws -> TmuxTabWindowInfo
 }
 
@@ -103,12 +104,18 @@ public enum TmuxTabWindowCoordinator {
     ///   - clientIdentityStore/locatorStore: Apple専用実装(`UserDefaults`/GRDB)を
     ///     呼び出し側が注入する。
     ///   - makeId: テストからUUID生成を差し替えられるようにするためのフック。
+    ///   - enableNotifications: Android版`ConnectionProfile.enableTabNotifications`に
+    ///     相当するopt-in。iOS側にはまだ対応する通知UIが無い(`TerminalSessionController.
+    ///     onNotify`と同じくno-op)ため、呼び出し元は現状常に`false`を渡す。Rust側は
+    ///     これが`false`の間、リモートtmuxサーバーへの通知フック関連の書き込み
+    ///     (`set-option -g remain-on-exit on`等)を一切行わない(`tmux_notify.rs`参照)。
     public static func ensureWindow(
         profileId: Int64,
         resolver: TmuxTabWindowResolving,
         clientIdentityStore: ClientIdentityStore,
         locatorStore: TmuxTabLocatorStore,
-        makeId: () -> String = { UUID().uuidString }
+        makeId: () -> String = { UUID().uuidString },
+        enableNotifications: Bool = false
     ) async throws -> TmuxTabWindowResult {
         let profileIdentity = "profile:\(profileId)"
         let clientId = ClientIdentity.getOrCreate(store: clientIdentityStore, makeId: makeId)
@@ -116,7 +123,8 @@ public enum TmuxTabWindowCoordinator {
         let info = try await resolver.ensureTmuxTabWindow(
             profileIdentity: profileIdentity,
             clientId: clientId,
-            existingTag: existingTag
+            existingTag: existingTag,
+            enableNotifications: enableNotifications
         )
         try locatorStore.saveTag(info.tag, forProfileId: profileId)
         return TmuxTabWindowResult(label: "tmux:\(info.windowIndex)", info: info)
