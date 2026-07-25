@@ -158,6 +158,11 @@ impl ActiveSession {
     fn set_theme(&self, theme: crate::theme::Theme) {
         dispatch_all!(self, set_theme, theme)
     }
+    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート。`set_theme`と同じく
+    /// 全トランスポート共通。
+    fn set_panel_enabled(&self, enabled: bool) {
+        dispatch_all!(self, set_panel_enabled, enabled)
+    }
     /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
     /// 接続上で短命なexecコマンドを実行する。全トランスポート共通
     /// (`SessionCore::run_exec`)なので`add_local_forward`と違い対象外の分岐は無いが、
@@ -1636,6 +1641,17 @@ impl SessionOrchestrator {
         let theme = crate::theme::from_raw(ansi16, default_fg, default_bg);
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.set_theme(theme);
+        }
+    }
+
+    /// `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(`presentDocument`/
+    /// `presentForm`)を有効化/無効化する。既定はOFFで、Kotlin側
+    /// (`TerminalTabsViewModel`)が`ConnectionProfile.enableAiPanel`を接続確立ごとに
+    /// ここへ渡す(`set_session_theme`と同じ「値を保持せず接続ごとに送り直す」設計、
+    /// `SessionCore::set_panel_enabled`のdocコメント参照)。未接続時は無視される。
+    pub fn set_ai_panel_enabled(&self, enabled: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.set_panel_enabled(enabled);
         }
     }
 

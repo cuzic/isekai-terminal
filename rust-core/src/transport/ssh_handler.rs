@@ -183,6 +183,9 @@ pub(crate) enum SessionCmd {
     TrzszCancel        { transfer_id: String },
     /// Phase 12: per-session theme。以降にパースされるSGRの色解決にのみ反映される。
     SetTheme(Theme),
+    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート(既定OFF)。
+    /// `SessionOrchestrator::set_ai_panel_enabled`から`SetTheme`と同じ経路で配線される。
+    SetPanelEnabled(bool),
     /// OSのフォーカス変化(タスク#60)。フォーカスレポーティング(`?1004`)が有効な場合のみ
     /// `session_state::SessionState::notify_focus_change`がCSI I/CSI Oへエンコードする。
     FocusChanged(bool),

@@ -278,6 +278,12 @@ impl SessionState {
         self.terminal.set_theme(theme);
     }
 
+    /// `AI_INTEGRATION_DESIGN.md` §3のopt-inゲートを`Terminal`へ転送する。
+    /// `set_theme`と同じ`SessionCmd`経由の配線(`session.rs::handle_session_cmd`参照)。
+    pub(crate) fn set_panel_enabled(&mut self, enabled: bool) {
+        self.terminal.set_panel_enabled(enabled);
+    }
+
     /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)経由でリモートから
     /// 届いたタイトルを、OSC 0/2 のパースを経由せず直接反映する。次の`ScreenUpdate`に
     /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
