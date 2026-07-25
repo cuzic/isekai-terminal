@@ -153,6 +153,15 @@ data class ConnectionProfile(
     // セッション/プロトコル状態ではないため`rust-ssot.md`の対象外(Kotlin側に置いてよい)。
     @ColumnInfo(name = "enable_tab_notifications", defaultValue = "0")
     val enableTabNotifications: Boolean = false,
+    // `AI_INTEGRATION_DESIGN.md` §3/§6.2: リモートAPC経由の構造化パネル
+    // (presentDocument/presentForm)を受け付けるかのプロファイル単位opt-in設定。
+    // 既定OFF(§3「AI機能はすべて既定OFF(opt-in)」の必須設計制約——コードレビュー
+    // 2026-07-25で、このゲート自体が実装されておらずopt-inしていないユーザーにも
+    // 任意のリモートバイト列由来のダイアログが表示され得ることが判明し追加された)。
+    // `enableTabNotifications`と同じくRust側(`Terminal::panel_enabled`)へ
+    // 接続確立ごとに転送するだけの純粋なUI opt-in設定(`rust-ssot.md`の対象外)。
+    @ColumnInfo(name = "enable_ai_panel", defaultValue = "0")
+    val enableAiPanel: Boolean = false,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
