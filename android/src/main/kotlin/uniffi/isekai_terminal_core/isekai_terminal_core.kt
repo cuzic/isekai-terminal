@@ -4912,6 +4912,63 @@ public object FfiConverterTypePackedRow: FfiConverterRustBuffer<PackedRow> {
 
 
 /**
+ * `presentForm`パネル1フィールド分の定義。値そのものはKotlin/Compose側の
+ * UI状態としてのみ保持され、Rust側には(送信されるまで)戻ってこない
+ * (`AI_INTEGRATION_DESIGN.md` §6.2のフィードバック方針: PTY stdinへの
+ * 通常テキスト書き込みで返すのみで、専用の往復チャネルは持たない)。
+ */
+data class PanelField (
+    var `id`: kotlin.String
+    , 
+    var `label`: kotlin.String
+    , 
+    var `kind`: PanelFieldKind
+    , 
+    /**
+     * `kind == Choice`の時のみ意味を持つ選択肢一覧。`Text`の時は空。
+     */
+    var `options`: List<kotlin.String>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePanelField: FfiConverterRustBuffer<PanelField> {
+    override fun read(buf: ByteBuffer): PanelField {
+        return PanelField(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypePanelFieldKind.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PanelField) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`label`) +
+            FfiConverterTypePanelFieldKind.allocationSize(value.`kind`) +
+            FfiConverterSequenceString.allocationSize(value.`options`)
+    )
+
+    override fun write(value: PanelField, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`label`, buf)
+            FfiConverterTypePanelFieldKind.write(value.`kind`, buf)
+            FfiConverterSequenceString.write(value.`options`, buf)
+    }
+}
+
+
+
+/**
  * #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
  * (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
  * `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
@@ -5238,6 +5295,39 @@ data class ScreenUpdate (
     var `bellGeneration`: kotlin.ULong
     , 
     /**
+     * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
+     * 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
+     * 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
+     * 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
+     * 読んでパネルを再描画すること。
+     */
+    var `panelGeneration`: kotlin.ULong
+    , 
+    /**
+     * 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
+     * クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
+     * 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
+     * この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+     */
+    var `panelKind`: PanelKind
+    , 
+    /**
+     * パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
+     * 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+     */
+    var `panelTitle`: kotlin.String
+    , 
+    /**
+     * `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+     */
+    var `panelMarkdown`: kotlin.String
+    , 
+    /**
+     * `panel_kind == Form`の時のみ意味を持つフィールド一覧。
+     */
+    var `panelFields`: List<PanelField>
+    , 
+    /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
      */
     var `cursorShape`: CursorShape
@@ -5341,6 +5431,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterTypePanelKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceTypePanelField.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5367,6 +5462,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`urxvtMouseMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
+            FfiConverterULong.allocationSize(value.`panelGeneration`) +
+            FfiConverterTypePanelKind.allocationSize(value.`panelKind`) +
+            FfiConverterString.allocationSize(value.`panelTitle`) +
+            FfiConverterString.allocationSize(value.`panelMarkdown`) +
+            FfiConverterSequenceTypePanelField.allocationSize(value.`panelFields`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
             FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
             FfiConverterSequenceString.allocationSize(value.`linkTable`) +
@@ -5392,6 +5492,11 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`urxvtMouseMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
+            FfiConverterULong.write(value.`panelGeneration`, buf)
+            FfiConverterTypePanelKind.write(value.`panelKind`, buf)
+            FfiConverterString.write(value.`panelTitle`, buf)
+            FfiConverterString.write(value.`panelMarkdown`, buf)
+            FfiConverterSequenceTypePanelField.write(value.`panelFields`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
             FfiConverterBoolean.write(value.`cursorBlink`, buf)
             FfiConverterSequenceString.write(value.`linkTable`, buf)
@@ -6583,6 +6688,83 @@ public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseRe
     override fun allocationSize(value: MouseReportingMode) = 4UL
 
     override fun write(value: MouseReportingMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * [PanelField]の入力種別。テキスト自由入力か、[PanelField::options]からの選択か。
+ */
+
+enum class PanelFieldKind {
+    
+    TEXT,
+    CHOICE;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePanelFieldKind: FfiConverterRustBuffer<PanelFieldKind> {
+    override fun read(buf: ByteBuffer) = try {
+        PanelFieldKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PanelFieldKind) = 4UL
+
+    override fun write(value: PanelFieldKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2、`ai_panel.rs`)で提示された
+ * 構造化パネルの種別。`None`は「現在パネルなし」を表す既定値(`ScreenUpdate.panelKind`
+ * が`panelGeneration`の初期値0とペアで意味を持つ、`bellGeneration`と同じ規約)。
+ */
+
+enum class PanelKind {
+    
+    NONE,
+    DOCUMENT,
+    FORM;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePanelKind: FfiConverterRustBuffer<PanelKind> {
+    override fun read(buf: ByteBuffer) = try {
+        PanelKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: PanelKind) = 4UL
+
+    override fun write(value: PanelKind, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -8621,6 +8803,34 @@ public object FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer<List<Pac
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePackedRow.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypePanelField: FfiConverterRustBuffer<List<PanelField>> {
+    override fun read(buf: ByteBuffer): List<PanelField> {
+        val len = buf.getInt()
+        return List<PanelField>(len) {
+            FfiConverterTypePanelField.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<PanelField>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypePanelField.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<PanelField>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypePanelField.write(it, buf)
         }
     }
 }
