@@ -727,15 +727,20 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
     }
 }
 
-/// タスク#57: `isekai_protocol::NotifyKind`(uniffiに依存しないpure crate側の型)を
-/// `crate::NotifyKind`(UniFFI境界を越える側の型)へ変換する
-/// (`clipboard_mime_kind_from_protocol`と同じ理由・同じパターン)。
+/// `isekai_protocol::NotifyKind`(uniffiに依存しないpure crate側の型)と`crate::NotifyKind`
+/// (UniFFI境界を越える側の型)は同じ7種(tmux hook由来の4種+AI/汎用の3種、統合の経緯は
+/// `isekai_protocol::ctl::NotifyKind`のdocコメント参照)を表す別々の型なので、
+/// `clipboard_mime_kind_*`と同じ理由でこの関数が要る(host→deviceの一方向のみなので
+/// 変換関数も1つでよい)。
 fn notify_kind_from_protocol(kind: isekai_protocol::NotifyKind) -> NotifyKind {
     match kind {
         isekai_protocol::NotifyKind::Bell => NotifyKind::Bell,
         isekai_protocol::NotifyKind::Activity => NotifyKind::Activity,
         isekai_protocol::NotifyKind::Silence => NotifyKind::Silence,
         isekai_protocol::NotifyKind::JobDone => NotifyKind::JobDone,
+        isekai_protocol::NotifyKind::Waiting => NotifyKind::Waiting,
+        isekai_protocol::NotifyKind::Done => NotifyKind::Done,
+        isekai_protocol::NotifyKind::Info => NotifyKind::Info,
     }
 }
 
@@ -852,14 +857,30 @@ fn dispatch_transport_event(
             | isekai_protocol::CtlMessage::BuildRequest { .. }
             | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
             | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
-            // #57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
-            // `pane-died`、`tmux_notify.rs`がインストール)が発火した。フォアグラウンド
-            // +このタブ表示中の抑制判断・`(tmux_tag, seq)`重複排除は`orchestrator.rs`の
-            // `OrchestratorAdapter::on_notify`が行うため、ここでは変換して素通しする
-            // だけでよい。
-            isekai_protocol::CtlMessage::Notify { kind, tmux_tag, seq } => {
-                callback.on_notify(notify_kind_from_protocol(kind), tmux_tag, seq);
-                EventOutcome::Continue(None)
+            // `Notify`は2つの独立した系統を1つのワイヤーメッセージ・型として共有する
+            // (統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
+            // 2026-07-25)。kindでどちらの系統かを判別し、それぞれ既存の(互いに
+            // 独立な)配送経路へそのまま振り分ける——両者を無理に1つの配送経路へ
+            // 統合すると、片方がテスト済みの`orchestrator.rs`側dedup/抑制ロジックを
+            // 書き換えるリスクを負うため、ワイヤー形式のみ共有しRust側の内部配送は
+            // 意図的に分離したまま維持する:
+            // - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md`
+            //   §6.1): `title`/`body`を`Terminal`へ反映し`ScreenUpdate`経由でUIへ
+            //   届ける(`bell_generation`と同型の`notify_generation`カウンタ)。
+            // - tmux hook由来の通知(`Bell`/`Activity`/`Silence`/`JobDone`、#57):
+            //   フォアグラウンド+このタブ表示中の抑制判断・`(tmux_tag, seq)`重複排除は
+            //   `orchestrator.rs`の`OrchestratorAdapter::on_notify`が行うため、ここでは
+            //   変換して素通しするだけでよい。
+            isekai_protocol::CtlMessage::Notify { kind, tmux_tag, seq, title, body } => {
+                match notify_kind_from_protocol(kind) {
+                    ai_kind @ (NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info) => {
+                        EventOutcome::Continue(Some(state.notify_from_ctl(ai_kind, title, body)))
+                    }
+                    tmux_kind => {
+                        callback.on_notify(tmux_kind, tmux_tag, seq);
+                        EventOutcome::Continue(None)
+                    }
+                }
             }
         },
         TransportEvent::ClipboardPullRequestOverCtl(reply) => {

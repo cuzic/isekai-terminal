@@ -253,6 +253,10 @@ impl SessionState {
             urxvt_mouse_mode: t.urxvt_mouse_mode(),
             cursor_visible: t.cursor_visible(),
             bell_generation: t.bell_generation(),
+            notify_generation: t.notify_generation(),
+            notify_kind: t.notify_kind(),
+            notify_title: t.notify_title().to_owned(),
+            notify_body: t.notify_body().to_owned(),
             cursor_shape: t.cursor_shape(),
             cursor_blink: t.cursor_blink(),
             link_table: t.link_table().to_vec(),
@@ -274,6 +278,15 @@ impl SessionState {
     /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
     pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
         self.terminal.set_title(title);
+        ProcessResult { screen_dirty: true, ..Default::default() }
+    }
+
+    /// ctlソケット(`isekai-protocol::CtlMessage::Notify`、`AI_INTEGRATION_DESIGN.md`
+    /// §6.1)経由でリモートから届いた注目通知を`Terminal`へ反映する。`set_title_from_ctl`
+    /// と同じパターン: `notify_generation`を進めて次の`ScreenUpdate`に乗せ、
+    /// `screen_dirty`を立てて`onScreenUpdate`まで届かせる。
+    pub(crate) fn notify_from_ctl(&mut self, kind: crate::NotifyKind, title: String, body: String) -> ProcessResult {
+        self.terminal.set_notify(kind, title, body);
         ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
@@ -549,6 +562,33 @@ mod tests {
         assert!(r.side_effects.is_empty());
         assert!(r.timer_cmds.is_empty());
         assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn notify_from_ctl_reflects_in_terminal_and_marks_screen_dirty() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        assert_eq!(state.terminal().notify_generation(), 0);
+
+        let r = state.notify_from_ctl(crate::NotifyKind::Waiting, "needs input".to_string(), "sudo?".to_string());
+
+        assert_eq!(state.terminal().notify_generation(), 1);
+        assert_eq!(state.terminal().notify_kind(), crate::NotifyKind::Waiting);
+        assert_eq!(state.terminal().notify_title(), "needs input");
+        assert_eq!(state.terminal().notify_body(), "sudo?");
+        assert!(r.screen_dirty);
+        assert!(r.side_effects.is_empty());
+        assert!(r.timer_cmds.is_empty());
+        assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn notify_from_ctl_generation_is_monotonic_across_calls() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.notify_from_ctl(crate::NotifyKind::Info, "a".to_string(), String::new());
+        state.notify_from_ctl(crate::NotifyKind::Done, "b".to_string(), String::new());
+        assert_eq!(state.terminal().notify_generation(), 2);
+        assert_eq!(state.terminal().notify_kind(), crate::NotifyKind::Done);
+        assert_eq!(state.terminal().notify_title(), "b");
     }
 
     #[test]

@@ -3547,6 +3547,27 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var bellGeneration: UInt64
     /**
+     * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+     * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+     * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+     * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+     * 通知(タブバッジ・システム通知)を1回発火させること。
+     */
+    public var notifyGeneration: UInt64
+    /**
+     * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
+     */
+    public var notifyKind: NotifyKind
+    /**
+     * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+     * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
+     */
+    public var notifyTitle: String
+    /**
+     * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
+     */
+    public var notifyBody: String
+    /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
      */
     public var cursorShape: CursorShape
@@ -3665,6 +3686,23 @@ public struct ScreenUpdate: Equatable, Hashable {
          * (`ESC]0;title BEL`)はカウントされない。
          */bellGeneration: UInt64, 
         /**
+         * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+         * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+         * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+         * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+         * 通知(タブバッジ・システム通知)を1回発火させること。
+         */notifyGeneration: UInt64, 
+        /**
+         * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
+         */notifyKind: NotifyKind, 
+        /**
+         * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+         * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
+         */notifyTitle: String, 
+        /**
+         * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
+         */notifyBody: String, 
+        /**
          * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
          */cursorShape: CursorShape, 
         /**
@@ -3741,6 +3779,10 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.urxvtMouseMode = urxvtMouseMode
         self.cursorVisible = cursorVisible
         self.bellGeneration = bellGeneration
+        self.notifyGeneration = notifyGeneration
+        self.notifyKind = notifyKind
+        self.notifyTitle = notifyTitle
+        self.notifyBody = notifyBody
         self.cursorShape = cursorShape
         self.cursorBlink = cursorBlink
         self.linkTable = linkTable
@@ -3781,6 +3823,10 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 urxvtMouseMode: FfiConverterBool.read(from: &buf), 
                 cursorVisible: FfiConverterBool.read(from: &buf), 
                 bellGeneration: FfiConverterUInt64.read(from: &buf), 
+                notifyGeneration: FfiConverterUInt64.read(from: &buf), 
+                notifyKind: FfiConverterTypeNotifyKind.read(from: &buf), 
+                notifyTitle: FfiConverterString.read(from: &buf), 
+                notifyBody: FfiConverterString.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
                 cursorBlink: FfiConverterBool.read(from: &buf), 
                 linkTable: FfiConverterSequenceString.read(from: &buf), 
@@ -3807,6 +3853,10 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.urxvtMouseMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
+        FfiConverterUInt64.write(value.notifyGeneration, into: &buf)
+        FfiConverterTypeNotifyKind.write(value.notifyKind, into: &buf)
+        FfiConverterString.write(value.notifyTitle, into: &buf)
+        FfiConverterString.write(value.notifyBody, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
         FfiConverterBool.write(value.cursorBlink, into: &buf)
         FfiConverterSequenceString.write(value.linkTable, into: &buf)
@@ -5322,10 +5372,12 @@ public func FfiConverterTypeMouseReportingMode_lower(_ value: MouseReportingMode
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
- * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
- * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
- * なので、その型をUniFFI境界越しにそのまま公開できない)。
+ * `isekai_protocol::ctl::NotifyKind`(uniffiに依存しないpure crate側の型)をUniFFI
+ * 境界越しに公開するための同型(`ClipboardMimeKind`と同じ理由でミラーが必要)。
+ * tmux hook由来の4種(タスク#57: `alert-bell`/`alert-activity`/`alert-silence`/
+ * `pane-died`)とAI/汎用の注目通知の3種(`AI_INTEGRATION_DESIGN.md` §6.1)を1つの
+ * enumで表す(統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
+ * 2026-07-25)。
  */
 
 public enum NotifyKind: Equatable, Hashable {
@@ -5334,6 +5386,9 @@ public enum NotifyKind: Equatable, Hashable {
     case activity
     case silence
     case jobDone
+    case waiting
+    case done
+    case info
 
 
 
@@ -5363,6 +5418,12 @@ public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
         
         case 4: return .jobDone
         
+        case 5: return .waiting
+        
+        case 6: return .done
+        
+        case 7: return .info
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -5385,6 +5446,18 @@ public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
         
         case .jobDone:
             writeInt(&buf, Int32(4))
+        
+        
+        case .waiting:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .done:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .info:
+            writeInt(&buf, Int32(7))
         
         }
     }

@@ -21,6 +21,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
 
@@ -74,6 +75,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
 
@@ -111,6 +113,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
+                notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
                 cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
             view.apply(update)
@@ -165,6 +168,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -193,6 +197,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: true, bellGeneration: 0,
+                notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
                 cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
             view.apply(update)
@@ -217,6 +222,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -248,6 +254,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -283,6 +290,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -316,6 +324,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -350,6 +359,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -383,6 +393,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
@@ -655,6 +666,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
+                notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
                 cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
         }
@@ -1095,6 +1107,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: 0,
+            notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
             cursorShape: .block, cursorBlink: false, linkTable: [], images: images,
             kittyKeyboardFlags: 0, dirtyRows: dirtyRows
         )

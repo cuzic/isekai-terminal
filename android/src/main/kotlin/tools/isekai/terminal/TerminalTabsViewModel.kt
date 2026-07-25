@@ -253,11 +253,21 @@ class TerminalTabsViewModel(
                     val vibrator = app.getSystemService(Vibrator::class.java)
                     vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
-                // タスク#57: tmux hook発火。「見せるべきか」の判断はRust側で済んでおり、
-                // ここでは(a) このプロファイルのopt-in設定、(b) 通知権限、の2つの確認と
-                // 実際のpostだけを行う(`TabAlertNotifier`参照)。通知は同じプロファイルの
-                // 複数タブで1枠に集約する(profile.idをキーにする、`rust-ssot.md`の対象外
-                // ——UI表示上の判断)。
+                // `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由のAI/汎用の注目通知
+                // (kindが`Waiting`/`Done`/`Info`)。判断(取りこぼし無く1回だけ発火させる
+                // `notifyGeneration`の単調増加チェック)は[TerminalSession]側で完結しており、
+                // ここでは実際の副作用注入のみを行う(`onBell`と同じ構成)。タブバーのバッジ
+                // 表示・バックグラウンド時のシステム通知は未実装(別タスク)のため、現時点
+                // ではログ出力のみ——`onNotify`自体を配線し忘れて既定no-opのまま放置される
+                // (Codexレビュー2026-07-25で指摘)のを避けるための最低限の接続。
+                onNotify = { kind, title, body ->
+                    RemoteLogger.i("IsekaiTerminalNotify", "[$kind] $title: $body")
+                },
+                // タスク#57: tmux hook発火(kindが`Bell`/`Activity`/`Silence`/`JobDone`)。
+                // 「見せるべきか」の判断はRust側で済んでおり、ここでは(a) このプロファイルの
+                // opt-in設定、(b) 通知権限、の2つの確認と実際のpostだけを行う
+                // (`TabAlertNotifier`参照)。通知は同じプロファイルの複数タブで1枠に集約する
+                // (profile.idをキーにする、`rust-ssot.md`の対象外——UI表示上の判断)。
                 onNotifyRequested = { kind ->
                     TabAlertNotifier.notify(
                         context = app,

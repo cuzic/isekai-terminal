@@ -84,6 +84,16 @@ pub const MAX_BUILD_RESULT_PATHS: usize = 64;
 /// Cap on a single `result_paths` entry's byte length.
 pub const MAX_BUILD_RESULT_PATH_LEN: usize = 4 * 1024;
 
+/// Cap on a `notify`'s `title` byte length (`AI_INTEGRATION_DESIGN.md` §6.1).
+/// Shares `MAX_VAR_KEY_LEN`'s order of magnitude: this is a short
+/// notification-bar-style label, not body text.
+pub const MAX_NOTIFY_TITLE_LEN: usize = 256;
+
+/// Cap on a `notify`'s `body` byte length. Shares `MAX_CLIPBOARD_TEXT_DECODED_LEN`'s
+/// order of magnitude — enough for a few lines of hook output, not a full
+/// screen dump (which would defeat the point of a short attention ping).
+pub const MAX_NOTIFY_BODY_LEN: usize = 64 * 1024;
+
 /// Scope a `setvar`/`getvar` key is stored/looked up under. Resolved by
 /// whichever process hosts the receiving end of the ctl-socket-forward
 /// channel (the `isekai-ssh` CLI wrapper, or the isekai-terminal Android app's
@@ -140,6 +150,14 @@ impl ClipboardMime {
 /// Android-side consumer maps each kind to a distinct notification
 /// channel/icon, and a free-form string would make new spellings silently
 /// fall through to "unrecognized" instead of failing to compile.
+///
+/// Two independent families share this one enum/wire message
+/// (`AI_INTEGRATION_DESIGN.md` §6.1で当初別々に設計されていたが、#57のtmux hook通知
+/// と`op":"notify"`ワイヤータグ・型名が衝突したため統合した、2026-07-25):
+/// `Bell`/`Activity`/`Silence`/`JobDone`(tmux hook由来、`CtlMessage::Notify`の
+/// `tmux_tag`/`seq`と対で意味を持つ)と`Waiting`/`Done`/`Info`(AI/汎用の注目通知、
+/// `title`/`body`と対で意味を持つ)。`validate_ctl_message`のこの enum に対する
+/// 分岐がどちらの組かで検証対象フィールドを切り替える。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotifyKind {
     /// tmux `alert-bell` hook (BEL / visual bell in a pane; NOT a hook named
@@ -172,6 +190,19 @@ pub enum NotifyKind {
     /// name addressed it.
     #[serde(rename = "job_done")]
     JobDone,
+    /// The remote side is blocked on user input (e.g. a Claude Code
+    /// `Notification` hook firing for a permission prompt). AI/汎用の注目通知
+    /// (`AI_INTEGRATION_DESIGN.md` §6.1)——`tmux_tag`/`seq`でなく`title`/`body`と
+    /// 対で意味を持つ。
+    #[serde(rename = "waiting")]
+    Waiting,
+    /// The remote side finished what it was doing (e.g. a Claude Code `Stop`
+    /// hook).
+    #[serde(rename = "done")]
+    Done,
+    /// Anything that doesn't fit `Waiting`/`Done`.
+    #[serde(rename = "info")]
+    Info,
 }
 
 /// One message exchanged over a tab's control-plane UNIX domain socket.
@@ -184,6 +215,62 @@ pub enum NotifyKind {
 pub enum CtlMessage {
     #[serde(rename = "title")]
     SetTitle { value: String },
+    /// host → device: ask the device to surface an attention notification.
+    /// Two independent families share this one variant (統合の経緯は`NotifyKind`
+    /// のdocコメント参照、2026-07-25):
+    /// - tmux hook由来(`Bell`/`Activity`/`Silence`/`JobDone`、#57): something
+    ///   happened in a tmux pane/window the device isn't currently viewing.
+    ///   `tmux_tag`/`seq`が意味を持ち、`title`/`body`は空。
+    /// - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md`
+    ///   §6.1): Intended for hooks (e.g. Claude Code's
+    ///   `UserPromptSubmit`/`Stop`/`Notification`) running in a tab the user
+    ///   isn't currently looking at. `title`/`body`が意味を持ち、`tmux_tag`/`seq`
+    ///   は空/0。Deliberately carries no execution privilege: the device only
+    ///   ever renders `title`/`body` as text, never evaluates them.
+    ///
+    /// Fire-and-forget, same as `SetTitle` — no response is expected or sent.
+    /// Never sent device → host — there's no response variant.
+    #[serde(rename = "notify")]
+    Notify {
+        kind: NotifyKind,
+        /// The stable tag identifying which pane/window this fired in
+        /// (tmux kinds only, see `NotifyKind`). This is the *same* tag string
+        /// `tmux_locator::TmuxTag` already mints and stores as a tmux
+        /// user-option — deliberately not a new identifier scheme. Carried as
+        /// a plain `String` rather than the `TmuxTag` newtype itself:
+        /// `TmuxTag` lives in the top-level `rust-core` crate, which depends
+        /// on `isekai-protocol` (not the reverse), so reusing it here would
+        /// be a cyclic dependency. Callers convert at the boundary, the same
+        /// way `session.rs` already converts between
+        /// `isekai_protocol::ClipboardMime` and `crate::ClipboardMimeKind`.
+        /// Empty for AI kinds — `#[serde(default)]` so an AI-only sender
+        /// (`isekai-pipe ctl notify --kind waiting <title> <body>`, no
+        /// `--tag`) can omit it entirely.
+        #[serde(default)]
+        tmux_tag: String,
+        /// Sender-maintained counter, monotonically increasing per
+        /// `tmux_tag` (tmux kinds only, see `NotifyKind`; not global, and
+        /// deliberately not wall-clock-based: host and device don't share a
+        /// clock, and re-running a test twice should produce identical
+        /// bytes). Lets a receiver that already saw the same
+        /// `(tmux_tag, seq)` pair drop a duplicate delivery — tmux can
+        /// re-fire a hook (e.g. re-attaching a session re-runs
+        /// `set-hook`-installed triggers) and #57's transport may itself
+        /// retry — without needing any per-connection state to detect it.
+        /// `0` (meaningless) for AI kinds — `#[serde(default)]`, same reason
+        /// as `tmux_tag`.
+        #[serde(default)]
+        seq: u64,
+        /// AI kinds only, see `NotifyKind`. Empty for tmux kinds —
+        /// `#[serde(default)]` so a tmux hook sender (`isekai-pipe ctl notify
+        /// --kind bell --tag <tag> --seq <n>`) can omit it entirely.
+        #[serde(default)]
+        title: String,
+        /// AI kinds only, see `NotifyKind`. Empty for tmux kinds, same
+        /// `#[serde(default)]` reason as `title`.
+        #[serde(default)]
+        body: String,
+    },
     /// host → device: set this tab's background color (Windows Terminal via
     /// OSC 4 palette-index 264, see `isekai-ssh::ctl_forward::osc_sequence_for`;
     /// a harmless no-op on platforms/terminals with no equivalent). Fire-and-
@@ -204,37 +291,6 @@ pub enum CtlMessage {
     ClipboardPullResponse {
         mime: ClipboardMime,
         data_b64: String,
-    },
-    /// host → device: something happened in a tmux pane/window the device
-    /// isn't currently viewing (#57: tmux hooks running on the host →
-    /// Android notifications; this crate only defines the wire type, #57
-    /// wires up the hook script that emits it and the Android
-    /// notification it produces). Never sent device → host — there's no
-    /// response variant.
-    #[serde(rename = "notify")]
-    Notify {
-        kind: NotifyKind,
-        /// The stable tag identifying which pane/window this fired in.
-        /// This is the *same* tag string `tmux_locator::TmuxTag` already
-        /// mints and stores as a tmux user-option — deliberately not a
-        /// new identifier scheme. Carried as a plain `String` rather than
-        /// the `TmuxTag` newtype itself: `TmuxTag` lives in the top-level
-        /// `rust-core` crate, which depends on `isekai-protocol` (not the
-        /// reverse), so reusing it here would be a cyclic dependency.
-        /// Callers convert at the boundary, the same way `session.rs`
-        /// already converts between `isekai_protocol::ClipboardMime` and
-        /// `crate::ClipboardMimeKind`.
-        tmux_tag: String,
-        /// Sender-maintained counter, monotonically increasing per
-        /// `tmux_tag` (not global, and deliberately not wall-clock-based:
-        /// host and device don't share a clock, and re-running a test
-        /// twice should produce identical bytes). Lets a receiver that
-        /// already saw the same `(tmux_tag, seq)` pair drop a duplicate
-        /// delivery — tmux can re-fire a hook (e.g. re-attaching a
-        /// session re-runs `set-hook`-installed triggers) and #57's
-        /// transport may itself retry — without needing any per-connection
-        /// state to detect it.
-        seq: u64,
     },
     /// host → device: store `value` under `key` in the given scope's shared
     /// KV store (task #16, `isekai-pipe ctl setvar`). Fire-and-forget, same
@@ -321,7 +377,40 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
             validate_clipboard_payload(*mime, data_b64)
         }
         CtlMessage::ClipboardPullRequest {} => Ok(()),
-        CtlMessage::Notify { tmux_tag, .. } => validate_notify_tag(tmux_tag),
+        // kindがtmux由来かAI/汎用かで検証対象フィールドを切り替える
+        // (`NotifyKind`/`CtlMessage::Notify`のdocコメント参照、統合の経緯)。
+        CtlMessage::Notify { kind, tmux_tag, title, body, .. } => match kind {
+            NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => {
+                validate_notify_tag(tmux_tag)
+            }
+            NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
+                if title.is_empty() {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "title",
+                        reason: "must be non-empty".to_string(),
+                    });
+                }
+                if title.len() > MAX_NOTIFY_TITLE_LEN {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "title",
+                        reason: format!(
+                            "is {} bytes, exceeding the {MAX_NOTIFY_TITLE_LEN} byte limit",
+                            title.len()
+                        ),
+                    });
+                }
+                if body.len() > MAX_NOTIFY_BODY_LEN {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "body",
+                        reason: format!(
+                            "is {} bytes, exceeding the {MAX_NOTIFY_BODY_LEN} byte limit",
+                            body.len()
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        },
         CtlMessage::SetVar { key, value, .. } => {
             validate_var_key(key)?;
             if value.len() > MAX_VAR_VALUE_LEN {
@@ -505,6 +594,93 @@ mod tests {
     }
 
     #[test]
+    fn decodes_notify() {
+        let json = br#"{"op":"notify","kind":"waiting","title":"needs input","body":"sudo password?"}"#;
+        let msg = decode_ctl_message(json).unwrap();
+        assert_eq!(
+            msg,
+            CtlMessage::Notify {
+                kind: NotifyKind::Waiting,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "needs input".to_string(),
+                body: "sudo password?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_notify_done_and_info_kinds() {
+        let done = br#"{"op":"notify","kind":"done","title":"finished","body":""}"#;
+        assert_eq!(
+            decode_ctl_message(done).unwrap(),
+            CtlMessage::Notify {
+                kind: NotifyKind::Done,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "finished".to_string(),
+                body: String::new(),
+            }
+        );
+
+        let info = br#"{"op":"notify","kind":"info","title":"fyi","body":"just an fyi"}"#;
+        assert_eq!(
+            decode_ctl_message(info).unwrap(),
+            CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "fyi".to_string(),
+                body: "just an fyi".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_notify_with_empty_title() {
+        let json = br#"{"op":"notify","kind":"info","title":"","body":"x"}"#;
+        let err = decode_ctl_message(json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_notify_with_oversized_title() {
+        let json = serde_json::to_vec(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: "x".repeat(MAX_NOTIFY_TITLE_LEN + 1),
+            body: String::new(),
+        })
+        .unwrap();
+        let err = decode_ctl_message(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_notify_with_oversized_body() {
+        let json = serde_json::to_vec(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: "t".to_string(),
+            body: "x".repeat(MAX_NOTIFY_BODY_LEN + 1),
+        })
+        .unwrap();
+        let err = decode_ctl_message(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "body", .. }
+        ));
+    }
+
+    #[test]
     fn decodes_clipboard_push_text_plain() {
         let json = br#"{"op":"clip_push","mime":"text/plain","data_b64":"aGVsbG8="}"#;
         let msg = decode_ctl_message(json).unwrap();
@@ -634,6 +810,8 @@ mod tests {
                 kind: NotifyKind::Bell,
                 tmux_tag: "abc123".to_string(),
                 seq: 0,
+                title: String::new(),
+                body: String::new(),
             }
         );
     }
@@ -731,7 +909,13 @@ mod tests {
             (NotifyKind::Silence, "silence"),
             (NotifyKind::JobDone, "job_done"),
         ] {
-            let msg = CtlMessage::Notify { kind, tmux_tag: "tag".to_string(), seq: 7 };
+            let msg = CtlMessage::Notify {
+                kind,
+                tmux_tag: "tag".to_string(),
+                seq: 7,
+                title: String::new(),
+                body: String::new(),
+            };
             let encoded = serde_json::to_string(&msg).unwrap();
             assert!(
                 encoded.contains(&format!("\"kind\":\"{rendered}\"")),
@@ -744,7 +928,13 @@ mod tests {
 
     #[test]
     fn rejects_notify_with_empty_tag() {
-        let msg = CtlMessage::Notify { kind: NotifyKind::Bell, tmux_tag: String::new(), seq: 0 };
+        let msg = CtlMessage::Notify {
+            kind: NotifyKind::Bell,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: String::new(),
+            body: String::new(),
+        };
         let err = validate_ctl_message(&msg).unwrap_err();
         assert!(matches!(
             err,
@@ -758,6 +948,8 @@ mod tests {
             kind: NotifyKind::Activity,
             tmux_tag: "a".repeat(MAX_NOTIFY_TAG_LEN + 1),
             seq: 0,
+            title: String::new(),
+            body: String::new(),
         };
         let err = validate_ctl_message(&msg).unwrap_err();
         assert!(matches!(
@@ -772,6 +964,8 @@ mod tests {
             kind: NotifyKind::Silence,
             tmux_tag: "a".repeat(MAX_NOTIFY_TAG_LEN),
             seq: 0,
+            title: String::new(),
+            body: String::new(),
         };
         validate_ctl_message(&msg).unwrap();
     }

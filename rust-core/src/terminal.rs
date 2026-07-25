@@ -3,7 +3,7 @@ use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
-use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, TerminalKeyModifiers};
+use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, NotifyKind, TerminalKeyModifiers};
 
 /// Sixel(タスク#42)の名目セルサイズ(ピクセル)。実フォントのピクセルサイズは
 /// このRustコアには分からない(Android/iOSの実描画レイヤーのみが知っている)ため、
@@ -432,6 +432,17 @@ pub(crate) struct Terminal {
     /// ターミネータとして消費し `execute` には渡らないため、ここではカウントされない
     /// (この仕様はテストで明記する)。
     bell_generation: u64,
+    /// `CtlMessage::Notify`(`AI_INTEGRATION_DESIGN.md` §6.1、ctlソケット経由でリモート
+    /// から届く注目通知)を受信するたびに単調増加するカウンタ。`bell_generation`と同じ
+    /// 理由(conflatedチャネルでの取りこぼし検知・二重フィードバック防止)で、bool ではなく
+    /// 世代カウンタにしてある。呼び出し側は前回値と比較し、進んでいれば`notify_kind`/
+    /// `notify_title`/`notify_body`(＝直近のNotify1件分)を読んで通知を1回発火させる。
+    notify_generation: u64,
+    /// 直近受信した`Notify`の種別・タイトル・本文。`notify_generation`が進んでいない間は
+    /// 意味を持たない(前回発火済み)。
+    notify_kind: NotifyKind,
+    notify_title: String,
+    notify_body: String,
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     cursor_shape: CursorShape,
     /// カーソルが点滅すべきか。DECSCUSRのパラメータ(奇数=blink/偶数=steady、
@@ -799,6 +810,10 @@ impl Terminal {
             focus_reporting_mode: false,
             cursor_visible: true,
             bell_generation: 0,
+            notify_generation: 0,
+            notify_kind: NotifyKind::Info,
+            notify_title: String::new(),
+            notify_body: String::new(),
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             autowrap_mode: true,
@@ -912,6 +927,22 @@ impl Terminal {
     pub(crate) fn urxvt_mouse_mode(&self) -> bool { self.urxvt_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
+    pub(crate) fn notify_generation(&self) -> u64 { self.notify_generation }
+    pub(crate) fn notify_kind(&self) -> NotifyKind { self.notify_kind }
+    pub(crate) fn notify_title(&self) -> &str { &self.notify_title }
+    pub(crate) fn notify_body(&self) -> &str { &self.notify_body }
+
+    /// ctlソケット経由で届いた`CtlMessage::Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)を
+    /// 反映する。`set_title`と同じく、OSC/エスケープシーケンスのパースを経由せず外部
+    /// (`isekai-protocol`のctlチャネル)から直接呼ばれる。`notify_generation`を
+    /// `saturating_add`で単調増加させる(`bell_generation`と同じ周回対策、u64::MAXから
+    /// 0への周回で後退しないようにする)。
+    pub(crate) fn set_notify(&mut self, kind: NotifyKind, title: String, body: String) {
+        self.notify_generation = self.notify_generation.saturating_add(1);
+        self.notify_kind = kind;
+        self.notify_title = title;
+        self.notify_body = body;
+    }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
     pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
     /// DECAWM(`CSI ?7h`/`CSI ?7l`)の現在値。テスト・`print()`から参照する。

@@ -30,6 +30,7 @@ import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.TerminalSession
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TmuxSessionException
 import uniffi.isekai_terminal_core.TransportPreference
@@ -553,7 +554,7 @@ class TerminalTabsViewModelTest {
     private fun screenUpdate(applicationCursorMode: Boolean, kittyKeyboardFlags: UShort = 0u) =
         ScreenUpdate(
             0u, 80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, false,
-            MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
+            MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(),
             emptyList(), kittyKeyboardFlags, null,
         )
 
