@@ -253,6 +253,11 @@ impl SessionState {
             urxvt_mouse_mode: t.urxvt_mouse_mode(),
             cursor_visible: t.cursor_visible(),
             bell_generation: t.bell_generation(),
+            panel_generation: t.panel_generation(),
+            panel_kind: t.panel_kind(),
+            panel_title: t.panel_title().to_owned(),
+            panel_markdown: t.panel_markdown().to_owned(),
+            panel_fields: t.panel_fields().to_vec(),
             cursor_shape: t.cursor_shape(),
             cursor_blink: t.cursor_blink(),
             link_table: t.link_table().to_vec(),
@@ -405,7 +410,7 @@ impl SessionState {
                                 self.parser.advance(&mut self.terminal, b);
                             }
                             ApcStep::Consume => {}
-                            ApcStep::Apc(payload) => self.terminal.dispatch_kitty_apc(&payload),
+                            ApcStep::Apc(payload) => self.terminal.dispatch_apc(&payload),
                         }
                     }
                     screen_dirty = true;

@@ -1,5 +1,6 @@
 package tools.isekai.terminal.session
 
+import tools.isekai.terminal.AiPanelUiState
 import tools.isekai.terminal.HostKeyChangedWarning
 import tools.isekai.terminal.PromptJumpResult
 import tools.isekai.terminal.PromptOutputCopyResult
@@ -132,6 +133,52 @@ class TerminalSession(
             lastFiredBellGeneration.set(update.bellGeneration.toLong())
             onBell()
         }
+    }
+
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §6.2: 直近反映した`ScreenUpdate.panelGeneration`。
+     * [lastFiredBellGeneration]と同じdedupe用の記憶だが、こちらは「1回だけ発火する
+     * 副作用」ではなく「ユーザーが明示的に閉じるまで表示し続けるUI状態」を切り替える
+     * ため、`dismissAiPanel()`はこの値を戻さない(同じ世代のパネルが再度湧いて
+     * 出ないようにする一方、次に届く新しい世代のパネルは正しく表示される)。
+     */
+    private val lastAppliedPanelGeneration = AtomicLong(0)
+
+    /** [onScreenUpdate]の消費ループから呼ぶ。`panelGeneration`が進んでいれば
+     *  `_state.aiPanel`を更新する。`PanelKind.NONE`(未提示)の間は何もしない。 */
+    private fun maybeApplyPanel(update: ScreenUpdate) {
+        val prev = lastAppliedPanelGeneration.get()
+        if (update.panelGeneration > prev.toULong() && update.panelKind != uniffi.isekai_terminal_core.PanelKind.NONE) {
+            lastAppliedPanelGeneration.set(update.panelGeneration.toLong())
+            _state.update {
+                it.copy(
+                    aiPanel = AiPanelUiState(
+                        kind = update.panelKind,
+                        title = update.panelTitle,
+                        markdown = update.panelMarkdown,
+                        fields = update.panelFields,
+                    ),
+                )
+            }
+        }
+    }
+
+    /** ユーザーがパネルを閉じた(送信せずに閉じた、または送信後の後始末)。
+     *  [lastAppliedPanelGeneration]はリセットしない(§上のdocコメント参照)。 */
+    fun dismissAiPanel() {
+        _state.update { it.copy(aiPanel = null) }
+    }
+
+    /**
+     * `presentForm`パネルの送信。フォーム入力値はRust側へ返す専用チャネルを持たず、
+     * `AI_INTEGRATION_DESIGN.md` §6.2の方針通りPTYへの通常のstdin文字列書き込みで
+     * 返す(1行のJSON、末尾に改行)。信頼境界: 送信内容はあくまで表示専用パネルへの
+     * ユーザー入力であり、Rust/Kotlinどちらの側でも実行・評価はしない。
+     */
+    fun submitAiPanelForm(values: Map<String, String>) {
+        val json = org.json.JSONObject(values as Map<*, *>).toString()
+        send((json + "\n").toByteArray(Charsets.UTF_8))
+        dismissAiPanel()
     }
 
     // SSH agent forwarding: 署名要求ごとにユーザー確認を待つための橋渡し。
@@ -306,6 +353,7 @@ class TerminalSession(
                 if (_state.value.connected) {
                     _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
                     maybeFireBell(update)
+                    maybeApplyPanel(update)
                 }
             }
         }
@@ -329,6 +377,10 @@ class TerminalSession(
         // リセットすることで、この直後の`connect()`が(ハンドシェイクを経て)新しい
         // `Terminal`での最初の`ScreenUpdate`を届け始めるより確実に先行させる。
         lastFiredBellGeneration.set(0)
+        // `AI_INTEGRATION_DESIGN.md` §6.2: 新しい論理セッションでは前回接続の
+        // パネル世代・表示中パネルを引き継がない([lastFiredBellGeneration]と同じ理由)。
+        lastAppliedPanelGeneration.set(0)
+        _state.update { it.copy(aiPanel = null) }
         // CONFLATEDチャネルに旧セッションの`ScreenUpdate`(高い`bellGeneration`)が
         // まだ未消費のまま残っている稀なケース(旧`onScreenUpdate`が切断直後の一瞬
         // `_state.value.connected`の古い読み取りで滑り込んだ場合)に備え、ここで

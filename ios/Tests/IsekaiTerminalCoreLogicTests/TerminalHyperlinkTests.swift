@@ -19,6 +19,7 @@ final class TerminalHyperlinkTests: XCTestCase {
             applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: .block, cursorBlink: true, linkTable: linkTable, images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }

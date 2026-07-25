@@ -636,6 +636,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: bellGeneration,
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }
@@ -677,6 +678,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 3,
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         ))
         try await waitUntilFixtureCondition(timeout: 2) {

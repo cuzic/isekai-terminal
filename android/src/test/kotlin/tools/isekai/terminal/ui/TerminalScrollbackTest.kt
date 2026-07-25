@@ -5,6 +5,7 @@ import org.junit.Test
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.PanelKind
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -47,6 +48,11 @@ class TerminalScrollbackTest {
             urxvtMouseMode = false,
             cursorVisible = cursorVisible,
             bellGeneration = bellGeneration,
+            panelGeneration = 0uL,
+            panelKind = PanelKind.NONE,
+            panelTitle = "",
+            panelMarkdown = "",
+            panelFields = emptyList(),
             cursorShape = CursorShape.BLOCK,
             cursorBlink = true,
             linkTable = emptyList(),

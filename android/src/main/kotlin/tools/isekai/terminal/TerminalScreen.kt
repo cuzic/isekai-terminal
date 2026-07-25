@@ -140,6 +140,11 @@ data class TerminalScreenActions(
      *  (パース/デコードは全てRust側で完結しており、ここは中継するだけ)。 */
     val onFilePreviewRequest: suspend (FilePreviewRequestKind) -> FilePreviewOutcome =
         { FilePreviewOutcome.Error("not connected") },
+    /** `AI_INTEGRATION_DESIGN.md` §6.2: `presentForm`パネルの送信(フィールドid→値)。
+     *  `TerminalSession.submitAiPanelForm`への薄い委譲。 */
+    val onSubmitAiPanelForm: (Map<String, String>) -> Unit = {},
+    /** 同、パネルを閉じる(送信せずキャンセル、またはpresentDocumentを閉じる)。 */
+    val onDismissAiPanel: () -> Unit = {},
 )
 
 /**
@@ -1343,6 +1348,14 @@ private fun TerminalModalHost(
             fingerprint = prompt.fingerprint,
             onAccept = { actions.onTrustNewHostKey() },
             onReject = { actions.onDismissNewHostKeyPrompt() },
+        )
+    }
+
+    uiState.aiPanel?.let { panel ->
+        tools.isekai.terminal.ui.AiPanelSheet(
+            panel = panel,
+            onSubmit = actions.onSubmitAiPanelForm,
+            onDismiss = actions.onDismissAiPanel,
         )
     }
 

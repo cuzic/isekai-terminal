@@ -461,6 +461,11 @@ private fun TerminalPaneScreen(
                     // タスク#17(ファイルプレビュー機能): `TerminalSession.filePreviewRequest`への
                     // 薄い委譲(パース/デコードはRust側で完結、Kotlin側は中継のみ)。
                     onFilePreviewRequest = { kind -> pane.session.filePreviewRequest(kind) },
+                    // `AI_INTEGRATION_DESIGN.md` §6.2: `TerminalSession`への薄い委譲
+                    // (フィールド値のJSON化・PTYへの書き戻し・パネルのdismissは全て
+                    // TerminalSession.submitAiPanelForm/dismissAiPanel側で完結)。
+                    onSubmitAiPanelForm = { values -> pane.session.submitAiPanelForm(values) },
+                    onDismissAiPanel = { pane.session.dismissAiPanel() },
                 ),
             )
 
