@@ -1221,6 +1221,26 @@ tmux.conf設定で直る範囲もあるが、それに頼らずリモートか�
   `clip_push`(クリップボードハイジャックの踏み台になりうる)・`clip_pull`
   (デバイス側の機密情報流出になりうる)は別々の設定でopt-inさせ、両方無効が既定値とする。
 
+- **`isekai-pipe ctl tab-color`(実装済み、2026-07-24)**: `title`と同じfire-and-forget
+  パターンで`CtlMessage::SetTabColor { r, g, b }`を追加し、Windows Terminal限定の
+  OSC 4;264(タブ背景色パレットのプライベート拡張、`microsoft/terminal` #6574)へ
+  マッピングする(`isekai-ssh::ctl_forward::osc_sequence_for`)。Android/iOS本体
+  アプリ側は対応するタブ色UIが無いため無視する(黙って無視、`session.rs`)。
+  - tmuxの`allow-passthrough`(DCSラップでの素通し)は既定OFFのopt-in設定に依存する
+    ため採用しない——tmux配下でも確実に届く既存のctlソケット経由に統一する
+    (`SetTitle`/`ClipboardPush`と同じ理由、本節冒頭の「動機」参照)。
+  - 色が実際に反映されたかのクエリ確認(OSC 4;264;? への応答読み取り、
+    `microsoft/terminal` #3718で対応済み)はあえて実装しない: CLIラッパー
+    (`isekai-ssh`)経由の場合、応答は共有ptyの標準入力に多重化されて戻ってくるため、
+    フォアグラウンドで対話的にstdinを読んでいる別プロセス(例: リモートのClaude Code)
+    の入力処理と衝突しうる。clipboard pull(`ClipboardPullResponse`)がOS APIに
+    すり替えることで同種の問題を回避しているのと異なり、タブ色にはWindows Terminal側の
+    代替クエリAPIが無いため、この手が使えない。呼び出し側(将来のClaude Code
+    hook連携)は再送で頑健性を確保する方針にする。
+  - この呼び出し元となるClaude Code hook連携(`Notification`/`Stop`での色変更、
+    タイムアウトでの自動リセット)自体は本コミットの範囲外(段階的実装、まず
+    プリミティブのみ追加)。
+
 **この設計で解決すること**: ControlMasterでの接続共有(CLI)・接続プーリング(Android)の
 どちらとも両立する。識別はisekai-transport/QUICの層ではなく、OpenSSH自身が管理する
 port forwardのリクエストスコープに委ねているため、「共有された1本の接続の上に何本の
