@@ -77,7 +77,9 @@ object TabAlertNotifier {
             NotifyKind.ACTIVITY -> "$profileLabel: アクティビティ" to "ウィンドウに出力がありました"
             NotifyKind.SILENCE -> "$profileLabel: 無音" to "しばらく出力がありません"
             NotifyKind.JOB_DONE -> "$profileLabel: コマンド終了" to "実行中のコマンドが終了しました"
-            NotifyKind.WAITING, NotifyKind.DONE, NotifyKind.INFO -> "$profileLabel: 通知" to "新しい通知があります"
+            NotifyKind.WAITING -> "$profileLabel: 入力待ち" to "リモート側が入力待ちです"
+            NotifyKind.DONE -> "$profileLabel: 完了" to "リモート側の処理が完了しました"
+            NotifyKind.INFO -> "$profileLabel: 通知" to "新しい通知があります"
         }
 
     /**
