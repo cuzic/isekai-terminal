@@ -35,6 +35,11 @@ data class TerminalUiState(
     val promptJumpResult: PromptJumpResult = PromptJumpResult(),
     // タスク#13(OSC 133)「直前コマンドの出力だけをコピー」の直近の結果。
     val promptOutputCopyResult: PromptOutputCopyResult = PromptOutputCopyResult(),
+    // `AI_INTEGRATION_DESIGN.md` §6.2: リモートAPC経由で提示された構造化パネル。
+    // `hostKeyChangedWarning`等と同じパターン(nullなら非表示、明示的なdismissで
+    // nullへ戻す)。判断ロジック(`panelGeneration`の取りこぼし無し検知)は
+    // TerminalSession側で完結させ、ここには最終結果だけを反映する。
+    val aiPanel: AiPanelUiState? = null,
 )
 
 /** タスク#13。[PromptJumpTarget]自体は「見つからなかった」場合`null`になりうるため、
@@ -82,4 +87,16 @@ data class NewHostKeyPrompt(
     val host: String,
     val port: Int,
     val fingerprint: String,
+)
+
+/** `AI_INTEGRATION_DESIGN.md` §6.2: リモートAPCで提示された構造化パネル1件分の
+ *  UI表示用スナップショット。`kind`が[uniffi.isekai_terminal_core.PanelKind.DOCUMENT]の
+ *  時は[markdown]、[uniffi.isekai_terminal_core.PanelKind.FORM]の時は[fields]のみが
+ *  意味を持つ(Rust側`ScreenUpdate`のdocコメントと同じ規約)。表示専用のスナップショットで
+ *  あり、ここに実行権限は一切無い(信頼境界は`ai_panel.rs`のモジュールdoc参照)。 */
+data class AiPanelUiState(
+    val kind: uniffi.isekai_terminal_core.PanelKind,
+    val title: String,
+    val markdown: String,
+    val fields: List<uniffi.isekai_terminal_core.PanelField>,
 )

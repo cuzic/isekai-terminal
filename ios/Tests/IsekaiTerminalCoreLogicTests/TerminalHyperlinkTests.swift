@@ -20,6 +20,7 @@ final class TerminalHyperlinkTests: XCTestCase {
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: .block, cursorBlink: true, linkTable: linkTable, images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }

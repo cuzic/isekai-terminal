@@ -28,6 +28,7 @@ final class TerminalSelectionTests: XCTestCase {
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }
@@ -81,7 +82,7 @@ final class TerminalSelectionTests: XCTestCase {
     }
 
     func testReconstructSelectionTextReturnsEmptyForInvalidDimensions() {
-        let update = ScreenUpdate(updateSeq: 0, cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false, mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false, cursorVisible: true, bellGeneration: 0, notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "", cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil)
+        let update = ScreenUpdate(updateSeq: 0, cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false, mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false, cursorVisible: true, bellGeneration: 0, notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "", panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [], cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil)
         let selection = SelectionRange(anchor: CellPos(row: 0, col: 0), head: CellPos(row: 0, col: 0))
 
         XCTAssertEqual(reconstructSelectionText(update: update, selection: selection), "")

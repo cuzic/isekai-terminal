@@ -33,6 +33,7 @@ final class TerminalScrollbackTests: XCTestCase {
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: bellGeneration,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
+            panelGeneration: 0, panelKind: .none, panelTitle: "", panelMarkdown: "", panelFields: [],
             cursorShape: cursorShape, cursorBlink: cursorBlink, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }

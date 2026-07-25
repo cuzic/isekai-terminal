@@ -3,7 +3,10 @@ use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
-use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, NotifyKind, TerminalKeyModifiers};
+use crate::{
+    CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, NotifyKind, PanelField, PanelKind,
+    TerminalKeyModifiers,
+};
 
 /// Sixel(タスク#42)の名目セルサイズ(ピクセル)。実フォントのピクセルサイズは
 /// このRustコアには分からない(Android/iOSの実描画レイヤーのみが知っている)ため、
@@ -443,6 +446,14 @@ pub(crate) struct Terminal {
     notify_kind: NotifyKind,
     notify_title: String,
     notify_body: String,
+    /// `AI_INTEGRATION_DESIGN.md` §6.2のリモートAPCパネル提示を受信するたびに単調
+    /// 増加するカウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし
+    /// 検知・二重描画防止)。
+    panel_generation: u64,
+    panel_kind: PanelKind,
+    panel_title: String,
+    panel_markdown: String,
+    panel_fields: Vec<PanelField>,
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     cursor_shape: CursorShape,
     /// カーソルが点滅すべきか。DECSCUSRのパラメータ(奇数=blink/偶数=steady、
@@ -814,6 +825,11 @@ impl Terminal {
             notify_kind: NotifyKind::Info,
             notify_title: String::new(),
             notify_body: String::new(),
+            panel_generation: 0,
+            panel_kind: PanelKind::None,
+            panel_title: String::new(),
+            panel_markdown: String::new(),
+            panel_fields: Vec::new(),
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             autowrap_mode: true,
@@ -942,6 +958,38 @@ impl Terminal {
         self.notify_kind = kind;
         self.notify_title = title;
         self.notify_body = body;
+    }
+
+    pub(crate) fn panel_generation(&self) -> u64 { self.panel_generation }
+    pub(crate) fn panel_kind(&self) -> PanelKind { self.panel_kind }
+    pub(crate) fn panel_title(&self) -> &str { &self.panel_title }
+    pub(crate) fn panel_markdown(&self) -> &str { &self.panel_markdown }
+    pub(crate) fn panel_fields(&self) -> &[PanelField] { &self.panel_fields }
+
+    /// [crate::ai_panel::parse_ai_panel_apc]が解析した内容を反映する
+    /// (`AI_INTEGRATION_DESIGN.md` §6.2)。`set_notify`/`set_title`と同じパターン:
+    /// OSC/エスケープシーケンスの通常パースを経由せず、APCインターセプタから
+    /// 直接呼ばれる。`panel_generation`を`saturating_add`で単調増加させる
+    /// (`bell_generation`と同じ周回対策)。
+    pub(crate) fn set_panel_from_ai_apc(&mut self, parsed: crate::ai_panel::ParsedPanel) {
+        self.panel_generation = self.panel_generation.saturating_add(1);
+        self.panel_kind = parsed.kind;
+        self.panel_title = parsed.title;
+        self.panel_markdown = parsed.markdown;
+        self.panel_fields = parsed.fields;
+    }
+
+    /// [crate::kitty_graphics::ApcInterceptor]が切り出した完成APCペイロード1件を、
+    /// 名前空間(ペイロード先頭バイト)で振り分けて処理する(Opusレビュー2026-07-24:
+    /// 新規APCチャンネルの増設ではなく、既存の1つの出口を内容ベースで分岐させる設計)。
+    /// `{`始まり(生JSON)ならAIパネルエンベロープ(`ai_panel.rs`)、それ以外(`G`始まりの
+    /// Kitty graphics等)は[Self::dispatch_kitty_apc]へフォールバックする。
+    pub(crate) fn dispatch_apc(&mut self, payload: &[u8]) {
+        if let Some(parsed) = crate::ai_panel::parse_ai_panel_apc(payload) {
+            self.set_panel_from_ai_apc(parsed);
+            return;
+        }
+        self.dispatch_kitty_apc(payload);
     }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
     pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
@@ -6535,6 +6583,71 @@ mod tests {
         let img = &images[0];
         assert_eq!(img.width_px, 500);
         assert_eq!(img.cols_span, 5, "画面の残り列数(5)にクランプされること");
+    }
+
+    // ── AIパネル(APC、`AI_INTEGRATION_DESIGN.md` §6.2) ─────────────
+    // dispatch_apcの名前空間分岐(`{`始まり=AIパネル、それ以外=Kitty graphicsへ
+    // フォールバック)を検証する。パース自体の詳細ケースはai_panel.rsの単体テスト
+    // が担当するので、ここではTerminalへの反映(panel_generation/panel_kind等)と
+    // Kitty graphicsとの共存だけを見る。
+
+    #[test]
+    fn dispatch_apc_present_document_updates_panel_fields_and_generation() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.panel_generation(), 0, "既定は0");
+        assert_eq!(t.panel_kind(), PanelKind::None);
+
+        t.dispatch_apc(br#"{"type":"presentDocument","title":"t","markdown":"m"}"#);
+
+        assert_eq!(t.panel_generation(), 1);
+        assert_eq!(t.panel_kind(), PanelKind::Document);
+        assert_eq!(t.panel_title(), "t");
+        assert_eq!(t.panel_markdown(), "m");
+        assert!(t.panel_fields().is_empty());
+    }
+
+    #[test]
+    fn dispatch_apc_present_form_populates_fields() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.dispatch_apc(
+            br#"{"type":"presentForm","title":"confirm","fields":[{"id":"a","label":"A","kind":"text"},{"id":"b","label":"B","kind":"choice","options":["x","y"]}]}"#,
+        );
+        assert_eq!(t.panel_kind(), PanelKind::Form);
+        assert_eq!(t.panel_fields().len(), 2);
+        assert_eq!(t.panel_fields()[1].options, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_apc_panel_generation_is_monotonic_and_does_not_reset_on_malformed_input() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.dispatch_apc(br#"{"type":"presentDocument","title":"first","markdown":""}"#);
+        assert_eq!(t.panel_generation(), 1);
+
+        // 不正なJSONは黙って無視され、直近のパネル状態・世代は変化しない
+        // (`ai_panel.rs`のopportunisticな方針)。
+        t.dispatch_apc(b"not a valid ai panel envelope");
+        assert_eq!(t.panel_generation(), 1);
+        assert_eq!(t.panel_title(), "first");
+
+        t.dispatch_apc(br#"{"type":"presentDocument","title":"second","markdown":""}"#);
+        assert_eq!(t.panel_generation(), 2);
+        assert_eq!(t.panel_title(), "second");
+    }
+
+    #[test]
+    fn dispatch_apc_still_routes_kitty_graphics_payloads() {
+        // `{`ではなく`G`始まりのペイロードは、AIパネルとしてはパースされずKitty
+        // graphicsへフォールバックすること(名前空間分岐が既存機能を壊していないこと
+        // の回帰テスト)。
+        use base64::Engine;
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let payload = format!(
+            "Gf=32,s=1,v=1,a=T;{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4])
+        );
+        t.dispatch_apc(payload.as_bytes());
+        assert_eq!(t.images().len(), 1, "Kitty graphicsは従来通り動くこと");
+        assert_eq!(t.panel_generation(), 0, "Kitty graphicsペイロードはパネル世代を進めない");
     }
 
     // ── Kitty graphics(APC、タスク#53) ─────────────

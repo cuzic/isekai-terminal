@@ -7,6 +7,7 @@ pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod sixel;
 pub(crate) mod kitty_graphics;
+pub(crate) mod ai_panel;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
@@ -1146,6 +1147,24 @@ pub struct ScreenUpdate {
     pub notify_title: String,
     /// 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
     pub notify_body: String,
+    /// リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
+    /// 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
+    /// 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
+    /// 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
+    /// 読んでパネルを再描画すること。
+    pub panel_generation: u64,
+    /// 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
+    /// クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
+    /// 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
+    /// この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+    pub panel_kind: PanelKind,
+    /// パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
+    /// 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+    pub panel_title: String,
+    /// `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+    pub panel_markdown: String,
+    /// `panel_kind == Form`の時のみ意味を持つフィールド一覧。
+    pub panel_fields: Vec<PanelField>,
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     pub cursor_shape: CursorShape,
     /// カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
@@ -1262,6 +1281,36 @@ pub enum NotifyKind {
     Waiting,
     Done,
     Info,
+}
+
+/// リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2、`ai_panel.rs`)で提示された
+/// 構造化パネルの種別。`None`は「現在パネルなし」を表す既定値(`ScreenUpdate.panelKind`
+/// が`panelGeneration`の初期値0とペアで意味を持つ、`bellGeneration`と同じ規約)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PanelKind {
+    None,
+    Document,
+    Form,
+}
+
+/// [PanelField]の入力種別。テキスト自由入力か、[PanelField::options]からの選択か。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PanelFieldKind {
+    Text,
+    Choice,
+}
+
+/// `presentForm`パネル1フィールド分の定義。値そのものはKotlin/Compose側の
+/// UI状態としてのみ保持され、Rust側には(送信されるまで)戻ってこない
+/// (`AI_INTEGRATION_DESIGN.md` §6.2のフィードバック方針: PTY stdinへの
+/// 通常テキスト書き込みで返すのみで、専用の往復チャネルは持たない)。
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PanelField {
+    pub id: String,
+    pub label: String,
+    pub kind: PanelFieldKind,
+    /// `kind == Choice`の時のみ意味を持つ選択肢一覧。`Text`の時は空。
+    pub options: Vec<String>,
 }
 
 /// クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の

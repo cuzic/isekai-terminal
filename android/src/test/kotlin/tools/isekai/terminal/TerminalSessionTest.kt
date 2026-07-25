@@ -16,6 +16,8 @@ import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.NotifyKind
+import uniffi.isekai_terminal_core.PanelField
+import uniffi.isekai_terminal_core.PanelKind
 import uniffi.isekai_terminal_core.PromptJumpTarget
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
@@ -64,7 +66,26 @@ class TerminalSessionTest {
      *  既存テストと同じ最小値で埋める。 */
     private fun bellUpdate(bellGeneration: ULong, cursorCol: UInt = 0u) = ScreenUpdate(
         0u, 80u, 24u, emptyList(), 0u, cursorCol, "title", false, false, false,
-        MouseReportingMode.OFF, false, false, false, true, bellGeneration, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
+        MouseReportingMode.OFF, false, false, false, true, bellGeneration,
+        0uL, NotifyKind.INFO, "", "",
+        0uL, PanelKind.NONE, "", "", emptyList(),
+        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
+    )
+
+    /** [bellUpdate]と同じ最小`ScreenUpdate`だが、`AI_INTEGRATION_DESIGN.md` §6.2の
+     *  パネル系フィールドだけを可変にする。 */
+    private fun panelUpdate(
+        panelGeneration: ULong,
+        panelKind: PanelKind = PanelKind.DOCUMENT,
+        panelTitle: String = "t",
+        panelMarkdown: String = "m",
+        panelFields: List<PanelField> = emptyList(),
+    ) = ScreenUpdate(
+        0u, 80u, 24u, emptyList(), 0u, 0u, "title", false, false, false,
+        MouseReportingMode.OFF, false, false, false, true, 0uL,
+        0uL, NotifyKind.INFO, "", "",
+        panelGeneration, panelKind, panelTitle, panelMarkdown, panelFields,
+        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
     )
 
     // ── 初期状態 ──────────────────────────────────────────────────
@@ -380,7 +401,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
         assertEquals("title1", session.state.value.screenUpdate?.title)
@@ -392,9 +413,9 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
 
         fakeOrchestrator.simulateScreenUpdate(update1)
         fakeOrchestrator.simulateScreenUpdate(update2)
@@ -410,7 +431,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
 
@@ -419,7 +440,7 @@ class TerminalSessionTest {
         assertNull("screenUpdate should be cleared on disconnect", session.state.value.screenUpdate)
 
         // 切断後に simulateScreenUpdate が来ても無視される
-        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
@@ -433,7 +454,7 @@ class TerminalSessionTest {
 
         repeat(50) { i ->
             fakeOrchestrator.simulateScreenUpdate(
-                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
             )
         }
 
@@ -808,6 +829,81 @@ class TerminalSessionTest {
         session.disconnect()
         assertEquals("切断済み", session.state.value.statusMsg)
         assertFalse(session.state.value.isConnecting)
+    }
+
+    // ── `AI_INTEGRATION_DESIGN.md` §6.2: リモートAPCパネル ────────────────
+
+    @Test
+    fun onScreenUpdate_panelGenerationAdvances_populatesAiPanelState() = runBlocking {
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateScreenUpdate(panelUpdate(panelGeneration = 1uL, panelTitle = "hello", panelMarkdown = "world"))
+        withTimeout(3000) { s.state.first { it.aiPanel != null } }
+
+        val panel = s.state.value.aiPanel
+        assertEquals(PanelKind.DOCUMENT, panel?.kind)
+        assertEquals("hello", panel?.title)
+        assertEquals("world", panel?.markdown)
+        s.close()
+    }
+
+    @Test
+    fun dismissAiPanel_clearsStateAndSameGenerationDoesNotReappear() = runBlocking {
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateScreenUpdate(panelUpdate(panelGeneration = 1uL))
+        withTimeout(3000) { s.state.first { it.aiPanel != null } }
+
+        s.dismissAiPanel()
+        assertNull(s.state.value.aiPanel)
+
+        // 同じ世代のScreenUpdateが(conflatedチャネル越しの重複配送等で)再適用されても、
+        // 一度dismissしたパネルは戻らない(`lastAppliedPanelGeneration`は据え置き)。
+        orch.simulateScreenUpdate(panelUpdate(panelGeneration = 1uL))
+        delay(50)
+        assertNull(s.state.value.aiPanel)
+
+        // 新しい世代のパネルは正しく表示される。
+        orch.simulateScreenUpdate(panelUpdate(panelGeneration = 2uL, panelTitle = "second"))
+        withTimeout(3000) { s.state.first { it.aiPanel?.title == "second" } }
+        s.close()
+    }
+
+    @Test
+    fun onScreenUpdate_formPanel_populatesFields() = runBlocking {
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        val fields = listOf(
+            PanelField(id = "a", label = "A", kind = uniffi.isekai_terminal_core.PanelFieldKind.TEXT, options = emptyList()),
+            PanelField(id = "b", label = "B", kind = uniffi.isekai_terminal_core.PanelFieldKind.CHOICE, options = listOf("x", "y")),
+        )
+        orch.simulateScreenUpdate(panelUpdate(panelGeneration = 1uL, panelKind = PanelKind.FORM, panelFields = fields))
+        withTimeout(3000) { s.state.first { it.aiPanel != null } }
+
+        assertEquals(PanelKind.FORM, s.state.value.aiPanel?.kind)
+        assertEquals(2, s.state.value.aiPanel?.fields?.size)
+        s.close()
     }
 
     // ── #25: BEL(端末ベル)受信時のフィードバック ────────────────────────
