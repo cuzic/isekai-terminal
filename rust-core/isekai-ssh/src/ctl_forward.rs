@@ -425,6 +425,10 @@ async fn send_build_finished(
 ///   remote's `isekai-pipe ctl clip pull` rather than hanging.
 /// - `ClipboardPullResponse` → we never issue `ClipboardPullRequest`
 ///   ourselves, so seeing this would only be a misbehaving peer; ignored.
+/// - `Notify` → this CLI wrapper has no notification surface of its own
+///   (that's the Android app's job, #57); ignored here rather than
+///   implemented, matching how `ClipboardPullRequest` above is also left
+///   unimplemented pending a capability this wrapper doesn't have yet.
 /// - `SetVar`/`GetVarRequest`/`GetVarResponse` (task #16) have no OSC
 ///   equivalent — they're handled directly in `handle_ctl_connection`
 ///   against `CTL_VARS` instead of through this OSC-emitting path.
@@ -440,6 +444,7 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {}
         | CtlMessage::ClipboardPullResponse { .. }
+        | CtlMessage::Notify { .. }
         | CtlMessage::SetVar { .. }
         | CtlMessage::GetVarRequest { .. }
         | CtlMessage::GetVarResponse { .. }

@@ -14,6 +14,21 @@ pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub(crate) mod net_health_policy;
+// #62: tmuxウィンドウ/ペインの安定ロケータ + アプリのタブ/ペインID ⟷
+// Epic M ctl-socketパスの対応表(データモデル本体。実際の配線は#60の
+// `tmux_session.rs`/`orchestrator.rs::ensure_tmux_tab_window`)。
+pub(crate) mod tmux_locator;
+// #58: フル再接続(resume失敗)直後にtmux自身のscrollback履歴をcapture-pane
+// 経由で取り込むためのコマンド組み立て/出力パース。実際の配線は
+// `orchestrator.rs`側。
+pub(crate) mod tmux_scrollback;
+// #60: tmux session group のensure/attach + タブ用ウィンドウのcreate-or-select。
+// #61(run_exec)・#62(tmux_locator)を実際に繋ぎ合わせる本体。
+pub(crate) mod tmux_session;
+// #57: tmux hooks(alert-bell/alert-activity/alert-silence/pane-died)を
+// インストールするコマンド組み立て。実際の配線(接続確立時に呼ぶ場所)は
+// `transport::ssh_handler::run_ssh_channel_loop`。
+pub(crate) mod tmux_notify;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
@@ -40,7 +55,7 @@ use tokio::runtime::Runtime;
 use russh::client;
 
 use crate::session::SessionCore;
-use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{ExecError, ExecOutput, TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -789,6 +804,56 @@ pub enum SshError {
     Disconnected,
 }
 
+/// タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+/// Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+/// プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+/// `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+/// キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TmuxTabWindowInfo {
+    /// tmuxウィンドウを長期的に指すタグ値。
+    pub tag: String,
+    /// このタグ解決時点でのウィンドウインデックス。
+    pub window_index: u32,
+    /// このクライアントがattachしたセッション名(グループ内で一意)。
+    pub session_name: String,
+    /// tmux session groupの名前。
+    pub group_name: String,
+    /// 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+    pub is_new_window: bool,
+}
+
+/// [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+/// (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+/// このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+/// `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+/// 切断)はメッセージにまとめて運ぶだけに留める。
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
+pub enum TmuxSessionError {
+    /// tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+    #[error("tmux command failed: {0}")]
+    Command(String),
+    /// tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+    #[error("unexpected tmux output: {0:?}")]
+    UnexpectedOutput(String),
+}
+
+impl From<crate::tmux_locator::TmuxLocatorError> for TmuxSessionError {
+    fn from(err: crate::tmux_locator::TmuxLocatorError) -> Self {
+        use crate::tmux_locator::TmuxLocatorError;
+        match err {
+            TmuxLocatorError::Command(e) => TmuxSessionError::Command(e.0),
+            // 実際には`tmux_session::ensure_tab_window`が`NotFound`を内部で
+            // 新規ウィンドウ作成へフォールバックするため外へは出てこないはずだが、
+            // 型としては網羅しておく(将来の呼び出し経路追加に備えた安全策)。
+            TmuxLocatorError::NotFound(tag) => TmuxSessionError::Command(format!(
+                "tmux locator tag {tag:?} was not found in the remote tmux state"
+            )),
+            TmuxLocatorError::UnexpectedOutput(s) => TmuxSessionError::UnexpectedOutput(s),
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CellData {
     pub ch: String,
@@ -1169,6 +1234,18 @@ pub enum ClipboardMimeKind {
     ImagePng,
 }
 
+/// タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+/// `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
+/// (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
+/// なので、その型をUniFFI境界越しにそのまま公開できない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotifyKind {
+    Bell,
+    Activity,
+    Silence,
+    JobDone,
+}
+
 /// クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の
 /// 現在のクリップボード内容)。`text: String`だった旧シグネチャを置き換える
 /// (画像は任意バイト列で運ぶ必要があり、UTF-8前提の`String`では表現できないため)。
@@ -1282,6 +1359,15 @@ pub trait OrchestratorCallback: Send + Sync {
     /// #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
     /// マルチパス以外のtransportでは呼ばれない。
     fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState);
+    /// タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+    /// `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+    /// 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+    /// 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+    /// から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+    /// per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+    /// (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+    /// per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+    fn on_notify(&self, kind: NotifyKind);
     /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
     /// `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
     fn on_prompt_jump(&self, target: Option<PromptJumpTarget>);
@@ -1317,6 +1403,12 @@ pub(crate) trait SessionCallback: Send + Sync {
     fn on_request_wifi_fd(&self) -> Option<PlatformFd> { None }
     fn on_request_cellular_fd(&self) -> Option<PlatformFd> { None }
     fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+    /// タスク#57: 受信した`isekai_protocol::CtlMessage::Notify`(`session.rs`の
+    /// `session_event_loop`経由)。`tmux_tag`/`seq`は`OrchestratorAdapter`が
+    /// (a)重複配信の検出(同じ`(tmux_tag, seq)`は無視)と(b)フォアグラウンド+
+    /// このタブ表示中の抑制判断に使う。既定は他のオプショナルコールバックと同じく
+    /// no-op(`OrchestratorAdapter`だけが実際にオーバーライドする)。
+    fn on_notify(&self, _kind: crate::NotifyKind, _tmux_tag: String, _seq: u64) {}
     /// タスク#13。デフォルトはno-op(`OrchestratorAdapter`だけが実際に
     /// `OrchestratorCallback::on_prompt_jump`へ委譲する——#10/#22と同じパターン)。
     fn on_prompt_jump(&self, _target: Option<PromptJumpTarget>) {}
@@ -1344,7 +1436,14 @@ pub(crate) fn create_ssh_session(config: SshConfig) -> Arc<SshSession> {
 }
 
 impl SshSession {
-    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    /// タスク#59: `app_pane_id`は`OrchestratorShared`が発行した、このタブの
+    /// 再接続をまたいで安定な識別子(`orchestrator::connect_via`参照)。
+    /// `run_ssh_channel_loop`まで素通しして、tmuxロケータレジストリを引くのに使う。
+    pub(crate) fn connect(
+        &self,
+        callback: Box<dyn SessionCallback>,
+        app_pane_id: crate::tmux_locator::AppPaneId,
+    ) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // config.forwards はコマンドチャネル経由で forward_type に応じたコマンドとして
@@ -1381,7 +1480,7 @@ impl SshSession {
             }
         }
         RUNTIME.spawn(async move {
-            run_russh_transport(config, cmd_rx, event_tx).await;
+            run_russh_transport(config, cmd_rx, event_tx, app_pane_id).await;
         });
         Ok(())
     }
@@ -1390,6 +1489,11 @@ impl SshSession {
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
+    }
+    /// タスク#58: フル再接続直後のtmux scrollback backfill。
+    /// `SessionCore::inject_scrollback_history`参照。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        self.core.inject_scrollback_history(lines)
     }
 
     pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
@@ -1430,6 +1534,12 @@ impl SshSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// SSH接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     pub(crate) fn add_local_forward(
@@ -1476,6 +1586,7 @@ pub(crate) async fn run_russh_transport(
     mut config: SshConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    app_pane_id: crate::tmux_locator::AppPaneId,
 ) {
     let russh_config = Arc::new(client::Config {
         keepalive_interval: Some(std::time::Duration::from_secs(60)),
@@ -1538,7 +1649,7 @@ pub(crate) async fn run_russh_transport(
     run_ssh_channel_loop(
         &pooled, config.cols, config.rows,
         config.agent_forward, config.allow_non_loopback_forward_bind,
-        cmd_rx, event_tx,
+        cmd_rx, event_tx, app_pane_id,
     ).await;
 
     if let Some(key) = pool_key {

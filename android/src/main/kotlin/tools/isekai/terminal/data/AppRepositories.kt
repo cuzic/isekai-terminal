@@ -130,6 +130,18 @@ class KeySequencePackInstallationRepository(private val dao: KeySequencePackInst
     suspend fun uninstall(installation: KeySequencePackInstallation) = dao.delete(installation)
 }
 
+/**
+ * タスク#60: プロファイル単位のtmux session groupウィンドウtag永続化
+ * ([TmuxTabLocator]参照)。
+ */
+class TmuxTabLocatorRepository(private val dao: TmuxTabLocatorDao) {
+    suspend fun findTagForProfile(profileId: Long): String? = dao.findByProfileId(profileId)?.tag
+
+    suspend fun saveTag(profileId: Long, tag: String) = dao.upsert(TmuxTabLocator(profileId = profileId, tag = tag))
+
+    suspend fun forgetProfile(profileId: Long) = dao.deleteByProfileId(profileId)
+}
+
 object Repositories {
     private var _db: AppDatabase? = null
 
@@ -144,4 +156,5 @@ object Repositories {
     val snippets get() = SnippetRepository(db.snippetDao())
     val keySequences get() = KeySequenceRepository(db.keySequenceDao())
     val keySequencePackInstallations get() = KeySequencePackInstallationRepository(db.keySequencePackInstallationDao())
+    val tmuxTabLocators get() = TmuxTabLocatorRepository(db.tmuxTabLocatorDao())
 }

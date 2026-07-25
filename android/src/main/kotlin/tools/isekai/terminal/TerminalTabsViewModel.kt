@@ -39,6 +39,7 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
+import tools.isekai.terminal.util.ClientIdentity
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ClipboardMimeKind
@@ -152,7 +153,7 @@ class PaneState internal constructor(
 class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
-    private val sessionFactory: (AppExecutor, RebindFdSource) -> TerminalSession,
+    private val sessionFactory: (AppExecutor, RebindFdSource, ConnectionProfile) -> TerminalSession,
     // テストがtestScheduler駆動のディスパッチャーを注入できるようにする(既定は本番同様
     // Dispatchers.IO)。ハードコードしていた頃はテストの仮想時間(TestCoroutineScheduler)と
     // ここで起動される実スレッドの完了タイミングが競合し、withTimeout()ポーリングが
@@ -181,7 +182,7 @@ class TerminalTabsViewModel(
     constructor(app: Application) : this(
         app,
         AndroidAppExecutor(app),
-        { executor, rebindFdSource ->
+        { executor, rebindFdSource, profile ->
             val clipboardPolicy = RemoteClipboardPolicy(
                 isWriteAllowed = {
                     app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
@@ -252,6 +253,20 @@ class TerminalTabsViewModel(
                     val vibrator = app.getSystemService(Vibrator::class.java)
                     vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
+                // タスク#57: tmux hook発火。「見せるべきか」の判断はRust側で済んでおり、
+                // ここでは(a) このプロファイルのopt-in設定、(b) 通知権限、の2つの確認と
+                // 実際のpostだけを行う(`TabAlertNotifier`参照)。通知は同じプロファイルの
+                // 複数タブで1枠に集約する(profile.idをキーにする、`rust-ssot.md`の対象外
+                // ——UI表示上の判断)。
+                onNotifyRequested = { kind ->
+                    TabAlertNotifier.notify(
+                        context = app,
+                        tabId = profile.id.toString(),
+                        profileLabel = profile.label,
+                        kind = kind,
+                        enabled = profile.enableTabNotifications,
+                    )
+                },
             )
         },
     )
@@ -310,6 +325,14 @@ class TerminalTabsViewModel(
         // (ペインごとの配色分岐はスコープ外)。
         internal val currentTheme = MutableStateFlow(initialTheme)
         internal var isThemeOverridden: Boolean = initialThemeIsOverridden
+
+        // ── tmux session group / ウィンドウ紐付け(タスク#60、primary paneのみ)──
+        // Rust側(`SessionOrchestrator.ensureTmuxTabWindow`)が解決したウィンドウ情報の
+        // うち、UIへ最小限反映してよい表示用ラベル(例: "win 2")だけを持つ。判断は
+        // 一切ここで行わない(`.claude/rules/rust-ssot.md`) — 常にRustが返した値の
+        // 素通しであり、Kotlin側で解釈・分岐はしない。まだ解決前(接続直後や
+        // opportunisticな失敗時)はnullのままで、その場合はタブラベルに何も追加しない。
+        internal val tmuxWindowLabel = MutableStateFlow<String?>(null)
 
         // ── 画面分割(split pane) ────────────────────────────────
         // まずは水平/垂直の2分割のみをサポートする(バイナリツリー式の多段分割はスコープ外)。
@@ -481,7 +504,7 @@ class TerminalTabsViewModel(
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
         val rebindFdSource = executor.createRebindFdSource()
-        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
+        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -576,7 +599,7 @@ class TerminalTabsViewModel(
         if (tab.splitPane.value != null) return null
         val profile = tab.profile ?: return null
         val rebindFdSource = executor.createRebindFdSource()
-        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
+        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
         RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
         tab.openSplit(pane, direction)
         watchPane(tab, pane)
@@ -674,6 +697,12 @@ class TerminalTabsViewModel(
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
+                // タスク#60: tmux session group ensure/attach + ウィンドウのcreate-or-select。
+                // primary paneのみが対象(split paneはtmux非対応のMVP判断、
+                // `rust-core/src/tmux_session.rs`のモジュールdoc参照)。
+                if (pane.paneId == tab.primaryPane.paneId) {
+                    maybeEnsureTmuxTabWindow(tab, pane)
+                }
                 // タスク#14: 「直近まで生きていたセッション」の記録を、Connectedへ
                 // 遷移するたびに新しい保存時刻で更新する。タブを開いた瞬間の時刻だけを
                 // 使うと、長時間接続し続けたセッションが(一度もネットワーク瞬断による
@@ -687,6 +716,12 @@ class TerminalTabsViewModel(
                 pane.upstreamFailoverMonitorHandle?.close()
                 pane.upstreamFailoverMonitorHandle = null
                 pane.upstreamFailoverEnabledForCurrentSession = false
+                // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
+                // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
+                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
+                if (pane.paneId == tab.primaryPane.paneId) {
+                    tab.tmuxWindowLabel.value = null
+                }
             }
             prevConnected = connected
         }
@@ -828,6 +863,60 @@ class TerminalTabsViewModel(
             delay(POST_CONNECT_DEBOUNCE_MS)
             RemoteLogger.i("IsekaiTerminalSSH", "sending post-connect commands (${bytes.size} bytes) pane=${pane.paneId}")
             pane.session.send(bytes)
+        }
+    }
+
+    // ── tmux session group / ウィンドウ紐付け(タスク#60)─────────────────
+
+    /**
+     * primary paneが接続完了した際に、tmux session groupのensure/attach + タブ用
+     * ウィンドウのcreate-or-selectをRust側(`SessionOrchestrator.ensureTmuxTabWindow`)
+     * へ依頼する。どのtmuxコマンドを実行するか・既存タグが見つかるか等の判断は一切
+     * Kotlin側で行わない(`.claude/rules/rust-ssot.md`) — ここは
+     * (1) Roomに永続化済みのタグがあれば読んで渡す
+     * (2) Rustが返した`tag`をRoomへ書き戻す
+     * (3) 表示用ラベルをタブへ反映する
+     * だけの薄い配線。
+     *
+     * opportunisticな補助機能: 失敗してもタブ自体は通常のシェルとして使い続けられる
+     * ため、ログのみ残して無視する(接続やUIをブロックしない)。プロファイルを
+     * 持たない、または未保存(id=0、理論上のみ)のタブでは何もしない。
+     *
+     * `tmux_tab_locators`(Room)は`profile_id`単位でしかタグを永続化できない
+     * (`TmuxTabLocator.kt`のdoc参照、タブ単位の永続識別子が現状無い設計)ため、
+     * 同一プロファイルを複数タブで同時に開くと、後から開いたタブが先のタブと
+     * 同じtmuxウィンドウを`select-window`で奪う・先のタブのタグを上書きする
+     * 事故になり得る。これを避けるため、既に他のタブがこのプロファイルで
+     * tmux連携済み(`tmuxWindowLabel`が非null)なら、このタブはtmux連携自体を
+     * スキップする(通常のシェルタブとして使い続けられる、上のopportunistic方針
+     * と同じ扱い)。
+     */
+    private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
+        val profile = tab.profile ?: return
+        if (profile.id == 0L) return
+        if (_tabs.value.any { it.tabId != tab.tabId && it.profile?.id == profile.id && it.tmuxWindowLabel.value != null }) {
+            RemoteLogger.i(
+                "IsekaiTerminalTmux",
+                "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already owns tmux window for profile ${profile.id}",
+            )
+            return
+        }
+        viewModelScope.launch(ioDispatcher) {
+            try {
+                val profileIdentity = "profile:${profile.id}"
+                val clientId = ClientIdentity.getOrCreate(getApplication())
+                val existingTag = Repositories.tmuxTabLocators.findTagForProfile(profile.id)
+                val info = pane.session.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, profile.enableTabNotifications)
+                Repositories.tmuxTabLocators.saveTag(profile.id, info.tag)
+                tab.tmuxWindowLabel.value = "tmux:${info.windowIndex}"
+                RemoteLogger.i(
+                    "IsekaiTerminalTmux",
+                    "ensureTmuxTabWindow[${tab.tabId}]: group=${info.groupName} session=${info.sessionName} " +
+                        "window=${info.windowIndex} tag=${info.tag} isNew=${info.isNewWindow}",
+                )
+            } catch (e: Exception) {
+                RemoteLogger.w("IsekaiTerminalTmux", "ensureTmuxTabWindow failed (non-fatal): ${e.message}")
+            }
         }
     }
 

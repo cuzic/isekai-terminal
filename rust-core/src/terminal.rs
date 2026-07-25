@@ -732,7 +732,15 @@ pub(crate) fn encode_pointer_event_bytes(
 
     let base = mouse_button_base_code(event.button);
     let modifier_bits = mouse_modifier_bits(event.modifiers);
+    // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
+    // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
+    // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
     let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
+    // 呼び出し元が実際の画面外の座標を渡してきても、この端末の実サイズ
+    // (`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]の
+    // docコメントで約束している通り、範囲チェックの責務はここに閉じる
+    // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
+    // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
     let col = event.col.min(cols.saturating_sub(1));
     let row = event.row.min(rows.saturating_sub(1));
 
@@ -751,6 +759,9 @@ pub(crate) fn encode_pointer_event_bytes(
         // 仕様上常に`3`(no button)を使う。
         let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
         let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
+        // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
+        // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
+        // 超える場合の保険。Fableレビュー指摘の設計判断)。
         let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
         Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
     }

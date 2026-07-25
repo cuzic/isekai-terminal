@@ -16,7 +16,7 @@ use crate::{
     init_logger, CellData, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME,
 };
 use crate::session::SessionCore;
-use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{ExecError, ExecOutput, TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 // ── 公開型 ──────────────────────────────────────────────
 
@@ -67,6 +67,11 @@ impl QuicSession {
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
+    /// タスク#58: フル再接続直後のtmux scrollback backfill。
+    /// `SessionCore::inject_scrollback_history`参照。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        self.core.inject_scrollback_history(lines)
+    }
 
     pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
         self.core.search_scrollback(&query, case_sensitive)
@@ -110,6 +115,12 @@ impl QuicSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     pub(crate) fn add_local_forward(
@@ -354,7 +365,15 @@ async fn run_quic_transport(
 
     // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
-    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
+    // タスク#59: この transport は`OrchestratorShared::app_pane_id`をまだ素通し
+    // していない(プレーンSSH経路のみ配線済み、follow-upとして残す判断は
+    // `rust-core/src/transport/ssh_handler.rs`の`run_ssh_channel_loop`引数docと
+    // タスク完了報告を参照)。呼び出しごとに新規生成した値を渡すため、
+    // tmuxロケータレジストリには何も登録されておらず実質no-op。
+    run_ssh_channel_loop(
+        &pooled, config.cols, config.rows, false, false, cmd_rx, event_tx,
+        crate::tmux_locator::AppPaneId::generate_process_local(),
+    ).await;
 }
 
 #[cfg(test)]

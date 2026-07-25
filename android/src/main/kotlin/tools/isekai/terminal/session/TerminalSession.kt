@@ -75,6 +75,16 @@ class TerminalSession(
      * 持ち込まない)。既定は no-op。
      */
     private val onBell: () -> Unit = {},
+    /**
+     * タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火。
+     * 「今この瞬間ユーザーへ見せるべきか」の抑制判断(アプリがフォアグラウンドかつ
+     * このタブ表示中なら抑制、`(tmux_tag, seq)`重複排除)は Rust 側
+     * (`OrchestratorAdapter::on_notify`)が既に済ませてから呼ばれるため、ここでは
+     * 実際にAndroid通知を出すかどうか(プロファイル単位opt-in・通知権限)の判断だけを
+     * 行う副作用注入とする(`onClipboardWriteRequested`/`onBell`と同じ構成、
+     * `Context`を持たないこのクラス自体には持ち込まない)。既定は no-op。
+     */
+    private val onNotifyRequested: (NotifyKind) -> Unit = {},
 ) : AutoCloseable {
 
     companion object {
@@ -251,6 +261,12 @@ class TerminalSession(
             _state.update { it.copy(rebindState = state) }
         }
 
+        // タスク#57: tmux hook発火。抑制判断はRust側(OrchestratorAdapter::on_notify)
+        // 済み——ここは単に注入された副作用を呼ぶだけ。
+        override fun onNotify(kind: NotifyKind) {
+            onNotifyRequested(kind)
+        }
+
         // タスク#13(OSC 133)。判断ロジック(どのプロンプトが「前/次」か・出力範囲の
         // 切り出し)は全てRust側(`Terminal::prompt_jump_target`/`last_command_output_text`)
         // に一元化されており、ここでは結果を[TerminalUiState]へそのまま反映するだけ。
@@ -418,6 +434,15 @@ class TerminalSession(
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
         orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
+
+    /**
+     * タスク#60: tmux session groupのensure/attach + タブ用ウィンドウのcreate-or-select。
+     * 判断は一切ここでは行わず、Rust側(`SessionOrchestrator::ensure_tmux_tab_window`)へ
+     * そのまま委譲する薄いパススルー(`.claude/rules/rust-ssot.md`)。呼び出し元
+     * ([TerminalTabsViewModel])はprimary paneについてのみ呼ぶこと(split pane非対応)。
+     */
+    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Boolean) =
+        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, enableNotifications)
 
     // ── Network ───────────────────────────────────────────────────────
 
