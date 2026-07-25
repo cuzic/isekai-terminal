@@ -63,6 +63,13 @@ object TabAlertNotifier {
     /**
      * [kind] に応じた通知タイトル・本文。プロファイル名([profileLabel])を含めることで
      * 複数タブ/複数ホストを開いている場合にどのタブの出来事か分かるようにする。
+     *
+     * `WAITING`/`DONE`/`INFO`(AI/汎用の注目通知)はここには来ない想定
+     * (Rust側`OrchestratorAdapter::on_notify`はtmux hook由来の4種のみをこの
+     * コールバック経由で流し、AI側は`TerminalSession.onNotify`という別配線
+     * ——`session.rs`のマッチで両ファミリーが分岐済み——を経由するため)だが、
+     * `NotifyKind`が両ファミリーを1つのenumに統合しているため`when`を網羅する
+     * 必要があり、フォールバック文言を用意する。
      */
     internal fun titleAndTextFor(kind: NotifyKind, profileLabel: String): Pair<String, String> =
         when (kind) {
@@ -70,6 +77,7 @@ object TabAlertNotifier {
             NotifyKind.ACTIVITY -> "$profileLabel: アクティビティ" to "ウィンドウに出力がありました"
             NotifyKind.SILENCE -> "$profileLabel: 無音" to "しばらく出力がありません"
             NotifyKind.JOB_DONE -> "$profileLabel: コマンド終了" to "実行中のコマンドが終了しました"
+            NotifyKind.WAITING, NotifyKind.DONE, NotifyKind.INFO -> "$profileLabel: 通知" to "新しい通知があります"
         }
 
     /**
