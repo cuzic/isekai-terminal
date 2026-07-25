@@ -418,9 +418,9 @@ pub(crate) struct OrchestratorShared {
     /// タスク#58: このオーケストレータが担当するタブ/ペインに対応するtmux
     /// ロケータ。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
     /// が対象ペインを特定するために読む。`None`(既定)なら単にbackfillを
-    /// fail-openでスキップする —— #62の`TmuxLocatorRegistry`をこの値の実際の
-    /// 供給元として配線するのは別タスクの範囲（このワークツリーの時点では
-    /// まだ配線されていない）。`set_tmux_backfill_locator`参照。
+    /// fail-openでスキップする —— `ensure_tmux_tab_window`成功時に
+    /// `set_tmux_backfill_locator`経由で設定される(#60が#62の
+    /// `TmuxLocatorRegistry`へ登録するのと同じタイミング)。
     tmux_backfill_locator: Mutex<Option<TmuxLocator>>,
     /// タスク#58: `reconnect_attempt`(`connect_via`)が同期的に成功した直後
     /// (`spawn_reconnect_loop`の2箇所、および`notify_will_enter_foreground`の
@@ -1186,10 +1186,9 @@ impl SessionOrchestrator {
     /// 設定/更新する。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
     /// が対象ペインを特定するために読む値そのもの。`TmuxLocator`自体が
     /// UniFFI境界を越えない内部専用の型のため、この関数もUniFFIへは公開しない
-    /// ——呼び出すのは#62の`TmuxLocatorRegistry`をこのオーケストレータへ実際に
-    /// 配線する側(別タスク)の想定で、このワークツリーの時点ではまだどこからも
-    /// 呼ばれていない(呼ばれなければ`tmux_backfill_locator`は`None`のままで、
-    /// backfillはfail-openで単にスキップされる)。
+    /// ——`ensure_tmux_tab_window`が成功のたびに呼ぶ(#62の`TmuxLocatorRegistry`への
+    /// 登録と同じタイミング)。呼ばれなければ`tmux_backfill_locator`は`None`のままで、
+    /// backfillはfail-openで単にスキップされる。
     pub(crate) fn set_tmux_backfill_locator(&self, locator: Option<TmuxLocator>) {
         *self.shared.tmux_backfill_locator.lock() = locator;
     }
@@ -1763,6 +1762,12 @@ impl SessionOrchestrator {
         let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
         registry.lock().register(self.shared.app_pane_id.clone(), outcome.locator.clone(), None);
         registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
+        // タスク#58: `spawn_tmux_scrollback_backfill`が読む`tmux_backfill_locator`
+        // (`OrchestratorShared`フィールドのdoc参照)も同じタイミングで配線する。
+        // ここを呼ばないと`tmux_backfill_locator`が常に`None`のままとなり、
+        // フル再接続後のscrollback backfillがfail-openで常にスキップされ続ける
+        // (上のTMUX_LOCATOR_REGISTRY登録漏れと同種の、配線し忘れによる無効化)。
+        self.set_tmux_backfill_locator(Some(outcome.locator.clone()));
         Ok(crate::TmuxTabWindowInfo {
             tag: outcome.locator.tag.0,
             window_index: outcome.coords.window_index,
@@ -2753,10 +2758,17 @@ mod tests {
 
         let attempts = attempt_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(attempts >= 1, "少なくとも1回は再接続試行が起きるはず");
-        assert_eq!(
-            backfill_count.load(std::sync::atomic::Ordering::SeqCst),
-            attempts,
-            "成功した試行の回数だけbackfillフックが呼ばれるはず"
+        // opusレビューM3: attempt_countとbackfill_countは別々のタイミングでloadする
+        // 2つの独立したアトミックのため、この2回のload()の間にループがもう1回
+        // 試行を開始してattempt_countだけ先に進んでいる(その試行のbackfillはまだ
+        // 記録されていない)ことがある(高負荷環境で特に踏みやすい)。「backfillは
+        // 成功した試行の数」という不変条件は、現在進行中の1試行分の遅延を許容した
+        // 範囲(attempts-1 <= backfill <= attempts)としてなら常に成り立つ。
+        let backfill = backfill_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            backfill == attempts || backfill == attempts - 1,
+            "backfillは成功した試行の回数と一致するか、直近1試行分だけ遅れているはず, \
+             attempts={attempts} backfill={backfill}"
         );
     }
 
