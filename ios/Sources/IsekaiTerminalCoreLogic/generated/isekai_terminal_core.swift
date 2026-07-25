@@ -3158,6 +3158,80 @@ public func FfiConverterTypePackedRow_lower(_ value: PackedRow) -> RustBuffer {
 
 
 /**
+ * `presentForm`パネル1フィールド分の定義。値そのものはKotlin/Compose側の
+ * UI状態としてのみ保持され、Rust側には(送信されるまで)戻ってこない
+ * (`AI_INTEGRATION_DESIGN.md` §6.2のフィードバック方針: PTY stdinへの
+ * 通常テキスト書き込みで返すのみで、専用の往復チャネルは持たない)。
+ */
+public struct PanelField: Equatable, Hashable {
+    public var id: String
+    public var label: String
+    public var kind: PanelFieldKind
+    /**
+     * `kind == Choice`の時のみ意味を持つ選択肢一覧。`Text`の時は空。
+     */
+    public var options: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, label: String, kind: PanelFieldKind, 
+        /**
+         * `kind == Choice`の時のみ意味を持つ選択肢一覧。`Text`の時は空。
+         */options: [String]) {
+        self.id = id
+        self.label = label
+        self.kind = kind
+        self.options = options
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PanelField: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePanelField: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PanelField {
+        return
+            try PanelField(
+                id: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypePanelFieldKind.read(from: &buf), 
+                options: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PanelField, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterTypePanelFieldKind.write(value.kind, into: &buf)
+        FfiConverterSequenceString.write(value.options, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelField_lift(_ buf: RustBuffer) throws -> PanelField {
+    return try FfiConverterTypePanelField.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelField_lower(_ value: PanelField) -> RustBuffer {
+    return FfiConverterTypePanelField.lower(value)
+}
+
+
+/**
  * #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
  * (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
  * `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
@@ -3568,6 +3642,34 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var notifyBody: String
     /**
+     * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
+     * 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
+     * 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
+     * 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
+     * 読んでパネルを再描画すること。
+     */
+    public var panelGeneration: UInt64
+    /**
+     * 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
+     * クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
+     * 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
+     * この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+     */
+    public var panelKind: PanelKind
+    /**
+     * パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
+     * 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+     */
+    public var panelTitle: String
+    /**
+     * `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+     */
+    public var panelMarkdown: String
+    /**
+     * `panel_kind == Form`の時のみ意味を持つフィールド一覧。
+     */
+    public var panelFields: [PanelField]
+    /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
      */
     public var cursorShape: CursorShape
@@ -3703,6 +3805,29 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
          */notifyBody: String, 
         /**
+         * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
+         * 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
+         * 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
+         * 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
+         * 読んでパネルを再描画すること。
+         */panelGeneration: UInt64, 
+        /**
+         * 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
+         * クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
+         * 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
+         * この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+         */panelKind: PanelKind, 
+        /**
+         * パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
+         * 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+         */panelTitle: String, 
+        /**
+         * `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+         */panelMarkdown: String, 
+        /**
+         * `panel_kind == Form`の時のみ意味を持つフィールド一覧。
+         */panelFields: [PanelField], 
+        /**
          * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
          */cursorShape: CursorShape, 
         /**
@@ -3783,6 +3908,11 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.notifyKind = notifyKind
         self.notifyTitle = notifyTitle
         self.notifyBody = notifyBody
+        self.panelGeneration = panelGeneration
+        self.panelKind = panelKind
+        self.panelTitle = panelTitle
+        self.panelMarkdown = panelMarkdown
+        self.panelFields = panelFields
         self.cursorShape = cursorShape
         self.cursorBlink = cursorBlink
         self.linkTable = linkTable
@@ -3827,6 +3957,11 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 notifyKind: FfiConverterTypeNotifyKind.read(from: &buf), 
                 notifyTitle: FfiConverterString.read(from: &buf), 
                 notifyBody: FfiConverterString.read(from: &buf), 
+                panelGeneration: FfiConverterUInt64.read(from: &buf), 
+                panelKind: FfiConverterTypePanelKind.read(from: &buf), 
+                panelTitle: FfiConverterString.read(from: &buf), 
+                panelMarkdown: FfiConverterString.read(from: &buf), 
+                panelFields: FfiConverterSequenceTypePanelField.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
                 cursorBlink: FfiConverterBool.read(from: &buf), 
                 linkTable: FfiConverterSequenceString.read(from: &buf), 
@@ -3857,6 +3992,11 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterTypeNotifyKind.write(value.notifyKind, into: &buf)
         FfiConverterString.write(value.notifyTitle, into: &buf)
         FfiConverterString.write(value.notifyBody, into: &buf)
+        FfiConverterUInt64.write(value.panelGeneration, into: &buf)
+        FfiConverterTypePanelKind.write(value.panelKind, into: &buf)
+        FfiConverterString.write(value.panelTitle, into: &buf)
+        FfiConverterString.write(value.panelMarkdown, into: &buf)
+        FfiConverterSequenceTypePanelField.write(value.panelFields, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
         FfiConverterBool.write(value.cursorBlink, into: &buf)
         FfiConverterSequenceString.write(value.linkTable, into: &buf)
@@ -5476,6 +5616,155 @@ public func FfiConverterTypeNotifyKind_lift(_ buf: RustBuffer) throws -> NotifyK
 #endif
 public func FfiConverterTypeNotifyKind_lower(_ value: NotifyKind) -> RustBuffer {
     return FfiConverterTypeNotifyKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * [PanelField]の入力種別。テキスト自由入力か、[PanelField::options]からの選択か。
+ */
+
+public enum PanelFieldKind: Equatable, Hashable {
+    
+    case text
+    case choice
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PanelFieldKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePanelFieldKind: FfiConverterRustBuffer {
+    typealias SwiftType = PanelFieldKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PanelFieldKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text
+        
+        case 2: return .choice
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PanelFieldKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .text:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .choice:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelFieldKind_lift(_ buf: RustBuffer) throws -> PanelFieldKind {
+    return try FfiConverterTypePanelFieldKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelFieldKind_lower(_ value: PanelFieldKind) -> RustBuffer {
+    return FfiConverterTypePanelFieldKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2、`ai_panel.rs`)で提示された
+ * 構造化パネルの種別。`None`は「現在パネルなし」を表す既定値(`ScreenUpdate.panelKind`
+ * が`panelGeneration`の初期値0とペアで意味を持つ、`bellGeneration`と同じ規約)。
+ */
+
+public enum PanelKind: Equatable, Hashable {
+    
+    case none
+    case document
+    case form
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PanelKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePanelKind: FfiConverterRustBuffer {
+    typealias SwiftType = PanelKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PanelKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .document
+        
+        case 3: return .form
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PanelKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .document:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .form:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelKind_lift(_ buf: RustBuffer) throws -> PanelKind {
+    return try FfiConverterTypePanelKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePanelKind_lower(_ value: PanelKind) -> RustBuffer {
+    return FfiConverterTypePanelKind.lower(value)
 }
 
 
@@ -7943,6 +8232,31 @@ fileprivate struct FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePackedRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePanelField: FfiConverterRustBuffer {
+    typealias SwiftType = [PanelField]
+
+    public static func write(_ value: [PanelField], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePanelField.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PanelField] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PanelField]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePanelField.read(from: &buf))
         }
         return seq
     }
