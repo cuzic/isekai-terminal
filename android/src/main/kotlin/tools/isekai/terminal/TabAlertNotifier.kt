@@ -89,7 +89,11 @@ object TabAlertNotifier {
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        val notificationId = NOTIFICATION_ID_BASE + tabId.hashCode()
+        // `String.hashCode()`は負値も返し得るため、そのままNOTIFICATION_ID_BASEに
+        // 足すと他の通知機能(例: TerminalSessionServiceのフォアグラウンド通知
+        // ID=1002)のID帯と衝突し得る(opusレビューLow指摘)。符号ビットを落として
+        // 常に非負にし、かつ固定幅のID帯(NOTIFICATION_ID_BASE〜+9999)へ収める。
+        val notificationId = NOTIFICATION_ID_BASE + (tabId.hashCode() and 0x7fffffff) % 10_000
         try {
             androidx.core.app.NotificationManagerCompat.from(context).notify(notificationId, notification)
         } catch (_: SecurityException) {

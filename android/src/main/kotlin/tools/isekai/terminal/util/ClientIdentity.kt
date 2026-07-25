@@ -22,10 +22,19 @@ object ClientIdentity {
     private const val PREFS_NAME = "isekai_terminal_ui"
     private const val KEY_CLIENT_ID = "tmux_client_id"
 
+    /**
+     * read-then-writeを`synchronized`で直列化し、書き込みも`commit()`(同期)にする
+     * (opusレビューLow指摘: 複数タブがほぼ同時に`getOrCreate`を呼ぶと、両方が
+     * `getString`でnullを見て別々のUUIDを生成・`apply()`(非同期)してしまい、
+     * 「同じデバイスからの再接続は常に同じtmux session group」という前提が
+     * 崩れ得た)。呼び出し元は`viewModelScope.launch(ioDispatcher)`内で呼ぶため、
+     * `commit()`の同期I/Oはブロッキングの懸念にならない。
+     */
+    @Synchronized
     fun getOrCreate(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getString(KEY_CLIENT_ID, null) ?: UUID.randomUUID().toString().also { fresh ->
-            prefs.edit().putString(KEY_CLIENT_ID, fresh).apply()
+            prefs.edit().putString(KEY_CLIENT_ID, fresh).commit()
         }
     }
 }
