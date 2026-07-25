@@ -378,12 +378,20 @@ struct OrchestratorState {
     /// `background_state`と合わせて「今この瞬間ユーザーがこのタブを見ているか」の
     /// 抑制判断に使う。
     tab_focused: bool,
-    /// タスク#57: 直近配信した`(tmux_tag, seq)`。`isekai_protocol::CtlMessage::Notify`の
-    /// docコメントが想定する重複配信(tmux hookの再発火・session group内の複数
-    /// メンバーからの重複起動、`tmux_notify.rs`のモジュールdoc参照)を、同じペアが
-    /// 来たら黙って無視することで検出する。
-    last_notify_seq: Option<(String, u64)>,
+    /// タスク#57: 直近配信した`(tmux_tag, seq)`の小さなリングバッファ。
+    /// `isekai_protocol::CtlMessage::Notify`のdocコメントが想定する重複配信
+    /// (tmux hookの再発火・session group内の複数メンバーからの重複起動、
+    /// `tmux_notify.rs`のモジュールdoc参照)を、同じペアが来たら黙って無視する
+    /// ことで検出する。1件だけ(`Option`)だと、session group内の別ウィンドウの
+    /// タグが交互に届いた場合に重複排除が破れる(opusレビュー指摘)ため、
+    /// [`RECENT_NOTIFY_SEQ_CAPACITY`]件までは覚えておく。
+    recent_notify_seqs: std::collections::VecDeque<(String, u64)>,
 }
+
+/// [`OrchestratorState::recent_notify_seqs`]が覚えておく直近件数。tmux hookの
+/// 重複配信は同じイベントについてほぼ同時に(せいぜい数件)届く想定のため、
+/// 無界に育てる必要はない——小さな固定upper boundにしてメモリを有界に保つ。
+const RECENT_NOTIFY_SEQ_CAPACITY: usize = 8;
 
 /// 1回の再接続試行を実行する処理の型。既定は`connect_via`(実際にセッションを
 /// 生成して接続する)。テストでは実ネットワークに触れないフェイクへ差し替え、
@@ -657,10 +665,14 @@ impl SessionCallback for OrchestratorAdapter {
         if !self.is_current() { return; }
         let should_deliver = {
             let mut s = self.shared.state.lock();
-            if s.last_notify_seq.as_ref() == Some(&(tmux_tag.clone(), seq)) {
+            let key = (tmux_tag, seq);
+            if s.recent_notify_seqs.contains(&key) {
                 false
             } else {
-                s.last_notify_seq = Some((tmux_tag, seq));
+                if s.recent_notify_seqs.len() >= RECENT_NOTIFY_SEQ_CAPACITY {
+                    s.recent_notify_seqs.pop_front();
+                }
+                s.recent_notify_seqs.push_back(key);
                 !(s.tab_focused && s.background_state == BackgroundState::Foreground)
             }
         };
@@ -1129,7 +1141,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             reconnect_policy: ReconnectPolicy::default(),
             background_state: BackgroundState::Foreground,
             tab_focused: false,
-            last_notify_seq: None,
+            recent_notify_seqs: std::collections::VecDeque::new(),
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
@@ -1916,7 +1928,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
-                last_notify_seq: None,
+                recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -1978,7 +1990,7 @@ mod tests {
                 reconnect_policy: policy,
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
-                last_notify_seq: None,
+                recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -2033,7 +2045,7 @@ mod tests {
                 reconnect_policy: policy,
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
-                last_notify_seq: None,
+                recent_notify_seqs: std::collections::VecDeque::new(),
                 pending_file_previews: HashMap::new(),
             }),
             callback: callback.clone(),
@@ -3260,7 +3272,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
-                last_notify_seq: None,
+                recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -3363,6 +3375,24 @@ mod tests {
         adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
         adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 6);
         assert_eq!(cb.notifications.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn on_notify_drops_duplicate_even_when_a_different_tag_arrived_in_between() {
+        // 直前1件だけを覚える実装(Option<(String, u64)>)だと、session group内の
+        // 別ウィンドウのタグが交互に届いた場合に重複排除が破れていた(opusレビュー
+        // 指摘)。recent_notify_seqsが複数件覚えることで、tag-aの重複がtag-bを
+        // 挟んでも検出できることを確認する。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().tab_focused = false;
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-b".to_string(), 1);
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
+        assert_eq!(
+            cb.notifications.lock().unwrap().len(),
+            2,
+            "tag-aの重複は、間にtag-bが挟まっても検出されるはず"
+        );
     }
 
     #[test]
