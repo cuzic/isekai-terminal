@@ -1974,16 +1974,53 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    (TabState, Vec<Action>)`。10分/1時間の実時間待ちなしで全遷移をテストできる)。
    非同期の実行ループはこの純粋関数の結果(`Action`のリスト: `SetColor`/
    `SendPopup`)をI/Oに変換するだけの薄いラッパーにする。
-   - **イベント→意味の対応はdaemon側で決める**(上記の制約参照):
-     `hook_event_name == "Notification" | "Stop"` → その`session_id`にNotify。
-     `hook_event_name == "PreToolUse"`かつ`tool_name == "AskUserQuestion"` →
-     Notify。`hook_event_name == "UserPromptSubmit"` → Resolve。
-     `hook_event_name == "PostToolUse"`かつ`tool_name == "AskUserQuestion"` →
-     Resolve(1回目のレビューで発見: `AskUserQuestion`への`PreToolUse`には
-     対応する`PostToolUse`が無いと、回答してもツール呼び出し自体は
-     `UserPromptSubmit`を発火しないため、10分のタイムアウトまでAttentionが
-     残り続け、その間の他の本物のイベントもdebounceとして握りつぶされる)。
-     それ以外のイベントは無視する。
+   - **イベント→意味の対応はdaemon側で決める**(上記の制約参照)。2026-07-25、
+     Opusによる設計相談(公式ドキュメント`code.claude.com/docs/en/hooks.md`の
+     生テキストを直接確認、レンダリング済みページの要約は`Stop`の該当フィールドを
+     欠落させることが判明したため`.md`直取得で裏取り済み)を経て、当初案から
+     以下の点を修正した:
+     - **Notify**: `hook_event_name == "Notification"`かつ`notification_type`が
+       `permission_prompt`/`idle_prompt`/`elicitation_dialog`/
+       `agent_needs_input`/`agent_completed`のいずれか(`notification_type`
+       欠落時は後方互換のため無条件Notify)。`hook_event_name == "Stop"`かつ
+       `background_tasks`(Claude Code v2.1.145+)が空またはフィールド自体が
+       無い場合。`hook_event_name == "StopFailure"`(APIエラー等で`Stop`の
+       代わりに発火、無条件)。`hook_event_name == "PreToolUse"`かつ
+       `tool_name == "AskUserQuestion"`。
+     - **Resolve**: `hook_event_name == "UserPromptSubmit"`。
+       `hook_event_name == "SessionEnd"`(セッション自体が無くなればもう
+       誰も待っていない、taskタイムアウト・daemon起動時自己修復のどちらも
+       塞がない「ユーザーがattention中にClaude Codeごと終了する」隙間を
+       埋める)。`hook_event_name`が`PostToolUse`または
+       `PostToolUseFailure`かつ`agent_id`フィールドが無い(=subagent発火では
+       ない)場合、`tool_name`を問わず無条件。
+     - **無視**(Notify/Resolveどちらでもない): `notification_type`が
+       `auth_success`(何も待っていない状態を示すだけ)。`background_tasks`が
+       空でない`Stop`(実際にはまだ一時停止中——完了時に改めて空配列の`Stop`
+       か`Notification(idle_prompt)`が届くので取りこぼさない)。それ以外の
+       `hook_event_name`。
+     - **`PermissionRequest`(独立したhookイベント)は意図的に使わない**:
+       ダイアログが実際に表示される**前**に発火する同期的な判定hookのため、
+       他の`PermissionRequest`hookが自動承認すればユーザーは何も見ないまま
+       attention色になりうる。`Notification`の`permission_prompt`
+       (ダイアログ表示と同時に発火する通知専用hook)の方が実態に即している。
+     - **`PostToolUse`から`AskUserQuestion`のmatcherを外した**(1回目のレビューで
+       発見: `AskUserQuestion`への`PreToolUse`には対応する`PostToolUse`が無く、
+       回答してもツール呼び出し自体は`UserPromptSubmit`を発火しないため、
+       10分のタイムアウトまでAttentionが残り続けていた)。無条件Resolveは
+       既にIdleのsessionへのno-opとしてテスト済みなので安全で、`Notification`
+       の`permission_prompt`が承認されて実際にツールが走った場合の解消にも
+       この経路がそのまま使える。
+     - **`agent_id`ガードが必須な理由**: subagentは親と同じ`session_id`を共有し、
+       Claude Code v2.1.198+ではデフォルトでバックグラウンド実行されるため、
+       matcherを外した`PostToolUse`をそのまま使うと、メインターンの`Stop`が
+       付けたattentionを、後から届くsubagent自身のツール完了イベントが
+       即座に解除してしまう。
+     - **`Stop`を`Resolve`にはしない・`stop_hook_active`も見ない**:
+       `Stop`hook実行時点では他のhookがこの後ブロックするかどうか分からず、
+       `stop_hook_active: true`はstop-hookループの最終的な本当の終了時にも
+       現れうるため、ここでResolveすると「実は完了した」ターンをidle色のまま
+       誤魔化しかねない。多少無駄にattention色が続く方の実害が小さいと判断した。
    - あるタブで初めて(=集約値がidleからattentionに変わる瞬間)`SetColor(attention)`
      と`isekai-pipe ctl notify --kind waiting <title> <body>`
      (`AI_INTEGRATION_DESIGN.md` §6.1、`NotifyKind::Waiting`)の両方を実行する。
@@ -1994,8 +2031,15 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    - **自己修復**(1回目のレビュー指摘: crashやEpic Mの既知の制限で古い
      `$ISEKAI_CTL_SOCK`を掴んだままになった等でタブがattention色のまま
      取り残されるケースへの対処): daemonは起動時に一度`SetColor(idle)`を送る。
-     `claude-hookd event`はdaemon不在かつResolve相当のイベントだった場合でも、
-     daemonを新規起動せずに`SetColor(idle)`だけを1回冪等に送ってから終了する。
+     加えて`claude-hookd event`は、`SessionEnd`(=もうこのセッションから
+     イベントは二度と来ない)がdaemonに届かなかった場合に限り、daemonを
+     新規起動せずに`SetColor(idle)`だけを1回冪等に直接送る(2026-07-25、
+     Opus相談で発見: これが無いと、attention中にdaemonがクラッシュしたまま
+     セッションが終了すると、二度と塗り直されず永久にattention色のまま
+     残る)。他の`Resolve`(`PostToolUse`等、matcherを外して常時発火する
+     もの)では行わない——ほとんどの場合そのタブは一度もattentionになった
+     ことが無くdaemonも元々不要なので、ツール呼び出しのたびに冗長な
+     `SetColor(idle)`をctlソケットへ送り続けるだけの無駄になる。
    - 既定タイムアウト: attention→idleへの自動復帰は10分。将来
      `#@isekai tab-attention-timeout-secs <n>`等での上書きは増分として残す。
    - daemon自身は最後のイベントから1時間イベントが無ければ自発的に終了する
@@ -2008,17 +2052,25 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    ```json
    {
      "hooks": {
-       "Notification":     [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "Stop":             [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "PreToolUse":  [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "PostToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }]
+       "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
+       "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
+       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }]
      }
    }
    ```
-   `matcher`はどのツール呼び出しについてhookを起動するかという「配線」の指定に
-   留まり、それが「Notifyを意味するかResolveを意味するか」の判断自体は上記4の
-   通りdaemon側(`tool_name`を見て判定)にある。
+   `matcher`が要るのは`PreToolUse`(`AskUserQuestion`のみ)だけ。それ以外の
+   hookは全件登録し、実際にNotify/Resolveのどちらを意味するか(`tool_name`
+   の`AskUserQuestion`一致・`notification_type`の値・`background_tasks`の
+   有無・`agent_id`の有無等)の判断は上記4の通りdaemon側で一元的に行う。
+   `PostToolUse`/`PostToolUseFailure`/`Notification`はマッチャー無しで
+   ツール呼び出しのたびに発火するため、Claude Code本体をブロックしないよう
+   `"async": true`を付ける(`claude-hookd event`は元々exitコード常に0・
+   stdout無出力なので、asyncにしても判定への影響は無い)。
 
 **明示的にスコープ外(v1)**:
 - **isekai-terminal本体アプリ(Android/iOS)には効果が無い**: `SetTabColor`は

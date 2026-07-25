@@ -42,6 +42,16 @@ use state::HookEvent;
 #[cfg(unix)]
 const SPAWN_RETRY_DELAYS_MS: [u64; 5] = [50, 100, 200, 400, 800];
 
+/// Fallback colors used when `#@isekai tab-idle-color`/`tab-attention-color`
+/// was never set. Shared between the daemon (`daemon::run`'s `DaemonConfig`
+/// defaults) and this module's own [`event_command`] fallback below — both
+/// need the same idle color to paint the same thing regardless of which one
+/// ends up doing the painting.
+#[cfg(unix)]
+pub(crate) const DEFAULT_IDLE_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
+#[cfg(unix)]
+pub(crate) const DEFAULT_ATTENTION_COLOR: (u8, u8, u8) = (0xff, 0x88, 0x00);
+
 #[cfg(unix)]
 pub(crate) async fn claude_hookd_command(mut args: impl Iterator<Item = String>) -> ExitCode {
     match args.next().as_deref() {
@@ -81,7 +91,7 @@ async fn event_command() -> ExitCode {
     if tokio::io::stdin().read_to_end(&mut payload).await.is_err() {
         return ExitCode::SUCCESS;
     }
-    let Some((session_id, event)) = parse_hook_event(&payload) else {
+    let Some((session_id, event, is_session_end)) = parse_hook_event(&payload) else {
         return ExitCode::SUCCESS;
     };
     // `#@isekai ctl-socket` is opt-in and defaults off (`ISEKAI_PIPE_DESIGN.md`
@@ -107,6 +117,40 @@ async fn event_command() -> ExitCode {
     }
 
     let idle_color = std::env::var("ISEKAI_TAB_IDLE_COLOR").ok().and_then(|v| isekai_pipe_core::parse_hex_color(&v).ok());
+
+    // Only `Notify` lazily spawns a daemon: if none is running there is by
+    // definition no attention state for a *daemon-tracked* `Resolve` to
+    // clear (Opus design consult, 2026-07-25). This matters more than it
+    // looks — dropping `PostToolUse`'s matcher means it now fires on *every*
+    // tool call, so paying `SPAWN_RETRY_DELAYS_MS`'s ~1.55s worst case on
+    // each one whenever no daemon happens to be running would add real,
+    // visible latency to ordinary tool use. It also protects `SessionEnd`,
+    // whose hooks have a documented 1.5s default timeout that ladder alone
+    // could exceed.
+    if event != HookEvent::Notify {
+        // `SessionEnd` alone still gets one direct, best-effort, idempotent
+        // `SetTabColor(idle)` — bypassing the daemon/state machine entirely
+        // — when no daemon answers. Without this, "the daemon happened to be
+        // dead (crashed; the routine 1h idle-exit can't cause this, since
+        // any regular Resolve traffic keeps resetting its own idle-exit
+        // deadline) right as the very last event for this tab arrives"
+        // strands the tab in the attention color forever: a dead `Resolve`
+        // no longer spawns a daemon that could self-heal on startup, and
+        // once the session is gone there's no more traffic to ever trigger
+        // a repaint. Deliberately scoped to just `SessionEnd`, not every
+        // `Resolve` — most `Resolve`s are unconditional `PostToolUse`/
+        // `PostToolUseFailure` firing on a tab that was never Attention in
+        // the first place (no daemon ever needed to exist), and sending a
+        // redundant idle-color write to the real ctl socket on literally
+        // every tool call would be constant, mostly-pointless overhead for
+        // a benefit that only matters in this one specific, rarer case.
+        if is_session_end {
+            let (r, g, b) = idle_color.unwrap_or(DEFAULT_IDLE_COLOR);
+            let _ = crate::ctl::send_ctl_message(&ctl_sock_path, isekai_protocol::CtlMessage::SetTabColor { r, g, b }).await;
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let attention_color = std::env::var("ISEKAI_TAB_ATTENTION_COLOR")
         .ok()
         .and_then(|v| isekai_pipe_core::parse_hex_color(&v).ok());
@@ -121,28 +165,105 @@ async fn event_command() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Extracts just the two fields `claude-hookd` needs from Claude Code's hook
-/// JSON payload and maps `hook_event_name` (`tool_name`, for
-/// `PreToolUse`/`PostToolUse`) to this module's own [`HookEvent`] — the one
-/// place in this feature that knows Claude Code's hook schema, deliberately
-/// kept separate from the daemon's own minimal wire format
+/// Extracts just the fields `claude-hookd` needs from Claude Code's hook JSON
+/// payload and maps them to this module's own [`HookEvent`] — the one place
+/// in this feature that knows Claude Code's hook schema, deliberately kept
+/// separate from the daemon's own minimal wire format
 /// (`daemon::read_one_event`) so a future Claude Code schema change touches
 /// only this function. `None` covers both "malformed JSON" and "an event
 /// type `claude-hookd` doesn't act on" identically — both are silent no-ops.
+/// The third element is `true` only for `SessionEnd` — `event_command`'s only
+/// use for it is deciding whether a `Resolve` that can't reach any daemon
+/// still deserves a direct, one-off self-heal `SetTabColor` (see its call
+/// site); every other `Resolve` reaching a dead/absent daemon is left alone.
+///
+/// This mapping was worked out with an Opus design consult (2026-07-25) that
+/// fetched the raw `code.claude.com/docs/en/hooks.md` directly (the rendered/
+/// summarized page silently drops the `Stop` fields below — verify against
+/// the `.md` URL, not the HTML one, if this ever needs re-checking) rather
+/// than trusting either of two third-party design docs that had disagreed
+/// with each other on some of these fields:
+/// - `Notification(notification_type=permission_prompt)`, not the separate
+///   `PermissionRequest` hook, is the right signal for "a permission dialog
+///   appeared": `PermissionRequest` fires *before* the dialog and is a
+///   blocking decision hook (another `PermissionRequest` hook could
+///   auto-allow it, so it doesn't reliably mean a human saw anything), and
+///   adding a hook there puts this daemon's latency in front of every
+///   permission check.
+/// - `StopFailure` fires *instead of* `Stop` on an API error — without it, an
+///   errored turn silently leaves the tab its idle color.
+/// - `Stop`'s hook input includes `background_tasks`/`session_crons`/
+///   `stop_hook_active` (Claude Code v2.1.145+; absent on older builds, which
+///   this function treats as "no background work" — falling back to
+///   unconditional `Notify`, today's pre-existing behavior). Only
+///   `background_tasks` is checked: a non-empty array means the session is
+///   *paused waiting for its own background work*, not actually done, so
+///   `Stop` is skipped (the eventual wake-up produces a fresh `Stop` with an
+///   empty array, or a `Notification(idle_prompt)` backstop, so the signal
+///   isn't lost). `session_crons` is deliberately ignored — a `/loop`/
+///   `ScheduleWakeup` entry can sit there for hours while the user genuinely
+///   is needed for something else. `stop_hook_active` is also deliberately
+///   ignored and no `Stop` variant maps to `Resolve`: at `Stop`-hook time
+///   there's no way to know whether another hook is about to block, and
+///   `stop_hook_active: true` is also what a stop-hook loop's final,
+///   genuinely-terminal `Stop` looks like — resolving on it risks ending a
+///   just-finished turn with the idle color, which costs the user more than
+///   a transient extra orange during a `/goal`-style loop does.
+/// - `PostToolUse`'s `AskUserQuestion` matcher is dropped: it now fires (and
+///   resolves) for every tool, since a `Resolve` on an unrelated/already-Idle
+///   session is a tested no-op, and this is also what closes out a
+///   `permission_prompt` Notify once the approved tool actually runs (a bare
+///   `AskUserQuestion` matcher never covered that case at all).
+///   `PostToolUseFailure` gets the same treatment (a permission-approved tool
+///   that then fails must still close out the attention it caused).
+/// - The `agent_id` guard on `PostToolUse`/`PostToolUseFailure` is required,
+///   not optional, once the matcher is dropped: subagents share the parent's
+///   `session_id` and (Claude Code v2.1.198+) run in the background by
+///   default, so their tool-completion events keep arriving *after* the main
+///   turn's `Stop` — without this guard they would immediately clear the
+///   attention color `Stop` just set.
+/// - `SessionEnd` maps to `Resolve`: nothing can still be waiting on the user
+///   once the session itself is gone (covers "user quits Claude Code while
+///   the tab is still orange", the one gap the 10-minute attention timeout
+///   and the daemon's own startup self-heal don't already close).
 #[cfg(unix)]
-fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent)> {
+fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let session_id = value.get("session_id")?.as_str()?.to_string();
     let hook_event_name = value.get("hook_event_name")?.as_str()?;
     let tool_name = value.get("tool_name").and_then(|v| v.as_str());
+    // Present only inside a subagent's own hook calls (see the doc comment's
+    // note on the `PostToolUse`/`PostToolUseFailure` guard above).
+    let in_subagent = value.get("agent_id").is_some();
+    let background_work_pending = value
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tasks| !tasks.is_empty());
+
     let event = match hook_event_name {
-        "Notification" | "Stop" => HookEvent::Notify,
-        "UserPromptSubmit" => HookEvent::Resolve,
+        "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
+            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input" | "agent_completed") => {
+                HookEvent::Notify
+            }
+            // The MCP elicitation dialog was answered or dismissed.
+            Some("elicitation_complete" | "elicitation_response") => HookEvent::Resolve,
+            // `auth_success` never means "you're needed"; unrecognized/future
+            // sub-types are ignored rather than guessed into a false orange.
+            Some(_) => return None,
+            // No `notification_type` at all (older Claude Code build): keep
+            // the pre-filtering catch-all behavior rather than silently
+            // dropping every Notification.
+            None => HookEvent::Notify,
+        },
+        "Stop" if !background_work_pending => HookEvent::Notify,
+        "StopFailure" => HookEvent::Notify,
         "PreToolUse" if tool_name == Some("AskUserQuestion") => HookEvent::Notify,
-        "PostToolUse" if tool_name == Some("AskUserQuestion") => HookEvent::Resolve,
+        "UserPromptSubmit" => HookEvent::Resolve,
+        "PostToolUse" | "PostToolUseFailure" if !in_subagent => HookEvent::Resolve,
+        "SessionEnd" => HookEvent::Resolve,
         _ => return None,
     };
-    Some((session_id, event))
+    Some((session_id, event, hook_event_name == "SessionEnd"))
 }
 
 /// `$ISEKAI_CTL_SOCK` is `/tmp/isekai-pipe-ctl-<token>.sock`
@@ -254,29 +375,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_notification_and_stop_as_notify() {
-        for name in ["Notification", "Stop"] {
-            let payload = format!(r#"{{"session_id":"s1","hook_event_name":"{name}"}}"#);
-            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), HookEvent::Notify)));
+    fn bare_notification_with_no_notification_type_falls_back_to_notify() {
+        // Older Claude Code builds that predate the `notification_type`
+        // field entirely — keep the pre-filtering catch-all behavior rather
+        // than silently dropping every Notification.
+        let payload = br#"{"session_id":"s1","hook_event_name":"Notification"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+    }
+
+    #[test]
+    fn notification_types_that_mean_needs_input_are_notify() {
+        for kind in ["permission_prompt", "idle_prompt", "elicitation_dialog", "agent_needs_input", "agent_completed"] {
+            let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), HookEvent::Notify, false)),
+                "notification_type {kind:?} should be Notify"
+            );
         }
+    }
+
+    #[test]
+    fn notification_types_that_close_an_elicitation_are_resolve() {
+        for kind in ["elicitation_complete", "elicitation_response"] {
+            let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
+            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), HookEvent::Resolve, false)));
+        }
+    }
+
+    #[test]
+    fn auth_success_notification_is_ignored() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"auth_success"}"#;
+        assert_eq!(parse_hook_event(payload), None);
+    }
+
+    #[test]
+    fn stop_without_pending_background_work_is_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        // Also true for older Claude Code builds where the field is absent
+        // entirely (Claude Code v2.1.145+ only).
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+    }
+
+    #[test]
+    fn stop_with_pending_background_work_is_ignored() {
+        // The session is paused waiting for its own background work to wake
+        // it back up, not actually done — the eventual wake-up produces a
+        // fresh Stop (empty array) or a Notification(idle_prompt) backstop.
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","status":"running"}]}"#;
+        assert_eq!(parse_hook_event(payload), None);
+    }
+
+    #[test]
+    fn stop_failure_is_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"StopFailure"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
     }
 
     #[test]
     fn parses_user_prompt_submit_as_resolve() {
         let payload = br#"{"session_id":"s1","hook_event_name":"UserPromptSubmit"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve, false)));
+    }
+
+    #[test]
+    fn session_end_is_resolve_and_flagged_for_the_self_heal_fallback() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve, true)));
     }
 
     #[test]
     fn pre_tool_use_ask_user_question_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify)));
-    }
-
-    #[test]
-    fn post_tool_use_ask_user_question_is_resolve() {
-        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"AskUserQuestion"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
     }
 
     #[test]
@@ -286,8 +459,23 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_for_other_tools_is_ignored() {
-        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash"}"#;
+    fn post_tool_use_resolves_regardless_of_tool_name() {
+        // The `AskUserQuestion` matcher was deliberately dropped: `Resolve`
+        // on an unrelated/already-Idle session is a tested no-op, and this
+        // is what closes out a `permission_prompt` Notify once the approved
+        // tool actually runs.
+        for name in ["PostToolUse", "PostToolUseFailure"] {
+            let payload = format!(r#"{{"session_id":"s1","hook_event_name":"{name}","tool_name":"Bash"}}"#);
+            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), HookEvent::Resolve, false)));
+        }
+    }
+
+    #[test]
+    fn subagent_post_tool_use_is_ignored() {
+        // A subagent's own tool completions (shares the parent session_id,
+        // runs in the background by default since v2.1.198) must not clear
+        // attention the main turn's Stop just raised.
+        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":"sub1"}"#;
         assert_eq!(parse_hook_event(payload), None);
     }
 

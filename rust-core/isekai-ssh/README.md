@@ -546,19 +546,33 @@ hook でも同じ1行、Claude Code のフック JSON を stdin から読んで�
 ```json
 {
   "hooks": {
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "PreToolUse":  [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "PostToolUse": [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }]
+    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }]
   }
 }
 ```
 
-これで、Claude Code が権限確認や `AskUserQuestion` で止まっている間はタブが
-attention色になり、ポップアップ通知(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)
-が一度だけ出る。次のプロンプト送信(`UserPromptSubmit`)か`AskUserQuestion`への回答
-(`PostToolUse`)で即座にidle色へ戻り、何も操作しなくても10分経てば自動的に戻る。
+`PostToolUse`/`PostToolUseFailure`/`Notification` はmatcherを付けずに全件登録する
+(どのイベント種別が実際に色を変えるかの判断は`.claude/settings.json`側ではなく
+`claude-hookd`自身が行う、という設計方針そのままなので、フィルタも向こう側に置く)。
+`PostToolUse`は全ツール呼び出しごとに発火するようになるため、Claude Code本体を
+ブロックしないよう`"async": true`を付けている(`claude-hookd event`は元々exit
+コードが常に0でstdoutも出力しないので、asyncにしても判定への影響は無い)。
+
+これで、Claude Codeが権限確認(`Notification`の`permission_prompt`)や
+`AskUserQuestion`で止まっている間、あるいはAPIエラーで応答が終わった
+(`StopFailure`)間はタブがattention色になり、ポップアップ通知
+(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)が一度だけ出る。次のプロンプト
+送信・ツール呼び出しの完了・セッション終了のいずれかで即座にidle色へ戻り、何も
+操作しなくても10分経てば自動的に戻る。バックグラウンドタスク待ちで一時停止した
+`Stop`(`background_tasks`が空でない)はattention色にしない——実際に完了した
+ときに改めて`Stop`(空配列)か`Notification`の`idle_prompt`が届く。
 
 裏側では、最初のイベントが来たタイミングでタブごとの小さなdaemon
 (`isekai-pipe claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ

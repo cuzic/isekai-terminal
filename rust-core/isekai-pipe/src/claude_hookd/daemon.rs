@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 
 use super::state::{apply_event, apply_timeout, Action, HookEvent, TabState};
@@ -27,11 +27,6 @@ const ATTENTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// `claude-hookd event` invocation's `sweep_stale_ctl_sockets_on_remote`
 /// call to reclaim, same as every other ctl-socket path).
 const IDLE_EXIT: Duration = Duration::from_secs(60 * 60);
-
-/// Fallback colors used when `#@isekai tab-idle-color`/`tab-attention-color`
-/// was never set (no `--idle-color`/`--attention-color` spawn argument).
-const DEFAULT_IDLE_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
-const DEFAULT_ATTENTION_COLOR: (u8, u8, u8) = (0xff, 0x88, 0x00);
 
 struct DaemonConfig {
     sock_path: PathBuf,
@@ -87,8 +82,8 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
     run(DaemonConfig {
         sock_path,
         ctl_sock_path,
-        idle_color: idle_color.unwrap_or(DEFAULT_IDLE_COLOR),
-        attention_color: attention_color.unwrap_or(DEFAULT_ATTENTION_COLOR),
+        idle_color: idle_color.unwrap_or(super::DEFAULT_IDLE_COLOR),
+        attention_color: attention_color.unwrap_or(super::DEFAULT_ATTENTION_COLOR),
         attention_timeout,
         idle_exit,
     })
@@ -259,6 +254,7 @@ async fn send_notify_popup(ctl_sock_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
 
