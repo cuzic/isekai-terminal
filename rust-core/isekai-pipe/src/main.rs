@@ -1,3 +1,4 @@
+mod claude_hookd;
 mod ctl;
 mod ctl_file;
 mod datagram_relay;
