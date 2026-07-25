@@ -470,6 +470,16 @@ impl TmuxLocatorRegistry {
         if let Some(old) = self.by_app_pane.get(&app_pane) {
             self.by_locator.remove(&old.locator);
         }
+        // 別のapp_paneが既に同じlocatorを持っていた場合、そちらのby_app_pane
+        // エントリも取り除く(opusレビューLow指摘: これをしないとby_locatorだけ
+        // 上書きされ、古いapp_pane側にはもう他人のものになったlocatorへの参照が
+        // stale状態のまま残る——その古いapp_paneが後でunregisterされた際、既に
+        // 別のapp_paneが正当に使っているby_locatorエントリを誤って消してしまう)。
+        if let Some(prev_owner) = self.by_locator.get(&locator) {
+            if *prev_owner != app_pane {
+                self.by_app_pane.remove(prev_owner);
+            }
+        }
         self.by_locator.insert(locator.clone(), app_pane.clone());
         self.by_app_pane.insert(
             app_pane.clone(),
@@ -963,6 +973,36 @@ mod tests {
         let updated = registry.set_ctl_socket_path(&app_pane, Some("/tmp/isekai-pipe-ctl-b.sock".to_string()));
         assert!(updated);
         assert_eq!(registry.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-b.sock"));
+    }
+
+    #[test]
+    fn register_same_locator_for_a_different_app_pane_evicts_the_previous_owners_entry() {
+        // opusレビューLow指摘: by_locatorだけ上書きされ、古いapp_pane側の
+        // by_app_paneエントリがstaleなlocator参照を持ったまま残ると、その古い
+        // app_paneが後でunregisterされた際に、既に新しいapp_paneが正当に使って
+        // いるby_locatorエントリを誤って消してしまう。
+        let mut registry = TmuxLocatorRegistry::new();
+        let old_pane = pane("tab-old", "pane-primary");
+        let new_pane = pane("tab-new", "pane-primary");
+        let loc = locator("tag-shared");
+        registry.register(old_pane.clone(), loc.clone(), None);
+        registry.register(new_pane.clone(), loc.clone(), None);
+
+        assert_eq!(
+            registry.locator_for(&old_pane),
+            None,
+            "古いapp_pane側のエントリごと消えているはず"
+        );
+        assert_eq!(registry.app_pane_for(&loc), Some(&new_pane));
+
+        // 古いapp_pane(既にエントリが無い)をunregisterしても、新しいapp_pane
+        // が正当に持っているby_locatorエントリは壊れないはず。
+        assert_eq!(registry.unregister(&old_pane), None);
+        assert_eq!(
+            registry.app_pane_for(&loc),
+            Some(&new_pane),
+            "古いapp_paneのunregisterで新しいapp_paneの逆引きが壊れてはいけない"
+        );
     }
 
     #[test]
