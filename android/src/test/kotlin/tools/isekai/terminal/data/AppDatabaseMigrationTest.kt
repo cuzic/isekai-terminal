@@ -123,6 +123,7 @@ class AppDatabaseMigrationTest {
                 AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
                 AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
                 AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_21_22,
             )
             .build()
 
@@ -238,6 +239,7 @@ class AppDatabaseMigrationTest {
                 AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12,
                 AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
                 AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_21_22,
             )
             .build()
         try {
@@ -354,6 +356,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
                 AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_21_22,
             )
             .build()
         try {
@@ -475,6 +478,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18,
                 AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_21_22,
             )
             .build()
         try {
@@ -593,6 +597,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19,
                 AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_21_22,
             )
             .build()
         try {
@@ -714,7 +719,7 @@ class AppDatabaseMigrationTest {
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
             .addMigrations(
                 AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20,
-                AppDatabase.MIGRATION_20_21,
+                AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_21_22,
             )
             .build()
         try {
@@ -856,7 +861,7 @@ class AppDatabaseMigrationTest {
         // Room 経由で開くと MIGRATION_18_19 が適用され、key_sequence_pack_installations
         // テーブルが作られるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21)
+            .addMigrations(AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_21_22)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -1006,7 +1011,7 @@ class AppDatabaseMigrationTest {
         // Room 経由で開くと MIGRATION_19_20 が適用され、tmux_tab_locators テーブルが
         // 作られるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21)
+            .addMigrations(AppDatabase.MIGRATION_19_20, AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_21_22)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -1164,7 +1169,7 @@ class AppDatabaseMigrationTest {
         rawHelper.close()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_20_21)
+            .addMigrations(AppDatabase.MIGRATION_20_21, AppDatabase.MIGRATION_21_22)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
