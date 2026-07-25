@@ -707,6 +707,12 @@ class TerminalTabsViewModel(
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
+                // `AI_INTEGRATION_DESIGN.md` §3: このpaneのAIパネルopt-inを、接続の
+                // たびに(再接続を含め)Rust側へ送り直す(`SessionCore.set_panel_enabled`
+                // のdocコメント参照: 値を保持しないため毎回の送信が必須)。split pane
+                // それぞれが独立した`Terminal`を持つため、tmux通知(primary paneのみ)
+                // と異なり全paneに対して行う。
+                tab.profile?.let { pane.session.setAiPanelEnabled(it.enableAiPanel) }
                 // タスク#60: tmux session group ensure/attach + ウィンドウのcreate-or-select。
                 // primary paneのみが対象(split paneはtmux非対応のMVP判断、
                 // `rust-core/src/tmux_session.rs`のモジュールdoc参照)。

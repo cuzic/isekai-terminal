@@ -218,6 +218,51 @@ class ProfileEditScreenTest {
         }
     }
 
+    // ── AIパネルトグル(`AI_INTEGRATION_DESIGN.md` §3/§6.2) ────────────────
+
+    @Test fun aiPanelToggle_hiddenExplanation_untilEnabled() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("AIパネル(構造化ドキュメント/フォーム)").assertExists()
+        composeTestRule.onNodeWithText("信頼できるホストのみで有効にしてください", substring = true)
+            .assertDoesNotExist()
+    }
+
+    @Test fun aiPanelToggle_enabling_showsExplanation() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("AIパネル(構造化ドキュメント/フォーム)").performScrollTo()
+        composeTestRule.onNodeWithTag("aiPanelSwitch").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("信頼できるホストのみで有効にしてください", substring = true)
+            .assertExists()
+    }
+
+    @Test fun editProfile_prefillsAiPanelEnabled() {
+        val profile = sampleProfile().copy(enableAiPanel = true)
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("信頼できるホストのみで有効にしてください", substring = true)
+            .assertExists()
+    }
+
+    @Test fun saveNewProfile_withAiPanelEnabled_persistsFlag() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("Bastion4")
+        fields[1].performTextInput("bastion4.example.com")
+        fields[3].performTextInput("admin")
+        composeTestRule.onNodeWithTag("aiPanelSwitch").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "Bastion4" }
+            assertTrue(stored.enableAiPanel)
+        }
+    }
+
     // ── 踏み台(ProxyJump) ───────────────────────────────────────────────
 
     @Test fun jumpHostToggle_hiddenFields_untilEnabled() {
