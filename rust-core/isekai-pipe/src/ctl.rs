@@ -30,6 +30,11 @@ const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
 #[derive(Debug, PartialEq, Eq)]
 enum CtlLaunch {
     Title { sock: Option<String>, value: String },
+    /// Sets this tab's background color in terminals that support it
+    /// (Windows Terminal via OSC 4;264 — see
+    /// `isekai-ssh::ctl_forward::osc_sequence_for`). Fire-and-forget, same
+    /// wire shape as `Title`.
+    TabColor { sock: Option<String>, r: u8, g: u8, b: u8 },
     ClipPush { sock: Option<String>, mime: ClipboardMime },
     ClipPull { sock: Option<String> },
     /// タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
@@ -50,6 +55,10 @@ enum CtlLaunch {
 fn print_ctl_help() {
     println!("USAGE:");
     println!("    isekai-pipe ctl title <text> [--sock <path>]");
+    println!("    isekai-pipe ctl tab-color <rrggbb> [--sock <path>]");
+    println!("        (6 hex digits, optionally prefixed with '#', e.g. ff0000 or '#ff0000' —");
+    println!("        quote the '#' form, unquoted it starts a shell comment;");
+    println!("        Windows Terminal only — see ISEKAI_PIPE_DESIGN.md §8 Epic M)");
     println!("    isekai-pipe ctl clip push --mime <text/plain|text/html|image/png> [--sock <path>]");
     println!("        (reads the payload from stdin)");
     println!("    isekai-pipe ctl clip pull [--sock <path>]");
@@ -70,7 +79,7 @@ fn print_ctl_help() {
     println!("        the actual command run is never sent over the wire, see ISEKAI_PIPE_DESIGN.md");
     println!("        §8 Epic P)");
     println!();
-    println!("`setvar`/`getvar`/`title`/`clip`/`build` need the tab's ctl-socket forward: without --sock,");
+    println!("`setvar`/`getvar`/`title`/`tab-color`/`clip`/`build` need the tab's ctl-socket forward: without --sock,");
     println!("they read the target UNIX domain socket path from ${ENV_CTL_SOCK}. `file` does not");
     println!("use this socket at all (see `isekai-pipe ctl file --help`).");
     println!();
@@ -115,6 +124,21 @@ fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
     }
 }
 
+/// Parses a `rrggbb` (optionally `#`-prefixed) color argument into its three
+/// channel bytes.
+fn parse_hex_color(value: &str) -> Result<(u8, u8, u8), String> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "isekai-pipe ctl tab-color: {value:?} is not a valid color (expected 6 hex digits, e.g. ff0000 or '#ff0000')"
+        ));
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).expect("validated hex digits");
+    let g = u8::from_str_radix(&hex[2..4], 16).expect("validated hex digits");
+    let b = u8::from_str_radix(&hex[4..6], 16).expect("validated hex digits");
+    Ok((r, g, b))
+}
+
 fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
     match args.next().as_deref() {
         None | Some("-h") | Some("--help") => {
@@ -122,6 +146,7 @@ fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>
             Ok(None)
         }
         Some("title") => parse_ctl_title(args),
+        Some("tab-color") => parse_ctl_tab_color(args),
         Some("clip") => parse_ctl_clip(args),
         Some("notify") => parse_ctl_notify(args),
         Some("setvar") => parse_ctl_setvar(args),
@@ -221,6 +246,36 @@ fn parse_ctl_notify(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
         return Err(ExitCode::from(EX_USAGE));
     };
     Ok(Some(CtlLaunch::Notify { sock, kind, tmux_tag, seq }))
+}
+
+fn parse_ctl_tab_color(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut color: Option<(u8, u8, u8)> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl tab-color", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other if color.is_none() => {
+                color = Some(parse_hex_color(other).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other => {
+                eprintln!("isekai-pipe ctl tab-color: unexpected extra argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some((r, g, b)) = color else {
+        eprintln!("isekai-pipe ctl tab-color: a color argument is required (6 hex digits, e.g. ff0000)");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::TabColor { sock, r, g, b }))
 }
 
 fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
@@ -531,6 +586,7 @@ async fn ctl_command_with_sweep_dir(mut args: impl Iterator<Item = String>, swee
     sweep_stale_ctl_sockets_in(sweep_dir);
     let sock = match &launch {
         CtlLaunch::Title { sock, .. }
+        | CtlLaunch::TabColor { sock, .. }
         | CtlLaunch::ClipPush { sock, .. }
         | CtlLaunch::ClipPull { sock }
         | CtlLaunch::Notify { sock, .. }
@@ -583,6 +639,7 @@ pub(crate) async fn ctl_command(mut args: impl Iterator<Item = String>) -> ExitC
     // to it" step is unix-only.
     let sock = match &launch {
         CtlLaunch::Title { sock, .. }
+        | CtlLaunch::TabColor { sock, .. }
         | CtlLaunch::ClipPush { sock, .. }
         | CtlLaunch::ClipPull { sock }
         | CtlLaunch::Notify { sock, .. }
@@ -604,6 +661,10 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<u8> {
     match launch {
         CtlLaunch::Title { value, .. } => {
             send_ctl_message(sock_path, CtlMessage::SetTitle { value }).await?;
+            Ok(0)
+        }
+        CtlLaunch::TabColor { r, g, b, .. } => {
+            send_ctl_message(sock_path, CtlMessage::SetTabColor { r, g, b }).await?;
             Ok(0)
         }
         CtlLaunch::ClipPush { mime, .. } => {
@@ -839,6 +900,39 @@ mod tests {
     #[test]
     fn rejects_title_without_text() {
         let err = parse_ctl(args(&["title"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_tab_color() {
+        let launch = parse_ctl(args(&["tab-color", "ff0000"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::TabColor { sock: None, r: 0xff, g: 0x00, b: 0x00 });
+    }
+
+    #[test]
+    fn parses_tab_color_with_hash_prefix_and_explicit_sock() {
+        let launch = parse_ctl(args(&["tab-color", "--sock", "/tmp/a.sock", "#00ff80"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::TabColor { sock: Some("/tmp/a.sock".to_string()), r: 0x00, g: 0xff, b: 0x80 }
+        );
+    }
+
+    #[test]
+    fn rejects_tab_color_without_argument() {
+        let err = parse_ctl(args(&["tab-color"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_tab_color_with_wrong_length() {
+        let err = parse_ctl(args(&["tab-color", "fff"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_tab_color_with_non_hex_digits() {
+        let err = parse_ctl(args(&["tab-color", "zzzzzz"])).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
