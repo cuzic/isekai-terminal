@@ -15,6 +15,7 @@ import org.junit.Test
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.PromptJumpTarget
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
@@ -63,7 +64,7 @@ class TerminalSessionTest {
      *  既存テストと同じ最小値で埋める。 */
     private fun bellUpdate(bellGeneration: ULong, cursorCol: UInt = 0u) = ScreenUpdate(
         0u, 80u, 24u, emptyList(), 0u, cursorCol, "title", false, false, false,
-        MouseReportingMode.OFF, false, false, false, true, bellGeneration, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
+        MouseReportingMode.OFF, false, false, false, true, bellGeneration, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
     )
 
     // ── 初期状態 ──────────────────────────────────────────────────

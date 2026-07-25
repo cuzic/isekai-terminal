@@ -6,6 +6,7 @@ import org.junit.Test
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 class TerminalHyperlinkTest {
@@ -35,6 +36,10 @@ class TerminalHyperlinkTest {
             urxvtMouseMode = false,
         cursorVisible = true,
         bellGeneration = 0uL,
+        notifyGeneration = 0uL,
+        notifyKind = NotifyKind.INFO,
+        notifyTitle = "",
+        notifyBody = "",
         cursorShape = CursorShape.BLOCK,
         cursorBlink = true,
         linkTable = linkTable,
