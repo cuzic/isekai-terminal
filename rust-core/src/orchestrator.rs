@@ -2015,6 +2015,7 @@ mod tests {
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
                 last_notify_seq: None,
+                pending_file_previews: HashMap::new(),
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -3481,6 +3482,7 @@ mod tests {
             fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
                 let _ = self.tx.send(TestEvent::FilePreview(request_id, outcome));
             }
+            fn on_notify(&self, _kind: crate::NotifyKind) {}
         }
 
         /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
