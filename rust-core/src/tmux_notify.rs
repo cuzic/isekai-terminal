@@ -72,6 +72,25 @@ const WINDOW_SCOPED_HOOK: (&str, &str) = ("pane-died", "job_done");
 /// 趣旨に対する妥当な値としてこのタスクで決めたjudgment call(最終報告参照)。
 const MONITOR_SILENCE_SECONDS: u32 = 30;
 
+/// `$isekai_pipe`に、実行可能な`isekai-pipe`へのパスを解決して代入する
+/// シェル片。tmuxサーバはSSH execチャンネル(非ログイン・非対話シェル)経由で
+/// 起動されるため、`isekai-pipe`のインストール先
+/// (`isekai_protocol::bootstrap::ISEKAI_PIPE_INSTALL_DIR` = `~/.local/bin`)が
+/// PATHに入っているとは限らない(Debian系の`~/.bashrc`は非対話時に早期return
+/// する)。bare `isekai-pipe`(PATH依存)だとその場合サイレントに失敗するため、
+/// インストール先の絶対パス(`~`はHOMEから展開される。non-loginシェルでも
+/// HOME自体はsshdがセットするため信頼できる、PATHと違いこの展開はシェル自身の
+/// 組み込み機能でありPATH検索に依らない)を優先し、実行不可なら`isekai-pipe`
+/// (PATH検索)へフォールバックする。
+fn resolve_isekai_pipe_script() -> String {
+    format!(
+        "isekai_pipe={}/{}; [ -x \"$isekai_pipe\" ] || isekai_pipe={}",
+        isekai_protocol::bootstrap::ISEKAI_PIPE_INSTALL_DIR,
+        isekai_protocol::bootstrap::ISEKAI_PIPE_BIN_NAME,
+        isekai_protocol::bootstrap::ISEKAI_PIPE_BIN_NAME,
+    )
+}
+
 /// `run-shell`へ渡す1行のPOSIX shスクリプトを組み立てる。`#{q:...}`が値の
 /// シェルエスケープを担うため(モジュールdoc参照)、ここでは値を追加で引用符化
 /// しない——それをすると`#{q:...}`の二重エスケープになり壊れる。
@@ -85,8 +104,10 @@ fn notify_hook_script(kind_wire: &str) -> String {
          old=${{old:-0}}; \
          new=$((old+1)); \
          tmux set-option -w -t \"$tgt\" @isekai_notify_seq \"$new\"; \
-         isekai-pipe ctl notify --kind {kind_wire} --tag \"$tag\" --seq \"$new\" --sock \"$sock\"; \
-         fi"
+         {}; \
+         \"$isekai_pipe\" ctl notify --kind {kind_wire} --tag \"$tag\" --seq \"$new\" --sock \"$sock\"; \
+         fi",
+        resolve_isekai_pipe_script()
     )
 }
 
@@ -170,8 +191,18 @@ pub(crate) async fn install_notify_hooks<R: RemoteTmuxCommandRunner>(
     app_pane_id: &AppPaneId,
     runner: R,
 ) -> Result<(), TmuxLocatorError> {
-    let locator = registry.lock().locator_for(app_pane_id).cloned();
+    let (locator, notifications_enabled) = {
+        let reg = registry.lock();
+        (reg.locator_for(app_pane_id).cloned(), reg.notify_hooks_enabled_for(app_pane_id))
+    };
     let Some(locator) = locator else { return Ok(()) };
+    // `ConnectionProfile.enableTabNotifications`が無効なタブでは、リモートの
+    // tmuxサーバーへ一切書き込まない(`build_enable_remain_on_exit_command`の
+    // `set-option -g`はそのサーバー全体への恒久的な副作用を持つため、opt-in
+    // していないユーザーにまで強制しない、モジュールdocのjudgment call参照)。
+    if !notifications_enabled {
+        return Ok(());
+    }
     let resolver = TmuxLocatorResolver::new(runner);
     let session_name = locator.scope.addressable_session_name().to_string();
 
@@ -206,7 +237,7 @@ mod tests {
         let cmd = build_session_hook_command("main", "alert-bell", "bell");
         assert_eq!(
             cmd,
-            "tmux set-hook -t 'main' alert-bell 'run-shell '\\''tag=#{q:@isekai_tab_id}; if [ -n \"$tag\" ]; then sock=#{q:@isekai_ctl_sock}; tgt=#{q:session_name}:#{window_index}; old=$(tmux show-options -wv -t \"$tgt\" @isekai_notify_seq 2>/dev/null); old=${old:-0}; new=$((old+1)); tmux set-option -w -t \"$tgt\" @isekai_notify_seq \"$new\"; isekai-pipe ctl notify --kind bell --tag \"$tag\" --seq \"$new\" --sock \"$sock\"; fi'\\'''"
+            "tmux set-hook -t 'main' alert-bell 'run-shell '\\''tag=#{q:@isekai_tab_id}; if [ -n \"$tag\" ]; then sock=#{q:@isekai_ctl_sock}; tgt=#{q:session_name}:#{window_index}; old=$(tmux show-options -wv -t \"$tgt\" @isekai_notify_seq 2>/dev/null); old=${old:-0}; new=$((old+1)); tmux set-option -w -t \"$tgt\" @isekai_notify_seq \"$new\"; isekai_pipe=~/.local/bin/isekai-pipe; [ -x \"$isekai_pipe\" ] || isekai_pipe=isekai-pipe; \"$isekai_pipe\" ctl notify --kind bell --tag \"$tag\" --seq \"$new\" --sock \"$sock\"; fi'\\'''"
         );
     }
 
