@@ -332,6 +332,7 @@ mod tests {
         let app_pane = pane("tab-1", "pane-primary");
         let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
+        registry.lock().set_notify_hooks_enabled(&app_pane, true);
 
         let calls = Arc::new(StdMutex::new(Vec::new()));
         // 1回目のrun_rawの応答は使い捨てられるが(session hooks install、出力は
@@ -357,11 +358,30 @@ mod tests {
         let app_pane = pane("tab-1", "pane-primary");
         let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("missing".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
+        registry.lock().set_notify_hooks_enabled(&app_pane, true);
 
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let runner = RecordingRunner::new("0\tother\n", calls.clone());
 
         let err = install_notify_hooks(&registry, &app_pane, runner).await.unwrap_err();
         assert!(matches!(err, TmuxLocatorError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn is_a_noop_when_notifications_not_opted_in() {
+        // opusレビューM1: ConnectionProfile.enableTabNotificationsが無効な
+        // タブでは、ロケータが解決済みでもリモートtmuxサーバーへ一切書き込まない。
+        let registry = Mutex::new(TmuxLocatorRegistry::new());
+        let app_pane = pane("tab-1", "pane-primary");
+        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
+        registry.lock().register(app_pane.clone(), loc, None);
+        // set_notify_hooks_enabledを呼ばない(registerの既定はfalse)。
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", calls.clone());
+
+        install_notify_hooks(&registry, &app_pane, runner).await.unwrap();
+
+        assert!(calls.lock().unwrap().is_empty(), "opt-inしていないタブへは何も書き込まないはず");
     }
 }
