@@ -980,4 +980,11 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // ファイルビューアを追加する際は、Android版と同じく`request_id`→`CompletableDeferred`
     // 相当の待ち合わせでこのコールバックを解決すればよい。
     public func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
+
+    // tmux統合の通知連携(#57): Android版(`TerminalSession.kt`の`onNotify`→
+    // `TabAlertNotifier`)でのみUI実装済みで、iOS側にはまだ対応する通知UIが無い
+    // (`onPromptJump`/`onFilePreviewResult`と同じくno-op)。iOS側に通知を追加する際は
+    // Android版と同じく`kind`(`NotifyKind`)をそのままローカル通知APIへ橋渡しすればよい
+    // (抑制/重複排除の判断はRust側`orchestrator.rs`のSSOTで既に完結している)。
+    public func onNotify(kind: NotifyKind) {}
 }
