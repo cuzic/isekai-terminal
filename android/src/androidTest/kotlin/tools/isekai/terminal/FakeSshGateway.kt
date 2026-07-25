@@ -148,6 +148,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
     }
 
+    val setAiPanelEnabledCalls = mutableListOf<Boolean>()
+    override fun setAiPanelEnabled(enabled: Boolean) {
+        setAiPanelEnabledCalls.add(enabled)
+    }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {

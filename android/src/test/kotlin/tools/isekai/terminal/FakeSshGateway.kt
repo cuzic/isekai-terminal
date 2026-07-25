@@ -160,6 +160,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
     }
 
+    val setAiPanelEnabledCalls = mutableListOf<Boolean>()
+    override fun setAiPanelEnabled(enabled: Boolean) {
+        setAiPanelEnabledCalls.add(enabled)
+    }
+
     // ── タスク#60: tmux session group ensure/attach + ウィンドウcreate-or-select ──
     data class EnsureTmuxTabWindowCall(
         val profileIdentity: String,
