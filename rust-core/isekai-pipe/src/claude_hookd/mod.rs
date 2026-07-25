@@ -183,13 +183,21 @@ async fn event_command() -> ExitCode {
 /// the `.md` URL, not the HTML one, if this ever needs re-checking) rather
 /// than trusting either of two third-party design docs that had disagreed
 /// with each other on some of these fields:
-/// - `Notification(notification_type=permission_prompt)`, not the separate
-///   `PermissionRequest` hook, is the right signal for "a permission dialog
-///   appeared": `PermissionRequest` fires *before* the dialog and is a
-///   blocking decision hook (another `PermissionRequest` hook could
-///   auto-allow it, so it doesn't reliably mean a human saw anything), and
-///   adding a hook there puts this daemon's latency in front of every
-///   permission check.
+/// - `PermissionRequest` is wired *in addition to* `Notification
+///   (notification_type=permission_prompt)`, not instead of it — reversing
+///   the original design-consult recommendation to skip it (2026-07-25,
+///   found while checking two real, independently-maintained tmux plugins
+///   that solve the same problem: `accessd/tmux-agent-indicator`, 81 stars,
+///   uses `PermissionRequest` as its *primary* signal; `sandudorogan/
+///   tmux-pane-tree` registers both, matcher-less). The original theoretical
+///   concern (it fires *before* the dialog, so another `PermissionRequest`
+///   hook could auto-allow it and this one would still fire) turns out to
+///   cost little in this design specifically: `PostToolUse`'s unconditional
+///   `Resolve` (below) clears any such early-and-wrong `Notify` as soon as
+///   the auto-allowed tool actually runs, so the worst case is a
+///   self-correcting, momentary flash rather than a stuck false positive.
+///   Firing both is harmless — a second `Notify` for an already-`Attention`
+///   session is just a debounce refresh, not a duplicate popup.
 /// - `StopFailure` fires *instead of* `Stop` on an API error — without it, an
 ///   errored turn silently leaves the tab its idle color.
 /// - `Stop`'s hook input includes `background_tasks`/`session_crons`/
@@ -257,6 +265,7 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
         },
         "Stop" if !background_work_pending => HookEvent::Notify,
         "StopFailure" => HookEvent::Notify,
+        "PermissionRequest" => HookEvent::Notify,
         "PreToolUse" if tool_name == Some("AskUserQuestion") => HookEvent::Notify,
         "UserPromptSubmit" => HookEvent::Resolve,
         "PostToolUse" | "PostToolUseFailure" if !in_subagent => HookEvent::Resolve,
@@ -431,6 +440,14 @@ mod tests {
     #[test]
     fn stop_failure_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"StopFailure"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+    }
+
+    #[test]
+    fn permission_request_is_notify() {
+        // Wired alongside (not instead of) Notification's permission_prompt —
+        // see the doc comment above parse_hook_event for why both are used.
+        let payload = br#"{"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":"Bash"}"#;
         assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
     }
 

@@ -244,6 +244,11 @@ async fn send_notify_popup(ctl_sock_path: &std::path::Path) {
         ctl_sock_path,
         isekai_protocol::CtlMessage::Notify {
             kind: isekai_protocol::NotifyKind::Waiting,
+            // AI/汎用kind(`Waiting`)なのでtmux_tag/seqは意味を持たない
+            // (`isekai_protocol::ctl::CtlMessage::Notify`のdocコメント参照、
+            // tmux hook由来kind専用のフィールド)。
+            tmux_tag: String::new(),
+            seq: 0,
             title: "Claude Code".to_string(),
             body: "needs your input".to_string(),
         },

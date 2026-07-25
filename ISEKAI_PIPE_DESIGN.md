@@ -1985,7 +1985,9 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
        欠落時は後方互換のため無条件Notify)。`hook_event_name == "Stop"`かつ
        `background_tasks`(Claude Code v2.1.145+)が空またはフィールド自体が
        無い場合。`hook_event_name == "StopFailure"`(APIエラー等で`Stop`の
-       代わりに発火、無条件)。`hook_event_name == "PreToolUse"`かつ
+       代わりに発火、無条件)。`hook_event_name == "PermissionRequest"`
+       (無条件、`Notification`の`permission_prompt`と意図的に併用——下記
+       参照)。`hook_event_name == "PreToolUse"`かつ
        `tool_name == "AskUserQuestion"`。
      - **Resolve**: `hook_event_name == "UserPromptSubmit"`。
        `hook_event_name == "SessionEnd"`(セッション自体が無くなればもう
@@ -1999,11 +2001,19 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
        空でない`Stop`(実際にはまだ一時停止中——完了時に改めて空配列の`Stop`
        か`Notification(idle_prompt)`が届くので取りこぼさない)。それ以外の
        `hook_event_name`。
-     - **`PermissionRequest`(独立したhookイベント)は意図的に使わない**:
-       ダイアログが実際に表示される**前**に発火する同期的な判定hookのため、
-       他の`PermissionRequest`hookが自動承認すればユーザーは何も見ないまま
-       attention色になりうる。`Notification`の`permission_prompt`
-       (ダイアログ表示と同時に発火する通知専用hook)の方が実態に即している。
+     - **`PermissionRequest`(独立したhookイベント)も`Notification`の
+       `permission_prompt`と併用する**(2026-07-25、当初の「使わない」判断
+       (下記括弧内)を撤回): `accessd/tmux-agent-indicator`(⭐81、`Permission
+       Request`を主信号に使用)・`sandudorogan/tmux-pane-tree`(両方をmatcher
+       無しで登録)という実運用されている2つのtmuxプラグインの`.claude/
+       settings.json`配線を確認したところ、どちらも`PermissionRequest`を
+       使っていた。当初の懸念(ダイアログが実際に表示される**前**に発火する
+       同期的な判定hookのため、他の`PermissionRequest`hookが自動承認すれば
+       ユーザーは何も見ないままattention色になりうる)は、本設計では実害が
+       小さい: 誤ってNotifyしても、承認されたツールが実際に走れば無条件
+       `PostToolUse`が即座にResolveするため、一瞬色が点いて消えるだけの
+       自己修復可能な誤検知で済む。両方から発火しても実害は無い(同一
+       `session_id`が既にAttentionならdebounceとして握りつぶされるだけ)。
      - **`PostToolUse`から`AskUserQuestion`のmatcherを外した**(1回目のレビューで
        発見: `AskUserQuestion`への`PreToolUse`には対応する`PostToolUse`が無く、
        回答してもツール呼び出し自体は`UserPromptSubmit`を発火しないため、
@@ -2052,17 +2062,21 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    ```json
    {
      "hooks": {
-       "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
-       "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
-       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }]
+       "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
      }
    }
    ```
+   `timeout`(秒)は`accessd/tmux-agent-indicator`・`sandudorogan/tmux-pane-tree`
+   の実運用設定を参考に全hookへ明示した(`claude-hookd`自身の最悪ケース——
+   daemon起動待ちのバウンドリトライ——は~1.55秒なので10秒で十分な余裕がある)。
    `matcher`が要るのは`PreToolUse`(`AskUserQuestion`のみ)だけ。それ以外の
    hookは全件登録し、実際にNotify/Resolveのどちらを意味するか(`tool_name`
    の`AskUserQuestion`一致・`notification_type`の値・`background_tasks`の

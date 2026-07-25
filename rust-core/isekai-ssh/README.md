@@ -546,33 +546,42 @@ hook でも同じ1行、Claude Code のフック JSON を stdin から読んで�
 ```json
 {
   "hooks": {
-    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
-    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event" }] }],
-    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }],
-    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true }] }]
+    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
   }
 }
 ```
 
-`PostToolUse`/`PostToolUseFailure`/`Notification` はmatcherを付けずに全件登録する
-(どのイベント種別が実際に色を変えるかの判断は`.claude/settings.json`側ではなく
-`claude-hookd`自身が行う、という設計方針そのままなので、フィルタも向こう側に置く)。
-`PostToolUse`は全ツール呼び出しごとに発火するようになるため、Claude Code本体を
-ブロックしないよう`"async": true`を付けている(`claude-hookd event`は元々exit
-コードが常に0でstdoutも出力しないので、asyncにしても判定への影響は無い)。
+`PostToolUse`/`PostToolUseFailure`/`Notification`/`PermissionRequest` はmatcherを
+付けずに全件登録する(どのイベント種別が実際に色を変えるかの判断は
+`.claude/settings.json`側ではなく`claude-hookd`自身が行う、という設計方針
+そのままなので、フィルタも向こう側に置く)。`PostToolUse`は全ツール呼び出し
+ごとに発火するようになるため、Claude Code本体をブロックしないよう
+`"async": true`を付けている(`claude-hookd event`は元々exitコードが常に0で
+stdoutも出力しないので、asyncにしても判定への影響は無い)。全hookに
+`"timeout": 10`(秒)も明示している——`claude-hookd`自身の最悪ケース
+(daemon起動待ちのバウンドリトライ)は~1.55秒で終わるので十分な余裕がある。
+これらの設定(`async`・`timeout`の付け方含む)は`accessd/tmux-agent-indicator`・
+`sandudorogan/tmux-pane-tree`という実運用されている2つのtmuxプラグインの
+hook設定を参考にした。
 
-これで、Claude Codeが権限確認(`Notification`の`permission_prompt`)や
-`AskUserQuestion`で止まっている間、あるいはAPIエラーで応答が終わった
-(`StopFailure`)間はタブがattention色になり、ポップアップ通知
-(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)が一度だけ出る。次のプロンプト
-送信・ツール呼び出しの完了・セッション終了のいずれかで即座にidle色へ戻り、何も
-操作しなくても10分経てば自動的に戻る。バックグラウンドタスク待ちで一時停止した
-`Stop`(`background_tasks`が空でない)はattention色にしない——実際に完了した
-ときに改めて`Stop`(空配列)か`Notification`の`idle_prompt`が届く。
+これで、Claude Codeが権限確認(`PermissionRequest`、または`Notification`の
+`permission_prompt`——両方使うのは意図的な冗長化、`claude_hookd::mod::
+parse_hook_event`のdocコメント参照)や`AskUserQuestion`で止まっている間、
+あるいはAPIエラーで応答が終わった(`StopFailure`)間はタブがattention色になり、
+ポップアップ通知(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)が一度だけ出る。
+次のプロンプト送信・ツール呼び出しの完了・セッション終了のいずれかで即座に
+idle色へ戻り、何も操作しなくても10分経てば自動的に戻る。バックグラウンド
+タスク待ちで一時停止した`Stop`(`background_tasks`が空でない)はattention色に
+しない——実際に完了したときに改めて`Stop`(空配列)か`Notification`の
+`idle_prompt`が届く。
 
 裏側では、最初のイベントが来たタイミングでタブごとの小さなdaemon
 (`isekai-pipe claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
