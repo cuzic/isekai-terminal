@@ -388,6 +388,31 @@ public struct KeySequencePackInstallation: Codable, Equatable, Hashable, Fetchab
     }
 }
 
+/// タスク#3(Android版タスク#60`data/TmuxTabLocator.kt`のiOS移植): プロファイル
+/// (の主接続)が使っているtmux session groupのウィンドウを長期的に指すタグの永続化。
+///
+/// iOS版はタブ一覧自体の永続化/復元機能を持たない(`TerminalTabsModel.Tab.id`は
+/// プロセス内限定の`UUID()`)ため、永続化キーには代わりに`ConnectionProfile.id`
+/// (安定なGRDB自動採番主キー)を使う——Android版のRoom`profile_id`列と同じ判断
+/// (`TmuxTabLocator.kt`のドキュメントコメント参照)。「このプロファイルを開いたら、
+/// 前回と同じtmuxウィンドウに戻る」というプロファイル単位の粒度になる(タブ単位ではない)。
+///
+/// `tag`だけを永続化し、tmuxウィンドウインデックス等の揮発性の値は保持しない
+/// (Android版`TmuxTabLocator`/Rust側`TmuxCoordinates`と同じ方針)。
+public struct TmuxTabLocator: Codable, Equatable, FetchableRecord, PersistableRecord {
+    public var profileId: Int64
+    public var tag: String
+    public var updatedAt: Date
+
+    public static let databaseTableName = "tmux_tab_locators"
+
+    public init(profileId: Int64, tag: String, updatedAt: Date = Date()) {
+        self.profileId = profileId
+        self.tag = tag
+        self.updatedAt = updatedAt
+    }
+}
+
 public final class ProfileDatabase {
     public let dbQueue: DatabaseQueue
 
@@ -475,6 +500,16 @@ public final class ProfileDatabase {
                 t.column("version", .integer).notNull()
                 t.column("paramValuesJson", .text).notNull()
                 t.column("profileId", .integer)
+            }
+        }
+        migrator.registerMigration("v6_create_tmux_tab_locators") { db in
+            // Android版Room migration 19→20(`tmux_tab_locators`テーブル、
+            // `TmuxTabLocator.kt`参照)と対称。`profileId`が主キー(1プロファイルにつき
+            // 高々1タグ)。
+            try db.create(table: "tmux_tab_locators") { t in
+                t.column("profileId", .integer).notNull().primaryKey()
+                t.column("tag", .text).notNull()
+                t.column("updatedAt", .datetime).notNull()
             }
         }
         return migrator
@@ -655,5 +690,33 @@ public final class ProfileDatabase {
 
     public func deletePackInstallation(id: Int64) throws {
         _ = try dbQueue.write { db in try KeySequencePackInstallation.deleteOne(db, key: id) }
+    }
+
+    // MARK: - TmuxTabLocator CRUD(タスク#3、Android版`TmuxTabLocatorDao`と対称)
+
+    public func findTmuxTag(forProfileId profileId: Int64) throws -> String? {
+        try dbQueue.read { db in try TmuxTabLocator.fetchOne(db, key: profileId)?.tag }
+    }
+
+    /// 既存行があれば上書き、無ければ挿入する(Android版`OnConflictStrategy.REPLACE`と
+    /// 対称。GRDBの`save(_:)`は主キーの有無を見てupdate/insertを切り替える)。
+    public func saveTmuxTag(_ tag: String, forProfileId profileId: Int64) throws {
+        try dbQueue.write { db in
+            try TmuxTabLocator(profileId: profileId, tag: tag).save(db)
+        }
+    }
+}
+
+/// `TmuxTabWindowCoordinator`(`IsekaiTerminalCoreLogic`、Linuxでもテスト可能な決定
+/// ロジック本体)から見た`ProfileDatabase`の姿。GRDBというApple/Linux両対応だが
+/// このプロジェクトではApple専用ターゲット(`IsekaiTerminalCore`)にしか置いていない
+/// 永続化層を、プロトコル越しに注入できるようにするための適合。
+extension ProfileDatabase: TmuxTabLocatorStore {
+    public func findTag(forProfileId profileId: Int64) throws -> String? {
+        try findTmuxTag(forProfileId: profileId)
+    }
+
+    public func saveTag(_ tag: String, forProfileId profileId: Int64) throws {
+        try saveTmuxTag(tag, forProfileId: profileId)
     }
 }

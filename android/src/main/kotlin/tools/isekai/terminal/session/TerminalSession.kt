@@ -76,6 +76,31 @@ class TerminalSession(
      * 持ち込まない)。既定は no-op。
      */
     private val onBell: () -> Unit = {},
+    /**
+     * `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由でリモートから届いたAI/汎用の
+     * 注目通知(`CtlMessage::Notify`、kindが`Waiting`/`Done`/`Info`)を受信した時に呼ばれる。
+     * 判断ロジック(取りこぼし無く1回だけ発火させる`notifyGeneration`の単調増加チェック)は
+     * このクラス内([maybeFireNotify]参照)で完結させ、ここではタブバッジ更新・システム
+     * 通知等の副作用注入のみを行う(`onBell`と同じ構成)。呼び出し元は[ioScope]の
+     * コルーチン上(メインスレッド保証なし)。既定はno-op。
+     *
+     * [onNotifyRequested](tmux hook由来、kindが`Bell`/`Activity`/`Silence`/`JobDone`)とは
+     * 独立した別経路(統合の経緯は`isekai_protocol::ctl::NotifyKind`のRust側docコメント
+     * 参照): こちらはRust側`ScreenUpdate.notifyGeneration`経由、あちらは
+     * `OrchestratorCallback.onNotify`経由(`orchestrator.rs`の重複排除・フォアグラウンド
+     * 抑制を経由済み)。
+     */
+    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit = { _, _, _ -> },
+    /**
+     * タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火。
+     * 「今この瞬間ユーザーへ見せるべきか」の抑制判断(アプリがフォアグラウンドかつ
+     * このタブ表示中なら抑制、`(tmux_tag, seq)`重複排除)は Rust 側
+     * (`OrchestratorAdapter::on_notify`)が既に済ませてから呼ばれるため、ここでは
+     * 実際にAndroid通知を出すかどうか(プロファイル単位opt-in・通知権限)の判断だけを
+     * 行う副作用注入とする(`onClipboardWriteRequested`/`onBell`と同じ構成、
+     * `Context`を持たないこのクラス自体には持ち込まない)。既定は no-op。
+     */
+    private val onNotifyRequested: (NotifyKind) -> Unit = {},
 ) : AutoCloseable {
 
     companion object {
@@ -124,6 +149,11 @@ class TerminalSession(
      */
     private val lastFiredBellGeneration = AtomicLong(0)
 
+    /** [lastFiredBellGeneration]と同じ理由・同じ対処(再接続時のリセット・conflated
+     *  チャネルドレイン)が要る、`notifyGeneration`版のdedupe記憶(`AI_INTEGRATION_DESIGN.md`
+     *  §6.1)。 */
+    private val lastFiredNotifyGeneration = AtomicLong(0)
+
     /** [onScreenUpdate]の消費ループから呼ぶ。`bellGeneration`が進んでいれば[onBell]を1回だけ
      *  発火する(同一世代の`ScreenUpdate`がconflatedチャネル経由で再適用されても二重発火
      *  しない)。 */
@@ -132,6 +162,15 @@ class TerminalSession(
         if (update.bellGeneration > prev.toULong()) {
             lastFiredBellGeneration.set(update.bellGeneration.toLong())
             onBell()
+        }
+    }
+
+    /** [maybeFireBell]と同じdedupeパターンの`notifyGeneration`版。 */
+    private fun maybeFireNotify(update: ScreenUpdate) {
+        val prev = lastFiredNotifyGeneration.get()
+        if (update.notifyGeneration > prev.toULong()) {
+            lastFiredNotifyGeneration.set(update.notifyGeneration.toLong())
+            onNotify(update.notifyKind, update.notifyTitle, update.notifyBody)
         }
     }
 
@@ -298,6 +337,12 @@ class TerminalSession(
             _state.update { it.copy(rebindState = state) }
         }
 
+        // タスク#57: tmux hook発火。抑制判断はRust側(OrchestratorAdapter::on_notify)
+        // 済み——ここは単に注入された副作用を呼ぶだけ。
+        override fun onNotify(kind: NotifyKind) {
+            onNotifyRequested(kind)
+        }
+
         // タスク#13(OSC 133)。判断ロジック(どのプロンプトが「前/次」か・出力範囲の
         // 切り出し)は全てRust側(`Terminal::prompt_jump_target`/`last_command_output_text`)
         // に一元化されており、ここでは結果を[TerminalUiState]へそのまま反映するだけ。
@@ -353,6 +398,7 @@ class TerminalSession(
                 if (_state.value.connected) {
                     _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
                     maybeFireBell(update)
+                    maybeFireNotify(update)
                     maybeApplyPanel(update)
                 }
             }
@@ -377,6 +423,8 @@ class TerminalSession(
         // リセットすることで、この直後の`connect()`が(ハンドシェイクを経て)新しい
         // `Terminal`での最初の`ScreenUpdate`を届け始めるより確実に先行させる。
         lastFiredBellGeneration.set(0)
+        // `AI_INTEGRATION_DESIGN.md` §6.1: notifyGenerationも同じ理由でリセットする。
+        lastFiredNotifyGeneration.set(0)
         // `AI_INTEGRATION_DESIGN.md` §6.2: 新しい論理セッションでは前回接続の
         // パネル世代・表示中パネルを引き継がない([lastFiredBellGeneration]と同じ理由)。
         lastAppliedPanelGeneration.set(0)
@@ -470,6 +518,15 @@ class TerminalSession(
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
         orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
+
+    /**
+     * タスク#60: tmux session groupのensure/attach + タブ用ウィンドウのcreate-or-select。
+     * 判断は一切ここでは行わず、Rust側(`SessionOrchestrator::ensure_tmux_tab_window`)へ
+     * そのまま委譲する薄いパススルー(`.claude/rules/rust-ssot.md`)。呼び出し元
+     * ([TerminalTabsViewModel])はprimary paneについてのみ呼ぶこと(split pane非対応)。
+     */
+    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Boolean) =
+        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, enableNotifications)
 
     // ── Network ───────────────────────────────────────────────────────
 

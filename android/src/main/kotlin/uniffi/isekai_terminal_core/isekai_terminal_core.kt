@@ -669,12 +669,15 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod13 : com.sun
     fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod14 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod15 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod16 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod17 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
@@ -715,7 +718,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onNotify", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -733,9 +736,10 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
     @JvmField internal var `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
     @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
-    @JvmField internal var `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
-    @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
-    @JvmField internal var `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+    @JvmField internal var `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+    @JvmField internal var `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+    @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+    @JvmField internal var `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod17? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -754,10 +758,11 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
         `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
         `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
-        `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
-        `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
-        `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,), Structure.ByValue
+        `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+        `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+        `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+        `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod17? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onNotify`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -776,6 +781,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd` = other.`onRequestWifiFd`
         `onRequestCellularFd` = other.`onRequestCellularFd`
         `onRebindStateChanged` = other.`onRebindStateChanged`
+        `onNotify` = other.`onNotify`
         `onPromptJump` = other.`onPromptJump`
         `onPromptOutputCopyReady` = other.`onPromptOutputCopyReady`
         `onFilePreviewResult` = other.`onFilePreviewResult`
@@ -881,6 +887,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
@@ -969,6 +977,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready(
@@ -1056,6 +1066,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(`ptr`: Long,`profileIdentity`: RustBuffer.ByValue,`clientId`: RustBuffer.ByValue,`existingTag`: RustBuffer.ByValue,`enableNotifications`: Byte,
+): Long
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(`ptr`: Long,`requestId`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1383,6 +1395,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 4218) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1407,7 +1422,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -1515,13 +1530,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 20924) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 29419) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 797) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3059,6 +3077,31 @@ public interface SessionOrchestratorInterface {
     fun `disconnect`()
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?, `enableNotifications`: kotlin.Boolean): TmuxTabWindowInfo
+    
+    /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
      * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
      * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
@@ -3121,6 +3164,13 @@ public interface SessionOrchestratorInterface {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
     fun `notifyFocusChange`(`focused`: kotlin.Boolean)
     
@@ -3496,6 +3546,50 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
 
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     * - `enable_notifications`: 呼び出し側の`ConnectionProfile.enableTabNotifications`。
+     * `true`の場合のみ`install_notify_hooks`(タスク#57)がこのタブのリモート
+     * tmuxサーバーへ通知フックを書き込む(`set-option -g remain-on-exit on`という
+     * サーバー全体への恒久的副作用を、opt-inしていないユーザーにまで強制しない
+     * ため、`tmux_notify.rs`のモジュールdoc参照)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    @Throws(TmuxSessionException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?, `enableNotifications`: kotlin.Boolean) : TmuxTabWindowInfo {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
+                uniffiHandle,
+                FfiConverterString.lower(`profileIdentity`),FfiConverterString.lower(`clientId`),FfiConverterOptionalString.lower(`existingTag`),FfiConverterBoolean.lower(`enableNotifications`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_isekai_terminal_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterTypeTmuxTabWindowInfo.lift(it) },
+        // Error FFI converter
+        TmuxSessionException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
      * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
      * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
@@ -3639,6 +3733,13 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */override fun `notifyFocusChange`(`focused`: kotlin.Boolean)
         = 
     callWithHandle {
@@ -4912,63 +5013,6 @@ public object FfiConverterTypePackedRow: FfiConverterRustBuffer<PackedRow> {
 
 
 /**
- * `presentForm`パネル1フィールド分の定義。値そのものはKotlin/Compose側の
- * UI状態としてのみ保持され、Rust側には(送信されるまで)戻ってこない
- * (`AI_INTEGRATION_DESIGN.md` §6.2のフィードバック方針: PTY stdinへの
- * 通常テキスト書き込みで返すのみで、専用の往復チャネルは持たない)。
- */
-data class PanelField (
-    var `id`: kotlin.String
-    , 
-    var `label`: kotlin.String
-    , 
-    var `kind`: PanelFieldKind
-    , 
-    /**
-     * `kind == Choice`の時のみ意味を持つ選択肢一覧。`Text`の時は空。
-     */
-    var `options`: List<kotlin.String>
-    
-){
-    
-
-    
-
-    
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypePanelField: FfiConverterRustBuffer<PanelField> {
-    override fun read(buf: ByteBuffer): PanelField {
-        return PanelField(
-            FfiConverterString.read(buf),
-            FfiConverterString.read(buf),
-            FfiConverterTypePanelFieldKind.read(buf),
-            FfiConverterSequenceString.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: PanelField) = (
-            FfiConverterString.allocationSize(value.`id`) +
-            FfiConverterString.allocationSize(value.`label`) +
-            FfiConverterTypePanelFieldKind.allocationSize(value.`kind`) +
-            FfiConverterSequenceString.allocationSize(value.`options`)
-    )
-
-    override fun write(value: PanelField, buf: ByteBuffer) {
-            FfiConverterString.write(value.`id`, buf)
-            FfiConverterString.write(value.`label`, buf)
-            FfiConverterTypePanelFieldKind.write(value.`kind`, buf)
-            FfiConverterSequenceString.write(value.`options`, buf)
-    }
-}
-
-
-
-/**
  * #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
  * (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
  * `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
@@ -5295,37 +5339,29 @@ data class ScreenUpdate (
     var `bellGeneration`: kotlin.ULong
     , 
     /**
-     * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
-     * 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
-     * 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
-     * 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
-     * 読んでパネルを再描画すること。
+     * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+     * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+     * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+     * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+     * 通知(タブバッジ・システム通知)を1回発火させること。
      */
-    var `panelGeneration`: kotlin.ULong
+    var `notifyGeneration`: kotlin.ULong
     , 
     /**
-     * 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
-     * クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
-     * 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
-     * この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+     * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
      */
-    var `panelKind`: PanelKind
+    var `notifyKind`: NotifyKind
     , 
     /**
-     * パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
-     * 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+     * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+     * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
      */
-    var `panelTitle`: kotlin.String
+    var `notifyTitle`: kotlin.String
     , 
     /**
-     * `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+     * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
      */
-    var `panelMarkdown`: kotlin.String
-    , 
-    /**
-     * `panel_kind == Form`の時のみ意味を持つフィールド一覧。
-     */
-    var `panelFields`: List<PanelField>
+    var `notifyBody`: kotlin.String
     , 
     /**
      * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
@@ -5432,10 +5468,9 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
-            FfiConverterTypePanelKind.read(buf),
+            FfiConverterTypeNotifyKind.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterSequenceTypePanelField.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5462,11 +5497,10 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`urxvtMouseMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
-            FfiConverterULong.allocationSize(value.`panelGeneration`) +
-            FfiConverterTypePanelKind.allocationSize(value.`panelKind`) +
-            FfiConverterString.allocationSize(value.`panelTitle`) +
-            FfiConverterString.allocationSize(value.`panelMarkdown`) +
-            FfiConverterSequenceTypePanelField.allocationSize(value.`panelFields`) +
+            FfiConverterULong.allocationSize(value.`notifyGeneration`) +
+            FfiConverterTypeNotifyKind.allocationSize(value.`notifyKind`) +
+            FfiConverterString.allocationSize(value.`notifyTitle`) +
+            FfiConverterString.allocationSize(value.`notifyBody`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
             FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
             FfiConverterSequenceString.allocationSize(value.`linkTable`) +
@@ -5492,11 +5526,10 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`urxvtMouseMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
-            FfiConverterULong.write(value.`panelGeneration`, buf)
-            FfiConverterTypePanelKind.write(value.`panelKind`, buf)
-            FfiConverterString.write(value.`panelTitle`, buf)
-            FfiConverterString.write(value.`panelMarkdown`, buf)
-            FfiConverterSequenceTypePanelField.write(value.`panelFields`, buf)
+            FfiConverterULong.write(value.`notifyGeneration`, buf)
+            FfiConverterTypeNotifyKind.write(value.`notifyKind`, buf)
+            FfiConverterString.write(value.`notifyTitle`, buf)
+            FfiConverterString.write(value.`notifyBody`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
             FfiConverterBoolean.write(value.`cursorBlink`, buf)
             FfiConverterSequenceString.write(value.`linkTable`, buf)
@@ -5795,6 +5828,81 @@ public object FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer<Termi
             FfiConverterBoolean.write(value.`alt`, buf)
             FfiConverterBoolean.write(value.`ctrl`, buf)
             FfiConverterBoolean.write(value.`meta`, buf)
+    }
+}
+
+
+
+/**
+ * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+ * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+ * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+ * `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+ * キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+ */
+data class TmuxTabWindowInfo (
+    /**
+     * tmuxウィンドウを長期的に指すタグ値。
+     */
+    var `tag`: kotlin.String
+    , 
+    /**
+     * このタグ解決時点でのウィンドウインデックス。
+     */
+    var `windowIndex`: kotlin.UInt
+    , 
+    /**
+     * このクライアントがattachしたセッション名(グループ内で一意)。
+     */
+    var `sessionName`: kotlin.String
+    , 
+    /**
+     * tmux session groupの名前。
+     */
+    var `groupName`: kotlin.String
+    , 
+    /**
+     * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+     */
+    var `isNewWindow`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer<TmuxTabWindowInfo> {
+    override fun read(buf: ByteBuffer): TmuxTabWindowInfo {
+        return TmuxTabWindowInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TmuxTabWindowInfo) = (
+            FfiConverterString.allocationSize(value.`tag`) +
+            FfiConverterUInt.allocationSize(value.`windowIndex`) +
+            FfiConverterString.allocationSize(value.`sessionName`) +
+            FfiConverterString.allocationSize(value.`groupName`) +
+            FfiConverterBoolean.allocationSize(value.`isNewWindow`)
+    )
+
+    override fun write(value: TmuxTabWindowInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`tag`, buf)
+            FfiConverterUInt.write(value.`windowIndex`, buf)
+            FfiConverterString.write(value.`sessionName`, buf)
+            FfiConverterString.write(value.`groupName`, buf)
+            FfiConverterBoolean.write(value.`isNewWindow`, buf)
     }
 }
 
@@ -6697,53 +6805,23 @@ public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseRe
 
 
 /**
- * [PanelField]の入力種別。テキスト自由入力か、[PanelField::options]からの選択か。
+ * `isekai_protocol::ctl::NotifyKind`(uniffiに依存しないpure crate側の型)をUniFFI
+ * 境界越しに公開するための同型(`ClipboardMimeKind`と同じ理由でミラーが必要)。
+ * tmux hook由来の4種(タスク#57: `alert-bell`/`alert-activity`/`alert-silence`/
+ * `pane-died`)とAI/汎用の注目通知の3種(`AI_INTEGRATION_DESIGN.md` §6.1)を1つの
+ * enumで表す(統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
+ * 2026-07-25)。
  */
 
-enum class PanelFieldKind {
+enum class NotifyKind {
     
-    TEXT,
-    CHOICE;
-
-    
-
-
-    companion object
-}
-
-
-/**
- * @suppress
- */
-public object FfiConverterTypePanelFieldKind: FfiConverterRustBuffer<PanelFieldKind> {
-    override fun read(buf: ByteBuffer) = try {
-        PanelFieldKind.values()[buf.getInt() - 1]
-    } catch (e: IndexOutOfBoundsException) {
-        throw RuntimeException("invalid enum value, something is very wrong!!", e)
-    }
-
-    override fun allocationSize(value: PanelFieldKind) = 4UL
-
-    override fun write(value: PanelFieldKind, buf: ByteBuffer) {
-        buf.putInt(value.ordinal + 1)
-    }
-}
-
-
-
-
-
-/**
- * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2、`ai_panel.rs`)で提示された
- * 構造化パネルの種別。`None`は「現在パネルなし」を表す既定値(`ScreenUpdate.panelKind`
- * が`panelGeneration`の初期値0とペアで意味を持つ、`bellGeneration`と同じ規約)。
- */
-
-enum class PanelKind {
-    
-    NONE,
-    DOCUMENT,
-    FORM;
+    BELL,
+    ACTIVITY,
+    SILENCE,
+    JOB_DONE,
+    WAITING,
+    DONE,
+    INFO;
 
     
 
@@ -6755,16 +6833,16 @@ enum class PanelKind {
 /**
  * @suppress
  */
-public object FfiConverterTypePanelKind: FfiConverterRustBuffer<PanelKind> {
+public object FfiConverterTypeNotifyKind: FfiConverterRustBuffer<NotifyKind> {
     override fun read(buf: ByteBuffer) = try {
-        PanelKind.values()[buf.getInt() - 1]
+        NotifyKind.values()[buf.getInt() - 1]
     } catch (e: IndexOutOfBoundsException) {
         throw RuntimeException("invalid enum value, something is very wrong!!", e)
     }
 
-    override fun allocationSize(value: PanelKind) = 4UL
+    override fun allocationSize(value: NotifyKind) = 4UL
 
-    override fun write(value: PanelKind, buf: ByteBuffer) {
+    override fun write(value: NotifyKind, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -7327,6 +7405,102 @@ public object FfiConverterTypeTerminalSpecialKey : FfiConverterRustBuffer<Termin
 
 
 
+
+
+/**
+ * [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+ * (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+ * このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+ * `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+ * 切断)はメッセージにまとめて運ぶだけに留める。
+ */
+sealed class TmuxSessionException: kotlin.Exception() {
+    
+    /**
+     * tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+     */
+    class Command(
+        
+        val v1: kotlin.String
+        ) : TmuxSessionException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+     */
+    class UnexpectedOutput(
+        
+        val v1: kotlin.String
+        ) : TmuxSessionException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+
+    
+
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<TmuxSessionException> {
+        override fun lift(error_buf: RustBuffer.ByValue): TmuxSessionException = FfiConverterTypeTmuxSessionError.lift(error_buf)
+    }
+
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTmuxSessionError : FfiConverterRustBuffer<TmuxSessionException> {
+    override fun read(buf: ByteBuffer): TmuxSessionException {
+        
+
+        return when(buf.getInt()) {
+            1 -> TmuxSessionException.Command(
+                FfiConverterString.read(buf),
+                )
+            2 -> TmuxSessionException.UnexpectedOutput(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: TmuxSessionException): ULong {
+        return when(value) {
+            is TmuxSessionException.Command -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is TmuxSessionException.UnexpectedOutput -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+        }
+    }
+
+    override fun write(value: TmuxSessionException, buf: ByteBuffer) {
+        when(value) {
+            is TmuxSessionException.Command -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is TmuxSessionException.UnexpectedOutput -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
+
+
+
 /**
  * Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
  * Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
@@ -7764,6 +7938,18 @@ public interface OrchestratorCallback {
     fun `onRebindStateChanged`(`state`: RebindPublicState)
     
     /**
+     * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+     * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+     * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+     * 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+     * から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+     * per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+     * (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+     * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+     */
+    fun `onNotify`(`kind`: NotifyKind)
+    
+    /**
      * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
      * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
      */
@@ -7957,7 +8143,19 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
+    internal object `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
+        override fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onNotify`(
+                    FfiConverterTypeNotifyKind.lift(`kind`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod15 {
         override fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -7969,7 +8167,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15 {
+    internal object `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod16 {
         override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -7981,7 +8179,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
-    internal object `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16 {
+    internal object `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod17 {
         override fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
@@ -8024,6 +8222,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onRequestWifiFd`,
         `onRequestCellularFd`,
         `onRebindStateChanged`,
+        `onNotify`,
         `onPromptJump`,
         `onPromptOutputCopyReady`,
         `onFilePreviewResult`,
@@ -8803,34 +9002,6 @@ public object FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer<List<Pac
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePackedRow.write(it, buf)
-        }
-    }
-}
-
-
-
-
-/**
- * @suppress
- */
-public object FfiConverterSequenceTypePanelField: FfiConverterRustBuffer<List<PanelField>> {
-    override fun read(buf: ByteBuffer): List<PanelField> {
-        val len = buf.getInt()
-        return List<PanelField>(len) {
-            FfiConverterTypePanelField.read(buf)
-        }
-    }
-
-    override fun allocationSize(value: List<PanelField>): ULong {
-        val sizeForLength = 4UL
-        val sizeForItems = value.map { FfiConverterTypePanelField.allocationSize(it) }.sum()
-        return sizeForLength + sizeForItems
-    }
-
-    override fun write(value: List<PanelField>, buf: ByteBuffer) {
-        buf.putInt(value.size)
-        value.iterator().forEach {
-            FfiConverterTypePanelField.write(it, buf)
         }
     }
 }

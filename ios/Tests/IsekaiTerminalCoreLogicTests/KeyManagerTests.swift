@@ -102,4 +102,5 @@ private actor KeyManagerAuthRecorder: OrchestratorCallback {
     nonisolated func onPromptJump(target: PromptJumpTarget?) {}
     nonisolated func onPromptOutputCopyReady(text: String?) {}
     nonisolated func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
+    nonisolated func onNotify(kind: NotifyKind) {}
 }

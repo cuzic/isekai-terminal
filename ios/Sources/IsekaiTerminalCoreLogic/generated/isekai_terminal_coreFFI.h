@@ -371,7 +371,14 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod15)(uint64_t, Ru
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD16
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD16
-typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod16)(uint64_t, RustBuffer, RustBuffer, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod16)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD17
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD17
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod17)(uint64_t, RustBuffer, RustBuffer, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
@@ -413,9 +420,10 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod11 _Nonnull onRequestWifiFd;
     UniffiCallbackInterfaceOrchestratorCallbackMethod12 _Nonnull onRequestCellularFd;
     UniffiCallbackInterfaceOrchestratorCallbackMethod13 _Nonnull onRebindStateChanged;
-    UniffiCallbackInterfaceOrchestratorCallbackMethod14 _Nonnull onPromptJump;
-    UniffiCallbackInterfaceOrchestratorCallbackMethod15 _Nonnull onPromptOutputCopyReady;
-    UniffiCallbackInterfaceOrchestratorCallbackMethod16 _Nonnull onFilePreviewResult;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod14 _Nonnull onNotify;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod15 _Nonnull onPromptJump;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod16 _Nonnull onPromptOutputCopyReady;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod17 _Nonnull onFilePreviewResult;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -570,6 +578,11 @@ void uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_DISCONNECT
 void uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_ENSURE_TMUX_TAB_WINDOW
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_ENSURE_TMUX_TAB_WINDOW
+uint64_t uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(uint64_t ptr, RustBuffer profile_identity, RustBuffer client_id, RustBuffer existing_tag, int8_t enable_notifications
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_FILE_PREVIEW_REQUEST
@@ -1301,6 +1314,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconn
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_ENSURE_TMUX_TAB_WINDOW
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_ENSURE_TMUX_TAB_WINDOW
+uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_FILE_PREVIEW_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_FILE_PREVIEW_REQUEST
 uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request(void
@@ -1562,6 +1581,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_req
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
 uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_NOTIFY
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_NOTIFY
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify(void
     
 );
 #endif

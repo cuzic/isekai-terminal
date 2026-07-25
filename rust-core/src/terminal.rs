@@ -4,7 +4,7 @@ use crate::sixel::{SixelDecoder, SixelImage};
 use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
 use crate::{
-    CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, PanelField, PanelKind,
+    CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, NotifyKind, PanelField, PanelKind,
     TerminalKeyModifiers,
 };
 
@@ -435,6 +435,17 @@ pub(crate) struct Terminal {
     /// ターミネータとして消費し `execute` には渡らないため、ここではカウントされない
     /// (この仕様はテストで明記する)。
     bell_generation: u64,
+    /// `CtlMessage::Notify`(`AI_INTEGRATION_DESIGN.md` §6.1、ctlソケット経由でリモート
+    /// から届く注目通知)を受信するたびに単調増加するカウンタ。`bell_generation`と同じ
+    /// 理由(conflatedチャネルでの取りこぼし検知・二重フィードバック防止)で、bool ではなく
+    /// 世代カウンタにしてある。呼び出し側は前回値と比較し、進んでいれば`notify_kind`/
+    /// `notify_title`/`notify_body`(＝直近のNotify1件分)を読んで通知を1回発火させる。
+    notify_generation: u64,
+    /// 直近受信した`Notify`の種別・タイトル・本文。`notify_generation`が進んでいない間は
+    /// 意味を持たない(前回発火済み)。
+    notify_kind: NotifyKind,
+    notify_title: String,
+    notify_body: String,
     /// `AI_INTEGRATION_DESIGN.md` §6.2のリモートAPCパネル提示を受信するたびに単調
     /// 増加するカウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし
     /// 検知・二重描画防止)。
@@ -743,7 +754,15 @@ pub(crate) fn encode_pointer_event_bytes(
 
     let base = mouse_button_base_code(event.button);
     let modifier_bits = mouse_modifier_bits(event.modifiers);
+    // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
+    // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
+    // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
     let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
+    // 呼び出し元が実際の画面外の座標を渡してきても、この端末の実サイズ
+    // (`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]の
+    // docコメントで約束している通り、範囲チェックの責務はここに閉じる
+    // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
+    // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
     let col = event.col.min(cols.saturating_sub(1));
     let row = event.row.min(rows.saturating_sub(1));
 
@@ -762,6 +781,9 @@ pub(crate) fn encode_pointer_event_bytes(
         // 仕様上常に`3`(no button)を使う。
         let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
         let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
+        // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
+        // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
+        // 超える場合の保険。Fableレビュー指摘の設計判断)。
         let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
         Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
     }
@@ -799,6 +821,10 @@ impl Terminal {
             focus_reporting_mode: false,
             cursor_visible: true,
             bell_generation: 0,
+            notify_generation: 0,
+            notify_kind: NotifyKind::Info,
+            notify_title: String::new(),
+            notify_body: String::new(),
             panel_generation: 0,
             panel_kind: PanelKind::None,
             panel_title: String::new(),
@@ -917,6 +943,23 @@ impl Terminal {
     pub(crate) fn urxvt_mouse_mode(&self) -> bool { self.urxvt_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
+    pub(crate) fn notify_generation(&self) -> u64 { self.notify_generation }
+    pub(crate) fn notify_kind(&self) -> NotifyKind { self.notify_kind }
+    pub(crate) fn notify_title(&self) -> &str { &self.notify_title }
+    pub(crate) fn notify_body(&self) -> &str { &self.notify_body }
+
+    /// ctlソケット経由で届いた`CtlMessage::Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)を
+    /// 反映する。`set_title`と同じく、OSC/エスケープシーケンスのパースを経由せず外部
+    /// (`isekai-protocol`のctlチャネル)から直接呼ばれる。`notify_generation`を
+    /// `saturating_add`で単調増加させる(`bell_generation`と同じ周回対策、u64::MAXから
+    /// 0への周回で後退しないようにする)。
+    pub(crate) fn set_notify(&mut self, kind: NotifyKind, title: String, body: String) {
+        self.notify_generation = self.notify_generation.saturating_add(1);
+        self.notify_kind = kind;
+        self.notify_title = title;
+        self.notify_body = body;
+    }
+
     pub(crate) fn panel_generation(&self) -> u64 { self.panel_generation }
     pub(crate) fn panel_kind(&self) -> PanelKind { self.panel_kind }
     pub(crate) fn panel_title(&self) -> &str { &self.panel_title }

@@ -173,6 +173,51 @@ class ProfileEditScreenTest {
         }
     }
 
+    // ── タスク#57: tmux通知トグル ──────────────────────────────────────
+
+    @Test fun tabNotificationsToggle_hiddenExplanation_untilEnabled() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("tmux通知(bell/activity/silence/コマンド終了)").assertExists()
+        composeTestRule.onNodeWithText("バックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします", substring = true)
+            .assertDoesNotExist()
+    }
+
+    @Test fun tabNotificationsToggle_enabling_showsExplanation() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("tmux通知(bell/activity/silence/コマンド終了)").performScrollTo()
+        composeTestRule.onNodeWithTag("tabNotificationsSwitch").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("バックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします", substring = true)
+            .assertExists()
+    }
+
+    @Test fun editProfile_prefillsTabNotificationsEnabled() {
+        val profile = sampleProfile().copy(enableTabNotifications = true)
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("バックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします", substring = true)
+            .assertExists()
+    }
+
+    @Test fun saveNewProfile_withTabNotificationsEnabled_persistsFlag() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("Bastion3")
+        fields[1].performTextInput("bastion3.example.com")
+        fields[3].performTextInput("admin")
+        composeTestRule.onNodeWithTag("tabNotificationsSwitch").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "Bastion3" }
+            assertTrue(stored.enableTabNotifications)
+        }
+    }
+
     // ── 踏み台(ProxyJump) ───────────────────────────────────────────────
 
     @Test fun jumpHostToggle_hiddenFields_untilEnabled() {

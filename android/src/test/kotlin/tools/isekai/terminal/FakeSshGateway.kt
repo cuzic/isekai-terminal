@@ -160,6 +160,34 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
     }
 
+    // ── タスク#60: tmux session group ensure/attach + ウィンドウcreate-or-select ──
+    data class EnsureTmuxTabWindowCall(
+        val profileIdentity: String,
+        val clientId: String,
+        val existingTag: String?,
+        val enableNotifications: Boolean,
+    )
+    val ensureTmuxTabWindowCalls = mutableListOf<EnsureTmuxTabWindowCall>()
+    var ensureTmuxTabWindowResult: TmuxTabWindowInfo = TmuxTabWindowInfo(
+        tag = "fake-tag",
+        windowIndex = 0u,
+        sessionName = "fake-session",
+        groupName = "fake-group",
+        isNewWindow = true,
+    )
+    var ensureTmuxTabWindowThrows: TmuxSessionException? = null
+
+    override suspend fun ensureTmuxTabWindow(
+        profileIdentity: String,
+        clientId: String,
+        existingTag: String?,
+        enableNotifications: Boolean,
+    ): TmuxTabWindowInfo {
+        ensureTmuxTabWindowCalls.add(EnsureTmuxTabWindowCall(profileIdentity, clientId, existingTag, enableNotifications))
+        ensureTmuxTabWindowThrows?.let { throw it }
+        return ensureTmuxTabWindowResult
+    }
+
     // タスク#13(OSC 133)。呼び出し引数を記録するだけ(判断ロジックはRust側にあるため、
     // Fakeは配線されているかどうかのみ確認できればよい)。
     val jumpToPreviousPromptCalls = mutableListOf<Pair<UInt, Boolean>>()
@@ -233,6 +261,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     fun simulateAgentSignRequest(fingerprint: String = "SHA256:test-fingerprint"): Boolean =
         callback!!.onAgentSignRequest(fingerprint)
+
+    /** タスク#57: tmux hook発火(Rust側の抑制判断済みという前提で、届いたものとして再現)。 */
+    fun simulateNotify(kind: NotifyKind) = callback!!.onNotify(kind)
 
     fun simulatePromptJump(target: PromptJumpTarget?) = callback!!.onPromptJump(target)
 
