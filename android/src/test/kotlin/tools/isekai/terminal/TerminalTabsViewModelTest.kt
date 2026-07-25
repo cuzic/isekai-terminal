@@ -120,7 +120,7 @@ class TerminalTabsViewModelTest {
         freshnessPolicy: ReattachFreshnessPolicy = ReattachFreshnessPolicy { _, _ -> true },
     ): TerminalTabsViewModel {
         val app = ApplicationProvider.getApplicationContext<Application>()
-        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, ConnectionProfile) -> TerminalSession = { _, _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
