@@ -1964,6 +1964,35 @@ mod tests {
     /// 呼び出し回数を記録するだけのフェイクに差し替えてある — `connect()`は
     /// 非同期fire-and-forgetで実際の接続結果は検証できないため、この粒度の
     /// 単体テストでは「正しいcadenceで試行が発火したか」だけを見る。
+    /// 自動再接続ループのテスト群が共有する`OrchestratorState`の組み立て
+    /// (opusレビューLow指摘: 以前は2つのヘルパー関数がこの約20行をほぼ丸ごと
+    /// 複製していた)。`reconnect_attempt`/`after_reconnect_success`(テストごとに
+    /// 異なるフェイク)はこの関数の範囲外——呼び出し側が`OrchestratorShared`
+    /// 構築時に個別に指定する。
+    fn reconnect_test_state(policy: ReconnectPolicy) -> OrchestratorState {
+        OrchestratorState {
+            current_host: Some("example.com".to_string()),
+            current_port: 22,
+            is_quic: false,
+            phase: ConnPhase::Connected,
+            current_transfer_id: None,
+            trzsz_mode: None,
+            download_buf: Vec::new(),
+            size_limit_exceeded_for: None,
+            pending_file_previews: HashMap::new(),
+            session_generation: 0,
+            reconnect_epoch: 0,
+            reconnect_loop_active: false,
+            retry_attempt_in_flight: false,
+            user_initiated_disconnect: false,
+            last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
+            reconnect_policy: policy,
+            background_state: BackgroundState::Foreground,
+            tab_focused: false,
+            recent_notify_seqs: std::collections::VecDeque::new(),
+        }
+    }
+
     fn orchestrator_connected_with_reconnect_policy(
         policy: ReconnectPolicy,
     ) -> (SessionOrchestrator, Arc<RecordingCallback>, Arc<std::sync::atomic::AtomicUsize>) {
@@ -1971,27 +2000,7 @@ mod tests {
         let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = attempt_count.clone();
         let shared = Arc::new(OrchestratorShared {
-            state: Mutex::new(OrchestratorState {
-                current_host: Some("example.com".to_string()),
-                current_port: 22,
-                is_quic: false,
-                phase: ConnPhase::Connected,
-                current_transfer_id: None,
-                trzsz_mode: None,
-                download_buf: Vec::new(),
-                size_limit_exceeded_for: None,
-                pending_file_previews: HashMap::new(),
-                session_generation: 0,
-                reconnect_epoch: 0,
-                reconnect_loop_active: false,
-                retry_attempt_in_flight: false,
-                user_initiated_disconnect: false,
-                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
-                reconnect_policy: policy,
-                background_state: BackgroundState::Foreground,
-                tab_focused: false,
-                recent_notify_seqs: std::collections::VecDeque::new(),
-            }),
+            state: Mutex::new(reconnect_test_state(policy)),
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
@@ -2027,27 +2036,7 @@ mod tests {
         let counter = attempt_count.clone();
         let backfill_counter_for_hook = backfill_count.clone();
         let shared = Arc::new(OrchestratorShared {
-            state: Mutex::new(OrchestratorState {
-                current_host: Some("example.com".to_string()),
-                current_port: 22,
-                is_quic: false,
-                phase: ConnPhase::Connected,
-                current_transfer_id: None,
-                trzsz_mode: None,
-                download_buf: Vec::new(),
-                size_limit_exceeded_for: None,
-                session_generation: 0,
-                reconnect_epoch: 0,
-                reconnect_loop_active: false,
-                retry_attempt_in_flight: false,
-                user_initiated_disconnect: false,
-                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
-                reconnect_policy: policy,
-                background_state: BackgroundState::Foreground,
-                tab_focused: false,
-                recent_notify_seqs: std::collections::VecDeque::new(),
-                pending_file_previews: HashMap::new(),
-            }),
+            state: Mutex::new(reconnect_test_state(policy)),
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
