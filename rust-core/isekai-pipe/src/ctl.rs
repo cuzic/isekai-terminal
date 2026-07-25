@@ -729,8 +729,13 @@ fn secret_preamble(sock_path: &Path) -> Vec<u8> {
     line
 }
 
+/// `pub(crate)` (not private) so `claude_hookd`'s daemon can send
+/// `CtlMessage`s in-process rather than shelling out to a second
+/// `isekai-pipe ctl` invocation (`ISEKAI_PIPE_DESIGN.md` §8 Epic Q, Opus
+/// review: avoids a `PATH` dependency, a fork per color/popup transition,
+/// and the opacity of a subprocess exit code).
 #[cfg(unix)]
-async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
+pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
     let mut stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;

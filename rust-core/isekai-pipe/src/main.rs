@@ -51,6 +51,12 @@ fn print_help() {
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
     println!("    ctl        title/clipboard/setvar/getvar/file control-plane client (see `isekai-pipe ctl --help`)");
+    println!("    claude-hookd event");
+    println!("               Claude Code hook entrypoint for a debounced tab-color attention indicator");
+    println!("               (ISEKAI_PIPE_DESIGN.md §8 Epic Q) — put this exact command in every");
+    println!("               Notification/Stop/UserPromptSubmit hook and PreToolUse/PostToolUse");
+    println!("               (matcher: AskUserQuestion) hook in .claude/settings.json; reads the hook's");
+    println!("               JSON payload from stdin, always exits 0.");
     println!("    version    print version");
     println!();
     println!(
@@ -276,6 +282,7 @@ async fn run() -> ExitCode {
         Some("probe") => probe::probe_command(args).await,
         Some("inspect") => inspect::inspect_command(args).await,
         Some("ctl") => ctl::ctl_command(args).await,
+        Some("claude-hookd") => claude_hookd::claude_hookd_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");
