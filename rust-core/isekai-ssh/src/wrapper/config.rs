@@ -50,6 +50,8 @@ pub(super) fn resolve_isekai_config(
         remote_log_level: None,
         remote_bind_port_range: None,
         local_bind_port_range: None,
+        tab_idle_color: None,
+        tab_attention_color: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -110,6 +112,8 @@ pub(super) fn resolve_isekai_config(
         remote_log_level: builder.remote_log_level.unwrap_or_else(|| "info".to_string()),
         remote_bind_port_range: builder.remote_bind_port_range,
         local_bind_port_range: builder.local_bind_port_range,
+        tab_idle_color: builder.tab_idle_color,
+        tab_attention_color: builder.tab_attention_color,
     })
 }
 
@@ -134,6 +138,8 @@ struct IsekaiConfigBuilder {
     remote_log_level: Option<String>,
     remote_bind_port_range: Option<(u16, u16)>,
     local_bind_port_range: Option<(u16, u16)>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 }
 
 fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDirective) -> Result<()> {
@@ -247,6 +253,16 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
             parse_bind_port_range(one_arg(&directive)?)?,
             "local-bind-port-range",
         ),
+        "tab-idle-color" => set_once(
+            &mut builder.tab_idle_color,
+            parse_tab_color(one_arg(&directive)?, "tab-idle-color")?,
+            "tab-idle-color",
+        ),
+        "tab-attention-color" => set_once(
+            &mut builder.tab_attention_color,
+            parse_tab_color(one_arg(&directive)?, "tab-attention-color")?,
+            "tab-attention-color",
+        ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -326,6 +342,19 @@ fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
         ));
     }
     Ok((start, end))
+}
+
+/// Parses `#@isekai tab-idle-color`/`tab-attention-color <rrggbb>` using the
+/// same validator `isekai-pipe ctl tab-color` and `claude-hookd` use
+/// (`isekai_pipe_core::parse_hex_color`, `ISEKAI_PIPE_DESIGN.md` §8 Epic Q).
+/// Failing closed here — at config-resolution time — matters more than for
+/// most directives: an unvalidated value would otherwise reach
+/// `ctl_forward.rs::remote_command_arg`, which embeds it directly into the
+/// shell command line `isekai-ssh` execs on the remote to establish the
+/// session (see that function's doc comment on why bare validated hex,
+/// never arbitrary text, is required there).
+fn parse_tab_color(value: &str, field: &str) -> Result<(u8, u8, u8)> {
+    isekai_pipe_core::parse_hex_color(value).map_err(|e| anyhow!("isekai-ssh: invalid #@isekai {field}: {e}"))
 }
 
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
@@ -467,5 +496,60 @@ mod tests {
     #[test]
     fn parse_bootstrap_relay_rejects_unknown_key() {
         assert!(parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com", "jwt=abc"])).is_err());
+    }
+
+    #[test]
+    fn parse_tab_color_accepts_bare_and_hash_prefixed_hex() {
+        assert_eq!(parse_tab_color("ff0000", "tab-idle-color").unwrap(), (0xff, 0x00, 0x00));
+        assert_eq!(parse_tab_color("#00ff80", "tab-attention-color").unwrap(), (0x00, 0xff, 0x80));
+    }
+
+    #[test]
+    fn parse_tab_color_rejects_invalid_values() {
+        assert!(parse_tab_color("not-a-color", "tab-idle-color").is_err());
+        assert!(parse_tab_color("$(id)", "tab-idle-color").is_err());
+        assert!(parse_tab_color("", "tab-idle-color").is_err());
+    }
+
+    #[test]
+    fn apply_isekai_directive_sets_tab_colors_once() {
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-idle-color".to_string(), args: s(&["202020"]) }).unwrap();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-attention-color".to_string(), args: s(&["ff8800"]) })
+            .unwrap();
+        assert_eq!(builder.tab_idle_color, Some((0x20, 0x20, 0x20)));
+        assert_eq!(builder.tab_attention_color, Some((0xff, 0x88, 0x00)));
+
+        // `set_once`: a second `tab-idle-color` directive (e.g. a later
+        // `Host` block matching the same connection) must not override the
+        // first, matching `ssh(1)`'s own "first match wins" semantics.
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tab-idle-color".to_string(), args: s(&["ffffff"]) }).unwrap();
+        assert_eq!(builder.tab_idle_color, Some((0x20, 0x20, 0x20)));
+    }
+
+    fn empty_builder() -> IsekaiConfigBuilder {
+        IsekaiConfigBuilder {
+            enabled: None,
+            bootstrap_policy: None,
+            profile: None,
+            remote_path: None,
+            services: Vec::new(),
+            bootstrap_candidates: Vec::new(),
+            link_endpoints: Vec::new(),
+            rendezvous: Vec::new(),
+            stun_servers: Vec::new(),
+            relay_endpoints: Vec::new(),
+            resume_grace_secs: None,
+            candidate_race_delay_ms: None,
+            relay_delay_ms: None,
+            install_mode: None,
+            bootstrap_relay: None,
+            ctl_socket_enabled: None,
+            remote_log_level: None,
+            remote_bind_port_range: None,
+            local_bind_port_range: None,
+            tab_idle_color: None,
+            tab_attention_color: None,
+        }
     }
 }
