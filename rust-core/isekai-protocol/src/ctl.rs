@@ -138,6 +138,12 @@ impl ClipboardMime {
 pub enum CtlMessage {
     #[serde(rename = "title")]
     SetTitle { value: String },
+    /// host → device: set this tab's background color (Windows Terminal via
+    /// OSC 4 palette-index 264, see `isekai-ssh::ctl_forward::osc_sequence_for`;
+    /// a harmless no-op on platforms/terminals with no equivalent). Fire-and-
+    /// forget, same pattern as `SetTitle` — no response is expected or sent.
+    #[serde(rename = "tab_color")]
+    SetTabColor { r: u8, g: u8, b: u8 },
     /// host → device: write to the device's clipboard.
     #[serde(rename = "clip_push")]
     ClipboardPush {
@@ -231,6 +237,8 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
             }
             Ok(())
         }
+        // r/g/b are u8, already bounded to 0..=255 by the type itself.
+        CtlMessage::SetTabColor { .. } => Ok(()),
         CtlMessage::ClipboardPush { mime, data_b64 }
         | CtlMessage::ClipboardPullResponse { mime, data_b64 } => {
             validate_clipboard_payload(*mime, data_b64)
