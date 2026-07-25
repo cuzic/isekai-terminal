@@ -186,9 +186,19 @@ pub(crate) fn to_cell_data(c: &TermCell) -> CellData {
 /// scrollbackが持つ`Vec<TermCell>`行表現に変換する。`cols`を超える分は
 /// 切り詰め、`cols`に満たない分は現在のテーマの既定色の空白セルで埋める
 /// (`Terminal::new`の`blank`セルと同じ組み立て方)。
+///
+/// opusレビューM4: 以前は`chars()`の個数(=文字コードポイント数)でしか列を
+/// 消費しておらず、CJK等の全角文字も半角と同じ1セル扱いになっていた
+/// (`is_wide_placeholder`も常にfalse)。日本語IME完全対応を差別化点に掲げる
+/// プロダクトのbackfillとしては桁ズレが致命的なため、`terminal.rs`の
+/// `cell_display_width`/`sanitize_wide_cells`が使うのと同じ`unicode_width`で
+/// 各文字の表示幅(1/2)を見て、全角文字は「本体セル(幅2) + 直後の
+/// `is_wide_placeholder`セル」の対で書き込む。
 fn plain_text_to_scrollback_row(line: &str, cols: usize, theme: Theme) -> Vec<TermCell> {
-    let blank = TermCell {
-        ch: smol_str::SmolStr::new_inline(" "),
+    use unicode_width::UnicodeWidthChar;
+
+    let blank_cell = |ch: &str, is_wide_placeholder: bool| TermCell {
+        ch: smol_str::SmolStr::new(ch),
         fg: theme.default_fg,
         bg: theme.default_bg,
         bold: false,
@@ -198,25 +208,26 @@ fn plain_text_to_scrollback_row(line: &str, cols: usize, theme: Theme) -> Vec<Te
         strikethrough: false,
         blink: false,
         invisible: false,
-        is_wide_placeholder: false,
+        is_wide_placeholder,
         link_id: None,
     };
-    let mut row = vec![blank; cols];
-    for (i, ch) in line.chars().take(cols).enumerate() {
-        row[i] = TermCell {
-            ch: smol_str::SmolStr::new(ch.encode_utf8(&mut [0u8; 4])),
-            fg: theme.default_fg,
-            bg: theme.default_bg,
-            bold: false,
-            dim: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            blink: false,
-            invisible: false,
-            is_wide_placeholder: false,
-            link_id: None,
-        };
+    let mut row = vec![blank_cell(" ", false); cols];
+    let mut col = 0usize;
+    for ch in line.chars() {
+        if col >= cols {
+            break;
+        }
+        let width = ch.width().unwrap_or(1);
+        // 全角文字が最終列1つにしか収まらない場合は`sanitize_wide_cells`同様
+        // 片割れを持てないため書き込まず、そこで打ち切る(残りは既定の空白のまま)。
+        if width == 2 && col + 1 >= cols {
+            break;
+        }
+        row[col] = blank_cell(ch.encode_utf8(&mut [0u8; 4]), false);
+        if width == 2 {
+            row[col + 1] = blank_cell(" ", true);
+        }
+        col += width.max(1);
     }
     row
 }
@@ -1418,6 +1429,44 @@ mod tests {
             !sync_output_timeout_is_current(1, None),
             "既にdisarm済み(?2026l/RIS/直前のforce_end)なら無視すべき"
         );
+    }
+
+    // ── タスク#58: plain_text_to_scrollback_rowの全角文字幅(opusレビューM4) ──
+
+    #[test]
+    fn plain_text_to_scrollback_row_ascii_uses_one_cell_per_char() {
+        let row = plain_text_to_scrollback_row("abc", 5, Theme::default());
+        assert_eq!(row.len(), 5);
+        assert_eq!(row[0].ch.as_str(), "a");
+        assert_eq!(row[1].ch.as_str(), "b");
+        assert_eq!(row[2].ch.as_str(), "c");
+        assert_eq!(row[3].ch.as_str(), " ");
+        assert!(row.iter().all(|c| !c.is_wide_placeholder));
+    }
+
+    #[test]
+    fn plain_text_to_scrollback_row_cjk_consumes_two_cells_with_placeholder() {
+        // "あ"(U+3042)は全角(表示幅2)。以前はchars()の個数だけで列を消費しており
+        // 半角と同じ1セル扱いになっていた(is_wide_placeholderも常にfalse)ため、
+        // 続く文字がすべて1列ずれていた。
+        let row = plain_text_to_scrollback_row("あx", 5, Theme::default());
+        assert_eq!(row[0].ch.as_str(), "あ");
+        assert!(!row[0].is_wide_placeholder);
+        assert!(row[1].is_wide_placeholder, "全角本体の直後はplaceholderセルであるべき");
+        assert_eq!(row[1].ch.as_str(), " ");
+        assert_eq!(row[2].ch.as_str(), "x", "全角文字は2列消費するので、次の文字は列2から始まるべき");
+        assert_eq!(row[3].ch.as_str(), " ");
+    }
+
+    #[test]
+    fn plain_text_to_scrollback_row_cjk_at_last_column_is_dropped_not_split() {
+        // 全角文字の片割れ(is_wide_placeholder)を置く列が無い場合、
+        // sanitize_wide_cells(terminal.rs)と同じく孤立した本体セルを残さない
+        // ——書き込まずに空白のままにする。
+        let row = plain_text_to_scrollback_row("xあ", 2, Theme::default());
+        assert_eq!(row[0].ch.as_str(), "x");
+        assert_eq!(row[1].ch.as_str(), " ", "最終列1つにしか収まらない全角文字は書き込まれないはず");
+        assert!(!row[1].is_wide_placeholder);
     }
 
     #[test]
