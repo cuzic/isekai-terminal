@@ -18,7 +18,7 @@
 #    - reserved に current 以下の値(＝削除し忘れ)が残っていないこと
 #    を検証する。
 
-current = 19
+current = 21
 
 # 予約中のマイグレーション(未マージ)。マージ後は必ず削除すること。
 # 例:
@@ -27,15 +27,3 @@ current = 19
 # owner = "phase12-relay-credential-vault"
 # branch = "agent/relay-jwt-keystore"
 # reserved_at = "2026-07-04"
-
-[[reserved]]
-version = 20
-owner = "task60-tmux-session-mapping"
-branch = "worktree-agent-abdb7f693214ea531"
-reserved_at = "2026-07-19"
-
-[[reserved]]
-version = 21
-owner = "task57-tmux-notify"
-branch = "worktree-agent-a1e1e4020360813f3"
-reserved_at = "2026-07-19"
