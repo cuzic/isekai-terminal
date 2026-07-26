@@ -111,6 +111,16 @@ pub struct MultipathIsekaiPipeQuicConfig {
     /// `None`の場合はRust側で従来通りの既定値フォールバックを維持する
     /// (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
     pub bind_port: Option<u16>,
+    /// #22: `RebindManager`(WiFi⇔セルラー自動フェイルオーバーFSM)を有効にするか
+    /// (`ConnectionProfile.enableUpstreamFailover`の値をそのまま渡す)。`false`
+    /// なら`NoViablePath`/`UpstreamHealthDegraded`を検知しても`RebindManager`は
+    /// 一切反応しない(`establish_multipath_connection`呼び出し時に`rebind_driver`
+    /// 引数を`None`にする、`notify_upstream_health_degraded`も早期returnする)。
+    /// 以前はこの値がRust側に伝わっておらず、Kotlin側`onWifiUpstreamBroken`の
+    /// 起動条件としてしか使われていなかったため、この設定を無効にしていても
+    /// `RebindManager`自体は常時反応していた(実害: 意図せずセルラー[従量課金]へ
+    /// 切り替わる、opusレビューで発見)。
+    pub enable_upstream_failover: bool,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -240,6 +250,27 @@ impl MultipathIsekaiPipeQuicSession {
         match driver {
             Some(driver) => driver.send_event(crate::rebind_manager::RebindEvent::ManualForceReturnRequested),
             None => warn!("multipath_quic: force_return_to_wifi called before RebindManager Driver started"),
+        }
+    }
+
+    /// Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+    /// 喪失、Rust側のQUICパスヘルスとは無関係な独自シグナル)からの生イベントを、
+    /// `RebindManager`の`RebindEvent::UpstreamHealthDegraded`としてそのまま転送する
+    /// だけ(`rust-ssot.md`準拠、判断はしない)。以前はKotlin側がこの検知を受けて
+    /// 独自にセルラーfdを取得しrebindを直接実行していたが、それは`RebindManager`が
+    /// 同じ物理path劣化に対して`NoViablePath`経由で既に行う`PerformRebindToCellular`
+    /// と完全に重複しており、同一セッションに対して独立に2本のセルラーfdを取得し
+    /// `rebind_abstract`を2回叩く二重rebindになっていた(opusレビューで発見)。
+    /// `enable_upstream_failover`が無効なら、この検知経路も含めて何もしない
+    /// (`MultipathIsekaiPipeQuicConfig::enable_upstream_failover`のdocコメント参照)。
+    pub(crate) fn notify_upstream_health_degraded(&self) {
+        if !self.config.enable_upstream_failover {
+            return;
+        }
+        let driver = self.rebind_driver.lock().unwrap().clone();
+        match driver {
+            Some(driver) => driver.send_event(crate::rebind_manager::RebindEvent::UpstreamHealthDegraded),
+            None => warn!("multipath_quic: notify_upstream_health_degraded called before RebindManager Driver started"),
         }
     }
 
@@ -1055,9 +1086,14 @@ async fn try_connect_multipath(
     let observer: Arc<dyn rebind_driver::RebindStateObserver> = Arc::new(RealRebindObserver { callback: rebind_callback });
     let driver_handle = rebind_driver::spawn_rebind_driver(fd_source, probe, executor, quiet_source, observer);
 
+    // #22: `enable_upstream_failover`が無効なら`RebindManager`へ`NoViablePath`を
+    // 一切転送しない(`driver_handle`自体は返り値として`session.rebind_driver`に
+    // 保持されるが、イベントを受け取らないFSMは`Phase::OnWifi`のまま動かない)。
+    // `MultipathIsekaiPipeQuicConfig::enable_upstream_failover`のdocコメント参照。
+    let rebind_driver_for_health = config.enable_upstream_failover.then(|| driver_handle.clone());
     let (conn, _broker, endpoint) = establish_multipath_connection(
         path0_addr, path1_addr, physical, &cert_sha256_hex, event_tx, crate::debug_fault::shared_injector(),
-        traffic_stats.clone(), Some(driver_handle.clone()),
+        traffic_stats.clone(), rebind_driver_for_health,
     )
     .await?;
     let (send, recv) = hello_ack(&conn, &session_secret).await?;
@@ -1195,6 +1231,7 @@ mod tests {
             rows: 24,
             jump: None,
             bind_port: None,
+            enable_upstream_failover: false,
         }
     }
 

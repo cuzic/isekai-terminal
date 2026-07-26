@@ -84,6 +84,14 @@ impl ActiveSession {
             s.force_return_to_wifi();
         }
     }
+    /// `UpstreamHealthMonitor`(Android ConnectivityManager由来、rebind_to_fdと
+    /// 同じくマルチパス以外のtransportでは何もしない)からの生イベントを
+    /// `RebindManager`へ転送する。
+    fn notify_upstream_health_degraded(&self) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.notify_upstream_health_degraded();
+        }
+    }
     /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
     /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
     /// `rebind_to_fd`と同じくno-op委譲。
@@ -1418,6 +1426,18 @@ impl SessionOrchestrator {
         }
     }
 
+    /// Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+    /// 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+    /// そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+    /// (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+    /// マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+    /// Rust側で無視される。
+    pub fn notify_upstream_health_degraded(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.notify_upstream_health_degraded();
+        }
+    }
+
     pub fn send(&self, data: Vec<u8>) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.send(data);
@@ -2254,6 +2274,7 @@ mod tests {
             rows: 24,
             jump: None,
             bind_port: None,
+            enable_upstream_failover: false,
         }
     }
 
