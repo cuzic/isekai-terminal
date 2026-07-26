@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use attach_runtime::{AttachRuntime, HelloOutcome};
+use attach_runtime::{AttachRuntime, EstablishedLease, HelloOutcome};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use isekai_protocol::attach::{
@@ -1111,12 +1111,16 @@ async fn handle_attach_stream(
         reject_attach(&mut send, reason).await;
         return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
     }
-    let (lease, attach_token) = match attach_runtime.hello(key).await {
+    // `lease`(この`HelloOutcome::Ready`が返すもの)自体はここでは使わない —
+    // `attach_runtime.activate()`は`key`から`PendingActivation`状態を引く
+    // ので不要。実際に使う`EstablishedLease`は下で`activate()`の戻り値から
+    // 得る(`Established`への遷移が実際に起きた瞬間に限ってガードを作るため)。
+    let attach_token = match attach_runtime.hello(key).await {
         HelloOutcome::Reject(reason) => {
             reject_attach(&mut send, reason).await;
             return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
         }
-        HelloOutcome::Ready { lease, attach_token } => (lease, attach_token),
+        HelloOutcome::Ready { attach_token, .. } => attach_token,
     };
 
     // クライアントが希望する resume-grace 期間（0 = 希望なし）。この値を
@@ -1146,7 +1150,7 @@ async fn handle_attach_stream(
     })
     .await;
 
-    let tcp = match activate {
+    let activated = match activate {
         Ok(Ok(activate))
             if activate.session_id == key.session_id
                 && activate.generation == key.generation
@@ -1164,7 +1168,12 @@ async fn handle_attach_stream(
             None
         }
     };
-    let Some(tcp) = tcp else {
+    // Minted by `activate()` at the exact moment the arbiter transitioned
+    // this session to `Established` — never earlier (see `EstablishedLease`
+    // docs). Everything above this point (timeout/decode-failure/superseded)
+    // is a routine non-panic early return that never held a slot to begin
+    // with, so it must not go through this guard.
+    let Some((tcp, lease)) = activated else {
         return Err(anyhow!("attach never activated (timeout, decode failure, or superseded)"));
     };
 
@@ -1208,12 +1217,13 @@ async fn handle_attach_stream(
 
     match outcome {
         RelayOutcome::TcpDied => {
-            attach_runtime.relay_ended(lease).await;
+            lease.release().await;
             sessions.remove(&session_id_bytes).await;
         }
         RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
             // まだ`Established`のまま(=fencing slotを保持したまま)にする —
             // 一致する`RESUME`がこのsession_idの元へ戻ってこられるように。
+            lease.keep();
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
@@ -1292,7 +1302,7 @@ async fn handle_resume_stream(
     // しない — この`session_id`が現在まさに`Established`スロットを占有して
     // いる、その`lease`を確認するだけでよい(module docs: 同一sessionへの
     // resumeはfencing上の競合になり得ない)。
-    let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
+    let Some(lease_id) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
     else {
         repark(&handle, tcp_read, tcp_write).await;
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
@@ -1330,6 +1340,13 @@ async fn handle_resume_stream(
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
     }
 
+    // ここでようやくRAIIガードを作る — この行より前にある`repark`+早期return
+    // 経路(UnknownToken/OffsetGone/RESUME_ACK書き込み失敗)はいずれも
+    // 「slotを`Established`のまま維持したい」正常系であり、ガードをここより
+    // 前で作ると、それらの正常な早期returnのたびにDropが誤ってslotを
+    // 解放してしまう(`EstablishedLease`/`AttachRuntime::resumed_lease`docs参照)。
+    let lease = attach_runtime.resumed_lease(lease_id);
+
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
     // 確立を待たずに中継を先に始める。既知のsession_idをそのまま再利用する
@@ -1360,7 +1377,7 @@ async fn handle_resume_stream(
     )
     .await;
     control_task.abort();
-    finish_or_park_session(&sessions, &attach_runtime, lease, Some(session_id), handle, outcome).await;
+    finish_or_park_session(&sessions, lease, Some(session_id), handle, outcome).await;
     Ok(())
 }
 
@@ -1471,13 +1488,13 @@ async fn accept_control_stream(
 /// `Option`のまま残す。
 async fn finish_or_park_session(
     sessions: &SessionTable,
-    attach_runtime: &Arc<AttachRuntime>,
-    lease: attach_arbiter::LeaseId,
+    lease: EstablishedLease,
     id: Option<resume::SessionId>,
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
     let Some(id) = id else {
+        lease.keep();
         return;
     };
     match outcome {
@@ -1486,7 +1503,7 @@ async fn finish_or_park_session(
                 "session {} target connection died, discarding",
                 hex_lower(&id)
             );
-            attach_runtime.relay_ended(lease).await;
+            lease.release().await;
             sessions.remove(&id).await;
         }
         RelayOutcome::DataStreamDied {
@@ -1497,6 +1514,7 @@ async fn finish_or_park_session(
                 "session {} data stream died, parking for possible resume",
                 hex_lower(&id)
             );
+            lease.keep();
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
