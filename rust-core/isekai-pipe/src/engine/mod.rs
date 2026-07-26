@@ -1070,6 +1070,71 @@ async fn admit_new_session(
     }
 }
 
+/// `EstablishedLease`と対になる、`SessionTable`側エントリのRAIIガード。
+/// `AttachArbiter`のfencing slot(`EstablishedLease`が守る)と`SessionTable`
+/// のresumeバッファ付きエントリは別々のデータ構造で(`resume.rs`のモジュール
+/// docs参照)、`EstablishedLease`のDropはfencing slotしか解放しない。
+///
+/// `insert_existing`でエントリを登録してから、通常の後始末(`TcpDied`での
+/// 明示的な`sessions.remove`、または`DataStreamDied`でのpark — parkされた
+/// エントリは既存の`sweep_expired_parked`/`insert_existing`のLRU立ち退きで
+/// 回収可能になる)に到達する前にタスクがpanicすると、`parked_tcp: None`・
+/// `parked_since: None`のまま、つまり現在アクティブに中継中のセッションと
+/// 区別が付かない状態でエントリが残る。`find_oldest_parked`(`resume.rs`)は
+/// parkされたエントリしか立ち退き対象にしないため、この孤児エントリは
+/// **`sweep_expired_parked`にも`insert_existing`のLRU立ち退きにも一切
+/// 引っかからず永久に残り続ける**。`--max-sessions`分たまると、以後の
+/// `insert_existing`が新規セッションの登録自体を拒否するようになり
+/// (`Rejected`)、その戻り値は呼び出し元で見過ごされたまま中継自体は
+/// 継続するため実害が気付かれにくいが、そのセッションはresume不能になる
+/// (`.claude/rules/always-connects.md`が禁じる「復旧しない状態」の一形態)。
+///
+/// `disarm()`を呼ばずにDropされた場合(=panicで正常な後始末に到達しなかった
+/// 場合)のフォールバックとして、Drop側でエントリそのものを`SessionTable`
+/// から取り除く。
+struct SessionTableEntryGuard {
+    sessions: SessionTable,
+    id: Option<[u8; 16]>,
+}
+
+impl SessionTableEntryGuard {
+    fn new(sessions: SessionTable, id: [u8; 16]) -> Self {
+        Self { sessions, id: Some(id) }
+    }
+
+    /// 通常の後始末(`sessions.remove`済み、または`DataStreamDied`でpark済み
+    /// — どちらも既存の仕組みで正しく扱われる状態)に到達したことを示し、
+    /// Dropフォールバックを無効化する。
+    fn disarm(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for SessionTableEntryGuard {
+    /// `EstablishedLease::drop`と同じ理由(panic unwind中の二重panicを避ける
+    /// ため、Drop自身は絶対にpanicしない/直接awaitしない)でfire-and-forget
+    /// spawnにする。
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                "SessionTableEntryGuard dropped outside a tokio runtime; session {} could not be removed",
+                hex_lower(&id)
+            );
+            return;
+        };
+        log::warn!(
+            "SessionTableEntryGuard dropped without disarm() (session={}); removing orphaned entry via \
+             Drop fallback — the owning task likely panicked or returned early",
+            hex_lower(&id)
+        );
+        let sessions = self.sessions.clone();
+        handle.spawn(async move {
+            sessions.remove(&id).await;
+        });
+    }
+}
+
 /// helper 側の `ATTACH_HELLO` 検証・fencing判定([`AttachRuntime::hello`])・
 /// `AttachActivate`待ち・中継を行う(`#18`)。`PendingActivation`(ACK送信後
 /// `AttachActivate`受信前)の間は、まだtargetへのSSHユーザーデータを一切
@@ -1186,11 +1251,18 @@ async fn handle_attach_stream(
     new_session.negotiated_resume_grace_secs = Some(negotiated_resume_grace_secs);
     let handle = Arc::new(Mutex::new(new_session));
     let session_id_bytes = *hello.session_id.as_bytes();
-    if let resume::InsertOutcome::InsertedAfterEvicting(evicted_id) =
-        sessions.insert_existing(session_id_bytes, handle.clone()).await
-    {
-        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
-    }
+    // `Rejected`(既存のギャップ、このガード追加の対象外)ではテーブルに
+    // エントリが実在しないので守るものが無く、`table_guard`は`None`のまま
+    // 中継を継続する(=このsessionはresume不能になるが、それは今回のスコープ
+    // 外の既存動作)。
+    let table_guard = match sessions.insert_existing(session_id_bytes, handle.clone()).await {
+        resume::InsertOutcome::InsertedAfterEvicting(evicted_id) => {
+            release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
+            Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes))
+        }
+        resume::InsertOutcome::Inserted => Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes)),
+        resume::InsertOutcome::Rejected => None,
+    };
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 
     // control stream(APP_ACK用)は既知のsession_idを再利用するだけで、新規
@@ -1220,6 +1292,9 @@ async fn handle_attach_stream(
         RelayOutcome::TcpDied => {
             lease.release().await;
             sessions.remove(&session_id_bytes).await;
+            if let Some(guard) = table_guard {
+                guard.disarm();
+            }
         }
         RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
             // まだ`Established`のまま(=fencing slotを保持したまま)にする —
@@ -1228,6 +1303,14 @@ async fn handle_attach_stream(
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
+            drop(session);
+            // park済み(=parked_sinceがSome)になったので、既存の
+            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
+            // 回収可能な状態になった — `table_guard`のDropフォールバックは
+            // もう不要。
+            if let Some(guard) = table_guard {
+                guard.disarm();
+            }
         }
     }
     Ok(())
@@ -1347,6 +1430,12 @@ async fn handle_resume_stream(
     // 前で作ると、それらの正常な早期returnのたびにDropが誤ってslotを
     // 解放してしまう(`EstablishedLease`/`AttachRuntime::resumed_lease`docs参照)。
     let lease = attach_runtime.resumed_lease(lease_id);
+    // `parked_tcp.take()`(上、repark前提の一時的な取り出し)によって、この
+    // session_idの`SessionTable`エントリは既に「parkされていない」状態に
+    // 戻っている。ここから`finish_or_park_session`が outcome を解決する
+    // までの間にタスクがpanicすると、`EstablishedLease`と全く同じ理由で
+    // このエントリも孤児化する(`SessionTableEntryGuard`docs参照)。
+    let table_guard = SessionTableEntryGuard::new(sessions.clone(), session_id);
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
@@ -1378,7 +1467,7 @@ async fn handle_resume_stream(
     )
     .await;
     control_task.abort();
-    finish_or_park_session(&sessions, lease, Some(session_id), handle, outcome).await;
+    finish_or_park_session(&sessions, lease, table_guard, Some(session_id), handle, outcome).await;
     Ok(())
 }
 
@@ -1490,12 +1579,14 @@ async fn accept_control_stream(
 async fn finish_or_park_session(
     sessions: &SessionTable,
     lease: EstablishedLease,
+    table_guard: SessionTableEntryGuard,
     id: Option<resume::SessionId>,
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
     let Some(id) = id else {
         lease.keep();
+        table_guard.disarm();
         return;
     };
     match outcome {
@@ -1506,6 +1597,7 @@ async fn finish_or_park_session(
             );
             lease.release().await;
             sessions.remove(&id).await;
+            table_guard.disarm();
         }
         RelayOutcome::DataStreamDied {
             tcp_read,
@@ -1519,6 +1611,10 @@ async fn finish_or_park_session(
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
+            drop(session);
+            // park済みになったので、既存のsweep_expired_parked/insert_existing
+            // のLRU立ち退きで正しく回収可能な状態になった。
+            table_guard.disarm();
             // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
             // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
         }
