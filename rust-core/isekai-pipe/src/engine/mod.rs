@@ -542,6 +542,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&args.log_level))
         .target(env_logger::Target::Stderr)
         .init();
+    crate::install_panic_hook();
 
     rustls::crypto::ring::default_provider()
         .install_default()
