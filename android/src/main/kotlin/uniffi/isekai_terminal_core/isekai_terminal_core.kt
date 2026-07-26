@@ -911,6 +911,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_upstream_health_degraded(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd(
@@ -1089,6 +1091,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_fo
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_path_changed(`ptr`: Long,`isSatisfied`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_upstream_health_degraded(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1429,6 +1433,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed() != 22300) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_upstream_health_degraded() != 13087) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
@@ -3197,6 +3204,16 @@ public interface SessionOrchestratorInterface {
     fun `notifyNetworkPathChanged`(`isSatisfied`: kotlin.Boolean)
     
     /**
+     * Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+     * そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+     * (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+     * マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+     * Rust側で無視される。
+     */
+    fun `notifyUpstreamHealthDegraded`()
+    
+    /**
      * アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
      * `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
      * (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
@@ -3789,6 +3806,26 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_path_changed(
         it,
         FfiConverterBoolean.lower(`isSatisfied`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+     * そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+     * (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+     * マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+     * Rust側で無視される。
+     */override fun `notifyUpstreamHealthDegraded`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_upstream_health_degraded(
+        it,
+        _status)
 }
     }
     
@@ -4894,6 +4931,19 @@ data class MultipathIsekaiPipeQuicConfig (
      * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
      */
     var `bindPort`: kotlin.UShort?
+    , 
+    /**
+     * #22: `RebindManager`(WiFi⇔セルラー自動フェイルオーバーFSM)を有効にするか
+     * (`ConnectionProfile.enableUpstreamFailover`の値をそのまま渡す)。`false`
+     * なら`NoViablePath`/`UpstreamHealthDegraded`を検知しても`RebindManager`は
+     * 一切反応しない(`establish_multipath_connection`呼び出し時に`rebind_driver`
+     * 引数を`None`にする、`notify_upstream_health_degraded`も早期returnする)。
+     * 以前はこの値がRust側に伝わっておらず、Kotlin側`onWifiUpstreamBroken`の
+     * 起動条件としてしか使われていなかったため、この設定を無効にしていても
+     * `RebindManager`自体は常時反応していた(実害: 意図せずセルラー[従量課金]へ
+     * 切り替わる、opusレビューで発見)。
+     */
+    var `enableUpstreamFailover`: kotlin.Boolean
     
 ){
     
@@ -4924,6 +4974,7 @@ public object FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuf
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
             FfiConverterOptionalUShort.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -4941,7 +4992,8 @@ public object FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuf
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
-            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`) +
+            FfiConverterBoolean.allocationSize(value.`enableUpstreamFailover`)
     )
 
     override fun write(value: MultipathIsekaiPipeQuicConfig, buf: ByteBuffer) {
@@ -4959,6 +5011,7 @@ public object FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuf
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
             FfiConverterOptionalUShort.write(value.`bindPort`, buf)
+            FfiConverterBoolean.write(value.`enableUpstreamFailover`, buf)
     }
 }
 
