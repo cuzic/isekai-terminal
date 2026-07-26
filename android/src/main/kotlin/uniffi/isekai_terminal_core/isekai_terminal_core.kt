@@ -915,8 +915,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground(
     ): Int
-    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd(
-    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize(
@@ -1095,8 +1093,6 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_ne
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_upstream_health_degraded(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1439,9 +1435,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
@@ -3224,13 +3217,6 @@ public interface SessionOrchestratorInterface {
      */
     fun `notifyWillEnterForeground`()
     
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */
-    fun `rebindToFd`(`fd`: kotlin.Int, `localIp`: kotlin.String)
-    
     fun `removeForward`(`id`: kotlin.String)
     
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
@@ -3847,23 +3833,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
         it,
         _status)
-}
-    }
-    
-    
-
-    
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */override fun `rebindToFd`(`fd`: kotlin.Int, `localIp`: kotlin.String)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(
-        it,
-        FfiConverterInt.lower(`fd`),FfiConverterString.lower(`localIp`),_status)
 }
     }
     

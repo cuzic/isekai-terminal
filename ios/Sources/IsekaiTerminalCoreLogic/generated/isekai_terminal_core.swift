@@ -1297,13 +1297,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func notifyWillEnterForeground() 
     
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */
-    func rebindToFd(fd: Int32, localIp: String) 
-    
     func removeForward(id: String) 
     
     func resize(cols: UInt32, rows: UInt32) 
@@ -1764,20 +1757,6 @@ open func notifyUpstreamHealthDegraded()  {try! rustCall() {
 open func notifyWillEnterForeground()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
             self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */
-open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(
-            self.uniffiCloneHandle(),
-        FfiConverterInt32.lower(fd),
-        FfiConverterString.lower(localIp),$0
     )
 }
 }
@@ -8571,9 +8550,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
