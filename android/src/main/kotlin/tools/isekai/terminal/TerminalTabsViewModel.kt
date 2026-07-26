@@ -136,7 +136,6 @@ class PaneState internal constructor(
 
     // ── upstream フェイルオーバー ────────────────────────────
     internal var upstreamFailoverEnabledForCurrentSession = false
-    internal val rebindInFlight = AtomicBoolean(false)
 
     // ── Task #10: per-pane handle所有権(後勝ちバグ修正) ─────────
     /** 物理マルチパスfd取得のhandle。接続試行のたびに古いhandleを閉じてから発行し直す。 */
@@ -253,15 +252,26 @@ class TerminalTabsViewModel(
                     val vibrator = app.getSystemService(Vibrator::class.java)
                     vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
-                // `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由のAI/汎用の注目通知
-                // (kindが`Waiting`/`Done`/`Info`)。判断(取りこぼし無く1回だけ発火させる
-                // `notifyGeneration`の単調増加チェック)は[TerminalSession]側で完結しており、
-                // ここでは実際の副作用注入のみを行う(`onBell`と同じ構成)。タブバーのバッジ
-                // 表示・バックグラウンド時のシステム通知は未実装(別タスク)のため、現時点
-                // ではログ出力のみ——`onNotify`自体を配線し忘れて既定no-opのまま放置される
-                // (Codexレビュー2026-07-25で指摘)のを避けるための最低限の接続。
+                // `AI_INTEGRATION_DESIGN.md` §6.1/§11.1.4: ctlソケット経由のAI/汎用の
+                // 注目通知(kindが`Waiting`/`Done`/`Info`)。判断(取りこぼし無く1回だけ
+                // 発火させる`notifyGeneration`の単調増加チェック)は[TerminalSession]側で
+                // 完結しており、ここでは実際の副作用注入のみを行う(`onBell`と同じ構成)。
+                // 2026-07-25、tmux hook系kind(下の`onNotifyRequested`)と全く同じ
+                // `TabAlertNotifier`経路へ配線した(バックグラウンドシステム通知)——
+                // ただしこちらはRust側にフォアグラウンド/タブフォーカス抑制が無いため、
+                // 該当タブを表示中でも通知が出うる(既知の差異、`TabAlertNotifier`の
+                // クラスdocコメント参照)。「状態ドット」・通知タップでのタブジャンプは
+                // tmux系kindも含めまだ未実装。
                 onNotify = { kind, title, body ->
                     RemoteLogger.i("IsekaiTerminalNotify", "[$kind] $title: $body")
+                    TabAlertNotifier.notify(
+                        context = app,
+                        tabId = profile.id.toString(),
+                        profileLabel = profile.label,
+                        kind = kind,
+                        enabled = profile.enableTabNotifications,
+                        message = title to body,
+                    )
                 },
                 // タスク#57: tmux hook発火(kindが`Bell`/`Activity`/`Silence`/`JobDone`)。
                 // 「見せるべきか」の判断はRust側で済んでおり、ここでは(a) このプロファイルの
@@ -321,7 +331,6 @@ class TerminalTabsViewModel(
         internal var upstreamFailoverEnabledForCurrentSession: Boolean
             get() = primaryPane.upstreamFailoverEnabledForCurrentSession
             set(value) { primaryPane.upstreamFailoverEnabledForCurrentSession = value }
-        internal val rebindInFlight get() = primaryPane.rebindInFlight
 
         /** UI が購読する合成済み状態(主ペインのもの)。 */
         val uiState: Flow<TerminalUiState> get() = primaryPane.uiState
@@ -665,8 +674,10 @@ class TerminalTabsViewModel(
 
     /**
      * ペイン固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
-     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)・
-     * upstream フェイルオーバーの `NoViablePath` 検知。非アクティブでも動き続ける。
+     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)。
+     * 非アクティブでも動き続ける。upstream フェイルオーバーの `NoViablePath` 検知は
+     * `RebindManager`(Rust側)が既に同じイベントで反応するため、Kotlin側で
+     * 二重に監視しない(`observeFailover`は撤去済み、`rust-ssot.md`参照)。
      * [watchJobs] は paneId(タブをまたいで一意)をキーにする — 分割ペインを付け替えても
      * ジョブの追跡が壊れないようにするため。
      */
@@ -674,7 +685,6 @@ class TerminalTabsViewModel(
         watchJobs[pane.paneId] = viewModelScope.launch {
             launch { observeSummary(pane) }
             launch { observeDownloads(pane) }
-            launch { observeFailover(pane) }
             launch { observeConnectionTransitions(tab, pane) }
         }
     }
@@ -688,12 +698,6 @@ class TerminalTabsViewModel(
             pending ?: return@collect
             executor.saveDownloadFile(pending.first, pending.second)
             pane.session.consumeDownloadFile()
-        }
-    }
-
-    private suspend fun observeFailover(pane: PaneState) {
-        pane.session.noViablePathEvent.collect {
-            if (pane.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(pane)
         }
     }
 
@@ -746,27 +750,21 @@ class TerminalTabsViewModel(
     // ── upstream フェイルオーバー ────────────────────────────────────
 
     /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」を検知した際の処理。
-     * セルラーへの bindSocket 済み fd を取得できたら `rebindToFd` でendpointの
-     * ソケットを丸ごと差し替える。取得できなければ何もしない（日和見的ポリシー）。
-     * [PaneState.rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
+     * `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失、Rust側のQUICパスヘルスとは無関係な独自シグナル)が「WiFiは繋がっている
+     * がupstreamが死んでいる」を検知した際に呼ばれる。判断・実際のrebind実行は
+     * 一切せず、生イベントを`RebindManager`(Rust側)へそのまま転送するだけ
+     * (`rust-ssot.md`準拠)。以前はここでKotlin側が独自にセルラーfdを取得して
+     * `rebindToFd`を直接呼んでいたが、これは`RebindManager`が同じ`NoViablePath`
+     * (Rust側のQUICパスヘルス検知経由)で既に行っている`PerformRebindToCellular`と
+     * 完全に重複しており、同じセッションに対して独立に2本のセルラーfdを取得し
+     * `rebind_abstract`を2回叩く二重rebindになっていた(実害あり、opusレビューで
+     * 発見)。`notifyUpstreamHealthDegraded`はマルチパス以外のtransportや
+     * `enableUpstreamFailover`が無効な場合はRust側で何もしない(`rust-ssot.md`の
+     * 「判断ロジックを一箇所に集約」原則通り、Kotlin側では分岐しない)。
      */
     private fun onWifiUpstreamBroken(pane: PaneState) {
-        if (!pane.rebindInFlight.compareAndSet(false, true)) return
-        viewModelScope.launch(ioDispatcher) {
-            try {
-                val cellular = pane.rebindFdSource.acquireCellularFd()
-                if (cellular == null) {
-                    RemoteLogger.w("IsekaiTerminalSSH", "upstream failover: cellular fd not available, staying on current path")
-                    return@launch
-                }
-                val (fd, localIp) = cellular
-                RemoteLogger.i("IsekaiTerminalSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
-                pane.session.rebindToFd(fd, localIp)
-            } finally {
-                pane.rebindInFlight.set(false)
-            }
-        }
+        pane.session.notifyUpstreamHealthDegraded()
     }
 
     // ── 接続 ─────────────────────────────────────────────────────────

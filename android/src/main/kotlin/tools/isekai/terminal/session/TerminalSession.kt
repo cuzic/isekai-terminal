@@ -489,6 +489,13 @@ class TerminalSession(
      *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
     fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
 
+    /** `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`喪失、
+     *  Rust側のQUICパスヘルスとは無関係な独自シグナル)が検知した「WiFiは繋がっている
+     *  がupstreamが死んでいる」を、判断・rebind実行を一切せずRust側`RebindManager`へ
+     *  そのまま転送するだけ(`rust-ssot.md`準拠)。マルチパス以外のtransportや
+     *  `enableUpstreamFailover`が無効な場合はRust側で無視される。 */
+    fun notifyUpstreamHealthDegraded() = orchestrator.notifyUpstreamHealthDegraded()
+
     /** #11: 「今すぐWiFiに戻す」。疎通確認だけは省略されないが、静けさ待ち・セルラー
      *  最小滞在はバイパスされる(`RebindManager::handle_manual_force_return`参照)。
      *  マルチパス以外のtransportや未接続時はRust側で無視される。 */

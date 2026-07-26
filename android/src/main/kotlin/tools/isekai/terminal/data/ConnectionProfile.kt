@@ -412,4 +412,5 @@ fun ConnectionProfile.toMultipathIsekaiPipeQuicConfig(
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
         bindPort = helperBindPort?.toUShort(),
+        enableUpstreamFailover = enableUpstreamFailover,
     )
