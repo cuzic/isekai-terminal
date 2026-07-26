@@ -123,11 +123,6 @@ class TerminalSession(
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
 
-    // 「WiFiはあるがupstreamが死んでいる」等、マルチパスtransportがQUIC自身の視点で
-    // 「応答が一切返ってこない」ことを検知した際に発火する（Rust側`PathBroker`起点）。
-    private val _noViablePathEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val noViablePathEvent: SharedFlow<Unit> = _noViablePathEvent.asSharedFlow()
-
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
 
@@ -260,9 +255,12 @@ class TerminalSession(
             _pendingDownloadFile.value = Pair(fileName ?: "download", data)
         }
 
+        // 診断ログのみ。以前はここでKotlin側にもFlowを流し独自にセルラーへ
+        // rebindしていたが、RebindManager(Rust側FSM)が同じイベントで既に
+        // PerformRebindToCellularを行うため撤去した(rust-ssot.md準拠、二重
+        // rebindになっていたバグの修正)。
         override fun onNoViablePath() {
             RemoteLogger.w("IsekaiTerminalSSH", "no viable path (QUIC sees no response on any path)")
-            _noViablePathEvent.tryEmit(Unit)
         }
 
         override fun onForwardStateChanged(id: String, state: ForwardState) {
@@ -484,10 +482,6 @@ class TerminalSession(
      *  （`SessionOrchestrator::notify_network_path_changed`）が行う。
      *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
     fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
-
-    /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
-     *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
-    fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
 
     /** `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`喪失、
      *  Rust側のQUICパスヘルスとは無関係な独自シグナル)が検知した「WiFiは繋がっている
