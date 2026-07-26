@@ -69,22 +69,15 @@ impl ActiveSession {
     fn disconnect(&self) {
         dispatch_all!(self, disconnect)
     }
-    /// マルチパス以外のセッションでは意味を持たないため何もしない
-    /// （呼び出し側は「そのとき使っているtransportがマルチパスかどうか」を
-    /// 意識せず日和見的に呼べばよい）。
-    fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        if let Self::MultipathIsekaiPipeQuic(s) = self {
-            s.rebind_to_fd(fd, local_ip);
-        }
-    }
-    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のtransportでは
-    /// 何もしない(rebind_to_fdと同じ理由)。
+    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のセッションでは
+    /// 意味を持たないため何もしない（呼び出し側は「そのとき使っているtransportが
+    /// マルチパスかどうか」を意識せず日和見的に呼べばよい）。
     fn force_return_to_wifi(&self) {
         if let Self::MultipathIsekaiPipeQuic(s) = self {
             s.force_return_to_wifi();
         }
     }
-    /// `UpstreamHealthMonitor`(Android ConnectivityManager由来、rebind_to_fdと
+    /// `UpstreamHealthMonitor`(Android ConnectivityManager由来、force_return_to_wifiと
     /// 同じくマルチパス以外のtransportでは何もしない)からの生イベントを
     /// `RebindManager`へ転送する。
     fn notify_upstream_health_degraded(&self) {
@@ -94,7 +87,7 @@ impl ActiveSession {
     }
     /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
     /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
-    /// `rebind_to_fd`と同じくno-op委譲。
+    /// `force_return_to_wifi`と同じくno-op委譲。
     fn set_interactive_busy(&self, busy: bool) {
         if let Self::MultipathIsekaiPipeQuic(s) = self {
             s.set_interactive_busy(busy);
@@ -1320,15 +1313,6 @@ impl SessionOrchestrator {
                     issue_hint: None,
                 }
             );
-        }
-    }
-
-    /// 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-    /// `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-    /// （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-    pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.rebind_to_fd(fd, local_ip);
         }
     }
 

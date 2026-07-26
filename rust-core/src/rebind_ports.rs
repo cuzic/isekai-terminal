@@ -57,7 +57,7 @@ pub(crate) trait WifiProbeExecutor: Send + Sync {
 }
 
 /// 与えられたfdで実際に`Endpoint::rebind_abstract()`
-/// (既存の`MultipathIsekaiPipeQuicSession::rebind_to_fd`と同じ経路)を呼ぶ。
+/// (`multipath_transport.rs`の`spawn_rebind_listener`と同じ経路)を呼ぶ。
 pub(crate) trait RebindExecutor: Send + Sync {
     fn rebind(&self, fd: BoundFd);
 }
