@@ -394,6 +394,21 @@ class TerminalTabsViewModel(
     private val _tabs = MutableStateFlow<List<TabState>>(emptyList())
     val tabs: StateFlow<List<TabState>> = _tabs.asStateFlow()
 
+    /**
+     * [maybeEnsureTmuxTabWindow]の「同一プロファイルへの二重tmux連携」防止用。
+     * `_tabs.value`を見た`tmuxWindowLabel != null`チェック(TOCTOU: 非同期RPCが
+     * 完了して`tmuxWindowLabel`が書かれるまでの間は他のタブから見えない)だけでは
+     * 同一プロファイルの2タブがほぼ同時に`connected`へ遷移した場合に両方すり抜け、
+     * 互いに異なる`SessionOrchestrator`(=異なる`AppPaneId`)から同時に
+     * `ensureTmuxTabWindow`を呼んでしまう(実機検証、2026-07-27。tmuxウィンドウの
+     * 奪い合い自体に加え、`isekai-pipe ctl notify`が書き込むctl-socketパスの
+     * 登録先app_pane_idと実際に接続しているapp_pane_idが食い違い、
+     * `@isekai_ctl_sock`が永久に正しいウィンドウへ届かなくなる二次被害があった)。
+     * `putIfAbsent`でコルーチン起動前に同期的に「予約」し、RPCが失敗した場合のみ
+     * 解放して別タブに再挑戦の機会を残す。
+     */
+    private val tmuxClaimedProfileIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     private val _activeTabId = MutableStateFlow<String?>(null)
     val activeTabId: StateFlow<String?> = _activeTabId.asStateFlow()
 
@@ -549,6 +564,13 @@ class TerminalTabsViewModel(
         val tab = _tabs.value.find { it.tabId == tabId } ?: return
         RemoteLogger.i("IsekaiTerminalTabsVM", "closeTab id=$tabId")
         tab.panes.forEach { pane -> closePaneSession(pane) }
+        // このタブがtmux連携を保有していた場合は解放する。他タブが同じプロファイルを
+        // 参照し続けている場合に誤って解放してしまわないよう、profile自体が閉じられて
+        // いる(このタブが最後の1枚だった)場合のみ解放する。
+        tab.profile?.let { profile ->
+            val remainingForProfile = _tabs.value.any { it.tabId != tabId && it.profile?.id == profile.id }
+            if (!remainingForProfile) tmuxClaimedProfileIds.remove(profile.id)
+        }
 
         _tabs.update { list -> list.filterNot { it.tabId == tabId } }
         if (_activeTabId.value == tabId) {
@@ -898,6 +920,11 @@ class TerminalTabsViewModel(
      * tmux連携済み(`tmuxWindowLabel`が非null)なら、このタブはtmux連携自体を
      * スキップする(通常のシェルタブとして使い続けられる、上のopportunistic方針
      * と同じ扱い)。
+     *
+     * この判定だけではTOCTOUレースが残る(`tmuxWindowLabel`は非同期RPCが完了する
+     * まで書かれないため、同一プロファイルの2タブがほぼ同時に`connected`へ遷移
+     * すると両方この判定をすり抜ける、実機検証2026-07-27)。[tmuxClaimedProfileIds]
+     * への同期的な`add`(コルーチン起動前)で実際に排他する。
      */
     private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
         val profile = tab.profile ?: return
@@ -906,6 +933,13 @@ class TerminalTabsViewModel(
             RemoteLogger.i(
                 "IsekaiTerminalTmux",
                 "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already owns tmux window for profile ${profile.id}",
+            )
+            return
+        }
+        if (!tmuxClaimedProfileIds.add(profile.id)) {
+            RemoteLogger.i(
+                "IsekaiTerminalTmux",
+                "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already claimed profile ${profile.id}",
             )
             return
         }
@@ -923,6 +957,7 @@ class TerminalTabsViewModel(
                         "window=${info.windowIndex} tag=${info.tag} isNew=${info.isNewWindow}",
                 )
             } catch (e: Exception) {
+                tmuxClaimedProfileIds.remove(profile.id)
                 RemoteLogger.w("IsekaiTerminalTmux", "ensureTmuxTabWindow failed (non-fatal): ${e.message}")
             }
         }
