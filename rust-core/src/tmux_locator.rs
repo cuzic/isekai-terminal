@@ -941,6 +941,54 @@ mod tests {
         }
     }
 
+    /// 実機検証(2026-07-27)で判明した本番の実際の順序を再現する回帰テスト:
+    /// `push_ctl_socket_to_tmux`(ctl-socket forward確立直後にspawnされる)が、
+    /// ロケータがまだ登録される前に完走してしまう("push_ctl_socket_to_tmux_is_a_noop_when_locator_unknown"
+    /// と同じ状況)。この時点でも`ctl_socket_path`自体は対応表に書き込まれている
+    /// ことを踏まえ、後から`register()`する側(`orchestrator.rs::ensure_tmux_tab_window`)
+    /// が`ctl_socket_path_for()`で拾って引き継ぎ、ロケータが分かった今すぐ
+    /// 改めて`push_ctl_socket_to_tmux`し直せば、実際にtmuxへ書き込まれることを確認する。
+    /// この「引き継いで再試行」をしなければ(=`register()`に単純に`None`を渡せば)、
+    /// 既に分かっていた`ctl_socket_path`が永久に失われ、`@isekai_ctl_sock`が
+    /// 一度も書き込まれないまま(実機で確認したのと同じ壊れ方)になる。
+    #[tokio::test]
+    async fn ctl_socket_path_known_before_locator_is_recovered_once_locator_registers() {
+        let registry = parking_lot::Mutex::new(TmuxLocatorRegistry::new());
+        let app_pane = pane("tab-1", "pane-primary");
+        let loc = locator("my-tag");
+
+        // ── ctl-socket forward確立直後、ロケータはまだ未登録 ──
+        let early_calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let early_runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", early_calls.clone());
+        push_ctl_socket_to_tmux(&registry, &app_pane, "/tmp/isekai-pipe-ctl-a.sock", early_runner)
+            .await
+            .unwrap();
+        assert!(
+            early_calls.lock().unwrap().is_empty(),
+            "ロケータ未登録の間はtmuxへ何も書き込まれない"
+        );
+
+        // ── orchestrator.rs::ensure_tmux_tab_window相当: 既知のctl_socket_pathを
+        //    引き継いでregister()する ──
+        let pending = registry.lock().ctl_socket_path_for(&app_pane).map(str::to_string);
+        assert_eq!(pending.as_deref(), Some("/tmp/isekai-pipe-ctl-a.sock"));
+        registry.lock().register(app_pane.clone(), loc.clone(), pending.clone());
+
+        // ── ロケータが分かった今すぐ改めて書き込み直す ──
+        let retry_calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let retry_runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", retry_calls.clone());
+        push_ctl_socket_to_tmux(&registry, &app_pane, pending.as_deref().unwrap(), retry_runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retry_calls.lock().unwrap().last().unwrap(),
+            "tmux set-option -w -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-a.sock'"
+        );
+        assert_eq!(registry.lock().ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-a.sock"));
+        assert_eq!(registry.lock().locator_for(&app_pane), Some(&loc));
+    }
+
     // ── TmuxLocatorRegistry (マッピングテーブル) ─────────
 
     fn pane(tab: &str, pane: &str) -> AppPaneId {

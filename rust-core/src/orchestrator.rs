@@ -1777,7 +1777,25 @@ impl SessionOrchestrator {
         // ここを配線し忘れると両者は「ロケータ未登録」として黙ってno-opになり
         // (ssh_handler.rsのコメント参照)、tmux統合機能が本番で一切発火しない。
         let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
-        registry.lock().register(self.shared.app_pane_id.clone(), outcome.locator.clone(), None);
+        // 実機検証(2026-07-27)で判明: `push_ctl_socket_to_tmux`はctl-socket forward
+        // 確立直後にspawnされ(`ssh_handler.rs`)、この`ensure_tmux_tab_window`
+        // (Kotlin側の接続確認コールバック→UniFFI経由のこの呼び出し、というひと往復
+        // 分だけ遅れる)より先に完走するのが実際にはほぼ常であることを確認した
+        // (「稀にロケータ未登録のことがあるopportunistic機能」という従来の想定より
+        // 厳しい状況で、`isekai-pipe ctl notify`/`isekai-pipe ctl tab-color`が
+        // 実機では常に一切届いていなかった)。そのため`push_ctl_socket_to_tmux`は
+        // ロケータが無いまま`ctl_socket_path`だけを対応表(まず登録、後から値を
+        // 確定という構成の逆)に書き込んで抜ける。ここで`register()`が単純に
+        // `ctl_socket_path=None`で上書きすると、その既に分かっているパスを
+        // 永久に握りつぶしてしまっていた。既知のパスがあれば引き継いで登録し、
+        // ロケータが分かった今すぐ改めてtmuxへ書き込み直す。
+        let pending_ctl_socket_path =
+            registry.lock().ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string);
+        registry.lock().register(
+            self.shared.app_pane_id.clone(),
+            outcome.locator.clone(),
+            pending_ctl_socket_path.clone(),
+        );
         registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         // タスク#58: `spawn_tmux_scrollback_backfill`が読む`tmux_backfill_locator`
         // (`OrchestratorShared`フィールドのdoc参照)も同じタイミングで配線する。
@@ -1785,6 +1803,29 @@ impl SessionOrchestrator {
         // フル再接続後のscrollback backfillがfail-openで常にスキップされ続ける
         // (上のTMUX_LOCATOR_REGISTRY登録漏れと同種の、配線し忘れによる無効化)。
         self.set_tmux_backfill_locator(Some(outcome.locator.clone()));
+        // 上と同じ理由で、tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
+        // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
+        // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが
+        // 分かった今すぐ改めて試す(有効化されていなければ内部で無害にno-opする)。
+        if let Some(ctl_socket_path) = pending_ctl_socket_path {
+            let push_runner = OrchestratorTmuxRunner { orchestrator: self };
+            if let Err(e) = crate::tmux_locator::push_ctl_socket_to_tmux(
+                registry,
+                &self.shared.app_pane_id,
+                &ctl_socket_path,
+                push_runner,
+            )
+            .await
+            {
+                log::debug!("tmux-ctl-sock: retroactive push after registration failed (best-effort): {e}");
+            }
+        }
+        let notify_hooks_runner = OrchestratorTmuxRunner { orchestrator: self };
+        if let Err(e) =
+            crate::tmux_notify::install_notify_hooks(registry, &self.shared.app_pane_id, notify_hooks_runner).await
+        {
+            log::debug!("tmux-notify-hooks: retroactive install after registration failed (best-effort): {e}");
+        }
         Ok(crate::TmuxTabWindowInfo {
             tag: outcome.locator.tag.0,
             window_index: outcome.coords.window_index,
