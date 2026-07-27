@@ -18,7 +18,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 // detectTransformGestures は awaitEachGesture ベースの手動実装に置き換えたため未使用
@@ -36,14 +35,20 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.util.fastFirstOrNull
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
@@ -160,6 +165,44 @@ internal fun searchHighlightMatch(
     showingScrollback: Boolean,
 ): ScrollbackSearchMatch? =
     match?.takeIf { scrollOffset == it.row.toInt() && (it.row != 0u || showingScrollback) }
+
+/**
+ * `androidx.compose.foundation.gestures.awaitLongPressOrCancellation`の代わりに使う。
+ *
+ * 標準の`awaitLongPressOrCancellation`は追跡中の指の「移動量」そのものでは打ち切られず、
+ * 他のジェスチャーハンドラが位置変化をconsumeしない限り、指が動いていても既定の長押し
+ * タイムアウト(~500ms)まで律儀に待ち続けてから非nullを返す。そのため単一指のドラッグは
+ * 「タイムアウト前に指を離せばTAP」「タイムアウトまで押し続ければ(その間動いていても)
+ * SELECTION」のどちらかにしかならず、`classifyNormalGesture`のPINCH_PAN分岐
+ * (「長押し失敗 かつ 指がまだ押されている」)へ単一指では実質的に到達できないバグを
+ * 実機で確認した(2026-07-27、ドラッグでヘッダー[ログ/ファイル/切断/戻る]を表示する
+ * 機能が単一指では一切機能しなかった)。
+ *
+ * タッチスロップ超えを自前で監視し、超えた時点でタイムアウトを待たずに「長押し失敗、
+ * ただし指はまだ押されている」として打ち切ることで、単一指ドラッグでも正しく
+ * PINCH_PAN(ひいてはヘッダー表示のトリガーである`onUserActivity()`)へ到達できるようにする。
+ */
+private suspend fun AwaitPointerEventScope.awaitLongPressOrDragCancellation(
+    pointerId: PointerId,
+    initialPosition: Offset,
+): PointerInputChange? {
+    val slop = viewConfiguration.touchSlop
+    return try {
+        withTimeout(viewConfiguration.longPressTimeoutMillis) {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Main)
+                val change = event.changes.fastFirstOrNull { it.id == pointerId } ?: return@withTimeout
+                if (!change.pressed) return@withTimeout
+                if ((change.position - initialPosition).getDistance() > slop) return@withTimeout
+            }
+            @Suppress("UNREACHABLE_CODE") Unit
+        }
+        null
+    } catch (e: TimeoutCancellationException) {
+        // タイムアウトまでスロップ内で押され続けた = 本物の長押し(位置は動いていない)。
+        currentEvent.changes.fastFirstOrNull { it.id == pointerId }
+    }
+}
 
 /**
  * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen`、および画面分割(split pane)時の
@@ -799,9 +842,8 @@ fun TerminalScreenBody(
                                         }
                                         return@awaitEachGesture
                                     }
-                                    val longPress = awaitLongPressOrCancellation(down.id)
-                                    // awaitLongPressOrCancellation は「指定した1本の指」の移動/リリースしか
-                                    // 見ておらず、2本指が同時に押され続けている(=ピンチ操作中)場合でも
+                                    val longPress = awaitLongPressOrDragCancellation(down.id, down.position)
+                                    // 2本指が同時に押され続けている(=ピンチ操作中)場合でも
                                     // 長押しタイムアウト(既定 ~400ms)で非nullを返してしまう(実機ログで確認
                                     // 済み: 自然なピンチはほぼ確実にこの時間を超える)。そのため、ここで
                                     // 実際に押されている指の本数を見て、2本以上ならピンチ/パン優先で扱う
