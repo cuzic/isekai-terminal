@@ -1783,18 +1783,29 @@ impl SessionOrchestrator {
         // 分だけ遅れる)より先に完走するのが実際にはほぼ常であることを確認した
         // (「稀にロケータ未登録のことがあるopportunistic機能」という従来の想定より
         // 厳しい状況で、`isekai-pipe ctl notify`/`isekai-pipe ctl tab-color`が
-        // 実機では常に一切届いていなかった)。そのため`push_ctl_socket_to_tmux`は
-        // ロケータが無いまま`ctl_socket_path`だけを対応表(まず登録、後から値を
-        // 確定という構成の逆)に書き込んで抜ける。ここで`register()`が単純に
-        // `ctl_socket_path=None`で上書きすると、その既に分かっているパスを
-        // 永久に握りつぶしてしまっていた。既知のパスがあれば引き継いで登録し、
-        // ロケータが分かった今すぐ改めてtmuxへ書き込み直す。
-        let pending_ctl_socket_path =
-            registry.lock().ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string);
+        // 実機では常に一切届いていなかった)。
+        //
+        // 既知のctl_socket_pathには2つの由来がありうる:
+        // (a) このapp_paneが真に初めての接続で、まだ一度も`register()`されて
+        //     いない間に届いた分(`TmuxLocatorRegistry::pending_ctl_socket_paths`
+        //     に退避されている、`take_pending_ctl_socket_path`で取り出すと消える)。
+        // (b) 同じタブでの再接続で、既存エントリ(前回の`register()`が作った
+        //     ロケータ)がまだ生きているために`push_ctl_socket_to_tmux`が直接
+        //     書き込み済みの分(`ctl_socket_path_for`で読める、消費しない)。
+        // どちらの場合も、ここで`register()`が単純に`ctl_socket_path=None`で
+        // 上書きすると既に分かっている値を握りつぶしてしまう。両方を確認し、
+        // 引き継いで登録した上で、ロケータが分かった今すぐ改めてtmuxへ
+        // 書き込み直す(bの場合は直接pushで既に成功済みのはずだが、再送は
+        // 無害なのでどちらの由来でも同じ経路で扱う)。
+        let recovered_ctl_socket_path = {
+            let mut reg = registry.lock();
+            reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
+                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string))
+        };
         registry.lock().register(
             self.shared.app_pane_id.clone(),
             outcome.locator.clone(),
-            pending_ctl_socket_path.clone(),
+            recovered_ctl_socket_path.clone(),
         );
         registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         // タスク#58: `spawn_tmux_scrollback_backfill`が読む`tmux_backfill_locator`
@@ -1807,7 +1818,7 @@ impl SessionOrchestrator {
         // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
         // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが
         // 分かった今すぐ改めて試す(有効化されていなければ内部で無害にno-opする)。
-        if let Some(ctl_socket_path) = pending_ctl_socket_path {
+        if let Some(ctl_socket_path) = recovered_ctl_socket_path {
             let push_runner = OrchestratorTmuxRunner { orchestrator: self };
             if let Err(e) = crate::tmux_locator::push_ctl_socket_to_tmux(
                 registry,

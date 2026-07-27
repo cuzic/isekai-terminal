@@ -453,6 +453,17 @@ pub(crate) struct TmuxLocatorRegistry {
     /// 逆引き用の索引。`register`/`unregister`が`by_app_pane`と同時に
     /// 整合を保つ(下記参照)。
     by_locator: HashMap<TmuxLocator, AppPaneId>,
+    /// タスク#59実機検証(2026-07-27)で判明: `push_ctl_socket_to_tmux`は
+    /// ctl-socket forward確立直後にspawnされ、`register()`(`ensure_tmux_tab_window`、
+    /// Kotlin側の接続確認コールバックを経由するため1往復分遅れる)より先に
+    /// ほぼ常に完走する。このタブの`by_app_pane`エントリが1度も`register()`
+    /// されていない(=真に初めての接続の)間は`set_ctl_socket_path`が「未登録なら
+    /// 何もしない」仕様上のno-opになり、`TmuxTabEntry.locator`が必須フィールド
+    /// である以上ロケータ抜きのエントリを作ることもできないため、既知になった
+    /// パスを置いておく場所がどこにも無く永久に失われていた。この一時退避場所を
+    /// 追加し、`register()`が最初に呼ばれた時点で拾って正式なエントリへ引き継ぐ
+    /// (`note_pending_ctl_socket_path`/`take_pending_ctl_socket_path`参照)。
+    pending_ctl_socket_paths: HashMap<AppPaneId, String>,
 }
 
 impl TmuxLocatorRegistry {
@@ -537,8 +548,32 @@ impl TmuxLocatorRegistry {
         }
     }
 
+    /// `app_pane`がまだ`register()`されていない(=真に初めての接続でロケータが
+    /// 未解決の)間に届いたctl-socketパスを一時退避する(`push_ctl_socket_to_tmux`の
+    /// ロケータ未登録分岐から呼ぶ)。`set_ctl_socket_path`と違い、こちらは
+    /// エントリの有無を問わず必ず記録できる(`TmuxTabEntry.locator`が必須
+    /// フィールドである以上、ロケータ無しのエントリ自体を作れないため)。
+    /// 同じ`app_pane`について複数回呼ばれた場合は最新のパスで上書きする
+    /// (Epic Mは再接続のたびに新しいパスを発行するため、退避場所も常に
+    /// 最新であるべき)。
+    pub(crate) fn note_pending_ctl_socket_path(&mut self, app_pane: AppPaneId, ctl_socket_path: String) {
+        self.pending_ctl_socket_paths.insert(app_pane, ctl_socket_path);
+    }
+
+    /// `note_pending_ctl_socket_path`で退避されたパスを取り出す(取り出すと
+    /// 退避場所からは消える——`register()`が引き継いだ後は正式なエントリの
+    /// `ctl_socket_path`が唯一の情報源になるべきで、古い退避値が残り続けると
+    /// 混乱の元になる)。`ensure_tmux_tab_window`が`register()`の直前に呼ぶ想定。
+    pub(crate) fn take_pending_ctl_socket_path(&mut self, app_pane: &AppPaneId) -> Option<String> {
+        self.pending_ctl_socket_paths.remove(app_pane)
+    }
+
     /// `app_pane`のエントリを対応表から取り除く(タブが閉じられた際など)。
     pub(crate) fn unregister(&mut self, app_pane: &AppPaneId) -> Option<TmuxTabEntry> {
+        // `register()`が一度も呼ばれないままタブが閉じられた場合(接続直後に
+        // すぐ閉じる等)、`pending_ctl_socket_paths`にエントリが残ったままに
+        // なりうるので、`by_app_pane`の有無によらず必ず掃除する。
+        self.pending_ctl_socket_paths.remove(app_pane);
         let entry = self.by_app_pane.remove(app_pane)?;
         self.by_locator.remove(&entry.locator);
         Some(entry)
@@ -591,15 +626,25 @@ pub(crate) async fn push_ctl_socket_to_tmux<R: RemoteTmuxCommandRunner>(
     runner: R,
 ) -> Result<(), TmuxLocatorError> {
     let locator = registry.lock().locator_for(app_pane_id).cloned();
-    let result = match &locator {
+    match &locator {
         Some(locator) => {
             let resolver = TmuxLocatorResolver::new(runner);
-            resolver.push_ctl_socket_path(locator, ctl_socket_path).await
+            let result = resolver.push_ctl_socket_path(locator, ctl_socket_path).await;
+            registry.lock().set_ctl_socket_path(app_pane_id, Some(ctl_socket_path.to_string()));
+            result
         }
-        None => Ok(()),
-    };
-    registry.lock().set_ctl_socket_path(app_pane_id, Some(ctl_socket_path.to_string()));
-    result
+        None => {
+            // ロケータがまだ無い(=このapp_paneはまだ一度も`register()`されて
+            // いない、真に初めての接続)。対応表にエントリ自体が無く
+            // `set_ctl_socket_path`はno-opになるため(`TmuxTabEntry.locator`が
+            // 必須フィールドである以上ロケータ無しのエントリを作れない)、
+            // `register()`が最初に呼ばれた時点で拾えるよう一時退避しておく
+            // (実機検証、2026-07-27。これを怠ると分かっていたパスが永久に
+            // 失われ、`isekai-pipe ctl notify`が一度も届かなくなる)。
+            registry.lock().note_pending_ctl_socket_path(app_pane_id.clone(), ctl_socket_path.to_string());
+            Ok(())
+        }
+    }
 }
 
 // ── テスト ────────────────────────────────────────────────
@@ -944,13 +989,16 @@ mod tests {
     /// 実機検証(2026-07-27)で判明した本番の実際の順序を再現する回帰テスト:
     /// `push_ctl_socket_to_tmux`(ctl-socket forward確立直後にspawnされる)が、
     /// ロケータがまだ登録される前に完走してしまう("push_ctl_socket_to_tmux_is_a_noop_when_locator_unknown"
-    /// と同じ状況)。この時点でも`ctl_socket_path`自体は対応表に書き込まれている
-    /// ことを踏まえ、後から`register()`する側(`orchestrator.rs::ensure_tmux_tab_window`)
-    /// が`ctl_socket_path_for()`で拾って引き継ぎ、ロケータが分かった今すぐ
-    /// 改めて`push_ctl_socket_to_tmux`し直せば、実際にtmuxへ書き込まれることを確認する。
-    /// この「引き継いで再試行」をしなければ(=`register()`に単純に`None`を渡せば)、
-    /// 既に分かっていた`ctl_socket_path`が永久に失われ、`@isekai_ctl_sock`が
-    /// 一度も書き込まれないまま(実機で確認したのと同じ壊れ方)になる。
+    /// と同じ状況)。この時点では`by_app_pane`にエントリ自体が存在しない
+    /// (`TmuxTabEntry.locator`が必須フィールドのためプレースホルダーエントリを
+    /// 作れない)ので、`ctl_socket_path`は`pending_ctl_socket_paths`という別の
+    /// side-tableに退避される。後から`register()`する側
+    /// (`orchestrator.rs::ensure_tmux_tab_window`)が`take_pending_ctl_socket_path()`
+    /// で取り出して引き継ぎ、ロケータが分かった今すぐ改めて`push_ctl_socket_to_tmux`
+    /// し直せば、実際にtmuxへ書き込まれることを確認する。この「引き継いで再試行」を
+    /// しなければ(=`register()`に単純に`None`を渡せば)、既に分かっていた
+    /// `ctl_socket_path`が永久に失われ、`@isekai_ctl_sock`が一度も書き込まれない
+    /// まま(実機で確認したのと同じ壊れ方)になる。
     #[tokio::test]
     async fn ctl_socket_path_known_before_locator_is_recovered_once_locator_registers() {
         let registry = parking_lot::Mutex::new(TmuxLocatorRegistry::new());
@@ -968,9 +1016,9 @@ mod tests {
             "ロケータ未登録の間はtmuxへ何も書き込まれない"
         );
 
-        // ── orchestrator.rs::ensure_tmux_tab_window相当: 既知のctl_socket_pathを
-        //    引き継いでregister()する ──
-        let pending = registry.lock().ctl_socket_path_for(&app_pane).map(str::to_string);
+        // ── orchestrator.rs::ensure_tmux_tab_window相当: pending側テーブルから
+        //    既知のctl_socket_pathを取り出してregister()に引き継ぐ ──
+        let pending = registry.lock().take_pending_ctl_socket_path(&app_pane);
         assert_eq!(pending.as_deref(), Some("/tmp/isekai-pipe-ctl-a.sock"));
         registry.lock().register(app_pane.clone(), loc.clone(), pending.clone());
 
