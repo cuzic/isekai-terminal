@@ -626,12 +626,10 @@ pub(crate) async fn push_ctl_socket_to_tmux<R: RemoteTmuxCommandRunner>(
     runner: R,
 ) -> Result<(), TmuxLocatorError> {
     let locator = registry.lock().locator_for(app_pane_id).cloned();
-    log::info!("push_ctl_socket_to_tmux: app_pane={app_pane_id:?} locator={locator:?} ctl_socket_path={ctl_socket_path}");
     match &locator {
         Some(locator) => {
             let resolver = TmuxLocatorResolver::new(runner);
             let result = resolver.push_ctl_socket_path(locator, ctl_socket_path).await;
-            log::info!("push_ctl_socket_to_tmux: push result={result:?}");
             registry.lock().set_ctl_socket_path(app_pane_id, Some(ctl_socket_path.to_string()));
             result
         }
