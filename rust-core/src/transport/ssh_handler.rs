@@ -740,8 +740,14 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
         let handle = self.handle.clone();
         let cmd = cmd.to_string();
         async move {
+            info!("tmux-runner: exec {cmd:?}");
             match run_exec_on_handle(&handle, &cmd).await {
                 Ok(ExecOutput { stdout, exit_status }) => {
+                    info!(
+                        "tmux-runner: exec {cmd:?} -> status={:?} stdout={:?}",
+                        exit_status,
+                        String::from_utf8_lossy(&stdout)
+                    );
                     if !crate::tmux_locator::tmux_exit_status_is_success(exit_status) {
                         return Err(crate::tmux_locator::TmuxRunError(format!(
                             "command {cmd:?} exited with status {:?}",
@@ -750,7 +756,10 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
                     }
                     Ok(String::from_utf8_lossy(&stdout).into_owned())
                 }
-                Err(e) => Err(crate::tmux_locator::TmuxRunError(e.to_string())),
+                Err(e) => {
+                    info!("tmux-runner: exec {cmd:?} -> transport error {e}");
+                    Err(crate::tmux_locator::TmuxRunError(e.to_string()))
+                }
             }
         }
     }
