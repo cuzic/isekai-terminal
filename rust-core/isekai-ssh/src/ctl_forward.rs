@@ -418,6 +418,11 @@ async fn send_build_finished(
 ///     escape sequence rather than inventing one" choice as `SetTitle`/OSC 0
 ///     and `ClipboardPush`/OSC 52). `title`/`body` are joined into OSC 9's
 ///     single message argument since it has no separate title/body fields.
+///     Both are passed through [`strip_ascii_control_chars`] first — the
+///     remote host only controls the text content (`AI_INTEGRATION_DESIGN.md`
+///     §6.1/§8's "no execution authority" boundary), so an ESC/BEL byte
+///     inside either field must not be able to inject an arbitrary escape
+///     sequence into this process's own stderr.
 ///   - tmux hook由来(`Bell`/`Activity`/`Silence`/`JobDone`、#57) → this CLI
 ///     wrapper has no notification surface of its own (that's the Android
 ///     app's job); ignored (`None`) rather than implemented, matching how
@@ -451,7 +456,9 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
         CtlMessage::Notify { kind, title, body, .. } => match kind {
             NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
-                let message = if body.is_empty() { title.clone() } else { format!("{title}: {body}") };
+                let title = strip_ascii_control_chars(title);
+                let body = strip_ascii_control_chars(body);
+                let message = if body.is_empty() { title } else { format!("{title}: {body}") };
                 Some(format!("\x1b]9;{message}\x07"))
             }
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => None,
@@ -467,6 +474,18 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
         | CtlMessage::BuildOutputChunk { .. }
         | CtlMessage::BuildFinished { .. } => None,
     }
+}
+
+/// Removes ASCII C0 control characters (`< 0x20`) and DEL (`0x7F`) from
+/// remote-controlled text before it is embedded in an OSC escape sequence
+/// written to this process's own stderr ([`emit_osc`]). Without this, a
+/// `Notify` title/body containing `ESC`/`BEL` (accidental — e.g. a hook that
+/// captured ANSI-colored output — or crafted) could terminate the intended
+/// `OSC 9 ... BEL` sequence early and inject an arbitrary escape sequence
+/// into the user's real terminal (`AI_INTEGRATION_DESIGN.md` §6.1's "no
+/// execution authority" boundary applies to more than just shell commands).
+fn strip_ascii_control_chars(text: &str) -> String {
+    text.chars().filter(|c| !c.is_ascii_control()).collect()
 }
 
 /// Writes an OSC escape sequence to this process's own stderr in a single
@@ -546,6 +565,63 @@ mod tests {
     fn osc_sequence_for_set_title_is_osc_0() {
         let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_notify_joins_title_and_body_with_osc_9() {
+        let seq = osc_sequence_for(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: "hi".to_string(),
+            body: "there".to_string(),
+        })
+        .unwrap();
+        assert_eq!(seq, "\x1b]9;hi: there\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_notify_omits_separator_when_body_is_empty() {
+        let seq = osc_sequence_for(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: "hi".to_string(),
+            body: String::new(),
+        })
+        .unwrap();
+        assert_eq!(seq, "\x1b]9;hi\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_notify_tmux_kinds_is_none() {
+        for kind in [NotifyKind::Bell, NotifyKind::Activity, NotifyKind::Silence, NotifyKind::JobDone] {
+            let seq = osc_sequence_for(&CtlMessage::Notify {
+                kind,
+                tmux_tag: "session:0".to_string(),
+                seq: 1,
+                title: String::new(),
+                body: String::new(),
+            });
+            assert!(seq.is_none(), "{kind:?} should not produce an OSC sequence");
+        }
+    }
+
+    /// Regression test for the OSC injection this sanitization closes: a
+    /// title/body containing `ESC`/`BEL` could otherwise terminate the
+    /// intended `OSC 9 ... BEL` sequence early and splice an attacker- or
+    /// hook-controlled escape sequence into the user's real terminal.
+    #[test]
+    fn osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body() {
+        let seq = osc_sequence_for(&CtlMessage::Notify {
+            kind: NotifyKind::Info,
+            tmux_tag: String::new(),
+            seq: 0,
+            title: "hi\x1b]0;pwned\x07".to_string(),
+            body: "bo\x07dy".to_string(),
+        })
+        .unwrap();
+        assert_eq!(seq, "\x1b]9;hi]0;pwned: body\x07");
     }
 
     #[test]
