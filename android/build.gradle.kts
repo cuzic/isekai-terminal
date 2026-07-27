@@ -26,6 +26,22 @@ android {
         buildConfigField("boolean", "ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH", "true")
     }
 
+    // リポジトリに固定debug keystoreをコミットし、ローカルビルド・CI(GitHub Actions)
+    // 間で常に同じ鍵で署名させる。AGPが既定で使う`~/.android/debug.keystore`は
+    // マシン/CI runnerごとに初回ビルド時に自動生成される別々の鍵であり、CIを回すたびに
+    // 毎回違う署名になって`adb install -r`が`INSTALL_FAILED_UPDATE_INCOMPATIBLE`で失敗し、
+    // 実機の既存インストール(保存済みプロファイル・鍵を含むアプリデータ)を毎回
+    // アンインストールする羽目になっていた(2026-07-27、実機検証で発覚)。debug専用の
+    // 使い捨て鍵なので秘匿する必要はない(Android公式サンプルと同じ運用方針)。
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("keystore/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
