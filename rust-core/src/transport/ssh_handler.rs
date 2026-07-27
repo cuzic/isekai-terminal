@@ -875,7 +875,6 @@ pub(crate) async fn run_ssh_channel_loop(
                 let app_pane_for_push = app_pane_id.clone();
                 let path_for_push = path.clone();
                 tokio::spawn(async move {
-                    log::error!("ISEKAI_DEBUG_MARKER: push_ctl spawn entered app_pane={app_pane_for_push:?}");
                     if let Err(e) = crate::tmux_locator::push_ctl_socket_to_tmux(
                         &crate::tmux_locator::TMUX_LOCATOR_REGISTRY,
                         &app_pane_for_push,
@@ -884,7 +883,6 @@ pub(crate) async fn run_ssh_channel_loop(
                     ).await {
                         debug!("tmux-ctl-sock: push for {:?} failed (best-effort): {}", app_pane_for_push, e);
                     }
-                    log::error!("ISEKAI_DEBUG_MARKER: push_ctl spawn finished app_pane={app_pane_for_push:?}");
                 });
                 // タスク#57: 同じタイミング(ctl-socket forward確立直後、接続確立時・
                 // 再接続時の両方)で、このタブのtmuxウィンドウ/ペインへ通知用hook
