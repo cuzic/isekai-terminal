@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -31,10 +31,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- dataSyncではなくremoteMessagingを使う: dataSync/mediaProcessing型は
+             Android 15+でバックグラウンド起動後の短時間強制終了・長時間セッションでの
+             累積6時間クォータの対象になり、SSHセッションのように「接続している間ずっと
+             生きているべき」用途に適さない(実機でクラッシュループを確認、2026-07-27、
+             TerminalSessionService.kt参照)。 -->
         <service
             android:name=".TerminalSessionService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="remoteMessaging" />
         <!-- クリップボード画像同期(`ISEKAI_PIPE_DESIGN.md` §8 Epic M follow-up)用。
              リモートから受け取ったPNGを一時ファイルとして書き出し、他アプリの
              ペースト操作から読める content:// URI を発行するためだけに使う。 -->
