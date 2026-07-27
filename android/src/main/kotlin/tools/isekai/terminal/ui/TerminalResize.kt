@@ -10,6 +10,12 @@ data class ResizeStabilityState(
     val hasObservedImeClosed: Boolean,
     /** resize要求(cols/rows算出)に使う、IME開閉の影響を打ち消した高さ(px)。 */
     val stableHeightPx: Float,
+    /**
+     * 直近に観測した幅(px)。幅はIMEの影響を受けないため、前回からの変化は回転・分割
+     * ペインのリサイズ等「本当のサイズ変化」の signal として使う([advanceResizeStability]
+     * のdoc参照)。
+     */
+    val lastWidthPx: Float,
 )
 
 /**
@@ -33,18 +39,33 @@ data class ResizeStabilityState(
  * IMEが既に表示中のケースへの対応)。
  *
  * 回転や実ウィンドウサイズ変化・ピンチズーム(cellW/cellHの変化)による本当の
- * サイズ変化は、IMEが非表示である限りそのまま`liveHeightPx`に反映されて追随する
- * (IME表示中に回転が起きた場合は、IMEが閉じるまで反映が遅れる既知のトレードオフ
- * ——回転そのものは表示ビューポートには即座に反映されるため実害は小さい)。
+ * サイズ変化は、IMEが非表示である限りそのまま`liveHeightPx`に反映されて追随する。
+ *
+ * IME表示中に本当のサイズ変化が起きた場合(回転・分割ペインのリサイズ・上部バーの
+ * 自動非表示など)は例外的に即座に反映する。判定は2通り: (1)[liveWidthPx](IMEの
+ * 影響を受けない値)が前回観測時から変化した、(2)`.imePadding()`は高さを縮める方向
+ * にしか働かないため、[liveHeightPx]が現在の凍結値[ResizeStabilityState.stableHeightPx]
+ * より大きい(IMEでは説明がつかない増加)。SshTerminalCanvas自体の描画高さもこの
+ * 安定値に固定している(タスク#19後追い修正)ため、これらを無視して古い高さのまま
+ * 凍結し続けると、新しい画面サイズと大きく食い違ったままクリップされてしまう。
+ *
+ * このとき単に`liveHeightPx`を採用するだけでなく[hasObservedImeClosed]も`false`へ
+ * 戻す——「まだ信頼できる凍結基準が無い」状態に戻すことで、次に本当にIMEが閉じて
+ * 新しい基準が確立するまでは素直に`liveHeightPx`を追随し続ける。戻さないと、この
+ * サイズ変化より前の(もう無効な)値へ次のIME開閉時に凍結してしまい、IMEを閉じた
+ * 瞬間に改めてptyへresizeが飛ぶ——タスク#19が抑止したかった「IME開閉のたびの
+ * 不要なresize」が、サイズ変化の直後だけ部分的に復活してしまう。
  */
 fun advanceResizeStability(
     previous: ResizeStabilityState,
     isImeVisible: Boolean,
     liveHeightPx: Float,
+    liveWidthPx: Float,
 ): ResizeStabilityState {
-    val hasObservedImeClosed = previous.hasObservedImeClosed || !isImeVisible
+    val realSizeChange = liveWidthPx != previous.lastWidthPx || liveHeightPx > previous.stableHeightPx
+    val hasObservedImeClosed = if (realSizeChange) !isImeVisible else (previous.hasObservedImeClosed || !isImeVisible)
     val stableHeightPx = if (!hasObservedImeClosed || !isImeVisible) liveHeightPx else previous.stableHeightPx
-    return ResizeStabilityState(hasObservedImeClosed, stableHeightPx)
+    return ResizeStabilityState(hasObservedImeClosed, stableHeightPx, liveWidthPx)
 }
 
 /**
