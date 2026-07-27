@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventTimeoutCancellationException
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -46,9 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.fastFirstOrNull
 import androidx.compose.ui.viewinterop.AndroidView
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
 import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
@@ -188,17 +187,25 @@ private suspend fun AwaitPointerEventScope.awaitLongPressOrDragCancellation(
 ): PointerInputChange? {
     val slop = viewConfiguration.touchSlop
     return try {
+        // ここでの`withTimeout`は(`kotlinx.coroutines.withTimeout`ではなく)
+        // `AwaitPointerEventScope`のメンバ版に解決される(暗黙レシーバのメンバは
+        // トップレベル関数よりKotlinの呼び出し解決で優先されるため)。タイムアウト時に
+        // 投げるのも`kotlinx.coroutines.TimeoutCancellationException`ではなく
+        // `androidx.compose.ui.input.pointer.PointerEventTimeoutCancellationException`
+        // (`CancellationException`の兄弟であり`TimeoutCancellationException`の
+        // サブクラスではない)——catch側の型を誤ると例外は`awaitEachGesture`まで
+        // 突き抜けてジェスチャー全体が握りつぶされ、長押し選択(SELECTION)が完全に
+        // 機能しなくなる(Opusレビューでバイトコードレベルで確認、2026-07-27)。
         withTimeout(viewConfiguration.longPressTimeoutMillis) {
             while (true) {
                 val event = awaitPointerEvent(PointerEventPass.Main)
-                val change = event.changes.fastFirstOrNull { it.id == pointerId } ?: return@withTimeout
-                if (!change.pressed) return@withTimeout
-                if ((change.position - initialPosition).getDistance() > slop) return@withTimeout
+                val change = event.changes.fastFirstOrNull { it.id == pointerId } ?: break
+                if (!change.pressed) break
+                if ((change.position - initialPosition).getDistance() > slop) break
             }
-            @Suppress("UNREACHABLE_CODE") Unit
         }
         null
-    } catch (e: TimeoutCancellationException) {
+    } catch (e: PointerEventTimeoutCancellationException) {
         // タイムアウトまでスロップ内で押され続けた = 本物の長押し(位置は動いていない)。
         currentEvent.changes.fastFirstOrNull { it.id == pointerId }
     }
