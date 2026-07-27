@@ -43,6 +43,7 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.fastFirstOrNull
@@ -732,6 +733,7 @@ fun TerminalScreenBody(
                         theme = terminalTheme,
                         typeface = terminalTypeface,
                         modifier = Modifier
+                            .testTag("terminalCanvas")
                             .fillMaxSize()
                             .pointerInput(Unit) {
                                 awaitEachGesture {
@@ -856,7 +858,14 @@ fun TerminalScreenBody(
                                     // 実際に押されている指の本数を見て、2本以上ならピンチ/パン優先で扱う
                                     // (単一指の本物の長押しだけを選択モードにする)。
                                     val pointerCount = currentEvent.changes.count { it.pressed }
-                                    val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
+                                    // Opusレビュー指摘(2026-07-27): 追跡していた指(down.id)だけを見ると、
+                                    // その指が先に離れても別の指がまだ画面に触れている場合に「指がまだ
+                                    // 押されているか」がfalseになり、classifyNormalGestureがTAP
+                                    // (=カーソル移動バイト送出+IME起動)へ倒れてしまう(実際には
+                                    // 2本目の指でのピンチ/パン継続の可能性がある途中なのに)。
+                                    // どの指であれ1本でも押され続けていればPINCH_PAN側へ倒すべきなので、
+                                    // 特定のdown.idではなく「押されている指が1本でもあるか」を見る。
+                                    val anyFingerStillPressed = currentEvent.changes.any { it.pressed }
                                     // タスク#87: 長押し/タップ/ピンチの3択の裁定自体は`classifyNormalGesture`
                                     // (`MouseGestureArbiter.kt`)へ抽出済み。以下の3分岐は判断結果に応じた
                                     // 副作用(選択ループ・hit-test・ピンチ委譲)のみを行う。
@@ -864,7 +873,7 @@ fun TerminalScreenBody(
                                         classifyNormalGesture(
                                             longPressSucceeded = longPress != null,
                                             pointerCount = pointerCount,
-                                            trackedFingerStillPressed = stillDown?.pressed == true,
+                                            trackedFingerStillPressed = anyFingerStillPressed,
                                         )
                                     ) {
                                         NormalGestureOutcome.SELECTION -> {
