@@ -1841,10 +1841,22 @@ stdout/stderrへ書き出すだけで、追加の表示経路なしにリモー�
 - `rust-core/isekai-pipe/src/ctl.rs`: `CtlLaunch::Build`/`stream_build`
 - `rust-core/isekai-ssh/tests/build_result_push_e2e.rs`
 
-### Epic Q: Claude Codeフック連携によるタブ状態表示(claude-hookd)— 設計段階、未着手(2026-07-25、Opusレビュー2回反映後)
+### Epic Q: Claude Codeフック連携によるタブ状態表示(claude-hookd)— 実装済み・未マージ(2026-07-25、Opusレビュー2回反映後、`feat/claude-hookd`ブランチ)
+
+**実装状況**: 状態機械(`claude_hookd::state`)・常駐daemon(`claude_hookd::daemon`)・
+`isekai-pipe claude-hookd event`/`__serve`サブコマンド・`#@isekai tab-idle-color`/
+`tab-attention-color`ディレクティブ・README(`rust-core/isekai-ssh/README.md`)は
+すべてこのworktree上に実装済み。まだ`main`にはマージされていない。以下は着手前に
+書かれた設計節をほぼそのまま残しているため、意思決定の経緯としてはそのまま有効だが、
+「未着手」ではなく「この設計の通りに実装され、実機/単体テストで検証済み」と読むこと
+(状態機械は`.claude/rules/rust-ssot.md`の方針通りI/O無し純粋関数として単体テストされ
+ている——`claude_hookd::state`のテストを参照)。`PermissionRequest`/`timeout`の追加
+(2026-07-25、下記4参照)は実運用中のtmuxプラグイン2種の設定を調査した上での増分修正。
 
 **動機**: `AI_INTEGRATION_DESIGN.md` §6.1(`ctl notify`)は「注目通知」を一過性のポップアップ
-(OSC 9)・状態ドット・システム通知として実装したが、これは**状態を持たない**——通知は
+(OSC 9)・システム通知として実装したが(「状態ドット」は当初の設計文にあった記述で、
+実際にはタブバーの永続的な視覚インジケータとしては実装されていない——2026-07-25訂正、
+`AI_INTEGRATION_DESIGN.md` §11参照)、これは**状態を持たない**——通知は
 出た瞬間で終わりで、「まだ対応待ちか」「もう対応済みか」を見た目で持続的に示すものが
 無い。Epic M-tab-color(2026-07-24、`isekai-pipe ctl tab-color`)は「タブの背景色を
 明示的に設定する」プリミティブを追加したが、これも単発のfire-and-forgetで、
@@ -2091,8 +2103,14 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
   Android/iOS側では防御的に無視される(`session.rs`)実装のままで、OSC 4;264も
   Windows Terminal固有。本Epicは`isekai-ssh` + Windows Terminalの組み合わせのみを
   対象とする(1回目のレビュー指摘: 「参照実装」だけを見ると本体アプリでも動くように
-  誤読されうるため明記する)。`ctl notify`のポップアップ/状態ドット部分は既存の通り
-  本体アプリでも動く。
+  誤読されうるため明記する)。`ctl notify`自体はAndroid本体アプリでも受信できるが、
+  当初「既存の通り本体アプリでも動く」としていたのは誤りだった(2026-07-25訂正):
+  tmux hook系kindのバックグラウンドシステム通知は実装済みだったが、AI系kind
+  (`Waiting`/`Done`/`Info`、本Epicが送出するもの)はAndroid側で未配線のまま
+  ログ出力止まりだった。2026-07-25、`TerminalTabsViewModel.kt`の`onNotify`を
+  `TabAlertNotifier`へ配線して解消した(`AI_INTEGRATION_DESIGN.md` §11.1.4参照)。
+  「状態ドット」(タブバーの永続的な視覚インジケータ)は元の設計文にあった記述だが、
+  tmux系・AI系いずれについても実装されていない(バックグラウンドシステム通知のみ)。
 - 「元のターミナル既定色に戻す」という意味での真のreset(`SetTabColor`にreset
   プリミティブが無い前提のまま、idle色も明示的なRGB値として扱う——tab-color増分の
   Opusレビュー時の議論と同じ判断を踏襲)。

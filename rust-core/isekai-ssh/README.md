@@ -588,11 +588,13 @@ idle色へ戻り、何も操作しなくても10分経てば自動的に戻る�
 転送される。daemonは1時間イベントが無いと自動的に終了する(常駐監視プロセスは
 無い、Epic Mの ctl-socket 自体と同じ方針)。
 
-**明示的にスコープ外**: この機能は `isekai-ssh` + Windows Terminal の組み合わせ
-専用(`ctl notify` のポップアップ部分だけは isekai-terminal 本体アプリでも動くが、
-タブ色自体は OSC 4;264 という Windows Terminal 固有の拡張に依存するため本体アプリ
-では効果が無い)。`.claude/settings.json` への自動追記は行わない(手動で追加する
-必要がある)。
+**明示的にスコープ外**: タブ色を実際に変える部分は `isekai-ssh` + Windows Terminal の
+組み合わせ専用(タブ色自体は OSC 4;264 という Windows Terminal 固有の拡張に依存する
+ため isekai-terminal 本体アプリでは効果が無い)。`ctl notify` のポップアップ部分
+(`AI_INTEGRATION_DESIGN.md` §6.1)は isekai-terminal 本体アプリでも独立に届く——
+Android はバックグラウンドシステム通知として実装済み(2026-07-25)、iOS は
+まだ未実装(`AI_INTEGRATION_DESIGN.md` §9 Epic AI-9)。`.claude/settings.json` への
+自動追記は行わない(手動で追加する必要がある)。
 
 ### 新規クレートの位置づけ
 
