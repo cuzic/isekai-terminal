@@ -44,6 +44,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::time::unix_now;
 use crate::{refresh, AuthError, TokenProvider, TokenResponse};
@@ -128,6 +129,26 @@ impl TokenSet {
     }
 }
 
+/// Zeroizes `access_token`/`refresh_token` when a `TokenSet` is dropped.
+/// Unlike the root crate's `SshAuth` (an UniFFI-exported type, which zeroizes
+/// via an explicit `zeroize_ssh_auth()` call because UniFFI-generated types
+/// can't derive `Drop`), `TokenSet` is a plain internal type, so `Drop` is
+/// the safer default here — an explicit-call convention is easy to forget at
+/// one of several call sites, `Drop` is not (2026-07-28, gap found while
+/// fact-checking the isekai-terminal case study for a book manuscript).
+///
+/// `Drop` means fields can no longer be moved out of a `TokenSet` (only
+/// `.clone()`d) — see the call sites in this file that changed to
+/// `.access_token.clone()`/`.client_id.clone()` alongside this impl.
+impl Drop for TokenSet {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        if let Some(refresh_token) = self.refresh_token.as_mut() {
+            refresh_token.zeroize();
+        }
+    }
+}
+
 impl From<TokenFileV1> for TokenSet {
     fn from(v1: TokenFileV1) -> Self {
         TokenSet {
@@ -180,7 +201,9 @@ pub fn default_token_path() -> Result<PathBuf, AuthError> {
 /// Fails closed: a missing file, a world-writable file/directory, malformed
 /// JSON, or an empty token value are all errors, never a silent empty token.
 pub fn load_token(path: &Path) -> Result<String, AuthError> {
-    Ok(load_token_set(path)?.access_token)
+    // `.clone()`, not a move: `TokenSet` now zeroizes on drop (see `impl Drop
+    // for TokenSet` below), which Rust disallows moving a field out of.
+    Ok(load_token_set(path)?.access_token.clone())
 }
 
 /// Reads the full `TokenSet` out of the token file at `path`. A legacy v1
@@ -336,8 +359,9 @@ impl FileTokenProvider {
         })?;
 
         let response = refresh::refresh_access_token(&token_endpoint, current.client_id.as_deref(), &refresh_token)?;
+        // `.clone()`, not a move: see the `impl Drop for TokenSet` comment above.
         let refreshed =
-            TokenSet::from_token_response(response, token_endpoint, current.client_id, Some(refresh_token));
+            TokenSet::from_token_response(response, token_endpoint, current.client_id.clone(), Some(refresh_token));
         self.save_token_set(&refreshed)?;
         Ok(refreshed)
     }
@@ -351,11 +375,13 @@ impl TokenProvider for FileTokenProvider {
     /// are returned as-is, matching this method's pre-phase-S-5 behavior
     /// exactly — `needs_refresh()` is always `false` for them.
     fn get_relay_jwt(&self) -> Result<String, AuthError> {
+        // Both `.clone()`s below, not moves: see the `impl Drop for
+        // TokenSet` comment above.
         let token_set = load_token_set(&self.path)?;
         if !token_set.needs_refresh() {
-            return Ok(token_set.access_token);
+            return Ok(token_set.access_token.clone());
         }
-        Ok(self.refresh_and_save(token_set)?.access_token)
+        Ok(self.refresh_and_save(token_set)?.access_token.clone())
     }
 }
 
