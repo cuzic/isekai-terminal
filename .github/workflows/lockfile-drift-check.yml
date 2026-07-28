@@ -1,0 +1,40 @@
+name: Lockfile drift check
+
+# AI並行開発の事故類型③(AIエージェントが依存パッケージのバージョンを勝手に変更し
+# lockファイルが荒れる事故)への予防策。マイグレーション採番競合(①、
+# room-migration-check.yml参照)と同じ「アトミック化→CIゲートでの再検証」の階梯を
+# Cargo.lockにも適用する。
+#
+# `cargo metadata --locked`はCargo.lockを一切書き換えず、Cargo.tomlの依存宣言と
+# Cargo.lockの解決結果が一致するかだけを検証する(依存解決のみで実コンパイルは
+# 行わないため、rust-core-test-check.ymlより大幅に軽い)。エージェントがCargo.tomlの
+# バージョン指定だけ変更して`cargo update`し忘れた場合や、Cargo.lockを手で編集して
+# しまった場合に、実際のビルドを待たず数秒〜十数秒で検出できる。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**/Cargo.toml"
+      - "rust-core/Cargo.lock"
+  pull_request:
+    paths:
+      - "rust-core/**/Cargo.toml"
+      - "rust-core/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+      - name: Verify Cargo.lock matches Cargo.toml (dependency resolution only, no build)
+        working-directory: rust-core
+        run: cargo metadata --locked --format-version 1 > /dev/null
