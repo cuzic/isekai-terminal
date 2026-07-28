@@ -59,3 +59,7 @@ tempfile = "3"
 # comment, this mirrors that).
 ssh-encoding = "0.2"
 signature = "2"
+# `native_agent_auth_windows_e2e.rs`: wraps a `tokio::sync::mpsc` of accepted
+# Windows named-pipe connections into the `Stream` `russh_keys::agent::server
+# ::serve` requires, without hand-rolling a `Stream` impl.
+tokio-stream = "0.1"
