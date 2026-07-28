@@ -353,6 +353,10 @@ impl client::Handler for RusshEventHandler {
                 return;
             }
             if secret_line.trim_end_matches('\n') != socket_path {
+                log::error!(
+                    "ISEKAI_DEBUG_MARKER: ctl-socket preamble mismatch got={:?} want={:?}",
+                    secret_line, socket_path
+                );
                 warn!("ctl-socket[{socket_path}]: ctl connection preamble did not match this tab's expected secret");
                 return;
             }
