@@ -2,20 +2,40 @@ name: F-Droid build check
 
 # Simulates what an F-Droid buildserver would do when it processes
 # fdroid/tools.isekai.terminal.yml: install the pinned NDK, run the recipe's
-# `sudo:` setup commands (as root, like F-Droid does), then build with a
-# plain non-root `gradle:` step. This exists to catch drift between the
-# recipe and the actual build *before* submitting to fdroiddata, since none
-# of this has been verified against a real F-Droid buildserver yet.
+# `sudo:` setup commands (as root, like F-Droid does), run its `build:`
+# commands (non-root, in the repo root), then build with a plain non-root
+# `gradle:` step — the same order fdroidserver/build.py uses. This exists to
+# catch drift between the recipe and the actual build *before* submitting to
+# fdroiddata, since none of this has been verified against a real F-Droid
+# buildserver yet.
+#
+# Everything the build needs must be installed by the recipe itself, not by
+# steps here: a toolchain this workflow installs on its own would hide the
+# fact that the recipe forgot it (that is exactly the drift being checked).
 
 on:
-  # このジョブは現状 isekai-pipe の musl バイナリを未ビルドのまま
-  # `cargo build` を叩くため、常に失敗する(#67参照)。musl バイナリの
-  # ビルド手順を組み込むまでの間、push/PR 毎の必須チェックからは外し、
-  # リリースタグ(`v*`)を打った時とworkflow_dispatchでの手動実行のみにする。
   push:
     tags:
       - "v*"
   workflow_dispatch:
+  # TODO: the recipe now builds the musl isekai-pipe binaries in its
+  # `build:` block, so the "always fails, no musl step" reason for keeping
+  # this off push/PR is gone — but the fixed recipe has never had a green
+  # run yet. Trigger this once via workflow_dispatch and, when it passes,
+  # uncomment the paths-filtered pull_request trigger below. It stays
+  # path-filtered rather than running on every PR because the job does two
+  # release musl builds plus a release Android build from a cold toolchain,
+  # which is far too slow for a per-PR required check.
+  # pull_request:
+  #   paths:
+  #     - "fdroid/**"
+  #     - ".github/workflows/fdroid-build-check.yml"
+  #     - "**/*.gradle.kts"
+  #     - "gradle/libs.versions.toml"
+  #     - "gradle.properties"
+  #     - "rust-core/Cargo.lock"
+  #     - "rust-core/.cargo/config.toml"
+  #     - "rust-core/scripts/**"
 
 permissions:
   contents: read
@@ -23,12 +43,13 @@ permissions:
 jobs:
   simulate-fdroid-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       RECIPE: fdroid/tools.isekai.terminal.yml
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read recipe fields (ndk / sudo / gradle) with PyYAML
+      - name: Read recipe fields (ndk / sudo / build / gradle) with PyYAML
         id: recipe
         run: |
           pip install --quiet --user pyyaml
@@ -39,16 +60,22 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"ndk={build['ndk']}\n")
               out.write(f"commit={build['commit']}\n")
-          with open("/tmp/fdroid-sudo-setup.sh", "w") as f:
-              f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
-              for line in build.get("sudo", []):
-                  f.write(line + "\n")
+          # fdroidserver joins each field's entries and runs them as one
+          # `bash -e -u -o pipefail -x -c` script, so `set -euo pipefail` here
+          # matches what the recipe's commands actually run under.
+          for field, path in (("sudo", "/tmp/fdroid-sudo-setup.sh"), ("build", "/tmp/fdroid-build-step.sh")):
+              with open(path, "w") as f:
+                  f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
+                  for line in build.get(field, []):
+                      f.write(line + "\n")
           print("--- recipe Builds[0] ---")
           print(json.dumps(build, indent=2))
           PY
-          chmod +x /tmp/fdroid-sudo-setup.sh
+          chmod +x /tmp/fdroid-sudo-setup.sh /tmp/fdroid-build-step.sh
           echo "--- extracted sudo: setup script ---"
           cat /tmp/fdroid-sudo-setup.sh
+          echo "--- extracted build: script ---"
+          cat /tmp/fdroid-build-step.sh
 
       - name: Remove the runner's preinstalled Rust toolchain
         # GitHub's hosted runner image ships rustup at ~/.cargo for CI
@@ -78,7 +105,7 @@ jobs:
       - name: "Run the recipe's sudo: block (root, like F-Droid's buildserver)"
         run: sudo bash -x /tmp/fdroid-sudo-setup.sh
 
-      - name: Confirm cargo/rustc are reachable without sudo
+      - name: Confirm cargo/rustc/zig/cargo-zigbuild are reachable without sudo
         run: |
           # This step exists because the recipe's symlinks bypass rustup's
           # proxy shim entirely (see the comment in the recipe for why) - so
@@ -86,10 +113,14 @@ jobs:
           # Whether the aarch64-linux-android target is actually installed is
           # left to the real `cargo build --target aarch64-linux-android`
           # step below to prove; a wrong/missing target fails loudly there.
-          which cargo
-          which rustc
+          # zig and cargo-zigbuild are checked the same way: they are installed
+          # into /opt by the recipe and reached via /usr/local/bin symlinks, and
+          # the musl builds below need them as a non-root user.
+          which cargo rustc zig cargo-zigbuild
           cargo --version
           rustc --version
+          zig version
+          cargo zigbuild --version
 
       - name: Cache Gradle and Cargo
         uses: actions/cache@v4
@@ -99,7 +130,13 @@ jobs:
             ~/.gradle/wrapper
             ~/.cargo/registry
             rust-core/target
-          key: fdroid-build-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'rust-core/Cargo.lock') }}
+          key: fdroid-build-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'rust-core/Cargo.lock', 'fdroid/tools.isekai.terminal.yml') }}
+
+      - name: "Run the recipe's build: block (non-root, repo root, before gradle)"
+        # Produces the static musl isekai-pipe binaries that
+        # isekai-terminal-core include_bytes!s; without them the gradle step's
+        # `cargo build` cannot compile at all.
+        run: bash -x /tmp/fdroid-build-step.sh
 
       - name: "Build (matches the recipe's gradle: yes)"
         run: ./gradlew assembleRelease --stacktrace
