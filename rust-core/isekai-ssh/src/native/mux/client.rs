@@ -12,12 +12,21 @@
 //! ordinary `try_claim` path and becomes the new owner (the old owner's claim
 //! having been released) — there is no special recovery code path.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::log_file::log_line;
 
 use super::protocol::{spawn_frame_reader, write_frame, Frame, MUX_PROTOCOL_VERSION};
+
+/// How long to wait for an in-flight build's task to actually observe an
+/// abort signal and kill its child (`ActiveBuild::abort_and_wait`) before
+/// giving up — every call site here runs right before the process exits, so
+/// this only bounds how long that exit is delayed, not whether the build
+/// gets a chance to die cleanly at all.
+const BUILD_ABORT_WAIT: Duration = Duration::from_secs(2);
 
 /// How a client session ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -190,8 +199,8 @@ where
                     }
                     Ok(n) => {
                         if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
-                            if let Some(build) = &mut active_build {
-                                build.abort();
+                            if let Some(build) = active_build.take() {
+                                build.abort_and_wait(BUILD_ABORT_WAIT).await;
                             }
                             return Ok(ClientOutcome::OwnerLost);
                         }
@@ -216,8 +225,8 @@ where
                         Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
                     );
                     if write_frame(conn_write, &Frame::Ctl(bytes)).await.is_err() {
-                        if let Some(build) = &mut active_build {
-                            build.abort();
+                        if let Some(build) = active_build.take() {
+                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
                         }
                         return Ok(ClientOutcome::OwnerLost);
                     }
@@ -263,8 +272,8 @@ where
                             Ok(isekai_protocol::CtlMessage::BuildFinished { exit_code, .. })
                                 if exit_code == super::build_relay::BUILD_ABORTED_SENTINEL =>
                             {
-                                if let Some(mut build) = active_build.take() {
-                                    build.abort();
+                                if let Some(build) = active_build.take() {
+                                    build.abort_and_wait(BUILD_ABORT_WAIT).await;
                                 }
                             }
                             Ok(msg) => {
@@ -277,14 +286,29 @@ where
                             Err(_) => {}
                         }
                     }
-                    Some(Ok(Some(Frame::Exit(code)))) => return Ok(ClientOutcome::Exited(code)),
-                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}")),
+                    // The remote shell exited normally, but a build this tab
+                    // spawned may still be streaming (found missing in
+                    // review: every other terminal arm here aborts an
+                    // in-flight build, this one didn't, orphaning the real
+                    // child process since nothing else will ever kill it).
+                    Some(Ok(Some(Frame::Exit(code)))) => {
+                        if let Some(build) = active_build.take() {
+                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
+                        }
+                        return Ok(ClientOutcome::Exited(code));
+                    }
+                    Some(Ok(Some(other))) => {
+                        if let Some(build) = active_build.take() {
+                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
+                        }
+                        return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}"));
+                    }
                     // A clean close without an Exit, any read error (a reset
                     // pipe), or the reader task ending all mean the owner died
                     // mid-session.
                     Some(Ok(None)) | Some(Err(_)) | None => {
-                        if let Some(build) = &mut active_build {
-                            build.abort();
+                        if let Some(build) = active_build.take() {
+                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
                         }
                         return Ok(ClientOutcome::OwnerLost);
                     }
@@ -293,8 +317,8 @@ where
             resize = recv_resize(&mut resize_rx) => {
                 if let Some((cols, rows)) = resize {
                     if write_frame(conn_write, &Frame::Resize { cols: cols as u16, rows: rows as u16 }).await.is_err() {
-                        if let Some(build) = &mut active_build {
-                            build.abort();
+                        if let Some(build) = active_build.take() {
+                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
                         }
                         return Ok(ClientOutcome::OwnerLost);
                     }

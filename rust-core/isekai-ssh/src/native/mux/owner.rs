@@ -197,10 +197,6 @@ where
         other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
     };
 
-    write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION })
-        .await
-        .context("isekai-ssh mux owner: sending HelloAck failed")?;
-
     // This client's own private ctl-socket forward (opportunistic: a failed
     // setup just leaves `ctl` as `None`).
     let ctl = match ctl_routes {
@@ -223,6 +219,19 @@ where
                 .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
         }
     };
+    // `HelloAck` is deliberately sent only *after* the channel-open above
+    // succeeds (review finding: it used to be sent first) — a client that
+    // already saw `HelloAck` has passed its handshake and expects
+    // stdout/stderr/ctl frames next, so a subsequent open failure had no
+    // way to be reported except dropping the connection outright, which
+    // `client.rs` can only read as `ClientOutcome::OwnerLost` (a hard exit,
+    // no fallback — the holder itself is fine, so every retry hit the exact
+    // same dead end, the class of bug `.claude/rules/always-connects.md`
+    // calls out). Reporting the failure as `Frame::Rejected` instead — same
+    // as the version/token-mismatch arms above — lets the client fall back
+    // to an unmultiplexed direct connect (`client.rs`'s handshake read
+    // already accepts `Rejected` in place of `HelloAck`, confirmed by the
+    // existing version/token-mismatch handling).
     let mut channel = match open_result {
         Ok(channel) => channel,
         Err(e) => {
@@ -233,9 +242,24 @@ where
             if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
                 ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
             }
+            let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
             return Err(e);
         }
     };
+
+    if let Err(e) = write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await {
+        // The channel opened above is real and remote — a client that
+        // vanished between Hello and HelloAck (a genuine race, not just a
+        // test artifact) must not leak it: `russh::Channel` has no `Drop`
+        // impl, so nothing sends `CHANNEL_CLOSE` unless we do here (same
+        // rationale as `build_relay.rs::run_build_over_channel`'s identical
+        // call).
+        let _ = channel.close().await;
+        if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
+            ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
+        }
+        return Err(anyhow::Error::new(e).context("isekai-ssh mux owner: sending HelloAck failed"));
+    }
 
     // Pump this client's forwarded ctl channels into an mpsc the relay loop
     // drains and wraps in `Frame::Ctl` (so all owner→client writes stay on the
@@ -299,6 +323,14 @@ where
     // (in the ctl-branch match), so state never outlives the build it
     // belongs to regardless of which side ended it.
     let mut active_build_reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
+    // The forwarded channel `active_build_reply_tx` belongs to (review
+    // finding: without this, an unrelated channel's synthesized
+    // `CtlRelayEvent::BuildAborted` — e.g. a second, already-rejected
+    // `BuildRequest`'s own channel closing — could be mistaken for the
+    // *active* build's abort and kill it). Set alongside
+    // `active_build_reply_tx` in the `BuildStarted` arm, cleared alongside
+    // it everywhere else.
+    let mut active_build_channel_id: Option<russh::ChannelId> = None;
 
     loop {
         tokio::select! {
@@ -342,6 +374,7 @@ where
                             let _ = tx.send(bytes);
                             if is_finished {
                                 active_build_reply_tx = None;
+                                active_build_channel_id = None;
                             }
                         }
                     }
@@ -379,20 +412,27 @@ where
                     // A ctl message this client received over its private
                     // forward: relay it as a `Frame::Ctl` on the same writer as
                     // stdout/stderr (so all owner→client writes stay ordered on
-                    // one stream). Also covers `pump_to_frames`'s synthesized
-                    // abort sentinel (Epic P Phase 2) — from this branch's
-                    // perspective it's just another message to relay, but
-                    // decoding it as `BuildFinished` here too keeps
-                    // `active_build_reply_tx` from outliving a build that
-                    // ended because the *remote* went away rather than
-                    // because the client finished normally (see the
-                    // client-frame `Frame::Ctl` arm above for that path).
-                    Some(ctl_forward::CtlRelayEvent::Message(bytes)) => {
-                        if matches!(
-                            isekai_protocol::decode_ctl_message(&bytes),
-                            Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
-                        ) {
+                    // one stream). A message decoding as `BuildFinished` here
+                    // only clears `active_build_reply_tx`/
+                    // `active_build_channel_id` if it arrived on the channel
+                    // those are currently tracking — review finding: an
+                    // earlier version cleared on *any* channel's
+                    // `BuildFinished`-shaped message, so a hand-crafted line
+                    // on an unrelated forwarded channel (never actually sent
+                    // by real `isekai-pipe ctl`, which never emits
+                    // `BuildFinished` itself) could clear state for a build
+                    // that's still genuinely in flight, the same
+                    // cross-channel confusion class the `BuildAborted` arm
+                    // below exists to prevent.
+                    Some(ctl_forward::CtlRelayEvent::Message { channel_id, bytes }) => {
+                        if active_build_channel_id == Some(channel_id)
+                            && matches!(
+                                isekai_protocol::decode_ctl_message(&bytes),
+                                Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                            )
+                        {
                             active_build_reply_tx = None;
+                            active_build_channel_id = None;
                         }
                         if write_frame(writer, &Frame::Ctl(bytes)).await.is_err() {
                             break;
@@ -421,7 +461,7 @@ where
                     // it's never stored) lets that second pump task's next
                     // `reply_rx.recv()` return `None` and end cleanly once
                     // it has relayed these two messages.
-                    Some(ctl_forward::CtlRelayEvent::BuildStarted { reply_tx }) => {
+                    Some(ctl_forward::CtlRelayEvent::BuildStarted { channel_id, reply_tx }) => {
                         if active_build_reply_tx.is_some() {
                             if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
                                 isekai_protocol::BuildOutputStream::Stderr,
@@ -434,6 +474,27 @@ where
                             }
                         } else {
                             active_build_reply_tx = Some(reply_tx);
+                            active_build_channel_id = Some(channel_id);
+                        }
+                    }
+                    // The channel a build was running over disconnected
+                    // (`ctl_forward::pump_to_frames`'s docs) before a real
+                    // `BuildFinished` ever arrived. Only synthesize+relay the
+                    // abort sentinel if `channel_id` is still the build we're
+                    // actually tracking — review finding: an earlier version
+                    // let *any* channel's disconnect kill whichever build
+                    // happened to be active (e.g. a second, already-rejected
+                    // `BuildRequest`'s own channel closing killed the first,
+                    // unrelated, still-running build).
+                    Some(ctl_forward::CtlRelayEvent::BuildAborted { channel_id }) => {
+                        if active_build_channel_id == Some(channel_id) {
+                            if let Ok(abort) = crate::build_exec::encode_build_finished(super::build_relay::BUILD_ABORTED_SENTINEL, Vec::new()) {
+                                active_build_reply_tx = None;
+                                active_build_channel_id = None;
+                                if write_frame(writer, &Frame::Ctl(abort)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     // The ctl pump ended (forward cancelled / all senders gone):
@@ -571,19 +632,21 @@ mod tests {
     async fn serve_clients_exits_after_the_idle_grace_once_the_last_client_disconnects() {
         let name = "isekai-ssh-mux-idle-exit-test";
         let token = Arc::new(b"tok".to_vec());
-        // The real TCP handshake against the mock sshd must run with real time
-        // (russh's own handshake has timer-based internals that can misbehave
-        // under a paused clock) — only pause *after* authentication completes,
-        // for the idle-grace fast-forwarding below.
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
-        tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
         let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
 
         // One client connects, sends Hello, then immediately disconnects
-        // (drops without Shutdown) — `relay_client`'s per-client task ends
-        // (successfully or not doesn't matter here) and decrements the count.
+        // (drops without Shutdown) — `relay_client`'s per-client task now
+        // opens a real remote channel *before* it ever notices the client is
+        // gone (review finding #3: `HelloAck` is sent only after that open
+        // succeeds), ending in a failed HelloAck write that decrements the
+        // count. Like `authed_test_handle`'s own real SSH handshake, this
+        // round trip must run under *real* time — russh's request/response
+        // internals can misbehave under a paused clock (see that function's
+        // note) — so, unlike before finding #3 existed, we don't pause the
+        // clock until this has had a real chance to finish.
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
@@ -592,16 +655,11 @@ mod tests {
                 .unwrap();
             // conn drops here.
         }
-        // Let the spawned relay task actually run to completion (read Hello,
-        // fail to write HelloAck to the now-dropped connection, decrement the
-        // count) *before* advancing the clock — otherwise the idle-exit grace
-        // sleep hasn't even started counting down yet when we jump the clock
-        // past it, and the assertion below races against a grace window that
-        // effectively restarts after the jump.
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Advance the paused clock past both the (short, since a client did
-        // connect) idle grace and give spawned tasks a chance to run.
+        // Now pause and jump the clock past the (short, since a client did
+        // connect) idle grace.
+        tokio::time::pause();
         tokio::time::advance(IDLE_GRACE + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
 
@@ -618,22 +676,27 @@ mod tests {
         let name = "isekai-ssh-mux-idle-exit-reset-test";
         let token = Arc::new(b"tok".to_vec());
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
-        tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
         let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
 
-        // First client connects then disconnects immediately.
+        // First client connects then disconnects immediately — like the
+        // idle-exit test above, its relay task's real (post-auth,
+        // finding-#3) channel-open must be given a chance to run under real
+        // time before the clock is paused, since russh's request/response
+        // internals can misbehave under a paused one (see
+        // `authed_test_handle`'s note about the handshake, which applies
+        // equally to this later channel-open).
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
             write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Well within the idle grace, a second client connects and stays
-        // connected (holds its Hello/HelloAck round-trip open).
-        tokio::time::advance(Duration::from_secs(1)).await;
+        // A second client connects and stays connected (holds its
+        // Hello/HelloAck round-trip open) — also under real time, for the
+        // same reason, before the clock is paused below.
         let conn2 = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
         let (mut r2, mut w2) = tokio::io::split(conn2);
         write_frame(&mut w2, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
@@ -642,9 +705,10 @@ mod tests {
             other => panic!("expected HelloAck, got {other:?}"),
         }
 
-        // Advance well past what the *first* client's grace window would have
-        // been — the loop must still be alive, serving the still-connected
-        // second client, not exited.
+        // Only now pause and advance well past what the *first* client's
+        // grace window would have been — the loop must still be alive,
+        // serving the still-connected second client, not exited.
+        tokio::time::pause();
         tokio::time::advance(IDLE_GRACE + Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert!(!serve_task.is_finished(), "a still-connected client must prevent the idle-exit from firing");
@@ -1332,9 +1396,16 @@ mod tests {
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await
             .unwrap();
+        // Review finding: `HelloAck` is now sent only *after* the login-shell
+        // open succeeds (previously it was sent unconditionally right after
+        // the handshake, before this failure was even known) — a client
+        // that already saw `HelloAck` has no way to be told the session
+        // never actually started except a hard, non-recoverable
+        // disconnect. `Frame::Rejected` here lets the client fall back to
+        // an unmultiplexed direct connect instead.
         match read_frame(&mut client).await.unwrap().unwrap() {
-            Frame::HelloAck { .. } => {}
-            other => panic!("expected HelloAck, got {other:?}"),
+            Frame::Rejected { .. } => {}
+            other => panic!("expected Rejected (not HelloAck — the login-shell open fails before HelloAck is ever sent), got {other:?}"),
         }
 
         // The forward the owner requested must be cancelled once the login-shell

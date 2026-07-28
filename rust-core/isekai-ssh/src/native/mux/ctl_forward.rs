@@ -108,14 +108,29 @@ pub(crate) async fn open_login_shell<H: client::Handler>(
     Ok(channel)
 }
 
+/// Backs `SetVar`/`GetVarRequest` for [`pump_to_stderr`] — the single-process
+/// foreground path is exactly the "one process per tab" shape
+/// `isekai_protocol::ctl_vars` module docs say makes one shared store
+/// correct for `Tab`/`Session`/`Global` alike (matching the Unix `ssh(1)`
+/// wrapper path's own `ctl_forward.rs::CTL_VARS`, a separate `#[cfg(unix)]`
+/// instance — this one is native/Windows-only, hence its own static rather
+/// than reusing that one). Review finding: previously `SetVar`/
+/// `GetVarRequest` silently fell through `osc_sequence_for`'s `None` return
+/// (correct for e.g. `ClipboardPullRequest`, which has no OSC form by
+/// design, but wrong here) — `SetVar` was dropped with no storage at all,
+/// and a remote `isekai-pipe ctl getvar` hung forever waiting for a
+/// `GetVarResponse` that never arrived.
+static NATIVE_CTL_VARS: std::sync::LazyLock<isekai_protocol::CtlVarStore> = std::sync::LazyLock::new(isekai_protocol::CtlVarStore::new);
+
 /// Consumes forwarded ctl channels and applies each message to *this*
 /// process's terminal — the owner's own / single-process foreground shell
-/// direction. Every message except `BuildRequest` is applied in place as an
-/// OSC escape on stderr, matching Epic M's original design. `BuildRequest`
-/// (Epic P Phase 2) has no OSC equivalent and keeps the channel busy for the
-/// whole build's duration instead of a single reply — see
-/// [`super::build_relay::run_build_over_channel`]. Runs until the route's
-/// sender is dropped (the forward is cancelled / the session ends).
+/// direction. `SetVar`/`GetVarRequest` are answered via [`NATIVE_CTL_VARS`]
+/// (see its docs); every other message except `BuildRequest` is applied in
+/// place as an OSC escape on stderr, matching Epic M's original design.
+/// `BuildRequest` (Epic P Phase 2) has no OSC equivalent and keeps the
+/// channel busy for the whole build's duration instead of a single reply —
+/// see [`super::build_relay::run_build_over_channel`]. Runs until the
+/// route's sender is dropped (the forward is cancelled / the session ends).
 pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::Channel<client::Msg>>, host: String) {
     while let Some(mut channel) = channels.recv().await {
         let host = host.clone();
@@ -126,14 +141,28 @@ pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::
             let Ok(msg) = isekai_protocol::decode_ctl_message(&line) else {
                 return;
             };
-            if let isekai_protocol::CtlMessage::BuildRequest { profile } = &msg {
-                if let Err(e) = super::build_relay::run_build_over_channel(&mut channel, &host, profile).await {
-                    log_line!("isekai-ssh: build over ctl channel ended with an error: {e:#}");
+            match &msg {
+                isekai_protocol::CtlMessage::BuildRequest { profile } => {
+                    if let Err(e) = super::build_relay::run_build_over_channel(&mut channel, &host, profile).await {
+                        log_line!("isekai-ssh: build over ctl channel ended with an error: {e:#}");
+                    }
                 }
-                return;
-            }
-            if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
-                let _ = crate::ctl_forward::emit_osc(&seq);
+                isekai_protocol::CtlMessage::SetVar { key, value, .. } => {
+                    NATIVE_CTL_VARS.set(key.clone(), value.clone());
+                }
+                isekai_protocol::CtlMessage::GetVarRequest { key, .. } => {
+                    let response = isekai_protocol::CtlMessage::GetVarResponse { value: NATIVE_CTL_VARS.get(key) };
+                    if let Ok(mut out) = serde_json::to_vec(&response) {
+                        out.push(b'\n');
+                        let _ = channel.data(&out[..]).await;
+                    }
+                    let _ = channel.close().await;
+                }
+                _ => {
+                    if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
+                        let _ = crate::ctl_forward::emit_osc(&seq);
+                    }
+                }
             }
         });
     }
@@ -142,16 +171,34 @@ pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::
 /// One event `pump_to_frames` sends to `owner.rs::relay_loop` over its
 /// `ctl_frame_rx`. Every existing message kind (title/clip/setvar/getvar,
 /// and the initial `BuildRequest` line itself) is a one-shot
-/// [`Message`](CtlRelayEvent::Message) exactly as before. `BuildRequest`
-/// (Epic P Phase 2) additionally follows up with
-/// [`BuildStarted`](CtlRelayEvent::BuildStarted): `relay_loop` must
+/// [`Message`](CtlRelayEvent::Message) exactly as before, now tagged with its
+/// originating channel's id — review finding: without it, a hand-crafted
+/// (non-`isekai-pipe ctl`) line on an *unrelated* forwarded channel that
+/// happens to decode as `BuildFinished` would clear `active_build_reply_tx`/
+/// `active_build_channel_id` for whichever build is actually in flight, the
+/// same cross-channel confusion class [`BuildAborted`](CtlRelayEvent::BuildAborted)
+/// exists to prevent. `BuildRequest` (Epic P Phase 2) additionally follows up
+/// with [`BuildStarted`](CtlRelayEvent::BuildStarted): `relay_loop` must
 /// remember `reply_tx` so it can forward the client's own `Frame::Ctl`
 /// replies into it, since only the owner holds the real SSH channel a mux
 /// client's build needs to stream its output back over
 /// (`super::owner`/`super::client`'s module docs cover the full round trip).
 pub(crate) enum CtlRelayEvent {
-    Message(Vec<u8>),
-    BuildStarted { reply_tx: mpsc::UnboundedSender<Vec<u8>> },
+    Message { channel_id: russh::ChannelId, bytes: Vec<u8> },
+    BuildStarted { channel_id: russh::ChannelId, reply_tx: mpsc::UnboundedSender<Vec<u8>> },
+    /// The forwarded channel a build was running over disconnected
+    /// (`Close`/`None`, never `Eof` — see `pump_to_frames`'s docs) before a
+    /// real `BuildFinished` arrived. Carries the *originating* channel's id
+    /// so `relay_loop` can tell an abort for a build that's no longer the
+    /// active one (e.g. a since-rejected overlapping `BuildRequest`'s own
+    /// channel closing) apart from one for the build it's actually
+    /// tracking — synthesizing and relaying the abort sentinel only in the
+    /// latter case. Review finding: an earlier version folded this into a
+    /// plain `Message` carrying an already-encoded `BuildFinished{exit_code:
+    /// BUILD_ABORTED_SENTINEL}}`, indistinguishable from any other channel's
+    /// abort, which let a second (already-rejected) build's channel closing
+    /// kill an unrelated, still-running first build.
+    BuildAborted { channel_id: russh::ChannelId },
 }
 
 /// Consumes forwarded ctl channels and relays each message to a mux *client*
@@ -168,26 +215,64 @@ pub(crate) enum CtlRelayEvent {
 /// whatever the mux client later sends back (via `reply_rx`, fed by
 /// `relay_loop` routing the client's own `Frame::Ctl` frames) onto the real
 /// channel with `channel.data()`, and forwards `channel.wait()` reporting the
-/// remote side closing as a synthesized abort `BuildFinished` (see
-/// `super::build_relay::BUILD_ABORTED_SENTINEL`) so the client can kill its
-/// still-running child instead of streaming into the void. This task never
-/// decodes replies to look for `BuildFinished` itself — `relay_loop` already
-/// has to do that (to know when to stop routing), and clearing its
-/// `active_build_reply_tx` there drops `reply_tx`, which naturally ends this
-/// task's `reply_rx.recv()` loop without a second, redundant decode here.
+/// remote side closing (`Close`/`None` — **not** `Eof`, see the note on that
+/// arm below) as a [`CtlRelayEvent::BuildAborted`] tagged with this channel's
+/// id, so `relay_loop` can synthesize+relay an abort only if this channel is
+/// still the one it's actually tracking, rather than blindly killing
+/// whichever build happens to be active. This task never decodes replies to
+/// look for `BuildFinished` itself — `relay_loop` already has to do that (to
+/// know when to stop routing), and clearing its `active_build_reply_tx`
+/// there drops `reply_tx`, which naturally ends this task's
+/// `reply_rx.recv()` loop without a second, redundant decode here.
 pub(crate) async fn pump_to_frames(
     mut channels: mpsc::UnboundedReceiver<russh::Channel<client::Msg>>,
     frame_tx: mpsc::UnboundedSender<CtlRelayEvent>,
 ) {
     while let Some(mut channel) = channels.recv().await {
         let frame_tx = frame_tx.clone();
+        // Captured before `tokio::spawn` moves `channel` — needed to tag
+        // this channel's `BuildStarted`/`BuildAborted` events so
+        // `relay_loop` can tell them apart from a different build's.
+        let channel_id = channel.id();
         tokio::spawn(async move {
             let Some(line) = read_ctl_line(&mut channel).await else {
                 return;
             };
-            let is_build_request =
-                matches!(isekai_protocol::decode_ctl_message(&line), Ok(isekai_protocol::CtlMessage::BuildRequest { .. }));
-            if frame_tx.send(CtlRelayEvent::Message(line)).is_err() {
+            let decoded = isekai_protocol::decode_ctl_message(&line);
+
+            // `GetVarRequest`/`SetVar` are answered/logged by the owner
+            // itself here, never relayed as a `Message` to the mux client:
+            // a mux client has no way to answer a `GetVarRequest` (its only
+            // upstream is `Frame::Ctl`, which `relay_loop` routes solely
+            // into `active_build_reply_tx` — a client-emitted
+            // `GetVarResponse` while a build is in flight would land on the
+            // *build's* channel instead and break it, per review finding).
+            // Full `VarScope`-aware native var-store parity across a mux
+            // session (one holder, potentially many tabs) is deliberately
+            // out of scope here — `VarScope::Tab` doesn't fit a
+            // one-process-serves-many-tabs shape the way it does for
+            // `pump_to_stderr`'s single-process-per-tab case (see that
+            // function's `NATIVE_CTL_VARS` docs) — so `GetVarRequest` always
+            // answers "unset" and `SetVar` is a no-op, both honestly logged
+            // rather than silently dropped as before.
+            if let Ok(isekai_protocol::CtlMessage::GetVarRequest { .. }) = &decoded {
+                log_line!("isekai-ssh: ignoring a getvar request over a multiplexed (mux) session — answering \"unset\" (native var-store parity for mux sessions is not implemented yet)");
+                let response = isekai_protocol::CtlMessage::GetVarResponse { value: None };
+                if let Ok(mut out) = serde_json::to_vec(&response) {
+                    out.push(b'\n');
+                    let _ = channel.data(&out[..]).await;
+                }
+                let _ = channel.close().await;
+                return;
+            }
+            if let Ok(isekai_protocol::CtlMessage::SetVar { key, .. }) = &decoded {
+                log_line!("isekai-ssh: ignoring a setvar request for {key:?} over a multiplexed (mux) session (native var-store parity for mux sessions is not implemented yet)");
+                let _ = channel.close().await;
+                return;
+            }
+
+            let is_build_request = matches!(decoded, Ok(isekai_protocol::CtlMessage::BuildRequest { .. }));
+            if frame_tx.send(CtlRelayEvent::Message { channel_id, bytes: line }).is_err() {
                 return;
             }
             if !is_build_request {
@@ -195,7 +280,7 @@ pub(crate) async fn pump_to_frames(
             }
 
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            if frame_tx.send(CtlRelayEvent::BuildStarted { reply_tx }).is_err() {
+            if frame_tx.send(CtlRelayEvent::BuildStarted { channel_id, reply_tx }).is_err() {
                 return;
             }
             loop {
@@ -211,18 +296,29 @@ pub(crate) async fn pump_to_frames(
                         }
                     }
                     msg = channel.wait() => {
-                        if matches!(msg, None | Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close)) {
-                            if let Ok(abort) = crate::build_exec::encode_build_finished(
-                                super::build_relay::BUILD_ABORTED_SENTINEL,
-                                Vec::new(),
-                            ) {
-                                let _ = frame_tx.send(CtlRelayEvent::Message(abort));
-                            }
+                        // `Eof` deliberately excluded: RFC 4254 makes it a
+                        // read-half-only half-close an exit-status may still
+                        // legally follow, and the real `isekai-pipe ctl
+                        // build` client always produces one right after
+                        // sending `BuildRequest` (it shares every other ctl
+                        // message's fire-and-forget `shutdown()` convention)
+                        // — treating it as a real disconnect killed every
+                        // real remote-triggered build before it could stream
+                        // anything (see `build_relay.rs`'s module docs for
+                        // the identical fix there).
+                        if matches!(msg, None | Some(russh::ChannelMsg::Close)) {
+                            let _ = frame_tx.send(CtlRelayEvent::BuildAborted { channel_id });
                             break;
                         }
                     }
                 }
             }
+            // `russh::Channel` has no `Drop` impl, so nothing sends
+            // `CHANNEL_CLOSE` unless we do (same rationale as
+            // `build_relay.rs::run_build_over_channel`'s identical call) —
+            // harmless no-op if the channel is already closing (the
+            // `disconnected`/`BuildAborted` exit above).
+            let _ = channel.close().await;
         });
     }
 }
@@ -244,6 +340,15 @@ pub(crate) async fn pump_to_frames(
 /// Both lines can arrive in the same `Data` chunk (or split across several),
 /// so this carries any bytes read past the preamble's newline forward into
 /// the second line's search rather than discarding them.
+///
+/// `buf` is capped at [`isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN`] across
+/// *both* loops combined (review finding: this reader had no cap at all,
+/// unlike every other reader in this codebase — `isekai_protocol::
+/// decode_ctl_message`'s own cap doesn't help here since it only applies
+/// *after* a `\n` is already found, and a peer that never sends one could
+/// otherwise grow `buf` unboundedly inside the shared detached holder
+/// process, where that's worse than an ordinary single-process crash). A
+/// peer that exceeds it is treated the same as a malformed/absent message.
 async fn read_ctl_line(channel: &mut russh::Channel<client::Msg>) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     // The preamble line: read and discard it.
@@ -251,6 +356,9 @@ async fn read_ctl_line(channel: &mut russh::Channel<client::Msg>) -> Option<Vec<
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             buf.drain(..=pos);
             break;
+        }
+        if buf.len() > isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN {
+            return None;
         }
         match channel.wait().await {
             Some(russh::ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
@@ -265,6 +373,9 @@ async fn read_ctl_line(channel: &mut russh::Channel<client::Msg>) -> Option<Vec<
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             buf.truncate(pos);
             return Some(buf);
+        }
+        if buf.len() > isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN {
+            return None;
         }
         match channel.wait().await {
             Some(russh::ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
@@ -387,8 +498,9 @@ mod tests {
             .expect("a ctl message should arrive before the timeout")
             .expect("the frame sender must not have been dropped");
         let bytes = match event {
-            CtlRelayEvent::Message(bytes) => bytes,
+            CtlRelayEvent::Message { bytes, .. } => bytes,
             CtlRelayEvent::BuildStarted { .. } => panic!("SetTitle must relay as a plain Message, not BuildStarted"),
+            CtlRelayEvent::BuildAborted { .. } => panic!("SetTitle must relay as a plain Message, not BuildAborted"),
         };
         let msg = isekai_protocol::decode_ctl_message(&bytes).expect("relayed bytes must decode as a ctl message");
         assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "hello-ctl".to_string() });
