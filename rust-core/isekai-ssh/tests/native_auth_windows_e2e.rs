@@ -354,5 +354,7 @@ async fn certificate_file_authenticates_over_the_native_windows_path() {
     assert_eq!(connection_count.load(Ordering::SeqCst), 1, "the mock sshd (which rejects plain publickey auth) must have accepted exactly one certificate-authenticated connection");
 
     let _ = tab.start_kill();
-    let _ = helper.child.kill();
+    // `helper` (a `HelperProcess`) kills its child in `Drop` when it goes out
+    // of scope at the end of this function — same as `MuxFixture`'s `_helper`
+    // field in `mux_holder_windows_e2e.rs`.
 }
