@@ -124,7 +124,7 @@ async fn rm_recursive_deletes_a_nonempty_directory() {
     std::fs::create_dir(&sub).unwrap();
     std::fs::write(sub.join("f.txt"), b"x").unwrap();
 
-    let (code, stdout, stderr) = run_ctl_file(&["rm", "--recursive", sub.to_str().unwrap()]).await;
+    let (code, _stdout, stderr) = run_ctl_file(&["rm", "--recursive", sub.to_str().unwrap()]).await;
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(!sub.exists());
 }
