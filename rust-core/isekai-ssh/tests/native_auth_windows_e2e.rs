@@ -37,6 +37,8 @@
 //! `russh-stream-session/src/lib.rs`'s own test module of the same shape.
 #![cfg(windows)]
 
+mod support;
+
 use std::io::BufRead as StdBufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -54,7 +56,6 @@ use russh_keys::ssh_key::private::Ed25519Keypair;
 use russh_keys::ssh_key::Certificate;
 use russh_keys::{PrivateKey, PublicKey};
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::{Child, Command as TokioCommand};
 
 fn isekai_ssh_bin_path() -> PathBuf {
@@ -160,18 +161,7 @@ impl server::Handler for CertOnlyShellHandler {
 }
 
 async fn spawn_cert_only_ssh_server(trusted_ca: PublicKey, connection_count: Arc<AtomicUsize>) -> (SocketAddr, String) {
-    let keypair = Ed25519Keypair::from_seed(&[97u8; 32]);
-    let host_key = PrivateKey::from(keypair);
-    let fingerprint = host_key.public_key().fingerprint(russh_keys::HashAlg::Sha256).to_string();
-    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
-    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut sh = CertOnlyShellServer { trusted_ca, connection_count };
-    tokio::spawn(async move {
-        use server::Server as _;
-        let _ = sh.run_on_socket(config, &listener).await;
-    });
-    (addr, fingerprint)
+    support::spawn_sshd(97, CertOnlyShellServer { trusted_ca, connection_count }).await
 }
 
 fn seed_ssh_host_key_trust(home: &std::path::Path, host_port: &str, fingerprint: &str) {
