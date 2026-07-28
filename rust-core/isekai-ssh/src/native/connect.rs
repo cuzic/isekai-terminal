@@ -515,12 +515,23 @@ pub(crate) fn decide_session_kind(
     terminal_modes: &[(russh::Pty, u32)],
 ) -> SessionKind {
     match remote_cmd {
-        Some(cmd) if request_tty == crate::wrapper::RequestTty::No => SessionKind::Exec { command: cmd.join(" ") },
+        Some(cmd) if !wants_pty(remote_cmd, request_tty) => SessionKind::Exec { command: cmd.join(" ") },
         Some(cmd) => {
             SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec(), command: Some(cmd.join(" ")) }
         }
         None => SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec(), command: None },
     }
+}
+
+/// The PTY-or-not half of [`decide_session_kind`]'s decision, split out so
+/// `native::mux::mod`'s `want_pty` (sent to the owner in `Frame::Hello`,
+/// before any `SessionKind` exists to ask) can reuse the exact same logic
+/// instead of re-deriving it as an untested, easily-drifting duplicate
+/// boolean expression — `decide_session_kind`'s own tests exercise every
+/// `RequestTty` variant × with/without a command, so this function is
+/// covered transitively through them.
+pub(crate) fn wants_pty(remote_cmd: Option<&[String]>, request_tty: crate::wrapper::RequestTty) -> bool {
+    !(remote_cmd.is_some() && request_tty == crate::wrapper::RequestTty::No)
 }
 
 /// The authenticated-session half of [`connect_attempt`], split out so
@@ -640,8 +651,22 @@ async fn run_authenticated_session(
     // private forward. Reached only on success, so a failed attempt (which
     // returns above) never `take`s the hook out of the caller's `Option` — it
     // stays available for the always-connects re-bootstrap retry.
+    //
+    // Deliberately `resolution.ctl_socket_enabled()`, not `ctl_enabled`: a
+    // holder is spawned once per host and re-exec'd with *this* invocation's
+    // exact argv (`mux::holder`), then goes on to serve every future tab to
+    // that host until it idle-exits — `ctl_enabled` also folds in
+    // `should_attempt_ctl_forward`'s "no trailing remote command" check,
+    // which is about *this one session's own* foreground forward, not
+    // whether the route table the holder hands out to *other, later,
+    // interactive* clients should exist at all. Gating the holder's route
+    // table on it meant a holder spawned by `isekai-ssh host -- cmd` (this
+    // PR's own mux remote-command feature makes that pattern usable for the
+    // first time) permanently lost ctl-socket for every sibling tab it
+    // served afterward, with no way to recover short of the holder idle-exiting.
+    let ctl_routes_for_holder = resolution.ctl_socket_enabled().then(|| forward_routes.clone());
     if let Some(hook) = owner_hook.take() {
-        let serve_handle = hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let serve_handle = hook(handle.clone(), ctl_routes_for_holder);
         let _ = serve_handle.await;
         return Ok(0);
     }

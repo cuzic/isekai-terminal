@@ -322,10 +322,11 @@ where
     // path (`resolution.profile()`).
     let host = prepared.resolution().profile().to_string();
     // Same `-t`/`-T` intent the non-mux path derives via
-    // `decide_session_kind` (`connect.rs`), sent to the owner in `Hello` so
-    // it can make the identical decision — see `client::run`'s doc comment.
+    // `decide_session_kind`/`wants_pty` (`connect.rs`), sent to the owner in
+    // `Hello` so it can make the identical decision — see `client::run`'s
+    // doc comment.
+    let want_pty = connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
     let remote_command = prepared.plan().remote_command().map(|cmd| cmd.join(" "));
-    let want_pty = !(remote_command.is_some() && prepared.plan().request_tty == crate::wrapper::RequestTty::No);
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
         // The holder released its claim (or hadn't finished writing the token
@@ -577,9 +578,11 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string())
-            .await
-            .unwrap();
+        let outcome = super::client::run_inner(
+            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, super::client::ClientOutcome::Exited(0), "a clean remote exit must reach the client as Exited(0)");
         assert!(
