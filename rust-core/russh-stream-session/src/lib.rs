@@ -864,18 +864,30 @@ mod tests {
         .await
         .expect("shell+command channel should open");
 
-        let mut saw_data = false;
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    assert_eq!(&data[..], b"ran: echo hi\n", "the command must be exec'd, not opened as an interactive shell");
-                    saw_data = true;
+        use tokio::time::{timeout, Duration};
+
+        // Timeout, not a bare loop: if this regresses to calling
+        // `request_shell` instead of `exec`, `EchoExecServer` has no
+        // `shell_request` handler — `russh`'s default implementation is a
+        // silent `Ok(())` that never sends data, an exit status, or closes
+        // the channel — so a regression would hang here forever.
+        let saw_data = timeout(Duration::from_secs(10), async {
+            let mut saw_data = false;
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => {
+                        assert_eq!(&data[..], b"ran: echo hi\n", "the command must be exec'd, not opened as an interactive shell");
+                        saw_data = true;
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => assert_eq!(exit_status, 0),
+                    None => break,
+                    _ => {}
                 }
-                Some(ChannelMsg::ExitStatus { exit_status }) => assert_eq!(exit_status, 0),
-                None => break,
-                _ => {}
             }
-        }
+            saw_data
+        })
+        .await
+        .expect("timed out waiting for exec output — open_channel likely regressed to request_shell (no shell_request handler on the mock server)");
         assert!(saw_data, "SessionKind::Shell with a command must exec it, not silently drop into a login shell");
     }
 

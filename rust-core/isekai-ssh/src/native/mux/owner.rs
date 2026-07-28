@@ -930,24 +930,34 @@ mod tests {
         .await
         .unwrap();
 
-        match read_frame(&mut client).await.unwrap().unwrap() {
-            Frame::HelloAck { version } => assert_eq!(version, MUX_PROTOCOL_VERSION),
-            other => panic!("expected HelloAck, got {other:?}"),
-        }
-
-        let mut seen = Vec::new();
-        loop {
-            match read_frame(&mut client).await.unwrap() {
-                Some(Frame::Stdout(data)) => {
-                    seen.extend_from_slice(&data);
-                    if seen.windows(3).any(|w| w == b"ran") {
-                        break;
-                    }
-                }
-                Some(Frame::Exit(_)) | None => break,
-                Some(_) => {}
+        // Timeout, not a bare `.await`: if this regresses to `SessionKind::Shell`
+        // (no command), `EchoExecServer` has no `shell_request` handler at
+        // all — `russh`'s default implementation is a silent `Ok(())]` that
+        // never sends data, an exit status, or closes the channel — so a
+        // regression would hang here forever instead of failing outright.
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            match read_frame(&mut client).await.unwrap().unwrap() {
+                Frame::HelloAck { version } => assert_eq!(version, MUX_PROTOCOL_VERSION),
+                other => panic!("expected HelloAck, got {other:?}"),
             }
-        }
+
+            let mut seen = Vec::new();
+            loop {
+                match read_frame(&mut client).await.unwrap() {
+                    Some(Frame::Stdout(data)) => {
+                        seen.extend_from_slice(&data);
+                        if seen.windows(3).any(|w| w == b"ran") {
+                            break;
+                        }
+                    }
+                    Some(Frame::Exit(_)) | None => break,
+                    Some(_) => {}
+                }
+            }
+            seen
+        })
+        .await
+        .expect("timed out waiting for exec output — SessionKind likely regressed to Shell (no shell_request handler on the mock server)");
         assert_eq!(seen, b"ran: echo hi\n", "the remote_command must be exec'd, not silently dropped in favor of a login shell");
 
         drop(client);
