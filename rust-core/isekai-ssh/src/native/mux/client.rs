@@ -66,9 +66,15 @@ pub(crate) enum ClientRunResult {
 /// during the handshake (before any shell existed), it instead returns
 /// [`ClientRunResult::Rejected`] so the caller can retry unmultiplexed.
 ///
+/// `remote_command`/`want_pty` are sent to the owner in [`Frame::Hello`] and
+/// decide the same `-t`/`-T` `SessionKind` as the non-mux path's
+/// `native::connect::decide_session_kind` — see that function's doc comment.
+///
 /// Propagates local terminal resize events to the owner via [`Frame::Resize`]
-/// frames (which the owner forwards to the remote PTY).
-pub(crate) async fn run<Conn>(conn: Conn, token: &[u8], host: String) -> Result<ClientRunResult>
+/// frames (which the owner forwards to the remote PTY) — skipped when
+/// `want_pty` is `false`, since a PTY-less `SessionKind::Exec` channel has no
+/// terminal geometry to resize.
+pub(crate) async fn run<Conn>(conn: Conn, token: &[u8], host: String, remote_command: Option<String>, want_pty: bool) -> Result<ClientRunResult>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -76,7 +82,7 @@ where
     let (cols, rows) = super::super::console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
-    let resize_rx = super::super::console::spawn_resize_watcher();
+    let resize_rx = if want_pty { super::super::console::spawn_resize_watcher() } else { None };
 
     let _raw_mode = super::super::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
     let outcome = run_inner(
@@ -91,6 +97,8 @@ where
         tokio::io::stderr(),
         resize_rx,
         host,
+        remote_command,
+        want_pty,
     )
     .await?;
 
@@ -134,6 +142,8 @@ pub(crate) async fn run_inner<CR, CW, I, O, E>(
     mut stderr: E,
     mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
     host: String,
+    remote_command: Option<String>,
+    want_pty: bool,
 ) -> Result<ClientOutcome>
 where
     CR: AsyncRead + Unpin + Send + 'static,
@@ -142,7 +152,7 @@ where
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    write_frame(conn_write, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: token.to_vec(), term, cols, rows })
+    write_frame(conn_write, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: token.to_vec(), term, cols, rows, want_pty, remote_command })
         .await
         .map_err(|e| anyhow!("isekai-ssh: failed to send Hello to the owner: {e}"))?;
 
@@ -369,6 +379,8 @@ mod tests {
             &mut stderr,
             None,
             "mybox".to_string(),
+            None,
+            true,
         )
         .await;
         (outcome, stdout, stderr)
@@ -559,7 +571,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string())
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true)
             .await
             .unwrap();
 
@@ -617,7 +629,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None, "mybox".to_string())
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None, "mybox".to_string(), None, true)
             .await
             .unwrap();
 
@@ -720,7 +732,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string())
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true)
             .await
             .unwrap();
 
@@ -787,7 +799,7 @@ mod tests {
         let mut stderr = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string()),
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true),
         )
         .await
         .expect("run_inner must not hang waiting on a second build that the active_build guard silently ignores")
@@ -887,7 +899,7 @@ mod tests {
         let mut stderr = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string()),
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true),
         )
         .await
         .expect("run_inner must not hang after the abort sentinel and a clean Exit")
