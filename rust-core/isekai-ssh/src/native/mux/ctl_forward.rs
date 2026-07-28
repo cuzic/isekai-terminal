@@ -171,15 +171,20 @@ pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::
 /// One event `pump_to_frames` sends to `owner.rs::relay_loop` over its
 /// `ctl_frame_rx`. Every existing message kind (title/clip/setvar/getvar,
 /// and the initial `BuildRequest` line itself) is a one-shot
-/// [`Message`](CtlRelayEvent::Message) exactly as before. `BuildRequest`
-/// (Epic P Phase 2) additionally follows up with
-/// [`BuildStarted`](CtlRelayEvent::BuildStarted): `relay_loop` must
+/// [`Message`](CtlRelayEvent::Message) exactly as before, now tagged with its
+/// originating channel's id — review finding: without it, a hand-crafted
+/// (non-`isekai-pipe ctl`) line on an *unrelated* forwarded channel that
+/// happens to decode as `BuildFinished` would clear `active_build_reply_tx`/
+/// `active_build_channel_id` for whichever build is actually in flight, the
+/// same cross-channel confusion class [`BuildAborted`](CtlRelayEvent::BuildAborted)
+/// exists to prevent. `BuildRequest` (Epic P Phase 2) additionally follows up
+/// with [`BuildStarted`](CtlRelayEvent::BuildStarted): `relay_loop` must
 /// remember `reply_tx` so it can forward the client's own `Frame::Ctl`
 /// replies into it, since only the owner holds the real SSH channel a mux
 /// client's build needs to stream its output back over
 /// (`super::owner`/`super::client`'s module docs cover the full round trip).
 pub(crate) enum CtlRelayEvent {
-    Message(Vec<u8>),
+    Message { channel_id: russh::ChannelId, bytes: Vec<u8> },
     BuildStarted { channel_id: russh::ChannelId, reply_tx: mpsc::UnboundedSender<Vec<u8>> },
     /// The forwarded channel a build was running over disconnected
     /// (`Close`/`None`, never `Eof` — see `pump_to_frames`'s docs) before a
@@ -267,7 +272,7 @@ pub(crate) async fn pump_to_frames(
             }
 
             let is_build_request = matches!(decoded, Ok(isekai_protocol::CtlMessage::BuildRequest { .. }));
-            if frame_tx.send(CtlRelayEvent::Message(line)).is_err() {
+            if frame_tx.send(CtlRelayEvent::Message { channel_id, bytes: line }).is_err() {
                 return;
             }
             if !is_build_request {
@@ -308,6 +313,12 @@ pub(crate) async fn pump_to_frames(
                     }
                 }
             }
+            // `russh::Channel` has no `Drop` impl, so nothing sends
+            // `CHANNEL_CLOSE` unless we do (same rationale as
+            // `build_relay.rs::run_build_over_channel`'s identical call) —
+            // harmless no-op if the channel is already closing (the
+            // `disconnected`/`BuildAborted` exit above).
+            let _ = channel.close().await;
         });
     }
 }
@@ -487,7 +498,7 @@ mod tests {
             .expect("a ctl message should arrive before the timeout")
             .expect("the frame sender must not have been dropped");
         let bytes = match event {
-            CtlRelayEvent::Message(bytes) => bytes,
+            CtlRelayEvent::Message { bytes, .. } => bytes,
             CtlRelayEvent::BuildStarted { .. } => panic!("SetTitle must relay as a plain Message, not BuildStarted"),
             CtlRelayEvent::BuildAborted { .. } => panic!("SetTitle must relay as a plain Message, not BuildAborted"),
         };

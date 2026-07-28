@@ -188,9 +188,9 @@ pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::
 /// A build `client.rs::run_inner` is currently streaming, so it can abort it
 /// (kill the child) when the owner connection is lost or the owner relays a
 /// [`BUILD_ABORTED_SENTINEL`]. Dropping an `ActiveBuild` **does** still kill
-/// the build even without calling [`abort`](Self::abort): `abort_rx` is a
-/// `oneshot::Receiver`, which resolves with `Err(RecvError)` as soon as its
-/// sender is dropped, and `run_client_build`'s select loop treats that
+/// the build even without calling `abort` (test-only, see below): `abort_rx`
+/// is a `oneshot::Receiver`, which resolves with `Err(RecvError)` as soon as
+/// its sender is dropped, and `run_client_build`'s select loop treats that
 /// exactly like an explicit abort signal. This is harmless today only
 /// because every current drop site runs after the task has already
 /// finished — but nothing enforces that, so prefer
@@ -275,8 +275,26 @@ async fn run_client_build(host: String, profile_name: String, build_out_tx: mpsc
         .spawn()
     {
         Ok(child) => child,
+        // Mirrors the unknown-profile arm above and `run_build_over_channel`'s
+        // matching arm (review finding: this side was missed in an earlier
+        // pass — a spawn failure here used to just log and return with
+        // nothing sent into `build_out_tx`, leaving `active_build` `Some`
+        // forever — every later `BuildRequest` on this tab silently ignored
+        // by `client.rs`'s `active_build.is_some()` guard, and the owner's
+        // `active_build_reply_tx` never cleared either, rejecting every
+        // subsequent remote build with 125 while this one hung with no
+        // reply at all).
         Err(e) => {
             log_line!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}");
+            if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
+                isekai_protocol::BuildOutputStream::Stderr,
+                format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}\n").into_bytes(),
+            ) {
+                let _ = build_out_tx.send(chunk);
+            }
+            if let Ok(finished) = crate::build_exec::encode_build_finished(126, Vec::new()) {
+                let _ = build_out_tx.send(finished);
+            }
             return;
         }
     };

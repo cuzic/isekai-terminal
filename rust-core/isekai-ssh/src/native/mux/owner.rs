@@ -402,19 +402,25 @@ where
                     // A ctl message this client received over its private
                     // forward: relay it as a `Frame::Ctl` on the same writer as
                     // stdout/stderr (so all owner→client writes stay ordered on
-                    // one stream). Also covers `pump_to_frames`'s synthesized
-                    // abort sentinel (Epic P Phase 2) — from this branch's
-                    // perspective it's just another message to relay, but
-                    // decoding it as `BuildFinished` here too keeps
-                    // `active_build_reply_tx` from outliving a build that
-                    // ended because the *remote* went away rather than
-                    // because the client finished normally (see the
-                    // client-frame `Frame::Ctl` arm above for that path).
-                    Some(ctl_forward::CtlRelayEvent::Message(bytes)) => {
-                        if matches!(
-                            isekai_protocol::decode_ctl_message(&bytes),
-                            Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
-                        ) {
+                    // one stream). A message decoding as `BuildFinished` here
+                    // only clears `active_build_reply_tx`/
+                    // `active_build_channel_id` if it arrived on the channel
+                    // those are currently tracking — review finding: an
+                    // earlier version cleared on *any* channel's
+                    // `BuildFinished`-shaped message, so a hand-crafted line
+                    // on an unrelated forwarded channel (never actually sent
+                    // by real `isekai-pipe ctl`, which never emits
+                    // `BuildFinished` itself) could clear state for a build
+                    // that's still genuinely in flight, the same
+                    // cross-channel confusion class the `BuildAborted` arm
+                    // below exists to prevent.
+                    Some(ctl_forward::CtlRelayEvent::Message { channel_id, bytes }) => {
+                        if active_build_channel_id == Some(channel_id)
+                            && matches!(
+                                isekai_protocol::decode_ctl_message(&bytes),
+                                Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                            )
+                        {
                             active_build_reply_tx = None;
                             active_build_channel_id = None;
                         }
