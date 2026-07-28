@@ -30,6 +30,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -66,6 +67,7 @@ import tools.isekai.terminal.ui.MouseTouchStep
 import tools.isekai.terminal.ui.advanceResizeStability
 import tools.isekai.terminal.ui.classifyNormalGesture
 import tools.isekai.terminal.ui.computeResizeTargetColsRows
+import tools.isekai.terminal.ui.effectiveCanvasHeightPx
 import tools.isekai.terminal.ui.decideMouseTouchStep
 import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
@@ -501,9 +503,15 @@ fun TerminalScreenBody(
                 // composition時の扱いは advanceResizeStability のdoc参照)。
                 val isImeVisible = WindowInsets.isImeVisible
                 var resizeStability by remember {
-                    mutableStateOf(ResizeStabilityState(hasObservedImeClosed = !isImeVisible, stableHeightPx = heightPx))
+                    mutableStateOf(
+                        ResizeStabilityState(
+                            hasObservedImeClosed = !isImeVisible,
+                            stableHeightPx = heightPx,
+                            lastWidthPx = widthPx,
+                        ),
+                    )
                 }
-                resizeStability = advanceResizeStability(resizeStability, isImeVisible, heightPx)
+                resizeStability = advanceResizeStability(resizeStability, isImeVisible, heightPx, widthPx)
                 val stableHeightPx = resizeStability.stableHeightPx
 
                 val cellDims = remember(density, fontScale, terminalTypeface) {
@@ -581,16 +589,24 @@ fun TerminalScreenBody(
                 }
 
                 // ジェスチャーのヒットテスト(タップ/選択/ピンチ)に使うセル寸法・cols/rows
-                // は、SshTerminalCanvas が実際の描画に使う値(実ピクセル領域を
-                // displayUpdate.cols/rows へ均等割りしたセルサイズ)に厳密に合わせる。
-                // 上の cellDims(フォント計測ベース)・cols/rows(resize要求用、IME非表示時
-                // 想定の"安定"サイズ)をそのまま使うと、IME表示中(タスク#19の変更でtty側
-                // cols/rowsを据え置くため、実ビューポート寸法と一致しなくなる)や
-                // resize飛行中にタップ位置が実際のセルとズレる(Codexレビュー指摘:
-                // TerminalScreen.kt既存の不整合。#46でのdisplayUpdate合成側の修正と同種)。
+                // は、SshTerminalCanvas が実際の描画に使う値に厳密に合わせる。SshTerminalCanvas
+                // 自体はIMEを意識せず「自身に割り当てられたレイアウトサイズ ÷ rows/cols」で
+                // セルサイズを決めるため、ここでの高さも(IME表示中に縮む生の[heightPx]ではなく)
+                // Canvasへ実際に渡している高さである[effectiveHeightPx]を使う必要がある(下の
+                // SshTerminalCanvas呼び出しの`.height(effectiveHeightPx)`と対称、タスク#19後追い
+                // 修正: IME表示中に文字が縦に潰れて見えていた不具合。高さをIME開閉に関わらず
+                // 固定してフォントサイズを保ち、Canvas自体を下端に揃えて上側をクリップすることで
+                // 「表示行数だけが変わる」挙動にする)。
+                //
+                // `stableHeightPx`をそのまま使わず`effectiveCanvasHeightPx`
+                // (`max(stableHeightPx, heightPx)`)を経由するのは、`advanceResizeStability`
+                // が検知しない一時的な高さ増加(nav bar insetの計算揺れ等、`TerminalResize.kt`
+                // のdoc参照)の間もビューポートより低く描画されて上端に空白が出ないようにする
+                // ため(Opusレビュー指摘)。
+                val effectiveHeightPx = effectiveCanvasHeightPx(stableHeightPx, heightPx)
                 val renderCols = displayUpdate.cols.toInt().coerceAtLeast(1)
                 val renderRows = displayUpdate.rows.toInt().coerceAtLeast(1)
-                val renderCellDims = Pair(widthPx / renderCols, heightPx / renderRows)
+                val renderCellDims = Pair(widthPx / renderCols, effectiveHeightPx / renderRows)
 
                 // pointerInput の key に renderCellDims/renderCols/renderRows を直接使うと、
                 // ピンチで fontScale が変わる → resize要求 → 新しい displayUpdate が届く →
@@ -686,8 +702,28 @@ fun TerminalScreenBody(
                         searchHighlight = searchHighlight,
                         theme = terminalTheme,
                         typeface = terminalTypeface,
+                        // IME表示中はこの親`Box`自体が`.imePadding()`分だけ縮む。素朴に
+                        // `.fillMaxSize()`のままだとCanvas自身の実測高さもそのまま縮み、
+                        // rows(タスク#19でIME表示中は凍結される)は変わらないのに
+                        // `size.height`だけ縮むため、SshTerminalCanvas内部の
+                        // `cellH = size.height / rows`が縮んでフォントが潰れて見える。
+                        // `.height(stableHeightPx)`は素朴には親の(縮んだ)incoming
+                        // constraintsでクランプされてしまい効かない(`Modifier.height`は
+                        // enforceIncoming=trueで動作するため)。`wrapContentHeight(
+                        // Alignment.Bottom, unbounded = true)`で`.height()`以下の子測定
+                        // だけ高さ上限を外しつつ、この階層自体が上位へ報告するサイズは
+                        // 元の(縮んだ)incoming constraintsのまま保つことで、親Boxを
+                        // 伸ばさず`clipToBounds()`が正しく効くようにしている。
+                        // `Alignment.Bottom`により固定高さのCanvasは下端を揃えて配置される
+                        // ため、キーボードに隠れた分だけ上側(履歴側)の行が見えなくなり、
+                        // カーソルのある下側の行は見え続ける(タスク#19が「表示領域だけ変え、
+                        // tty側cols/rowsは据え置く」と意図していた挙動を、Canvas側でも
+                        // 実現する後追い修正)。
                         modifier = Modifier
-                            .fillMaxSize()
+                            .clipToBounds()
+                            .fillMaxWidth()
+                            .wrapContentHeight(Alignment.Bottom, unbounded = true)
+                            .height(with(density) { effectiveHeightPx.toDp() })
                             .pointerInput(Unit) {
                                 awaitEachGesture {
                                     // ジェスチャー開始時点の最新値を1回だけ読む
