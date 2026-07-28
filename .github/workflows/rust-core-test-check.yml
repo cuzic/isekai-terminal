@@ -262,6 +262,16 @@ jobs:
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test mux_holder_windows_e2e
 
+      # `native_auth_windows_e2e.rs`: 同じ理由(mux_holder_windows_e2e同様、
+      # `main.rs`の`#[cfg(windows)]`アーム経由でしか実行されない)でssh_test_shim
+      # を使わない独立stepとして、5ファイルループより前に配置する。CertificateFile
+      # 認証(非対話)のみを検証する — keyboard-interactive/パスフレーズ対話認証は
+      # このファイルのモジュールdocが説明する通り原理的にe2eで到達不能なため対象外。
+      - name: cargo test -p isekai-ssh --test native_auth_windows_e2e (Windows, CertificateFile auth over the native path)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_auth_windows_e2e
+
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim
       # (コンパイル済み.exeパススルー、`wrapper_auto_bootstrap_e2e.rs::
