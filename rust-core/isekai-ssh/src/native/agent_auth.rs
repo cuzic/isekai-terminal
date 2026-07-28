@@ -95,6 +95,25 @@ pub(crate) fn agent_connect_failure_is_benign(target: &AgentTarget) -> bool {
     matches!(target, AgentTarget::Default)
 }
 
+/// Whether a failure to *list identities from an already-connected* agent
+/// (`AgentClient::request_identities`) should be treated as "the agent
+/// offered zero identities" — i.e. the caller should behave exactly as if
+/// `request_identities` had returned `Ok(vec![])` — rather than a hard
+/// error. Same platform-default-vs-explicit-target asymmetry as
+/// [`agent_connect_failure_is_benign`] (which governs the earlier failure to
+/// even *connect*), and delegates to it: a default agent hiccuping
+/// *after* a successful connect (e.g. the `ssh-agent` service restarting
+/// mid-handshake, or some other transient failure) is exactly as
+/// unremarkable for the opportunistic platform-default agent as a failure
+/// to connect at all, and must not block a login that the
+/// keyboard-interactive fallback tried afterward would otherwise have
+/// completed successfully. An explicitly configured `IdentityAgent <path>`
+/// keeps its hard error unchanged — the user asked for that specific agent,
+/// so a failure to list its identities is a real, actionable problem.
+pub(crate) fn agent_list_identities_failure_is_benign(target: &AgentTarget) -> bool {
+    agent_connect_failure_is_benign(target)
+}
+
 /// Connects to the agent named by `target`, Windows-only (named pipe or
 /// Pageant) — the actual point of this whole module. Not exercised by any
 /// test in this codebase: doing so needs a real Windows OpenSSH agent or
@@ -247,6 +266,36 @@ mod tests {
         assert!(
             !agent_connect_failure_is_benign(&AgentTarget::None),
             "IdentityAgent none never connects, so it is not a 'benign connect failure' either"
+        );
+    }
+
+    /// Regression: a *default* agent that fails `request_identities` after a
+    /// successful connect (e.g. the `ssh-agent` service restarting
+    /// mid-handshake) must be treated the same as "zero identities offered",
+    /// letting `try_agent_auth` fall through to the keyboard-interactive
+    /// fallback instead of hard-failing the whole login on a transient
+    /// hiccup. An *explicitly* configured `IdentityAgent <path>` keeps its
+    /// hard error. (`try_agent_auth` itself is `cfg(windows)`-only and needs
+    /// a real `AgentClient<NamedPipeClient>` — same as
+    /// `agent_connect_failure_is_benign`/`connect_agent` above, there is no
+    /// seam in this crate to fake `request_identities` itself on Linux, so
+    /// only the platform-generic *decision* is unit-tested here.)
+    #[test]
+    fn a_default_agent_list_identities_failure_is_benign_but_an_explicit_one_is_not() {
+        assert!(
+            agent_list_identities_failure_is_benign(&AgentTarget::Default),
+            "a transient failure listing identities from the platform-default agent must not \
+             block a login that keyboard-interactive would otherwise have completed"
+        );
+        assert!(
+            !agent_list_identities_failure_is_benign(&AgentTarget::Path(r"\\.\pipe\configured-agent".to_string())),
+            "an explicitly configured IdentityAgent must still surface a request_identities \
+             failure as a real error"
+        );
+        assert!(
+            !agent_list_identities_failure_is_benign(&AgentTarget::None),
+            "IdentityAgent none never connects (and so never reaches request_identities \
+             either), so it is not a 'benign list-identities failure' either"
         );
     }
 
