@@ -99,6 +99,8 @@ jobs:
           ALLOWED_WINDOWS=(
             mux_holder_windows_e2e
             native_auth_windows_e2e
+            native_agent_auth_windows_e2e
+            native_ctl_build_relay_windows_e2e
             wrapper_auto_bootstrap_e2e
             doctor_e2e
             init_e2e
@@ -329,6 +331,26 @@ jobs:
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test native_auth_windows_e2e
+
+      # `native_agent_auth_windows_e2e.rs`: 同じ理由(main.rsの#[cfg(windows)]
+      # アーム経由でしか実行されない)で独立step。SSH agent認証
+      # (native/agent_auth.rs::connect_agent、実Windows名前付きパイプ経由で
+      # 一度もテストされていなかった経路)をin-process russh_keys::agent::server
+      # 経由で検証する。
+      - name: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e (Windows, SSH agent auth over a named pipe)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e
+
+      # `native_ctl_build_relay_windows_e2e.rs`: 同じ理由で独立step。Windows
+      # native mux経由のctl-socket転送(native/mux/ctl_forward.rs)とEpic P
+      # ビルドトリガーリレー(native/mux/build_relay.rs、ISEKAI_PIPE_DESIGN.md
+      # 自身が実Windows機での検証が一度も行われていないと明記していた経路)を
+      # 実cmd.exe子プロセスの起動まで含めて検証する。
+      - name: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e (Windows, native mux ctl-forward + Epic P build relay)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e
 
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim
