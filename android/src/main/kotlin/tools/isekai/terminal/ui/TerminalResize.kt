@@ -38,16 +38,25 @@ data class ResizeStabilityState(
  * それ以降は正しく安定化される。Codexレビュー指摘、タスク#19: 初回composition時に
  * IMEが既に表示中のケースへの対応)。
  *
- * 回転や実ウィンドウサイズ変化・ピンチズーム(cellW/cellHの変化)による本当の
- * サイズ変化は、IMEが非表示である限りそのまま`liveHeightPx`に反映されて追随する。
+ * 回転や実ウィンドウサイズ変化による本当のサイズ変化は、IMEが非表示である限り
+ * そのまま`liveHeightPx`/`liveWidthPx`に反映されて追随する(ピンチズームは
+ * `liveWidthPx`/`liveHeightPx`自体を変えず`cellW`/`cellH`だけを変えるため、この
+ * 関数の追随対象ではなく[computeResizeTargetColsRows]呼び出し側で直接反映される)。
  *
- * IME表示中に本当のサイズ変化が起きた場合(回転・分割ペインのリサイズ・上部バーの
- * 自動非表示など)は例外的に即座に反映する。判定は2通り: (1)[liveWidthPx](IMEの
- * 影響を受けない値)が前回観測時から変化した、(2)`.imePadding()`は高さを縮める方向
- * にしか働かないため、[liveHeightPx]が現在の凍結値[ResizeStabilityState.stableHeightPx]
- * より大きい(IMEでは説明がつかない増加)。SshTerminalCanvas自体の描画高さもこの
- * 安定値に固定している(タスク#19後追い修正)ため、これらを無視して古い高さのまま
- * 凍結し続けると、新しい画面サイズと大きく食い違ったままクリップされてしまう。
+ * IME表示中に本当の横幅変化が起きた場合(回転・分割ペインのリサイズなど、[liveWidthPx]
+ * ——IMEの影響を受けない値——が前回観測時から変わった場合)は例外的に即座に反映する。
+ * この判定を「凍結値[ResizeStabilityState.stableHeightPx]より[liveHeightPx]が大きい」
+ * という高さ側の条件でも行うことは意図的に避けている(Opusレビュー指摘): 端末・OS
+ * バージョンによっては`.navigationBarsPadding()`との相互作用でIME表示アニメーション中に
+ * navigation barのinsetが一時的に0扱いになることがあり(上のコメント参照)、その1フレームだけ
+ * `liveHeightPx`が凍結値を上回ってしまう。高さ側もtriggerに含めると、この一時的な
+ * inset計算の乱れだけで[hasObservedImeClosed]が`false`へ戻り、そのIME表示セッション
+ * 全体が「まだ基準が無い」状態に落ちて`liveHeightPx`を追随し続けてしまう(=このPRが
+ * 直そうとしているフォント潰れ症状と、tty側への不要なresizeの両方が復活する)。
+ * 高さが一時的に凍結値を超えるケース自体は、[ResizeStabilityState.stableHeightPx]を
+ * そのまま使わず呼び出し側([TerminalScreen.kt]の`.height()`/`renderCellDims`)が
+ * `max(stableHeightPx, liveHeightPx)`を使うことで「凍結値を下回ることはない」を
+ * 保ちながら吸収する(=描画上の空白は出ないが、状態自体は書き換えない)。
  *
  * このとき単に`liveHeightPx`を採用するだけでなく[hasObservedImeClosed]も`false`へ
  * 戻す——「まだ信頼できる凍結基準が無い」状態に戻すことで、次に本当にIMEが閉じて
@@ -55,6 +64,11 @@ data class ResizeStabilityState(
  * サイズ変化より前の(もう無効な)値へ次のIME開閉時に凍結してしまい、IMEを閉じた
  * 瞬間に改めてptyへresizeが飛ぶ——タスク#19が抑止したかった「IME開閉のたびの
  * 不要なresize」が、サイズ変化の直後だけ部分的に復活してしまう。
+ *
+ * 幅が変わらない縦方向のみの本当のサイズ変化(IME表示中の上部バー自動非表示・分割
+ * ペインの縦リサイズ等)は、この関数では検知しない既知のギャップ(Opusレビュー指摘)。
+ * 幅を伴わない高さ増加をtriggerに使うと上記の理由で誤検知するため、あえて対象外にした
+ * ——このケースはIMEが閉じた時点で自己修復する。
  */
 fun advanceResizeStability(
     previous: ResizeStabilityState,
@@ -62,11 +76,23 @@ fun advanceResizeStability(
     liveHeightPx: Float,
     liveWidthPx: Float,
 ): ResizeStabilityState {
-    val realSizeChange = liveWidthPx != previous.lastWidthPx || liveHeightPx > previous.stableHeightPx
+    val realSizeChange = liveWidthPx != previous.lastWidthPx
     val hasObservedImeClosed = if (realSizeChange) !isImeVisible else (previous.hasObservedImeClosed || !isImeVisible)
     val stableHeightPx = if (!hasObservedImeClosed || !isImeVisible) liveHeightPx else previous.stableHeightPx
     return ResizeStabilityState(hasObservedImeClosed, stableHeightPx, liveWidthPx)
 }
+
+/**
+ * [SshTerminalCanvas]の描画高さ・[TerminalScreen.kt]の`renderCellDims`に使う実効的な
+ * 高さ(px)。[ResizeStabilityState.stableHeightPx](IME開閉の影響を除いた凍結値)を
+ * そのまま使うと、[advanceResizeStability]が検知しない一時的な高さの増加
+ * (nav bar insetの計算揺れ・幅を伴わない縦方向のみの本当のサイズ変化)の間、
+ * ビューポートより低く描画されて上端に空白が出てしまう。[liveHeightPx]との
+ * `max`を取ることで、凍結状態(=tty側cols/rowsへの反映)はそのままに、描画だけは
+ * 「ビューポートより低くならない」を常に保証する。
+ */
+fun effectiveCanvasHeightPx(stableHeightPx: Float, liveHeightPx: Float): Float =
+    stableHeightPx.coerceAtLeast(liveHeightPx)
 
 /**
  * ビューポート寸法とセルサイズから、tty(Rust側`SessionCore::resize`)へ要求する

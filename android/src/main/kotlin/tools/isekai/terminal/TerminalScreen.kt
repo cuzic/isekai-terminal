@@ -67,6 +67,7 @@ import tools.isekai.terminal.ui.MouseTouchStep
 import tools.isekai.terminal.ui.advanceResizeStability
 import tools.isekai.terminal.ui.classifyNormalGesture
 import tools.isekai.terminal.ui.computeResizeTargetColsRows
+import tools.isekai.terminal.ui.effectiveCanvasHeightPx
 import tools.isekai.terminal.ui.decideMouseTouchStep
 import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
@@ -591,14 +592,21 @@ fun TerminalScreenBody(
                 // は、SshTerminalCanvas が実際の描画に使う値に厳密に合わせる。SshTerminalCanvas
                 // 自体はIMEを意識せず「自身に割り当てられたレイアウトサイズ ÷ rows/cols」で
                 // セルサイズを決めるため、ここでの高さも(IME表示中に縮む生の[heightPx]ではなく)
-                // Canvasへ実際に渡している高さである[stableHeightPx]を使う必要がある(下の
-                // SshTerminalCanvas呼び出しの`.height(stableHeightPx)`と対称、タスク#19後追い
+                // Canvasへ実際に渡している高さである[effectiveHeightPx]を使う必要がある(下の
+                // SshTerminalCanvas呼び出しの`.height(effectiveHeightPx)`と対称、タスク#19後追い
                 // 修正: IME表示中に文字が縦に潰れて見えていた不具合。高さをIME開閉に関わらず
                 // 固定してフォントサイズを保ち、Canvas自体を下端に揃えて上側をクリップすることで
                 // 「表示行数だけが変わる」挙動にする)。
+                //
+                // `stableHeightPx`をそのまま使わず`effectiveCanvasHeightPx`
+                // (`max(stableHeightPx, heightPx)`)を経由するのは、`advanceResizeStability`
+                // が検知しない一時的な高さ増加(nav bar insetの計算揺れ等、`TerminalResize.kt`
+                // のdoc参照)の間もビューポートより低く描画されて上端に空白が出ないようにする
+                // ため(Opusレビュー指摘)。
+                val effectiveHeightPx = effectiveCanvasHeightPx(stableHeightPx, heightPx)
                 val renderCols = displayUpdate.cols.toInt().coerceAtLeast(1)
                 val renderRows = displayUpdate.rows.toInt().coerceAtLeast(1)
-                val renderCellDims = Pair(widthPx / renderCols, stableHeightPx / renderRows)
+                val renderCellDims = Pair(widthPx / renderCols, effectiveHeightPx / renderRows)
 
                 // pointerInput の key に renderCellDims/renderCols/renderRows を直接使うと、
                 // ピンチで fontScale が変わる → resize要求 → 新しい displayUpdate が届く →
@@ -715,7 +723,7 @@ fun TerminalScreenBody(
                             .clipToBounds()
                             .fillMaxWidth()
                             .wrapContentHeight(Alignment.Bottom, unbounded = true)
-                            .height(with(density) { stableHeightPx.toDp() })
+                            .height(with(density) { effectiveHeightPx.toDp() })
                             .pointerInput(Unit) {
                                 awaitEachGesture {
                                     // ジェスチャー開始時点の最新値を1回だけ読む

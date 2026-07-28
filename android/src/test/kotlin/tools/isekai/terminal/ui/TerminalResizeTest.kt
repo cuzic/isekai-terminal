@@ -62,14 +62,36 @@ class TerminalResizeTest {
     }
 
     @Test
-    fun `height growing without a width change also unfreezes immediately`() {
-        // 上部バーの自動非表示や分割ペインのリサイズ等、幅は変わらず高さだけが増える
-        // ケース。`.imePadding()`は高さを縮める方向にしか働かないため、凍結値より
-        // 高いliveHeightPxはIMEでは説明がつかず、本当のサイズ変化とみなせる。
+    fun `height growing without a width change does not unfreeze (known gap, Opus review)`() {
+        // 上部バーの自動非表示や分割ペインの縦リサイズ等、幅は変わらず高さだけが増える
+        // ケースは、あえて凍結解除のtriggerに含めない。`.imePadding()`との相互作用で
+        // navigation barのinsetが一時的に0扱いになる端末があり(TerminalResize.ktの
+        // advanceResizeStabilityドキュメント参照)、それだけでliveHeightPxが凍結値を
+        // 一時的に上回ってしまう。高さ側もtriggerにすると、その1フレームの揺れだけで
+        // IME表示セッション全体が「まだ基準が無い」状態に落ちてしまう(Opusレビュー指摘)。
+        // このケース自体は、[TerminalScreen.kt]側が`effectiveCanvasHeightPx`
+        // (`max(stableHeightPx, liveHeightPx)`)を使って描画の空白だけを防ぎ、tty側の
+        // 凍結状態(=cols/rows)はIMEが実際に閉じるまで据え置く。
         val initial = ResizeStabilityState(hasObservedImeClosed = true, stableHeightPx = 280f, lastWidthPx = 400f)
         val next = advanceResizeStability(initial, isImeVisible = true, liveHeightPx = 320f, liveWidthPx = 400f)
-        assertEquals(320f, next.stableHeightPx)
-        assertEquals(false, next.hasObservedImeClosed)
+        assertEquals(280f, next.stableHeightPx)
+        assertEquals(true, next.hasObservedImeClosed)
+    }
+
+    // ── effectiveCanvasHeightPx ───────────────────────────────────────
+
+    @Test
+    fun `effectiveCanvasHeightPx uses the frozen height when the viewport is not taller`() {
+        assertEquals(480f, effectiveCanvasHeightPx(stableHeightPx = 480f, liveHeightPx = 280f))
+        assertEquals(480f, effectiveCanvasHeightPx(stableHeightPx = 480f, liveHeightPx = 480f))
+    }
+
+    @Test
+    fun `effectiveCanvasHeightPx tracks the live height when it exceeds the frozen value`() {
+        // advanceResizeStabilityが凍結解除しない一時的な高さ増加(nav bar insetの
+        // 計算揺れ・幅を伴わない縦方向のみのリサイズ)の間も、描画側だけはビューポートより
+        // 低くならないようにする(上端に空白が出ない)。
+        assertEquals(320f, effectiveCanvasHeightPx(stableHeightPx = 280f, liveHeightPx = 320f))
     }
 
     @Test
