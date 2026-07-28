@@ -83,6 +83,64 @@ jobs:
           restore-keys: |
             rust-core-test-${{ runner.os }}-
 
+      # `test-windows`ジョブは`rust-core/isekai-ssh/tests/*.rs`をファイル名の明示list
+      # (`mux_holder_windows_e2e`/`native_auth_windows_e2e`単独step + 5ファイルループ)
+      # で実行しており、新規e2eファイルを追加してもここへの追加を忘れるとサイレントに
+      # 一切Windows CIで走らない(実際に`native_auth_windows_e2e.rs`追加時に一度
+      # 踏みかけた)。全ファイルが「Windowsで実行する(ALLOWED_WINDOWS)」「実sshd/
+      # `wrapper::run`(`#[cfg(not(windows))]`)前提でWindowsでは原理的に実行できない
+      # (EXCLUDED_UNIX_ONLY)」「技術的理由なく単に未追加(KNOWN_GAP、正直に告知する
+      # ためのバケットで"除外"とは別枠)」のいずれかに分類されているかをここで検証する。
+      # 3つの配列のどれにも属さない新規ファイルがあれば、著者に
+      # `test-windows`ジョブへの追加(または除外理由の追記)を促してこのstepを失敗させる。
+      - name: Verify every isekai-ssh e2e test file is accounted for in Windows CI
+        run: |
+          set -euo pipefail
+          ALLOWED_WINDOWS=(
+            mux_holder_windows_e2e
+            native_auth_windows_e2e
+            wrapper_auto_bootstrap_e2e
+            doctor_e2e
+            init_e2e
+            wrapper_auto_download_relay_bootstrap_e2e
+            wrapper_stale_trust_auto_recovery_e2e
+          )
+          # 実`/usr/sbin/sshd`+`setsid`前提、または`wrapper::run`
+          # (`main.rs`で`#[cfg(not(windows))]`)経由のコードパスをテストしており、
+          # Windowsでは原理的に実行できないファイル。
+          EXCLUDED_UNIX_ONLY=(
+            real_sshd_bootstrap_e2e
+            real_sshd_multihop_bootstrap_e2e
+            ctl_socket_forward_e2e
+            build_result_push_e2e
+            wrapper_stdout_cleanliness
+            log_file_e2e
+          )
+          # 技術的にWindowsで実行できない理由が見当たらないが、単に`test-windows`
+          # ジョブに追加されていない既知のギャップ。EXCLUDED_UNIX_ONLYと違い
+          # 「正当な除外」ではないことを明示するための別枠。
+          KNOWN_GAP=(
+            login_e2e
+          )
+          missing=0
+          for f in rust-core/isekai-ssh/tests/*.rs; do
+            name=$(basename "$f" .rs)
+            found=0
+            for list in ALLOWED_WINDOWS EXCLUDED_UNIX_ONLY KNOWN_GAP; do
+              declare -n arr="$list"
+              for entry in "${arr[@]}"; do
+                if [ "$entry" = "$name" ]; then
+                  found=1
+                fi
+              done
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "::error::rust-core/isekai-ssh/tests/$name.rs is not accounted for in this workflow's ALLOWED_WINDOWS/EXCLUDED_UNIX_ONLY/KNOWN_GAP lists — add it to the test-windows job's run list, or to one of these lists with a reason, before merging."
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
