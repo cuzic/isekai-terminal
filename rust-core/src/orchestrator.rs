@@ -1802,11 +1802,6 @@ impl SessionOrchestrator {
             reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
                 .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string))
         };
-        log::error!(
-            "ISEKAI_DEBUG_MARKER: ensure_tmux_tab_window app_pane={:?} recovered_ctl_socket_path={:?}",
-            self.shared.app_pane_id,
-            recovered_ctl_socket_path
-        );
         registry.lock().register(
             self.shared.app_pane_id.clone(),
             outcome.locator.clone(),
