@@ -292,6 +292,21 @@ fn malformed(msg: &str) -> io::Error {
 /// Returns an error if the payload exceeds [`MAX_FRAME_PAYLOAD`] (so a bug on
 /// the *sending* side surfaces here rather than tripping the peer's reader).
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
+    // Checked *before* `encode()`, not left to `decode()` on the peer's side:
+    // `remote_command`'s on-wire length prefix is a `u16` (max 65535), so a
+    // command past that would silently wrap and truncate instead of being
+    // rejected — this check catches both that case and the (far more likely)
+    // 4097..=65535-byte case, which `encode()` would otherwise happily emit
+    // even though it's guaranteed to fail the peer's `MAX_REMOTE_COMMAND_LEN`
+    // check on decode (a real but harmless-in-practice bug found in review:
+    // the peer's `Frame::Rejected` degrades safely to an unmultiplexed direct
+    // connect either way, per `always-connects.md` — this just fails it
+    // earlier and more clearly, on the sending side).
+    if let Frame::Hello { remote_command: Some(cmd), .. } = frame {
+        if cmd.len() > MAX_REMOTE_COMMAND_LEN {
+            return Err(malformed("outgoing Hello remote_command exceeds the cap"));
+        }
+    }
     let body = frame.encode();
     if body.len() > MAX_FRAME_LEN {
         return Err(malformed("outgoing frame exceeds the size cap"));
@@ -512,6 +527,27 @@ mod tests {
         let too_big = Frame::Stdin(vec![0u8; MAX_FRAME_PAYLOAD + 1]);
         let err = write_frame(&mut w, &too_big).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "a payload past the cap must be refused on the sending side");
+    }
+
+    /// A `Hello.remote_command` past [`MAX_REMOTE_COMMAND_LEN`] must be
+    /// refused on the sending side, same as an oversized `Stdin` payload
+    /// above — `decode()`'s own cap would reject it on the peer's side
+    /// anyway, but only after a byte length past `u16::MAX` had already
+    /// silently wrapped/truncated on encode (found in review).
+    #[tokio::test]
+    async fn writing_a_hello_with_an_oversized_remote_command_fails_on_the_sender() {
+        let (mut w, _r) = duplex(1024);
+        let too_big = Frame::Hello {
+            version: MUX_PROTOCOL_VERSION,
+            token: vec![],
+            term: "xterm".to_string(),
+            cols: 80,
+            rows: 24,
+            want_pty: false,
+            remote_command: Some("x".repeat(MAX_REMOTE_COMMAND_LEN + 1)),
+        };
+        let err = write_frame(&mut w, &too_big).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "a remote_command past the cap must be refused on the sending side");
     }
 
     #[test]
