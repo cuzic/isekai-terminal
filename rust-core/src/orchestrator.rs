@@ -866,12 +866,12 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
         }
         LastConnectAttempt::IsekaiPipeQuic(config) => {
             let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-            session.connect(Box::new(adapter))?;
+            session.connect(Box::new(adapter), shared.app_pane_id.clone())?;
             ActiveSession::IsekaiPipeQuic(session)
         }
         LastConnectAttempt::IsekaiPipeQuicAuto(config) => {
             let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-            session.connect_auto(Box::new(adapter))?;
+            session.connect_auto(Box::new(adapter), shared.app_pane_id.clone())?;
             ActiveSession::IsekaiPipeQuic(session)
         }
         LastConnectAttempt::MultipathIsekaiPipeQuic(config) => {
@@ -1234,7 +1234,7 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuic(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter))?;
+        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }
@@ -1245,7 +1245,7 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuicAuto(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect_auto(Box::new(adapter))?;
+        session.connect_auto(Box::new(adapter), self.shared.app_pane_id.clone())?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }

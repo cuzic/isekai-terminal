@@ -111,7 +111,11 @@ impl IsekaiPipeQuicSession {
     /// (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
     /// パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
     /// QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
-    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect(
+        &self,
+        callback: Box<dyn SessionCallback>,
+        app_pane_id: crate::tmux_locator::AppPaneId,
+    ) -> Result<(), SshError> {
         let mut config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSH(isekai-helperを起動するための踏み台接続)のホスト鍵検証を
@@ -122,13 +126,7 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない
-                    // (follow-up、`transport/ssh_handler.rs`の`run_ssh_channel_loop`
-                    // 引数doc参照)。実質no-op。
-                    run_ssh_channel_loop(
-                        &pooled, cols, rows, false, false, cmd_rx, event_tx,
-                        crate::tmux_locator::AppPaneId::generate_process_local(),
-                    ).await;
+                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx, app_pane_id).await;
                     if let Some(key) = pool_key {
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                     }
@@ -146,7 +144,11 @@ impl IsekaiPipeQuicSession {
     /// 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
     /// および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
     /// (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
-    pub(crate) fn connect_auto(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect_auto(
+        &self,
+        callback: Box<dyn SessionCallback>,
+        app_pane_id: crate::tmux_locator::AppPaneId,
+    ) -> Result<(), SshError> {
         let mut config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let host_key_callback = self.core.callback();
@@ -154,12 +156,9 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない
-                    // (follow-up、`transport/ssh_handler.rs`の`run_ssh_channel_loop`
-                    // 引数doc参照)。実質no-op。
                     run_ssh_channel_loop(
                         &pooled, cols, rows, false, false, cmd_rx, event_tx,
-                        crate::tmux_locator::AppPaneId::generate_process_local(),
+                        app_pane_id.clone(),
                     ).await;
                     if let Some(key) = pool_key {
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
@@ -182,13 +181,7 @@ impl IsekaiPipeQuicSession {
                         jump: None,
                         allow_non_loopback_forward_bind: false,
                     };
-                    // タスク#59: このフォールバック経路は`app_pane_id`をまだ素通し
-                    // していない(follow-up、`transport/ssh_handler.rs`の
-                    // `run_ssh_channel_loop`引数doc参照)。実質no-op。
-                    crate::run_russh_transport(
-                        ssh_config, cmd_rx, event_tx,
-                        crate::tmux_locator::AppPaneId::generate_process_local(),
-                    ).await;
+                    crate::run_russh_transport(ssh_config, cmd_rx, event_tx, app_pane_id).await;
                 }
                 AcquireOutcome::OtherFailed(e) => {
                     warn!("isekai_pipe_quic auto: {e}");
@@ -921,7 +914,9 @@ mod tests {
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
-        session.connect(Box::new(callback)).expect("connect() call failed");
+        session
+            .connect(Box::new(callback), crate::tmux_locator::AppPaneId::generate_process_local())
+            .expect("connect() call failed");
 
         // シェルプロンプトが出るまで少し待ってからコマンドを送る。
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -981,7 +976,9 @@ mod tests {
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
-        session.connect(Box::new(callback)).expect("connect() call failed");
+        session
+            .connect(Box::new(callback), crate::tmux_locator::AppPaneId::generate_process_local())
+            .expect("connect() call failed");
 
         tokio::time::sleep(Duration::from_millis(800)).await;
         session.send(b"echo before-cut\n".to_vec());
