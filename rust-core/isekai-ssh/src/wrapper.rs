@@ -63,7 +63,17 @@ const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestTty {
     /// No explicit `-t`/`-T` given: allocate a PTY for an interactive
-    /// (no-remote-command) session, skip it for a one-shot remote command.
+    /// (no-remote-command) session. **Diverges from real `ssh(1)`, which
+    /// skips the PTY for a one-shot remote command under `Auto`** — this
+    /// codebase's `decide_session_kind`/`wants_pty` (`native/connect.rs`)
+    /// deliberately still allocates one (`SessionKind::Shell { command:
+    /// Some(_), .. }`, execing the command over that PTY) so a command
+    /// needing a real terminal (an editor, a pager, `sudo` prompting for a
+    /// password) keeps working without the caller having to remember `-t`.
+    /// The tradeoff — CRLF newline translation and merged stdout/stderr on
+    /// the PTY, same as real `ssh -t host cmd` — matches this project's
+    /// history of choosing convenience for interactive terminal use over
+    /// strict `ssh(1)` parity elsewhere. Pass `-T` to opt out.
     Auto,
     /// `-t`: force PTY allocation even for a remote command.
     Yes,
