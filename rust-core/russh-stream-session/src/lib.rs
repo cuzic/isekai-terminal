@@ -616,26 +616,43 @@ where
     session.authenticate_publickey_with(username, public_key, signer).await.map_err(SessionError::AgentAuth)
 }
 
-/// What kind of session channel to open: an interactive PTY+shell, or a
-/// single non-interactive command (`ssh host 'command'` equivalent).
+/// What kind of session channel to open: an interactive PTY+shell (with an
+/// optional command to `exec` over that PTY instead of a login shell), or a
+/// single PTY-less non-interactive command (`ssh -T host 'command'`
+/// equivalent).
 pub enum SessionKind {
-    Shell { term: String, cols: u32, rows: u32, terminal_modes: Vec<(russh::Pty, u32)> },
+    Shell { term: String, cols: u32, rows: u32, terminal_modes: Vec<(russh::Pty, u32)>, command: Option<String> },
     Exec { command: String },
 }
 
-/// Opens one session channel on `handle` and requests either a PTY+shell or
-/// a single exec, per `kind`. The returned channel is ready for the caller
-/// to drive its own I/O loop (read `ChannelMsg::Data`/`ExitStatus`, write
-/// via `channel.data(...)`).
+/// Opens one session channel on `handle` and requests either a PTY+shell/exec
+/// or a single PTY-less exec, per `kind`. The returned channel is ready for
+/// the caller to drive its own I/O loop (read `ChannelMsg::Data`/`ExitStatus`,
+/// write via `channel.data(...)`).
+///
+/// `Shell { command: Some(cmd), .. }` requests the PTY, then `exec`s `cmd`
+/// over it — it does **not** call `request_shell` first. An OpenSSH server
+/// (and RFC 4254 §6.5 generally) only accepts one of `shell`/`exec`/
+/// `subsystem` per channel; issuing both fails the second one, silently if
+/// the caller doesn't check its result — this used to be a real bug here
+/// (`native::connect::run_authenticated_session` opened a `Shell` channel,
+/// which called `request_shell`, then issued a *second*, always-failing
+/// `channel.exec(...)` on top of it with the error discarded via `let _ =`,
+/// so `isekai-ssh -t host cmd` silently landed in a login shell instead of
+/// running `cmd`). Folding `command` into `SessionKind::Shell` itself makes
+/// this the only place that decides shell vs. exec, so it can't recur.
 pub async fn open_channel<H: client::Handler>(
     handle: &client::Handle<H>,
     kind: &SessionKind,
 ) -> Result<russh::Channel<client::Msg>, SessionError> {
     let channel = handle.channel_open_session().await.map_err(SessionError::Channel)?;
     match kind {
-        SessionKind::Shell { term, cols, rows, terminal_modes } => {
+        SessionKind::Shell { term, cols, rows, terminal_modes, command } => {
             channel.request_pty(false, term, *cols, *rows, 0, 0, terminal_modes).await.map_err(SessionError::Channel)?;
-            channel.request_shell(false).await.map_err(SessionError::Channel)?;
+            match command {
+                Some(cmd) => channel.exec(false, cmd.as_str()).await.map_err(SessionError::Channel)?,
+                None => channel.request_shell(false).await.map_err(SessionError::Channel)?,
+            }
         }
         SessionKind::Exec { command } => {
             channel.exec(false, command.as_str()).await.map_err(SessionError::Channel)?;
@@ -815,6 +832,51 @@ mod tests {
             }
         }
         assert!(saw_data, "expected the server's echoed exec output");
+    }
+
+    /// Regression for a real bug (2026-07-28): `SessionKind::Shell { command:
+    /// Some(_), .. }` must `request_pty` then `exec`, never `request_shell`
+    /// then a *second*, always-failing `exec` on the same channel (RFC 4254
+    /// §6.5 allows only one of `shell`/`exec`/`subsystem` per channel) — the
+    /// caller-side "exec after the shell channel opened" pattern this used to
+    /// require made exactly that mistake, silently landing in a login shell
+    /// instead of running the command. `EchoExecServer` only replies to
+    /// `exec_request` (never implements `shell_request`), so this test fails
+    /// with no data at all if `open_channel` regresses to calling
+    /// `request_shell` for a `Shell` variant that carries a command.
+    #[tokio::test]
+    async fn direct_connect_shell_with_a_command_execs_over_the_pty_not_a_login_shell() {
+        let addr = spawn_server(EchoExecServer, 2).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        assert!(authenticate_session(&mut session.handle, "tester", &Credential::Password("correct-password".into())).await.unwrap());
+
+        let mut channel = open_channel(
+            &session.handle,
+            &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![], command: Some("echo hi".to_string()) },
+        )
+        .await
+        .expect("shell+command channel should open");
+
+        let mut saw_data = false;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    assert_eq!(&data[..], b"ran: echo hi\n", "the command must be exec'd, not opened as an interactive shell");
+                    saw_data = true;
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => assert_eq!(exit_status, 0),
+                None => break,
+                _ => {}
+            }
+        }
+        assert!(saw_data, "SessionKind::Shell with a command must exec it, not silently drop into a login shell");
     }
 
     #[tokio::test]
