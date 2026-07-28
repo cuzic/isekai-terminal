@@ -8,7 +8,12 @@
 //! the one that should run the build (it's the tab the user is actually
 //! looking at), so no cross-process relay is needed — it decodes, spawns,
 //! streams, and detects disconnection (a failed write *or* the channel
-//! itself reporting `Eof`/`Close`) all in one place.
+//! itself reporting `Close`/`None` — **not** `Eof`, which per RFC 4254 is a
+//! read-half-only half-close an exit-status may still legally follow, and
+//! which the real `isekai-pipe ctl build` client always produces right after
+//! sending `BuildRequest` since it shares every other ctl message's
+//! fire-and-forget `shutdown()` convention; see `owner.rs`'s identical
+//! `Eof`-is-a-no-op handling for the shell channel) all in one place.
 //!
 //! A *mux client* tab has no direct access to the real SSH channel (only the
 //! owner does), so it cannot reuse this function directly — see
@@ -37,8 +42,17 @@ use crate::log_file::log_line;
 /// sentinel round-trips like any other value (see `build_exec.rs`'s
 /// `encode_build_finished_accepts_the_i32_min_abort_sentinel` test) — it's a
 /// convention `native/mux` establishes, not a new `isekai_protocol` variant.
-/// `i32::MIN` can never collide with a real process exit code (0–255 on
-/// every platform).
+///
+/// **Not a value-uniqueness guarantee** (a real Windows child's exit code is
+/// the full `i32` range via `ExitStatus::code()`, so a crashing child can in
+/// principle produce this exact value too) — what actually keeps this safe
+/// today is *direction*: a real `BuildFinished` only ever travels
+/// client→owner (`super::client`'s `build_out_tx`), while this synthesized
+/// sentinel only ever travels owner→client (`super::owner`'s
+/// `CtlRelayEvent::BuildAborted`, tagged with the originating channel's id so
+/// it can't be mistaken for a different build's real completion either — see
+/// that type's docs). Neither side re-consumes its own outbound direction's
+/// `BuildFinished` as if it might be the other side's sentinel.
 pub(crate) const BUILD_ABORTED_SENTINEL: i32 = i32::MIN;
 
 /// Runs the build profile `(host, profile_name)` resolves to and streams its
@@ -46,14 +60,15 @@ pub(crate) const BUILD_ABORTED_SENTINEL: i32 = i32::MIN;
 /// already holds) as `BuildOutputChunk`s, finishing with `BuildFinished`.
 ///
 /// Detects the remote disconnecting mid-build two ways at once — a failed
-/// `channel.data()` write, or `channel.wait()` itself reporting `Eof`/
-/// `Close`/`None` — and kills the child immediately either way (the same
-/// "every session must have a guaranteed cleanup path" principle
-/// `.claude/rules/always-connects.md` documents for the fencing-slot lesson,
-/// applied to a local child process). Watching `channel.wait()` concurrently
-/// (rather than only reacting to the next failed write, as the simpler Unix
-/// single-process path does) means a build that goes briefly quiet doesn't
-/// delay detecting a disconnect that already happened.
+/// `channel.data()` write, or `channel.wait()` itself reporting `Close`/
+/// `None` (**not** `Eof` — see this module's docs) — and kills the child
+/// immediately either way (the same "every session must have a guaranteed
+/// cleanup path" principle `.claude/rules/always-connects.md` documents for
+/// the fencing-slot lesson, applied to a local child process). Watching
+/// `channel.wait()` concurrently (rather than only reacting to the next
+/// failed write, as the simpler Unix single-process path does) means a
+/// build that goes briefly quiet doesn't delay detecting a disconnect that
+/// already happened.
 pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::Msg>, host: &str, profile_name: &str) -> Result<()> {
     let profile = crate::build_profile::default_build_profiles_path()
         .and_then(|path| crate::build_profile::load_build_profiles(&path))
@@ -68,16 +83,39 @@ pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::
         let _ = channel.data(&chunk[..]).await;
         let finished = crate::build_exec::encode_build_finished(127, Vec::new())?;
         let _ = channel.data(&finished[..]).await;
+        let _ = channel.close().await;
         return Ok(());
     };
 
-    let mut child = crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
+    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"))?;
+    {
+        Ok(child) => child,
+        // Mirrors the unknown-profile arm above (and `run_client_build`'s
+        // matching arm): a profile that exists but can't actually be
+        // spawned (e.g. `dir` no longer exists) must still answer with a
+        // `BuildFinished`, not just propagate `Err` and leave the remote's
+        // `isekai-pipe ctl build` hanging forever with no reply and no
+        // channel close (`russh::Channel` has no `Drop` impl, so simply
+        // returning here without an explicit `close()` would never send
+        // `CHANNEL_CLOSE` either). `126` (distinct from `127` above) matches
+        // the POSIX convention for "found but not executable".
+        Err(e) => {
+            let chunk = crate::build_exec::encode_build_output_chunk(
+                isekai_protocol::BuildOutputStream::Stderr,
+                format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}\n").into_bytes(),
+            )?;
+            let _ = channel.data(&chunk[..]).await;
+            let finished = crate::build_exec::encode_build_finished(126, Vec::new())?;
+            let _ = channel.data(&finished[..]).await;
+            let _ = channel.close().await;
+            return Ok(());
+        }
+    };
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -102,7 +140,7 @@ pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::
                 }
             }
             msg = channel.wait() => {
-                if matches!(msg, None | Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close)) {
+                if matches!(msg, None | Some(russh::ChannelMsg::Close)) {
                     disconnected = true;
                     break;
                 }
@@ -140,28 +178,59 @@ pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::
     }
     let finished = crate::build_exec::encode_build_finished(exit_code, result_paths)?;
     let _ = channel.data(&finished[..]).await;
+    // `russh::Channel` has no `Drop` impl, so nothing sends `CHANNEL_CLOSE`
+    // unless we do — without this the remote `isekai-pipe ctl build` would
+    // see its reply arrive but the channel itself never properly close.
+    let _ = channel.close().await;
     Ok(())
 }
 
 /// A build `client.rs::run_inner` is currently streaming, so it can abort it
 /// (kill the child) when the owner connection is lost or the owner relays a
-/// [`BUILD_ABORTED_SENTINEL`]. Dropping an `ActiveBuild` without calling
-/// [`abort`](Self::abort) leaves the task to finish on its own — fine for the
-/// normal "it already reached `BuildFinished`" case, since by then there is
-/// nothing left to kill.
+/// [`BUILD_ABORTED_SENTINEL`]. Dropping an `ActiveBuild` **does** still kill
+/// the build even without calling [`abort`](Self::abort): `abort_rx` is a
+/// `oneshot::Receiver`, which resolves with `Err(RecvError)` as soon as its
+/// sender is dropped, and `run_client_build`'s select loop treats that
+/// exactly like an explicit abort signal. This is harmless today only
+/// because every current drop site runs after the task has already
+/// finished — but nothing enforces that, so prefer
+/// [`abort_and_wait`](Self::abort_and_wait) at every real call site instead
+/// of relying on this incidentally-correct behavior.
 pub(crate) struct ActiveBuild {
     abort_tx: Option<oneshot::Sender<()>>,
-    #[allow(dead_code)] // kept so the task itself isn't detached from `ActiveBuild`'s lifetime in spirit; not currently awaited
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ActiveBuild {
     /// Signals the build task to kill its child and stop. A no-op if the
     /// build already finished on its own (the signal is only sent once).
+    /// Fire-and-forget: nothing here guarantees the task is ever polled
+    /// again before the caller returns — see
+    /// [`abort_and_wait`](Self::abort_and_wait), which every real caller
+    /// should prefer.
+    #[cfg(test)]
     pub(crate) fn abort(&mut self) {
         if let Some(tx) = self.abort_tx.take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Signals the build task to kill its child and stop, then waits (up to
+    /// `timeout`) for that task to actually finish before returning.
+    /// `client.rs`'s callers all run right before the process exits via
+    /// `std::process::exit` (`main.rs`), which runs no destructors — a bare
+    /// fire-and-forget `oneshot` send (the old `abort()`) is not guaranteed
+    /// to be observed by the task before the process is gone, which would
+    /// leave the real child process (a `cmd.exe` tree on Windows) orphaned
+    /// (Windows does not kill children when their parent exits). `timeout`
+    /// bounds the wait so a wedged build task can never block process exit
+    /// indefinitely; past it, the child may still end up orphaned, but no
+    /// worse than the old fire-and-forget behavior always was.
+    pub(crate) async fn abort_and_wait(mut self, timeout: std::time::Duration) {
+        if let Some(tx) = self.abort_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = tokio::time::timeout(timeout, self.task).await;
     }
 }
 

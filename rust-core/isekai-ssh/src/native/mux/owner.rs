@@ -197,10 +197,6 @@ where
         other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
     };
 
-    write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION })
-        .await
-        .context("isekai-ssh mux owner: sending HelloAck failed")?;
-
     // This client's own private ctl-socket forward (opportunistic: a failed
     // setup just leaves `ctl` as `None`).
     let ctl = match ctl_routes {
@@ -223,6 +219,19 @@ where
                 .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
         }
     };
+    // `HelloAck` is deliberately sent only *after* the channel-open above
+    // succeeds (review finding: it used to be sent first) — a client that
+    // already saw `HelloAck` has passed its handshake and expects
+    // stdout/stderr/ctl frames next, so a subsequent open failure had no
+    // way to be reported except dropping the connection outright, which
+    // `client.rs` can only read as `ClientOutcome::OwnerLost` (a hard exit,
+    // no fallback — the holder itself is fine, so every retry hit the exact
+    // same dead end, the class of bug `.claude/rules/always-connects.md`
+    // calls out). Reporting the failure as `Frame::Rejected` instead — same
+    // as the version/token-mismatch arms above — lets the client fall back
+    // to an unmultiplexed direct connect (`client.rs`'s handshake read
+    // already accepts `Rejected` in place of `HelloAck`, confirmed by the
+    // existing version/token-mismatch handling).
     let mut channel = match open_result {
         Ok(channel) => channel,
         Err(e) => {
@@ -233,9 +242,14 @@ where
             if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
                 ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
             }
+            let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
             return Err(e);
         }
     };
+
+    write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION })
+        .await
+        .context("isekai-ssh mux owner: sending HelloAck failed")?;
 
     // Pump this client's forwarded ctl channels into an mpsc the relay loop
     // drains and wraps in `Frame::Ctl` (so all owner→client writes stay on the
@@ -299,6 +313,14 @@ where
     // (in the ctl-branch match), so state never outlives the build it
     // belongs to regardless of which side ended it.
     let mut active_build_reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
+    // The forwarded channel `active_build_reply_tx` belongs to (review
+    // finding: without this, an unrelated channel's synthesized
+    // `CtlRelayEvent::BuildAborted` — e.g. a second, already-rejected
+    // `BuildRequest`'s own channel closing — could be mistaken for the
+    // *active* build's abort and kill it). Set alongside
+    // `active_build_reply_tx` in the `BuildStarted` arm, cleared alongside
+    // it everywhere else.
+    let mut active_build_channel_id: Option<russh::ChannelId> = None;
 
     loop {
         tokio::select! {
@@ -342,6 +364,7 @@ where
                             let _ = tx.send(bytes);
                             if is_finished {
                                 active_build_reply_tx = None;
+                                active_build_channel_id = None;
                             }
                         }
                     }
@@ -393,6 +416,7 @@ where
                             Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
                         ) {
                             active_build_reply_tx = None;
+                            active_build_channel_id = None;
                         }
                         if write_frame(writer, &Frame::Ctl(bytes)).await.is_err() {
                             break;
@@ -421,7 +445,7 @@ where
                     // it's never stored) lets that second pump task's next
                     // `reply_rx.recv()` return `None` and end cleanly once
                     // it has relayed these two messages.
-                    Some(ctl_forward::CtlRelayEvent::BuildStarted { reply_tx }) => {
+                    Some(ctl_forward::CtlRelayEvent::BuildStarted { channel_id, reply_tx }) => {
                         if active_build_reply_tx.is_some() {
                             if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
                                 isekai_protocol::BuildOutputStream::Stderr,
@@ -434,6 +458,27 @@ where
                             }
                         } else {
                             active_build_reply_tx = Some(reply_tx);
+                            active_build_channel_id = Some(channel_id);
+                        }
+                    }
+                    // The channel a build was running over disconnected
+                    // (`ctl_forward::pump_to_frames`'s docs) before a real
+                    // `BuildFinished` ever arrived. Only synthesize+relay the
+                    // abort sentinel if `channel_id` is still the build we're
+                    // actually tracking — review finding: an earlier version
+                    // let *any* channel's disconnect kill whichever build
+                    // happened to be active (e.g. a second, already-rejected
+                    // `BuildRequest`'s own channel closing killed the first,
+                    // unrelated, still-running build).
+                    Some(ctl_forward::CtlRelayEvent::BuildAborted { channel_id }) => {
+                        if active_build_channel_id == Some(channel_id) {
+                            if let Ok(abort) = crate::build_exec::encode_build_finished(super::build_relay::BUILD_ABORTED_SENTINEL, Vec::new()) {
+                                active_build_reply_tx = None;
+                                active_build_channel_id = None;
+                                if write_frame(writer, &Frame::Ctl(abort)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     // The ctl pump ended (forward cancelled / all senders gone):
@@ -1332,9 +1377,16 @@ mod tests {
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
             .await
             .unwrap();
+        // Review finding: `HelloAck` is now sent only *after* the login-shell
+        // open succeeds (previously it was sent unconditionally right after
+        // the handshake, before this failure was even known) — a client
+        // that already saw `HelloAck` has no way to be told the session
+        // never actually started except a hard, non-recoverable
+        // disconnect. `Frame::Rejected` here lets the client fall back to
+        // an unmultiplexed direct connect instead.
         match read_frame(&mut client).await.unwrap().unwrap() {
-            Frame::HelloAck { .. } => {}
-            other => panic!("expected HelloAck, got {other:?}"),
+            Frame::Rejected { .. } => {}
+            other => panic!("expected Rejected (not HelloAck — the login-shell open fails before HelloAck is ever sent), got {other:?}"),
         }
 
         // The forward the owner requested must be cancelled once the login-shell
