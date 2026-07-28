@@ -160,6 +160,23 @@ async fn wait_for_idle_exit(active_clients: &AtomicUsize, count_changed: &Notify
     }
 }
 
+/// Turns one client's `Frame::Hello` fields into the `SessionKind` to open on
+/// the shared handle — the mux-side half of the same `-t`/`-T` decision
+/// `native::connect::run_authenticated_session` makes for the non-mux path,
+/// routed through the identical `decide_session_kind` (kept in one function
+/// both paths call — see its doc comment for why re-deriving this logic
+/// separately would risk the exact shell-then-exec double-request bug it was
+/// written to prevent). Split out of [`relay_client`] as its own pure
+/// function purely so it's unit-testable without a real SSH connection —
+/// `relay_client`'s own tests exercise it only through the `want_pty: true`
+/// case (real exec/shell channel opens), so the `want_pty: false` case
+/// (`SessionKind::Exec`) had no coverage at all before this split.
+fn session_kind_for_hello(term: &str, cols: u16, rows: u16, want_pty: bool, remote_command: Option<&str>) -> russh_stream_session::SessionKind {
+    let remote_cmd_words = remote_command.map(|cmd| vec![cmd.to_string()]);
+    let request_tty = if remote_command.is_some() && !want_pty { crate::wrapper::RequestTty::No } else { crate::wrapper::RequestTty::Yes };
+    super::connect::decide_session_kind(remote_cmd_words.as_deref(), request_tty, term, cols as u32, rows as u32, &[])
+}
+
 /// Serves exactly one client: reads its [`Frame::Hello`] (validating the
 /// protocol version and auth token), opens a private remote shell channel with
 /// the client's requested PTY geometry, then relays until either side ends.
@@ -199,15 +216,7 @@ where
         }
         other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
     };
-    // Same `-t`/`-T` decision `native::connect::run_authenticated_session`
-    // makes for the non-mux path, kept in the one function
-    // (`decide_session_kind`) both paths call — see that function's doc
-    // comment for why re-deriving this logic here would risk the exact
-    // shell-then-exec double-request bug it was written to prevent.
-    let remote_cmd_words = remote_command.as_ref().map(|cmd| vec![cmd.clone()]);
-    let request_tty = if remote_command.is_some() && !want_pty { crate::wrapper::RequestTty::No } else { crate::wrapper::RequestTty::Yes };
-    let session_kind =
-        super::connect::decide_session_kind(remote_cmd_words.as_deref(), request_tty, &term, cols as u32, rows as u32, &[]);
+    let session_kind = session_kind_for_hello(&term, cols, rows, want_pty, remote_command.as_deref());
 
     // This client's own private ctl-socket forward (opportunistic: a failed
     // setup just leaves `ctl` as `None`). Skipped entirely for a
@@ -546,10 +555,54 @@ mod tests {
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
     use russh_stream_session::{
         authenticate_session, establish_over_stream, verifying_handler, verifying_handler_with_routes, Credential, HostKeyVerifier,
-        VerifyOutcome,
+        SessionKind, VerifyOutcome,
     };
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
+
+    // -- session_kind_for_hello (pure, no real SSH connection needed) -----
+
+    /// `want_pty: false` + a command must produce `SessionKind::Exec` (no
+    /// PTY) — before `session_kind_for_hello` was split out as its own
+    /// function, this branch of `relay_client`'s behavior had no coverage at
+    /// all (every existing owner.rs test used `want_pty: true`).
+    #[test]
+    fn session_kind_for_hello_no_pty_with_a_command_is_exec() {
+        let kind = session_kind_for_hello("xterm", 80, 24, false, Some("echo hi"));
+        match kind {
+            SessionKind::Exec { command } => assert_eq!(command, "echo hi"),
+            SessionKind::Shell { .. } => panic!("want_pty: false with a remote command must skip the PTY"),
+        }
+    }
+
+    /// `want_pty: true` + a command must produce `SessionKind::Shell` with
+    /// that command set (exec'd over the PTY, not a login shell).
+    #[test]
+    fn session_kind_for_hello_with_pty_and_a_command_is_shell_with_the_command_set() {
+        let kind = session_kind_for_hello("xterm", 80, 24, true, Some("echo hi"));
+        match kind {
+            SessionKind::Shell { command, term, cols, rows, .. } => {
+                assert_eq!(command.as_deref(), Some("echo hi"));
+                assert_eq!((term.as_str(), cols, rows), ("xterm", 80, 24));
+            }
+            SessionKind::Exec { .. } => panic!("want_pty: true must allocate a PTY even with a remote command"),
+        }
+    }
+
+    /// No `remote_command` at all is always an interactive login shell,
+    /// regardless of `want_pty` (mirrors `decide_session_kind`'s own
+    /// `None` arm — a client can't ask for a PTY-less login shell, there's
+    /// nothing to `exec`).
+    #[test]
+    fn session_kind_for_hello_with_no_command_is_always_a_login_shell() {
+        for want_pty in [true, false] {
+            let kind = session_kind_for_hello("xterm", 80, 24, want_pty, None);
+            match kind {
+                SessionKind::Shell { command, .. } => assert_eq!(command, None, "want_pty={want_pty}"),
+                SessionKind::Exec { .. } => panic!("no remote_command must never produce SessionKind::Exec (want_pty={want_pty})"),
+            }
+        }
+    }
 
     struct AcceptAllHostKeys;
     #[async_trait]
@@ -1117,6 +1170,83 @@ mod tests {
         let msg = isekai_protocol::decode_ctl_message(&ctl_bytes).expect("the relayed ctl bytes must decode");
         assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "tab-title".to_string() });
 
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// A `remote_command` Hello must skip the ctl-socket forward entirely —
+    /// mirrors `native::connect::run_authenticated_session`'s own
+    /// `ctl_enabled && remote_cmd.is_none()` check (ctl-socket/OSC
+    /// title-clipboard is for this tab's *interactive* login shell, which a
+    /// one-shot remote command has no use for). Reuses
+    /// `CtlPushShellServer`, which would proactively push a `SetTitle` ctl
+    /// message the moment the owner calls `streamlocal_forward` — since that
+    /// call only happens inside `ctl_forward::request` (skipped here), no
+    /// push can ever fire, so seeing *zero* `Frame::Ctl` for the whole
+    /// session is a direct proof the skip took effect, not a timing-dependent
+    /// absence.
+    #[tokio::test]
+    async fn relay_client_skips_the_ctl_forward_for_a_remote_command() {
+        let keypair = Ed25519Keypair::from_seed(&[132; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = CtlPushShellServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        // `Some(&routes)`: ctl-socket *is* on for this connection — the skip
+        // being tested is specific to this one Hello carrying a
+        // remote_command, not the forward being unavailable altogether.
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+
+        write_frame(
+            &mut client,
+            &Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: b"tok".to_vec(),
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                want_pty: true,
+                remote_command: Some("echo hi".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut saw_exec_banner = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match read_frame(&mut client).await.unwrap() {
+                    Some(Frame::HelloAck { .. }) => {}
+                    Some(Frame::Ctl(bytes)) => panic!("ctl-socket forward must be skipped for a remote_command, got a Frame::Ctl: {bytes:?}"),
+                    Some(Frame::Stdout(data)) if data == b"login-ready\n" => {
+                        saw_exec_banner = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("owner closed before the exec banner arrived"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the exec banner");
+        assert!(saw_exec_banner, "expected the mock sshd's exec banner");
+
+        write_frame(&mut client, &Frame::Shutdown).await.unwrap();
         drop(client);
         let _ = relay.await.unwrap();
     }
