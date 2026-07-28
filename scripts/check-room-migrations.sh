@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Room migration(AppDatabase)の版数整合性をチェックする。CI(room-migration-check.yml)と
-# ローカルの両方から実行できる。
+# ローカルの両方から実行できる。版数を事前に確保する「予約」側は
+# scripts/reserve-room-migration.sh が担当し、こちらはその結果の「検証」側にあたる。
+# 背景・運用手順の詳細は android/migration_registry.toml のコメントを参照。
 #
 # 検証内容:
 #  1. AppDatabase.kt の @Database(version = N) と android/migration_registry.toml の

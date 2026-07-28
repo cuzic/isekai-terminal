@@ -2,6 +2,10 @@
 # 新しいRoom migration(AppDatabase)のバージョン番号を予約し、
 # android/migration_registry.toml に [[reserved]] エントリとして記録する。
 #
+# 並行作業間での版数の奪い合いを防ぐための「予約」側スクリプト。予約した番号どおりに
+# 実装・マージされたか(および予約エントリの削除し忘れ)の「検証」側は
+# scripts/check-room-migrations.sh(CI: .github/workflows/room-migration-check.yml)が担当する。
+#
 # 背景・使い方の詳細は android/migration_registry.toml のコメントを参照。
 #
 # 使い方:
