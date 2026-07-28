@@ -1003,7 +1003,19 @@ async fn try_agent_auth<H: client::Handler>(
         Err(_) if agent_auth::agent_connect_failure_is_benign(&target) => return Ok(false),
         Err(e) => return Err(e),
     };
-    let identities = agent.request_identities().await.context("failed to list SSH agent identities")?;
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        // Same benign/hard-error asymmetry as the connect failure above,
+        // just one step later: a transient failure listing identities from
+        // the platform-default agent (e.g. the agent service restarting
+        // mid-connect) must not block a login that the keyboard-interactive
+        // fallback below would otherwise complete — behave as though the
+        // agent simply offered zero identities. An explicitly configured
+        // `IdentityAgent <path>` keeps its hard error (see
+        // `agent_auth::agent_list_identities_failure_is_benign`).
+        Err(_) if agent_auth::agent_list_identities_failure_is_benign(&target) => Vec::new(),
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to list SSH agent identities")),
+    };
     Ok(agent_auth::try_each_identity(handle, username, &identities, &mut agent).await?)
 }
 
