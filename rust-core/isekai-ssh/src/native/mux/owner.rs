@@ -247,9 +247,19 @@ where
         }
     };
 
-    write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION })
-        .await
-        .context("isekai-ssh mux owner: sending HelloAck failed")?;
+    if let Err(e) = write_frame(&mut writer, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await {
+        // The channel opened above is real and remote — a client that
+        // vanished between Hello and HelloAck (a genuine race, not just a
+        // test artifact) must not leak it: `russh::Channel` has no `Drop`
+        // impl, so nothing sends `CHANNEL_CLOSE` unless we do here (same
+        // rationale as `build_relay.rs::run_build_over_channel`'s identical
+        // call).
+        let _ = channel.close().await;
+        if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
+            ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
+        }
+        return Err(anyhow::Error::new(e).context("isekai-ssh mux owner: sending HelloAck failed"));
+    }
 
     // Pump this client's forwarded ctl channels into an mpsc the relay loop
     // drains and wraps in `Frame::Ctl` (so all owner→client writes stay on the
@@ -622,19 +632,21 @@ mod tests {
     async fn serve_clients_exits_after_the_idle_grace_once_the_last_client_disconnects() {
         let name = "isekai-ssh-mux-idle-exit-test";
         let token = Arc::new(b"tok".to_vec());
-        // The real TCP handshake against the mock sshd must run with real time
-        // (russh's own handshake has timer-based internals that can misbehave
-        // under a paused clock) — only pause *after* authentication completes,
-        // for the idle-grace fast-forwarding below.
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
-        tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
         let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
 
         // One client connects, sends Hello, then immediately disconnects
-        // (drops without Shutdown) — `relay_client`'s per-client task ends
-        // (successfully or not doesn't matter here) and decrements the count.
+        // (drops without Shutdown) — `relay_client`'s per-client task now
+        // opens a real remote channel *before* it ever notices the client is
+        // gone (review finding #3: `HelloAck` is sent only after that open
+        // succeeds), ending in a failed HelloAck write that decrements the
+        // count. Like `authed_test_handle`'s own real SSH handshake, this
+        // round trip must run under *real* time — russh's request/response
+        // internals can misbehave under a paused clock (see that function's
+        // note) — so, unlike before finding #3 existed, we don't pause the
+        // clock until this has had a real chance to finish.
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
@@ -643,16 +655,11 @@ mod tests {
                 .unwrap();
             // conn drops here.
         }
-        // Let the spawned relay task actually run to completion (read Hello,
-        // fail to write HelloAck to the now-dropped connection, decrement the
-        // count) *before* advancing the clock — otherwise the idle-exit grace
-        // sleep hasn't even started counting down yet when we jump the clock
-        // past it, and the assertion below races against a grace window that
-        // effectively restarts after the jump.
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Advance the paused clock past both the (short, since a client did
-        // connect) idle grace and give spawned tasks a chance to run.
+        // Now pause and jump the clock past the (short, since a client did
+        // connect) idle grace.
+        tokio::time::pause();
         tokio::time::advance(IDLE_GRACE + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
 
@@ -669,22 +676,27 @@ mod tests {
         let name = "isekai-ssh-mux-idle-exit-reset-test";
         let token = Arc::new(b"tok".to_vec());
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
-        tokio::time::pause();
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
         let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
 
-        // First client connects then disconnects immediately.
+        // First client connects then disconnects immediately — like the
+        // idle-exit test above, its relay task's real (post-auth,
+        // finding-#3) channel-open must be given a chance to run under real
+        // time before the clock is paused, since russh's request/response
+        // internals can misbehave under a paused one (see
+        // `authed_test_handle`'s note about the handshake, which applies
+        // equally to this later channel-open).
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
             write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Well within the idle grace, a second client connects and stays
-        // connected (holds its Hello/HelloAck round-trip open).
-        tokio::time::advance(Duration::from_secs(1)).await;
+        // A second client connects and stays connected (holds its
+        // Hello/HelloAck round-trip open) — also under real time, for the
+        // same reason, before the clock is paused below.
         let conn2 = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
         let (mut r2, mut w2) = tokio::io::split(conn2);
         write_frame(&mut w2, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
@@ -693,9 +705,10 @@ mod tests {
             other => panic!("expected HelloAck, got {other:?}"),
         }
 
-        // Advance well past what the *first* client's grace window would have
-        // been — the loop must still be alive, serving the still-connected
-        // second client, not exited.
+        // Only now pause and advance well past what the *first* client's
+        // grace window would have been — the loop must still be alive,
+        // serving the still-connected second client, not exited.
+        tokio::time::pause();
         tokio::time::advance(IDLE_GRACE + Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert!(!serve_task.is_finished(), "a still-connected client must prevent the idle-exit from firing");
