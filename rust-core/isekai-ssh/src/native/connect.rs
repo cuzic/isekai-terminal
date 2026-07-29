@@ -497,11 +497,16 @@ async fn connect_attempt(
 /// (`RequestTty::No`) with a remote command skips the PTY entirely and runs
 /// the command directly via `SessionKind::Exec`. Every other combination
 /// (no command at all, or a command with `Auto`/`Yes`/`Force`) opens a
-/// PTY+shell instead — when a command is also present, the caller `exec`s it
-/// over that PTY afterwards (see the `remote_cmd`/`request_tty` check right
-/// after the channel opens in [`run_authenticated_session`]), since
-/// `SessionKind::Exec` itself never allocates a PTY.
-fn decide_session_kind(
+/// PTY+shell instead; if a command is also present, it's `exec`'d over that
+/// PTY (`SessionKind::Shell`'s own `command` field — `open_channel` never
+/// issues both `request_shell` and `exec` on the same channel).
+///
+/// `pub(crate)` (not `pub(super)`) so `native::mux::owner` can reuse this
+/// exact decision for the mux path's per-client channel open, keeping the
+/// `-t`/`-T` logic in one place rather than re-deriving it — see this
+/// module's own doc comment on why `SessionKind::Shell` gained `command` in
+/// the first place.
+pub(crate) fn decide_session_kind(
     remote_cmd: Option<&[String]>,
     request_tty: crate::wrapper::RequestTty,
     term: &str,
@@ -510,9 +515,23 @@ fn decide_session_kind(
     terminal_modes: &[(russh::Pty, u32)],
 ) -> SessionKind {
     match remote_cmd {
-        Some(cmd) if request_tty == crate::wrapper::RequestTty::No => SessionKind::Exec { command: cmd.join(" ") },
-        _ => SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec() },
+        Some(cmd) if !wants_pty(remote_cmd, request_tty) => SessionKind::Exec { command: cmd.join(" ") },
+        Some(cmd) => {
+            SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec(), command: Some(cmd.join(" ")) }
+        }
+        None => SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec(), command: None },
     }
+}
+
+/// The PTY-or-not half of [`decide_session_kind`]'s decision, split out so
+/// `native::mux::mod`'s `want_pty` (sent to the owner in `Frame::Hello`,
+/// before any `SessionKind` exists to ask) can reuse the exact same logic
+/// instead of re-deriving it as an untested, easily-drifting duplicate
+/// boolean expression — `decide_session_kind`'s own tests exercise every
+/// `RequestTty` variant × with/without a command, so this function is
+/// covered transitively through them.
+pub(crate) fn wants_pty(remote_cmd: Option<&[String]>, request_tty: crate::wrapper::RequestTty) -> bool {
+    !(remote_cmd.is_some() && request_tty == crate::wrapper::RequestTty::No)
 }
 
 /// The authenticated-session half of [`connect_attempt`], split out so
@@ -632,8 +651,22 @@ async fn run_authenticated_session(
     // private forward. Reached only on success, so a failed attempt (which
     // returns above) never `take`s the hook out of the caller's `Option` — it
     // stays available for the always-connects re-bootstrap retry.
+    //
+    // Deliberately `resolution.ctl_socket_enabled()`, not `ctl_enabled`: a
+    // holder is spawned once per host and re-exec'd with *this* invocation's
+    // exact argv (`mux::holder`), then goes on to serve every future tab to
+    // that host until it idle-exits — `ctl_enabled` also folds in
+    // `should_attempt_ctl_forward`'s "no trailing remote command" check,
+    // which is about *this one session's own* foreground forward, not
+    // whether the route table the holder hands out to *other, later,
+    // interactive* clients should exist at all. Gating the holder's route
+    // table on it meant a holder spawned by `isekai-ssh host -- cmd` (this
+    // PR's own mux remote-command feature makes that pattern usable for the
+    // first time) permanently lost ctl-socket for every sibling tab it
+    // served afterward, with no way to recover short of the holder idle-exiting.
+    let ctl_routes_for_holder = resolution.ctl_socket_enabled().then(|| forward_routes.clone());
     if let Some(hook) = owner_hook.take() {
-        let serve_handle = hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let serve_handle = hook(handle.clone(), ctl_routes_for_holder);
         let _ = serve_handle.await;
         return Ok(0);
     }
@@ -701,12 +734,6 @@ async fn run_authenticated_session(
         if key == "LANG" || key.starts_with("LC_") {
             let _ = channel.set_env(false, &key, &value).await;
         }
-    }
-
-    // If a remote command was requested with a PTY, exec it now.
-    if let (Some(cmd), true) = (remote_cmd, plan.request_tty != crate::wrapper::RequestTty::No) {
-        let command = cmd.join(" ");
-        let _ = channel.exec(false, command.as_str()).await;
     }
 
     // Apply ctl messages this tab receives over its forward directly to the
@@ -1669,15 +1696,25 @@ mod tests {
         }
     }
 
-    /// `Auto`/`Yes`/`Force` all open a PTY+shell even when a command is present — the
-    /// command itself is `exec`'d over that PTY separately by the caller (see the
-    /// `remote_cmd`/`request_tty` check right after the channel opens in
-    /// `run_authenticated_session`), since `SessionKind::Exec` never allocates a PTY.
+    /// `Auto`/`Yes`/`Force` all open a PTY+shell even when a command is present —
+    /// `open_channel` `exec`s the command over that PTY itself
+    /// (`SessionKind::Shell`'s own `command` field), since `SessionKind::Exec`
+    /// never allocates a PTY. This used to be a caller-side `channel.exec(...)`
+    /// issued *after* `open_channel` had already called `request_shell` on the
+    /// same channel — silently failing (RFC 4254 §6.5: a channel accepts only
+    /// one of `shell`/`exec`/`subsystem`) and leaving `isekai-ssh -t host cmd`
+    /// in a login shell instead of running `cmd`; folding `command` into
+    /// `SessionKind::Shell` fixed it (2026-07-28) — this test now also checks
+    /// the field is actually populated, not just that a PTY was requested.
     #[test]
     fn decide_session_kind_uses_shell_for_a_command_with_a_pty_requested() {
         let cmd = vec!["echo".to_string(), "hi".to_string()];
         for request_tty in [crate::wrapper::RequestTty::Auto, crate::wrapper::RequestTty::Yes, crate::wrapper::RequestTty::Force] {
             let kind = decide_session_kind(Some(&cmd), request_tty, "xterm", 80, 24, &[]);
+            match &kind {
+                SessionKind::Shell { command, .. } => assert_eq!(command.as_deref(), Some("echo hi"), "{request_tty:?}"),
+                SessionKind::Exec { .. } => panic!("{request_tty:?} with a remote command must still allocate a PTY"),
+            }
             assert!(
                 matches!(kind, SessionKind::Shell { .. }),
                 "{request_tty:?} with a remote command must still allocate a PTY"
@@ -1751,7 +1788,7 @@ mod tests {
             .unwrap();
         assert!(authed, "CloseWithoutExitStatusServer accepts any password");
 
-        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![] })
+        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![], command: None })
             .await
             .unwrap();
 
@@ -1774,7 +1811,7 @@ mod tests {
         let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
         let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string())).await.unwrap();
         assert!(authed, "the shell-request test server accepts any password");
-        let channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![] })
+        let channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![], command: None })
             .await
             .unwrap();
         (handle, channel)

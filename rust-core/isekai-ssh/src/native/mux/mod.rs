@@ -321,6 +321,12 @@ where
     // profile identity Epic P Phase 2's build-profile lookup uses on the Unix
     // path (`resolution.profile()`).
     let host = prepared.resolution().profile().to_string();
+    // Same `-t`/`-T` intent the non-mux path derives via
+    // `decide_session_kind`/`wants_pty` (`connect.rs`), sent to the owner in
+    // `Hello` so it can make the identical decision — see `client::run`'s
+    // doc comment.
+    let want_pty = connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
+    let remote_command = prepared.plan().remote_command().map(|cmd| cmd.join(" "));
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
         // The holder released its claim (or hadn't finished writing the token
@@ -329,7 +335,7 @@ where
         // principle) — dial SSH ourselves, unmultiplexed.
         ClientToken::FallBack => return connect::run_prepared(prepared, None, handoff).await,
     };
-    match client::run(conn, &token, host).await? {
+    match client::run(conn, &token, host, remote_command, want_pty).await? {
         client::ClientRunResult::ExitCode(code) => Ok(code),
         // The holder rejected us before any shell session existed (protocol
         // version mismatch, or a stale token read in the window before a new
@@ -572,9 +578,11 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string())
-            .await
-            .unwrap();
+        let outcome = super::client::run_inner(
+            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, super::client::ClientOutcome::Exited(0), "a clean remote exit must reach the client as Exited(0)");
         assert!(
