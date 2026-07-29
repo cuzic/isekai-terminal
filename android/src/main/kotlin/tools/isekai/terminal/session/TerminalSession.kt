@@ -503,6 +503,18 @@ class TerminalSession(
      *  生の可視性/フォーカス状態を渡すだけでよい。 */
     fun notifyFocusChange(focused: Boolean) = orchestrator.notifyFocusChange(focused)
 
+    /** アプリ全体がバックグラウンドへ遷移した(`ProcessLifecycleOwner.onStop`相当)ことを
+     *  そのままRust側へ転送する。`budgetMs`はAndroidではForeground Service経由で
+     *  セッションを維持するため猶予概念が無く、常に0を渡す(Rust側もこの引数は現状
+     *  未使用)。tmux通知の抑制判断(`SessionOrchestrator::on_notify`)を含む「今アプリが
+     *  前景か」の生の事実として使われる(`rust-ssot.md`、実機検証2026-07-28で
+     *  これが未配線のためtmux通知が常に抑制されるバグを修正)。 */
+    fun notifyDidEnterBackground() = orchestrator.notifyDidEnterBackground(0u)
+
+    /** アプリがフォアグラウンドへ復帰した(`ProcessLifecycleOwner.onStart`相当)ことを
+     *  そのままRust側へ転送する。[notifyDidEnterBackground]と対称。 */
+    fun notifyWillEnterForeground() = orchestrator.notifyWillEnterForeground()
+
     // ── Host key ──────────────────────────────────────────────────────
 
     fun trustUpdatedHostKey() {

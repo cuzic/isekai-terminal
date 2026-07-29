@@ -379,6 +379,16 @@ struct OrchestratorState {
     /// `background_state`と合わせて「今この瞬間ユーザーがこのタブを見ているか」の
     /// 抑制判断に使う。
     tab_focused: bool,
+    /// タスク#57フォローアップ(実機検証、2026-07-28): アプリ自体が今フォアグラウンド
+    /// かどうかの生の事実。`notify_did_enter_background`/`notify_will_enter_foreground`
+    /// が`phase`に関係なく無条件で複製する(`tab_focused`と同じ「生イベントをそのまま
+    /// 転送するだけ」の扱い、`rust-ssot.md`)。`background_state`(#20)は
+    /// 再接続バジェット管理のためのFSMであり「ユーザーが今画面を見ているか」の事実とは
+    /// 別物——`Idle`中の切断待機や再接続成功時に`Foreground`へ戻る等、アプリの実際の
+    /// 前景/背景とは無関係な理由で値が変わる。`OrchestratorAdapter::on_notify`の
+    /// 抑制判断はこの`app_foreground`を見る(以前は`background_state`を誤用しており、
+    /// バックグラウンド化してもtmux通知が永久に抑制され続けるバグがあった)。
+    app_foreground: bool,
     /// タスク#57: 直近配信した`(tmux_tag, seq)`の小さなリングバッファ。
     /// `isekai_protocol::CtlMessage::Notify`のdocコメントが想定する重複配信
     /// (tmux hookの再発火・session group内の複数メンバーからの重複起動、
@@ -658,10 +668,16 @@ impl SessionCallback for OrchestratorAdapter {
     ///
     /// (b): 「アプリがフォアグラウンドかつこのタブが今まさに表示されている」なら
     /// ユーザーは既にその出来事を画面上で見ているはずなので、Android通知としては
-    /// 冗長 — 抑制する。この判断はセッション状態(`background_state`)とUOSの生
-    /// フォーカスイベントの複製(`tab_focused`)に基づくため`rust-ssot.md`の対象
-    /// (Kotlin側にミラー状態を作って分岐させない)。per-tab通知ON/OFF設定自体は
-    /// UI設定でありKotlin側(`OrchestratorCallback::on_notify`実装)の責務。
+    /// 冗長 — 抑制する。この判断はアプリの前景/背景の生の事実(`app_foreground`)と
+    /// UOSの生フォーカスイベントの複製(`tab_focused`)に基づくため`rust-ssot.md`の
+    /// 対象(Kotlin側にミラー状態を作って分岐させない)。`background_state`(#20)は
+    /// 再接続バジェット管理のためのFSMであり「今ユーザーが画面を見ているか」の
+    /// 事実とは別物なので、ここでは意図的に見ない(実機検証、2026-07-28: これを
+    /// 誤って見ていたため、バックグラウンド化してもtmux通知が一切配信されない
+    /// バグがあった——`background_state`は`Idle`中の切断待機や再接続成功時など
+    /// アプリの実際の前景/背景と無関係な理由でも`Foreground`に戻り得る)。
+    /// per-tab通知ON/OFF設定自体はUI設定でありKotlin側
+    /// (`OrchestratorCallback::on_notify`実装)の責務。
     fn on_notify(&self, kind: crate::NotifyKind, tmux_tag: String, seq: u64) {
         if !self.is_current() { return; }
         let should_deliver = {
@@ -674,7 +690,7 @@ impl SessionCallback for OrchestratorAdapter {
                     s.recent_notify_seqs.pop_front();
                 }
                 s.recent_notify_seqs.push_back(key);
-                !(s.tab_focused && s.background_state == BackgroundState::Foreground)
+                !(s.tab_focused && s.app_foreground)
             }
         };
         if should_deliver {
@@ -1142,6 +1158,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             reconnect_policy: ReconnectPolicy::default(),
             background_state: BackgroundState::Foreground,
             tab_focused: false,
+            app_foreground: true,
             recent_notify_seqs: std::collections::VecDeque::new(),
         }),
         callback: Arc::from(callback),
@@ -1331,6 +1348,9 @@ impl SessionOrchestrator {
     /// 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
     pub fn notify_did_enter_background(&self, _budget_ms: u32) {
         let mut s = self.shared.state.lock();
+        // `app_foreground`は`phase`に関係なく無条件で更新する生の事実
+        // (`tab_focused`と同じ扱い、上のフィールドdoc参照)。
+        s.app_foreground = false;
         // #20 codexレビュー指摘: `Connecting`中にバックグラウンド化し、その猶予中に
         // 接続が成立するケース(`on_connected()`は`background_state`に触れない)も
         // 追跡対象に含める。`Idle`(そもそも維持すべきセッションが無い)は対象外のまま。
@@ -1369,6 +1389,9 @@ impl SessionOrchestrator {
     pub fn notify_will_enter_foreground(&self) {
         let reconnect_with = {
             let mut s = self.shared.state.lock();
+            // `app_foreground`は`phase`/`background_state`に関係なく無条件で更新する
+            // 生の事実(`notify_did_enter_background`と対称、上のフィールドdoc参照)。
+            s.app_foreground = true;
             let was_suspended = s.background_state == BackgroundState::Suspended;
             s.background_state = BackgroundState::Foreground;
             if was_suspended && !s.reconnect_loop_active && s.phase != ConnPhase::Connecting {
@@ -1984,6 +2007,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
+                app_foreground: true,
                 recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
@@ -2045,6 +2069,7 @@ mod tests {
             reconnect_policy: policy,
             background_state: BackgroundState::Foreground,
             tab_focused: false,
+            app_foreground: true,
             recent_notify_seqs: std::collections::VecDeque::new(),
         }
     }
@@ -3318,6 +3343,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
+                app_foreground: true,
                 recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
@@ -3381,7 +3407,7 @@ mod tests {
         {
             let mut s = shared.state.lock();
             s.tab_focused = true;
-            s.background_state = BackgroundState::Foreground;
+            s.app_foreground = true;
         }
         adapter.on_notify(crate::NotifyKind::Activity, "tag-a".to_string(), 1);
         assert!(cb.notifications.lock().unwrap().is_empty());
@@ -3391,14 +3417,49 @@ mod tests {
     fn on_notify_delivers_when_tab_focused_but_app_backgrounded() {
         // タブ自体はフォーカスされていても(Compose側の直近状態が古い等)、
         // アプリ全体がバックグラウンドならユーザーは見ていないので配信する。
+        // `background_state`(再接続バジェットFSM)ではなく`app_foreground`
+        // (生の前景/背景の事実)で判断することを確認する(2026-07-28の実機バグ修正)。
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
         {
             let mut s = shared.state.lock();
             s.tab_focused = true;
-            s.background_state = BackgroundState::Suspended;
+            s.app_foreground = false;
         }
         adapter.on_notify(crate::NotifyKind::Silence, "tag-a".to_string(), 1);
         assert_eq!(cb.notifications.lock().unwrap().as_slice(), &[crate::NotifyKind::Silence]);
+    }
+
+    #[test]
+    fn on_notify_suppresses_when_tab_focused_even_if_background_state_is_quiescing() {
+        // regression: `background_state`が`Quiescing`(#20の再接続バジェットFSM)でも、
+        // `app_foreground`が真の前景/背景の事実(`notify_did_enter_background`が
+        // 未呼び出しでデフォルトのtrueのまま等)であれば抑制すべき——on_notifyは
+        // `background_state`を一切見てはいけない。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.tab_focused = true;
+            s.app_foreground = true;
+            s.background_state = BackgroundState::Quiescing;
+        }
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 1);
+        assert!(cb.notifications.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_did_enter_background_sets_app_foreground_false_unconditionally() {
+        let (orch, _cb, _events) = orchestrator_connected_with_reconnect_policy(ReconnectPolicy::default());
+        orch.notify_did_enter_background(0);
+        assert!(!orch.shared.state.lock().app_foreground);
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_sets_app_foreground_true_unconditionally() {
+        let (orch, _cb, _events) = orchestrator_connected_with_reconnect_policy(ReconnectPolicy::default());
+        orch.notify_did_enter_background(0);
+        assert!(!orch.shared.state.lock().app_foreground);
+        orch.notify_will_enter_foreground();
+        assert!(orch.shared.state.lock().app_foreground);
     }
 
     #[test]

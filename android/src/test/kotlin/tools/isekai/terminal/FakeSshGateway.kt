@@ -95,8 +95,12 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun cancelReconnect() { cancelReconnectCalled = true }
     // iOSセッションライフサイクル用のRustコールバック(このファイルが対象とする複数タブ/pane
     // まわりのテストでは未検証、no-opで足りる)。
-    override fun notifyDidEnterBackground(budgetMs: UInt) {}
-    override fun notifyWillEnterForeground() {}
+    // 実機検証(2026-07-28)のバグ修正で、TerminalTabsViewModelのファンアウトを検証
+    // できるよう呼び出し回数を記録する(notifyNetworkPathChangedCallsと同じ形)。
+    var notifyDidEnterBackgroundCallCount = 0
+    var notifyWillEnterForegroundCallCount = 0
+    override fun notifyDidEnterBackground(budgetMs: UInt) { notifyDidEnterBackgroundCallCount++ }
+    override fun notifyWillEnterForeground() { notifyWillEnterForegroundCallCount++ }
     override fun notifyBackgroundBudgetExpired() {}
     override fun notifyMemoryWarning() {}
     override fun send(data: ByteArray) { sentBytes.add(data) }

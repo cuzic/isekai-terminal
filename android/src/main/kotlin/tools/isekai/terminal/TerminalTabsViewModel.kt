@@ -438,6 +438,13 @@ class TerminalTabsViewModel(
             },
             onLost = { onNetworkPathChanged(isSatisfied = false) },
         )
+        // 実機検証(2026-07-28)でこれが未配線だったため、tmux通知(enableTabNotifications)が
+        // バックグラウンド化しても常に抑制され続けるバグがあった(SessionOrchestrator側の
+        // app_foregroundが起動時のtrueから変わらないため)。
+        executor.registerLifecycleCallbacks(
+            onBackground = { onAppBackgrounded() },
+            onForeground = { onAppForegrounded() },
+        )
         // タスク#14: このViewModelはプロセス寿命にスコープされた(Applicationスコープの)
         // シングルトンなので(クラスdoc参照)、このinitブロックはプロセスが新規に起動した
         // 時にちょうど1回だけ走る——「前回のプロセスがkillされる直前に開いていたタブを
@@ -521,6 +528,25 @@ class TerminalTabsViewModel(
         _tabs.value.flatMap { it.panes }.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
     }
 
+    // ── アプリ全体のフォアグラウンド/バックグラウンド（全タブへファンアウト）──────
+
+    /** [openTab]/[splitPane]が新規セッションを作った直後に現在の前景/背景状態を
+     *  適用するための保持値(実機検証2026-07-28)。バックグラウンド中に新規セッションが
+     *  作られた場合、Rust側の初期値`app_foreground=true`のまま取り残されるのを防ぐ。 */
+    @Volatile private var appInForeground = true
+
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
+    internal fun onAppBackgrounded() {
+        appInForeground = false
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyDidEnterBackground() }
+    }
+
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
+    internal fun onAppForegrounded() {
+        appInForeground = true
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyWillEnterForeground() }
+    }
+
     // ── タブのライフサイクル ────────────────────────────────────────
 
     /**
@@ -539,6 +565,9 @@ class TerminalTabsViewModel(
         val tabId = UUID.randomUUID().toString()
         val rebindFdSource = executor.createRebindFdSource()
         val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
+        // バックグラウンド中に新規タブが開かれた(黙示的復元等)場合、新しいセッションの
+        // Rust側初期値`app_foreground=true`のまま取り残さないよう現在値を反映する。
+        if (!appInForeground) primaryPane.session.notifyDidEnterBackground()
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -641,6 +670,7 @@ class TerminalTabsViewModel(
         val profile = tab.profile ?: return null
         val rebindFdSource = executor.createRebindFdSource()
         val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
+        if (!appInForeground) pane.session.notifyDidEnterBackground()
         RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
         tab.openSplit(pane, direction)
         watchPane(tab, pane)
@@ -1066,6 +1096,7 @@ class TerminalTabsViewModel(
         RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel cleared")
         _tabs.value.forEach { tab -> tab.panes.forEach { closePaneSession(it) } }
         executor.unregisterNetworkCallbacks()
+        executor.unregisterLifecycleCallbacks()
         executor.release()
     }
 }

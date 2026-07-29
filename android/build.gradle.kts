@@ -119,6 +119,9 @@ dependencies {
     ksp(libs.room.compiler)
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.1")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.1")
+    // アプリ全体(プロセス)のフォアグラウンド/バックグラウンド遷移をSessionOrchestratorへ
+    // 転送するための ProcessLifecycleOwner(AndroidAppExecutor.registerLifecycleCallbacks参照)。
+    implementation("androidx.lifecycle:lifecycle-process:2.9.1")
     implementation("androidx.navigation:navigation-compose:2.9.0")
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation("androidx.compose.ui:ui-test-manifest")

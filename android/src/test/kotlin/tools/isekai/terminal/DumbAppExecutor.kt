@@ -23,6 +23,8 @@ class DumbAppExecutor : AppExecutor {
 
     private var _onAvailable: (() -> Unit)? = null
     private var _onLost: (() -> Unit)? = null
+    private var _onBackground: (() -> Unit)? = null
+    private var _onForeground: (() -> Unit)? = null
 
     override fun ensureServiceRunning() { serviceRunCount++ }
     override fun notifyConnected(host: String) { connectedHosts.add(host) }
@@ -40,6 +42,15 @@ class DumbAppExecutor : AppExecutor {
     override fun unregisterNetworkCallbacks() {
         _onAvailable = null
         _onLost = null
+    }
+
+    override fun registerLifecycleCallbacks(onBackground: () -> Unit, onForeground: () -> Unit) {
+        _onBackground = onBackground
+        _onForeground = onForeground
+    }
+    override fun unregisterLifecycleCallbacks() {
+        _onBackground = null
+        _onForeground = null
     }
 
     override suspend fun loadKeyPem(keyId: Long): ByteArray {
@@ -113,6 +124,8 @@ class DumbAppExecutor : AppExecutor {
 
     fun simulateNetworkLost() = _onLost?.invoke()
     fun simulateNetworkAvailable() = _onAvailable?.invoke()
+    fun simulateAppBackgrounded() = _onBackground?.invoke()
+    fun simulateAppForegrounded() = _onForeground?.invoke()
     /** [index]番目(登録順)に登録されたupstream failover監視のコールバックを発火する。既定は先頭。 */
     fun simulateWifiUpstreamBroken(index: Int = 0) = onWifiUpstreamBrokenCallbacks.getOrNull(index)?.invoke()
 }
