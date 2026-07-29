@@ -81,10 +81,17 @@ class TerminalHostScreenTest {
         label = label, host = "$label.example.com", username = "user", authType = "password",
     )
 
+    // key認証プロファイル: パスワードプロンプトを挟まずopenTabが直接呼ばれる経路を検証したい
+    // テスト用(「+」ボタンのパスワード認証分岐は別途addSessionButton_forPasswordAuthProfile_...
+    // でカバーする)。
+    private fun keyProfile(label: String) = ConnectionProfile(
+        label = label, host = "$label.example.com", username = "user", authType = "key",
+    )
+
     @Test fun tabBar_rendersOneLabelPerOpenTab() {
         vm.openTab(profile("alpha"))
         vm.openTab(profile("beta"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         composeTestRule.onNodeWithText("alpha").assertExists()
         composeTestRule.onNodeWithText("beta").assertExists()
     }
@@ -96,7 +103,7 @@ class TerminalHostScreenTest {
 
     @Test fun tabLabel_prefersOscTitleOverProfileLabel() {
         vm.openTab(profile("alpha"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         composeTestRule.onNodeWithText("alpha").assertExists()
 
         // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
@@ -111,7 +118,7 @@ class TerminalHostScreenTest {
 
     @Test fun tabLabel_fallsBackToProfileLabel_whenOscTitleIsBlank() {
         vm.openTab(profile("alpha"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
@@ -126,7 +133,7 @@ class TerminalHostScreenTest {
         // openTab は開いた直後のタブ(beta)をアクティブにする。
         assertEquals(vm.tabs.value.last().tabId, vm.activeTabId.value)
 
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         // ScrollableTabRow の Tab は素の performClick() だとインジケーターアニメーション絡みで
         // 座標ベースのクリックが安定しないため、既存の FilterChip テストと同じく
         // semantics の OnClick アクションを直接叩く方式にする。
@@ -139,7 +146,7 @@ class TerminalHostScreenTest {
     @Test fun closingOneOfTwoTabs_removesOnlyThatTabAndDisconnectsItsSession() {
         vm.openTab(profile("alpha"))
         vm.openTab(profile("beta"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         assertEquals(2, vm.tabs.value.size)
 
         // タブ行の並び順(生成順)通りにクローズボタン(×)が並ぶはずなので、先頭(alpha)を閉じる。
@@ -151,11 +158,63 @@ class TerminalHostScreenTest {
         assertTrue("閉じたタブのセッションはdisconnectされるべき", orchestrators[0].disconnectCalled)
     }
 
+    // タスク#57フォローアップ: 「戻る」はタブを閉じず、プロファイル一覧への遷移だけを要求する
+    // (以前はonBack==onCloseTabでタブ自体が破棄されるバグがあった)。
+
+    @Test fun tappingBack_navigatesToProfileList_withoutClosingTab() {
+        vm.openTab(profile("alpha"))
+        var navigatedToProfileList = false
+        composeTestRule.setContent {
+            TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = { navigatedToProfileList = true }, tabsVm = vm)
+        }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("戻る").performClick()
+        composeTestRule.waitForIdle()
+
+        assertTrue("「戻る」はプロファイル一覧への遷移を要求するべき", navigatedToProfileList)
+        assertEquals("「戻る」はタブを閉じるべきではない", 1, vm.tabs.value.size)
+        assertTrue("「戻る」はセッションをdisconnectするべきではない", !orchestrators[0].disconnectCalled)
+    }
+
+    // ── ターミナル画面から同一プロファイルへ新規タブを追加する「+」ボタン ──────
+
+    @Test fun addSessionButton_opensNewTabForSameProfile() {
+        vm.openTab(keyProfile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("addSessionButton").performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(2, vm.tabs.value.size)
+        assertEquals("alpha", vm.tabs.value[1].label)
+        assertEquals(vm.tabs.value[1].tabId, vm.activeTabId.value)
+    }
+
+    @Test fun addSessionButton_forPasswordAuthProfile_promptsForPasswordAndConnects() {
+        vm.openTab(profile("alpha"), "pass")
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("addSessionButton").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("パスワード入力").assertExists()
+        composeTestRule.onAllNodes(hasSetTextAction())[0].performTextInput("second-secret")
+        composeTestRule.onNodeWithText("接続").performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(2, vm.tabs.value.size)
+        composeTestRule.waitUntil(3000) { orchestrators.size > 1 && orchestrators[1].connectCalled }
+        assertTrue("パスワード入力後は新規タブ側のセッションも接続を試みるべき", orchestrators[1].connectCalled)
+    }
+
     @Test fun closingLastRemainingTab_invokesOnAllTabsClosed() {
         vm.openTab(profile("alpha"))
         var closedCallbackInvoked = false
         composeTestRule.setContent {
-            TerminalHostScreen(onAllTabsClosed = { closedCallbackInvoked = true }, tabsVm = vm)
+            TerminalHostScreen(onAllTabsClosed = { closedCallbackInvoked = true }, onNavigateToProfileList = {}, tabsVm = vm)
         }
         composeTestRule.onNodeWithText("×").performClick()
         composeTestRule.waitForIdle()
@@ -165,7 +224,7 @@ class TerminalHostScreenTest {
 
     @Test fun themeButton_opensDialog_andSelectingThemeOverridesOnlyThatTab() {
         vm.openTab(profile("alpha"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         composeTestRule.onNodeWithText(TerminalThemes.DRACULA.name).assertDoesNotExist()
         composeTestRule.onNodeWithText("🎨").performClick()
@@ -182,7 +241,7 @@ class TerminalHostScreenTest {
 
     @Test fun splitPaneNewConnection_forPasswordAuthProfile_promptsForPasswordAndConnects() {
         vm.openTab(profile("alpha"), "pass")
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithTag("splitPaneButton").performClick()
@@ -215,7 +274,7 @@ class TerminalHostScreenTest {
         // 一度も呼ばれない(=connectCalledが永遠にtrueにならない)。TerminalTabsViewModelTestの
         // tmuxテスト群と同じ理由でここでもpasswordを渡す。
         vm.openTab(savedProfile, "pass")
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         composeTestRule.onNodeWithText("alpha").assertExists()
 
         composeTestRule.waitUntil(10_000) { orchestrators.isNotEmpty() && orchestrators[0].connectCalled }
@@ -240,7 +299,7 @@ class TerminalHostScreenTest {
         // tmuxサフィックスは一切付かない(既存のtabBar_rendersOneLabelPerOpenTab等の
         // 前提を明示的にテストとして固定する)。
         vm.openTab(profile("alpha"))
-        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
         orchestrators[0].simulateConnected()
         composeTestRule.waitForIdle()
 

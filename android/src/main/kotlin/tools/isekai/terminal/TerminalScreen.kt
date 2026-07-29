@@ -303,7 +303,6 @@ fun TerminalScreenBody(
         }
     }
 
-    var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
     var showKeySequenceSheet by remember { mutableStateOf(false) }
@@ -383,22 +382,10 @@ fun TerminalScreenBody(
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
 
-    BackHandler(enabled = connected && isActive && hasFocus) { showDisconnectDialog = true }
-
-    if (showDisconnectDialog) {
-        AlertDialog(
-            onDismissRequest = { showDisconnectDialog = false },
-            title = { Text("切断しますか？") },
-            confirmButton = {
-                TextButton(onClick = { actions.onDisconnect(); showDisconnectDialog = false; actions.onBack() }) {
-                    Text("切断")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDisconnectDialog = false }) { Text("キャンセル") }
-            },
-        )
-    }
+    // 「戻る」はタブ/セッションを破棄しない(プロファイル一覧へ遷移するだけ、セッションは
+    // バックグラウンドで生き続ける)。破棄の確認は不要になったため、切断確認ダイアログは出さない
+    // (明示的な切断は上のステータスバーの「切断」ボタン、タブの破棄はタブ行の「×」)。
+    BackHandler(enabled = isActive && hasFocus) { actions.onBack() }
 
     // モーダルUI(host key/trzsz/agent forwarding/スニペット一覧確認)は「フォーカス中の
     // ペインに対してだけ表示する」設計(このComposableのdocstring参照)。表示条件を
