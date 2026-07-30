@@ -112,25 +112,35 @@ fun TerminalHostScreen(
                 enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
                 exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
             ) {
-                ScrollableTabRow(
-                    selectedTabIndex = selectedIndex,
-                    containerColor = Color(0xFF1A1A2E),
-                    contentColor = Color.White,
-                    edgePadding = 4.dp,
-                ) {
-                    tabs.forEachIndexed { index, tab ->
-                        Tab(
-                            selected = index == selectedIndex,
-                            onClick = { tabsVm.setActiveTab(tab.tabId) },
-                            text = {
-                                TabLabel(
-                                    tabsVm = tabsVm,
-                                    tab = tab,
-                                    otherTabs = tabs.filterNot { it.tabId == tab.tabId },
-                                    onClose = { tabsVm.closeTab(tab.tabId) },
-                                )
-                            },
-                        )
+                // タブ数が変わる(特に増える)瞬間、ScrollableTabRowが「新しいタブがまだ計測されて
+                // いないのにselectedTabIndexだけ先にその新タブを指す」状態を1フレーム経由することが
+                // あり、Compose Material3側の内部position配列アクセスでIndexOutOfBoundsExceptionを
+                // 起こす(タブ追加と同時にその新タブをアクティブ化するopenTab()の直後、既にマウント
+                // 済みのScrollableTabRowへ「+」ボタンからタブを追加した際に実機クラッシュとして発見、
+                // タスク#57フォローアップ)。tabs.sizeをkeyにしてタブ数が変わるたびにScrollableTabRow
+                // 自体を作り直させる(内部のtabPositions等の派生状態を新しいタブ数に対して最初から
+                // 組み立て直させる)ことで、この“成長途中の1フレーム”を経由させない。
+                key(tabs.size) {
+                    ScrollableTabRow(
+                        selectedTabIndex = selectedIndex,
+                        containerColor = Color(0xFF1A1A2E),
+                        contentColor = Color.White,
+                        edgePadding = 4.dp,
+                    ) {
+                        tabs.forEachIndexed { index, tab ->
+                            Tab(
+                                selected = index == selectedIndex,
+                                onClick = { tabsVm.setActiveTab(tab.tabId) },
+                                text = {
+                                    TabLabel(
+                                        tabsVm = tabsVm,
+                                        tab = tab,
+                                        otherTabs = tabs.filterNot { it.tabId == tab.tabId },
+                                        onClose = { tabsVm.closeTab(tab.tabId) },
+                                    )
+                                },
+                            )
+                        }
                     }
                 }
             }
