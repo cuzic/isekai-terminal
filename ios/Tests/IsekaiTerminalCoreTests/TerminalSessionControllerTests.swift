@@ -409,6 +409,22 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(config.bindPort)
     }
 
+    // Android版`ConnectionProfileTest.toMultipathIsekaiPipeQuicConfig maps
+    // enableUpstreamFailover through`と対になる回帰テスト。RebindManager(Rust側)が
+    // この値でゲートされるようになったため(以前は伝わっておらずRust側は常時有効
+    // だった)、素通りしていることを確認する。
+    func testMakeMultipathIsekaiPipeQuicConfigMapsEnableUpstreamFailover() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            enableUpstreamFailover: true
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeMultipathIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertTrue(config.enableUpstreamFailover)
+    }
+
     // helperBindPortが以前は保存経路が無く常にnilになっていたバグの回帰テスト
     // (Codexアーキテクチャレビュー指摘、ProfileEditView側の修正とセット)。
     func testMakeMultipathIsekaiPipeQuicConfigMapsHelperBindPort() throws {

@@ -23,6 +23,15 @@ interface AppExecutor {
     fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit)
     /** ネットワーク変化のコールバックを解除する。 */
     fun unregisterNetworkCallbacks()
+    /**
+     * アプリ全体(プロセス)のフォアグラウンド/バックグラウンド遷移のコールバックを登録する
+     * (`ProcessLifecycleOwner.onStop`/`onStart`相当、タブ単位ではなくプロセス全体で1回)。
+     * 実機検証(2026-07-28)でこれが未配線だったため、tmux通知(`enableTabNotifications`)が
+     * バックグラウンド化しても常に抑制され続けるバグがあった。
+     */
+    fun registerLifecycleCallbacks(onBackground: () -> Unit, onForeground: () -> Unit)
+    /** フォアグラウンド/バックグラウンド遷移のコールバックを解除する。 */
+    fun unregisterLifecycleCallbacks()
     /** 指定 keyId の秘密鍵を復号して PEM バイト列で返す。 */
     suspend fun loadKeyPem(keyId: Long): ByteArray
     /**

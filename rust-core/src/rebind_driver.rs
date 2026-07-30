@@ -77,7 +77,7 @@ pub(crate) struct RebindDriverHandle {
 
 impl RebindDriverHandle {
     /// キューが詰まっている/ループが既に終了している場合は黙って捨てる
-    /// (既存の`rebind_to_fd`の`try_send`失敗時と同じ日和見的ポリシー)。
+    /// (日和見的ポリシー、`RealRebindExecutor::rebind`の`try_send`と同じ考え方)。
     pub(crate) fn send_event(&self, event: RebindEvent) {
         let _ = self.input_tx.try_send(event);
     }

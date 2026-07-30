@@ -259,6 +259,16 @@ struct IsekaiConfig {
     /// works even when this connection ends up sharing an underlying
     /// transport via ControlMaster/ControlPersist (see `ctl_forward.rs`).
     ctl_socket_enabled: bool,
+    /// `#@isekai tab-idle-color <rrggbb>` (`ISEKAI_PIPE_DESIGN.md` §8 Epic
+    /// Q): the tab background color `claude-hookd` restores once no Claude
+    /// Code session on this tab needs attention. `None` (no directive) means
+    /// "use the built-in default" — resolved on the remote side by
+    /// `claude-hookd`, not here, since `ISEKAI_TAB_IDLE_COLOR` is only
+    /// exported into the remote session's environment when this is `Some`.
+    tab_idle_color: Option<(u8, u8, u8)>,
+    /// `#@isekai tab-attention-color <rrggbb>`, the counterpart to
+    /// `tab_idle_color` for the "a session needs your input" state.
+    tab_attention_color: Option<(u8, u8, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +352,20 @@ impl WrapperResolution {
     /// private field directly (same module).
     pub(crate) fn ctl_socket_enabled(&self) -> bool {
         self.isekai.ctl_socket_enabled
+    }
+
+    /// `#@isekai tab-idle-color <rrggbb>` (Epic Q), already validated and
+    /// parsed at config-resolution time. Both the Unix (`ctl_forward.rs`,
+    /// same module) and native (`native/connect.rs`, `native/mux/owner.rs`)
+    /// paths need this to build the login-shell command's `export` clauses.
+    pub(crate) fn tab_idle_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_idle_color
+    }
+
+    /// `#@isekai tab-attention-color <rrggbb>` (Epic Q), `tab_idle_color`'s
+    /// counterpart.
+    pub(crate) fn tab_attention_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_attention_color
     }
 
     /// `{hostname}:{port}` for this destination, using the same
@@ -614,7 +638,11 @@ async fn apply_ctl_socket_forward(
     if let Some(forward) = &ctl_forward {
         // Anything appended after the destination is the remote command, not
         // an option, to ssh(1).
-        command.arg(crate::ctl_forward::remote_command_arg(forward));
+        command.arg(crate::ctl_forward::remote_command_arg(
+            forward,
+            resolution.isekai.tab_idle_color,
+            resolution.isekai.tab_attention_color,
+        ));
     }
 }
 
@@ -2043,6 +2071,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2101,6 +2131,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2324,6 +2356,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2385,6 +2419,8 @@ mod tests {
         // | `remote-log-level`     | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --log-level`, no `ConnectionIntent` field exists for it) |
         // | `remote-bind-port-range` | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
         // | `local-bind-port-range` | (a) `intent.local_bind_port_range`                                                |
+        // | `tab-idle-color`       | `ctl_forward.rs`'s `remote_command_arg` (opt-in env var export at connect time only; no `ConnectionIntent` field exists for it — same category as the pre-existing `ctl-socket`/`bootstrap-relay` gaps in this table) |
+        // | `tab-attention-color`  | ditto (`tab-idle-color`'s counterpart)                                            |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2556,6 +2592,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,

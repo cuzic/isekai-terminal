@@ -69,24 +69,25 @@ impl ActiveSession {
     fn disconnect(&self) {
         dispatch_all!(self, disconnect)
     }
-    /// マルチパス以外のセッションでは意味を持たないため何もしない
-    /// （呼び出し側は「そのとき使っているtransportがマルチパスかどうか」を
-    /// 意識せず日和見的に呼べばよい）。
-    fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        if let Self::MultipathIsekaiPipeQuic(s) = self {
-            s.rebind_to_fd(fd, local_ip);
-        }
-    }
-    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のtransportでは
-    /// 何もしない(rebind_to_fdと同じ理由)。
+    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のセッションでは
+    /// 意味を持たないため何もしない（呼び出し側は「そのとき使っているtransportが
+    /// マルチパスかどうか」を意識せず日和見的に呼べばよい）。
     fn force_return_to_wifi(&self) {
         if let Self::MultipathIsekaiPipeQuic(s) = self {
             s.force_return_to_wifi();
         }
     }
+    /// `UpstreamHealthMonitor`(Android ConnectivityManager由来、force_return_to_wifiと
+    /// 同じくマルチパス以外のtransportでは何もしない)からの生イベントを
+    /// `RebindManager`へ転送する。
+    fn notify_upstream_health_degraded(&self) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.notify_upstream_health_degraded();
+        }
+    }
     /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
     /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
-    /// `rebind_to_fd`と同じくno-op委譲。
+    /// `force_return_to_wifi`と同じくno-op委譲。
     fn set_interactive_busy(&self, busy: bool) {
         if let Self::MultipathIsekaiPipeQuic(s) = self {
             s.set_interactive_busy(busy);
@@ -383,6 +384,16 @@ struct OrchestratorState {
     /// `background_state`と合わせて「今この瞬間ユーザーがこのタブを見ているか」の
     /// 抑制判断に使う。
     tab_focused: bool,
+    /// タスク#57フォローアップ(実機検証、2026-07-28): アプリ自体が今フォアグラウンド
+    /// かどうかの生の事実。`notify_did_enter_background`/`notify_will_enter_foreground`
+    /// が`phase`に関係なく無条件で複製する(`tab_focused`と同じ「生イベントをそのまま
+    /// 転送するだけ」の扱い、`rust-ssot.md`)。`background_state`(#20)は
+    /// 再接続バジェット管理のためのFSMであり「ユーザーが今画面を見ているか」の事実とは
+    /// 別物——`Idle`中の切断待機や再接続成功時に`Foreground`へ戻る等、アプリの実際の
+    /// 前景/背景とは無関係な理由で値が変わる。`OrchestratorAdapter::on_notify`の
+    /// 抑制判断はこの`app_foreground`を見る(以前は`background_state`を誤用しており、
+    /// バックグラウンド化してもtmux通知が永久に抑制され続けるバグがあった)。
+    app_foreground: bool,
     /// タスク#57: 直近配信した`(tmux_tag, seq)`の小さなリングバッファ。
     /// `isekai_protocol::CtlMessage::Notify`のdocコメントが想定する重複配信
     /// (tmux hookの再発火・session group内の複数メンバーからの重複起動、
@@ -662,10 +673,16 @@ impl SessionCallback for OrchestratorAdapter {
     ///
     /// (b): 「アプリがフォアグラウンドかつこのタブが今まさに表示されている」なら
     /// ユーザーは既にその出来事を画面上で見ているはずなので、Android通知としては
-    /// 冗長 — 抑制する。この判断はセッション状態(`background_state`)とUOSの生
-    /// フォーカスイベントの複製(`tab_focused`)に基づくため`rust-ssot.md`の対象
-    /// (Kotlin側にミラー状態を作って分岐させない)。per-tab通知ON/OFF設定自体は
-    /// UI設定でありKotlin側(`OrchestratorCallback::on_notify`実装)の責務。
+    /// 冗長 — 抑制する。この判断はアプリの前景/背景の生の事実(`app_foreground`)と
+    /// UOSの生フォーカスイベントの複製(`tab_focused`)に基づくため`rust-ssot.md`の
+    /// 対象(Kotlin側にミラー状態を作って分岐させない)。`background_state`(#20)は
+    /// 再接続バジェット管理のためのFSMであり「今ユーザーが画面を見ているか」の
+    /// 事実とは別物なので、ここでは意図的に見ない(実機検証、2026-07-28: これを
+    /// 誤って見ていたため、バックグラウンド化してもtmux通知が一切配信されない
+    /// バグがあった——`background_state`は`Idle`中の切断待機や再接続成功時など
+    /// アプリの実際の前景/背景と無関係な理由でも`Foreground`に戻り得る)。
+    /// per-tab通知ON/OFF設定自体はUI設定でありKotlin側
+    /// (`OrchestratorCallback::on_notify`実装)の責務。
     fn on_notify(&self, kind: crate::NotifyKind, tmux_tag: String, seq: u64) {
         if !self.is_current() { return; }
         let should_deliver = {
@@ -678,7 +695,7 @@ impl SessionCallback for OrchestratorAdapter {
                     s.recent_notify_seqs.pop_front();
                 }
                 s.recent_notify_seqs.push_back(key);
-                !(s.tab_focused && s.background_state == BackgroundState::Foreground)
+                !(s.tab_focused && s.app_foreground)
             }
         };
         if should_deliver {
@@ -870,12 +887,12 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
         }
         LastConnectAttempt::IsekaiPipeQuic(config) => {
             let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-            session.connect(Box::new(adapter))?;
+            session.connect(Box::new(adapter), shared.app_pane_id.clone())?;
             ActiveSession::IsekaiPipeQuic(session)
         }
         LastConnectAttempt::IsekaiPipeQuicAuto(config) => {
             let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-            session.connect_auto(Box::new(adapter))?;
+            session.connect_auto(Box::new(adapter), shared.app_pane_id.clone())?;
             ActiveSession::IsekaiPipeQuic(session)
         }
         LastConnectAttempt::MultipathIsekaiPipeQuic(config) => {
@@ -1146,6 +1163,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             reconnect_policy: ReconnectPolicy::default(),
             background_state: BackgroundState::Foreground,
             tab_focused: false,
+            app_foreground: true,
             recent_notify_seqs: std::collections::VecDeque::new(),
         }),
         callback: Arc::from(callback),
@@ -1238,7 +1256,7 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuic(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter))?;
+        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }
@@ -1249,7 +1267,7 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuicAuto(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect_auto(Box::new(adapter))?;
+        session.connect_auto(Box::new(adapter), self.shared.app_pane_id.clone())?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }
@@ -1320,15 +1338,6 @@ impl SessionOrchestrator {
         }
     }
 
-    /// 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-    /// `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-    /// （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-    pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.rebind_to_fd(fd, local_ip);
-        }
-    }
-
     // ── #20: バックグラウンド/フォアグラウンド遷移 ─────────────
     //
     // Kotlin/Swiftはこの4メソッドへOS由来の生イベントをそのまま転送するだけでよい
@@ -1344,6 +1353,9 @@ impl SessionOrchestrator {
     /// 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
     pub fn notify_did_enter_background(&self, _budget_ms: u32) {
         let mut s = self.shared.state.lock();
+        // `app_foreground`は`phase`に関係なく無条件で更新する生の事実
+        // (`tab_focused`と同じ扱い、上のフィールドdoc参照)。
+        s.app_foreground = false;
         // #20 codexレビュー指摘: `Connecting`中にバックグラウンド化し、その猶予中に
         // 接続が成立するケース(`on_connected()`は`background_state`に触れない)も
         // 追跡対象に含める。`Idle`(そもそも維持すべきセッションが無い)は対象外のまま。
@@ -1382,6 +1394,9 @@ impl SessionOrchestrator {
     pub fn notify_will_enter_foreground(&self) {
         let reconnect_with = {
             let mut s = self.shared.state.lock();
+            // `app_foreground`は`phase`/`background_state`に関係なく無条件で更新する
+            // 生の事実(`notify_did_enter_background`と対称、上のフィールドdoc参照)。
+            s.app_foreground = true;
             let was_suspended = s.background_state == BackgroundState::Suspended;
             s.background_state = BackgroundState::Foreground;
             if was_suspended && !s.reconnect_loop_active && s.phase != ConnPhase::Connecting {
@@ -1420,6 +1435,18 @@ impl SessionOrchestrator {
     pub fn force_return_to_wifi(&self) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.force_return_to_wifi();
+        }
+    }
+
+    /// Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+    /// 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+    /// そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+    /// (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+    /// マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+    /// Rust側で無視される。
+    pub fn notify_upstream_health_degraded(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.notify_upstream_health_degraded();
         }
     }
 
@@ -1789,7 +1816,36 @@ impl SessionOrchestrator {
         // ここを配線し忘れると両者は「ロケータ未登録」として黙ってno-opになり
         // (ssh_handler.rsのコメント参照)、tmux統合機能が本番で一切発火しない。
         let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
-        registry.lock().register(self.shared.app_pane_id.clone(), outcome.locator.clone(), None);
+        // 実機検証(2026-07-27)で判明: `push_ctl_socket_to_tmux`はctl-socket forward
+        // 確立直後にspawnされ(`ssh_handler.rs`)、この`ensure_tmux_tab_window`
+        // (Kotlin側の接続確認コールバック→UniFFI経由のこの呼び出し、というひと往復
+        // 分だけ遅れる)より先に完走するのが実際にはほぼ常であることを確認した
+        // (「稀にロケータ未登録のことがあるopportunistic機能」という従来の想定より
+        // 厳しい状況で、`isekai-pipe ctl notify`/`isekai-pipe ctl tab-color`が
+        // 実機では常に一切届いていなかった)。
+        //
+        // 既知のctl_socket_pathには2つの由来がありうる:
+        // (a) このapp_paneが真に初めての接続で、まだ一度も`register()`されて
+        //     いない間に届いた分(`TmuxLocatorRegistry::pending_ctl_socket_paths`
+        //     に退避されている、`take_pending_ctl_socket_path`で取り出すと消える)。
+        // (b) 同じタブでの再接続で、既存エントリ(前回の`register()`が作った
+        //     ロケータ)がまだ生きているために`push_ctl_socket_to_tmux`が直接
+        //     書き込み済みの分(`ctl_socket_path_for`で読める、消費しない)。
+        // どちらの場合も、ここで`register()`が単純に`ctl_socket_path=None`で
+        // 上書きすると既に分かっている値を握りつぶしてしまう。両方を確認し、
+        // 引き継いで登録した上で、ロケータが分かった今すぐ改めてtmuxへ
+        // 書き込み直す(bの場合は直接pushで既に成功済みのはずだが、再送は
+        // 無害なのでどちらの由来でも同じ経路で扱う)。
+        let recovered_ctl_socket_path = {
+            let mut reg = registry.lock();
+            reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
+                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string))
+        };
+        registry.lock().register(
+            self.shared.app_pane_id.clone(),
+            outcome.locator.clone(),
+            recovered_ctl_socket_path.clone(),
+        );
         registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         // タスク#58: `spawn_tmux_scrollback_backfill`が読む`tmux_backfill_locator`
         // (`OrchestratorShared`フィールドのdoc参照)も同じタイミングで配線する。
@@ -1797,6 +1853,29 @@ impl SessionOrchestrator {
         // フル再接続後のscrollback backfillがfail-openで常にスキップされ続ける
         // (上のTMUX_LOCATOR_REGISTRY登録漏れと同種の、配線し忘れによる無効化)。
         self.set_tmux_backfill_locator(Some(outcome.locator.clone()));
+        // 上と同じ理由で、tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
+        // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
+        // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが
+        // 分かった今すぐ改めて試す(有効化されていなければ内部で無害にno-opする)。
+        if let Some(ctl_socket_path) = recovered_ctl_socket_path {
+            let push_runner = OrchestratorTmuxRunner { orchestrator: self };
+            if let Err(e) = crate::tmux_locator::push_ctl_socket_to_tmux(
+                registry,
+                &self.shared.app_pane_id,
+                &ctl_socket_path,
+                push_runner,
+            )
+            .await
+            {
+                log::debug!("tmux-ctl-sock: retroactive push after registration failed (best-effort): {e}");
+            }
+        }
+        let notify_hooks_runner = OrchestratorTmuxRunner { orchestrator: self };
+        if let Err(e) =
+            crate::tmux_notify::install_notify_hooks(registry, &self.shared.app_pane_id, notify_hooks_runner).await
+        {
+            log::debug!("tmux-notify-hooks: retroactive install after registration failed (best-effort): {e}");
+        }
         Ok(crate::TmuxTabWindowInfo {
             tag: outcome.locator.tag.0,
             window_index: outcome.coords.window_index,
@@ -1944,6 +2023,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
+                app_foreground: true,
                 recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
@@ -2005,6 +2085,7 @@ mod tests {
             reconnect_policy: policy,
             background_state: BackgroundState::Foreground,
             tab_focused: false,
+            app_foreground: true,
             recent_notify_seqs: std::collections::VecDeque::new(),
         }
     }
@@ -2270,6 +2351,7 @@ mod tests {
             rows: 24,
             jump: None,
             bind_port: None,
+            enable_upstream_failover: false,
         }
     }
 
@@ -3277,6 +3359,7 @@ mod tests {
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
+                app_foreground: true,
                 recent_notify_seqs: std::collections::VecDeque::new(),
             }),
             callback: callback.clone(),
@@ -3340,7 +3423,7 @@ mod tests {
         {
             let mut s = shared.state.lock();
             s.tab_focused = true;
-            s.background_state = BackgroundState::Foreground;
+            s.app_foreground = true;
         }
         adapter.on_notify(crate::NotifyKind::Activity, "tag-a".to_string(), 1);
         assert!(cb.notifications.lock().unwrap().is_empty());
@@ -3350,14 +3433,49 @@ mod tests {
     fn on_notify_delivers_when_tab_focused_but_app_backgrounded() {
         // タブ自体はフォーカスされていても(Compose側の直近状態が古い等)、
         // アプリ全体がバックグラウンドならユーザーは見ていないので配信する。
+        // `background_state`(再接続バジェットFSM)ではなく`app_foreground`
+        // (生の前景/背景の事実)で判断することを確認する(2026-07-28の実機バグ修正)。
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
         {
             let mut s = shared.state.lock();
             s.tab_focused = true;
-            s.background_state = BackgroundState::Suspended;
+            s.app_foreground = false;
         }
         adapter.on_notify(crate::NotifyKind::Silence, "tag-a".to_string(), 1);
         assert_eq!(cb.notifications.lock().unwrap().as_slice(), &[crate::NotifyKind::Silence]);
+    }
+
+    #[test]
+    fn on_notify_suppresses_when_tab_focused_even_if_background_state_is_quiescing() {
+        // regression: `background_state`が`Quiescing`(#20の再接続バジェットFSM)でも、
+        // `app_foreground`が真の前景/背景の事実(`notify_did_enter_background`が
+        // 未呼び出しでデフォルトのtrueのまま等)であれば抑制すべき——on_notifyは
+        // `background_state`を一切見てはいけない。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.tab_focused = true;
+            s.app_foreground = true;
+            s.background_state = BackgroundState::Quiescing;
+        }
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 1);
+        assert!(cb.notifications.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_did_enter_background_sets_app_foreground_false_unconditionally() {
+        let (orch, _cb, _events) = orchestrator_connected_with_reconnect_policy(ReconnectPolicy::default());
+        orch.notify_did_enter_background(0);
+        assert!(!orch.shared.state.lock().app_foreground);
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_sets_app_foreground_true_unconditionally() {
+        let (orch, _cb, _events) = orchestrator_connected_with_reconnect_policy(ReconnectPolicy::default());
+        orch.notify_did_enter_background(0);
+        assert!(!orch.shared.state.lock().app_foreground);
+        orch.notify_will_enter_foreground();
+        assert!(orch.shared.state.lock().app_foreground);
     }
 
     #[test]

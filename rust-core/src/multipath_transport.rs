@@ -111,6 +111,16 @@ pub struct MultipathIsekaiPipeQuicConfig {
     /// `None`の場合はRust側で従来通りの既定値フォールバックを維持する
     /// (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
     pub bind_port: Option<u16>,
+    /// #22: `RebindManager`(WiFi⇔セルラー自動フェイルオーバーFSM)を有効にするか
+    /// (`ConnectionProfile.enableUpstreamFailover`の値をそのまま渡す)。`false`
+    /// なら`NoViablePath`/`UpstreamHealthDegraded`を検知しても`RebindManager`は
+    /// 一切反応しない(`establish_multipath_connection`呼び出し時に`rebind_driver`
+    /// 引数を`None`にする、`notify_upstream_health_degraded`も早期returnする)。
+    /// 以前はこの値がRust側に伝わっておらず、Kotlin側`onWifiUpstreamBroken`の
+    /// 起動条件としてしか使われていなかったため、この設定を無効にしていても
+    /// `RebindManager`自体は常時反応していた(実害: 意図せずセルラー[従量課金]へ
+    /// 切り替わる、opusレビューで発見)。
+    pub enable_upstream_failover: bool,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -134,7 +144,6 @@ struct RebindRequest {
 pub(crate) struct MultipathIsekaiPipeQuicSession {
     config: MultipathIsekaiPipeQuicConfig,
     core: SessionCore,
-    rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
     /// trzsz転送中(WaitingUser含む)かどうか。`RebindManager`(rebind_manager.rs)の
     /// `RebindEvent::TrafficBusyDetected`/`TrafficQuietDetected`の判定材料の一つ
     /// として#22のDriver(`RealQuietTrafficSource`)が読み出す。`try_connect_multipath`
@@ -154,7 +163,6 @@ pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiP
     Arc::new(MultipathIsekaiPipeQuicSession {
         config,
         core: SessionCore::new(),
-        rebind_tx: StdMutex::new(None),
         interactive_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         traffic_stats: TrafficStats::new(),
         rebind_driver: StdMutex::new(None),
@@ -168,12 +176,11 @@ impl MultipathIsekaiPipeQuicSession {
     /// `self: &Arc<Self>`にしているのは、接続確立(`try_connect_multipath`)は
     /// `RemoteSpec`が揃うまでSSHブートストラップを待つ必要があり同期的に返せない
     /// ため、spawnされた非同期タスクの中で`self.rebind_driver`へ結果を書き戻す
-    /// 必要があるため(`rebind_tx`のように同期的に組み立てられない)。
+    /// 必要があるため。
     pub(crate) fn connect(self: &Arc<Self>, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
-        *self.rebind_tx.lock().unwrap() = Some(rebind_tx.clone());
         // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
         // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
         let host_key_callback = self.core.callback();
@@ -199,26 +206,6 @@ impl MultipathIsekaiPipeQuicSession {
         Ok(())
     }
 
-    /// 「WiFiは繋がっているがupstreamが死んでいる」等を検知したKotlin側から呼ぶ。
-    /// `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-    /// （所有権はこちらに移る）。接続確立前や既にrebind中の場合は素通りする
-    /// （エラーにはしない——呼び出し側は日和見的に呼べばよい）。
-    pub(crate) fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        let Ok(local_ip) = local_ip.parse::<IpAddr>() else {
-            warn!("multipath_quic: rebind_to_fd: invalid local_ip {local_ip:?}");
-            return;
-        };
-        let tx = self.rebind_tx.lock().unwrap().clone();
-        let Some(tx) = tx else {
-            warn!("multipath_quic: rebind_to_fd called before connect() established a session");
-            return;
-        };
-        let req = RebindRequest { fd: fd as RawFd, local_ip, injector: crate::debug_fault::shared_injector() };
-        if tx.try_send(req).is_err() {
-            warn!("multipath_quic: rebind_to_fd: request channel full or closed, dropping fd={fd}");
-        }
-    }
-
     /// `orchestrator.rs`のtrzsz転送イベント(`on_trzsz_request`/`on_trzsz_finished`/
     /// `trzsz_cancel`/`trzsz_dismiss`)から呼ばれる。判断は一切せず記録するだけ。
     pub(crate) fn set_interactive_busy(&self, busy: bool) {
@@ -240,6 +227,27 @@ impl MultipathIsekaiPipeQuicSession {
         match driver {
             Some(driver) => driver.send_event(crate::rebind_manager::RebindEvent::ManualForceReturnRequested),
             None => warn!("multipath_quic: force_return_to_wifi called before RebindManager Driver started"),
+        }
+    }
+
+    /// Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+    /// 喪失、Rust側のQUICパスヘルスとは無関係な独自シグナル)からの生イベントを、
+    /// `RebindManager`の`RebindEvent::UpstreamHealthDegraded`としてそのまま転送する
+    /// だけ(`rust-ssot.md`準拠、判断はしない)。以前はKotlin側がこの検知を受けて
+    /// 独自にセルラーfdを取得しrebindを直接実行していたが、それは`RebindManager`が
+    /// 同じ物理path劣化に対して`NoViablePath`経由で既に行う`PerformRebindToCellular`
+    /// と完全に重複しており、同一セッションに対して独立に2本のセルラーfdを取得し
+    /// `rebind_abstract`を2回叩く二重rebindになっていた(opusレビューで発見)。
+    /// `enable_upstream_failover`が無効なら、この検知経路も含めて何もしない
+    /// (`MultipathIsekaiPipeQuicConfig::enable_upstream_failover`のdocコメント参照)。
+    pub(crate) fn notify_upstream_health_degraded(&self) {
+        if !self.config.enable_upstream_failover {
+            return;
+        }
+        let driver = self.rebind_driver.lock().unwrap().clone();
+        match driver {
+            Some(driver) => driver.send_event(crate::rebind_manager::RebindEvent::UpstreamHealthDegraded),
+            None => warn!("multipath_quic: notify_upstream_health_degraded called before RebindManager Driver started"),
         }
     }
 
@@ -698,8 +706,7 @@ impl rebind_ports::PlatformFdSource for RealPlatformFdSource {
     }
 }
 
-/// 既存の`rebind_to_fd`/`spawn_rebind_listener`と全く同じ経路
-/// (`RebindRequest`をチャネル送信するだけ)を再利用する。
+/// `spawn_rebind_listener`が待ち受ける`RebindRequest`チャネルへ送信するだけ。
 struct RealRebindExecutor {
     rebind_tx: tokio::sync::mpsc::Sender<RebindRequest>,
 }
@@ -1060,9 +1067,14 @@ async fn try_connect_multipath(
     let observer: Arc<dyn rebind_driver::RebindStateObserver> = Arc::new(RealRebindObserver { callback: rebind_callback });
     let driver_handle = rebind_driver::spawn_rebind_driver(fd_source, probe, executor, quiet_source, observer);
 
+    // #22: `enable_upstream_failover`が無効なら`RebindManager`へ`NoViablePath`を
+    // 一切転送しない(`driver_handle`自体は返り値として`session.rebind_driver`に
+    // 保持されるが、イベントを受け取らないFSMは`Phase::OnWifi`のまま動かない)。
+    // `MultipathIsekaiPipeQuicConfig::enable_upstream_failover`のdocコメント参照。
+    let rebind_driver_for_health = config.enable_upstream_failover.then(|| driver_handle.clone());
     let (conn, _broker, endpoint) = establish_multipath_connection(
         path0_addr, path1_addr, physical, &cert_sha256_hex, event_tx, crate::debug_fault::shared_injector(),
-        traffic_stats.clone(), Some(driver_handle.clone()),
+        traffic_stats.clone(), rebind_driver_for_health,
     )
     .await?;
     let (send, recv) = hello_ack(&conn, &session_secret).await?;
@@ -1071,10 +1083,10 @@ async fn try_connect_multipath(
     Ok(((send, recv), driver_handle))
 }
 
-/// `rebind_to_fd`からの要求を待ち受け、`Endpoint::rebind_abstract()`でendpointの
-/// ソケットを丸ごと差し替える。物理pathのopen_pathとは異なりnoq issue #738の
-/// バグを踏まない（新規pathの追加検証ではなく、既存endpoint全体のNATリバインド
-/// 相当の操作のため）。
+/// `RealRebindExecutor`(#22の`RebindManager` Driver)からの`RebindRequest`を
+/// 待ち受け、`Endpoint::rebind_abstract()`でendpointのソケットを丸ごと差し替える。
+/// 物理pathのopen_pathとは異なりnoq issue #738のバグを踏まない（新規pathの
+/// 追加検証ではなく、既存endpoint全体のNATリバインド相当の操作のため）。
 fn spawn_rebind_listener(
     endpoint: noq::Endpoint,
     mut rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
@@ -1200,6 +1212,7 @@ mod tests {
             rows: 24,
             jump: None,
             bind_port: None,
+            enable_upstream_failover: false,
         }
     }
 

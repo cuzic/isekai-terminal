@@ -100,10 +100,12 @@ pub(crate) async fn open_login_shell<H: client::Handler>(
     cols: u32,
     rows: u32,
     remote_path: &str,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 ) -> Result<russh::Channel<client::Msg>, russh::Error> {
     let channel = handle.channel_open_session().await?;
     channel.request_pty(false, term, cols, rows, 0, 0, &[]).await?;
-    let command = format!("export ISEKAI_CTL_SOCK={remote_path:?}; exec \"${{SHELL:-/bin/sh}}\" -i -l");
+    let command = crate::ctl_forward::build_login_shell_command(remote_path, tab_idle_color, tab_attention_color);
     channel.exec(false, command.as_str()).await?;
     Ok(channel)
 }

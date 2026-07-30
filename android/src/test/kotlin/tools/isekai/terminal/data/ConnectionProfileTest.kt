@@ -156,6 +156,16 @@ class ConnectionProfileTest {
         assertNull(config.bindPort)
     }
 
+    @Test fun `toMultipathIsekaiPipeQuicConfig maps enableUpstreamFailover through`() {
+        // RebindManager(Rust側)がこの値でゲートされるようになったため
+        // (以前はKotlin側onWifiUpstreamBrokenの起動条件としてしか使われず
+        // Rustへ渡っていなかった)、素通りしていることを確認する。
+        assertFalse(profile().toMultipathIsekaiPipeQuicConfig(auth).enableUpstreamFailover)
+        assertTrue(
+            profile().copy(enableUpstreamFailover = true).toMultipathIsekaiPipeQuicConfig(auth).enableUpstreamFailover
+        )
+    }
+
     // ── hasRelayConfig / usesJumpHost（純粋な算出プロパティ）──────────────
 
     @Test fun `hasRelayConfig is false when no relay fields are set`() {

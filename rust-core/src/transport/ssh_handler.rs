@@ -342,6 +342,24 @@ impl client::Handler for RusshEventHandler {
 
             let (read_half, mut write_half) = tokio::io::split(channel.into_stream());
             let mut reader = BufReader::new(read_half);
+
+            // 先頭行はsecret preamble(このsocket_path自体)——`isekai-pipe ctl`/
+            // `isekai-ssh`のctl_forward.rsと同じワイヤー契約(送信側が既にこの
+            // タブのランダムなリモートパスを知っていることの証明)。ここで
+            // 消費・検証しないと、preambleの行がそのままCtlMessageのJSONとして
+            // decode_ctl_messageに渡り「expected value at line 1 column 1」で
+            // 常に失敗する(実機検証、2026-07-28: isekai-terminal-core側だけ
+            // この検証が抜けていた)。
+            let mut secret_line = String::new();
+            if let Err(e) = reader.read_line(&mut secret_line).await {
+                warn!("ctl-socket[{socket_path}]: failed to read ctl connection preamble: {e}");
+                return;
+            }
+            if secret_line.trim_end_matches('\n') != socket_path {
+                warn!("ctl-socket[{socket_path}]: ctl connection preamble did not match this tab's expected secret");
+                return;
+            }
+
             let mut line = String::new();
             match reader.read_line(&mut line).await {
                 Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),

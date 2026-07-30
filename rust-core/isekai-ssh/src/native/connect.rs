@@ -695,9 +695,17 @@ async fn run_authenticated_session(
         // `ctl_forward` cleanup below re-locks the handle.
         let guard = handle.lock().await;
         match &ctl {
-            Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols, rows, &fwd.remote_path)
-                .await
-                .context("isekai-ssh: failed to open a ctl-socket login shell"),
+            Some(fwd) => ctl_forward::open_login_shell(
+                &guard,
+                &term,
+                cols,
+                rows,
+                &fwd.remote_path,
+                resolution.tab_idle_color(),
+                resolution.tab_attention_color(),
+            )
+            .await
+            .context("isekai-ssh: failed to open a ctl-socket login shell"),
             None => open_channel(&guard, &session_kind).await.context("isekai-ssh: failed to open a session channel"),
         }
     };

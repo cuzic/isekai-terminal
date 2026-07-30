@@ -41,6 +41,12 @@ pub enum RebindEvent {
     TrafficBusyDetected,
     /// ユーザーが「今すぐ WiFi に戻す」操作を行った(`force_return_to_wifi`)。
     ManualForceReturnRequested,
+    /// Android `ConnectivityManager` の `NET_CAPABILITY_VALIDATED` 喪失
+    /// (`UpstreamHealthMonitor`)——`NoViablePath`(QUICパスヘルス、UDPが
+    /// 実際に無応答)とは独立した別ソースの検知。同一の物理path劣化を指し得る
+    /// ため`handle_no_viable_path`と同じ反応をするが、ログ/将来のテレメトリで
+    /// 検知経路を区別できるよう別variantにしてある。
+    UpstreamHealthDegraded,
 }
 
 /// [`RebindManager`] が返す出力アクション。実際の実行は Driver が担う。
@@ -322,7 +328,7 @@ impl TimedStateMachine for RebindManager {
 
     fn on_event(&mut self, event: RebindEvent) -> Response<RebindAction, RebindTimer> {
         match event {
-            RebindEvent::NoViablePath => self.handle_no_viable_path(),
+            RebindEvent::NoViablePath | RebindEvent::UpstreamHealthDegraded => self.handle_no_viable_path(),
             RebindEvent::WifiProbeSucceeded => self.handle_probe_succeeded(),
             RebindEvent::WifiProbeFailed => self.handle_probe_failed(),
             RebindEvent::TrafficQuietDetected => self.handle_quiet_detected(),
@@ -436,6 +442,24 @@ mod tests {
         let r = m.on_event(RebindEvent::NoViablePath);
         assert!(r.actions.is_empty());
         assert!(r.timers.is_empty());
+    }
+
+    #[test]
+    fn upstream_health_degraded_fails_over_identically_to_no_viable_path() {
+        // ConnectivityManager由来の検知(UpstreamHealthDegraded)もQUICパスヘルス
+        // 由来(NoViablePath)と同じ反応をする——検知経路が2つに増えても
+        // RebindManagerの振る舞いは1本化されている(rust-ssot.md準拠)。
+        let mut m = RebindManager::new();
+        let r = m.on_event(RebindEvent::UpstreamHealthDegraded);
+        assert!(has_action(&r, RebindAction::PerformRebindToCellular));
+        assert!(has_action(&r, RebindAction::StartWifiProbe));
+        assert!(has_action(&r, RebindAction::PublishState(RebindPublicState::FailedOverToCellular)));
+        assert_eq!(m.public_state(), RebindPublicState::FailedOverToCellular);
+
+        // 既にFailedOverToCellular中に別経路からもう一方が来ても二重発火しない。
+        let r2 = m.on_event(RebindEvent::NoViablePath);
+        assert!(r2.actions.is_empty());
+        assert!(r2.timers.is_empty());
     }
 
     #[test]
