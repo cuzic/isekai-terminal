@@ -981,7 +981,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         write_frame(
             &mut client,
@@ -1225,7 +1225,7 @@ mod tests {
         // `Some(&routes)`: ctl-socket *is* on for this connection — the skip
         // being tested is specific to this one Hello carrying a
         // remote_command, not the forward being unavailable altogether.
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
         write_frame(
             &mut client,
