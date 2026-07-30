@@ -1,3 +1,4 @@
+mod claude_hookd;
 mod ctl;
 mod ctl_file;
 mod datagram_relay;
@@ -14,6 +15,31 @@ use std::time::Duration;
 
 use anyhow::Result;
 use isekai_pipe_core::ServiceSpec;
+
+/// Records a panic into whichever `log`/`env_logger` sink `serve`/`connect`
+/// already initialized (stderr, or `connect`'s `ISEKAI_PIPE_LOG_FILE`),
+/// mirroring `isekai-ssh`'s `install_panic_hook` (`isekai-ssh/src/main.rs`).
+/// Without this, a panic in a per-session `tokio::spawn`'d task (`engine::
+/// mod::handle_incoming`) was invisible once its terminal scrollback was
+/// gone — the default hook only writes to the process's real stderr, which
+/// for a long-lived `serve` daemon is often redirected somewhere ephemeral
+/// by whatever launched it.
+///
+/// Must be called *after* the caller's own `env_logger::Builder::init()` —
+/// calling it earlier means `log::error!` here hits the crate's default
+/// no-op logger and the panic record is silently dropped. Fail-open like
+/// every other logging call: this must never itself panic (a panic inside
+/// a panic hook aborts the process immediately, which is exactly the
+/// failure mode removing `panic = "abort"` from the release profile was
+/// meant to avoid).
+pub(crate) fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log::error!("PANIC: {info}\n{backtrace}");
+    }));
+}
 
 pub(crate) const EX_USAGE: u8 = 64;
 pub(crate) const EX_UNAVAILABLE: u8 = 69;
@@ -50,6 +76,12 @@ fn print_help() {
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
     println!("    ctl        title/clipboard/setvar/getvar/file control-plane client (see `isekai-pipe ctl --help`)");
+    println!("    claude-hookd event");
+    println!("               Claude Code hook entrypoint for a debounced tab-color attention indicator");
+    println!("               (ISEKAI_PIPE_DESIGN.md §8 Epic Q) — put this exact command in every");
+    println!("               Notification/Stop/UserPromptSubmit hook and PreToolUse/PostToolUse");
+    println!("               (matcher: AskUserQuestion) hook in .claude/settings.json; reads the hook's");
+    println!("               JSON payload from stdin, always exits 0.");
     println!("    version    print version");
     println!();
     println!(
@@ -275,6 +307,7 @@ async fn run() -> ExitCode {
         Some("probe") => probe::probe_command(args).await,
         Some("inspect") => inspect::inspect_command(args).await,
         Some("ctl") => ctl::ctl_command(args).await,
+        Some("claude-hookd") => claude_hookd::claude_hookd_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");

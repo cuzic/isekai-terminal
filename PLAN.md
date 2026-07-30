@@ -3362,3 +3362,158 @@ D=コマンド終了)ベースのセマンティックプロンプト追跡を�
 `rust-core/src/orchestrator.rs`(`SessionOrchestrator`の4公開メソッド、`OrchestratorAdapter`)、
 Android側`TerminalSession.kt`/`TerminalTabsViewModel.kt`/`TerminalHostScreen.kt`/
 `TerminalScreen.kt`(前/次プロンプトジャンプボタン・出力コピーボタン・タップでのカーソル移動)。
+
+## タスク#57〜#63: tmux統合(タブ⇔tmuxウィンドウ対応・reconnect時scrollback backfill・tmux hookによる注目通知)
+
+**注記(タスク番号の再利用について)**: `#57`〜`#63`という番号帯は、本項が扱う tmux 統合バッチ
+（`feat/ai-integration-ctl-notify`の基盤となった`tmux-integration`ブランチでの作業）と、
+無関係な別バッチ(iOS側キーボード修飾/DECOM/OSC 10;11等の端末機能、コミット例:
+「タスク#63(#31で`TerminalKeyMapper.bytes`に…」)の両方で、時期の異なる並行 worktree 上で
+重複採番されてしまっている。以降このセクション内の「タスク#N」はすべて tmux 統合バッチを指す。
+
+**背景**: isekai-terminalはリモートホスト上で動く`tmux`セッションを、単なる透過的なパイプでは
+なく「アプリの各タブが特定のtmuxウィンドウに対応する」形で扱う。動機は次の3つ:
+1. resumeが失敗してフルreconnectになった場合でも、同じtmuxウィンドウに再アタッチできれば
+   シェルの状態(cwd・実行中プロセス・スクロールバック)を失わない。
+2. tmux自身のhook(`alert-bell`/`alert-activity`/`alert-silence`/`pane-died`)をAndroidの
+   ネイティブ通知に橋渡しできれば、バックグラウンドでの長時間ジョブの完了を見逃さない。
+3. フルreconnect後、切断中にtmux側へ溜まったスクロールバックをアプリのローカルscrollbackへ
+   backfillできれば、「再接続したら履歴が見えない」という体験の悪さを解消できる。
+
+さらに、同じホストに複数デバイス(端末アプリ複数台/複数タブ)から同時接続するケースを
+tmuxの「session group」機構(同じウィンドウ/ペイン集合を共有しつつ、デバイスごとに独立した
+「現在のウィンドウ」を持てる)で扱う設計にした。デバイス識別は物理デバイスIDではなく
+`ClientIdentity`(インストールごとのランダムUUID)。
+
+**主要コンポーネント**:
+
+- **`rust-core/src/tmux_locator.rs`(#62、アドレッシングの基盤)**: `TmuxTag`(128bitランダム
+  hexトークン、tmuxのuser-option`@isekai_tab_id`/`@isekai_pane_id`として書き込む——
+  tmuxの`automatic-rename`/`renumber-windows`で変化する名前・indexに依存しない安定識別子)。
+  `TmuxSessionScope`(`Standalone{session_name}` / `GroupMember{group, session_name}`)、
+  `TmuxLocator{scope, kind, tag}`(安定識別子)と`TmuxCoordinates{window_index, pane_index}`
+  (解決結果、揮発性・永続化しない)を分離。`RemoteTmuxCommandRunner`トレイトが「exec
+  チャネル越しにtmuxコマンドを1行実行する」ための差し替え可能な窓口で、本番実装は
+  `SshHandleTmuxRunner`(`transport/ssh_handler.rs`)/`OrchestratorTmuxRunner`
+  (`orchestrator.rs`)。プロセス全体で1つの`TmuxLocatorRegistry`(`AppPaneId ⟷ TmuxLocator
+  ⟷ ctl_socket_path`のマッピング表、`notify_hooks_enabled`フラグも保持)を
+  `TMUX_LOCATOR_REGISTRY`として持つ。`AppPaneId{tab_id, pane_id}`は本来Kotlin側の実際の
+  `PaneAddress`と一致すべきだが、UniFFI境界をまだ跨いでいないため現状は
+  `generate_process_local`によるプロセス内限定の仮トークン——既知の未解消ギャップ(下記)。
+- **`rust-core/src/tmux_session.rs`(#60、session group ensure/attach + window mapping)**:
+  `session_group_name`/`client_session_name`はprofile identity/client idのsha256ハッシュ
+  から決定的に導出(同じprofile→常に同じgroup、同じデバイス→常に同じsession)。
+  `build_ensure_group_attached_command`は`tmux new-session -A -d`ではなく
+  `has-session || new-session -d`を使う——実機tmux 3.3aで、既存sessionに対する`-A`は
+  PTYを持たないexecチャネル越しでは`open terminal failed: not a terminal`で失敗することが
+  判明したため(モジュールdocコメントに詳細あり)。`ensure_tab_window`は既存タグがあれば
+  それを解決し(リモート側で当該ウィンドウがkillされていた等でタグが無効なら新規作成に
+  自動フォールバック)、無ければ新規ウィンドウを作ってタグ付けする。
+- **`rust-core/src/tmux_scrollback.rs`(#58、reconnect後のbackfill)**: `capture-pane -S
+  -<max_lines> -E -1`(直後に来るライブPTY再描画と重複しないよう、現在可視の画面自体は
+  `-E -1`で意図的に除外)、プレーンテキストのみ(SGR無し、実装コストとのバランス判断)。
+  ペイン種別のlocatorのみ対象。`orchestrator.rs::spawn_tmux_scrollback_backfill`から
+  `after_reconnect_success`フックとして起動されるが、これは「resumeが失敗しフルreconnect
+  した」経路のみで発火し、初回接続やトランスポート層の透過的resumeでは発火しない。
+- **`rust-core/src/tmux_notify.rs`(#57、hook→Android通知)**: 実機tmux 3.3aでの検証結果を
+  モジュール冒頭に記録: `alert-bell`/`alert-activity`/`alert-silence`は`-w`指定でも
+  黙ってsessionスコープに丸められる一方、`pane-died`は逆にwindow/pane スコープのみ有効
+  (sessionスコープでは黙ってno-op)。`remain-on-exit`はウィンドウ作成**前**にグローバル
+  (`-g`)で設定しないと`pane-died`が5/5の再現率でレースに負けて発火しない(作成後に設定
+  すると機能しない)。`notify_hook_script`が各hookに仕込む`run-shell`ワンライナーは、
+  シェルクォートを手組みせず`#{q:...}`というtmuxのformat修飾子でエスケープし、
+  execチャネルにはPATHが無いため`isekai-pipe`のパスを明示的に解決する。
+  `install_notify_hooks`は`TmuxLocatorRegistry`にlocatorが解決済み **かつ**
+  タブごとのopt-inフラグ(下記)が有効な場合のみ動作し、どちらか一方でも欠けていれば
+  リモートのtmuxサーバーへ一切書き込みを行わない(`remain-on-exit`のグローバル変更は
+  ユーザーのtmuxサーバーに対する恒久的な副作用なので、opt-inしていないタブに対して
+  発火してはならない)。
+- **ctl-socket伝播(#59)**: 接続・再接続のたびに、その時点のctl-socketパスをwindow/pane
+  スコープのtmux user-option`@isekai_ctl_sock`へ`push_ctl_socket_to_tmux`が書き込む
+  (session スコープにしないのは、tmuxのoption継承だと「最後に書いた値」が同一グループの
+  他タブへ漏れるため——意図的にwindow/paneスコープに限定)。`isekai-pipe ctl`は
+  `--sock`/`$ISEKAI_CTL_SOCK`が無い場合、tmuxペイン内であれば`tmux show-options -pv
+  @isekai_ctl_sock`にフォールバックして自分のソケットを解決する
+  (`isekai-pipe/src/ctl.rs::resolve_ctl_socket_path`)。notify hookスクリプト自身も
+  この`@isekai_ctl_sock`を読んで`isekai-pipe ctl notify`の`--sock`に渡す。
+- **`run_exec`(#61、上記コンポーネント共通の実行プリミティブ)**: 既存のインタラクティブ
+  シェル/PTYチャネルとは別に、プールされたSSH `client::Handle`上に新しいexecチャネルを
+  開いて単発コマンドを実行しstdout+exit statusを回収する(`transport/ssh_handler.rs`の
+  `run_exec_on_handle`/`run_exec_on_handle_inner`が実体、`ExecOutput{stdout, exit_status}`
+  /`ExecError`)。`run_exec_works_concurrently_with_interactive_shell_channel`
+  (`ssh_handler.rs`)が「インタラクティブシェルチャネルが実データを送受信中でも、並行する
+  execは両者をブロック・破壊しない」ことをテストで担保している。出力上限
+  `RUN_EXEC_MAX_OUTPUT_BYTES`(1MiB)とタイムアウト`RUN_EXEC_TIMEOUT`(10秒)を持つ
+  (`ensure_tmux_tab_window`のようなUniFFI公開async関数が、リモートのハングしたコマンドで
+  永久に返らなくなることを防ぐため)。**UniFFI越しにKotlin/Swiftへは公開していない**
+  (`SessionOrchestrator::run_exec`は意図的に`#[uniffi::export]`を付けない`impl`ブロックに
+  置かれている、コメントで明記)——現状の唯一の実用的な呼び出し元はこの
+  `RemoteTmuxCommandRunner`実装(`SshHandleTmuxRunner`/`OrchestratorTmuxRunner`)経由の
+  tmux管理コマンド。`isekai-protocol/src/ctl.rs`が掲げる「no general-purpose exec RPC」
+  方針(`AI_INTEGRATION_DESIGN.md` §6.2が引用)とは別の層の話であり矛盾しない:
+  あの方針はctlソケット(タブ越しに外部プロセスが叩ける帯域外チャネル)に汎用exec相当を
+  持たせないという話で、`run_exec`はアプリ自身が既に保持しているSSH接続上でRustが内部的に
+  1コマンドだけ叩く仕組みであり、外部から到達可能なRPCではない。なお`helper_bootstrap.rs`
+  にも同名`run_exec`があるが、これはbootstrap専用の無関係な既存ヘルパー(stdin対応・別の
+  エラー型)で、本タスクの`run_exec`とは無関係。
+
+**Epic Mとの関係**: 依存の向きは一方向。tmux統合が Epic M(`ISEKAI_PIPE_DESIGN.md` 「Epic M:
+リモート発 control-plane」)のctl-socketを**消費する**側であり、Epic M側は tmux統合の存在を
+知らない。Epic Mのtitle/clipboard同期そのものとは無関係な機能なので、独立した項目として
+ここに記録する(Epic Mのサブ項目にはしない)。
+
+**opt-inゲート(2段)**:
+1. `ConnectionProfile.enableTabNotifications`(Kotlin、既定false、profile単位)→
+   `ensure_tmux_tab_window(..., enable_notifications)`→
+   `TmuxLocatorRegistry.notify_hooks_enabled_for`。`install_notify_hooks`がリモートtmux
+   サーバーへ何か書き込む(特に`remain-on-exit`のグローバル変更という恒久的副作用)ための
+   必須ゲート。
+2. locatorが登録済みであること(`#60`の`ensure_tmux_tab_window`が当該タブで一度でも
+   走っている)——`install_notify_hooks`/`push_ctl_socket_to_tmux`はどちらも未登録なら
+   無条件no-op。
+
+配信時の重複抑制はさらに別レイヤ: Rust側`on_notify`(`orchestrator.rs`)が
+`(tmux_tag, seq)`の直近8件リングバッファ(`recent_notify_seqs`)でdedupし
+(当初は直前1件しか覚えておらずタグが交互に来ると破綻していたのを修正、コミット
+`13f3e2ac`)、かつアプリがフォアグラウンドかつ当該タブがフォーカス中なら通知自体を
+抑制する(既存のフォーカス報告状態を再利用、新しいミラー状態は作らない)。Android側
+`TabAlertNotifier`も`enableTabNotifications`+`POST_NOTIFICATIONS`権限を最終ゲートとして
+持つ(Rust側が既に配信判断した上でのbelt-and-suspenders)。
+
+**既知の制限**:
+- **split paneは対象外(MVPスコープ)**: タブの「主ペイン」のみをtmuxウィンドウへ対応させる。
+  将来の拡張候補として明記(`tmux_session.rs`モジュールdoc)。
+- **SSHトランスポート限定**: `AppPaneId`が実際のKotlin側`PaneAddress`とまだ紐付いていない
+  (上記)ため、QUIC/multipath/relay等の非SSHトランスポート経路からは
+  `TmuxLocatorRegistry`へ登録されない——現状tmux統合はプレーンSSHトランスポート経由でしか
+  機能しない。ドキュメント化されていなかった実質的な制約。
+- **同一profileの複数タブ同時オープン**: Roomは`profile_id`ごとに1つのタグしか永続化
+  できないため、`TerminalTabsViewModel.maybeEnsureTmuxTabWindow`(Kotlin側)が「同一
+  profileの別タブが既にtmux紐付け済みなら2つ目以降はスキップ」というガードを持つ。
+  Rustではなくアプリプロセス内でのタブ間UI状態調整という性質のため`rust-ssot.md`の例外
+  として扱っているが、Rust側へ寄せられないか将来再検討の余地がある。
+- **`(tmux_tag, seq)`のシーケンス番号はレース耐性が無い**: hookシェルスクリプト自身が
+  tmux user-option`@isekai_notify_seq`をロック無しでread-increment-writeするため、
+  同一session-group内の複数デバイスが同じ実イベントにほぼ同時に反応するとseqが競合しうる。
+  `CtlMessage::Notify`のdedup側がこの重複を許容する前提で設計されているため実害は
+  想定していない。
+- **`NotifyKind`は無関係な2系統を1つのenumに統合している**: `BELL`/`ACTIVITY`/`SILENCE`/
+  `JOB_DONE`が本タスクのtmux hook系、`WAITING`/`DONE`/`INFO`は`AI_INTEGRATION_DESIGN.md`
+  §6.1のAI注目通知系(claude-hookd経由)——2026-07-25に同じ`op":"notify"`ワイヤ型へ後から
+  統合された。`TabAlertNotifier.titleAndTextFor`は7バリアント全てを網羅的に処理する必要が
+  ある(非網羅による表示崩れが過去に一度発生、コミット`357faf13`)。当初はAI系kindが
+  `TabAlertNotifier.notify()`まで到達しない想定だったが、2026-07-25に
+  `TerminalTabsViewModel.kt`の`onNotify`をtmux hook系kind(`onNotifyRequested`)と
+  同じ`TabAlertNotifier`経路へ配線したため、現在は7バリアントすべてが実際にこの
+  オブジェクトを通ってAndroid通知として届く(`AI_INTEGRATION_DESIGN.md` §11.1.4参照)。
+
+**実装**: `rust-core/src/tmux_locator.rs`・`tmux_session.rs`・`tmux_scrollback.rs`・
+`tmux_notify.rs`、`rust-core/src/transport/ssh_handler.rs`(`SshHandleTmuxRunner`・
+`run_exec_on_handle`)、`rust-core/src/orchestrator.rs`(`ensure_tmux_tab_window`・
+`spawn_tmux_scrollback_backfill`・`on_notify`・`OrchestratorTmuxRunner`)、
+`rust-core/isekai-pipe/src/ctl.rs`(`resolve_ctl_socket_path`のtmuxフォールバック)、
+Android側`TerminalTabsViewModel.kt`(`maybeEnsureTmuxTabWindow`)・
+`data/TmuxTabLocator.kt`(Room `tmux_tab_locators`テーブル、`profile_id`キー)・
+`TabAlertNotifier.kt`・`ConnectionProfile.kt`(`enableTabNotifications`)、
+iOS側`ios/Sources/IsekaiTerminalCoreLogic/TmuxTabWindowCoordinator.swift`(Androidの#60配線を
+移植、通知UIが未実装のため`enableNotifications`は呼び出し側で固定`false`)。

@@ -18,7 +18,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 // detectTransformGestures は awaitEachGesture ベースの手動実装に置き換えたため未使用
@@ -37,12 +36,18 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventTimeoutCancellationException
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.util.fastFirstOrNull
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.KeySequence
@@ -169,6 +174,52 @@ internal fun searchHighlightMatch(
     match?.takeIf { scrollOffset == it.row.toInt() && (it.row != 0u || showingScrollback) }
 
 /**
+ * `androidx.compose.foundation.gestures.awaitLongPressOrCancellation`の代わりに使う。
+ *
+ * 標準の`awaitLongPressOrCancellation`は追跡中の指の「移動量」そのものでは打ち切られず、
+ * 他のジェスチャーハンドラが位置変化をconsumeしない限り、指が動いていても既定の長押し
+ * タイムアウト(~500ms)まで律儀に待ち続けてから非nullを返す。そのため単一指のドラッグは
+ * 「タイムアウト前に指を離せばTAP」「タイムアウトまで押し続ければ(その間動いていても)
+ * SELECTION」のどちらかにしかならず、`classifyNormalGesture`のPINCH_PAN分岐
+ * (「長押し失敗 かつ 指がまだ押されている」)へ単一指では実質的に到達できないバグを
+ * 実機で確認した(2026-07-27、ドラッグでヘッダー[ログ/ファイル/切断/戻る]を表示する
+ * 機能が単一指では一切機能しなかった)。
+ *
+ * タッチスロップ超えを自前で監視し、超えた時点でタイムアウトを待たずに「長押し失敗、
+ * ただし指はまだ押されている」として打ち切ることで、単一指ドラッグでも正しく
+ * PINCH_PAN(ひいてはヘッダー表示のトリガーである`onUserActivity()`)へ到達できるようにする。
+ */
+private suspend fun AwaitPointerEventScope.awaitLongPressOrDragCancellation(
+    pointerId: PointerId,
+    initialPosition: Offset,
+): PointerInputChange? {
+    val slop = viewConfiguration.touchSlop
+    return try {
+        // ここでの`withTimeout`は(`kotlinx.coroutines.withTimeout`ではなく)
+        // `AwaitPointerEventScope`のメンバ版に解決される(暗黙レシーバのメンバは
+        // トップレベル関数よりKotlinの呼び出し解決で優先されるため)。タイムアウト時に
+        // 投げるのも`kotlinx.coroutines.TimeoutCancellationException`ではなく
+        // `androidx.compose.ui.input.pointer.PointerEventTimeoutCancellationException`
+        // (`CancellationException`の兄弟であり`TimeoutCancellationException`の
+        // サブクラスではない)——catch側の型を誤ると例外は`awaitEachGesture`まで
+        // 突き抜けてジェスチャー全体が握りつぶされ、長押し選択(SELECTION)が完全に
+        // 機能しなくなる(Opusレビューでバイトコードレベルで確認、2026-07-27)。
+        withTimeout(viewConfiguration.longPressTimeoutMillis) {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Main)
+                val change = event.changes.fastFirstOrNull { it.id == pointerId } ?: break
+                if (!change.pressed) break
+                if ((change.position - initialPosition).getDistance() > slop) break
+            }
+        }
+        null
+    } catch (e: PointerEventTimeoutCancellationException) {
+        // タイムアウトまでスロップ内で押され続けた = 本物の長押し(位置は動いていない)。
+        currentEvent.changes.fastFirstOrNull { it.id == pointerId }
+    }
+}
+
+/**
  * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen`、および画面分割(split pane)時の
  * 各ペイン(`TerminalPaneScreen`)から共有される。
  *
@@ -259,7 +310,6 @@ fun TerminalScreenBody(
         }
     }
 
-    var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
     var showKeySequenceSheet by remember { mutableStateOf(false) }
@@ -339,22 +389,10 @@ fun TerminalScreenBody(
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
 
-    BackHandler(enabled = connected && isActive && hasFocus) { showDisconnectDialog = true }
-
-    if (showDisconnectDialog) {
-        AlertDialog(
-            onDismissRequest = { showDisconnectDialog = false },
-            title = { Text("切断しますか？") },
-            confirmButton = {
-                TextButton(onClick = { actions.onDisconnect(); showDisconnectDialog = false; actions.onBack() }) {
-                    Text("切断")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDisconnectDialog = false }) { Text("キャンセル") }
-            },
-        )
-    }
+    // 「戻る」はタブ/セッションを破棄しない(プロファイル一覧へ遷移するだけ、セッションは
+    // バックグラウンドで生き続ける)。破棄の確認は不要になったため、切断確認ダイアログは出さない
+    // (明示的な切断は上のステータスバーの「切断」ボタン、タブの破棄はタブ行の「×」)。
+    BackHandler(enabled = isActive && hasFocus) { actions.onBack() }
 
     // モーダルUI(host key/trzsz/agent forwarding/スニペット一覧確認)は「フォーカス中の
     // ペインに対してだけ表示する」設計(このComposableのdocstring参照)。表示条件を
@@ -720,6 +758,7 @@ fun TerminalScreenBody(
                         // tty側cols/rowsは据え置く」と意図していた挙動を、Canvas側でも
                         // 実現する後追い修正)。
                         modifier = Modifier
+                            .testTag("terminalCanvas")
                             .clipToBounds()
                             .fillMaxWidth()
                             .wrapContentHeight(Alignment.Bottom, unbounded = true)
@@ -840,15 +879,21 @@ fun TerminalScreenBody(
                                         }
                                         return@awaitEachGesture
                                     }
-                                    val longPress = awaitLongPressOrCancellation(down.id)
-                                    // awaitLongPressOrCancellation は「指定した1本の指」の移動/リリースしか
-                                    // 見ておらず、2本指が同時に押され続けている(=ピンチ操作中)場合でも
+                                    val longPress = awaitLongPressOrDragCancellation(down.id, down.position)
+                                    // 2本指が同時に押され続けている(=ピンチ操作中)場合でも
                                     // 長押しタイムアウト(既定 ~400ms)で非nullを返してしまう(実機ログで確認
                                     // 済み: 自然なピンチはほぼ確実にこの時間を超える)。そのため、ここで
                                     // 実際に押されている指の本数を見て、2本以上ならピンチ/パン優先で扱う
                                     // (単一指の本物の長押しだけを選択モードにする)。
                                     val pointerCount = currentEvent.changes.count { it.pressed }
-                                    val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
+                                    // Opusレビュー指摘(2026-07-27): 追跡していた指(down.id)だけを見ると、
+                                    // その指が先に離れても別の指がまだ画面に触れている場合に「指がまだ
+                                    // 押されているか」がfalseになり、classifyNormalGestureがTAP
+                                    // (=カーソル移動バイト送出+IME起動)へ倒れてしまう(実際には
+                                    // 2本目の指でのピンチ/パン継続の可能性がある途中なのに)。
+                                    // どの指であれ1本でも押され続けていればPINCH_PAN側へ倒すべきなので、
+                                    // 特定のdown.idではなく「押されている指が1本でもあるか」を見る。
+                                    val anyFingerStillPressed = currentEvent.changes.any { it.pressed }
                                     // タスク#87: 長押し/タップ/ピンチの3択の裁定自体は`classifyNormalGesture`
                                     // (`MouseGestureArbiter.kt`)へ抽出済み。以下の3分岐は判断結果に応じた
                                     // 副作用(選択ループ・hit-test・ピンチ委譲)のみを行う。
@@ -856,7 +901,7 @@ fun TerminalScreenBody(
                                         classifyNormalGesture(
                                             longPressSucceeded = longPress != null,
                                             pointerCount = pointerCount,
-                                            trackedFingerStillPressed = stillDown?.pressed == true,
+                                            trackedFingerStillPressed = anyFingerStillPressed,
                                         )
                                     ) {
                                         NormalGestureOutcome.SELECTION -> {

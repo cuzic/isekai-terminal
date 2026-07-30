@@ -9,8 +9,9 @@ import android.os.ParcelFileDescriptor
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetSocketAddress
-import kotlin.coroutines.resume
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import tools.isekai.terminal.util.RemoteLogger
 
@@ -38,7 +39,50 @@ data class PhysicalMultipathFds(
 
 class PhysicalPathProvider(context: Context) {
     private val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-    private val callbacks = mutableListOf<ConnectivityManager.NetworkCallback>()
+
+    /**
+     * transportごとに1個だけ保持する[ConnectivityManager.NetworkCallback]と、
+     * それが最後に報告した[Network]。[watchFor]が[synchronized]付きで
+     * transportごとに1回だけ`requestNetwork`する(この無線を要求し続ける状態を
+     * 維持しつつ、以後は`onAvailable`/`onLost`で更新されるこの[network]を
+     * 読むだけにする)。
+     */
+    private class TransportWatch(val callback: ConnectivityManager.NetworkCallback) {
+        val network = MutableStateFlow<Network?>(null)
+    }
+
+    private val watches = mutableMapOf<Int, TransportWatch>()
+
+    /**
+     * `transport`用の[TransportWatch]を(まだ無ければ)1回だけ`requestNetwork`して
+     * 作る。以前は[acquireOne]を呼ぶたびに新規[NetworkRequest]を登録していたため、
+     * `RebindManager`(Rust側)の`ProbeCadence`(10秒周期)でこれを繰り返し呼ぶと、
+     * uidあたりの同時[NetworkRequest]数上限(Android既定100件)に約17分で到達し
+     * `TooManyRequestsException`が[runBlocking]越しにUniFFIコールバック境界へ
+     * 抜けていた(実機未検証のまま存在していたバグ、opusレビューで発見)。
+     * transportごとに1回だけ登録し、その後は[TransportWatch.network]を読むだけに
+     * することでこの上限に到達しなくなる。
+     */
+    private fun watchFor(transport: Int): TransportWatch = synchronized(watches) {
+        watches.getOrPut(transport) {
+            lateinit var watch: TransportWatch
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    watch.network.value = network
+                }
+                override fun onLost(network: Network) {
+                    if (watch.network.value == network) watch.network.value = null
+                }
+            }
+            watch = TransportWatch(callback)
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addTransportType(transport)
+                .build()
+            cm.requestNetwork(request, callback)
+            watch
+        }
+    }
 
     /**
      * Wi-Fi・セルラー双方について並行して [Network.bindSocket] を試み、
@@ -76,7 +120,18 @@ class PhysicalPathProvider(context: Context) {
         acquireOne("wifi", NetworkCapabilities.TRANSPORT_WIFI, timeoutMs)
 
     private suspend fun acquireOne(label: String, transport: Int, timeoutMs: Long): Pair<Int, String>? {
-        val network = awaitNetwork(transport, timeoutMs)
+        val network = try {
+            awaitNetwork(transport, timeoutMs)
+        } catch (e: Exception) {
+            // `watchFor`のrequestNetwork自体が例外を投げるケース(理論上のみ、既に
+            // transportごとに1回しか呼ばないので`TooManyRequestsException`は
+            // もう踏まないはずだが、他の予期しない失敗も含めここで必ず止める —
+            // このメソッドはRust側`spawn_blocking`スレッドから同期呼び出しされる
+            // 経路の奥にあり、ここで投げるとUniFFIコールバック境界まで例外が
+            // 抜けてしまう)。
+            RemoteLogger.w("PhysicalPath", "$label: awaitNetwork failed (${e.javaClass.simpleName}: ${e.message})")
+            null
+        }
         if (network == null) {
             RemoteLogger.i("PhysicalPath", "$label: network not available within ${timeoutMs}ms, skipping")
             return null
@@ -92,22 +147,11 @@ class PhysicalPathProvider(context: Context) {
         }
     }
 
-    private suspend fun awaitNetwork(transport: Int, timeoutMs: Long): Network? =
-        withTimeoutOrNull(timeoutMs) {
-            suspendCancellableCoroutine { cont ->
-                val request = NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .addTransportType(transport)
-                    .build()
-                val callback = object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: Network) {
-                        if (cont.isActive) cont.resume(network)
-                    }
-                }
-                synchronized(callbacks) { callbacks.add(callback) }
-                cm.requestNetwork(request, callback)
-            }
-        }
+    private suspend fun awaitNetwork(transport: Int, timeoutMs: Long): Network? {
+        val watch = watchFor(transport)
+        watch.network.value?.let { return it }
+        return withTimeoutOrNull(timeoutMs) { watch.network.filterNotNull().first() }
+    }
 
     private fun bindAndDetach(network: Network): Pair<Int, String> {
         // socket.bind(InetSocketAddress(0))（ワイルドカードbind）だと、この端末のような
@@ -129,9 +173,9 @@ class PhysicalPathProvider(context: Context) {
 
     /** 保持していたネットワークリクエストをすべて解除する。接続終了時に必ず呼ぶこと。 */
     fun release() {
-        synchronized(callbacks) {
-            callbacks.forEach { runCatching { cm.unregisterNetworkCallback(it) } }
-            callbacks.clear()
+        synchronized(watches) {
+            watches.values.forEach { runCatching { cm.unregisterNetworkCallback(it.callback) } }
+            watches.clear()
         }
     }
 }

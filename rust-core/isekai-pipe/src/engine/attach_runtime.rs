@@ -51,6 +51,75 @@ enum LeaseResource {
     PendingTarget { tcp: TcpStream, timer: Option<JoinHandle<()>> },
 }
 
+/// RAII guard over an `Established` fencing slot. `AttachRuntime::activate`
+/// mints one exactly when the arbiter actually transitions a session to
+/// `Established` (never earlier — a session in `PendingActivation` isn't
+/// occupying the slot this guard is meant to protect, and releasing it
+/// early would defeat both the parked-for-resume case and the ordinary
+/// `AttachActivate` timeout case; see `engine/mod.rs`'s call sites for why
+/// this must be minted at the `StartRelay`/`respond_resume_accepted`
+/// boundary and nowhere earlier).
+///
+/// Whoever owns this must eventually call exactly one of [`Self::release`]
+/// (the target TCP died for good) or [`Self::keep`] (park the slot for a
+/// possible `RESUME`). If neither runs — most notably because the owning
+/// task panicked while relaying — `Drop` falls back to releasing the slot
+/// itself, so `.claude/rules/always-connects.md`'s "a missed `relay_ended`
+/// permanently orphans the slot" failure mode degrades to "released a
+/// little late by the Drop fallback" instead.
+pub struct EstablishedLease {
+    runtime: Arc<AttachRuntime>,
+    lease: Option<LeaseId>,
+}
+
+impl EstablishedLease {
+    fn new(runtime: Arc<AttachRuntime>, lease: LeaseId) -> Self {
+        Self { runtime, lease: Some(lease) }
+    }
+
+    /// The target TCP connection died for good — release the slot now.
+    pub async fn release(mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.runtime.relay_ended(lease).await;
+        }
+    }
+
+    /// The data stream died but the target TCP is still alive and parked
+    /// for a possible `RESUME` — the slot must stay `Established`, so
+    /// consume this guard without releasing.
+    pub fn keep(mut self) {
+        self.lease = None;
+    }
+}
+
+impl Drop for EstablishedLease {
+    /// Best-effort fallback only: never panics (a panic here, while already
+    /// unwinding from the panic that skipped `release()`/`keep()`, would
+    /// abort the process — exactly the failure mode this guard exists to
+    /// avoid) and never awaits directly (`relay_ended` is async; `Drop`
+    /// isn't). If no tokio runtime is reachable (e.g. this guard outlives
+    /// the runtime during process shutdown), the slot simply can't be
+    /// released here — logged so it's visible, left to the existing
+    /// `sweep_expired_parked` backstop.
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else { return };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                "EstablishedLease dropped outside a tokio runtime; lease {lease:?} could not be released"
+            );
+            return;
+        };
+        log::warn!(
+            "EstablishedLease dropped without release()/keep() (lease={lease:?}); \
+             releasing via Drop fallback — the owning task likely panicked or returned early"
+        );
+        let runtime = self.runtime.clone();
+        handle.spawn(async move {
+            runtime.relay_ended(lease).await;
+        });
+    }
+}
+
 pub struct AttachRuntime {
     arbiter: Mutex<AttachArbiter>,
     leases: Mutex<HashMap<LeaseId, LeaseResource>>,
@@ -122,8 +191,11 @@ impl AttachRuntime {
     /// Applies `AttachActivate`; on success (the activation matched the
     /// current `PendingActivation` lease), returns the target `TcpStream`
     /// the connection task should now relay through — ownership fully
-    /// transfers out of this runtime's bookkeeping at this point.
-    pub async fn activate(self: &Arc<Self>, key: AttachKey, attach_token: AttachToken) -> Option<TcpStream> {
+    /// transfers out of this runtime's bookkeeping at this point — paired
+    /// with an [`EstablishedLease`] minted at exactly this transition
+    /// (the arbiter has just moved this session to `Established`, per
+    /// `AttachArbiter::on_activated`).
+    pub async fn activate(self: &Arc<Self>, key: AttachKey, attach_token: AttachToken) -> Option<(TcpStream, EstablishedLease)> {
         let effects = self.arbiter.lock().await.apply(AttachEvent::Activated { key, attach_token });
         for effect in effects {
             if let AttachEffect::StartRelay { lease, .. } = effect {
@@ -131,11 +203,25 @@ impl AttachRuntime {
                     if let Some(timer) = timer {
                         timer.abort();
                     }
-                    return Some(tcp);
+                    return Some((tcp, EstablishedLease::new(self.clone(), lease)));
                 }
             }
         }
         None
+    }
+
+    /// Mints an [`EstablishedLease`] for a lease already known to be
+    /// `Established` — used by the `RESUME` path, which reattaches to a
+    /// slot `hello()`/`activate()` established on a *previous* connection
+    /// (`established_lease_for` looked it up) rather than transitioning it
+    /// itself. Callers must only call this once the slot is genuinely about
+    /// to be relayed through again (right before `relay_buffered`, after
+    /// every earlier repark-and-return path) — see `engine/mod.rs`'s
+    /// `handle_resume_stream` for why minting this too early would let a
+    /// guard dropped on a rejected/reparked `RESUME` wrongly release a slot
+    /// that must stay `Established`.
+    pub fn resumed_lease(self: &Arc<Self>, lease: LeaseId) -> EstablishedLease {
+        EstablishedLease::new(self.clone(), lease)
     }
 
     pub async fn cancel(self: &Arc<Self>, key: AttachKey) {

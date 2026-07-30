@@ -216,17 +216,19 @@ fun AppRoot() {
 
         composable(AppRoutes.TERMINAL) {
             RemoteLogger.i("IsekaiTerminalNav", "→ Terminal (tabs=${tabsVm.tabs.value.size})")
+            // popBackStack() だと、tabsVm復元によりTerminalがstartDestinationになっていた
+            // 場合(戻り先が無い)に詰まるため、明示的にProfileListへ遷移してTerminalを
+            // back stackから取り除く(タブは閉じない、セッションはバックグラウンドで生き続ける)。
+            val navigateToProfileList = {
+                navController.navigate(AppRoutes.PROFILE_LIST) {
+                    popUpTo(AppRoutes.TERMINAL) { inclusive = true }
+                    launchSingleTop = true
+                }
+            }
             TerminalHostScreen(
                 tabsVm = tabsVm,
-                // popBackStack() だと、tabsVm復元によりTerminalがstartDestinationになっていた
-                // 場合(戻り先が無い)に詰まるため、明示的にProfileListへ遷移してTerminalを
-                // back stackから取り除く。
-                onAllTabsClosed = {
-                    navController.navigate(AppRoutes.PROFILE_LIST) {
-                        popUpTo(AppRoutes.TERMINAL) { inclusive = true }
-                        launchSingleTop = true
-                    }
-                },
+                onAllTabsClosed = navigateToProfileList,
+                onNavigateToProfileList = navigateToProfileList,
             )
         }
 

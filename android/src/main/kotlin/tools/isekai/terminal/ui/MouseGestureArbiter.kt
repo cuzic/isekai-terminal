@@ -79,10 +79,13 @@ enum class NormalGestureOutcome {
 }
 
 /**
- * [longPressSucceeded]: `awaitLongPressOrCancellation`が非nullを返したか。
+ * [longPressSucceeded]: `awaitLongPressOrCancellation`(または
+ * `TerminalScreen.kt`の`awaitLongPressOrDragCancellation`)が非nullを返したか。
  * [pointerCount]: 判定時点で押されている指の総数。[trackedFingerStillPressed]:
- * 最初にdownした指(`down.id`)が、判定時点でもまだ押されているか(既に指が
- * 離れて`changes`から消えている場合も`false`として渡す)。
+ * 判定時点で押されている指が(どれか)1本でもあるか。最初にdownした指(`down.id`)
+ * 限定にすると、その指だけが先に離れて他の指がまだ押されている場合に誤って
+ * `false`になりTAP(カーソル移動+IME起動)へ倒れてしまうため(Opusレビュー指摘、
+ * 2026-07-27)、呼び出し側は特定の指IDではなく「1本でも押され続けているか」を渡す。
  */
 fun classifyNormalGesture(
     longPressSucceeded: Boolean,

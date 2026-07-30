@@ -384,4 +384,37 @@ mod tests {
 
         assert!(calls.lock().unwrap().is_empty(), "opt-inしていないタブへは何も書き込まないはず");
     }
+
+    #[tokio::test]
+    async fn retrying_after_locator_registers_installs_hooks_that_the_first_attempt_missed() {
+        // 実機検証(2026-07-27)で判明した本番の実際の順序を再現する回帰テスト:
+        // ctl-socket forward確立直後にspawnされる1回目の`install_notify_hooks`呼び出しは、
+        // ロケータがまだ登録される前に完走してしまい黙ってno-opになる(`is_a_noop_when_locator_unknown`
+        // と同じ状況)。`orchestrator.rs::ensure_tmux_tab_window`はロケータを登録した
+        // 直後に`install_notify_hooks`を改めて呼び直すことで、この取りこぼしを回復する。
+        let registry = Mutex::new(TmuxLocatorRegistry::new());
+        let app_pane = pane("tab-1", "pane-primary");
+
+        // ── ctl-socket forward確立直後、ロケータはまだ未登録 ──
+        let early_calls = Arc::new(StdMutex::new(Vec::new()));
+        let early_runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", early_calls.clone());
+        install_notify_hooks(&registry, &app_pane, early_runner).await.unwrap();
+        assert!(early_calls.lock().unwrap().is_empty(), "ロケータ未登録の間は何も書き込まれない");
+
+        // ── orchestrator.rs::ensure_tmux_tab_window相当: ロケータを登録し、
+        //    プロファイルのenableTabNotificationsを反映する ──
+        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
+        registry.lock().register(app_pane.clone(), loc, None);
+        registry.lock().set_notify_hooks_enabled(&app_pane, true);
+
+        // ── ロケータが分かった今すぐ改めて試す ──
+        let retry_calls = Arc::new(StdMutex::new(Vec::new()));
+        let retry_runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", retry_calls.clone());
+        install_notify_hooks(&registry, &app_pane, retry_runner).await.unwrap();
+
+        let recorded = retry_calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3, "session-hooks install, resolve(list-windows), window-hooks install");
+        assert!(recorded[0].contains("alert-bell"));
+        assert!(recorded[2].contains("pane-died"));
+    }
 }

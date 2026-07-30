@@ -235,6 +235,58 @@ class TerminalTabsViewModelTest {
         assertTrue("split pane should receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
     }
 
+    // ── アプリのフォアグラウンド/バックグラウンドは全セッションへファンアウトされる ──
+    // (実機検証2026-07-28で発見: ProcessLifecycleOwnerが未配線のためtmux通知が
+    // 常に抑制され続けるバグの修正)
+
+    @Test
+    fun onAppBackgrounded_fansOutToAllConnectedTabs() = runBlocking {
+        vm.openTab(profile("a"), "pass")
+        vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[0].simulateConnected("host-a")
+        orchestrators[1].simulateConnected("host-b")
+
+        executor.simulateAppBackgrounded()
+
+        assertEquals(1, orchestrators[0].notifyDidEnterBackgroundCallCount)
+        assertEquals(1, orchestrators[1].notifyDidEnterBackgroundCallCount)
+    }
+
+    @Test
+    fun onAppForegrounded_fansOutToAllConnectedTabs() = runBlocking {
+        vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+
+        executor.simulateAppBackgrounded()
+        executor.simulateAppForegrounded()
+
+        assertEquals(1, orchestrators[0].notifyWillEnterForegroundCallCount)
+    }
+
+    @Test
+    fun onAppBackgrounded_withNoTabs_doesNotThrow() {
+        vm.onAppBackgrounded()
+        vm.onAppForegrounded()
+    }
+
+    @Test
+    fun onAppBackgrounded_alsoFansOutToSplitPane() = runBlocking {
+        val tabId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+
+        vm.splitPane(tabId, SplitDirection.VERTICAL, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-split")
+
+        executor.simulateAppBackgrounded()
+        assertEquals(1, orchestrators[0].notifyDidEnterBackgroundCallCount)
+        assertEquals(1, orchestrators[1].notifyDidEnterBackgroundCallCount)
+    }
+
     // ── 最後のタブを閉じた時のみ FGS 停止 ────────────────────────────────
 
     @Test

@@ -100,6 +100,47 @@ class TabAlertNotifierTest {
     }
 
     @Test
+    fun notify_usesProvidedMessageInsteadOfDefaultTextWhenPresent() {
+        TabAlertNotifier.createChannel(app)
+        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        TabAlertNotifier.notify(
+            app,
+            tabId = "1",
+            profileLabel = "myhost",
+            kind = NotifyKind.WAITING,
+            enabled = true,
+            message = "Claude Code" to "needs your input",
+        )
+
+        val manager = app.getSystemService(NotificationManager::class.java)
+        val extras = shadowOf(manager).allNotifications.single().extras
+        assertEquals("myhost: Claude Code", extras.getCharSequence(android.app.Notification.EXTRA_TITLE).toString())
+        assertEquals("needs your input", extras.getCharSequence(android.app.Notification.EXTRA_TEXT).toString())
+    }
+
+    @Test
+    fun notify_fallsBackToDefaultTextWhenMessagePartsAreBlank() {
+        TabAlertNotifier.createChannel(app)
+        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        TabAlertNotifier.notify(
+            app,
+            tabId = "1",
+            profileLabel = "myhost",
+            kind = NotifyKind.WAITING,
+            enabled = true,
+            message = "" to "",
+        )
+
+        val manager = app.getSystemService(NotificationManager::class.java)
+        val extras = shadowOf(manager).allNotifications.single().extras
+        val (defaultTitle, defaultText) = TabAlertNotifier.titleAndTextFor(NotifyKind.WAITING, "myhost")
+        assertEquals(defaultTitle, extras.getCharSequence(android.app.Notification.EXTRA_TITLE).toString())
+        assertEquals(defaultText, extras.getCharSequence(android.app.Notification.EXTRA_TEXT).toString())
+    }
+
+    @Test
     fun titleAndTextFor_producesDistinctTextPerKind() {
         val texts = NotifyKind.values().map { TabAlertNotifier.titleAndTextFor(it, "myhost") }
         assertEquals(texts.size, texts.toSet().size)

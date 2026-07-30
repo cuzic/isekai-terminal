@@ -136,7 +136,6 @@ class PaneState internal constructor(
 
     // ── upstream フェイルオーバー ────────────────────────────
     internal var upstreamFailoverEnabledForCurrentSession = false
-    internal val rebindInFlight = AtomicBoolean(false)
 
     // ── Task #10: per-pane handle所有権(後勝ちバグ修正) ─────────
     /** 物理マルチパスfd取得のhandle。接続試行のたびに古いhandleを閉じてから発行し直す。 */
@@ -253,15 +252,26 @@ class TerminalTabsViewModel(
                     val vibrator = app.getSystemService(Vibrator::class.java)
                     vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
-                // `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由のAI/汎用の注目通知
-                // (kindが`Waiting`/`Done`/`Info`)。判断(取りこぼし無く1回だけ発火させる
-                // `notifyGeneration`の単調増加チェック)は[TerminalSession]側で完結しており、
-                // ここでは実際の副作用注入のみを行う(`onBell`と同じ構成)。タブバーのバッジ
-                // 表示・バックグラウンド時のシステム通知は未実装(別タスク)のため、現時点
-                // ではログ出力のみ——`onNotify`自体を配線し忘れて既定no-opのまま放置される
-                // (Codexレビュー2026-07-25で指摘)のを避けるための最低限の接続。
+                // `AI_INTEGRATION_DESIGN.md` §6.1/§11.1.4: ctlソケット経由のAI/汎用の
+                // 注目通知(kindが`Waiting`/`Done`/`Info`)。判断(取りこぼし無く1回だけ
+                // 発火させる`notifyGeneration`の単調増加チェック)は[TerminalSession]側で
+                // 完結しており、ここでは実際の副作用注入のみを行う(`onBell`と同じ構成)。
+                // 2026-07-25、tmux hook系kind(下の`onNotifyRequested`)と全く同じ
+                // `TabAlertNotifier`経路へ配線した(バックグラウンドシステム通知)——
+                // ただしこちらはRust側にフォアグラウンド/タブフォーカス抑制が無いため、
+                // 該当タブを表示中でも通知が出うる(既知の差異、`TabAlertNotifier`の
+                // クラスdocコメント参照)。「状態ドット」・通知タップでのタブジャンプは
+                // tmux系kindも含めまだ未実装。
                 onNotify = { kind, title, body ->
                     RemoteLogger.i("IsekaiTerminalNotify", "[$kind] $title: $body")
+                    TabAlertNotifier.notify(
+                        context = app,
+                        tabId = profile.id.toString(),
+                        profileLabel = profile.label,
+                        kind = kind,
+                        enabled = profile.enableTabNotifications,
+                        message = title to body,
+                    )
                 },
                 // タスク#57: tmux hook発火(kindが`Bell`/`Activity`/`Silence`/`JobDone`)。
                 // 「見せるべきか」の判断はRust側で済んでおり、ここでは(a) このプロファイルの
@@ -321,7 +331,6 @@ class TerminalTabsViewModel(
         internal var upstreamFailoverEnabledForCurrentSession: Boolean
             get() = primaryPane.upstreamFailoverEnabledForCurrentSession
             set(value) { primaryPane.upstreamFailoverEnabledForCurrentSession = value }
-        internal val rebindInFlight get() = primaryPane.rebindInFlight
 
         /** UI が購読する合成済み状態(主ペインのもの)。 */
         val uiState: Flow<TerminalUiState> get() = primaryPane.uiState
@@ -385,6 +394,21 @@ class TerminalTabsViewModel(
     private val _tabs = MutableStateFlow<List<TabState>>(emptyList())
     val tabs: StateFlow<List<TabState>> = _tabs.asStateFlow()
 
+    /**
+     * [maybeEnsureTmuxTabWindow]の「同一プロファイルへの二重tmux連携」防止用。
+     * `_tabs.value`を見た`tmuxWindowLabel != null`チェック(TOCTOU: 非同期RPCが
+     * 完了して`tmuxWindowLabel`が書かれるまでの間は他のタブから見えない)だけでは
+     * 同一プロファイルの2タブがほぼ同時に`connected`へ遷移した場合に両方すり抜け、
+     * 互いに異なる`SessionOrchestrator`(=異なる`AppPaneId`)から同時に
+     * `ensureTmuxTabWindow`を呼んでしまう(実機検証、2026-07-27。tmuxウィンドウの
+     * 奪い合い自体に加え、`isekai-pipe ctl notify`が書き込むctl-socketパスの
+     * 登録先app_pane_idと実際に接続しているapp_pane_idが食い違い、
+     * `@isekai_ctl_sock`が永久に正しいウィンドウへ届かなくなる二次被害があった)。
+     * `putIfAbsent`でコルーチン起動前に同期的に「予約」し、RPCが失敗した場合のみ
+     * 解放して別タブに再挑戦の機会を残す。
+     */
+    private val tmuxClaimedProfileIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     private val _activeTabId = MutableStateFlow<String?>(null)
     val activeTabId: StateFlow<String?> = _activeTabId.asStateFlow()
 
@@ -413,6 +437,13 @@ class TerminalTabsViewModel(
                 onNetworkPathChanged(isSatisfied = true)
             },
             onLost = { onNetworkPathChanged(isSatisfied = false) },
+        )
+        // 実機検証(2026-07-28)でこれが未配線だったため、tmux通知(enableTabNotifications)が
+        // バックグラウンド化しても常に抑制され続けるバグがあった(SessionOrchestrator側の
+        // app_foregroundが起動時のtrueから変わらないため)。
+        executor.registerLifecycleCallbacks(
+            onBackground = { onAppBackgrounded() },
+            onForeground = { onAppForegrounded() },
         )
         // タスク#14: このViewModelはプロセス寿命にスコープされた(Applicationスコープの)
         // シングルトンなので(クラスdoc参照)、このinitブロックはプロセスが新規に起動した
@@ -497,6 +528,25 @@ class TerminalTabsViewModel(
         _tabs.value.flatMap { it.panes }.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
     }
 
+    // ── アプリ全体のフォアグラウンド/バックグラウンド（全タブへファンアウト）──────
+
+    /** [openTab]/[splitPane]が新規セッションを作った直後に現在の前景/背景状態を
+     *  適用するための保持値(実機検証2026-07-28)。バックグラウンド中に新規セッションが
+     *  作られた場合、Rust側の初期値`app_foreground=true`のまま取り残されるのを防ぐ。 */
+    @Volatile private var appInForeground = true
+
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
+    internal fun onAppBackgrounded() {
+        appInForeground = false
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyDidEnterBackground() }
+    }
+
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
+    internal fun onAppForegrounded() {
+        appInForeground = true
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyWillEnterForeground() }
+    }
+
     // ── タブのライフサイクル ────────────────────────────────────────
 
     /**
@@ -515,6 +565,9 @@ class TerminalTabsViewModel(
         val tabId = UUID.randomUUID().toString()
         val rebindFdSource = executor.createRebindFdSource()
         val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
+        // バックグラウンド中に新規タブが開かれた(黙示的復元等)場合、新しいセッションの
+        // Rust側初期値`app_foreground=true`のまま取り残さないよう現在値を反映する。
+        if (!appInForeground) primaryPane.session.notifyDidEnterBackground()
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -540,6 +593,13 @@ class TerminalTabsViewModel(
         val tab = _tabs.value.find { it.tabId == tabId } ?: return
         RemoteLogger.i("IsekaiTerminalTabsVM", "closeTab id=$tabId")
         tab.panes.forEach { pane -> closePaneSession(pane) }
+        // このタブがtmux連携を保有していた場合は解放する。他タブが同じプロファイルを
+        // 参照し続けている場合に誤って解放してしまわないよう、profile自体が閉じられて
+        // いる(このタブが最後の1枚だった)場合のみ解放する。
+        tab.profile?.let { profile ->
+            val remainingForProfile = _tabs.value.any { it.tabId != tabId && it.profile?.id == profile.id }
+            if (!remainingForProfile) tmuxClaimedProfileIds.remove(profile.id)
+        }
 
         _tabs.update { list -> list.filterNot { it.tabId == tabId } }
         if (_activeTabId.value == tabId) {
@@ -610,6 +670,7 @@ class TerminalTabsViewModel(
         val profile = tab.profile ?: return null
         val rebindFdSource = executor.createRebindFdSource()
         val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
+        if (!appInForeground) pane.session.notifyDidEnterBackground()
         RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
         tab.openSplit(pane, direction)
         watchPane(tab, pane)
@@ -665,8 +726,10 @@ class TerminalTabsViewModel(
 
     /**
      * ペイン固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
-     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)・
-     * upstream フェイルオーバーの `NoViablePath` 検知。非アクティブでも動き続ける。
+     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)。
+     * 非アクティブでも動き続ける。upstream フェイルオーバーの `NoViablePath` 検知は
+     * `RebindManager`(Rust側)が既に同じイベントで反応するため、Kotlin側で
+     * 二重に監視しない(`observeFailover`は撤去済み、`rust-ssot.md`参照)。
      * [watchJobs] は paneId(タブをまたいで一意)をキーにする — 分割ペインを付け替えても
      * ジョブの追跡が壊れないようにするため。
      */
@@ -674,7 +737,6 @@ class TerminalTabsViewModel(
         watchJobs[pane.paneId] = viewModelScope.launch {
             launch { observeSummary(pane) }
             launch { observeDownloads(pane) }
-            launch { observeFailover(pane) }
             launch { observeConnectionTransitions(tab, pane) }
         }
     }
@@ -688,12 +750,6 @@ class TerminalTabsViewModel(
             pending ?: return@collect
             executor.saveDownloadFile(pending.first, pending.second)
             pane.session.consumeDownloadFile()
-        }
-    }
-
-    private suspend fun observeFailover(pane: PaneState) {
-        pane.session.noViablePathEvent.collect {
-            if (pane.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(pane)
         }
     }
 
@@ -752,27 +808,21 @@ class TerminalTabsViewModel(
     // ── upstream フェイルオーバー ────────────────────────────────────
 
     /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」を検知した際の処理。
-     * セルラーへの bindSocket 済み fd を取得できたら `rebindToFd` でendpointの
-     * ソケットを丸ごと差し替える。取得できなければ何もしない（日和見的ポリシー）。
-     * [PaneState.rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
+     * `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失、Rust側のQUICパスヘルスとは無関係な独自シグナル)が「WiFiは繋がっている
+     * がupstreamが死んでいる」を検知した際に呼ばれる。判断・実際のrebind実行は
+     * 一切せず、生イベントを`RebindManager`(Rust側)へそのまま転送するだけ
+     * (`rust-ssot.md`準拠)。以前はここでKotlin側が独自にセルラーfdを取得して
+     * `rebindToFd`を直接呼んでいたが、これは`RebindManager`が同じ`NoViablePath`
+     * (Rust側のQUICパスヘルス検知経由)で既に行っている`PerformRebindToCellular`と
+     * 完全に重複しており、同じセッションに対して独立に2本のセルラーfdを取得し
+     * `rebind_abstract`を2回叩く二重rebindになっていた(実害あり、opusレビューで
+     * 発見)。`notifyUpstreamHealthDegraded`はマルチパス以外のtransportや
+     * `enableUpstreamFailover`が無効な場合はRust側で何もしない(`rust-ssot.md`の
+     * 「判断ロジックを一箇所に集約」原則通り、Kotlin側では分岐しない)。
      */
     private fun onWifiUpstreamBroken(pane: PaneState) {
-        if (!pane.rebindInFlight.compareAndSet(false, true)) return
-        viewModelScope.launch(ioDispatcher) {
-            try {
-                val cellular = pane.rebindFdSource.acquireCellularFd()
-                if (cellular == null) {
-                    RemoteLogger.w("IsekaiTerminalSSH", "upstream failover: cellular fd not available, staying on current path")
-                    return@launch
-                }
-                val (fd, localIp) = cellular
-                RemoteLogger.i("IsekaiTerminalSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
-                pane.session.rebindToFd(fd, localIp)
-            } finally {
-                pane.rebindInFlight.set(false)
-            }
-        }
+        pane.session.notifyUpstreamHealthDegraded()
     }
 
     // ── 接続 ─────────────────────────────────────────────────────────
@@ -906,6 +956,11 @@ class TerminalTabsViewModel(
      * tmux連携済み(`tmuxWindowLabel`が非null)なら、このタブはtmux連携自体を
      * スキップする(通常のシェルタブとして使い続けられる、上のopportunistic方針
      * と同じ扱い)。
+     *
+     * この判定だけではTOCTOUレースが残る(`tmuxWindowLabel`は非同期RPCが完了する
+     * まで書かれないため、同一プロファイルの2タブがほぼ同時に`connected`へ遷移
+     * すると両方この判定をすり抜ける、実機検証2026-07-27)。[tmuxClaimedProfileIds]
+     * への同期的な`add`(コルーチン起動前)で実際に排他する。
      */
     private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
         val profile = tab.profile ?: return
@@ -914,6 +969,13 @@ class TerminalTabsViewModel(
             RemoteLogger.i(
                 "IsekaiTerminalTmux",
                 "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already owns tmux window for profile ${profile.id}",
+            )
+            return
+        }
+        if (!tmuxClaimedProfileIds.add(profile.id)) {
+            RemoteLogger.i(
+                "IsekaiTerminalTmux",
+                "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already claimed profile ${profile.id}",
             )
             return
         }
@@ -931,6 +993,7 @@ class TerminalTabsViewModel(
                         "window=${info.windowIndex} tag=${info.tag} isNew=${info.isNewWindow}",
                 )
             } catch (e: Exception) {
+                tmuxClaimedProfileIds.remove(profile.id)
                 RemoteLogger.w("IsekaiTerminalTmux", "ensureTmuxTabWindow failed (non-fatal): ${e.message}")
             }
         }
@@ -1039,6 +1102,7 @@ class TerminalTabsViewModel(
         RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel cleared")
         _tabs.value.forEach { tab -> tab.panes.forEach { closePaneSession(it) } }
         executor.unregisterNetworkCallbacks()
+        executor.unregisterLifecycleCallbacks()
         executor.release()
     }
 }

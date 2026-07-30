@@ -287,6 +287,8 @@ Host production
     #@isekai candidate-race-delay 250ms
     #@isekai relay-delay 900ms
     #@isekai ctl-socket yes
+    #@isekai tab-idle-color 202020
+    #@isekai tab-attention-color ff8800
 ```
 
 これで `isekai-ssh production`(または `-L 5432:127.0.0.1:5432 production` で `service postgres`
@@ -314,13 +316,16 @@ Host production
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
 | `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |
 | `ctl-socket` | `yes`\|`no` | `no` | `yes` にすると、リモートの対話シェルから `isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push --mime <mime>` を実行することで、tmux を経由せず直接ローカルのタブ/ターミナルのタイトルやクリップボードへ反映できるよう per-タブのリモートフォワードを張る(`ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。Unix は実 `ssh(1)` の `-R` + UNIX domain socket、Windows ネイティブ経路は `russh` の streamlocal forward を in-process で消費する(下記「Windows(ネイティブ SSH クライアント経路)」)。明示的なリモートコマンドを指定した呼び出し(`isekai-ssh host 'some command'`)では黙って無効化される(opportunistic fallback) |
+| `tab-idle-color` | 6桁hex(`#`可) | (組み込みの既定色) | `claude-hookd`(下記「Claude Code フック連携によるタブ状態表示」参照)がタブを「対応不要」状態に戻すときの色。`ctl-socket yes` が前提 |
+| `tab-attention-color` | 6桁hex(`#`可) | (組み込みの既定色) | `claude-hookd` がタブを「対応が必要」状態にするときの色。`ctl-socket yes` が前提 |
 | `remote-log-level` | `error`\|`warn`\|`info`\|`debug`\|`trace` | `info` | 自動 bootstrap で起動するリモート側 `isekai-pipe serve` の `--log-level`。接続不良の切り分け時だけ `debug`/`trace` に上げ、常用ホストでは既定(`info`)のままにしておくのが推奨(ホストごとに設定できる) |
 | `remote-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | 自動 bootstrap で起動するリモート側 `isekai-pipe serve --bind-port-range`。この範囲だけをホスト側ファイアウォールで許可すればよくなる(既定は Linux の ephemeral port range 全体を開ける必要がある) |
 | `local-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | `isekai-ssh`(`isekai-pipe connect`)自身がこのマシンで張るQUICソケットのbindポート範囲。手元のファイアウォール/NATが outbound UDP を特定範囲にしか通さない場合に使う。`remote-bind-port-range` とは独立した設定(片方だけ・両方同時に設定してよい) |
 
 `bootstrap-candidate`/`link`/`rendezvous`/`stun`/`relay`/`service` は複数行書くと追記されていく。
 それ以外(`enabled`/`bootstrap-policy`/`profile`/`remote-path`/`resume-grace`/
-`candidate-race-delay`/`relay-delay`/`install-mode`/`ctl-socket`/`remote-log-level`/
+`candidate-race-delay`/`relay-delay`/`install-mode`/`ctl-socket`/`tab-idle-color`/
+`tab-attention-color`/`remote-log-level`/
 `remote-bind-port-range`/`local-bind-port-range`)は最初に出てきた値が採用される
 (OpenSSH 本体の `Host`/`Match` と同じ first-value-wins 規則)。
 
@@ -517,6 +522,80 @@ Windows が無いため、この機能自体はモックSSHサーバーでのユ
 `x86_64-pc-windows-gnu` へのクロスコンパイル確認までしか検証できていない——named pipe
 実体・`cmd.exe` 固有の挙動・実 `isekai-ssh.exe` での実際のビルドは未検証(既知の制限)。
 
+### Claude Code フック連携によるタブ状態表示(`claude-hookd`)
+
+`#@isekai ctl-socket yes` の上に乗る形で、リモートで動いている Claude Code の状態
+(権限確認待ち・応答待ちなど)に応じて、ローカル(Windows Terminal)のタブ背景色を
+自動的に変える(`ISEKAI_PIPE_DESIGN.md` §8 Epic Q)。tmux の pane ごとに独立した
+Claude Code セッションとして扱われるので、同じタブ内の複数 pane が互いの状態を
+打ち消し合うことはない。
+
+まず接続先ホストの色を設定する(省略した場合は組み込みの既定色を使う):
+
+```
+Host myhost
+    #@isekai ctl-socket yes
+    #@isekai tab-idle-color 202020
+    #@isekai tab-attention-color ff8800
+```
+
+次に、リモート側の `~/.claude/settings.json` に以下を追加する(コマンドはどの
+hook でも同じ1行、Claude Code のフック JSON を stdin から読んで判断は
+`claude-hookd` 側で行うので、`.claude/settings.json` 側は配線するだけでよい):
+
+```json
+{
+  "hooks": {
+    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
+  }
+}
+```
+
+`PostToolUse`/`PostToolUseFailure`/`Notification`/`PermissionRequest` はmatcherを
+付けずに全件登録する(どのイベント種別が実際に色を変えるかの判断は
+`.claude/settings.json`側ではなく`claude-hookd`自身が行う、という設計方針
+そのままなので、フィルタも向こう側に置く)。`PostToolUse`は全ツール呼び出し
+ごとに発火するようになるため、Claude Code本体をブロックしないよう
+`"async": true`を付けている(`claude-hookd event`は元々exitコードが常に0で
+stdoutも出力しないので、asyncにしても判定への影響は無い)。全hookに
+`"timeout": 10`(秒)も明示している——`claude-hookd`自身の最悪ケース
+(daemon起動待ちのバウンドリトライ)は~1.55秒で終わるので十分な余裕がある。
+これらの設定(`async`・`timeout`の付け方含む)は`accessd/tmux-agent-indicator`・
+`sandudorogan/tmux-pane-tree`という実運用されている2つのtmuxプラグインの
+hook設定を参考にした。
+
+これで、Claude Codeが権限確認(`PermissionRequest`、または`Notification`の
+`permission_prompt`——両方使うのは意図的な冗長化、`claude_hookd::mod::
+parse_hook_event`のdocコメント参照)や`AskUserQuestion`で止まっている間、
+あるいはAPIエラーで応答が終わった(`StopFailure`)間はタブがattention色になり、
+ポップアップ通知(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)が一度だけ出る。
+次のプロンプト送信・ツール呼び出しの完了・セッション終了のいずれかで即座に
+idle色へ戻り、何も操作しなくても10分経てば自動的に戻る。バックグラウンド
+タスク待ちで一時停止した`Stop`(`background_tasks`が空でない)はattention色に
+しない——実際に完了したときに改めて`Stop`(空配列)か`Notification`の
+`idle_prompt`が届く。
+
+裏側では、最初のイベントが来たタイミングでタブごとの小さなdaemon
+(`isekai-pipe claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
+転送される。daemonは1時間イベントが無いと自動的に終了する(常駐監視プロセスは
+無い、Epic Mの ctl-socket 自体と同じ方針)。
+
+**明示的にスコープ外**: タブ色を実際に変える部分は `isekai-ssh` + Windows Terminal の
+組み合わせ専用(タブ色自体は OSC 4;264 という Windows Terminal 固有の拡張に依存する
+ため isekai-terminal 本体アプリでは効果が無い)。`ctl notify` のポップアップ部分
+(`AI_INTEGRATION_DESIGN.md` §6.1)は isekai-terminal 本体アプリでも独立に届く——
+Android はバックグラウンドシステム通知として実装済み(2026-07-25)、iOS は
+まだ未実装(`AI_INTEGRATION_DESIGN.md` §9 Epic AI-9)。`.claude/settings.json` への
+自動追記は行わない(手動で追加する必要がある)。
+
 ### 新規クレートの位置づけ
 
 Windows ネイティブ経路の中核は、`isekai-` 固有の型に依存しない汎用クレートとして切り出して
@@ -565,6 +644,11 @@ Windows ネイティブ経路の中核は、`isekai-` 固有の型に依存し�
   (`%USERPROFILE%\.config\isekai-ssh` 等)のままで、Windows 流(`%LOCALAPPDATA%`)には
   なっていない(動作はするが非イディオマティック、今のところ意図的に未対応)。native 経路の
   非対応・非互換事項は「Windows(ネイティブ SSH クライアント経路)」節を参照。
+- `claude-hookd`(タブ状態表示)は `isekai-ssh` + Windows Terminal 専用で、
+  isekai-terminal 本体アプリ(Android/iOS)では OSC 4;264 非対応のため効果が無い。
+  `.claude/settings.json` への配線は手動(自動追記は無い)。`$ISEKAI_CTL_SOCK` 同様、
+  tmux を別の SSH 接続を跨いで再アタッチした場合は色関連の環境変数も古い値のまま
+  残り(サイレントに失敗するだけ)、新しいペイン/ウィンドウでは正しい値に戻る。
 
 ## トラブルシューティング
 
