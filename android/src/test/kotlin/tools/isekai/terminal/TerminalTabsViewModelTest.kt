@@ -509,7 +509,10 @@ class TerminalTabsViewModelTest {
      *  スレッド相当の呼び出し自体がテスト側で例外として観測され、テストが失敗する。 */
     @Test
     fun onWifiUpstreamBroken_whenRustThrows_doesNotPropagateToTheCaller() = runBlocking {
-        vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        val idA = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (!tab(idA).session.state.value.connected) delay(10) }
         withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
         orchestrators[0].notifyUpstreamHealthDegradedError = InternalException("boom")
 

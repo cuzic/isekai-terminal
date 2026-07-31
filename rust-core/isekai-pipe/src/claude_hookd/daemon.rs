@@ -739,7 +739,17 @@ mod tests {
     #[tokio::test]
     async fn a_self_exiting_daemon_leaves_its_socket_for_the_sweep_instead_of_unlinking_it() {
         let dir = tempfile::tempdir().unwrap();
-        let hookd_sock_path = dir.path().join("isekai-pipe-ctl-hookd-test0123456789abcdef.sock");
+        // Short token (unlike the real 32-hex-char one `derive_daemon_sock_path`
+        // generates) — CI on macOS failed here (2026-07-31) because `sockaddr_un`'s
+        // `sun_path` is only 104 bytes there (vs Linux's 108), and macOS's own
+        // tempdir paths (`/var/folders/.../T/...`) are already long enough that
+        // the full realistic-length filename pushed `bind()` past it, silently
+        // hitting `run`'s "lost the bind race" `Err(_) => return` branch instead
+        // of the graceful-exit path this test means to pin. Only the
+        // `isekai-pipe-ctl-`/`.sock` prefix+suffix matter for what this test
+        // checks (the sweep call below matches on those alone), so the exact
+        // token content and length don't need to resemble production.
+        let hookd_sock_path = dir.path().join("isekai-pipe-ctl-hookd-t.sock");
 
         tokio::time::timeout(
             Duration::from_secs(2),
