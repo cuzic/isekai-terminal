@@ -64,6 +64,15 @@ pub(crate) struct SixelDecoder {
     /// ジャグ配列(各行が独立に伸びる)。`rows[y][x]`はARGB
     /// (`0xAARRGGBB`、alpha=0=未設定/透過)。
     rows: Vec<Vec<u32>>,
+    /// これまでに`set_pixel`が受け付けた最大のx/y(クラッシュ観点レビュー、
+    /// 2026-07-31)。`finish()`が実際に確保するのは個々のピクセルではなく
+    /// このバウンディングボックス`(max_x+1)×(max_y+1)`全体なので、面積ガードは
+    /// 個々のピクセル1点の`(x+1)*(y+1)`ではなくこちらで判定しなければならない
+    /// (横長の線1本+縦長の線1本を別々に描くだけで、個々のピクセルは面積
+    /// チェックを通過したままバウンディングボックスだけを巨大化できてしまう
+    /// 実例がPoCとして見つかっている)。
+    max_x: usize,
+    max_y: usize,
     mode: Mode,
     /// サイズ上限超過等で以降のバイトを無視して良い状態になったら立てる。
     aborted: bool,
@@ -132,6 +141,8 @@ impl SixelDecoder {
             x: 0,
             y: 0,
             rows: Vec::new(),
+            max_x: 0,
+            max_y: 0,
             mode: Mode::Normal,
             aborted: false,
         }
@@ -275,10 +286,16 @@ impl SixelDecoder {
             self.aborted = true;
             return;
         }
-        if (x + 1).saturating_mul(y + 1) > MAX_SIXEL_AREA {
+        // Bounding-box area, not this single pixel's `(x+1)*(y+1)` (crash-
+        // focused review, 2026-07-31) — see the `max_x`/`max_y` field docs.
+        let new_max_x = self.max_x.max(x);
+        let new_max_y = self.max_y.max(y);
+        if (new_max_x + 1).saturating_mul(new_max_y + 1) > MAX_SIXEL_AREA {
             self.aborted = true;
             return;
         }
+        self.max_x = new_max_x;
+        self.max_y = new_max_y;
         while self.rows.len() <= y {
             self.rows.push(Vec::new());
         }
@@ -298,6 +315,16 @@ impl SixelDecoder {
         let height = self.rows.len();
         let width = self.rows.iter().map(|r| r.len()).max().unwrap_or(0);
         if width == 0 || height == 0 {
+            return None;
+        }
+        // Belt-and-suspenders re-check right at the actual allocation site
+        // (crash-focused review, 2026-07-31): `set_pixel`'s running
+        // `max_x`/`max_y` guard is the primary defense, but re-deriving the
+        // same bound from `width`/`height` here means this allocation can
+        // never exceed `MAX_SIXEL_AREA` regardless of how `rows` got built,
+        // matching `kitty_graphics.rs`'s equivalent check at its own
+        // allocation site.
+        if width.saturating_mul(height) > MAX_SIXEL_AREA {
             return None;
         }
         let mut rgba = vec![0u8; width * height * 4];
@@ -414,5 +441,37 @@ mod tests {
         // ビット無しなのでxが進まないため、代わりに'@'を大量repeatする)。
         feed_str(&mut dec, "!5000@");
         assert!(dec.finish().is_none());
+    }
+
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったバグのpin: 横長の1本の
+    /// 線と縦長の1本の線を別々に描くと、個々のピクセルは(修正前の)
+    /// per-pixelチェック`(x+1)*(y+1) <= MAX_SIXEL_AREA`を単独では通過したまま、
+    /// バウンディングボックス(`(max_x+1)*(max_y+1)` = 4095*4096 ≈ 16.77M)
+    /// だけを`MAX_SIXEL_AREA`(4M)超まで巨大化できていた。修正後は
+    /// `set_pixel`が更新後のバウンディングボックスで判定するため中断される。
+    #[test]
+    fn sparse_pixels_cannot_grow_bounding_box_past_area_cap() {
+        let mut dec = SixelDecoder::new();
+        feed_str(&mut dec, "#0;2;100;0;0!4095@"); // y=0 に幅4095の横線
+        for _ in 0..682 {
+            dec.feed(b'-'); // y=4092 へ(6ピクセル/バンド × 682 = 4092)
+        }
+        dec.feed(b'G'); // 0x47 - 0x3f = 8 = bit3 → y=4095に1px(縦線の先端)
+        assert!(dec.finish().is_none(), "bounding box 4095x4096 exceeds MAX_SIXEL_AREA and must be discarded, not allocated");
+    }
+
+    /// 上記の対テスト(偽陽性防止): バウンディングボックスが上限内に収まる
+    /// 疎な画像(100×4000 = 400,000 << 4,000,000)は正常に確定すること。
+    #[test]
+    fn sparse_pixels_within_the_area_cap_still_produce_an_image() {
+        let mut dec = SixelDecoder::new();
+        feed_str(&mut dec, "#0;2;100;0;0!100@"); // y=0 に幅100の横線
+        for _ in 0..666 {
+            dec.feed(b'-'); // y=3996へ
+        }
+        dec.feed(b'G'); // y=3999に1px
+        let img = dec.finish().expect("a bounding box within MAX_SIXEL_AREA must still produce an image");
+        assert_eq!(img.width, 100);
+        assert_eq!(img.height, 4000);
     }
 }

@@ -815,6 +815,17 @@ impl Terminal {
     /// (`SessionState`/`SessionCore`)が「グローバル既定を使うか、プロファイル/タブ固有の
     /// 上書きを使うか」を解決した結果をそのまま渡す。
     pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
+        // 最低1x1を保証する(クラッシュ観点レビュー、2026-07-31)——
+        // `resize_preserving_state`と同じ不変量・同じ理由(呼び出し元の実装に
+        // 依存させない)。ここでこれが無いと、`rows == 0`は`scroll_bottom:
+        // rows - 1`(下記)で即座にunderflow panicし、`cols == 0`は
+        // `default_tab_stops(cols)`が長さ0を返すため後段のHTS/TBCで
+        // `tab_stops[0]`アクセスがpanicする。呼び出し元(Android/iOS)は
+        // 現状もっと大きい下限を強制しているためリモートからは到達しないが、
+        // `Terminal`自身の不変量を呼び出し元の実装に依存させないための
+        // 防御的措置。
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let blank = blank_cell_for_theme(&theme);
         let cells = vec![blank.clone(); cols * rows];
         let tab_stops = default_tab_stops(cols);
@@ -1390,7 +1401,11 @@ impl Terminal {
             &self.alt_cells, old_cols, old_rows, new_cols, new_rows, alt_removed, &blank,
             None,
         );
+        // The diff must be computed from the *untrimmed* lengths (before any
+        // `trim_pending_scrollback()` call) — see that method's own doc
+        // comment for why trimming first would underflow this subtraction.
         self.total_scrolled_lines += (self.pending_scrollback.len() - scrollback_before) as u64;
+        self.trim_pending_scrollback();
 
         let max_row = new_rows.saturating_sub(1);
         let shift_row = |row: usize, removed: usize| -> usize {
@@ -1510,6 +1525,16 @@ impl Terminal {
     }
 
     fn switch_to_alt(&mut self, save_cursor: bool) {
+        // 既にalt画面ならno-op(クラッシュ観点レビュー、2026-07-31、対になる
+        // `switch_to_main`の`if !self.alt_active { return; }`と対称のガード)。
+        // このガードが無いと、`self.main_cells = self.cells().clone();`(下)は
+        // `alt_active`のとき`cells()`がalt側を返すため、保存されていたmain画面
+        // がalt画面の内容で上書きされ恒久的に失われる(vim内から`:!less`を
+        // 開いて閉じる、のようにネストした`?1049h`で踏む——2回目の進入は
+        // クラッシュしないが表示が壊れる)。
+        if self.alt_active {
+            return;
+        }
         // alt画面への切替は画面内容を丸ごと差し替える——全画面dirty(#93)。
         self.full_damage_pending = true;
         if save_cursor {
@@ -1610,6 +1635,31 @@ impl Terminal {
         }
     }
 
+    /// `pending_scrollback`を高水位`2 * SCROLLBACK_LIMIT`で間引き、
+    /// `SCROLLBACK_LIMIT`件まで戻す(クラッシュ観点レビュー、2026-07-31)。
+    ///
+    /// 呼び出し元は必ず`total_scrolled_lines`の更新を終えた**後**にこれを
+    /// 呼ぶこと——`resize_preserving_state`は呼び出し前後の`pending_scrollback`
+    /// の長さ差分で押し出し行数を数えているため、差分計算より先にここで
+    /// 間引くと`usize`アンダーフローでpanicする。
+    ///
+    /// この間引きは最終的な見た目を変えない: `session.rs`側の
+    /// `dispatch_result`は最終的に`pending_scrollback`を古い順に
+    /// scrollbackへ積んでから先頭`SCROLLBACK_LIMIT`件だけを残すので、
+    /// pending側で先に「新しい方`SCROLLBACK_LIMIT`件を除く古い側」を
+    /// 捨てておいても最終結果はバイト単位で同一になる(pending行数が
+    /// `SCROLLBACK_LIMIT`を超えていれば、既存scrollback・pendingの古い側は
+    /// どのみち全部捨てられる)。高水位を`SCROLLBACK_LIMIT`ちょうどではなく
+    /// その2倍にしているのは、`drain`をpush毎ではなく間引き2000行に1回だけ
+    /// 償却するため(REP拡大時、1呼び出しごとに`remove(0)`相当のmemmoveを
+    /// 発生させると無駄が大きい)。
+    fn trim_pending_scrollback(&mut self) {
+        let len = self.pending_scrollback.len();
+        if len > 2 * crate::session::SCROLLBACK_LIMIT {
+            self.pending_scrollback.drain(..len - crate::session::SCROLLBACK_LIMIT);
+        }
+    }
+
     /// SU(`CSI Ps S`)。scroll region内を`n`行分上方向へシフトし、下端を空行で
     /// 埋める。[scroll_down_region](SD)と同じ理由で、シフト対象が0行になる
     /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
@@ -1640,6 +1690,14 @@ impl Terminal {
             // `total_scrolled_lines`を進める(`Terminal::total_scrolled_lines`
             // フィールドdocコメント参照)。
             self.total_scrolled_lines += n as u64;
+            // クラッシュ観点レビュー(2026-07-31): このpushだけでは
+            // `pending_scrollback`に上限が無く、`session.rs`側の
+            // `SCROLLBACK_LIMIT`トリミングは1回のstdoutバッチを全部処理し
+            // 切った後にしか効かない。REPの拡大(`'b'`ハンドラのclamp参照)と
+            // 組み合わさると、約1KBの入力で数百MBを一括確保できてしまって
+            // いた。ここで随時トリミングすることで、バッチの途中経過に
+            // 関わらずメモリを有界に保つ。
+            self.trim_pending_scrollback();
         }
 
         if n < region_size {
@@ -2911,7 +2969,20 @@ impl Perform for Terminal {
             // (タスク#84)。
             'b' => {
                 if let Some((c, attrs, link_id)) = self.last_graphic_cell {
-                    let n = p0.max(1) as usize;
+                    // Clamped to one screen's worth of cells (crash-focused
+                    // review, 2026-07-31): `vte` saturates `p0` at u16::MAX,
+                    // so `CSI 65535 b` (8-10 bytes) used to be able to
+                    // re-print a single character 65535 times in one go —
+                    // on an 80-column screen that's 819 rows scrolled out to
+                    // `pending_scrollback` from one short escape sequence,
+                    // an amplification no other parameterized loop in this
+                    // file allows (every other one clamps to the region/
+                    // screen size already). A legitimate REP is a run-length
+                    // encoding within one line, so it's never more than
+                    // `cols - 1` in practice; `cols * rows` is a generous
+                    // upper bound that still can't be used to amplify a
+                    // short input into an unbounded scroll.
+                    let n = (p0.max(1) as usize).min(self.cols.saturating_mul(self.rows).max(1));
                     let restore_attrs = self.cur_attrs;
                     let restore_link_id = self.active_link_id;
                     self.cur_attrs = attrs;
@@ -3580,6 +3651,48 @@ mod tests {
         );
     }
 
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったREP拡大OOMバグのpin:
+    /// `vte`が`p0`をu16飽和させるため、修正前は`CSI 65535 b`という
+    /// 8〜10バイトだけで1文字を65535回再印字できていた(80桁端末なら
+    /// 819行がscrollback行へ押し出される)。修正後は1画面分
+    /// (`cols * rows`)にクランプされる。
+    #[test]
+    fn test_rep_count_is_clamped_to_one_screen() {
+        // `t.rows() + 2`(セル数ではなく行数)が正しい上限(Opusレビュー、
+        // 2026-07-31: `80 * 24`はセル数の上限であり、80桁端末では1920文字の
+        // REPでも高々24〜25行しかスクロールアウトしないため、この比較では
+        // クランプが無くても(修正前の65535文字→約819行スクロールでも)
+        // 819 <= 1920でテストが偽陽性に通ってしまいpinとして機能しなかった)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"x\x1b[65535b");
+        let scrolled = t.take_scrollback().len();
+        assert!(
+            scrolled <= t.rows() + 2,
+            "one REP invocation must not scroll out more than one screen's worth of rows, got {scrolled}"
+        );
+    }
+
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったバグのpin(REPクランプと
+    /// は独立した防御層): `take_scrollback()`(=`session.rs`側の1バッチ処理)
+    /// を挟まずに大量のREPを連投しても、`pending_scrollback`自体は
+    /// `2 * SCROLLBACK_LIMIT`を超えて成長し続けない。REPクランプ
+    /// (`cols * rows` = 1920)後もこのテストの入力(100回 × クランプ後
+    /// 1920文字 ≈ 2400行相当の押し出し)は高水位2000行を超えるので、
+    /// この随時トリミング自体が独立して効いていることを確認できる。
+    #[test]
+    fn test_pending_scrollback_is_capped_within_a_single_batch() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"x");
+        for _ in 0..100 {
+            feed(&mut t, b"\x1b[65535b");
+        }
+        assert!(
+            t.pending_scrollback.len() <= 2 * crate::session::SCROLLBACK_LIMIT,
+            "pending_scrollback must be trimmed as it grows, not only after a whole batch is processed, got {} rows",
+            t.pending_scrollback.len()
+        );
+    }
+
     #[test]
     fn test_alt_screen_roundtrip_preserves_sgr_attributes() {
         // vim起動→終了のような alt screen 往復で、SGR属性(新規属性含む)が
@@ -3649,6 +3762,30 @@ mod tests {
         assert_eq!(cell(&t, 0, 0), " "); // alt は空白
         feed(&mut t, b"\x1b[?1049l");   // main に戻る
         assert_eq!(cell(&t, 0, 0), "m"); // main が復元
+    }
+
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったバグのpin: `vim`の中から
+    /// `:!less`のようにネストして2回目の`?1049h`が来ても(vim自身の`?1049h`→
+    /// `less`自身の`?1049h`)、保存されていたmain画面(vim実行前のシェル画面)
+    /// を上書きしない。修正前は`switch_to_alt`にガードが無く、2回目の進入が
+    /// 無条件に`self.main_cells = self.cells().clone()`を実行していた——
+    /// `alt_active`が既に`true`のとき`cells()`はalt側を返すため、これは
+    /// 「alt画面の現在の内容(vimの画面)」を誤って`main_cells`として保存し
+    /// 直してしまい、後で`?1049l`でmain画面へ復帰した際に本来のシェル画面
+    /// ではなくvimの画面が表示される形で恒久的に失われていた。このテストは
+    /// ネストしたexit(`less`自身の`?1049l`)の挙動までは対象にしない
+    /// (real-world terminalも単一のalt bufferしか持たずネスト深度を追跡
+    /// しないため、それは今回の修正のスコープ外)——「2回目の`?1049h`が
+    /// `main_cells`を壊さないこと」だけを検証する。
+    #[test]
+    fn test_switch_to_alt_is_a_noop_when_already_in_alt_screen() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"shell-screen"); // main画面(最終的に復元されるべき内容)
+        feed(&mut t, b"\x1b[?1049h"); // vim自身のalt進入(main_cellsを正しく保存)
+        feed(&mut t, b"vim-screen"); // alt側(vimの画面)を書き換える
+        feed(&mut t, b"\x1b[?1049h"); // ネストした2回目の進入(:!less相当) — no-opであるべき
+        feed(&mut t, b"\x1b[?1049l"); // alt画面から抜ける
+        assert_eq!(cell(&t, 0, 0), "s", "the nested re-entry must not have overwritten main_cells with the alt screen's own content");
     }
 
     #[test]
@@ -5094,6 +5231,20 @@ mod tests {
         assert_eq!(t.screen_cells().len(), 1);
         assert!(t.cursor_row() < t.rows());
         assert!(t.cursor_col() <= t.cols());
+    }
+
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったバグのpin:
+    /// `resize_preserving_state`は0x0を最低1x1へclampする(直上のテスト)のに、
+    /// コンストラクタ自身には同じガードが無く、`rows == 0`は
+    /// `scroll_bottom: rows - 1`で即座にunderflow panicしていた
+    /// (`cols == 0`は`default_tab_stops(0)`が空配列を返すため、HTS/TBC等
+    /// `tab_stops[0]`へアクセスする経路で後からpanicする)。
+    #[test]
+    fn test_new_clamps_zero_size_to_minimum() {
+        let t = Terminal::new(0, 0, Theme::default());
+        assert_eq!(t.cols(), 1);
+        assert_eq!(t.rows(), 1);
+        assert_eq!(t.screen_cells().len(), 1);
     }
 
     // ── IL/DL(`CSI Ps L`/`CSI Ps M`、タスク#35) ─────────────
@@ -6629,6 +6780,22 @@ mod tests {
         // 画像の下・左端へカーソルが移動する(実装ノート参照)。
         assert_eq!(t.cursor_row(), 3);
         assert_eq!(t.cursor_col(), 0);
+    }
+
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったSixelバウンディング
+    /// ボックスOOMバグのpin: `sixel.rs`のユニットテスト
+    /// `sparse_pixels_cannot_grow_bounding_box_past_area_cap`と同じPoCを、
+    /// 実際の入口(DCS `ESC P q ... ST`経由の`vte`パース)を通して確認する。
+    /// 修正前はこの入力が約64MiBの`rgba`確保(`MAX_TOTAL_IMAGE_RGBA_BYTES`
+    /// のトリミングもすり抜ける)に至っていた。
+    #[test]
+    fn test_sixel_sparse_bounding_box_does_not_bypass_area_cap() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut seq = b"\x1bPq#0;2;100;0;0!4095@".to_vec();
+        seq.extend(std::iter::repeat(b'-').take(682));
+        seq.extend_from_slice(b"G\x1b\\");
+        feed(&mut t, &seq);
+        assert!(t.images().is_empty(), "an oversized bounding box must be discarded, never placed as a live image");
     }
 
     #[test]
