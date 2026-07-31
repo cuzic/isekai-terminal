@@ -271,13 +271,20 @@ async fn run(config: DaemonConfig) {
         }
     }
     accept_task.abort();
-    // Graceful-exit cleanup. Not load-bearing for correctness (the sweep in
-    // the next `claude-hookd event`/`__serve` invocation would reclaim this
-    // file regardless, via the same `is_abandoned` check that protects
-    // against the crash case where this line never runs at all) — just
-    // avoids leaving a guaranteed-dead file lying around for longer than
-    // necessary between now and whenever this tab's next event arrives.
-    let _ = std::fs::remove_file(&config.sock_path);
+    // Deliberately does *not* `remove_file(&config.sock_path)` here (crash-
+    // focused review, 2026-07-31): this daemon's own bind race handling
+    // above already relies on stale sockets being reclaimed by the next
+    // `claude-hookd event`/`__serve` invocation's `sweep_stale_ctl_sockets_
+    // on_remote` (the same `is_abandoned` check that covers the crash case,
+    // where this line never runs at all — deleting it here just makes the
+    // graceful-exit path use that one proven path too, instead of a second
+    // eager one). A prior version of this line raced a successor daemon
+    // that binds the same freshly-swept path between this loop's `break`
+    // and the `remove_file` call: this `run` would then unlink the
+    // *successor's* live socket, leaving it unlistened-on-but-present for
+    // up to an hour. Leaving the file for the sweep to find is strictly
+    // safer than trying to delete it eagerly and getting the ownership
+    // check wrong.
 }
 
 /// What the `accept()` loop in [`run`] should do after a failed accept,
@@ -500,9 +507,15 @@ mod tests {
         assert_eq!(next_message(&mut ctl_messages).await, isekai_protocol::CtlMessage::SetTabColor { r: 0x20, g: 0x20, b: 0x20 });
 
         // No further events at all — the 300ms idle-exit fires and the
-        // daemon task completes on its own, having unlinked its socket.
+        // daemon task completes on its own.
         tokio::time::timeout(Duration::from_secs(2), daemon).await.expect("daemon did not self-exit in time").unwrap();
-        assert!(!hookd_sock_path.exists(), "daemon must unlink its own socket on graceful self-exit");
+        // Deliberately *not* unlinked (crash-focused review, 2026-07-31): see
+        // the comment at the end of `run` for why eager unlink here used to
+        // race a successor daemon's live socket. Reclaiming a self-exited
+        // daemon's dead socket file is the sweep's job, pinned separately by
+        // `a_self_exiting_daemon_leaves_its_socket_for_the_sweep_instead_of_
+        // unlinking_it` below.
+        assert!(hookd_sock_path.exists(), "graceful self-exit must not unlink its own socket file");
     }
 
     #[tokio::test]
@@ -711,5 +724,56 @@ mod tests {
         // `EVENT_READ_TIMEOUT`, `read_one_event` would await forever.
         let (_silent_peer, reader) = UnixStream::pair().unwrap();
         assert_eq!(read_one_event(reader).await, None);
+    }
+
+    /// Pins the fix for the idle-exit socket-unlink race (crash-focused
+    /// review, 2026-07-31): a gracefully self-exiting daemon must leave its
+    /// socket file in place for `sweep_stale_ctl_sockets_on_remote` to
+    /// reclaim, not `remove_file` it itself — see the long comment at the
+    /// end of `run` for why eager unlink here used to be able to delete a
+    /// *successor* daemon's live socket. Uses the real
+    /// `isekai-pipe-ctl-hookd-*.sock` naming convention so this also pins
+    /// that the sweep (`isekai_pipe_core::sweep_stale_sockets` with the same
+    /// `isekai-pipe-ctl-` prefix `crate::ctl` uses) is actually able to find
+    /// and remove what `run` leaves behind.
+    #[tokio::test]
+    async fn a_self_exiting_daemon_leaves_its_socket_for_the_sweep_instead_of_unlinking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hookd_sock_path = dir.path().join("isekai-pipe-ctl-hookd-test0123456789abcdef.sock");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run(DaemonConfig {
+                sock_path: hookd_sock_path.clone(),
+                ctl_sock_path: dir.path().join("ctl.sock"),
+                idle_color: (0, 0, 0),
+                attention_color: (0, 0, 0),
+                attention_timeout: Duration::from_millis(50),
+                idle_exit: Duration::from_millis(50),
+            }),
+        )
+        .await
+        .expect("daemon did not self-exit in time");
+
+        assert!(hookd_sock_path.exists(), "self-exit must not unlink its own socket file");
+
+        // `run`'s `accept_task.abort()` only *schedules* cancellation (Opus
+        // review, 2026-07-31) — the listener fd `is_abandoned`'s `connect()`
+        // probes against doesn't actually close until the runtime drops that
+        // task, which hasn't necessarily happened yet just because `run`
+        // itself already returned. Poll until a probe connect genuinely fails
+        // (backlog-accepting a still-live listener would otherwise make the
+        // sweep see it as not abandoned and skip it) before asking the sweep
+        // to look.
+        for _ in 0..200 {
+            if std::os::unix::net::UnixStream::connect(&hookd_sock_path).is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let removed = isekai_pipe_core::sweep_stale_sockets(dir.path(), "isekai-pipe-ctl-", Duration::from_secs(24 * 60 * 60))
+            .expect("sweep must not fail on a plain tempdir");
+        assert_eq!(removed, vec![hookd_sock_path], "the sweep must be the one to reclaim it");
     }
 }
