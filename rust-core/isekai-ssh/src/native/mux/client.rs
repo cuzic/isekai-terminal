@@ -28,6 +28,27 @@ use super::protocol::{spawn_frame_reader, write_frame, Frame, MUX_PROTOCOL_VERSI
 /// gets a chance to die cleanly at all.
 const BUILD_ABORT_WAIT: Duration = Duration::from_secs(2);
 
+/// How long [`run_inner`] waits for the owner's `HelloAck`/`Rejected` after
+/// sending `Hello`, before giving up on this owner connection entirely
+/// (crash-focused review, 2026-07-31; the symmetric counterpart to the
+/// owner side's own `HELLO_READ_TIMEOUT` in `super::owner`). Without this, an
+/// owner that accepted the pipe connection but then stalls before answering
+/// (e.g. its own `open_channel`/`streamlocal_forward` round trip is stuck on
+/// a dead SSH link) hangs this foreground tab forever — with no fallback,
+/// this is a direct `always-connects.md` violation, worse than the owner
+/// side's holder-process zombification, since a human is waiting on it.
+/// Deliberately more generous than the owner side's 10s: the owner's own
+/// handshake work here (`open_channel`/`ctl_forward::request` over a real,
+/// possibly slow SSH link) is exactly the kind of operation that can
+/// legitimately take several seconds, where the owner side's `Hello` read is
+/// pure local IPC with no such excuse. Times out to
+/// [`ClientOutcome::Rejected`], not [`ClientOutcome::OwnerLost`] — nothing
+/// was ever established here (same reasoning as the existing "owner
+/// connection dropped during the handshake" arm just below), so the caller
+/// must be free to fall back to an unmultiplexed direct connect rather than
+/// treat this as fatal.
+const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How a client session ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ClientOutcome {
@@ -158,16 +179,16 @@ where
 
     let mut frame_rx = spawn_frame_reader(conn_read);
 
-    match frame_rx.recv().await {
-        Some(Ok(Some(Frame::HelloAck { version }))) => {
+    match tokio::time::timeout(HELLO_ACK_TIMEOUT, frame_rx.recv()).await {
+        Ok(Some(Ok(Some(Frame::HelloAck { version })))) => {
             if version != MUX_PROTOCOL_VERSION {
                 return Ok(ClientOutcome::Rejected {
                     reason: format!("owner speaks mux protocol version {version}, we speak {MUX_PROTOCOL_VERSION}"),
                 });
             }
         }
-        Some(Ok(Some(Frame::Rejected { reason }))) => return Ok(ClientOutcome::Rejected { reason }),
-        Some(Ok(Some(other))) => {
+        Ok(Some(Ok(Some(Frame::Rejected { reason })))) => return Ok(ClientOutcome::Rejected { reason }),
+        Ok(Some(Ok(Some(other)))) => {
             return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
         }
         // The owner connection dropped *during the handshake* — before any
@@ -181,9 +202,15 @@ where
         // e.g. a passphrase/keyboard-interactive prompt it can't answer) when
         // this tab's `try_claim`-losing connect races ahead of it — that must
         // degrade to an ordinary direct connect, not a scary "owner lost" exit.
-        Some(Ok(None)) | Some(Err(_)) | None => {
+        Ok(Some(Ok(None))) | Ok(Some(Err(_))) | Ok(None) => {
             return Ok(ClientOutcome::Rejected { reason: "the owner connection was lost during the handshake".to_string() })
         }
+        // The owner accepted the connection but never answered at all
+        // (crash-focused review, 2026-07-31, see `HELLO_ACK_TIMEOUT`) — same
+        // `Rejected` classification as the drop case just above, for the
+        // same reason: nothing was ever established, so falling back to a
+        // direct connect is always safe.
+        Err(_) => return Ok(ClientOutcome::Rejected { reason: format!("no response from the owner within {HELLO_ACK_TIMEOUT:?}") }),
     }
 
     let mut buf = [0u8; 8192];
@@ -449,6 +476,41 @@ mod tests {
         .await;
 
         assert_eq!(outcome.unwrap(), ClientOutcome::OwnerLost, "an owner that drops without Exit must be OwnerLost");
+    }
+
+    /// Pins the fix for the HelloAck-wait hang (crash-focused review,
+    /// 2026-07-31): an owner that accepts the connection, reads the Hello,
+    /// and then never answers at all (not even a drop) must not hang this
+    /// foreground tab forever — `HELLO_ACK_TIMEOUT` must give up and classify
+    /// it the same safe-to-fall-back-to-direct-connect way as an outright
+    /// drop, not `OwnerLost`. Drives `run_inner` directly (not through
+    /// `drive_client`, which offers no hook to pause/advance the clock
+    /// mid-flight) via `tokio::join!` rather than `tokio::spawn` — `run_inner`
+    /// borrows its writer/stdout/stderr, which `spawn`'s `'static` bound
+    /// can't accept, but `join!` polls both futures concurrently within this
+    /// same task without requiring that.
+    #[tokio::test]
+    async fn client_times_out_and_treats_a_silent_owner_as_rejected_not_owner_lost() {
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let _owner_task = tokio::spawn(async move {
+            let (mut r, _w) = tokio::io::split(owner_conn);
+            let _ = read_frame(&mut r).await; // consumes Hello, then never answers or drops
+            std::future::pending::<()>().await;
+        });
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        tokio::time::pause();
+        let (outcome, ()) = tokio::join!(
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true),
+            tokio::time::advance(HELLO_ACK_TIMEOUT + Duration::from_secs(1)),
+        );
+
+        match outcome.unwrap() {
+            ClientOutcome::Rejected { .. } => {}
+            other => panic!("a silent owner past HELLO_ACK_TIMEOUT must be Rejected (safe to fall back), got {other:?}"),
+        }
     }
 
     /// A `Ctl` frame (relayed `#@isekai ctl-socket` message) is decoded and

@@ -57,6 +57,19 @@ const WARMUP_GRACE: Duration = Duration::from_secs(30);
 /// another to the same host.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
+/// How long [`relay_client`] waits for a connected client to send its
+/// [`Frame::Hello`] before giving up on it (crash-focused review,
+/// 2026-07-31). Without this, a peer that connects to the named pipe and
+/// never sends anything holds this client slot — and the authenticated SSH
+/// connection behind it — forever, since nothing else in this file ever
+/// times out an unread `Hello`. Set equal to `mod.rs`'s `HOLDER_STARTUP_TIMEOUT`
+/// value for consistency with this crate's one existing "local IPC handshake
+/// budget" constant, and *not* shorter: a well-behaved client's own
+/// `read_owner_token` (`mod.rs`) retries for up to 2s after connecting and
+/// before it ever writes `Hello`, so anything close to that leaves too
+/// little headroom under load. 10s gives 5x that legitimate worst case.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Accepts clients on `channel` until either `accept` itself fails (the
 /// underlying IPC channel died — a genuine local-pipe infrastructure
 /// problem), or the client count drops to (and stays at) zero for the
@@ -203,8 +216,16 @@ where
 {
     let (mut reader, mut writer) = tokio::io::split(conn);
 
-    let hello = read_frame(&mut reader)
+    // `read_frame` is not cancel-safe (see its own doc comment: don't use it
+    // in a `select!` arm) — that's fine here because on timeout this whole
+    // connection is discarded rather than resumed, so losing whatever partial
+    // bytes were mid-read is not observable. Bounded by `HELLO_READ_TIMEOUT`
+    // (crash-focused review, 2026-07-31): a peer that connects and never
+    // sends `Hello` must not hold this client slot — and the shared
+    // authenticated SSH connection behind it — forever.
+    let hello = tokio::time::timeout(HELLO_READ_TIMEOUT, read_frame(&mut reader))
         .await
+        .map_err(|_| anyhow!("isekai-ssh mux owner: no Hello within {HELLO_READ_TIMEOUT:?}; dropping the connection"))?
         .context("isekai-ssh mux owner: reading the client Hello failed")?
         .ok_or_else(|| anyhow!("isekai-ssh mux owner: client closed before sending Hello"))?;
 
@@ -799,6 +820,46 @@ mod tests {
         serve_task.abort();
     }
 
+    /// End-to-end companion to `relay_client_times_out_a_peer_that_never_
+    /// sends_hello`: a client that connects to the real accept loop and then
+    /// sends nothing at all must not prevent `serve_clients` from eventually
+    /// idle-exiting — first `HELLO_READ_TIMEOUT` gives up on that one client
+    /// (decrementing `active_clients` back to zero), then `IDLE_GRACE`
+    /// elapses with nobody else connected.
+    #[tokio::test]
+    async fn serve_clients_exits_after_a_silent_client_times_out_and_the_idle_grace_elapses() {
+        let name = "isekai-ssh-mux-hello-timeout-then-idle-exit-test";
+        let token = Arc::new(b"tok".to_vec());
+        let handle = Arc::new(Mutex::new(authed_test_handle().await));
+
+        let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
+
+        // Connects but never sends anything — held alive by `_conn` so the
+        // owner's `accept()` sees a genuine open connection, not a dropped
+        // one. No real SSH activity happens for this client (it never gets
+        // past the Hello read), so unlike the other `serve_clients` tests
+        // above there is no round trip that needs real time to complete
+        // first.
+        let _conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::pause();
+        tokio::time::advance(HELLO_READ_TIMEOUT + Duration::from_secs(1)).await;
+        // Let the per-client task's `fetch_sub`/`notify_one` (spawned in
+        // response to the timeout above) actually run before advancing
+        // further — the idle-exit wait only re-checks on notification, so
+        // if the count-changed signal from *this* client's departure hasn't
+        // landed yet, advancing straight to `IDLE_GRACE` could jump past a
+        // still-nonzero count without ever re-checking it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_GRACE + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+        assert!(result.is_ok(), "serve_clients must exit once the silent client's Hello timeout and then the idle grace both elapse, not hang forever");
+        assert!(result.unwrap().unwrap().is_ok(), "an idle-exit is a clean Ok(()), not an error");
+    }
+
     /// A mock sshd whose shell echoes back a fixed banner plus whatever stdin
     /// bytes it receives, so an owner→client relay test can prove real remote
     /// stdout flows back through an independent channel. Modeled on
@@ -1081,6 +1142,38 @@ mod tests {
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");
+    }
+
+    /// Pins the fix for the Hello-read hang (crash-focused review,
+    /// 2026-07-31): a client that connects and then sends nothing at all —
+    /// not even a malformed frame — must not hold this slot (and the shared
+    /// authenticated connection behind it) forever. `handle`'s own real SSH
+    /// handshake runs to completion under real time first (same caution as
+    /// `authed_test_handle`'s doc comment); only the wait for
+    /// `HELLO_READ_TIMEOUT` itself, which is pure local I/O on `owner_side`,
+    /// is under the paused clock.
+    #[tokio::test]
+    async fn relay_client_times_out_a_peer_that_never_sends_hello() {
+        let addr = spawn_echo_server(125).await;
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (_client, owner_side) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        // `tokio::spawn` doesn't poll the task inline, and `tokio::time::advance`
+        // moves the clock *before* its own internal yield (Opus review,
+        // 2026-07-31) — without this yield, `relay`'s `timeout(HELLO_READ_TIMEOUT, ..)`
+        // would only register *after* the clock has already jumped, pushing its
+        // deadline a full `HELLO_READ_TIMEOUT` further out than intended and
+        // making the outer guard below fire first instead.
+        tokio::task::yield_now().await;
+
+        tokio::time::pause();
+        tokio::time::advance(HELLO_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(HELLO_READ_TIMEOUT * 3, relay).await;
+        assert!(result.is_ok(), "relay_client must give up once HELLO_READ_TIMEOUT elapses, not hang forever");
+        assert!(result.unwrap().unwrap().is_err(), "a Hello timeout must be a clean Err, not a hang");
     }
 
     /// A mock sshd that, when a client's per-tab `streamlocal_forward` is

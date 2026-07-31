@@ -561,6 +561,28 @@ mod tests {
         assert_eq!(all_rows.len(), 3);
     }
 
+    /// クラッシュ観点レビュー(2026-07-31)で見つかったバグのpin: 1回の
+    /// `on_stdout`呼び出し(=stdoutチャネルに溜まった全バイトを処理し切る
+    /// 「1バッチ」)の中でREPを連投しても、`pending_rows`(`Terminal::
+    /// pending_scrollback`をそのまま返したもの)は際限なく成長しない。
+    /// `session.rs`側の`SCROLLBACK_LIMIT`トリミングは`on_stdout`が返って
+    /// きた**後**にしか効かないため、`Terminal`側で随時トリミングされて
+    /// いることをこの層で確認する。
+    #[test]
+    fn test_huge_single_batch_keeps_pending_rows_capped() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let mut bytes = b"x".to_vec();
+        for _ in 0..100 {
+            bytes.extend_from_slice(b"\x1b[65535b");
+        }
+        let r = state.on_stdout(bytes); // a single batch, no take_scrollback() in between
+        assert!(
+            r.pending_rows.len() <= 2 * crate::session::SCROLLBACK_LIMIT,
+            "pending_rows from a single oversized batch must be capped, got {} rows",
+            r.pending_rows.len()
+        );
+    }
+
     #[test]
     fn set_title_from_ctl_reflects_in_terminal_title_and_marks_screen_dirty() {
         let mut state = SessionState::new(80, 24, Theme::default());

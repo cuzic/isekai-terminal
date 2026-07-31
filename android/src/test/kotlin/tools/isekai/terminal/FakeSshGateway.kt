@@ -125,7 +125,17 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszCancel() { trzszCancelCount++ }
     override fun notifyError(message: String) {}
     override fun forceReturnToWifi() { forceReturnToWifiCallCount++ }
-    override fun notifyUpstreamHealthDegraded() { notifyUpstreamHealthDegradedCallCount++ }
+    // クラッシュ観点レビュー(2026-07-31)で追加: `TerminalTabsViewModel`の
+    // `forwardToRust`(OSコールバックスレッド→UniFFI境界の防御的catch)が
+    // 実際に例外を握り潰すことをテストできるよう、本番のUniFFI生成
+    // バインディングが投げ得る`InternalException`/`IllegalStateException`
+    // (握り潰す側は`Exception`全般をcatchするので、テストではどちらでも
+    // 代表できる)をここから注入できるようにする。
+    var notifyUpstreamHealthDegradedError: Throwable? = null
+    override fun notifyUpstreamHealthDegraded() {
+        notifyUpstreamHealthDegradedCallCount++
+        notifyUpstreamHealthDegradedError?.let { throw it }
+    }
 
     override fun isQuic(): Boolean = quic
 
@@ -137,8 +147,14 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     // isSatisfied=true は切断判断には寄与しないが、呼び出し自体がこのペインまで届いたことは
     // notifyNetworkPathChangedCalls で検証できるようにする。
     val notifyNetworkPathChangedCalls = mutableListOf<Boolean>()
+    // クラッシュ観点レビュー(2026-07-31): `notifyUpstreamHealthDegradedError`と
+    // 同じ目的の注入フック。fan-out(`onNetworkPathChanged`が全ペインへ配信)の
+    // 途中で1ペインが例外を投げても、他のペインへの配信が止まらないことを
+    // 検証するために使う。
+    var notifyNetworkPathChangedError: Throwable? = null
     override fun notifyNetworkPathChanged(isSatisfied: Boolean) {
         notifyNetworkPathChangedCalls.add(isSatisfied)
+        notifyNetworkPathChangedError?.let { throw it }
         if (isSatisfied) return
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {

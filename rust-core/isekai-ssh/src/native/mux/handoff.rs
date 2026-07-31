@@ -160,10 +160,34 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<HandoffCredentials> {
     }
     let mut cursor = bytes;
     let count = read_u32(&mut cursor)?;
-    let mut resolved = HashMap::with_capacity(count as usize);
+    // No `with_capacity(count as usize)` here (crash-focused review,
+    // 2026-07-31): `count` is an attacker-adjacent-in-spirit u32 read
+    // straight off the wire before any other validation, and the number of
+    // real entries is tiny (0-3 identity candidates in practice, see
+    // `resolve_handoff_credentials`) — a hint sized off `count` buys
+    // nothing and a bogus `count` (this module's own stdin-only channel is
+    // self-inflicted-only, but still) would otherwise try to reserve up to
+    // ~4 billion buckets before the loop's own `read_bytes` bounds checks
+    // ever get a chance to reject it. `HashMap::new()` grows only as far as
+    // entries actually parsed.
+    let mut resolved = HashMap::new();
     for _ in 0..count {
         let path_bytes = read_bytes(&mut cursor)?;
-        let path = PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(path_bytes.to_vec()) });
+        // Not `OsString::from_encoded_bytes_unchecked` (crash-focused
+        // review, 2026-07-31): that call's safety contract requires the
+        // bytes to have come from a prior `as_encoded_bytes()`, which on
+        // Windows means well-formed WTF-8 — a guarantee arbitrary bytes
+        // read off a pipe don't satisfy, making it real undefined behavior
+        // (not just a panic) for a malformed payload. `str::from_utf8`
+        // rejects anything that isn't valid UTF-8 with a clean `Err`
+        // instead; the cost is that a non-UTF-8 path can no longer round-
+        // trip through the hand-off — since this `?` fails `decode` as a
+        // whole (not just this one entry), that means *every* candidate in
+        // this payload falls back to the ordinary on-disk path this
+        // module's docs already describe as the fallback for anything
+        // hand-off can't cover, the same all-or-nothing degradation a
+        // truncated/malformed payload already causes.
+        let path = PathBuf::from(std::str::from_utf8(path_bytes).map_err(|_| anyhow!("isekai-ssh: malformed handoff payload (candidate path is not valid UTF-8)"))?);
         let private_key_pem = Zeroizing::new(read_bytes(&mut cursor)?.to_vec());
         let has_cert = *cursor.first().ok_or_else(|| anyhow!("isekai-ssh: truncated handoff payload (missing certificate flag)"))?;
         cursor = &cursor[1..];
@@ -376,5 +400,31 @@ mod tests {
         let encoded = encode(&HandoffCredentials(resolved));
         let truncated = &encoded[..encoded.len() - 3];
         assert!(decode(truncated).is_err(), "a truncated payload must be a clean Err, never a panic");
+    }
+
+    /// Pins the fix for the unbounded-allocation bug (crash-focused review,
+    /// 2026-07-31): before, `count` fed straight into
+    /// `HashMap::with_capacity(count as usize)` with no validation, so this
+    /// input used to try to reserve capacity for ~4 billion entries and
+    /// abort the process instead of returning `Err`. Only the 4-byte count
+    /// is supplied — the payload is truncated immediately after — so a pass
+    /// here that returns `Err` instead of aborting is the whole test.
+    #[test]
+    fn decode_rejects_an_absurd_entry_count_without_trying_to_allocate_for_it() {
+        assert!(decode(&u32::MAX.to_be_bytes()).is_err());
+    }
+
+    /// Companion to the malformed-count fix above, on the path side: a
+    /// `from_encoded_bytes_unchecked` call used to accept literally any
+    /// bytes as a path (that was the point being fixed — no validation at
+    /// all), so this input would have round-tripped instead of erroring.
+    #[test]
+    fn decode_rejects_a_non_utf8_candidate_path_instead_of_invoking_ub() {
+        let mut buf = Vec::new();
+        write_u32(&mut buf, 1); // one entry
+        write_bytes(&mut buf, &[0xff, 0xfe]); // not valid UTF-8
+        write_bytes(&mut buf, b"key"); // private_key_pem
+        buf.push(0); // no certificate
+        assert!(decode(&buf).is_err(), "a non-UTF-8 candidate path must be a clean Err, never UB");
     }
 }
