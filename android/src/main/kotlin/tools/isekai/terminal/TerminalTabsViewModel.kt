@@ -525,7 +525,9 @@ class TerminalTabsViewModel(
 
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onNetworkPathChanged(isSatisfied: Boolean) {
-        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
+        _tabs.value.flatMap { it.panes }.forEach { pane ->
+            forwardToRust("notifyNetworkPathChanged") { pane.session.notifyNetworkPathChanged(isSatisfied) }
+        }
     }
 
     // ── アプリ全体のフォアグラウンド/バックグラウンド（全タブへファンアウト）──────
@@ -538,13 +540,17 @@ class TerminalTabsViewModel(
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onAppBackgrounded() {
         appInForeground = false
-        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyDidEnterBackground() }
+        _tabs.value.flatMap { it.panes }.forEach { pane ->
+            forwardToRust("notifyDidEnterBackground") { pane.session.notifyDidEnterBackground() }
+        }
     }
 
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onAppForegrounded() {
         appInForeground = true
-        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyWillEnterForeground() }
+        _tabs.value.flatMap { it.panes }.forEach { pane ->
+            forwardToRust("notifyWillEnterForeground") { pane.session.notifyWillEnterForeground() }
+        }
     }
 
     // ── タブのライフサイクル ────────────────────────────────────────
@@ -822,7 +828,29 @@ class TerminalTabsViewModel(
      * 「判断ロジックを一箇所に集約」原則通り、Kotlin側では分岐しない)。
      */
     private fun onWifiUpstreamBroken(pane: PaneState) {
-        pane.session.notifyUpstreamHealthDegraded()
+        forwardToRust("notifyUpstreamHealthDegraded") { pane.session.notifyUpstreamHealthDegraded() }
+    }
+
+    /**
+     * OSからの生イベント転送(ConnectivityManagerコールバックスレッド・
+     * ProcessLifecycleOwnerのメインルーパー経由)専用の防御的ラッパー
+     * (クラッシュ観点レビュー、2026-07-31)。転送先のUniFFIメソッドは宣言上
+     * 例外を投げない設計だが、生成バインディングは実際には`InternalException`
+     * (Rust panic由来)や`IllegalStateException`(destroyed handle)を投げ得る。
+     * これらのイベントは取りこぼしても致命的ではなく(例えば
+     * [onWifiUpstreamBroken]はRust側の`RebindManager`が`NoViablePath`検知で
+     * 冗長にカバーする、そのdocコメント参照)、OSコールバックスレッド上の
+     * 未捕捉例外によるアプリクラッシュを防ぐ方が優先度が高いため、ログだけ
+     * 残して握り潰す。ユーザー操作起因の呼び出し(`send`/`resize`等)には
+     * 意図的に使わない——バグを隠す方向に広げないため、対象はOS生イベントの
+     * 転送に限定する。
+     */
+    private inline fun forwardToRust(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            RemoteLogger.w("IsekaiTerminalTabsVM", "forwardToRust($what) failed, dropping this event", e)
+        }
     }
 
     // ── 接続 ─────────────────────────────────────────────────────────

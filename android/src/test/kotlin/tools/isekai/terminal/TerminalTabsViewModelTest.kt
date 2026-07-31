@@ -29,6 +29,7 @@ import tools.isekai.terminal.session.ReattachRecord
 import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.TerminalSession
 import uniffi.isekai_terminal_core.CursorShape
+import uniffi.isekai_terminal_core.InternalException
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.PanelKind
@@ -498,6 +499,41 @@ class TerminalTabsViewModelTest {
 
         assertTrue("切断したタブのupstream監視handleだけ閉じるべき", executor.upstreamFailoverHandles[0].closed)
         assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
+    }
+
+    /** クラッシュ観点レビュー(2026-07-31): `ConnectivityManager`コールバックスレッドから
+     *  同期的に呼ばれる`notifyUpstreamHealthDegraded`が(本番の生成バインディングが実際
+     *  投げ得る)`InternalException`を投げても、`TerminalTabsViewModel.forwardToRust`が
+     *  握り潰し、呼び出し元(このテストでは[DumbAppExecutor.simulateWifiUpstreamBroken])
+     *  まで伝播しないことを確認する。伝播していれば、この`ConnectivityManager`コールバック
+     *  スレッド相当の呼び出し自体がテスト側で例外として観測され、テストが失敗する。 */
+    @Test
+    fun onWifiUpstreamBroken_whenRustThrows_doesNotPropagateToTheCaller() = runBlocking {
+        vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+        orchestrators[0].notifyUpstreamHealthDegradedError = InternalException("boom")
+
+        executor.simulateWifiUpstreamBroken() // must not throw
+
+        assertEquals(1, orchestrators[0].notifyUpstreamHealthDegradedCallCount)
+    }
+
+    /** クラッシュ観点レビュー(2026-07-31): [TerminalTabsViewModel.onNetworkPathChanged]の
+     *  全ペインへのfan-outは、`forEach`の**内側**で例外を握り潰すため、先に処理される
+     *  ペインが例外を投げても後続のペインへの配信が止まらない(この防御が無いと1ペインの
+     *  失敗で残り全ペインへの生イベント転送が欠落する)。 */
+    @Test
+    fun onNetworkPathChanged_whenOnePaneThrows_stillDeliversToOtherPanes() = runBlocking {
+        vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[0].notifyNetworkPathChangedError = InternalException("boom")
+
+        vm.onNetworkPathChanged(true) // must not throw, and must still reach pane b
+
+        assertEquals(listOf(true), orchestrators[0].notifyNetworkPathChangedCalls)
+        assertEquals(listOf(true), orchestrators[1].notifyNetworkPathChangedCalls)
     }
 
     @Test
