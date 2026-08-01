@@ -18,6 +18,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.data.SnippetTemplate
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -34,11 +35,17 @@ class SnippetListScreenTest {
 
     private fun setScreen(
         onAddSnippet: () -> Unit = {},
+        onAddFromTemplate: (SnippetTemplate) -> Unit = {},
         onEditSnippet: (Snippet) -> Unit = {},
         onBack: () -> Unit = {},
     ) {
         composeTestRule.setContent {
-            SnippetListScreen(onAddSnippet = onAddSnippet, onEditSnippet = onEditSnippet, onBack = onBack)
+            SnippetListScreen(
+                onAddSnippet = onAddSnippet,
+                onAddFromTemplate = onAddFromTemplate,
+                onEditSnippet = onEditSnippet,
+                onBack = onBack,
+            )
         }
         composeTestRule.waitForIdle()
     }
@@ -143,5 +150,25 @@ class SnippetListScreenTest {
         composeTestRule.onNodeWithText("戻る").performClick()
         composeTestRule.waitForIdle()
         assertTrue(backClicked)
+    }
+
+    @Test fun templateButton_showsTemplatePicker() {
+        setScreen()
+        composeTestRule.onNodeWithText("テンプレート").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("tmuxセッション選択").assertExists()
+    }
+
+    @Test fun pickingTemplate_invokesOnAddFromTemplate_andClosesPicker() {
+        var picked: SnippetTemplate? = null
+        setScreen(onAddFromTemplate = { picked = it })
+        composeTestRule.onNodeWithText("テンプレート").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("tmuxセッション選択").performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals("tmuxセッション選択", picked?.label)
+        composeTestRule.onNodeWithText("テンプレートから追加").assertDoesNotExist()
     }
 }
