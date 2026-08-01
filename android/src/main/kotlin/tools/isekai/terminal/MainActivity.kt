@@ -20,6 +20,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
@@ -263,6 +264,15 @@ fun AppRoot() {
             SnippetListScreen(
                 onAddSnippet = {
                     navVm.pendingEditSnippet = null
+                    navController.navigate(AppRoutes.SNIPPET_EDIT)
+                },
+                onAddFromTemplate = { template ->
+                    navVm.pendingEditSnippet = Snippet(
+                        id = 0,
+                        label = template.label,
+                        command = template.command,
+                        appendNewline = template.appendNewline,
+                    )
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onEditSnippet = { snippet ->

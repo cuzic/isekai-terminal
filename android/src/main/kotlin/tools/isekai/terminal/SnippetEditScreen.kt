@@ -68,7 +68,7 @@ fun SnippetEditScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(
-            text = if (snippet == null) "定型コマンド追加" else "定型コマンド編集",
+            text = if (snippet == null || snippet.id == 0L) "定型コマンド追加" else "定型コマンド編集",
             fontWeight = FontWeight.Bold,
             fontSize = 20.sp,
         )
