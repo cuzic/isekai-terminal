@@ -455,7 +455,13 @@ async fn send_build_finished(
 /// Shared by the Unix `ssh(1)` path and the Windows-native mux client/owner
 /// paths (`native/mux`).
 ///
-/// - `SetTitle` → OSC 0 (icon name + window title).
+/// - `SetTitle` → OSC 0 (icon name + window title). Passed through
+///   [`strip_ascii_control_chars`] first, same reasoning as `Notify` below
+///   (fixed 2026-08: this arm used to embed `value` verbatim, so a remote
+///   host that could reach the ctl socket could smuggle an ESC/BEL inside
+///   the title to terminate the OSC 0 sequence early and inject arbitrary
+///   escape sequences — e.g. a spoofed OSC 52 clipboard write — into the
+///   user's real terminal).
 /// - `Notify`: 2つの独立した系統を1つのワイヤーメッセージが共有する
 ///   (`isekai_protocol::ctl::NotifyKind`のdocコメント参照)ため、kindで分岐する:
 ///   - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md` §6.1)
@@ -499,7 +505,7 @@ async fn send_build_finished(
 ///   OSC-emitting path every other variant goes through.
 pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     match msg {
-        CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
+        CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{}\x07", strip_ascii_control_chars(value))),
         CtlMessage::Notify { kind, title, body, .. } => match kind {
             NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
                 let title = strip_ascii_control_chars(title);
@@ -650,6 +656,21 @@ mod tests {
     fn osc_sequence_for_set_title_is_osc_0() {
         let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
+    }
+
+    /// Regression test for the OSC injection this sanitization closes
+    /// (2026-08): a title containing `ESC`/`BEL` could otherwise terminate
+    /// the intended `OSC 0 ... BEL` sequence early and splice an attacker-
+    /// or hook-controlled escape sequence (here, a spoofed OSC 52 clipboard
+    /// write) into the user's real terminal. Mirrors
+    /// `osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body`.
+    #[test]
+    fn osc_sequence_for_set_title_strips_esc_and_bel() {
+        let seq = osc_sequence_for(&CtlMessage::SetTitle {
+            value: "hi\x1b]52;c;cHduZWQ=\x07pwned".to_string(),
+        })
+        .unwrap();
+        assert_eq!(seq, "\x1b]0;hi]52;c;cHduZWQ=pwned\x07");
     }
 
     #[test]
