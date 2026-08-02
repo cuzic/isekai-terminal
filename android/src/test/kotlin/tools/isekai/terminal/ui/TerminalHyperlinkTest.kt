@@ -27,7 +27,7 @@ class TerminalHyperlinkTest {
         cells = cells,
         cursorRow = 0u,
         cursorCol = 0u,
-        title = null,
+        title = null, tabColor = null,
         applicationCursorMode = false,
         applicationKeypadMode = false,
         bracketedPasteMode = false,
@@ -51,8 +51,7 @@ class TerminalHyperlinkTest {
         linkTable = linkTable,
         images = emptyList(),
         kittyKeyboardFlags = 0u,
-        dirtyRows = null,
-    )
+        dirtyRows = null)
 
     // ── linkUrlAtCell ────────────────────────────────────────────────
 

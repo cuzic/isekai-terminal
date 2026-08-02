@@ -118,10 +118,9 @@ class SshTerminalCanvasTest {
     }
 
     private fun screenUpdate() = ScreenUpdate(
-        0u, 80u, 24u, emptyList(), 0u, 0u, null, false, false, false,
+        0u, 80u, 24u, emptyList(), 0u, 0u, null, null, false, false, false,
         MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(),
-        emptyList(), 0u, null,
-    )
+        emptyList(), 0u, null)
 
     // ── computeCursorRect: DECSCUSR(タスク#33)のblock/underline/bar描画分岐 ──────
 

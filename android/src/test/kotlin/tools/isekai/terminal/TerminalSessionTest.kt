@@ -65,12 +65,11 @@ class TerminalSessionTest {
     /** #25: `bellGeneration`だけを可変にした最小の`ScreenUpdate`。他フィールドは
      *  既存テストと同じ最小値で埋める。 */
     private fun bellUpdate(bellGeneration: ULong, cursorCol: UInt = 0u) = ScreenUpdate(
-        0u, 80u, 24u, emptyList(), 0u, cursorCol, "title", false, false, false,
+        0u, 80u, 24u, emptyList(), 0u, cursorCol, "title", null, false, false, false,
         MouseReportingMode.OFF, false, false, false, true, bellGeneration,
         0uL, NotifyKind.INFO, "", "",
         0uL, PanelKind.NONE, "", "", emptyList(),
-        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
-    )
+        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
 
     /** [bellUpdate]と同じ最小`ScreenUpdate`だが、`AI_INTEGRATION_DESIGN.md` §6.2の
      *  パネル系フィールドだけを可変にする。 */
@@ -81,12 +80,11 @@ class TerminalSessionTest {
         panelMarkdown: String = "m",
         panelFields: List<PanelField> = emptyList(),
     ) = ScreenUpdate(
-        0u, 80u, 24u, emptyList(), 0u, 0u, "title", false, false, false,
+        0u, 80u, 24u, emptyList(), 0u, 0u, "title", null, false, false, false,
         MouseReportingMode.OFF, false, false, false, true, 0uL,
         0uL, NotifyKind.INFO, "", "",
         panelGeneration, panelKind, panelTitle, panelMarkdown, panelFields,
-        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null,
-    )
+        CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
 
     // ── 初期状態 ──────────────────────────────────────────────────
 
@@ -401,7 +399,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
         assertEquals("title1", session.state.value.screenUpdate?.title)
@@ -413,9 +411,9 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
-        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update1 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "title1", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update2 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "title2", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update3 = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 10u, "title3", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
 
         fakeOrchestrator.simulateScreenUpdate(update1)
         fakeOrchestrator.simulateScreenUpdate(update2)
@@ -431,7 +429,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "before-disconnect", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
 
@@ -440,7 +438,7 @@ class TerminalSessionTest {
         assertNull("screenUpdate should be cleared on disconnect", session.state.value.screenUpdate)
 
         // 切断後に simulateScreenUpdate が来ても無視される
-        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        val staleUpdate = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 5u, "after-disconnect", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
@@ -454,7 +452,7 @@ class TerminalSessionTest {
 
         repeat(50) { i ->
             fakeOrchestrator.simulateScreenUpdate(
-                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+                ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
             )
         }
 

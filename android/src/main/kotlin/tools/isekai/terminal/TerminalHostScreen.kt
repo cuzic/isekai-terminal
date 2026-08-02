@@ -204,6 +204,23 @@ private fun TabLabel(
                     },
                 ),
         )
+        // リモートが Windows Terminal 互換の OSC 4;264(または isekai-pipe ctl
+        // tab-color 経由の CtlMessage::SetTabColor)でタブ色を指定していれば、
+        // 接続状態ドットの隣にアクセントドットとして表示する(Rust側 SSOT である
+        // ScreenUpdate.tab_color を直接読むだけで、Kotlin側にミラー状態は作らない)。
+        // タブの背景自体は染めない — claude-hookd の idle 通知色(常時点灯し得る
+        // 具体的な暗色)を背景に使うとタブが常時グレーがかって見え、色の変化に
+        // 意味を読み取りにくくなるため(2026-08 Opusレビュー指摘)。
+        uiState.screenUpdate?.tabColor?.let { tabColor ->
+            Box(
+                modifier = Modifier
+                    .padding(start = 3.dp)
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(Color(red = tabColor.r.toInt(), green = tabColor.g.toInt(), blue = tabColor.b.toInt()))
+                    .testTag("tabColorDot"),
+            )
+        }
         Text(
             // リモートの OSC 0/2 タイトル変更があればそれを優先表示する(セッション/Rust側の
             // ScreenUpdate.title が SSOT)。tmux が横取りして届かない環境や、まだ何も
