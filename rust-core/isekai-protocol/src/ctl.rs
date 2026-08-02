@@ -115,6 +115,35 @@ pub enum VarScope {
     Global,
 }
 
+/// Progress-bar state for `CtlMessage::SetProgress`, matching the
+/// ConEmu-originated `OSC 9;4;<state>;<progress>BEL` convention that
+/// Windows Terminal also implements (tab icon progress ring + taskbar
+/// integration on that platform; a harmless no-op on terminals that don't
+/// recognize OSC 9;4, same "graceful fallback" posture as `SetTabColor`'s
+/// OSC 4;264). Numeric values below are exactly the OSC 9;4 `<state>` wire
+/// values, not an arbitrary internal choice — `isekai-ssh::ctl_forward`
+/// serializes `state as u8` directly into the escape sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ProgressState {
+    /// Clears/hides the progress indicator (OSC 9;4;0；the trailing
+    /// `progress` value is ignored by convention when state is `None`).
+    #[serde(rename = "none")]
+    None = 0,
+    /// Normal progress, `progress` (0-100) is meaningful.
+    #[serde(rename = "normal")]
+    Normal = 1,
+    /// Error state (rendered in red where supported).
+    #[serde(rename = "error")]
+    Error = 2,
+    /// Indeterminate ("busy spinner"), `progress` is ignored.
+    #[serde(rename = "indeterminate")]
+    Indeterminate = 3,
+    /// Warning state (rendered in yellow where supported).
+    #[serde(rename = "warning")]
+    Warning = 4,
+}
+
 /// Which of the build child process's standard streams a `build_output_chunk`
 /// came from, so the receiving `isekai-pipe ctl build` can replay it to its
 /// own matching stream rather than merging stdout/stderr into one.
@@ -277,6 +306,16 @@ pub enum CtlMessage {
     /// forget, same pattern as `SetTitle` — no response is expected or sent.
     #[serde(rename = "tab_color")]
     SetTabColor { r: u8, g: u8, b: u8 },
+    /// host → device: set/clear a progress indicator on the outer real
+    /// terminal via OSC 9;4 (`isekai-ssh ctl_forward::osc_sequence_for`,
+    /// `ProgressState` doc). `progress` is 0-100, meaningful only when
+    /// `state == Normal` (ignored, but still validated as in-range, for the
+    /// other states — see `validate_ctl_message`). Fire-and-forget, same
+    /// pattern as `SetTitle`/`SetTabColor` — no response is expected or
+    /// sent. Intended caller: `isekai-pipe ctl build`, to auto-emit
+    /// progress while a triggered remote build streams output (Epic P).
+    #[serde(rename = "progress")]
+    SetProgress { state: ProgressState, progress: u8 },
     /// host → device: write to the device's clipboard.
     #[serde(rename = "clip_push")]
     ClipboardPush {
@@ -372,6 +411,15 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
         }
         // r/g/b are u8, already bounded to 0..=255 by the type itself.
         CtlMessage::SetTabColor { .. } => Ok(()),
+        CtlMessage::SetProgress { progress, .. } => {
+            if *progress > 100 {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "progress",
+                    reason: "must be 0-100".to_string(),
+                });
+            }
+            Ok(())
+        }
         CtlMessage::ClipboardPush { mime, data_b64 }
         | CtlMessage::ClipboardPullResponse { mime, data_b64 } => {
             validate_clipboard_payload(*mime, data_b64)

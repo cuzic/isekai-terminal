@@ -1082,6 +1082,16 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   **未着手のまま(スコープ外として明示)**: この呼び出し元となるClaude Code
   hook連携(`Notification`/`Stop`での色変更、タイムアウトでの自動リセット)。
   段階的実装として、まずこのプリミティブのみ追加した。
+- ✅(2026-08)`isekai-pipe ctl progress <none|normal|error|indeterminate|warning> [<0-100>]`:
+  `tab-color`と同じfire-and-forgetパターンで`CtlMessage::SetProgress { state, progress }`
+  を追加し、ConEmu由来・Windows Terminalも実装するOSC 9;4(タブアイコンのプログレス
+  リング + タスクバー統合)へマッピングする(`isekai-ssh::ctl_forward::osc_sequence_for`)。
+  `isekai-pipe ctl build`(Epic P)から自動発火する連携を実装済み——ビルド開始時に
+  `Indeterminate`(スピナー)、終了時に成功なら`None`(非表示)・失敗なら`Error`を
+  `run_build`が直接`osc_sequence_for`/`emit_osc`を呼んで送出する(ctlソケット越しの
+  往復は経由しない、`isekai-ssh`自身のプロセス内で完結するため)。Android本体アプリ
+  側は`SetProgress`受信時は現状無視する(`session.rs`)——タブ進捗UIは別タスクとして
+  未着手のまま。
 
 **動機**: リモートの対話シェルが出す OSC 0/2(タイトル変更)・OSC 52(クリップボード)は、
 tmux配下だと既定でtmuxに横取りされ、外側のターミナル(Windows Terminalの`ssh`+`isekai-ssh`

@@ -355,8 +355,16 @@ async fn run_build(
         )
         .await?;
         send_build_finished(write_half, 127, Vec::new()).await?;
+        emit_build_progress_result(false);
         return Ok(());
     };
+
+    // Epic P × 2026-08のOSC 9;4連携: ビルドの成否は事前に分からないので
+    // `Indeterminate`(スピナー)で開始を知らせる。`emit_build_progress_result`と
+    // 対で、doc commentはそちらを参照。
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }) {
+        let _ = emit_osc(&seq);
+    }
 
     let mut child = crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
         .stdout(std::process::Stdio::piped())
@@ -393,6 +401,7 @@ async fn run_build(
         let _ = child.wait().await;
         let _ = stdout_task.await;
         let _ = stderr_task.await;
+        emit_build_progress_result(false);
         bail!("isekai-ssh: ctl connection closed before the build finished; killed the child process");
     }
     let _ = stdout_task.await;
@@ -404,6 +413,7 @@ async fn run_build(
     // `-1` is not a valid process exit code on any platform, so it can't be
     // confused with a real one.
     let exit_code = status.code().unwrap_or(-1);
+    emit_build_progress_result(exit_code == 0);
 
     let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
         (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
@@ -418,6 +428,18 @@ async fn run_build(
     }
     send_build_finished(write_half, exit_code, result_paths).await?;
     Ok(())
+}
+
+/// Clears the OSC 9;4 progress indicator `run_build` set to `Indeterminate`
+/// at the start, replacing it with `Error` on failure (no profile found /
+/// remote disconnected mid-build / non-zero exit) or `None` (hide) on
+/// success. Same best-effort/no-op-on-failure posture as the start signal —
+/// see the call site in `run_build`.
+fn emit_build_progress_result(success: bool) {
+    let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }) {
+        let _ = emit_osc(&seq);
+    }
 }
 
 /// Thin wrappers around `build_exec`'s shared encoders that just add the
@@ -484,6 +506,9 @@ async fn send_build_finished(
 ///   convention for the tab background color (`microsoft/terminal` PR #13058,
 ///   which closed the original feature request #6574).
 ///   A harmless no-op on terminals that don't recognize that index.
+/// - `SetProgress` → OSC 9;4 (`ProgressState` doc), ConEmu-originated
+///   progress-bar convention also implemented by Windows Terminal (tab
+///   icon + taskbar integration there). Harmless no-op elsewhere.
 /// - `ClipboardPush` → OSC 52 clipboard-set. `data_b64` is already the
 ///   base64 encoding OSC 52 itself expects — no re-encoding needed.
 /// - `ClipboardPullRequest` → reading the local system clipboard back
@@ -516,6 +541,9 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => None,
         },
         CtlMessage::SetTabColor { r, g, b } => Some(format!("\x1b]4;264;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")),
+        CtlMessage::SetProgress { state, progress } => {
+            Some(format!("\x1b]9;4;{};{}\x07", *state as u8, progress))
+        }
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {}
         | CtlMessage::ClipboardPullResponse { .. }
@@ -734,6 +762,24 @@ mod tests {
     fn osc_sequence_for_tab_color_is_osc_4_264() {
         let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }).unwrap();
         assert_eq!(seq, "\x1b]4;264;rgb:ff/00/00\x1b\\");
+    }
+
+    #[test]
+    fn osc_sequence_for_progress_is_osc_9_4() {
+        let seq = osc_sequence_for(&CtlMessage::SetProgress {
+            state: isekai_protocol::ProgressState::Normal,
+            progress: 42,
+        })
+        .unwrap();
+        assert_eq!(seq, "\x1b]9;4;1;42\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_progress_none_uses_state_zero() {
+        let seq =
+            osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::None, progress: 0 })
+                .unwrap();
+        assert_eq!(seq, "\x1b]9;4;0;0\x07");
     }
 
     #[test]

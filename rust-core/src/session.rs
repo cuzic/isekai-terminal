@@ -863,6 +863,11 @@ fn dispatch_transport_event(
             // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
             // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
             //
+            // `SetProgress`(2026-08、OSC 9;4プログレスバー)は`isekai-ssh` CLI
+            // ラッパー(外側の実端末のタブアイコン/タスクバー統合)専用として追加した。
+            // Android本体アプリ側にタブ進捗UIができるまでは未サポート(タスク管理上の
+            // 6b)——`SetTabColor`がタブ色UI実装まで無視されていたのと同じ経過。
+            //
             // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
@@ -871,7 +876,8 @@ fn dispatch_transport_event(
             | isekai_protocol::CtlMessage::GetVarResponse { .. }
             | isekai_protocol::CtlMessage::BuildRequest { .. }
             | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
-            | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
+            | isekai_protocol::CtlMessage::BuildFinished { .. }
+            | isekai_protocol::CtlMessage::SetProgress { .. } => EventOutcome::Continue(None),
             // `Notify`は2つの独立した系統を1つのワイヤーメッセージ・型として共有する
             // (統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
             // 2026-07-25)。kindでどちらの系統かを判別し、それぞれ既存の(互いに

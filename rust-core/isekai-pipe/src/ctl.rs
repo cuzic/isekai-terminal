@@ -14,7 +14,7 @@ use anyhow::Result;
 use anyhow::{bail, Context};
 #[cfg(unix)]
 use base64::Engine as _;
-use isekai_protocol::{ClipboardMime, NotifyKind, VarScope};
+use isekai_protocol::{ClipboardMime, NotifyKind, ProgressState, VarScope};
 #[cfg(unix)]
 use isekai_protocol::{decode_ctl_message, CtlMessage};
 #[cfg(unix)]
@@ -35,6 +35,11 @@ enum CtlLaunch {
     /// `isekai-ssh::ctl_forward::osc_sequence_for`). Fire-and-forget, same
     /// wire shape as `Title`.
     TabColor { sock: Option<String>, r: u8, g: u8, b: u8 },
+    /// Sets/clears a progress indicator on terminals that support OSC 9;4
+    /// (Windows Terminal: tab icon + taskbar integration — see
+    /// `isekai-ssh::ctl_forward::osc_sequence_for`). Fire-and-forget, same
+    /// wire shape as `TabColor`.
+    Progress { sock: Option<String>, state: ProgressState, progress: u8 },
     ClipPush { sock: Option<String>, mime: ClipboardMime },
     ClipPull { sock: Option<String> },
     /// 2つの独立した系統を1つの`CtlLaunch`/`CtlMessage::Notify`が共有する
@@ -66,6 +71,9 @@ fn print_ctl_help() {
     println!("        (6 hex digits, optionally prefixed with '#', e.g. ff0000 or '#ff0000' —");
     println!("        quote the '#' form, unquoted it starts a shell comment;");
     println!("        Windows Terminal only — see ISEKAI_PIPE_DESIGN.md §8 Epic M)");
+    println!("    isekai-pipe ctl progress <none|normal|error|indeterminate|warning> [<0-100>] [--sock <path>]");
+    println!("        (progress value defaults to 0, ignored unless state is 'normal';");
+    println!("        Windows Terminal only via OSC 9;4 — tab icon + taskbar integration)");
     println!("    isekai-pipe ctl clip push --mime <text/plain|text/html|image/png> [--sock <path>]");
     println!("        (reads the payload from stdin)");
     println!("    isekai-pipe ctl clip pull [--sock <path>]");
@@ -88,7 +96,7 @@ fn print_ctl_help() {
     println!("        the actual command run is never sent over the wire, see ISEKAI_PIPE_DESIGN.md");
     println!("        §8 Epic P)");
     println!();
-    println!("`setvar`/`getvar`/`title`/`tab-color`/`clip`/`build` need the tab's ctl-socket forward: without --sock,");
+    println!("`setvar`/`getvar`/`title`/`tab-color`/`progress`/`clip`/`build` need the tab's ctl-socket forward: without --sock,");
     println!("they read the target UNIX domain socket path from ${ENV_CTL_SOCK}. `file` does not");
     println!("use this socket at all (see `isekai-pipe ctl file --help`).");
     println!();
@@ -126,6 +134,20 @@ fn parse_var_scope(value: &str) -> Result<VarScope, String> {
     }
 }
 
+fn parse_progress_state(value: &str) -> Result<ProgressState, String> {
+    match value {
+        "none" => Ok(ProgressState::None),
+        "normal" => Ok(ProgressState::Normal),
+        "error" => Ok(ProgressState::Error),
+        "indeterminate" => Ok(ProgressState::Indeterminate),
+        "warning" => Ok(ProgressState::Warning),
+        other => Err(format!(
+            "isekai-pipe ctl progress: unsupported state {other:?} \
+             (expected none, normal, error, indeterminate, or warning)"
+        )),
+    }
+}
+
 fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
     match value {
         "text/plain" => Ok(ClipboardMime::TextPlain),
@@ -154,6 +176,7 @@ fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>
         }
         Some("title") => parse_ctl_title(args),
         Some("tab-color") => parse_ctl_tab_color(args),
+        Some("progress") => parse_ctl_progress(args),
         Some("clip") => parse_ctl_clip(args),
         Some("notify") => parse_ctl_notify(args),
         Some("setvar") => parse_ctl_setvar(args),
@@ -223,6 +246,46 @@ fn parse_ctl_tab_color(mut args: impl Iterator<Item = String>) -> Result<Option<
         return Err(ExitCode::from(EX_USAGE));
     };
     Ok(Some(CtlLaunch::TabColor { sock, r, g, b }))
+}
+
+/// `isekai-pipe ctl progress <state> [<0-100>] [--sock <path>]`。`state`は
+/// 必須、`progress`は省略時0(`state`が`normal`以外なら実質無視される値
+/// なので既定値で問題ない)。
+fn parse_ctl_progress(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut state: Option<ProgressState> = None;
+    let mut progress: u8 = 0;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl progress", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other if state.is_none() => {
+                state = Some(parse_progress_state(other).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other => match other.parse::<u16>() {
+                Ok(n) if n <= 100 => progress = n as u8,
+                _ => {
+                    eprintln!("isekai-pipe ctl progress: progress value must be an integer 0-100, got {other:?}");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            },
+        }
+    }
+    let Some(state) = state else {
+        eprintln!(
+            "isekai-pipe ctl progress: a state argument is required \
+             (none, normal, error, indeterminate, or warning)"
+        );
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::Progress { sock, state, progress }))
 }
 
 fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
@@ -618,6 +681,7 @@ async fn ctl_command_with_sweep_dir(mut args: impl Iterator<Item = String>, swee
     let sock = match &launch {
         CtlLaunch::Title { sock, .. }
         | CtlLaunch::TabColor { sock, .. }
+        | CtlLaunch::Progress { sock, .. }
         | CtlLaunch::ClipPush { sock, .. }
         | CtlLaunch::ClipPull { sock }
         | CtlLaunch::Notify { sock, .. }
@@ -671,6 +735,7 @@ pub(crate) async fn ctl_command(mut args: impl Iterator<Item = String>) -> ExitC
     let sock = match &launch {
         CtlLaunch::Title { sock, .. }
         | CtlLaunch::TabColor { sock, .. }
+        | CtlLaunch::Progress { sock, .. }
         | CtlLaunch::ClipPush { sock, .. }
         | CtlLaunch::ClipPull { sock }
         | CtlLaunch::Notify { sock, .. }
@@ -696,6 +761,10 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<u8> {
         }
         CtlLaunch::TabColor { r, g, b, .. } => {
             send_ctl_message(sock_path, CtlMessage::SetTabColor { r, g, b }).await?;
+            Ok(0)
+        }
+        CtlLaunch::Progress { state, progress, .. } => {
+            send_ctl_message(sock_path, CtlMessage::SetProgress { state, progress }).await?;
             Ok(0)
         }
         CtlLaunch::ClipPush { mime, .. } => {
@@ -969,6 +1038,45 @@ mod tests {
     #[test]
     fn rejects_tab_color_with_non_hex_digits() {
         let err = parse_ctl(args(&["tab-color", "zzzzzz"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_progress_normal_with_value() {
+        let launch = parse_ctl(args(&["progress", "normal", "42"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::Progress { sock: None, state: ProgressState::Normal, progress: 42 });
+    }
+
+    #[test]
+    fn parses_progress_without_value_defaults_to_zero() {
+        let launch = parse_ctl(args(&["progress", "indeterminate"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::Progress { sock: None, state: ProgressState::Indeterminate, progress: 0 });
+    }
+
+    #[test]
+    fn parses_progress_with_explicit_sock() {
+        let launch = parse_ctl(args(&["progress", "--sock", "/tmp/a.sock", "error", "10"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::Progress { sock: Some("/tmp/a.sock".to_string()), state: ProgressState::Error, progress: 10 }
+        );
+    }
+
+    #[test]
+    fn rejects_progress_without_state_argument() {
+        let err = parse_ctl(args(&["progress"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_progress_with_unknown_state() {
+        let err = parse_ctl(args(&["progress", "bogus"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_progress_value_out_of_range() {
+        let err = parse_ctl(args(&["progress", "normal", "101"])).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
