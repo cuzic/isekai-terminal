@@ -376,6 +376,12 @@ pub(crate) struct Terminal {
     scroll_top: usize,
     scroll_bottom: usize,
     title: Option<String>,
+    /// Windows Terminal 独自拡張 OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`、
+    /// `microsoft/terminal` PR #13058)、または ctl-socket 経由の
+    /// `CtlMessage::SetTabColor`(`set_tab_color`)で設定されたタブ背景色。
+    /// タイトル(`title`)と同じくRIS(`reset_all`)でクリアされる、
+    /// セッション限りの状態(永続化しない)。
+    tab_color: Option<(u8, u8, u8)>,
     /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
     /// 場合、次に`take_pending_clipboard_write()`が呼ばれるまで保持する
     /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M: tmuxが`set-titles`/`allow-passthrough`を
@@ -841,6 +847,7 @@ impl Terminal {
             cur_attrs: TermAttrs::default_for(&theme),
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
+            tab_color: None,
             pending_clipboard_write: None,
             pending_clipboard_pull_request: false,
             pending_terminal_responses: Vec::new(),
@@ -943,6 +950,13 @@ impl Terminal {
     /// §8 Epic M)から直接タイトルを設定する。
     pub(crate) fn set_title(&mut self, title: String) {
         self.title = Some(title);
+    }
+    pub(crate) fn tab_color(&self) -> Option<(u8, u8, u8)> { self.tab_color }
+
+    /// OSC 4;264 のパース経由ではなく、外部(ctl-socket経由の
+    /// `CtlMessage::SetTabColor`)から直接タブ色を設定する。`set_title`と対になる。
+    pub(crate) fn set_tab_color(&mut self, r: u8, g: u8, b: u8) {
+        self.tab_color = Some((r, g, b));
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn application_keypad_mode(&self) -> bool { self.application_keypad_mode }
@@ -1252,6 +1266,7 @@ impl Terminal {
         self.cur_attrs = TermAttrs::default_for(&theme);
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
+        self.tab_color = None;
         self.pending_clipboard_write = None;
         self.pending_clipboard_pull_request = false;
         self.pending_terminal_responses.clear();
@@ -3076,6 +3091,36 @@ impl Perform for Terminal {
             (Some(&b"11"), Some(&spec)) => {
                 self.handle_osc_default_color(false, spec, bell_terminated);
             }
+            // OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`): Windows Terminalのプライベート
+            // 拡張(パレットindex 264をタブ背景色に流用、`microsoft/terminal` PR #13058)。
+            // 通常のOSC 4(パレット色index 0-255の設定)はこのアプリでは未実装のため、
+            // 264だけを個別にmatchして区別する(255以下の通常パレットindexは
+            // フォールスルーで無視され続ける)。
+            //
+            // 制約(Opusレビュー指摘、2026-08): tmuxはOSC 4を自前で解釈し、標準外の
+            // index(264)を宛先へ転送しない(`allow-passthrough`を有効にしても、
+            // 対象はDCSでラップされたパススルーシーケンスのみでOSC 4自体は対象外)。
+            // そのためこの経路が実際に効くのはtmuxを挟まない素のシェルのみで、
+            // tmux配下では`CtlMessage::SetTabColor`(`session.rs`のctlソケット経路、
+            // `set_tab_color`直接呼び出し)が主役になる。
+            //
+            // xtermのOSC 4は本来`4;idx;spec;idx;spec;...`と複数ペアを1シーケンスに
+            // 詰められるが、ここは`params[1] == "264"`の1ペアのみを見ている
+            // (`4;1;rgb:..;264;rgb:..`のような複合シーケンスの264は現状取りこぼす)。
+            // 通常のパレットOSC 4本体を将来実装する際は、2個ずつ回すループの中で
+            // 264を分岐する形に統合すること。またOSC 10/11と異なり`264;?`という
+            // query(現在値の読み出し)には応答しない——実害はほぼ無いための意図的な
+            // 非対称。
+            (Some(&b"4"), Some(&b"264")) => {
+                if let Some(&spec) = params.get(2) {
+                    if let Some(argb) = parse_osc_color_spec(spec) {
+                        let r = ((argb >> 16) & 0xFF) as u8;
+                        let g = ((argb >> 8) & 0xFF) as u8;
+                        let b = (argb & 0xFF) as u8;
+                        self.tab_color = Some((r, g, b));
+                    }
+                }
+            }
             // OSC 8(`ESC]8;params;URIST`): ハイパーリンク(タスク#40)。詳細は
             // `handle_osc8_hyperlink`のdocコメント参照。`params.get(1)`が`None`
             // (`ESC]8ST`のようなパラメータ自体が無い形)も含めて丸ごと委譲する
@@ -3793,6 +3838,39 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
+    }
+
+    #[test]
+    fn test_tab_color_osc_4_264_windows_terminal_convention() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn test_tab_color_osc_ignores_other_palette_indices() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // OSC 4 (regular palette color setting) is otherwise unimplemented —
+        // only index 264 (Windows Terminal's tab-color convention) should
+        // ever populate tab_color.
+        feed(&mut t, b"\x1b]4;1;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), None);
+    }
+
+    #[test]
+    fn test_tab_color_osc_cleared_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.tab_color(), None);
+    }
+
+    #[test]
+    fn test_set_tab_color_direct_setter_mirrors_set_title() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_tab_color(0x11, 0x22, 0x33);
+        assert_eq!(t.tab_color(), Some((0x11, 0x22, 0x33)));
     }
 
     #[test]

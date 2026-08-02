@@ -831,6 +831,13 @@ fn dispatch_transport_event(
             isekai_protocol::CtlMessage::SetTitle { value } => {
                 EventOutcome::Continue(Some(state.set_title_from_ctl(value)))
             }
+            // `isekai-ssh` CLIラッパー(`ctl_forward.rs::osc_sequence_for`)がWindows
+            // Terminal向けにOSC 4;264へ変換するのと同じ`CtlMessage::SetTabColor`を、
+            // Android/iOS本体アプリ側は自前のタブUI(`ScreenUpdate::tab_color`経由)へ
+            // 直接反映する。`SetTitle`と対になる経路(`set_title_from_ctl`参照)。
+            isekai_protocol::CtlMessage::SetTabColor { r, g, b } => {
+                EventOutcome::Continue(Some(state.set_tab_color_from_ctl(r, g, b)))
+            }
             isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
                 if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
                     let cb = Arc::clone(callback);
@@ -856,13 +863,8 @@ fn dispatch_transport_event(
             // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
             // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
             //
-            // `SetTabColor`もAndroid/iOS本体アプリでは未サポート
-            // (タブバーはisekai-ssh CLIラッパーのようなWindows Terminal依存の
-            // OSC 4;264ではなく、将来アプリ独自のUIで表現する想定)。
-            //
             // すべて到達したら無視するだけの防御的なアーム。
-            isekai_protocol::CtlMessage::SetTabColor { .. }
-            | isekai_protocol::CtlMessage::ClipboardPullRequest {}
+            isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
             | isekai_protocol::CtlMessage::SetVar { .. }
             | isekai_protocol::CtlMessage::GetVarRequest { .. }
@@ -1530,6 +1532,28 @@ mod tests {
             crate::terminal::MAX_LINK_TABLE,
             "ScreenUpdate.link_tableは上限件数で頭打ちになり無界には増えない"
         );
+    }
+
+    #[test]
+    fn make_screen_update_carries_tab_color_set_via_osc_4_264() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.on_stdout(b"\x1b]4;264;rgb:aa/bb/cc\x1b\\".to_vec());
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.tab_color, Some(crate::TabColor { r: 0xaa, g: 0xbb, b: 0xcc }));
+    }
+
+    #[test]
+    fn make_screen_update_carries_tab_color_set_via_ctl_message() {
+        // `TransportEvent::CtlMessage(SetTabColor)`は`dispatch_transport_event`が
+        // `state.set_tab_color_from_ctl`へ配線する(以前は防御的に無視していたアーム
+        // から2026-08にここへ移した——回帰しやすい箇所なので、ctlソケット経由の
+        // 反映も`make_screen_update`まで届くことをOSC経由と別に検証する)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.set_tab_color_from_ctl(0x11, 0x22, 0x33);
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.tab_color, Some(crate::TabColor { r: 0x11, g: 0x22, b: 0x33 }));
     }
 
     #[test]
