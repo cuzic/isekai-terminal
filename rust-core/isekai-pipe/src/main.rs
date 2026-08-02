@@ -1,4 +1,3 @@
-mod claude_hookd;
 mod ctl;
 mod ctl_file;
 mod datagram_relay;
@@ -76,13 +75,12 @@ fn print_help() {
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
     println!("    ctl        title/clipboard/setvar/getvar/file control-plane client (see `isekai-pipe ctl --help`)");
-    println!("    claude-hookd event");
-    println!("               Claude Code hook entrypoint for a debounced tab-color attention indicator");
-    println!("               (ISEKAI_PIPE_DESIGN.md §8 Epic Q) — put this exact command in every");
-    println!("               Notification/Stop/UserPromptSubmit hook and PreToolUse/PostToolUse");
-    println!("               (matcher: AskUserQuestion) hook in .claude/settings.json; reads the hook's");
-    println!("               JSON payload from stdin, always exits 0.");
     println!("    version    print version");
+    println!();
+    println!("Claude Code hook state indicator (tab color/notification) moved out of this binary");
+    println!("into the standalone `claude-hookd` crate (2026-08) — install it separately and put");
+    println!("`claude-hookd event` in your .claude/settings.json hooks instead of");
+    println!("`isekai-pipe claude-hookd event`. See rust-core/claude-hookd/src/main.rs.");
     println!();
     println!(
         "The command surface is reserved for the staged isekai-helper -> isekai-pipe migration."
@@ -307,7 +305,11 @@ async fn run() -> ExitCode {
         Some("probe") => probe::probe_command(args).await,
         Some("inspect") => inspect::inspect_command(args).await,
         Some("ctl") => ctl::ctl_command(args).await,
-        Some("claude-hookd") => claude_hookd::claude_hookd_command(args).await,
+        Some("claude-hookd") => {
+            eprintln!("isekai-pipe: `claude-hookd` moved to its own standalone crate (2026-08).");
+            eprintln!("Install `claude-hookd` separately and use `claude-hookd event` instead.");
+            ExitCode::from(EX_USAGE)
+        }
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");

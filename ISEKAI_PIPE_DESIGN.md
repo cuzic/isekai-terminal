@@ -1866,17 +1866,36 @@ stdout/stderrへ書き出すだけで、追加の表示経路なしにリモー�
 - `rust-core/isekai-pipe/src/ctl.rs`: `CtlLaunch::Build`/`stream_build`
 - `rust-core/isekai-ssh/tests/build_result_push_e2e.rs`
 
-### Epic Q: Claude Codeフック連携によるタブ状態表示(claude-hookd)— 実装済み・未マージ(2026-07-25、Opusレビュー2回反映後、`feat/claude-hookd`ブランチ)
+### Epic Q: Claude Codeフック連携によるタブ状態表示(claude-hookd)— 実装済み・main(2026-07-25、Opusレビュー2回反映後、`feat/claude-hookd`マージ済み)
 
-**実装状況**: 状態機械(`claude_hookd::state`)・常駐daemon(`claude_hookd::daemon`)・
-`isekai-pipe claude-hookd event`/`__serve`サブコマンド・`#@isekai tab-idle-color`/
-`tab-attention-color`ディレクティブ・README(`rust-core/isekai-ssh/README.md`)は
-すべてこのworktree上に実装済み。まだ`main`にはマージされていない。以下は着手前に
-書かれた設計節をほぼそのまま残しているため、意思決定の経緯としてはそのまま有効だが、
-「未着手」ではなく「この設計の通りに実装され、実機/単体テストで検証済み」と読むこと
-(状態機械は`.claude/rules/rust-ssot.md`の方針通りI/O無し純粋関数として単体テストされ
-ている——`claude_hookd::state`のテストを参照)。`PermissionRequest`/`timeout`の追加
-(2026-07-25、下記4参照)は実運用中のtmuxプラグイン2種の設定を調査した上での増分修正。
+**実装状況(2026-08更新)**: `claude-hookd`は`isekai-pipe claude-hookd`
+サブコマンドから**独立したスタンドアロンcrate**(`rust-core/claude-hookd/`)へ
+分離した。isekai-terminalのエコシステム(isekai-pipe/isekai-ssh)から独立しており、
+配送経路を3方式から自動判別(`$CLAUDE_HOOKD_DELIVERY`で明示上書きも可能)する:
+1. `$ISEKAI_CTL_SOCK`があれば従来通りisekai-sshのctl-socket経由(isekai-terminal
+   ユーザー向け、下記の設計節が説明する経路)
+2. tmux配下(`$TMUX_PANE`)なら、そのpaneのtty(`tmux display-message -p -t
+   $TMUX_PANE '#{pane_tty}'`)へ直接OSCを書き込む(tmux passthrough — `allow-
+   passthrough on`が必要、`osc_color::wrap_for_tmux_passthrough`)。isekai-ssh
+   もisekai-terminalも一切不要。
+3. tmuxも無ければ`$SSH_TTY`へ生のOSCを直接書き込む。
+
+**破壊的変更**: `claude-hookd event`/`__serve`は削除した(isekai-pipe
+バイナリからは呼べない)。既存ユーザーは`claude-hookd`を別途インストールし、
+`.claude/settings.json`のhookコマンドを`claude-hookd event`に書き換える必要がある
+(自動デプロイの対象外——isekai-terminal本体アプリへの埋め込み配布は意図的に
+していない、独立ツールとしての性質を保つため)。`#@isekai tab-idle-color`/
+`tab-attention-color`ディレクティブが注入する`$ISEKAI_TAB_IDLE_COLOR`/
+`$ISEKAI_TAB_ATTENTION_COLOR`環境変数名はそのまま(claude-hookd側は変更なく
+読み続ける、isekai-sshとの後方互換のため)。
+
+以下は着手前に書かれた設計節をほぼそのまま残しているため、意思決定の経緯としては
+そのまま有効だが、状態機械・daemon・ctl-socket経路については「この設計の通りに
+実装され、実機/単体テストで検証済み(現在は`claude-hookd`crateへ移設済み)」と
+読むこと(状態機械は`.claude/rules/rust-ssot.md`の方針通りI/O無し純粋関数として
+単体テストされている——`claude-hookd/src/state.rs`のテストを参照)。
+`PermissionRequest`/`timeout`の追加(2026-07-25、下記4参照)は実運用中のtmux
+プラグイン2種の設定を調査した上での増分修正。
 
 **動機**: `AI_INTEGRATION_DESIGN.md` §6.1(`ctl notify`)は「注目通知」を一過性のポップアップ
 (OSC 9)・システム通知として実装したが(「状態ドット」は当初の設計文にあった記述で、
@@ -1905,7 +1924,7 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
   「`Notification`/`Stop`はnotify、`UserPromptSubmit`はresolve」というイベント名→
   意味の対応表自体が`.claude/settings.json`(シェル側)に固定化されていて、これは
   「hookは生イベントを転送するだけ」という主張と矛盾する、と指摘された。v2では
-  `.claude/settings.json`側のコマンドを**`isekai-pipe claude-hookd event`1本**に
+  `.claude/settings.json`側のコマンドを**`claude-hookd event`1本**に
   統一し、hookのJSONペイロード(`hook_event_name`・`session_id`・`tool_name`等)を
   そのままstdinで渡して、意味付けは完全にdaemon側で行う(下記4)。
 - **新しいSSH/QUICチャネルは作らない**: daemonはリモートホストにローカルに閉じた
@@ -1960,7 +1979,7 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
      値に差し替わる。
    - `ctl-socket`は既定`no`(opt-in)なので、`$ISEKAI_CTL_SOCK`が未設定の環境では
      `claude-hookd event`はdaemonを起動せずサイレントにexit 0する。
-3. **`isekai-pipe claude-hookd event`**(唯一の新サブコマンド、`isekai-pipe`本体に
+3. **`claude-hookd event`**(唯一の新サブコマンド、`isekai-pipe`本体に
    追加——新しいバイナリは作らない):
    - stdinからhookのJSONペイロード全体を読み、`hook_event_name`・`session_id`・
      (`PreToolUse`/`PostToolUse`のときのみ)`tool_name`を取り出す。
@@ -2099,15 +2118,15 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    ```json
    {
      "hooks": {
-       "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-       "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
+       "Notification":       [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "Stop":               [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }]
      }
    }
    ```

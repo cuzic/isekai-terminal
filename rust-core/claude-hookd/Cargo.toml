@@ -1,0 +1,24 @@
+[package]
+name = "claude-hookd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Standalone Claude Code hook daemon: turns Claude Code hook events into a persistent, debounced tab-color/notification indicator. Independent of the isekai-terminal ecosystem — works over a bare SSH+tmux session (tmux passthrough), a bare SSH session with no tmux (direct OSC), or isekai-ssh's ctl-socket forward, auto-detected or explicitly chosen."
+
+[[bin]]
+name = "claude-hookd"
+path = "src/main.rs"
+
+[dependencies]
+osc-color = { path = "../osc-color" }
+isekai-protocol = { path = "../isekai-protocol" }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
+# `read_one_event_gives_up_on_a_peer_that_never_sends_anything`'s
+# `#[tokio::test(start_paused = true)]` needs this (not part of the
+# `[dependencies]` tokio's "full" feature — feature-unifies into the same
+# tokio crate).
+tokio = { version = "1", features = ["test-util"] }

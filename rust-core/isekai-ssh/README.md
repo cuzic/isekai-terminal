@@ -547,15 +547,15 @@ hook でも同じ1行、Claude Code のフック JSON を stdin から読んで�
 ```json
 {
   "hooks": {
-    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
+    "Notification":       [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }]
   }
 }
 ```
@@ -585,7 +585,7 @@ idle色へ戻り、何も操作しなくても10分経てば自動的に戻る�
 `idle_prompt`が届く。
 
 裏側では、最初のイベントが来たタイミングでタブごとの小さなdaemon
-(`isekai-pipe claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
+(`claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
 転送される。daemonは1時間イベントが無いと自動的に終了する(常駐監視プロセスは
 無い、Epic Mの ctl-socket 自体と同じ方針)。
 
