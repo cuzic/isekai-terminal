@@ -35,7 +35,7 @@ class TerminalSelectionTest {
             cells = cells,
             cursorRow = 0u,
             cursorCol = 0u,
-            title = null, tabColor = null,
+            title = null, tabColor = null, cursorColor = null,
             applicationCursorMode = false,
             applicationKeypadMode = false,
             bracketedPasteMode = false,
@@ -114,7 +114,7 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             updateSeq = 0u,
             cols = 80u, rows = 24u, cells = emptyList(),
-            cursorRow = 0u, cursorCol = 0u, title = null, tabColor = null,
+            cursorRow = 0u, cursorCol = 0u, title = null, tabColor = null, cursorColor = null,
             applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             alternateScroll = false,
@@ -134,7 +134,7 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             updateSeq = 0u,
             cols = 0u, rows = 0u, cells = emptyList(),
-            cursorRow = 0u, cursorCol = 0u, title = null, tabColor = null,
+            cursorRow = 0u, cursorCol = 0u, title = null, tabColor = null, cursorColor = null,
             applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             alternateScroll = false,

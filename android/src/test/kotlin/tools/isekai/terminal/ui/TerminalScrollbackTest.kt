@@ -39,7 +39,7 @@ class TerminalScrollbackTest {
             cells = cells,
             cursorRow = cursorRow,
             cursorCol = cursorCol,
-            title = "session", tabColor = null,
+            title = "session", tabColor = null, cursorColor = null,
             applicationCursorMode = true,
             applicationKeypadMode = true,
             bracketedPasteMode = true,

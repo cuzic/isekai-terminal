@@ -33,6 +33,7 @@ public func synthesizeDisplayUpdate(
         cursorRow: update.rows, cursorCol: 0,
         title: update.title,
         tabColor: update.tabColor,
+        cursorColor: update.cursorColor,
         applicationCursorMode: update.applicationCursorMode,
         applicationKeypadMode: update.applicationKeypadMode,
         bracketedPasteMode: update.bracketedPasteMode,

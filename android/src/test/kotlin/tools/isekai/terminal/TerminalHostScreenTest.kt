@@ -111,7 +111,7 @@ class TerminalHostScreenTest {
         // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
         // 先にconnectedにしてからタイトル更新を送る。
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("Remote Title").assertExists()
@@ -123,7 +123,7 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("alpha").assertExists()
@@ -138,7 +138,7 @@ class TerminalHostScreenTest {
         composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithTag("tabColorDot").assertExists()
@@ -149,7 +149,7 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
