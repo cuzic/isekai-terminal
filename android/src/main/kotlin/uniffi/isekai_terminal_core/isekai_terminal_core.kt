@@ -4269,6 +4269,54 @@ public object FfiConverterTypeClipboardPayload: FfiConverterRustBuffer<Clipboard
 
 
 
+/**
+ * OSC 12(xterm/iTerm2互換、`ESC]12;<spec>ST`)またはOSC 112(リセット)で設定された
+ * カーソル色。RGB各成分は0-255。`ScreenUpdate::cursor_color`が`None`のときは未設定
+ * (UI層は自身の既定カーソル色、Android `TerminalTheme.cursor`を使う)。
+ */
+data class CursorColor (
+    var `r`: kotlin.UByte
+    , 
+    var `g`: kotlin.UByte
+    , 
+    var `b`: kotlin.UByte
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCursorColor: FfiConverterRustBuffer<CursorColor> {
+    override fun read(buf: ByteBuffer): CursorColor {
+        return CursorColor(
+            FfiConverterUByte.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterUByte.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CursorColor) = (
+            FfiConverterUByte.allocationSize(value.`r`) +
+            FfiConverterUByte.allocationSize(value.`g`) +
+            FfiConverterUByte.allocationSize(value.`b`)
+    )
+
+    override fun write(value: CursorColor, buf: ByteBuffer) {
+            FfiConverterUByte.write(value.`r`, buf)
+            FfiConverterUByte.write(value.`g`, buf)
+            FfiConverterUByte.write(value.`b`, buf)
+    }
+}
+
+
+
 data class CursorState (
     var `row`: kotlin.UInt
     , 
@@ -5402,6 +5450,13 @@ data class ScreenUpdate (
      */
     var `tabColor`: TabColor?
     , 
+    /**
+     * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
+     * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
+     */
+    var `cursorColor`: CursorColor?
+    , 
     var `applicationCursorMode`: kotlin.Boolean
     , 
     /**
@@ -5613,6 +5668,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeTabColor.read(buf),
+            FfiConverterOptionalTypeCursorColor.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
@@ -5649,6 +5705,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterOptionalTypeTabColor.allocationSize(value.`tabColor`) +
+            FfiConverterOptionalTypeCursorColor.allocationSize(value.`cursorColor`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`applicationKeypadMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
@@ -5684,6 +5741,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.write(value.`cursorCol`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterOptionalTypeTabColor.write(value.`tabColor`, buf)
+            FfiConverterOptionalTypeCursorColor.write(value.`cursorColor`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`applicationKeypadMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
@@ -8823,6 +8881,38 @@ public object FfiConverterOptionalTypeClipboardPayload: FfiConverterRustBuffer<C
         } else {
             buf.put(1)
             FfiConverterTypeClipboardPayload.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeCursorColor: FfiConverterRustBuffer<CursorColor?> {
+    override fun read(buf: ByteBuffer): CursorColor? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeCursorColor.read(buf)
+    }
+
+    override fun allocationSize(value: CursorColor?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeCursorColor.allocationSize(value)
+        }
+    }
+
+    override fun write(value: CursorColor?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeCursorColor.write(value, buf)
         }
     }
 }
