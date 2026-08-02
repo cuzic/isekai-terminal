@@ -1079,6 +1079,14 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   設計とした——claude-hookdのidle色(`DEFAULT_IDLE_COLOR`)が常時暗色を
   送り続けるため、背景着色だとタブが常時グレーがかって見えてしまう問題が
   レビューで見つかったため。設計判断の詳細は下記「tab-colorの設計判断」を参照。
+  ✅(2026-08)`isekai-ssh`側もWindows Terminal専用の決め打ちから、実行中の実端末を
+  `$TERM_PROGRAM`(`ISEKAI_TERMINAL_KIND::resolve`、override可能な明示指定
+  `$ISEKAI_TERMINAL_KIND=iterm2|windows-terminal`込み)で判別し、iTerm2ならプロプラエタリな
+  `OSC 6;1;bg;<channel>;brightness;<0-255>`(RGB各成分ごとに1シーケンス)へ変換するよう
+  拡張した(`ctl_forward::TerminalKind`)。既知の制限: `isekai-ssh`自身をローカルの
+  tmux内で実行している場合、tmux 3.2+が`$TERM_PROGRAM=tmux`で上書きするため自動判別が
+  効かない(明示指定で回避)うえ、そもそもローカルtmuxもOSC 4;264/OSC 6を素通ししない
+  (実機検証済み、リモートtmuxと同じ制約)。
   **未着手のまま(スコープ外として明示)**: この呼び出し元となるClaude Code
   hook連携(`Notification`/`Stop`での色変更、タイムアウトでの自動リセット)。
   段階的実装として、まずこのプリミティブのみ追加した。

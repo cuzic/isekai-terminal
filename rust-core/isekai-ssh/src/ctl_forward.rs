@@ -297,7 +297,7 @@ async fn handle_ctl_connection(
     }
     let msg = decode_ctl_message(line.trim_end_matches('\n').as_bytes())
         .context("malformed ctl message")?;
-    if let Some(seq) = osc_sequence_for(&msg) {
+    if let Some(seq) = osc_sequence_for(&msg, TerminalKind::resolve()) {
         emit_osc(&seq)?;
     }
     match msg {
@@ -362,7 +362,7 @@ async fn run_build(
     // Epic P × 2026-08のOSC 9;4連携: ビルドの成否は事前に分からないので
     // `Indeterminate`(スピナー)で開始を知らせる。`emit_build_progress_result`と
     // 対で、doc commentはそちらを参照。
-    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }) {
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }, TerminalKind::resolve()) {
         let _ = emit_osc(&seq);
     }
 
@@ -437,7 +437,7 @@ async fn run_build(
 /// see the call site in `run_build`.
 fn emit_build_progress_result(success: bool) {
     let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
-    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }) {
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }, TerminalKind::resolve()) {
         let _ = emit_osc(&seq);
     }
 }
@@ -472,10 +472,64 @@ async fn send_build_finished(
     Ok(())
 }
 
+/// Which real terminal emulator this `isekai-ssh` process is running inside,
+/// for OSC variants that differ per terminal (currently only `SetTabColor`,
+/// see `osc_sequence_for`). Deliberately NOT read from inside
+/// `osc_sequence_for` itself — that function stays a pure, unit-testable
+/// mapping from `(CtlMessage, TerminalKind)` to a `String`; callers resolve
+/// `TerminalKind` once via [`TerminalKind::resolve`] and pass it in, the same
+/// "resolve once, thread the value through" shape this project already uses
+/// for `TofuConfirmation` (`.claude/rules/always-connects.md`) rather than
+/// having downstream code re-derive intent from raw env/state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalKind {
+    /// Default/fallback — also what every Windows-native call site passes
+    /// unconditionally (iTerm2 doesn't exist on Windows, so there is nothing
+    /// to detect there).
+    WindowsTerminal,
+    ITerm2,
+}
+
+impl TerminalKind {
+    /// Reads `$ISEKAI_TERMINAL_KIND` (explicit override — see
+    /// `print_ctl_help`/README) and falls back to auto-detecting from
+    /// `$TERM_PROGRAM` (`iTerm.app` on iTerm2; anything else, including
+    /// unset, defaults to Windows Terminal-compatible behavior, matching
+    /// this wrapper's pre-2026-08 unconditional OSC 4;264 behavior).
+    ///
+    /// Known limitation (undetectable, not a bug to "fix"): if `isekai-ssh`
+    /// itself runs inside a LOCAL tmux (not to be confused with the REMOTE
+    /// tmux `ctl_forward` exists to route around), tmux 3.2+ overwrites
+    /// `$TERM_PROGRAM=tmux` for everything running inside it, so the real
+    /// outer terminal can't be auto-detected — use the explicit override in
+    /// that case. This is also why the OSC this function's output feeds into
+    /// doesn't reach the real terminal at all when a *local* tmux is in the
+    /// way (verified experimentally against real tmux 3.3a): a local tmux
+    /// swallows OSC 4;264/OSC 6 exactly like a remote one does, and
+    /// `ISEKAI_PIPE_DESIGN.md` already rejects `allow-passthrough` as a
+    /// workaround for the remote case for the same reason.
+    pub(crate) fn resolve() -> Self {
+        Self::resolve_from(std::env::var("ISEKAI_TERMINAL_KIND").ok().as_deref(), std::env::var("TERM_PROGRAM").ok().as_deref())
+    }
+
+    fn resolve_from(override_val: Option<&str>, term_program: Option<&str>) -> Self {
+        match override_val {
+            Some("iterm2") => return Self::ITerm2,
+            Some("windows-terminal") => return Self::WindowsTerminal,
+            _ => {} // unset, or an unrecognized value — fall through to auto-detect
+        }
+        match term_program {
+            Some("iTerm.app") => Self::ITerm2,
+            _ => Self::WindowsTerminal,
+        }
+    }
+}
+
 /// Maps an incoming `CtlMessage` to the OSC escape sequence to emit on the
 /// local terminal, or `None` for messages this CLI wrapper doesn't act on.
 /// Shared by the Unix `ssh(1)` path and the Windows-native mux client/owner
-/// paths (`native/mux`).
+/// paths (`native/mux`, which always pass [`TerminalKind::WindowsTerminal`]
+/// — iTerm2 doesn't exist on Windows).
 ///
 /// - `SetTitle` → OSC 0 (icon name + window title). Passed through
 ///   [`strip_ascii_control_chars`] first, same reasoning as `Notify` below
@@ -502,10 +556,13 @@ async fn send_build_finished(
 ///     app's job); ignored (`None`) rather than implemented, matching how
 ///     `ClipboardPullRequest` below is also left unimplemented pending a
 ///     capability this wrapper doesn't have yet.
-/// - `SetTabColor` → OSC 4 palette-index 264, Windows Terminal's private
-///   convention for the tab background color (`microsoft/terminal` PR #13058,
-///   which closed the original feature request #6574).
-///   A harmless no-op on terminals that don't recognize that index.
+/// - `SetTabColor` → OSC 4 palette-index 264 (`TerminalKind::WindowsTerminal`,
+///   Windows Terminal's private convention for the tab background color,
+///   `microsoft/terminal` PR #13058, which closed the original feature
+///   request #6574 — a harmless no-op on terminals that don't recognize that
+///   index) or iTerm2's proprietary `OSC 6;1;bg;<channel>;brightness;<0-255>`
+///   (`TerminalKind::ITerm2`, one sequence per RGB channel — see iTerm2's
+///   "Proprietary Escape Codes" documentation).
 /// - `SetProgress` → OSC 9;4 (`ProgressState` doc), ConEmu-originated
 ///   progress-bar convention also implemented by Windows Terminal (tab
 ///   icon + taskbar integration there). Harmless no-op elsewhere.
@@ -528,7 +585,7 @@ async fn send_build_finished(
 ///   sequence for "run a local command", so this variant is handled by a
 ///   dedicated long-lived branch in `handle_ctl_connection` instead of the
 ///   OSC-emitting path every other variant goes through.
-pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
+pub(crate) fn osc_sequence_for(msg: &CtlMessage, terminal: TerminalKind) -> Option<String> {
     match msg {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{}\x07", strip_ascii_control_chars(value))),
         CtlMessage::Notify { kind, title, body, .. } => match kind {
@@ -540,7 +597,12 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
             }
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => None,
         },
-        CtlMessage::SetTabColor { r, g, b } => Some(format!("\x1b]4;264;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")),
+        CtlMessage::SetTabColor { r, g, b } => Some(match terminal {
+            TerminalKind::WindowsTerminal => format!("\x1b]4;264;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\"),
+            TerminalKind::ITerm2 => format!(
+                "\x1b]6;1;bg;red;brightness;{r}\x07\x1b]6;1;bg;green;brightness;{g}\x07\x1b]6;1;bg;blue;brightness;{b}\x07"
+            ),
+        }),
         CtlMessage::SetProgress { state, progress } => {
             Some(format!("\x1b]9;4;{};{}\x07", *state as u8, progress))
         }
@@ -682,7 +744,7 @@ mod tests {
 
     #[test]
     fn osc_sequence_for_set_title_is_osc_0() {
-        let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
+        let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }, TerminalKind::WindowsTerminal).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
     }
 
@@ -694,35 +756,42 @@ mod tests {
     /// `osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body`.
     #[test]
     fn osc_sequence_for_set_title_strips_esc_and_bel() {
-        let seq = osc_sequence_for(&CtlMessage::SetTitle {
-            value: "hi\x1b]52;c;cHduZWQ=\x07pwned".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::SetTitle { value: "hi\x1b]52;c;cHduZWQ=\x07pwned".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]0;hi]52;c;cHduZWQ=pwned\x07");
     }
 
     #[test]
     fn osc_sequence_for_notify_joins_title_and_body_with_osc_9() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi".to_string(),
-            body: "there".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi".to_string(),
+                body: "there".to_string(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi: there\x07");
     }
 
     #[test]
     fn osc_sequence_for_notify_omits_separator_when_body_is_empty() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi".to_string(),
-            body: String::new(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi".to_string(),
+                body: String::new(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi\x07");
     }
@@ -730,13 +799,16 @@ mod tests {
     #[test]
     fn osc_sequence_for_notify_tmux_kinds_is_none() {
         for kind in [NotifyKind::Bell, NotifyKind::Activity, NotifyKind::Silence, NotifyKind::JobDone] {
-            let seq = osc_sequence_for(&CtlMessage::Notify {
-                kind,
-                tmux_tag: "session:0".to_string(),
-                seq: 1,
-                title: String::new(),
-                body: String::new(),
-            });
+            let seq = osc_sequence_for(
+                &CtlMessage::Notify {
+                    kind,
+                    tmux_tag: "session:0".to_string(),
+                    seq: 1,
+                    title: String::new(),
+                    body: String::new(),
+                },
+                TerminalKind::WindowsTerminal,
+            );
             assert!(seq.is_none(), "{kind:?} should not produce an OSC sequence");
         }
     }
@@ -747,29 +819,75 @@ mod tests {
     /// hook-controlled escape sequence into the user's real terminal.
     #[test]
     fn osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi\x1b]0;pwned\x07".to_string(),
-            body: "bo\x07dy".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi\x1b]0;pwned\x07".to_string(),
+                body: "bo\x07dy".to_string(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi]0;pwned: body\x07");
     }
 
     #[test]
-    fn osc_sequence_for_tab_color_is_osc_4_264() {
-        let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }).unwrap();
+    fn osc_sequence_for_tab_color_on_windows_terminal_is_osc_4_264() {
+        let seq =
+            osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }, TerminalKind::WindowsTerminal)
+                .unwrap();
         assert_eq!(seq, "\x1b]4;264;rgb:ff/00/00\x1b\\");
     }
 
     #[test]
+    fn osc_sequence_for_tab_color_on_iterm2_is_osc_6() {
+        let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x88, b: 0x00 }, TerminalKind::ITerm2).unwrap();
+        assert_eq!(
+            seq,
+            "\x1b]6;1;bg;red;brightness;255\x07\x1b]6;1;bg;green;brightness;136\x07\x1b]6;1;bg;blue;brightness;0\x07"
+        );
+    }
+
+    #[test]
+    fn terminal_kind_resolve_from_defaults_to_windows_terminal_when_unset() {
+        assert_eq!(TerminalKind::resolve_from(None, None), TerminalKind::WindowsTerminal);
+    }
+
+    #[test]
+    fn terminal_kind_resolve_from_auto_detects_iterm2_via_term_program() {
+        assert_eq!(TerminalKind::resolve_from(None, Some("iTerm.app")), TerminalKind::ITerm2);
+    }
+
+    #[test]
+    fn terminal_kind_resolve_from_ignores_unrelated_term_program_values() {
+        // tmux 3.2+ overwrites $TERM_PROGRAM=tmux for anything running inside it —
+        // this must NOT be mistaken for iTerm2 (see `TerminalKind::resolve` doc).
+        assert_eq!(TerminalKind::resolve_from(None, Some("tmux")), TerminalKind::WindowsTerminal);
+        assert_eq!(TerminalKind::resolve_from(None, Some("vscode")), TerminalKind::WindowsTerminal);
+    }
+
+    #[test]
+    fn terminal_kind_resolve_from_explicit_override_wins_over_auto_detection() {
+        // Override says iTerm2 even though $TERM_PROGRAM claims otherwise (e.g. a
+        // local-tmux session masking the real outer terminal).
+        assert_eq!(TerminalKind::resolve_from(Some("iterm2"), Some("tmux")), TerminalKind::ITerm2);
+        // Override says Windows Terminal even though $TERM_PROGRAM says iTerm2.
+        assert_eq!(TerminalKind::resolve_from(Some("windows-terminal"), Some("iTerm.app")), TerminalKind::WindowsTerminal);
+    }
+
+    #[test]
+    fn terminal_kind_resolve_from_unrecognized_override_falls_back_to_auto_detect() {
+        assert_eq!(TerminalKind::resolve_from(Some("bogus"), Some("iTerm.app")), TerminalKind::ITerm2);
+    }
+
+    #[test]
     fn osc_sequence_for_progress_is_osc_9_4() {
-        let seq = osc_sequence_for(&CtlMessage::SetProgress {
-            state: isekai_protocol::ProgressState::Normal,
-            progress: 42,
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Normal, progress: 42 },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;4;1;42\x07");
     }
@@ -777,28 +895,31 @@ mod tests {
     #[test]
     fn osc_sequence_for_progress_none_uses_state_zero() {
         let seq =
-            osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::None, progress: 0 })
-                .unwrap();
+            osc_sequence_for(
+                &CtlMessage::SetProgress { state: isekai_protocol::ProgressState::None, progress: 0 },
+                TerminalKind::WindowsTerminal,
+            )
+            .unwrap();
         assert_eq!(seq, "\x1b]9;4;0;0\x07");
     }
 
     #[test]
     fn osc_sequence_for_clipboard_push_is_osc_52_and_reuses_data_b64_verbatim() {
-        let seq = osc_sequence_for(&CtlMessage::ClipboardPush {
-            mime: ClipboardMime::TextPlain,
-            data_b64: "aGVsbG8=".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::ClipboardPush { mime: ClipboardMime::TextPlain, data_b64: "aGVsbG8=".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]52;c;aGVsbG8=\x07");
     }
 
     #[test]
     fn osc_sequence_for_pull_variants_is_none() {
-        assert!(osc_sequence_for(&CtlMessage::ClipboardPullRequest {}).is_none());
-        assert!(osc_sequence_for(&CtlMessage::ClipboardPullResponse {
-            mime: ClipboardMime::TextPlain,
-            data_b64: "aGVsbG8=".to_string(),
-        })
+        assert!(osc_sequence_for(&CtlMessage::ClipboardPullRequest {}, TerminalKind::WindowsTerminal).is_none());
+        assert!(osc_sequence_for(
+            &CtlMessage::ClipboardPullResponse { mime: ClipboardMime::TextPlain, data_b64: "aGVsbG8=".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
         .is_none());
     }
 

@@ -70,7 +70,8 @@ fn print_ctl_help() {
     println!("    isekai-pipe ctl tab-color <rrggbb> [--sock <path>]");
     println!("        (6 hex digits, optionally prefixed with '#', e.g. ff0000 or '#ff0000' —");
     println!("        quote the '#' form, unquoted it starts a shell comment;");
-    println!("        Windows Terminal only — see ISEKAI_PIPE_DESIGN.md §8 Epic M)");
+    println!("        Windows Terminal or iTerm2 (auto-detected via $TERM_PROGRAM, override");
+    println!("        with $ISEKAI_TERMINAL_KIND=windows-terminal|iterm2) — see ISEKAI_PIPE_DESIGN.md §8 Epic M)");
     println!("    isekai-pipe ctl progress <none|normal|error|indeterminate|warning> [<0-100>] [--sock <path>]");
     println!("        (progress value defaults to 0, ignored unless state is 'normal';");
     println!("        Windows Terminal only via OSC 9;4 — tab icon + taskbar integration)");
