@@ -1557,6 +1557,22 @@ mod tests {
     }
 
     #[test]
+    fn make_screen_update_carries_cursor_color_set_via_osc_12() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.on_stdout(b"\x1b]12;rgb:aa/bb/cc\x1b\\".to_vec());
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.cursor_color, Some(crate::CursorColor { r: 0xaa, g: 0xbb, b: 0xcc }));
+    }
+
+    #[test]
+    fn make_screen_update_cursor_color_is_none_by_default() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let upd = state.make_screen_update();
+        assert_eq!(upd.cursor_color, None);
+    }
+
+    #[test]
     fn make_screen_update_clamps_cursor_col_during_delayed_wrap() {
         // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)中`cols`(範囲外)を
         // 返しうる内部表現をそのまま公開する。`ScreenUpdate.cursor_col`はUIが
