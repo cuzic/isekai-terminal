@@ -37,6 +37,7 @@ import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.PanelKind
 import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.TabColor
 
 /**
  * 複数タブUI([TerminalHostScreen])のタブ切り替え・クローズ・per-tab配色テーマ変更を検証する。
@@ -126,6 +127,32 @@ class TerminalHostScreenTest {
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("alpha").assertExists()
+    }
+
+    // ── タブ色アクセントドット(Windows Terminal互換OSC 4;264 / ctlソケット経由の
+    // CtlMessage::SetTabColor、どちらもScreenUpdate.tabColorに相乗りする)────────
+
+    @Test fun tabLabel_showsAccentDot_whenRemoteSetsTabColor() {
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
+        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+
+        orchestrators[0].simulateConnected()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("tabColorDot").assertExists()
+    }
+
+    @Test fun tabLabel_hasNoAccentDot_whenTabColorUnset() {
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
+
+        orchestrators[0].simulateConnected()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
     }
 
     @Test fun clickingInactiveTab_switchesActiveTab() {
