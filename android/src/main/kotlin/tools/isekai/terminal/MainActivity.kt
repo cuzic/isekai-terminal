@@ -20,7 +20,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
@@ -264,19 +263,17 @@ fun AppRoot() {
             SnippetListScreen(
                 onAddSnippet = {
                     navVm.pendingEditSnippet = null
+                    navVm.pendingSnippetTemplate = null
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onAddFromTemplate = { template ->
-                    navVm.pendingEditSnippet = Snippet(
-                        id = 0,
-                        label = template.label,
-                        command = template.command,
-                        appendNewline = template.appendNewline,
-                    )
+                    navVm.pendingEditSnippet = null
+                    navVm.pendingSnippetTemplate = template
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onEditSnippet = { snippet ->
                     navVm.pendingEditSnippet = snippet
+                    navVm.pendingSnippetTemplate = null
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onBack = { navController.popBackStack() },
@@ -285,9 +282,18 @@ fun AppRoot() {
 
         composable(AppRoutes.SNIPPET_EDIT) {
             val editing = navVm.pendingEditSnippet
-            RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
+            val template = navVm.pendingSnippetTemplate
+            RemoteLogger.i(
+                "IsekaiTerminalNav",
+                "→ ${
+                    if (editing != null) "SnippetEdit(id=${editing.id} '${editing.label}')"
+                    else if (template != null) "SnippetEdit(template='${template.label}')"
+                    else "SnippetEdit(new)"
+                }",
+            )
             SnippetEditScreen(
                 snippet = editing,
+                template = template,
                 onSave = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
             )
