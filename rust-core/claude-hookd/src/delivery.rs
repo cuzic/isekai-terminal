@@ -8,17 +8,34 @@
 //!    set up, which then relays it to the real terminal itself. Keeps
 //!    working exactly as before for isekai-terminal users; not required for
 //!    anyone else.
-//! 2. **`Tty` with tmux passthrough** (`$TMUX` set, no `$ISEKAI_CTL_SOCK`):
-//!    writes the raw OSC directly to this pane's tty device
-//!    (`tmux display-message -p -t $TMUX_PANE '#{pane_tty}'`), wrapped in
-//!    tmux's passthrough DCS (`osc_color::wrap_for_tmux_passthrough`) so a
-//!    tmux server with `allow-passthrough on` forwards it to the real outer
-//!    terminal. Requires no isekai-terminal infrastructure at all — just a
-//!    bare `ssh` + `tmux` session and `allow-passthrough` enabled.
-//! 3. **`Tty` direct** (neither of the above; `$SSH_TTY` set): writes the
+//! 2. **`TmuxSession`** (`$TMUX` set, no `$ISEKAI_CTL_SOCK`): identifies the
+//!    tmux *session* (`tmux display-message -p -t $TMUX_PANE '#{session_id}'`),
+//!    not the pane — a real physical terminal tab is one tmux client
+//!    attached to one session, and that session can have many
+//!    windows/panes, each potentially running its own Claude Code instance.
+//!    Keying by session (not pane) means every pane in that session shares
+//!    one daemon and one aggregate [`state::TabState`], so one pane
+//!    resolving its question can't paint over another pane's still-pending
+//!    attention (2026-08, see the crate's git history for the bug this
+//!    fixes — the original per-pane keying let N independent, mutually
+//!    unaware daemons race to paint the one physical tab they all shared).
+//!    Every actual write re-resolves *at write time* which pane is
+//!    currently active in that session (`tmux display-message -p -t
+//!    <session_id> '#{pane_tty}'`) rather than caching one pane's tty at
+//!    daemon-spawn time — this also sidesteps needing to know whether tmux
+//!    forwards `allow-passthrough` from a currently-inactive pane at all:
+//!    writing into whichever pane is active *right now* always lands on the
+//!    one pane tmux is actually rendering to the attached client, and stays
+//!    correct even if the pane that happened to spawn the daemon is later
+//!    closed. Wrapped in tmux's passthrough DCS
+//!    (`osc_color::wrap_for_tmux_passthrough`) so a tmux server with
+//!    `allow-passthrough on` forwards it to the real outer terminal.
+//!    Requires no isekai-terminal infrastructure at all — just a bare `ssh`
+//!    + `tmux` session and `allow-passthrough` enabled.
+//! 3. **`DirectTty`** (neither of the above; `$SSH_TTY` set): writes the
 //!    raw, unwrapped OSC straight to `$SSH_TTY`'s device — correct when
 //!    there's no tmux in the way at all, so nothing needs to relay/unwrap
-//!    anything.
+//!    anything, and there is only ever one pane to begin with.
 //!
 //! If none of these resolve, `claude-hookd` has no way to reach a real
 //! terminal and [`Delivery::resolve`] returns `None` — callers must treat
@@ -31,7 +48,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Delivery {
     IsekaiPipeCtl { ctl_sock: PathBuf },
-    Tty { path: PathBuf, wrap_tmux_passthrough: bool },
+    TmuxSession { session_id: String },
+    DirectTty { path: PathBuf },
 }
 
 impl Delivery {
@@ -48,7 +66,7 @@ impl Delivery {
             std::env::var("ISEKAI_CTL_SOCK").ok(),
             std::env::var("TMUX_PANE").ok(),
             std::env::var("SSH_TTY").ok(),
-            query_pane_tty,
+            query_session_id,
         )
     }
 
@@ -57,38 +75,39 @@ impl Delivery {
         ctl_sock: Option<String>,
         tmux_pane: Option<String>,
         ssh_tty: Option<String>,
-        query_pane_tty: impl Fn(&str) -> Option<PathBuf>,
+        query_session_id: impl Fn(&str) -> Option<String>,
     ) -> Option<Self> {
         match explicit {
             Some("isekai-pipe") => return ctl_sock.map(|s| Delivery::IsekaiPipeCtl { ctl_sock: s.into() }),
             Some("tmux-passthrough") => {
-                return tmux_pane
-                    .as_deref()
-                    .and_then(&query_pane_tty)
-                    .map(|path| Delivery::Tty { path, wrap_tmux_passthrough: true });
+                return tmux_pane.as_deref().and_then(&query_session_id).map(|session_id| Delivery::TmuxSession { session_id });
             }
-            Some("direct") => return ssh_tty.map(|s| Delivery::Tty { path: s.into(), wrap_tmux_passthrough: false }),
+            Some("direct") => return ssh_tty.map(|s| Delivery::DirectTty { path: s.into() }),
             // unset, or an unrecognized value — fall through to auto-detect
             _ => {}
         }
         if let Some(ctl_sock) = ctl_sock {
             return Some(Delivery::IsekaiPipeCtl { ctl_sock: ctl_sock.into() });
         }
-        if let Some(path) = tmux_pane.as_deref().and_then(&query_pane_tty) {
-            return Some(Delivery::Tty { path, wrap_tmux_passthrough: true });
+        if let Some(session_id) = tmux_pane.as_deref().and_then(&query_session_id) {
+            return Some(Delivery::TmuxSession { session_id });
         }
-        ssh_tty.map(|s| Delivery::Tty { path: s.into(), wrap_tmux_passthrough: false })
+        ssh_tty.map(|s| Delivery::DirectTty { path: s.into() })
     }
 
     /// A stable string identifying this delivery target, used to derive this
     /// tab's daemon socket name (`main.rs::derive_daemon_sock_path`) — the
-    /// same target (ctl-socket path, or pane tty device) must always derive
-    /// the same daemon socket so repeated hook events for the same pane
-    /// reuse one daemon rather than spawning a new one every time.
+    /// same target (ctl-socket path, tmux session id, or direct tty device)
+    /// must always derive the same daemon socket so repeated hook events for
+    /// the same tab reuse one daemon rather than spawning a new one every
+    /// time. Crucially, `TmuxSession`'s identity is the *session*, not any
+    /// one pane — see this module's docs on why every pane in a session must
+    /// share one daemon.
     pub(crate) fn identity(&self) -> String {
         match self {
             Delivery::IsekaiPipeCtl { ctl_sock } => format!("ctl:{}", ctl_sock.display()),
-            Delivery::Tty { path, .. } => format!("tty:{}", path.display()),
+            Delivery::TmuxSession { session_id } => format!("tmux-session:{session_id}"),
+            Delivery::DirectTty { path } => format!("tty:{}", path.display()),
         }
     }
 
@@ -101,8 +120,8 @@ impl Delivery {
     pub(crate) fn to_spec(&self) -> String {
         match self {
             Delivery::IsekaiPipeCtl { ctl_sock } => format!("ctl:{}", ctl_sock.display()),
-            Delivery::Tty { path, wrap_tmux_passthrough: true } => format!("tmux-tty:{}", path.display()),
-            Delivery::Tty { path, wrap_tmux_passthrough: false } => format!("tty:{}", path.display()),
+            Delivery::TmuxSession { session_id } => format!("tmux-session:{session_id}"),
+            Delivery::DirectTty { path } => format!("tty:{}", path.display()),
         }
     }
 
@@ -110,18 +129,18 @@ impl Delivery {
         if let Some(rest) = spec.strip_prefix("ctl:") {
             return Some(Delivery::IsekaiPipeCtl { ctl_sock: PathBuf::from(rest) });
         }
-        if let Some(rest) = spec.strip_prefix("tmux-tty:") {
-            return Some(Delivery::Tty { path: PathBuf::from(rest), wrap_tmux_passthrough: true });
+        if let Some(rest) = spec.strip_prefix("tmux-session:") {
+            return Some(Delivery::TmuxSession { session_id: rest.to_string() });
         }
         if let Some(rest) = spec.strip_prefix("tty:") {
-            return Some(Delivery::Tty { path: PathBuf::from(rest), wrap_tmux_passthrough: false });
+            return Some(Delivery::DirectTty { path: PathBuf::from(rest) });
         }
         None
     }
 }
 
-fn query_pane_tty(tmux_pane: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("tmux").args(["display-message", "-p", "-t", tmux_pane, "#{pane_tty}"]).output().ok()?;
+fn query_format(target: &str, format: &str) -> Option<String> {
+    let output = std::process::Command::new("tmux").args(["display-message", "-p", "-t", target, format]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -129,26 +148,54 @@ fn query_pane_tty(tmux_pane: &str) -> Option<PathBuf> {
     if s.is_empty() {
         None
     } else {
-        Some(PathBuf::from(s))
+        Some(s)
     }
+}
+
+fn query_session_id(tmux_pane: &str) -> Option<String> {
+    query_format(tmux_pane, "#{session_id}")
+}
+
+/// Resolves *at write time* which pane is currently active in `session_id`
+/// — deliberately not cached from daemon-spawn time, see this module's docs.
+fn query_current_pane_tty(session_id: &str) -> Option<PathBuf> {
+    query_format(session_id, "#{pane_tty}").map(PathBuf::from)
 }
 
 /// Best-effort: a failed send here must never crash or wedge the caller,
 /// just drop that one color/popup update (same trust model the pre-split
 /// `isekai-pipe ctl`-based version already used).
-pub(crate) async fn send_tab_color(delivery: &Delivery, (r, g, b): (u8, u8, u8)) {
+pub(crate) async fn send_tab_color(delivery: &Delivery, rgb: (u8, u8, u8)) {
+    send_tab_color_with(delivery, rgb, query_current_pane_tty).await
+}
+
+async fn send_tab_color_with(delivery: &Delivery, (r, g, b): (u8, u8, u8), resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>) {
     match delivery {
         Delivery::IsekaiPipeCtl { ctl_sock } => {
             let _ = send_ctl_message(ctl_sock, isekai_protocol::CtlMessage::SetTabColor { r, g, b }).await;
         }
-        Delivery::Tty { path, wrap_tmux_passthrough } => {
+        Delivery::TmuxSession { session_id } => {
+            let Some(path) = resolve_active_pane_tty(session_id) else { return };
             let seq = osc_color::tab_color_sequence(osc_color::TerminalKind::resolve(), r, g, b);
-            write_tty(path, &maybe_wrap(&seq, *wrap_tmux_passthrough));
+            write_tty(&path, &osc_color::wrap_for_tmux_passthrough(&seq));
+        }
+        Delivery::DirectTty { path } => {
+            let seq = osc_color::tab_color_sequence(osc_color::TerminalKind::resolve(), r, g, b);
+            write_tty(path, &seq);
         }
     }
 }
 
 pub(crate) async fn send_notify_popup(delivery: &Delivery) {
+    send_notify_popup_with(delivery, query_current_pane_tty).await
+}
+
+async fn send_notify_popup_with(delivery: &Delivery, resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>) {
+    // OSC 9: the iTerm2/Growl-style "post a system notification" convention
+    // several terminal emulators support (same choice
+    // `isekai-ssh::ctl_forward::osc_sequence_for` makes for the same message
+    // kind).
+    let seq = "\x1b]9;Claude Code: needs your input\x07";
     match delivery {
         Delivery::IsekaiPipeCtl { ctl_sock } => {
             let _ = send_ctl_message(
@@ -163,22 +210,11 @@ pub(crate) async fn send_notify_popup(delivery: &Delivery) {
             )
             .await;
         }
-        Delivery::Tty { path, wrap_tmux_passthrough } => {
-            // OSC 9: the iTerm2/Growl-style "post a system notification"
-            // convention several terminal emulators support (same choice
-            // `isekai-ssh::ctl_forward::osc_sequence_for` makes for the same
-            // message kind).
-            let seq = "\x1b]9;Claude Code: needs your input\x07".to_string();
-            write_tty(path, &maybe_wrap(&seq, *wrap_tmux_passthrough));
+        Delivery::TmuxSession { session_id } => {
+            let Some(path) = resolve_active_pane_tty(session_id) else { return };
+            write_tty(&path, &osc_color::wrap_for_tmux_passthrough(seq));
         }
-    }
-}
-
-fn maybe_wrap(seq: &str, wrap_tmux_passthrough: bool) -> String {
-    if wrap_tmux_passthrough {
-        osc_color::wrap_for_tmux_passthrough(seq)
-    } else {
-        seq.to_string()
+        Delivery::DirectTty { path } => write_tty(path, seq),
     }
 }
 
@@ -233,40 +269,40 @@ async fn send_ctl_message(sock_path: &Path, msg: isekai_protocol::CtlMessage) ->
 mod tests {
     use super::*;
 
-    fn no_pane_tty(_pane: &str) -> Option<PathBuf> {
+    fn no_session_id(_pane: &str) -> Option<String> {
         None
     }
-    fn fake_pane_tty(_pane: &str) -> Option<PathBuf> {
-        Some(PathBuf::from("/dev/pts/3"))
+    fn fake_session_id(_pane: &str) -> Option<String> {
+        Some("$3".to_string())
     }
 
     #[test]
     fn resolves_isekai_pipe_ctl_when_ctl_sock_is_set() {
-        let d = Delivery::resolve_from(None, Some("/tmp/ctl.sock".to_string()), None, None, no_pane_tty);
+        let d = Delivery::resolve_from(None, Some("/tmp/ctl.sock".to_string()), None, None, no_session_id);
         assert_eq!(d, Some(Delivery::IsekaiPipeCtl { ctl_sock: "/tmp/ctl.sock".into() }));
     }
 
     #[test]
     fn ctl_sock_takes_priority_over_tmux_when_both_present() {
-        let d = Delivery::resolve_from(None, Some("/tmp/ctl.sock".to_string()), Some("%1".to_string()), None, fake_pane_tty);
+        let d = Delivery::resolve_from(None, Some("/tmp/ctl.sock".to_string()), Some("%1".to_string()), None, fake_session_id);
         assert_eq!(d, Some(Delivery::IsekaiPipeCtl { ctl_sock: "/tmp/ctl.sock".into() }));
     }
 
     #[test]
     fn falls_back_to_tmux_passthrough_when_no_ctl_sock() {
-        let d = Delivery::resolve_from(None, None, Some("%1".to_string()), None, fake_pane_tty);
-        assert_eq!(d, Some(Delivery::Tty { path: "/dev/pts/3".into(), wrap_tmux_passthrough: true }));
+        let d = Delivery::resolve_from(None, None, Some("%1".to_string()), None, fake_session_id);
+        assert_eq!(d, Some(Delivery::TmuxSession { session_id: "$3".to_string() }));
     }
 
     #[test]
     fn falls_back_to_direct_tty_when_no_ctl_sock_or_tmux() {
-        let d = Delivery::resolve_from(None, None, None, Some("/dev/pts/7".to_string()), no_pane_tty);
-        assert_eq!(d, Some(Delivery::Tty { path: "/dev/pts/7".into(), wrap_tmux_passthrough: false }));
+        let d = Delivery::resolve_from(None, None, None, Some("/dev/pts/7".to_string()), no_session_id);
+        assert_eq!(d, Some(Delivery::DirectTty { path: "/dev/pts/7".into() }));
     }
 
     #[test]
     fn resolves_to_none_when_nothing_is_available() {
-        let d = Delivery::resolve_from(None, None, None, None, no_pane_tty);
+        let d = Delivery::resolve_from(None, None, None, None, no_session_id);
         assert_eq!(d, None);
     }
 
@@ -277,23 +313,23 @@ mod tests {
             Some("/tmp/ctl.sock".to_string()),
             Some("%1".to_string()),
             None,
-            fake_pane_tty,
+            fake_session_id,
         );
-        assert_eq!(d, Some(Delivery::Tty { path: "/dev/pts/3".into(), wrap_tmux_passthrough: true }));
+        assert_eq!(d, Some(Delivery::TmuxSession { session_id: "$3".to_string() }));
     }
 
     #[test]
     fn explicit_override_with_no_usable_target_is_none_not_a_fallback() {
-        // Forced tmux-passthrough but not actually inside tmux (no pane tty
+        // Forced tmux-passthrough but not actually inside tmux (no session id
         // resolvable) — must not silently fall back to a different mechanism
         // the user didn't ask for.
-        let d = Delivery::resolve_from(Some("tmux-passthrough"), Some("/tmp/ctl.sock".to_string()), None, None, no_pane_tty);
+        let d = Delivery::resolve_from(Some("tmux-passthrough"), Some("/tmp/ctl.sock".to_string()), None, None, no_session_id);
         assert_eq!(d, None);
     }
 
     #[test]
     fn explicit_isekai_pipe_override_requires_ctl_sock() {
-        let d = Delivery::resolve_from(Some("isekai-pipe"), None, None, None, no_pane_tty);
+        let d = Delivery::resolve_from(Some("isekai-pipe"), None, None, None, no_session_id);
         assert_eq!(d, None);
     }
 
@@ -301,8 +337,8 @@ mod tests {
     fn spec_round_trips_for_all_variants() {
         for d in [
             Delivery::IsekaiPipeCtl { ctl_sock: "/tmp/a.sock".into() },
-            Delivery::Tty { path: "/dev/pts/3".into(), wrap_tmux_passthrough: true },
-            Delivery::Tty { path: "/dev/pts/7".into(), wrap_tmux_passthrough: false },
+            Delivery::TmuxSession { session_id: "$3".to_string() },
+            Delivery::DirectTty { path: "/dev/pts/7".into() },
         ] {
             assert_eq!(Delivery::from_spec(&d.to_spec()), Some(d));
         }
@@ -311,20 +347,45 @@ mod tests {
     #[test]
     fn identity_distinguishes_ctl_from_tty_at_the_same_path_string() {
         let ctl = Delivery::IsekaiPipeCtl { ctl_sock: "/tmp/x".into() };
-        let tty = Delivery::Tty { path: "/tmp/x".into(), wrap_tmux_passthrough: false };
+        let tty = Delivery::DirectTty { path: "/tmp/x".into() };
         assert_ne!(ctl.identity(), tty.identity());
     }
 
+    #[test]
+    fn identity_is_shared_across_panes_of_the_same_tmux_session() {
+        // The whole point of keying by session rather than pane: two
+        // different panes (different `$TMUX_PANE`, different underlying
+        // pane tty) in the same session must still resolve to the same
+        // daemon so they share one aggregate `TabState` — see this module's
+        // docs on the multi-pane-vs-one-physical-tab bug this fixes.
+        let pane_a = Delivery::resolve_from(None, None, Some("%1".to_string()), None, |_| Some("$3".to_string()));
+        let pane_b = Delivery::resolve_from(None, None, Some("%2".to_string()), None, |_| Some("$3".to_string()));
+        assert_eq!(pane_a.unwrap().identity(), pane_b.unwrap().identity());
+    }
+
     #[tokio::test]
-    async fn send_tab_color_over_tty_writes_the_wrapped_osc() {
+    async fn send_tab_color_over_tmux_session_resolves_the_active_pane_at_write_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fake-tty");
         std::fs::write(&path, b"").unwrap();
-        let delivery = Delivery::Tty { path: path.clone(), wrap_tmux_passthrough: true };
-        send_tab_color(&delivery, (0xff, 0x00, 0x00)).await;
+        let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
+        let resolved_path = path.clone();
+        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), move |session_id| {
+            assert_eq!(session_id, "$3");
+            Some(resolved_path.clone())
+        })
+        .await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.starts_with("\x1bPtmux;"), "must be wrapped for tmux passthrough: {written:?}");
         assert!(written.contains("4;264;rgb:ff/00/00"), "must contain the WT-compatible tab-color OSC: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn send_tab_color_over_tmux_session_is_a_silent_no_op_when_no_pane_resolves() {
+        // e.g. every pane in the session has since been closed — must not
+        // panic or write anywhere.
+        let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
+        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), |_| None).await;
     }
 
     #[tokio::test]
@@ -332,7 +393,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fake-tty");
         std::fs::write(&path, b"").unwrap();
-        let delivery = Delivery::Tty { path: path.clone(), wrap_tmux_passthrough: false };
+        let delivery = Delivery::DirectTty { path: path.clone() };
         send_tab_color(&delivery, (0x00, 0xff, 0x00)).await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.starts_with("\x1bPtmux;"), "direct delivery must not wrap: {written:?}");

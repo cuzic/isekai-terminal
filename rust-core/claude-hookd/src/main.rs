@@ -213,12 +213,13 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
 }
 
 /// Derives this delivery target's daemon socket path deterministically from
-/// [`Delivery::identity`] (a stable string: the ctl-socket path, or the pane
-/// tty device path) via a non-cryptographic hash — short and filename-safe
-/// regardless of how long/unusual the underlying path is, while still
-/// mapping the same target to the same daemon every time so repeated hook
-/// events for one pane reuse one daemon rather than spawning a new one per
-/// event.
+/// [`Delivery::identity`] (a stable string: the ctl-socket path, the tmux
+/// session id, or the direct tty device path) via a non-cryptographic hash —
+/// short and filename-safe regardless of how long/unusual the underlying
+/// path is, while still mapping the same target to the same daemon every
+/// time so repeated hook events for the same tab (every pane of one tmux
+/// session, for `TmuxSession`) reuse one daemon rather than spawning a new
+/// one per event.
 #[cfg(unix)]
 fn derive_daemon_sock_path(delivery: &Delivery) -> PathBuf {
     use std::hash::{Hash, Hasher};
@@ -533,8 +534,8 @@ mod tests {
 
     #[test]
     fn derive_daemon_sock_path_differs_for_different_targets() {
-        let a = derive_daemon_sock_path(&Delivery::Tty { path: "/dev/pts/3".into(), wrap_tmux_passthrough: true });
-        let b = derive_daemon_sock_path(&Delivery::Tty { path: "/dev/pts/4".into(), wrap_tmux_passthrough: true });
+        let a = derive_daemon_sock_path(&Delivery::TmuxSession { session_id: "$1".to_string() });
+        let b = derive_daemon_sock_path(&Delivery::TmuxSession { session_id: "$2".to_string() });
         assert_ne!(a, b);
     }
 }

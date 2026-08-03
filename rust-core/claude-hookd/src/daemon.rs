@@ -274,7 +274,7 @@ mod tests {
     /// startup self-heal, a Notify→Attention transition (color + popup),
     /// an attention timeout back to Idle, and self-exit — using millisecond
     /// timeout config values so the whole test runs in well under a second
-    /// instead of the real 10-minute/1-hour durations. Uses `Delivery::Tty`
+    /// instead of the real 10-minute/1-hour durations. Uses `Delivery::DirectTty`
     /// against a plain tempfile standing in for a pty device (a real pty
     /// isn't needed to verify the daemon writes the right bytes at the
     /// right times).
@@ -289,7 +289,7 @@ mod tests {
         let attention_color = (0xff, 0x88, 0x00);
         let daemon = tokio::spawn(run(DaemonConfig {
             sock_path: hookd_sock_path.clone(),
-            delivery: Delivery::Tty { path: tty_path.clone(), wrap_tmux_passthrough: false },
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
             idle_color,
             attention_color,
             attention_timeout: Duration::from_millis(100),
@@ -361,7 +361,7 @@ mod tests {
             Duration::from_secs(2),
             run(DaemonConfig {
                 sock_path: hookd_sock_path.clone(),
-                delivery: Delivery::Tty { path: dir.path().join("fake-tty"), wrap_tmux_passthrough: false },
+                delivery: Delivery::DirectTty { path: dir.path().join("fake-tty") },
                 idle_color: (0, 0, 0),
                 attention_color: (0, 0, 0),
                 attention_timeout: Duration::from_millis(50),
@@ -454,7 +454,7 @@ mod tests {
             Duration::from_secs(2),
             run(DaemonConfig {
                 sock_path: hookd_sock_path.clone(),
-                delivery: Delivery::Tty { path: dir.path().join("fake-tty"), wrap_tmux_passthrough: false },
+                delivery: Delivery::DirectTty { path: dir.path().join("fake-tty") },
                 idle_color: (0, 0, 0),
                 attention_color: (0, 0, 0),
                 attention_timeout: Duration::from_millis(50),
