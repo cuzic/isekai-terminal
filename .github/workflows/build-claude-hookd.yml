@@ -1,17 +1,17 @@
 name: Build claude-hookd (on-demand)
 
 # 手動実行専用: claude-hookd(rust-core/claude-hookd/、isekai-terminal/isekai-ssh
-# から独立したスタンドアロンcrate)のLinux x86_64向けreleaseバイナリをビルドし、
+# から独立したスタンドアロンcrate)のx86_64 Linux musl静的バイナリをビルドし、
 # artifactとして出力する。「ローカルではcargo buildしない」というこのプロジェクトの
 # 方針(CLAUDE.md/.claude/rules参照)に従い、実際に動かすバイナリは常にここで
 # ビルドしたものをダウンロードして使う。
 #
-# musl静的バイナリではなくホストのglibcビルド(ubuntu-24.04ランナー同等の環境)——
-# isekai-pipe/isekai-sshのように任意の未知のリモートLinuxへ配布するのではなく、
-# 動かす環境(このrepoの開発サンドボックス、または動作確認済みの手元Linux)を
-# 制御できる前提のため、静的リンクの必要性が薄い。将来複数アーキテクチャ/
-# 配布用の静的バイナリが要るようになったらbuild-isekai-pipe-musl.shに倣って
-# 拡張する。
+# ホストのglibcビルド(ubuntu-24.04 = glibc 2.39+)ではなくmusl静的リンクを選ぶ理由:
+# 実際に動かす先(このrepoの開発サンドボックス = Debian 12/glibc 2.36)がビルド元の
+# GitHub Actionsランナーよりglibcが古く、動的リンクだと`GLIBC_2.39' not found`で
+# 起動できないことが判明した(2026-08、実機確認)。isekai-pipe/isekai-sshが同じ理由で
+# musl静的リンクにしている(build-isekai-pipe-musl.sh)のに倣う——配布先のglibc
+# バージョンを一切気にしなくてよくなる。
 
 on:
   workflow_dispatch:
@@ -39,23 +39,36 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust-core/target
-          key: build-claude-hookd-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: build-claude-hookd-musl-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            build-claude-hookd-${{ runner.os }}-
+            build-claude-hookd-musl-${{ runner.os }}-
 
-      - name: Build claude-hookd (release)
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
+      - name: Build claude-hookd (release, x86_64-unknown-linux-musl)
         working-directory: rust-core
-        run: cargo build --release -p claude-hookd
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
+          rustup target add x86_64-unknown-linux-musl
+          cargo zigbuild --release -p claude-hookd --target x86_64-unknown-linux-musl
 
       - name: sha256 the binary
         working-directory: rust-core
-        run: sha256sum target/release/claude-hookd | awk '{print $1}' > target/release/claude-hookd.sha256
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/claude-hookd
+          sha256sum "$bin" | awk '{print $1}' > "$bin.sha256"
 
       - name: Upload claude-hookd binary
         uses: actions/upload-artifact@v4
         with:
-          name: claude-hookd-linux-x86_64
+          name: claude-hookd-linux-x86_64-musl
           path: |
-            rust-core/target/release/claude-hookd
-            rust-core/target/release/claude-hookd.sha256
+            rust-core/target/x86_64-unknown-linux-musl/release/claude-hookd
+            rust-core/target/x86_64-unknown-linux-musl/release/claude-hookd.sha256
           retention-days: 7
