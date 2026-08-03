@@ -31,10 +31,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+#[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
 mod delivery;
 mod state;
 
+#[cfg(unix)]
 use delivery::Delivery;
 use state::HookEvent;
 
@@ -216,6 +219,7 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
 /// mapping the same target to the same daemon every time so repeated hook
 /// events for one pane reuse one daemon rather than spawning a new one per
 /// event.
+#[cfg(unix)]
 fn derive_daemon_sock_path(delivery: &Delivery) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -223,6 +227,7 @@ fn derive_daemon_sock_path(delivery: &Delivery) -> PathBuf {
     PathBuf::from(format!("/tmp/{DAEMON_SOCK_PREFIX}{:016x}.sock", hasher.finish()))
 }
 
+#[cfg(unix)]
 fn sweep_stale_daemon_sockets() {
     let _ = ctl_gc::sweep_stale_sockets(Path::new("/tmp"), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }

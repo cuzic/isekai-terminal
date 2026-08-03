@@ -188,7 +188,20 @@ fn write_tty(path: &Path, bytes: &str) {
     // and infrequent (one per state transition, not per hook event — see
     // `state.rs`'s debouncing), so a blocking open+write from an async
     // context is an acceptable, simpler alternative to `tokio::fs` here.
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+    //
+    // `.append(true)` (not just `.write(true)`) matters: a real tty/pty
+    // device has no meaningful seek position, so this makes no behavioral
+    // difference there — but this same function's tests stand a plain
+    // tempfile in for the tty, and a bare `.write(true)` open always seeks
+    // to position 0 on every call, so a shorter write doesn't fully
+    // overwrite a longer previous one and leaves stale trailing bytes
+    // behind (found via a real, non-deterministic CI failure: a slow CI
+    // runner let the attention timeout fire and overwrite before the test's
+    // own read, and the leftover tail of the earlier, longer popup message
+    // survived past the new, shorter idle-color write and corrupted the
+    // assertion). `.append(true)` makes every write observably a clean
+    // sequential log instead.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).append(true).open(path) {
         let _ = f.write_all(bytes.as_bytes());
     }
 }
