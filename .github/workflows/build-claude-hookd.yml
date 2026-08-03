@@ -1,0 +1,61 @@
+name: Build claude-hookd (on-demand)
+
+# 手動実行専用: claude-hookd(rust-core/claude-hookd/、isekai-terminal/isekai-ssh
+# から独立したスタンドアロンcrate)のLinux x86_64向けreleaseバイナリをビルドし、
+# artifactとして出力する。「ローカルではcargo buildしない」というこのプロジェクトの
+# 方針(CLAUDE.md/.claude/rules参照)に従い、実際に動かすバイナリは常にここで
+# ビルドしたものをダウンロードして使う。
+#
+# musl静的バイナリではなくホストのglibcビルド(ubuntu-24.04ランナー同等の環境)——
+# isekai-pipe/isekai-sshのように任意の未知のリモートLinuxへ配布するのではなく、
+# 動かす環境(このrepoの開発サンドボックス、または動作確認済みの手元Linux)を
+# 制御できる前提のため、静的リンクの必要性が薄い。将来複数アーキテクチャ/
+# 配布用の静的バイナリが要るようになったらbuild-isekai-pipe-musl.shに倣って
+# 拡張する。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-claude-hookd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: build-claude-hookd-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            build-claude-hookd-${{ runner.os }}-
+
+      - name: Build claude-hookd (release)
+        working-directory: rust-core
+        run: cargo build --release -p claude-hookd
+
+      - name: sha256 the binary
+        working-directory: rust-core
+        run: sha256sum target/release/claude-hookd | awk '{print $1}' > target/release/claude-hookd.sha256
+
+      - name: Upload claude-hookd binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-hookd-linux-x86_64
+          path: |
+            rust-core/target/release/claude-hookd
+            rust-core/target/release/claude-hookd.sha256
+          retention-days: 7
