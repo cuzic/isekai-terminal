@@ -1182,6 +1182,19 @@ fun TerminalScreenBody(
                             CtrlBtn("Wheel▼") { sendWheel(MouseButton.WHEEL_DOWN, 1) }
                             CtrlBtn("Wheel▲3x") { sendWheel(MouseButton.WHEEL_UP, 3) }
                             CtrlBtn("Wheel▼3x") { sendWheel(MouseButton.WHEEL_DOWN, 3) }
+                            // タスク#19の「IME開閉のたびに自動でresizeしない」方針はそのまま
+                            // 維持しつつ、ユーザーが明示的に望んだ時だけ手動でtty実サイズを
+                            // 現在の実効ビューポートへ同期する脱出口。stableHeightPxを現在の
+                            // 実測heightPxへ強制的に合わせるだけで、既存の
+                            // `LaunchedEffect(cols, rows, connected)`がcols/rowsの変化を検知して
+                            // 自動的にonResizeを送るため、ここから直接onResizeを呼ぶ必要はない
+                            // (2026-08、接続直後の空スクロールバック状態でIME表示中に凍結グリッド
+                            // の下端クリップがプロンプトを画面外へ追いやり何も見えなくなる実機
+                            // 不具合が見つかったことがきっかけ)。
+                            CtrlBtn("Resize") {
+                                onAuxDrawerActivity()
+                                resizeStability = resizeStability.copy(stableHeightPx = heightPx, hasObservedImeClosed = true)
+                            }
                         }
                     }
 
