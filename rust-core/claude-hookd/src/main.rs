@@ -50,15 +50,22 @@ use state::HookEvent;
 /// a Claude Code hook (which this must never visibly block) doesn't stall.
 const SPAWN_RETRY_DELAYS_MS: [u64; 5] = [50, 100, 200, 400, 800];
 
-/// Fallback colors used when `$ISEKAI_TAB_IDLE_COLOR`/`$ISEKAI_TAB_ATTENTION_COLOR`
-/// were never set. These env var names are unchanged from before this
-/// crate's split from `isekai-pipe` — kept for backward compat with
-/// `isekai-ssh`'s `#@isekai tab-idle-color`/`tab-attention-color` directives
-/// (which inject exactly these names into the remote session), but reading
-/// them creates no code dependency on isekai-ssh: anyone can set these two
-/// env vars directly regardless of how the session was started.
+/// Fallback colors used when `$ISEKAI_TAB_IDLE_COLOR`/`$ISEKAI_TAB_ATTENTION_COLOR`/
+/// `$ISEKAI_TAB_WAITING_COLOR` were never set. The first two env var names are
+/// unchanged from before this crate's split from `isekai-pipe` — kept for
+/// backward compat with `isekai-ssh`'s `#@isekai tab-idle-color`/
+/// `tab-attention-color` directives (which inject exactly these names into
+/// the remote session), but reading them creates no code dependency on
+/// isekai-ssh: anyone can set these env vars directly regardless of how the
+/// session was started. `ISEKAI_TAB_WAITING_COLOR` is new (2026-08, alongside
+/// `state::Aggregate::Waiting`) and has no such legacy directive yet.
 pub(crate) const DEFAULT_IDLE_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
 pub(crate) const DEFAULT_ATTENTION_COLOR: (u8, u8, u8) = (0xff, 0x88, 0x00);
+/// A dim blue — visually distinct from both the idle gray and the attention
+/// orange, and calm on purpose: this color means "something's happening,
+/// probably nothing you need to do," not "come look now" (compare
+/// `DEFAULT_ATTENTION_COLOR`, which also gets a popup; this one never does).
+pub(crate) const DEFAULT_WAITING_COLOR: (u8, u8, u8) = (0x00, 0x60, 0xa0);
 
 /// Prefix for this crate's own daemon sockets under `/tmp` (unrelated to
 /// `isekai-pipe-ctl-*` now that this crate no longer depends on isekai-pipe
@@ -127,15 +134,20 @@ async fn event_command() -> ExitCode {
 
     let idle_color = std::env::var("ISEKAI_TAB_IDLE_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
 
-    // Only `Notify` lazily spawns a daemon: if none is running there is by
-    // definition no attention state for a *daemon-tracked* `Resolve` to
-    // clear. This matters more than it looks — dropping `PostToolUse`'s
-    // matcher means it now fires on *every* tool call, so paying
-    // `SPAWN_RETRY_DELAYS_MS`'s ~1.55s worst case on each one whenever no
-    // daemon happens to be running would add real, visible latency to
-    // ordinary tool use. It also protects `SessionEnd`, whose hooks have a
-    // documented 1.5s default timeout that ladder alone could exceed.
-    if event != HookEvent::Notify {
+    // Only `Notify`/`StopDeferred` lazily spawn a daemon: if none is running
+    // there is by definition no pending state for a *daemon-tracked*
+    // `Resolve` to clear. This matters more than it looks — dropping
+    // `PostToolUse`'s matcher means it now fires on *every* tool call, so
+    // paying `SPAWN_RETRY_DELAYS_MS`'s ~1.55s worst case on each one
+    // whenever no daemon happens to be running would add real, visible
+    // latency to ordinary tool use. It also protects `SessionEnd`, whose
+    // hooks have a documented 1.5s default timeout that ladder alone could
+    // exceed. `StopDeferred` must spawn just like `Notify` — otherwise a
+    // `StopDeferred` arriving with no daemon running records nothing at all,
+    // and the eventual self-correcting promotion to `Attention` (see
+    // `state.rs::apply_timeout`) would silently never happen for that
+    // session.
+    if !matches!(event, HookEvent::Notify | HookEvent::StopDeferred) {
         // `SessionEnd` alone still gets one direct, best-effort, idempotent
         // idle-color write — bypassing the daemon/state machine entirely —
         // when no daemon answers. Without this, "the daemon happened to be
@@ -153,7 +165,8 @@ async fn event_command() -> ExitCode {
     }
 
     let attention_color = std::env::var("ISEKAI_TAB_ATTENTION_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
-    spawn_detached_daemon(&daemon_sock_path, &delivery, idle_color, attention_color);
+    let waiting_color = std::env::var("ISEKAI_TAB_WAITING_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
+    spawn_detached_daemon(&daemon_sock_path, &delivery, idle_color, attention_color, waiting_color);
 
     for delay_ms in SPAWN_RETRY_DELAYS_MS {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -176,8 +189,37 @@ async fn event_command() -> ExitCode {
 /// still deserves a direct, one-off self-heal tab-color write (see its call
 /// site); every other `Resolve` reaching a dead/absent daemon is left alone.
 ///
+/// A `Stop` means "waiting on a background task/agent that will auto-resume
+/// me" (`HookEvent::StopDeferred`, not "blocked on a human"
+/// (`HookEvent::Notify`)) when its `background_tasks` array (present on the
+/// real `Stop` hook payload — confirmed 2026-08-03 by reading the zod
+/// schemas embedded in the installed Claude Code CLI binary, then verified
+/// live by dumping a real `Stop` payload from a `Bash(run_in_background)`
+/// session; **not** documented in the public hooks reference, which is
+/// incomplete for this payload — see `claude-hookd-background-tasks-design`
+/// in the user's memory system for the full trail) contains an entry whose
+/// `type` is `"shell"` or `"subagent"` — the two mechanisms this crate
+/// actually means to detect (`Bash` with `run_in_background`, and a
+/// backgrounded `Agent`/subagent). Deliberately narrower than "array
+/// non-empty": the array can also contain `"teammate"`/`"dream"`/
+/// `"auto-mode scan"`/`"monitor"`/etc. entries that can sit `running`
+/// indefinitely (e.g. an idle teammate under `CLAUDE_CODE_TEAMMATE_MODE`),
+/// which an earlier, reverted attempt at this same fix (2026-08-03, believed
+/// at the time to be checking a nonexistent field — it wasn't) learned the
+/// hard way not to trust wholesale. An unrecognized/future `type` also fails
+/// to the safe (still-`Notify`) side, by construction (`matches!` against an
+/// explicit allowlist, not a denylist).
+///
+/// `StopDeferred` is not a permanent suppression — see `state.rs`'s
+/// `Pending::Deferred`/`apply_timeout` for the bounded self-correction that
+/// makes this safe even when the guess is wrong (an even earlier attempt at
+/// this fix, having Claude self-report a marker string when *it* judged a
+/// `Stop` ambiguous, was reverted the same day after producing false
+/// negatives with no such backstop — self-report alone isn't trustworthy for
+/// this, see `claude-hookd-self-report-marker-failed` in memory).
+///
 /// See the pre-split `isekai-pipe` version's doc comment (git history) for
-/// the detailed rationale behind each of these mappings — carried over
+/// the detailed rationale behind the other mappings below — carried over
 /// unchanged, this is purely a file move.
 #[cfg(unix)]
 fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
@@ -186,10 +228,10 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
     let hook_event_name = value.get("hook_event_name")?.as_str()?;
     let tool_name = value.get("tool_name").and_then(|v| v.as_str());
     let in_subagent = value.get("agent_id").is_some();
-    let background_work_pending = value
+    let has_relevant_background_work = value
         .get("background_tasks")
         .and_then(|v| v.as_array())
-        .is_some_and(|tasks| !tasks.is_empty());
+        .is_some_and(|tasks| tasks.iter().any(|t| matches!(t.get("type").and_then(|v| v.as_str()), Some("shell" | "subagent"))));
 
     let event = match hook_event_name {
         "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
@@ -200,7 +242,8 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
             Some(_) => return None,
             None => HookEvent::Notify,
         },
-        "Stop" if !background_work_pending => HookEvent::Notify,
+        "Stop" if has_relevant_background_work => HookEvent::StopDeferred,
+        "Stop" => HookEvent::Notify,
         "StopFailure" => HookEvent::Notify,
         "PermissionRequest" => HookEvent::Notify,
         "PreToolUse" if tool_name == Some("AskUserQuestion") => HookEvent::Notify,
@@ -247,6 +290,7 @@ async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> boo
     };
     let event_name = match event {
         HookEvent::Notify => "notify",
+        HookEvent::StopDeferred => "stop_deferred",
         HookEvent::Resolve => "resolve",
     };
     let Ok(session_id_json) = serde_json::to_string(session_id) else {
@@ -267,7 +311,13 @@ async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> boo
 /// depend on which of several near-simultaneous hook processes happened to
 /// win the spawn race.
 #[cfg(unix)]
-fn spawn_detached_daemon(daemon_sock_path: &Path, delivery: &Delivery, idle_color: Option<(u8, u8, u8)>, attention_color: Option<(u8, u8, u8)>) {
+fn spawn_detached_daemon(
+    daemon_sock_path: &Path,
+    delivery: &Delivery,
+    idle_color: Option<(u8, u8, u8)>,
+    attention_color: Option<(u8, u8, u8)>,
+    waiting_color: Option<(u8, u8, u8)>,
+) {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
@@ -283,6 +333,9 @@ fn spawn_detached_daemon(daemon_sock_path: &Path, delivery: &Delivery, idle_colo
     }
     if let Some(color) = attention_color {
         cmd.arg("--attention-color").arg(osc_color::format_hex_color(color));
+    }
+    if let Some(color) = waiting_color {
+        cmd.arg("--waiting-color").arg(osc_color::format_hex_color(color));
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // Safety: the closure only calls `setsid(2)`, an async-signal-safe libc
@@ -447,17 +500,50 @@ mod tests {
     }
 
     #[test]
-    fn stop_without_pending_background_work_is_notify() {
-        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+    fn stop_without_background_tasks_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#;
         assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
     }
 
     #[test]
-    fn stop_with_pending_background_work_is_ignored() {
-        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","status":"running"}]}"#;
-        assert_eq!(parse_hook_event(payload), None);
+    fn stop_with_a_shell_or_subagent_background_task_is_deferred() {
+        for kind in ["shell", "subagent"] {
+            let payload = format!(
+                r#"{{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{{"id":"t1","type":"{kind}","status":"running"}}]}}"#
+            );
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), HookEvent::StopDeferred, false)),
+                "type {kind:?} should defer"
+            );
+        }
+    }
+
+    /// The type filter is deliberately an allowlist, not "array non-empty"
+    /// — a long-lived `teammate`/`dream`/`monitor`/etc. entry must not
+    /// suppress attention (see `parse_hook_event`'s doc comment on why the
+    /// original, reverted `!is_empty()` version was too permissive).
+    #[test]
+    fn stop_with_only_non_relevant_background_task_types_is_notify() {
+        for kind in ["teammate", "dream", "auto-mode scan", "monitor", "MCP task", "cloud session", "workflow", "some-future-type"] {
+            let payload = format!(
+                r#"{{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{{"id":"t1","type":"{kind}","status":"running"}}]}}"#
+            );
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), HookEvent::Notify, false)),
+                "type {kind:?} should not defer"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_defers_if_any_entry_is_relevant_even_alongside_irrelevant_ones() {
+        let payload =
+            br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"},{"id":"t2","type":"shell","status":"running"}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
     }
 
     #[test]

@@ -21,6 +21,18 @@ use super::state::{apply_event, apply_timeout, Action, HookEvent, TabState};
 /// reading the value from somewhere.
 const ATTENTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How long a `Deferred` session (an ambiguous `Stop` — see `state.rs`'s
+/// module docs) is given the benefit of the doubt before [`apply_timeout`]
+/// promotes it to `Attention`. Deliberately longer than `ATTENTION_TIMEOUT`:
+/// this bound is meant to almost never actually fire (a normal background
+/// wait — a CI run, a long build — should resolve on its own well within
+/// it); if it routinely does, all that's been gained is a delayed false
+/// positive. Must stay comfortably under `IDLE_EXIT`, since a `Deferred`-
+/// only tab receives no further *events* to reset the idle-exit clock — with
+/// the current defaults (30 + 10 = 40 min < 60 min) a promotion is always
+/// reachable before self-exit.
+const MAX_DEFERRAL: Duration = Duration::from_secs(30 * 60);
+
 /// How long this daemon keeps running with no events at all before exiting
 /// on its own — its socket file is left for the next `claude-hookd event`
 /// invocation's sweep to reclaim.
@@ -48,11 +60,14 @@ struct DaemonConfig {
     delivery: Delivery,
     idle_color: (u8, u8, u8),
     attention_color: (u8, u8, u8),
+    waiting_color: (u8, u8, u8),
     /// Overridable only via the undocumented `--attention-timeout-ms`/
-    /// `--idle-exit-ms` flags, which exist solely so this module's own
-    /// tests can drive a real daemon through both timeout paths in
-    /// milliseconds instead of the real 10-minute/1-hour durations.
+    /// `--max-deferral-ms`/`--idle-exit-ms` flags, which exist solely so
+    /// this module's own tests can drive a real daemon through every
+    /// timeout/promotion path in milliseconds instead of the real
+    /// 10-minute/30-minute/1-hour durations.
     attention_timeout: Duration,
+    max_deferral: Duration,
     idle_exit: Duration,
 }
 
@@ -67,7 +82,9 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
     let mut delivery_spec = None;
     let mut idle_color = None;
     let mut attention_color = None;
+    let mut waiting_color = None;
     let mut attention_timeout = ATTENTION_TIMEOUT;
+    let mut max_deferral = MAX_DEFERRAL;
     let mut idle_exit = IDLE_EXIT;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -75,9 +92,15 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
             "--delivery-spec" => delivery_spec = args.next(),
             "--idle-color" => idle_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
             "--attention-color" => attention_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
+            "--waiting-color" => waiting_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
             "--attention-timeout-ms" => {
                 if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
                     attention_timeout = Duration::from_millis(ms);
+                }
+            }
+            "--max-deferral-ms" => {
+                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
+                    max_deferral = Duration::from_millis(ms);
                 }
             }
             "--idle-exit-ms" => {
@@ -96,7 +119,9 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
         delivery,
         idle_color: idle_color.unwrap_or(super::DEFAULT_IDLE_COLOR),
         attention_color: attention_color.unwrap_or(super::DEFAULT_ATTENTION_COLOR),
+        waiting_color: waiting_color.unwrap_or(super::DEFAULT_WAITING_COLOR),
         attention_timeout,
+        max_deferral,
         idle_exit,
     })
     .await;
@@ -173,12 +198,12 @@ async fn run(config: DaemonConfig) {
                 let Some((session_id, event)) = received else { break };
                 idle_exit_deadline = Instant::now() + config.idle_exit;
                 let now = Instant::now();
-                let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout);
+                let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout, config.max_deferral);
                 state = next_state;
                 execute_actions(&config, &actions).await;
             }
             () = attention_sleep(&state) => {
-                let (next_state, actions) = apply_timeout(&state, Instant::now());
+                let (next_state, actions) = apply_timeout(&state, Instant::now(), config.attention_timeout);
                 state = next_state;
                 execute_actions(&config, &actions).await;
             }
@@ -219,8 +244,9 @@ fn classify_accept_error(kind: io::ErrorKind, consecutive_backoff_failures: u32)
     }
 }
 
-/// Resolves at `state`'s earliest pending `Attention` deadline, or never
-/// resolves at all if the tab is fully idle.
+/// Resolves at `state`'s earliest pending deadline — `Attention` eviction or
+/// `Deferred` promotion, whichever is sooner — or never resolves at all if
+/// the tab is fully idle.
 async fn attention_sleep(state: &TabState) {
     match state.next_deadline() {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
@@ -228,7 +254,8 @@ async fn attention_sleep(state: &TabState) {
     }
 }
 
-/// Reads exactly one `{"session_id": "...", "event": "notify"|"resolve"}`
+/// Reads exactly one
+/// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"}`
 /// line — the daemon's own minimal wire format, deliberately decoupled from
 /// Claude Code's own hook JSON schema (only `super::parse_hook_event`, the
 /// client side, needs to know that shape).
@@ -244,6 +271,7 @@ async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, 
     let session_id = value.get("session_id")?.as_str()?.to_string();
     let event = match value.get("event")?.as_str()? {
         "notify" => HookEvent::Notify,
+        "stop_deferred" => HookEvent::StopDeferred,
         "resolve" => HookEvent::Resolve,
         _ => return None,
     };
@@ -256,6 +284,9 @@ async fn execute_actions(config: &DaemonConfig, actions: &[Action]) {
             Action::SetAttentionColorAndPopup => {
                 delivery::send_tab_color(&config.delivery, config.attention_color).await;
                 delivery::send_notify_popup(&config.delivery).await;
+            }
+            Action::SetWaitingColor => {
+                delivery::send_tab_color(&config.delivery, config.waiting_color).await;
             }
             Action::SetIdleColor => {
                 delivery::send_tab_color(&config.delivery, config.idle_color).await;
@@ -287,12 +318,15 @@ mod tests {
 
         let idle_color = (0x20, 0x20, 0x20);
         let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
         let daemon = tokio::spawn(run(DaemonConfig {
             sock_path: hookd_sock_path.clone(),
             delivery: Delivery::DirectTty { path: tty_path.clone() },
             idle_color,
             attention_color,
+            waiting_color,
             attention_timeout: Duration::from_millis(100),
+            max_deferral: Duration::from_millis(150),
             idle_exit: Duration::from_millis(300),
         }));
 
@@ -324,6 +358,52 @@ mod tests {
         // daemon task completes on its own.
         tokio::time::timeout(Duration::from_secs(2), daemon).await.expect("daemon did not self-exit in time").unwrap();
         assert!(hookd_sock_path.exists(), "graceful self-exit must not unlink its own socket file");
+    }
+
+    /// Drives the new `stop_deferred` wire event through a real daemon: a
+    /// `Deferred` session paints the waiting color with **no** popup, and
+    /// once `max_deferral` elapses with no further event, the daemon
+    /// self-corrects by promoting it to `Attention` — the actual color +
+    /// popup a wrongly-suppressed real notification eventually still gets.
+    #[tokio::test]
+    async fn stop_deferred_paints_waiting_then_self_corrects_to_attention() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(100),
+            max_deferral: Duration::from_millis(80),
+            idle_exit: Duration::from_secs(5),
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_deferred\"}\n").await.unwrap();
+        drop(client);
+
+        poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "stop_deferred must paint the waiting color").await;
+        assert!(
+            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;"),
+            "stop_deferred must never emit the attention popup"
+        );
+
+        // No further events — max_deferral (80ms) elapses and the daemon
+        // promotes the still-Deferred session to Attention on its own.
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must self-correct to the attention color").await;
+        poll_tty_contains(&tty_path, "]9;", "the self-correction must fire the popup, same as a real Notify would").await;
+
+        daemon.abort();
     }
 
     /// Polls (generous timeout, short interval) until `condition` returns
@@ -364,7 +444,9 @@ mod tests {
                 delivery: Delivery::DirectTty { path: dir.path().join("fake-tty") },
                 idle_color: (0, 0, 0),
                 attention_color: (0, 0, 0),
+                waiting_color: (0, 0, 0),
                 attention_timeout: Duration::from_millis(50),
+                max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
             }),
         )
@@ -457,7 +539,9 @@ mod tests {
                 delivery: Delivery::DirectTty { path: dir.path().join("fake-tty") },
                 idle_color: (0, 0, 0),
                 attention_color: (0, 0, 0),
+                waiting_color: (0, 0, 0),
                 attention_timeout: Duration::from_millis(50),
+                max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
             }),
         )
