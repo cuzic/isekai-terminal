@@ -19,6 +19,14 @@ on:
         description: "noq/noq-proto/noq-udpをpatchするgit rev(空なら未パッチのcrates.io 1.0.1)"
         required: false
         default: ""
+      bin_name:
+        description: "実行するbinターゲット"
+        required: false
+        default: "dual-fd-loopback-test"
+        type: choice
+        options:
+          - dual-fd-loopback-test
+          - dual-fd-loopback-test-v6dual
 
 concurrency:
   group: noq-738-repro-check-${{ github.ref }}
@@ -33,7 +41,8 @@ jobs:
     timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
-      RUST_LOG: noq=trace,noq_proto=trace,noq_udp=trace,dual_fd_loopback_test=trace
+      RUST_LOG: noq=trace,noq_proto=trace,noq_udp=trace,dual_fd_loopback_test=trace,dual_fd_loopback_test_v6dual=trace
+      BIN_NAME: ${{ github.event.inputs.bin_name || 'dual-fd-loopback-test' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,15 +78,15 @@ jobs:
           echo "--- patched Cargo.toml tail ---"
           tail -10 Cargo.toml
 
-      - name: Build dual-fd-loopback-test
+      - name: Build
         working-directory: rust-core/noq-multipath-spike
-        run: cargo build --bin dual-fd-loopback-test
+        run: cargo build --bin "$BIN_NAME"
 
-      - name: "Run dual-fd-loopback-test (30s timeout: bug reproduces as a hang on open_path)"
+      - name: "Run (30s timeout: bug reproduces as a hang on open_path)"
         working-directory: rust-core/noq-multipath-spike
         run: |
           set -uo pipefail
-          timeout 30 cargo run --bin dual-fd-loopback-test 2>&1 | tee /tmp/noq-738-repro.log
+          timeout 30 cargo run --bin "$BIN_NAME" 2>&1 | tee /tmp/noq-738-repro.log
           rc=$?
           echo "exit code: $rc"
           if [ "$rc" -eq 124 ]; then
@@ -93,6 +102,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: noq-738-repro-log-${{ github.event.inputs.noq_git_rev || 'baseline-1.0.1' }}
+          name: noq-738-repro-log-${{ env.BIN_NAME }}-${{ github.event.inputs.noq_git_rev || 'baseline-1.0.1' }}
           path: /tmp/noq-738-repro.log
           retention-days: 14
