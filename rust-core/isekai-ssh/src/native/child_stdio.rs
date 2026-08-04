@@ -54,7 +54,8 @@ pub(crate) fn spawn_isekai_pipe_connect(
     isekai_pipe_core::write_connection_intent(runtime_dir, intent)
         .with_context(|| format!("failed to write ConnectionIntent {} to {}", intent.intent_id, runtime_dir.display()))?;
 
-    Command::new(isekai_pipe_path)
+    let mut command = Command::new(isekai_pipe_path);
+    command
         .env("ISEKAI_INTENT_ID", &intent.intent_id)
         .env("ISEKAI_PIPE_RUNTIME_DIR", runtime_dir)
         .arg("connect")
@@ -66,9 +67,27 @@ pub(crate) fn spawn_isekai_pipe_connect(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", isekai_pipe_path.display()))
+        .kill_on_drop(true);
+
+    // Without this, a console-subsystem child spawned from a process that
+    // itself has no console (the detached ControlPersist-equivalent mux
+    // holder, `native/mux/holder.rs` — `DETACHED_PROCESS`-spawned, so it has
+    // nothing for this child to inherit) gets a brand-new *visible* console
+    // window auto-allocated by Windows, since neither `Stdio::piped()`
+    // (stdin/stdout) nor `Stdio::inherit()` (stderr, an explicitly duplicated
+    // handle) suppresses that on their own — only an explicit creation flag
+    // does. Harmless for the ordinary foreground case (parent already has a
+    // console): the inherited stderr handle stays a valid, writable duplicate
+    // of the parent's console screen buffer regardless of this flag, so the
+    // child's diagnostic logging is still visible there.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command.spawn().with_context(|| format!("failed to spawn {}", isekai_pipe_path.display()))
 }
 
 /// A child process's piped stdin+stdout, combined into one
