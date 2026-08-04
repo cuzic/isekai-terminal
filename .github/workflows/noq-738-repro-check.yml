@@ -73,7 +73,7 @@ jobs:
         working-directory: rust-core/noq-multipath-spike
         run: cargo build --bin dual-fd-loopback-test
 
-      - name: Run dual-fd-loopback-test (30s timeout: bug reproduces as a hang on open_path)
+      - name: "Run dual-fd-loopback-test (30s timeout: bug reproduces as a hang on open_path)"
         working-directory: rust-core/noq-multipath-spike
         run: |
           set -uo pipefail
