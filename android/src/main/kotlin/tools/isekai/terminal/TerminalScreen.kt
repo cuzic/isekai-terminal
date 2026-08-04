@@ -532,6 +532,12 @@ fun TerminalScreenBody(
                 val density = LocalDensity.current
                 val widthPx = with(density) { maxWidth.toPx() }
                 val heightPx = with(density) { maxHeight.toPx() }
+                // 補助操作ドロワー(下記)はAnimatedVisibilityのcontentラムダの中にあり、
+                // そこではBoxWithConstraintsScope.maxHeightが暗黙レシーバーとして解決
+                // できない("cannot be called in this context with an implicit receiver"、
+                // 実機ビルドで確認済みのコンパイルエラー)ため、ここで明示的にローカル変数へ
+                // 捕捉しておく。
+                val boxMaxHeight = maxHeight
                 // ソフトキーボード(IME)表示中は親Columnの`.imePadding()`がこの分だけ
                 // `heightPx`(=ここのBoxWithConstraintsの実測高さ)を圧縮する。IME開閉
                 // そのものはtty実サイズを変える理由にしたくない(タスク#19: IME開閉・回転・
@@ -1147,7 +1153,7 @@ fun TerminalScreenBody(
                             modifier = Modifier
                                 .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.medium)
                                 .padding(6.dp)
-                                .heightIn(max = maxHeight)
+                                .heightIn(max = boxMaxHeight)
                                 .verticalScroll(rememberScrollState()),
                         ) {
                             CtrlBtn("⌨") { onAuxDrawerActivity(); requestImeFocus() }
