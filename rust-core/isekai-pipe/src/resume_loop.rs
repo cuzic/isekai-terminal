@@ -31,6 +31,14 @@ const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
     jitter: 0.0,
 };
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Bounds `replay_and_advance`'s post-resume replay write — same rationale
+/// and magnitude as `isekai_transport::resume`'s `TRANSPORT_STEP_TIMEOUT`
+/// (not reused directly since that constant is private to that crate):
+/// don't trust `noq`'s own idle-timeout/keepalive to catch a connection this
+/// call itself just received from a successful `RESUME`, e.g. right after a
+/// host suspend/resume where a monotonic clock can undercount elapsed real
+/// time.
+const REPLAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often `run_resume_loop`'s background task calls
 /// `WarmStandby::ensure_warm` while `--tethering-interface` is set. Matches
 /// the "~15-30s while the primary looks healthy" half of the
@@ -390,8 +398,11 @@ async fn replay_and_advance(replay: &Mutex<C2hReplayBuffer>, committed_offset: u
         );
         return false;
     };
-    if !bytes.is_empty() && stream.write_all(&bytes).await.is_err() {
-        return false;
+    if !bytes.is_empty() {
+        match tokio::time::timeout(REPLAY_WRITE_TIMEOUT, stream.write_all(&bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
     }
     replay.lock().unwrap().advance_start(committed_offset);
     true
