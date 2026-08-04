@@ -1138,11 +1138,17 @@ fun TerminalScreenBody(
                         exit = fadeOut(),
                         modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp),
                     ) {
+                        // IME表示中はコンテナの実効高さが縮むため、ボタン数がここまで
+                        // 増えると(元々9個の時点でWheel▲3x/Wheel▼3xが既に画面外へ
+                        // はみ出ていた)Columnの外に出たボタンへ一切タップできなくなる。
+                        // Resizeボタン追加でこれが顕在化したのを機に、縦スクロール可能にする。
                         Column(
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                             modifier = Modifier
                                 .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.medium)
-                                .padding(6.dp),
+                                .padding(6.dp)
+                                .heightIn(max = maxHeight)
+                                .verticalScroll(rememberScrollState()),
                         ) {
                             CtrlBtn("⌨") { onAuxDrawerActivity(); requestImeFocus() }
                             CtrlBtn("履歴▲") {
