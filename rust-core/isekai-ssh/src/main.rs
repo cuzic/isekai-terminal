@@ -39,14 +39,27 @@ const EXIT_OTHER_ERROR: u8 = 1;
 
 /// Exit code a mux *client* returns when it detects the owner process died
 /// mid-session (its `local-ipc-mux` connection dropped without a clean session
-/// end). Deliberately distinct from `EXIT_OTHER_ERROR` (1) and from `ssh(1)`'s
-/// own 255 ("connection lost / could not execute"), so this specific,
-/// recoverable situation — "the shared owner went away; just reconnect" — is
-/// distinguishable from both a generic error and a normal SSH connection loss.
-/// 254 is otherwise unused by this codebase's exit conventions. See
-/// `native/mux/client.rs`'s re-election model.
+/// end) *and* `native::mux::run_with_reconnect`'s own automatic-reconnect
+/// loop gave up (after `native::mux::RECONNECT_BUDGET`) rather than ever
+/// recovering — this process no longer retries on its own once it reaches
+/// this exit code, so a human really does need to run `isekai-ssh <host>`
+/// again. Deliberately distinct from `EXIT_OTHER_ERROR` (1) and from
+/// `ssh(1)`'s own 255 ("connection lost / could not execute"). 254 is
+/// otherwise unused by this codebase's exit conventions.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const EXIT_MUX_OWNER_LOST: u8 = 254;
+
+/// Exit code `native::mux::run_with_reconnect` returns when the user cancels
+/// an in-progress `OwnerLost` auto-reconnect wait with Ctrl+C
+/// (`native::mux::wait_or_abort`) — the standard POSIX "terminated by
+/// `SIGINT`" convention (128 + `SIGINT`'s signal number, 2), even though no
+/// real signal is delivered here (Ctrl+C is read as a plain `0x03` byte off
+/// the console, per `native/mux/client.rs`'s docs on why no
+/// `SIGINT`/`ctrl_c`/`SetConsoleCtrlHandler` handling exists in this crate) —
+/// chosen for familiarity to anyone used to `ssh(1)`'s own exit codes, not
+/// because anything actually raised that signal.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const EXIT_USER_CANCELED: u8 = 130;
 
 /// Larger than the OS-default *process* main thread stack, which is fixed
 /// at link time and cannot be grown at runtime -- notably 1 MiB on Windows

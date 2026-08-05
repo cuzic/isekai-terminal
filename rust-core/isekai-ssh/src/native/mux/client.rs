@@ -69,10 +69,18 @@ pub(crate) enum ClientOutcome {
 
 /// What [`run`] did with an established owner connection.
 pub(crate) enum ClientRunResult {
-    /// The session ran to some conclusion; this is this process's own exit
-    /// code (either the remote shell's real exit code, or
-    /// [`crate::EXIT_MUX_OWNER_LOST`] if the owner was lost mid-session).
+    /// The remote shell exited (cleanly relayed `Exit` frame); this is its
+    /// real exit code.
     ExitCode(u8),
+    /// The owner connection dropped without a clean `Exit` — the owner
+    /// process died mid-session. Kept as its own variant rather than
+    /// collapsed into `ExitCode(crate::EXIT_MUX_OWNER_LOST)` (as this used
+    /// to be): a caller auto-reconnecting on owner loss needs to tell that
+    /// apart from a remote command that happens to itself `exit` with
+    /// `EXIT_MUX_OWNER_LOST`'s numeric value, which a bare `u8` cannot
+    /// distinguish. Callers that don't retry can still map this to
+    /// `crate::EXIT_MUX_OWNER_LOST` at their own boundary.
+    OwnerLost,
     /// The owner rejected the connection before any shell session started
     /// (see [`ClientOutcome::Rejected`]) — the caller should fall back to an
     /// unmultiplexed direct connect rather than treat this as fatal.
@@ -80,12 +88,24 @@ pub(crate) enum ClientRunResult {
 }
 
 /// Drives a client session against `conn` (an established owner connection),
-/// wiring the real local terminal (raw mode + current size) as the I/O. On a
-/// lost owner (after a shell session was already established) it prints the
-/// reconnect guidance and returns [`crate::EXIT_MUX_OWNER_LOST`] as an exit
-/// code — there is nothing left to fall back to at that point. On a rejection
-/// during the handshake (before any shell existed), it instead returns
-/// [`ClientRunResult::Rejected`] so the caller can retry unmultiplexed.
+/// wiring the real local terminal (current size) as the I/O. Returns
+/// [`ClientRunResult::OwnerLost`] if the owner connection drops after a shell
+/// session was already established — see that variant's docs for why the
+/// caller, not this function, now decides what to do about it (this used to
+/// print reconnect guidance and give up here; the mux client's `OwnerLost`
+/// auto-reconnect loop, `super::run_with_reconnect`, is the caller that
+/// decides that today). On a rejection during the handshake (before any
+/// shell existed), it instead returns [`ClientRunResult::Rejected`] so the
+/// caller can retry unmultiplexed.
+///
+/// Deliberately does **not** manage raw terminal mode itself (unlike this
+/// function's previous version) — the caller holds one
+/// [`super::super::console::RawModeGuard`] across every attempt of its own
+/// retry loop, not one per attempt, so the terminal doesn't visibly leave
+/// raw mode (and locally echo/interpret control characters) between
+/// `OwnerLost` reconnect attempts. `super::super::console_stdin::ConsoleStdin::open`
+/// is still safe to call once per attempt regardless (see its own docs on
+/// why it's a process-wide singleton under the hood).
 ///
 /// `remote_command`/`want_pty` are sent to the owner in [`Frame::Hello`] and
 /// decide the same `-t`/`-T` `SessionKind` as the non-mux path's
@@ -105,7 +125,6 @@ where
 
     let resize_rx = if want_pty { super::super::console::spawn_resize_watcher() } else { None };
 
-    let _raw_mode = super::super::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
     let outcome = run_inner(
         reader,
         &mut writer,
@@ -125,13 +144,7 @@ where
 
     match outcome {
         ClientOutcome::Exited(code) => Ok(ClientRunResult::ExitCode(code)),
-        ClientOutcome::OwnerLost => {
-            log_line!(
-                "isekai-ssh: connection to the isekai-ssh owner process was lost — \
-                 reconnect with `isekai-ssh <host>`."
-            );
-            Ok(ClientRunResult::ExitCode(crate::EXIT_MUX_OWNER_LOST))
-        }
+        ClientOutcome::OwnerLost => Ok(ClientRunResult::OwnerLost),
         ClientOutcome::Rejected { reason } => Ok(ClientRunResult::Rejected { reason }),
     }
 }
