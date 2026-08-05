@@ -28,7 +28,7 @@ use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use system_configuration::network_reachability::SCNetworkReachability;
 use tokio::sync::mpsc;
 
-use crate::{NetworkChangeEvent, NetworkChangeMonitor};
+use crate::{NetworkChangeCause, NetworkChangeEvent, NetworkChangeMonitor};
 
 /// How long `new()` waits for the background run-loop thread to finish
 /// registering before giving up and falling back to
@@ -59,7 +59,7 @@ impl MacosNetworkChangeMonitor {
                     // monitor) has been dropped, at which point `Drop` has
                     // already asked this run loop to stop — nothing to do
                     // from inside the callback either way.
-                    let _ = event_tx.send(NetworkChangeEvent);
+                    let _ = event_tx.send(NetworkChangeEvent { cause: NetworkChangeCause::InterfaceChange });
                 }) {
                     let _ = setup_tx.send(Err(format!("SCNetworkReachabilitySetCallback failed: {e}")));
                     return;
