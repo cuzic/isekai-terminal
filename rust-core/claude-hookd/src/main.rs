@@ -210,13 +210,40 @@ async fn event_command() -> ExitCode {
 /// to the safe (still-`Notify`) side, by construction (`matches!` against an
 /// explicit allowlist, not a denylist).
 ///
+/// The same `StopDeferred` treatment also applies when `session_crons`
+/// (present on the same `Stop` payload, alongside `background_tasks` —
+/// confirmed live 2026-08-04 by a temporary `Stop` hook dumping stdin to a
+/// file, same method as `background_tasks`'s own discovery; also
+/// undocumented in the public hooks reference) is non-empty: each entry is
+/// a scheduled self-resume this exact session registered for itself (e.g.
+/// the `ScheduleWakeup` tool, or a `/loop`-style recurring one —
+/// `recurring: true`/`false` doesn't change the classification, since
+/// either kind still means the session comes back on its own). Unlike
+/// `background_tasks`, no type-filtering is needed here: every
+/// `session_crons` entry unambiguously means Claude Code's own scheduling
+/// infrastructure — not a heuristic on this crate's part — already
+/// committed to resuming this session, which is if anything a *stronger*
+/// self-resolving signal than a `background_tasks` entry. This was the
+/// actual root cause of a real false-Attention report (2026-08-04, user
+/// noticed a tab going orange while a `ScheduleWakeup`-driven wait was
+/// still in flight): `parse_hook_event` checked `background_tasks` only,
+/// so a `Stop` with a pending `session_crons` entry but an empty
+/// `background_tasks` array fell through to unconditional `Notify`.
+///
 /// `StopDeferred` is not a permanent suppression — see `state.rs`'s
 /// `Pending::Deferred`/`apply_timeout` for the bounded self-correction that
 /// makes this safe even when the guess is wrong (an even earlier attempt at
 /// this fix, having Claude self-report a marker string when *it* judged a
 /// `Stop` ambiguous, was reverted the same day after producing false
 /// negatives with no such backstop — self-report alone isn't trustworthy for
-/// this, see `claude-hookd-self-report-marker-failed` in memory).
+/// this, see `claude-hookd-self-report-marker-failed` in memory). Note this
+/// bound (`MAX_DEFERRAL`, 30 minutes) is shorter than `ScheduleWakeup`'s own
+/// maximum delay (1 hour) — a `session_crons` wait can in principle still
+/// get promoted to `Attention` before its own scheduled time arrives. Left
+/// as-is rather than special-cased: `state.rs`'s self-correction is
+/// deliberately the same safety net regardless of *why* a `Stop` was
+/// deferred, and a late, spurious color flip is a smaller cost than adding
+/// a second deadline-tracking scheme.
 ///
 /// See the pre-split `isekai-pipe` version's doc comment (git history) for
 /// the detailed rationale behind the other mappings below — carried over
@@ -232,6 +259,8 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
         .get("background_tasks")
         .and_then(|v| v.as_array())
         .is_some_and(|tasks| tasks.iter().any(|t| matches!(t.get("type").and_then(|v| v.as_str()), Some("shell" | "subagent"))));
+    let has_pending_session_cron =
+        value.get("session_crons").and_then(|v| v.as_array()).is_some_and(|crons| !crons.is_empty());
 
     let event = match hook_event_name {
         "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
@@ -242,7 +271,7 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
             Some(_) => return None,
             None => HookEvent::Notify,
         },
-        "Stop" if has_relevant_background_work => HookEvent::StopDeferred,
+        "Stop" if has_relevant_background_work || has_pending_session_cron => HookEvent::StopDeferred,
         "Stop" => HookEvent::Notify,
         "StopFailure" => HookEvent::Notify,
         "PermissionRequest" => HookEvent::Notify,
@@ -543,6 +572,37 @@ mod tests {
     fn stop_defers_if_any_entry_is_relevant_even_alongside_irrelevant_ones() {
         let payload =
             br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"},{"id":"t2","type":"shell","status":"running"}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
+    }
+
+    /// Pins the fix for the real false-Attention report this file's docs
+    /// describe: a `ScheduleWakeup`-driven wait shows up as a non-empty
+    /// `session_crons` array with an empty `background_tasks`, and must
+    /// still defer rather than fall through to `Notify`.
+    #[test]
+    fn stop_with_a_pending_session_cron_is_deferred_even_with_no_background_tasks() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[],"session_crons":[{"id":"c1","schedule":"19 21 * * *","recurring":false}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
+    }
+
+    /// Unlike `background_tasks`, `session_crons` needs no type-filtering —
+    /// a recurring entry (e.g. a `/loop`-style schedule) defers exactly like
+    /// a one-shot `ScheduleWakeup` entry.
+    #[test]
+    fn stop_with_a_recurring_session_cron_is_also_deferred() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","session_crons":[{"id":"c1","schedule":"*/5 * * * *","recurring":true}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
+    }
+
+    #[test]
+    fn stop_with_an_empty_session_crons_array_is_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","session_crons":[]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+    }
+
+    #[test]
+    fn stop_defers_from_session_crons_alongside_an_irrelevant_background_task() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"}],"session_crons":[{"id":"c1","schedule":"19 21 * * *","recurring":false}]}"#;
         assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
     }
 
