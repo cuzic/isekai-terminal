@@ -47,6 +47,15 @@ pub enum TransportError {
     /// back to a fresh (non-resuming) connection.
     #[error("isekai-helper rejected RESUME: {0:?}")]
     ResumeRejected(ResumeRejectReason),
+
+    /// `reconnect_and_resume`'s dial or RESUME request didn't get an answer
+    /// within its bounded wait (`always-connects.md`: an OS-level bound
+    /// alone — here, `noq`'s own idle-timeout/keepalive — isn't trusted to
+    /// fire reliably, e.g. after a host suspend/resume where a monotonic
+    /// clock can undercount elapsed real time). `stage` names which awaited
+    /// call didn't return in time, for logs/diagnostics only.
+    #[error("timed out waiting for {stage}")]
+    TimedOut { stage: &'static str },
 }
 
 impl TransportError {
@@ -170,5 +179,6 @@ mod tests {
         assert!(!TransportError::Mux(quicmux::MuxError::Rebind("x".to_string())).is_stale_trust_signal());
         assert!(!TransportError::ControlHandshake("x".to_string()).is_stale_trust_signal());
         assert!(!TransportError::ResumeRejected(ResumeRejectReason::UnknownSession).is_stale_trust_signal());
+        assert!(!TransportError::TimedOut { stage: "connect" }.is_stale_trust_signal());
     }
 }

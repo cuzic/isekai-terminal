@@ -31,6 +31,14 @@ const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
     jitter: 0.0,
 };
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Bounds `replay_and_advance`'s post-resume replay write — same rationale
+/// and magnitude as `isekai_transport::resume`'s `TRANSPORT_STEP_TIMEOUT`
+/// (not reused directly since that constant is private to that crate):
+/// don't trust `noq`'s own idle-timeout/keepalive to catch a connection this
+/// call itself just received from a successful `RESUME`, e.g. right after a
+/// host suspend/resume where a monotonic clock can undercount elapsed real
+/// time.
+const REPLAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often `run_resume_loop`'s background task calls
 /// `WarmStandby::ensure_warm` while `--tethering-interface` is set. Matches
 /// the "~15-30s while the primary looks healthy" half of the
@@ -273,10 +281,15 @@ fn remote_bind_spec(remote: std::net::SocketAddr, local_bind_port_range: Option<
 ///   directly against `run_data_pump` in the same `select!`), just moved
 ///   into its own task so both shapes can feed the same channel.
 /// - **Experimental with a rebinder**: tries `AnyMuxRebinder::rebind`
-///   first on every change; only a *failed* rebind attempt is forwarded,
-///   and this task then stops (that generation's endpoint is about to be
-///   abandoned by the RESUME reconnect the failure triggers, so continuing
-///   to watch it is pointless). A *successful* rebind is invisible to the
+///   first on every `InterfaceChange` event; only a *failed* rebind attempt
+///   is forwarded, and this task then stops (that generation's endpoint is
+///   about to be abandoned by the RESUME reconnect the failure triggers, so
+///   continuing to watch it is pointless). A `Wake` event (host
+///   suspend/resume, `isekai_netmon::ClockSkewWatchdog`) skips the rebind
+///   attempt entirely and forwards immediately instead — a local rebind
+///   cannot fix a connection that went stale while this host was
+///   suspended, so trying one first would only delay the reconnect this
+///   task exists to speed up. A *successful* rebind is invisible to the
 ///   caller's `select!` entirely — `run_data_pump`'s QUIC stream keeps
 ///   running untouched, because `rebind` only swaps the endpoint's local
 ///   socket, never the connection/stream objects above it (the same
@@ -330,7 +343,22 @@ fn spawn_reconnect_signal<R: Rebindable + 'static>(
         match (experimental_network_rebind, rebinder) {
             (true, Some(rebinder)) => {
                 let bind = remote_bind_spec(helper_addr, local_bind_port_range);
-                while network_monitor.next_change().await.is_some() {
+                while let Some(event) = network_monitor.next_change().await {
+                    if event.cause == isekai_netmon::NetworkChangeCause::Wake {
+                        // A rebind only swaps the local socket — it cannot
+                        // fix a connection that went stale while this host
+                        // was suspended: the peer had the whole wall-clock
+                        // gap to idle-time it out and discard the parked
+                        // session (`isekai_netmon::ClockSkewWatchdog`'s
+                        // docs). Skip straight to a full reconnect, same as
+                        // a failed rebind below, instead of first trying —
+                        // and waiting out — a rebind that cannot help.
+                        log::info!(
+                            "isekai-pipe connect: host resume detected; skipping rebind and reconnecting now"
+                        );
+                        let _ = tx.send(()).await;
+                        return;
+                    }
                     log::info!("isekai-pipe connect: rebind_attempted");
                     match rebinder.rebind(bind).await {
                         Ok(()) => {
@@ -390,8 +418,11 @@ async fn replay_and_advance(replay: &Mutex<C2hReplayBuffer>, committed_offset: u
         );
         return false;
     };
-    if !bytes.is_empty() && stream.write_all(&bytes).await.is_err() {
-        return false;
+    if !bytes.is_empty() {
+        match tokio::time::timeout(REPLAY_WRITE_TIMEOUT, stream.write_all(&bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
     }
     replay.lock().unwrap().advance_start(committed_offset);
     true
@@ -1293,6 +1324,17 @@ mod tests {
     /// or a real QUIC connection to exercise that race in isolation.
     struct FireOnceNetworkChangeMonitor {
         fired: bool,
+        /// Defaults to `InterfaceChange` at every existing call site (via
+        /// `Default`) — only the `Wake`-specific tests below set this
+        /// explicitly, so this field's addition (`NetworkChangeCause`
+        /// wiring) didn't need to touch every pre-existing construction.
+        cause: isekai_netmon::NetworkChangeCause,
+    }
+
+    impl Default for FireOnceNetworkChangeMonitor {
+        fn default() -> Self {
+            Self { fired: false, cause: isekai_netmon::NetworkChangeCause::InterfaceChange }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1302,7 +1344,7 @@ mod tests {
                 std::future::pending().await
             } else {
                 self.fired = true;
-                Some(isekai_netmon::NetworkChangeEvent)
+                Some(isekai_netmon::NetworkChangeEvent { cause: self.cause })
             }
         }
     }
@@ -1310,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn network_change_event_wins_the_race_against_a_pump_that_never_finishes() {
         let mut monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
-            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+            Box::new(FireOnceNetworkChangeMonitor::default());
         // Stands in for `run_data_pump` (which would otherwise only resolve
         // on clean stdin EOF or a real I/O error) — mirrors the general
         // "pump vs. network-change signal" `tokio::select!` shape
@@ -1364,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_reconnect_signal_forwards_plain_network_change_when_not_experimental() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
-            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+            Box::new(FireOnceNetworkChangeMonitor::default());
         let (task, mut rx) =
             spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap(), None);
 
@@ -1378,7 +1420,7 @@ mod tests {
         // support rebinding (`rebinder: None`) - must fall back to exactly
         // the non-experimental behavior, not silently drop the event.
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
-            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+            Box::new(FireOnceNetworkChangeMonitor::default());
         let (task, mut rx) =
             spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap(), None);
 
@@ -1511,7 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_reconnect_signal_does_not_forward_after_a_successful_rebind() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
-            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+            Box::new(FireOnceNetworkChangeMonitor::default());
         let rebinder = MockRebinder { should_succeed: true };
         let (task, mut rx) = spawn_reconnect_signal(
             monitor,
@@ -1532,7 +1574,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_reconnect_signal_forwards_after_a_failed_rebind() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
-            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+            Box::new(FireOnceNetworkChangeMonitor::default());
         let rebinder = MockRebinder { should_succeed: false };
         let (task, mut rx) = spawn_reconnect_signal(
             monitor,
@@ -1543,6 +1585,32 @@ mod tests {
         );
 
         assert!(rx.recv().await.is_some(), "a failed rebind attempt must fall back to the reconnect signal");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_reconnect_signal_skips_rebind_and_forwards_immediately_on_wake() {
+        // A `Wake` event (host suspend/resume) must forward straight to a
+        // full reconnect without ever calling `rebind` — a local rebind
+        // cannot fix a connection that went stale during a suspend, so
+        // trying one first (and, on success, swallowing the signal
+        // entirely — see the test above) would be actively wrong here, not
+        // just slower.
+        let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false, cause: isekai_netmon::NetworkChangeCause::Wake });
+        let rebinder = MockRebinder { should_succeed: true };
+        let (task, mut rx) = spawn_reconnect_signal(
+            monitor,
+            Some(rebinder),
+            /* experimental */ true,
+            TEST_HELPER_ADDR.parse().unwrap(),
+            None,
+        );
+
+        assert!(
+            rx.recv().await.is_some(),
+            "a Wake event must forward immediately even though this rebinder would have succeeded"
+        );
         task.abort();
     }
 
@@ -1787,7 +1855,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn returns_early_when_the_network_monitor_fires_before_the_delay_elapses() {
-            let mut monitor = FireOnceNetworkChangeMonitor { fired: false };
+            let mut monitor = FireOnceNetworkChangeMonitor::default();
             let started = tokio::time::Instant::now();
             let mut tick_count = 0;
             wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
