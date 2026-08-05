@@ -86,6 +86,18 @@ pub struct NetworkChangeEvent {
 /// single task — they are not required to be `Clone`/shareable across tasks,
 /// matching how `isekai-pipe connect`'s single reconnect loop uses this
 /// (`&mut self`, not `&self`).
+///
+/// **Cancel-safe**: [`MergedMonitor`] (behind [`system_monitor`]) and
+/// `isekai-pipe`'s own `wait_backoff_or_network_change` both race a
+/// `next_change()` call inside `tokio::select!` against something else and
+/// let the loser's future drop mid-poll. An implementation that buffers an
+/// event internally *before* `next_change` observes it (rather than only
+/// producing one as a direct result of being polled — e.g. `mpsc::Receiver::
+/// recv`, which every current implementation in this crate relies on) would
+/// silently lose that event on a dropped poll. `ClockSkewWatchdog` upholds
+/// this by construction: its whole state (`last_mono`/`last_wall`) lives in
+/// `&mut self` between calls, and it only ever "produces" an event as the
+/// direct `return` of the call currently being polled.
 #[async_trait]
 pub trait NetworkChangeMonitor: Send {
     /// Waits for the next network-change event. Returns `None` if the

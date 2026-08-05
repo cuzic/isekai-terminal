@@ -30,16 +30,44 @@
 //! needs a hidden window and a message loop; `NSWorkspace` notifications
 //! need a run loop, both awkward to host in a CLI with no GUI event loop of
 //! its own). Comparing a monotonic clock against a wall clock needs neither
-//! an OS registration nor a new dependency, behaves identically on every
-//! platform (including ones with no interface-change backend at all), and
-//! degrades to "no false positives, just a slightly later reconnect" rather
-//! than "no signal at all" if the assumption about monotonic clocks turns
-//! out not to hold on some platform.
+//! an OS registration nor a new dependency, and doesn't depend on which
+//! interface-change backend (if any) a given platform has.
+//!
+//! Two honest limitations of this approach, both reviewed and accepted as
+//! low-impact rather than fixed (opus review, this module's introduction):
+//!
+//! - **Not actually identical on every platform.** This only works because
+//!   `Instant`/`CLOCK_MONOTONIC` is documented to exclude suspended time on
+//!   Linux. On Windows, `Instant` is backed by `QueryPerformanceCounter`,
+//!   whose suspend behavior is HAL/firmware-dependent — if a given machine's
+//!   QPC *does* count suspended time, `mono_elapsed` and `wall_elapsed` stay
+//!   in lockstep and this watchdog simply never fires there. That's not a
+//!   silent failure: it degrades to exactly the `isekai-transport` QUIC
+//!   idle-timeout-only detection that predates this crate, which is correct
+//!   in that scenario anyway (a QPC that counts suspended time makes the
+//!   idle-timeout math itself correct again). Unverified on real Windows
+//!   hardware — worth confirming empirically rather than trusting this
+//!   paragraph.
+//! - **A forward wall-clock step (NTP correction, `chrony`/
+//!   `systemd-timesyncd` catching up after boot) looks identical to a
+//!   suspend gap** — both are "wall clock advanced far more than the
+//!   monotonic clock across one tick" — so [`suspend_gap_detected`] cannot
+//!   tell them apart from a single tick's deltas alone, and neither can a
+//!   multi-tick debounce (a real suspend also only produces exactly *one*
+//!   anomalous tick, right after resume — `last_wall`/`last_mono` are
+//!   re-baselined every tick, so requiring two anomalous ticks in a row
+//!   would break true-positive detection just as effectively as it filters
+//!   this false-positive one). Accepted rather than fixed: the cost of a
+//!   false positive is one extra reconnect attempt, which `RESUME`
+//!   recovers from immediately if the connection was actually still fine —
+//!   annoying, never destructive, and rare enough in practice (this isn't
+//!   ticking every few seconds) not to be worth the complexity of a real
+//!   fix, which would need OS suspend/resume signal anyway (the thing this
+//!   module exists to avoid depending on).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::time::Instant;
 
 use crate::{NetworkChangeCause, NetworkChangeEvent, NetworkChangeMonitor};
 
@@ -76,12 +104,18 @@ fn suspend_gap_detected(mono_elapsed: Duration, wall_elapsed: Duration, threshol
 }
 
 /// [`NetworkChangeMonitor`] that never talks to the OS: it just samples
-/// `tokio::time::Instant::now()` (monotonic) and `SystemTime::now()`
+/// `std::time::Instant::now()` (monotonic) and `SystemTime::now()`
 /// (wall-clock) once per [`TICK_INTERVAL`] and yields a
 /// [`NetworkChangeCause::Wake`] event the first time
 /// [`suspend_gap_detected`] says the gap since the previous tick looks like
 /// a suspend. See this module's docs for why comparing clocks, rather than
-/// an OS suspend/resume notification, is this crate's approach.
+/// an OS suspend/resume notification, is this crate's approach. Deliberately
+/// `std::time::Instant`, not `tokio::time::Instant`: the latter is
+/// virtualized under `#[tokio::test(start_paused = true)]`/`tokio::time::
+/// pause()`, which would let a test advance the monotonic side far ahead of
+/// real wall-clock time — the opposite skew direction this module watches
+/// for, but still a mismatch worth not having to reason about at every call
+/// site that might someday pause time for an unrelated reason.
 pub struct ClockSkewWatchdog {
     tick_interval: Duration,
     threshold: Duration,
@@ -193,11 +227,17 @@ mod tests {
 
     #[tokio::test]
     async fn fires_once_the_pure_condition_is_synthetically_met() {
-        // Can't simulate a real suspend, but can prove the wiring calls
-        // `suspend_gap_detected` correctly by shrinking the threshold below
-        // what a real tick's wall-clock/monotonic-clock gap will exceed
-        // even without any suspend (ordinary tokio scheduling overhead is
-        // enough once the threshold is this tight).
+        // Can't simulate a real suspend, but can prove the wiring actually
+        // calls `suspend_gap_detected` and acts on a positive result by
+        // setting threshold=0: with no margin at all, whichever of the two
+        // back-to-back `now()` calls each tick reads a strictly later wall
+        // clock than monotonic clock (roughly a coin flip each tick, purely
+        // from the nanoseconds-scale gap between those two calls — *not*
+        // from scheduling delay, which lands on both clocks equally and so
+        // cancels out of the comparison) is enough to satisfy
+        // `wall_elapsed > mono_elapsed`. With up to ~500 tries in the
+        // timeout below, the odds of every single one losing that coin
+        // flip are astronomically small.
         let mut watchdog = ClockSkewWatchdog::with_params(Duration::from_millis(10), Duration::ZERO);
         let ev = tokio::time::timeout(Duration::from_secs(5), watchdog.next_change())
             .await
