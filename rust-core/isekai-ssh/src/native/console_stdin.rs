@@ -16,16 +16,34 @@
 //! When stdin is redirected (pipe / file), this module falls back to plain
 //! `tokio::io::stdin()` — the `ReadFile` defects only apply to console
 //! handles, not to pipes.
+//!
+//! **Process-wide singleton, not one-per-call** (windows): the background
+//! `ReadConsoleW` thread only ever terminates after a *failed* send to its
+//! channel — i.e. after blocking for, and consuming, one more keystroke
+//! that then goes nowhere (`try_open_console`'s `tx.send(...).is_err()`
+//! check below). If [`ConsoleStdin::open`] spawned a fresh thread/channel
+//! on every call, a caller that opens a new `ConsoleStdin` per reconnect
+//! attempt (the mux client's `OwnerLost` auto-reconnect loop) would leave
+//! the previous attempt's thread still blocked reading CONIN$ after its own
+//! `ConsoleStdin` was dropped — racing the new thread for the very next
+//! keystroke and silently eating one on every reconnect. `CONSOLE_READER`
+//! is initialized at most once per process; every subsequent `open()` reads
+//! through the same shared receiver instead of spawning a second reader.
 
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
+#[cfg(windows)]
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A console-aware stdin reader that implements [`AsyncRead`].
 ///
-/// On Windows with a real console handle, spawns a background thread that
-/// reads via `ReadConsoleW` and feeds bytes into an internal buffer.
+/// On Windows with a real console handle, reads from the process-wide
+/// [`CONSOLE_READER`] thread (spawned at most once — see the module docs)
+/// that reads via `ReadConsoleW` and feeds bytes into a shared channel.
 /// Otherwise delegates to `tokio::io::stdin()`.
 pub(crate) struct ConsoleStdin {
     #[cfg(windows)]
@@ -36,22 +54,25 @@ pub(crate) struct ConsoleStdin {
 
 #[cfg(windows)]
 enum Inner {
-    Console {
-        rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-        buf: Vec<u8>,
-        pos: usize,
-    },
+    /// Reads through the shared [`CONSOLE_READER`] channel rather than
+    /// owning one — each instance keeps only its own leftover-bytes buffer.
+    Console { buf: Vec<u8>, pos: usize },
     Pipe(tokio::io::Stdin),
 }
 
+#[cfg(windows)]
+static CONSOLE_READER: OnceLock<Mutex<UnboundedReceiver<Vec<u8>>>> = OnceLock::new();
+
 impl ConsoleStdin {
     /// Opens stdin, enabling `ENABLE_VIRTUAL_TERMINAL_INPUT` if it's a
-    /// Windows console handle.
+    /// Windows console handle. Safe to call more than once per process (see
+    /// module docs) — later calls reuse the first call's console-reader
+    /// thread instead of spawning a new one.
     pub(crate) fn open() -> Self {
         #[cfg(windows)]
         {
-            if let Some(rx) = try_open_console() {
-                return ConsoleStdin { inner: Inner::Console { rx, buf: Vec::new(), pos: 0 } };
+            if ensure_console_reader() {
+                return ConsoleStdin { inner: Inner::Console { buf: Vec::new(), pos: 0 } };
             }
             ConsoleStdin { inner: Inner::Pipe(tokio::io::stdin()) }
         }
@@ -60,6 +81,31 @@ impl ConsoleStdin {
             ConsoleStdin { inner: tokio::io::stdin() }
         }
     }
+}
+
+/// Ensures [`CONSOLE_READER`] is initialized, spawning the `ReadConsoleW`
+/// thread on the first call only. Returns whether stdin is a real console
+/// (`true`) or should fall back to [`Inner::Pipe`] (`false`) — cached
+/// implicitly by `CONSOLE_READER`'s presence, so repeated calls (including
+/// the very first one, on `not(windows)` build configs where this function
+/// doesn't exist at all) are cheap.
+#[cfg(windows)]
+fn ensure_console_reader() -> bool {
+    if CONSOLE_READER.get().is_some() {
+        return true;
+    }
+    let Some(rx) = try_open_console() else {
+        return false;
+    };
+    // If another call already won this race (shouldn't happen in practice:
+    // callers open a new attempt only after the previous one's ConsoleStdin
+    // was fully dropped, so this is never actually concurrent — but
+    // OnceLock::set losing a race is not a bug, just a discarded `rx` whose
+    // now-orphaned thread will exit on its next failed send, same as
+    // today's non-singleton behavior for that one thread only), keep
+    // whichever receiver won.
+    let _ = CONSOLE_READER.set(Mutex::new(rx));
+    true
 }
 
 #[cfg(windows)]
@@ -140,7 +186,7 @@ impl AsyncRead for ConsoleStdin {
         #[cfg(windows)]
         {
             match &mut self.inner {
-                Inner::Console { rx, buf: inner_buf, pos } => {
+                Inner::Console { buf: inner_buf, pos } => {
                     // Drain buffered data first.
                     if *pos < inner_buf.len() {
                         let remaining = inner_buf.len() - *pos;
@@ -154,7 +200,13 @@ impl AsyncRead for ConsoleStdin {
                         return Poll::Ready(Ok(()));
                     }
 
-                    // Try to get more data from the background thread.
+                    // Try to get more data from the shared background
+                    // thread's channel. The lock is only ever held for the
+                    // duration of this synchronous `poll_recv` call, never
+                    // across an await point, so contention is not a concern
+                    // even though callers are expected to be sequential.
+                    let rx_lock = CONSOLE_READER.get().expect("Inner::Console is only constructed after ensure_console_reader() succeeded");
+                    let mut rx = rx_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     match rx.poll_recv(cx) {
                         Poll::Ready(Some(data)) => {
                             let to_write = data.len().min(buf.remaining());
