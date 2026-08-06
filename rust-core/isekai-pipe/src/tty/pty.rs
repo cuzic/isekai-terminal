@@ -52,11 +52,18 @@ pub(crate) fn spawn(command: &[String], term: &str, cols: u16, rows: u16) -> io:
 
     let mut master_fd: libc::c_int = -1;
     let mut slave_fd: libc::c_int = -1;
-    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: `openpty` writes valid, newly-opened fds into `master_fd`/
     // `slave_fd` on success (return 0); `name`/`termp` null is documented
-    // as accepted (uses OS defaults for the device name / termios).
-    let rc = unsafe { libc::openpty(&mut master_fd, &mut slave_fd, std::ptr::null_mut(), std::ptr::null(), &winsize) };
+    // as accepted (uses OS defaults for the device name / termios). All
+    // three out-params are passed as `*mut` (not `*const`) even where glibc
+    // itself only declares `termp`/`winp` as `const` — Apple's `libc` crate
+    // declares every `openpty` parameter `*mut`, and `*mut T` coerces to
+    // `*const T` implicitly at the call site, so one `*mut`-everywhere call
+    // is portable to both without a `cfg` split (found via real macOS CI:
+    // the `*const`/`&winsize` version this replaced compiled on Linux but
+    // failed E0308 on macOS).
+    let rc = unsafe { libc::openpty(&mut master_fd, &mut slave_fd, std::ptr::null_mut(), std::ptr::null_mut(), &mut winsize) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }

@@ -51,11 +51,24 @@ use tokio::net::{UnixListener, UnixStream};
 /// group/other any access, and it must not be a symlink — a symlink swap
 /// is exactly the kind of TOCTOU a "just check the mode bits" verification
 /// alone would miss).
+///
+/// `.recursive(true)`: on a fresh `$HOME` (no `~/.cache` yet at all — the
+/// common case in a container/CI environment, and what an earlier version
+/// of this function missed, found by this feature's own e2e test failing
+/// with "the daemon never bound its socket" — a non-recursive `create` on a
+/// missing *grandparent* fails with `NotFound`, not `AlreadyExists`, so it
+/// fell through to a real `Err` instead of proceeding). `DirBuilderExt::mode`
+/// applies to every directory this creates, including any newly-created
+/// intermediates — so a from-scratch `~/.cache` ends up `0700` too, not
+/// just the leaf; harmless (more private than the usual `0755` default, and
+/// only affects directories this call itself is the one bringing into
+/// existence — an already-existing `~/.cache` is left untouched, only
+/// verified like the leaf directory itself).
 pub(crate) fn private_runtime_dir() -> io::Result<PathBuf> {
     let home = isekai_fs_guard::resolve_home_dir().ok_or_else(|| io::Error::other("could not determine the home directory"))?;
     let dir = home.join(".cache").join("isekai-pipe").join("tty");
 
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+    match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),

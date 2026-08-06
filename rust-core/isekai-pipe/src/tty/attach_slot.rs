@@ -225,7 +225,16 @@ mod tests {
             "vacate(stale generation) must not have cleared the current occupant"
         );
 
+        // `vacate` only clears the occupant slot -- it deliberately does
+        // *not* bump `generation` (that counter exists solely to detect a
+        // *newer* `install`/preemption, not general occupancy), so
+        // `is_current(gen2)` correctly stays `true` here; what must actually
+        // change is that the occupant's sender is dropped (its receiver
+        // observes disconnection, same as an ordinary preemption) and a
+        // later broadcast has nothing to deliver to.
         slot.vacate(gen2);
-        assert!(!slot.is_current(gen2));
+        assert!(slot.is_current(gen2), "vacate must not itself invalidate the generation counter");
+        assert_eq!(rx2.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected), "vacate must drop the occupant's sender");
+        slot.broadcast(b"nobody here now"); // must not panic with no occupant present
     }
 }
