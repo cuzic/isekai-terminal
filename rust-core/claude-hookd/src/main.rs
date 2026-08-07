@@ -255,6 +255,23 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
     Some((session_id, event, hook_event_name == "SessionEnd"))
 }
 
+/// Directory daemon sockets are created under. Prefers `$XDG_RUNTIME_DIR`
+/// (per-user, mode 0700, set by `pam_systemd` on virtually every real Linux
+/// target this daemon runs on — an interactive SSH session) over the
+/// world-writable, sticky-bit `/tmp` fallback: [`derive_daemon_sock_path`]'s
+/// path is a deterministic hash of public information (the tmux session id /
+/// ctl-socket path / tty device), so under `/tmp` any other local user can
+/// precompute and pre-bind the exact same path before this daemon ever
+/// starts, and [`send_event`] connecting to it would then relay every hook
+/// event (including `session_id`) straight to that impostor. Falling back to
+/// `/tmp` only when `$XDG_RUNTIME_DIR` isn't set is why [`send_event`] still
+/// carries its own independent peer-credential check — this directory
+/// preference alone doesn't help on a host without a per-user runtime dir.
+#[cfg(unix)]
+fn daemon_sock_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Derives this delivery target's daemon socket path deterministically from
 /// [`Delivery::identity`] (a stable string: the ctl-socket path, the tmux
 /// session id, or the direct tty device path) via a non-cryptographic hash —
@@ -262,24 +279,37 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
 /// path is, while still mapping the same target to the same daemon every
 /// time so repeated hook events for the same tab (every pane of one tmux
 /// session, for `TmuxSession`) reuse one daemon rather than spawning a new
-/// one per event.
+/// one per event. Being deterministic (rather than including any per-process
+/// secret) is exactly why this alone isn't sufficient access control — see
+/// [`daemon_sock_dir`]'s and [`send_event`]'s docs for the two layers that
+/// cover that.
 #[cfg(unix)]
 fn derive_daemon_sock_path(delivery: &Delivery) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     delivery.identity().hash(&mut hasher);
-    PathBuf::from(format!("/tmp/{DAEMON_SOCK_PREFIX}{:016x}.sock", hasher.finish()))
+    daemon_sock_dir().join(format!("{DAEMON_SOCK_PREFIX}{:016x}.sock", hasher.finish()))
 }
 
 #[cfg(unix)]
 fn sweep_stale_daemon_sockets() {
-    let _ = ctl_gc::sweep_stale_sockets(Path::new("/tmp"), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
+    let _ = ctl_gc::sweep_stale_sockets(&daemon_sock_dir(), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }
 
 /// Connects to the daemon socket and sends one line, this module's own
 /// minimal wire format (see `daemon::read_one_event`). Returns whether the
 /// connect+write succeeded — a proxy for "a daemon is reachable and got
 /// this", not a guarantee it was applied (fire-and-forget).
+///
+/// Verifies the peer's effective uid matches this process's own before
+/// sending anything — `derive_daemon_sock_path`'s path is a deterministic
+/// hash of public information, so under the `/tmp` fallback (no
+/// `$XDG_RUNTIME_DIR`, see `daemon_sock_dir`'s docs) another local user can
+/// pre-bind the exact same path and would otherwise silently receive every
+/// hook event for this tab. A uid mismatch is treated exactly like "nobody's
+/// listening" (`false`) — the caller's existing fallback (spawn a daemon,
+/// retry) already handles that case correctly, it just also now happens to
+/// be the right response to an impostor.
 #[cfg(unix)]
 async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> bool {
     use tokio::io::AsyncWriteExt as _;
@@ -288,6 +318,11 @@ async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> boo
     let Ok(mut stream) = UnixStream::connect(sock_path).await else {
         return false;
     };
+    let self_uid = unsafe { libc::geteuid() };
+    match stream.peer_cred() {
+        Ok(cred) if cred.uid() == self_uid => {}
+        _ => return false,
+    }
     let event_name = match event {
         HookEvent::Notify => "notify",
         HookEvent::StopDeferred => "stop_deferred",
@@ -623,5 +658,30 @@ mod tests {
         let a = derive_daemon_sock_path(&Delivery::TmuxSession { session_id: "$1".to_string() });
         let b = derive_daemon_sock_path(&Delivery::TmuxSession { session_id: "$2".to_string() });
         assert_ne!(a, b);
+    }
+
+    /// Regression guard for `send_event`'s peer-credential check: a real
+    /// same-user listener must still succeed. Doesn't (can't, without
+    /// root/setuid tricks unavailable in CI) exercise the actual
+    /// impostor-rejection path the check exists for, but this is what would
+    /// have caught a broken comparison (e.g. an inverted condition, or
+    /// comparing against the wrong uid) silently turning every legitimate
+    /// delivery into a false "unreachable, spawn a new daemon" — which would
+    /// have been a functional regression, not just a missed security fix.
+    #[tokio::test]
+    async fn send_event_succeeds_against_a_real_same_user_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("send-event-test.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::BufReader::new(stream), &mut buf).await;
+            }
+        });
+        assert!(
+            send_event(&sock_path, "s1", HookEvent::Notify).await,
+            "a real listener owned by this same process's own uid must be treated as reachable"
+        );
     }
 }
