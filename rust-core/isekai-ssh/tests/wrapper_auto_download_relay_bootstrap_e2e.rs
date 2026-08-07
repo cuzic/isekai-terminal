@@ -23,6 +23,8 @@
 //! plumbing is duplicated from `wrapper_auto_bootstrap_e2e.rs` and the mock
 //! HTTP server is duplicated from `helper_download.rs`'s own tests.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio as StdStdio;
@@ -30,10 +32,8 @@ use std::time::Duration;
 
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
-use russh_keys::ssh_key::private::Ed25519Keypair;
-use russh_keys::{PrivateKey, PublicKey};
+use russh_keys::PublicKey;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::Command as TokioCommand;
 
 fn ssh_binary_available() -> bool {
@@ -164,17 +164,7 @@ async fn read_all<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result
 }
 
 async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> SocketAddr {
-    let keypair = Ed25519Keypair::from_seed(&[11u8; 32]);
-    let host_key = PrivateKey::from(keypair);
-    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
-    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut sh = FakeShellServer { home, accepted_client_key };
-    tokio::spawn(async move {
-        use server::Server as _;
-        let _ = sh.run_on_socket(config, &listener).await;
-    });
-    addr
+    support::spawn_sshd(11, FakeShellServer { home, accepted_client_key }).await.0
 }
 
 fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {

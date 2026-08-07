@@ -48,6 +48,8 @@
 //! connection counter, without needing any stdin content at all.
 #![cfg(windows)]
 
+mod support;
+
 use std::io::BufRead as StdBufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,10 +62,8 @@ use isekai_protocol::handshake::HandshakeJson;
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, CryptoVec};
-use russh_keys::ssh_key::private::Ed25519Keypair;
-use russh_keys::{PrivateKey, PublicKey};
+use russh_keys::PublicKey;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::{Child, Command as TokioCommand};
 
 /// Serializes this file's 3 tests (`cargo test`'s default harness runs
@@ -195,25 +195,14 @@ impl server::Handler for FakeShellHandler {
     }
 }
 
-/// Returns the mock sshd's address and its host key's SHA256 fingerprint (the
-/// same format `isekai_trust::SshHostKeyTrust::fingerprint` stores) — needed
-/// to pre-seed `known_ssh_hosts.toml` so the native path's own SSH host-key
-/// TOFU prompt (distinct from the app-level bootstrap trust this test also
-/// pre-seeds) never fires; see `wrapper_stale_trust_auto_recovery_e2e.rs`'s
-/// `spawn_fake_ssh_server` docs for why an unattended e2e run needs this.
+/// Needed to pre-seed `known_ssh_hosts.toml` so the native path's own SSH
+/// host-key TOFU prompt (distinct from the app-level bootstrap trust this
+/// test also pre-seeds) never fires; see
+/// `wrapper_stale_trust_auto_recovery_e2e.rs`'s `spawn_fake_ssh_server` docs
+/// for why an unattended e2e run needs this. Mock-sshd bring-up itself is
+/// `support::spawn_sshd` (shared, see that module's docs).
 async fn spawn_fake_ssh_server(accepted_client_key: PublicKey, connection_count: Arc<AtomicUsize>) -> (SocketAddr, String) {
-    let keypair = Ed25519Keypair::from_seed(&[91u8; 32]);
-    let host_key = PrivateKey::from(keypair);
-    let fingerprint = host_key.public_key().fingerprint(russh_keys::HashAlg::Sha256).to_string();
-    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
-    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut sh = FakeShellServer { accepted_client_key, connection_count };
-    tokio::spawn(async move {
-        use server::Server as _;
-        let _ = sh.run_on_socket(config, &listener).await;
-    });
-    (addr, fingerprint)
+    support::spawn_sshd(91, FakeShellServer { accepted_client_key, connection_count }).await
 }
 
 fn seed_ssh_host_key_trust(home: &std::path::Path, host_port: &str, fingerprint: &str) {
