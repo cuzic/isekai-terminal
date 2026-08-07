@@ -181,10 +181,10 @@ impl WrapperPlan {
 /// `isekai-pipe tty attach <name>` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TtySelection {
-    /// Derive `<name>` from the connection profile (`isekai-<profile>`) —
-    /// one daemon per host by default, the same default `--isekai-tmux`
-    /// used for its own `Auto` variant in the abandoned tmux-based design
-    /// this superseded.
+    /// Derives `<name>` — see `tty_attach.rs::resolve_name_from`'s doc
+    /// comment for the actual rule (prefers Windows Terminal's
+    /// `$WT_SESSION`, one daemon per *tab*, falling back to `isekai-<profile>`,
+    /// one daemon per *host*, everywhere else).
     Auto,
     Named(String),
 }

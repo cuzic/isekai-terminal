@@ -14,12 +14,48 @@
 use crate::wrapper::TtySelection;
 
 /// Resolves a `TtySelection` to the actual `<name>` to hand to
-/// `isekai-pipe tty attach`. `Auto` derives `isekai-<profile>` — one daemon
-/// per host by default, mirroring the abandoned `--isekai-tmux` design's own
-/// `Auto` default.
+/// `isekai-pipe tty attach`. See [`resolve_name_from`] for `Auto`'s actual
+/// derivation — this thin wrapper only supplies the real `$WT_SESSION`.
 fn resolve_name(selection: &TtySelection, profile: &str) -> String {
+    resolve_name_from(selection, profile, std::env::var("WT_SESSION").ok().as_deref())
+}
+
+/// `Auto`'s derivation, with `$WT_SESSION` injected rather than read
+/// directly — lets tests exercise both branches deterministically instead of
+/// depending on whether the test process happens to have it set (this
+/// crate's `HOME_ENV_LOCK` in `main.rs` exists precisely because mutating
+/// real process-global env state under `cargo test`'s default multi-threaded
+/// runner is a real flakiness hazard; reading a var directly in a function
+/// under test has the same problem in miniature, so this sidesteps it by
+/// injection instead).
+///
+/// `Windows Terminal` sets `$WT_SESSION` to a GUID that stays the same for
+/// the lifetime of one pane/tab, independent of whatever child process is
+/// currently running in it — unlike anything `isekai-ssh` itself controls,
+/// this survives the exact "local process gets killed and re-run" event
+/// `--isekai-tty` exists to survive, which is what makes it a good default
+/// session key: re-running `isekai-ssh --isekai-tty host` from the *same*
+/// Windows Terminal tab reliably lands back on the *same* remote daemon, and
+/// a *different* tab connected to the *same* host gets a distinct one
+/// (`wt-<session>`) — no user-chosen name, and no ambiguity between tabs to
+/// resolve with a picker (considered and set aside: WT_SESSION already
+/// disambiguates this deterministically when it's available).
+///
+/// Falls back to `isekai-<profile>` (one daemon per host, no tab
+/// distinction — the pre-WT_SESSION behavior, and what every non-Windows-Terminal
+/// environment still gets, e.g. tmux, a plain Linux/macOS terminal, or an
+/// older Windows Terminal release without the variable) when `$WT_SESSION`
+/// isn't set. Scoped to Windows Terminal only, deliberately: no other
+/// terminal this project has looked at exposes an equivalently stable
+/// per-pane identity a *child* process can read after being killed and
+/// restarted, and building a cross-terminal picker for the ambiguous case
+/// was explicitly set aside as unnecessary scope for now.
+fn resolve_name_from(selection: &TtySelection, profile: &str, wt_session: Option<&str>) -> String {
     match selection {
-        TtySelection::Auto => format!("isekai-{profile}"),
+        TtySelection::Auto => match wt_session {
+            Some(session) if !session.is_empty() => format!("wt-{session}"),
+            _ => format!("isekai-{profile}"),
+        },
         TtySelection::Named(name) => name.clone(),
     }
 }
@@ -53,13 +89,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_derives_a_name_from_the_profile() {
-        assert_eq!(resolve_name(&TtySelection::Auto, "prod"), "isekai-prod");
+    fn auto_derives_a_name_from_the_profile_without_wt_session() {
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", None), "isekai-prod");
     }
 
     #[test]
-    fn named_uses_the_explicit_name_verbatim() {
-        assert_eq!(resolve_name(&TtySelection::Named("work".to_string()), "prod"), "work");
+    fn auto_prefers_wt_session_over_the_profile_when_present() {
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", Some("50295e02-2ea3-4f92")), "wt-50295e02-2ea3-4f92");
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_profile_for_an_empty_wt_session() {
+        // Defensive: an env var can technically be set-but-empty (distinct
+        // from unset). Treat that the same as unset rather than emitting the
+        // degenerate name "wt-".
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", Some("")), "isekai-prod");
+    }
+
+    #[test]
+    fn named_uses_the_explicit_name_verbatim_regardless_of_wt_session() {
+        assert_eq!(resolve_name_from(&TtySelection::Named("work".to_string()), "prod", Some("some-guid")), "work");
     }
 
     #[test]
