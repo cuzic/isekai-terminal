@@ -1790,6 +1790,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -1879,6 +1880,7 @@ dependencies = [
  "bytes",
  "env_logger",
  "hmac",
+ "isekai-fs-guard",
  "isekai-link-masque",
  "isekai-netmon",
  "isekai-pipe-core",
@@ -1886,6 +1888,7 @@ dependencies = [
  "isekai-stun",
  "isekai-transport",
  "isekai-trust",
+ "libc",
  "log",
  "notify-rust",
  "quicmux",
@@ -1966,6 +1969,7 @@ dependencies = [
  "ssh-encoding",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
  "ureq",
  "windows-sys 0.59.0",
@@ -2061,6 +2065,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "zeroize",
 ]
 
 [[package]]

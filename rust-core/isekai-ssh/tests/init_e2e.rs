@@ -33,6 +33,8 @@
 //! then lets `connect` (also unmodified, no `--dev-insecure-*`) drive a real
 //! HELLO/proof/ACK and SSH session against a real `isekai-helper` process.
 
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,10 +44,8 @@ use std::time::Duration;
 use isekai_protocol::handshake::{decode_handshake_json, HandshakeJson};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
-use russh_keys::ssh_key::private::Ed25519Keypair;
-use russh_keys::{PrivateKey, PublicKey};
+use russh_keys::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::Command as TokioCommand;
 
 // ---------------------------------------------------------------------
@@ -234,17 +234,7 @@ impl server::Handler for FakeShellHandler {
 }
 
 async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> SocketAddr {
-    let keypair = Ed25519Keypair::from_seed(&[9u8; 32]);
-    let host_key = PrivateKey::from(keypair);
-    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
-    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut sh = FakeShellServer { home, accepted_client_key };
-    tokio::spawn(async move {
-        use server::Server as _;
-        let _ = sh.run_on_socket(config, &listener).await;
-    });
-    addr
+    support::spawn_sshd(9, FakeShellServer { home, accepted_client_key }).await.0
 }
 
 fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {

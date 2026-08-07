@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -111,7 +112,7 @@ class TerminalHostScreenTest {
         // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
         // 先にconnectedにしてからタイトル更新を送る。
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "Remote Title", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("Remote Title").assertExists()
@@ -123,7 +124,7 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "   ", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("alpha").assertExists()
@@ -135,13 +136,30 @@ class TerminalHostScreenTest {
     @Test fun tabLabel_showsAccentDot_whenRemoteSetsTabColor() {
         vm.openTab(profile("alpha"))
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        composeTestRule.waitForIdle()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        // Two things had to be fixed here, both found only by actually
+        // running this against real CI (adversarial review, 2026-08):
+        // (1) waitForIdle() alone doesn't wait for ScreenUpdate's async
+        // propagation through TerminalSession's internal Channel, so a plain
+        // wait races the state update — waitUntil polling instead.
+        // (2) `tabColorDot`'s Box has no semantics of its own besides the
+        // tag, so in the *merged* semantics tree (Compose's default) it gets
+        // absorbed into the enclosing Tab's merged node, and
+        // `SemanticsProperties.TestTag`'s merge policy keeps only the
+        // parent's own tag — meaning `onNodeWithTag`/`onAllNodesWithTag`
+        // could *never* find it without `useUnmergedTree = true`, on every
+        // lookup in this test, not just the final assertion. This was the
+        // real root cause of the failure the waitUntil rewrite alone didn't
+        // fix (a previous, incomplete pass here misdiagnosed it as purely a
+        // timing race).
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertExists()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertExists()
     }
 
     @Test fun tabLabel_hasNoAccentDot_whenTabColorUnset() {
@@ -149,10 +167,21 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        composeTestRule.waitForIdle()
+        // まず色ありのScreenUpdateを送って波及を確認してから色なしへ切り替える —
+        // 色なし単発だと「まだ何も反映されていないので存在しないだけ」でも
+        // assertDoesNotExist()が同じ結果になり、テストとして何も検証できない
+        // (adversarial review指摘、2026-08: 「vacuously passes either way」)。
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
+        }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+        }
+
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
     }
 
     @Test fun clickingInactiveTab_switchesActiveTab() {

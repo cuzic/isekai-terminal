@@ -1,7 +1,7 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
 use crate::kitty_graphics::{ApcInterceptor, ApcStep};
-use crate::{CellData, CursorColor, CursorShape, LineDamage, ScreenUpdate, TabColor};
+use crate::{CellData, CursorShape, LineDamage, ScreenUpdate, TabColor};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
 use crate::theme::Theme;
@@ -245,7 +245,6 @@ impl SessionState {
             cursor_col: cursor_col as u32,
             title: t.title().map(str::to_owned),
             tab_color: t.tab_color().map(|(r, g, b)| TabColor { r, g, b }),
-            cursor_color: t.cursor_color().map(|(r, g, b)| CursorColor { r, g, b }),
             application_cursor_mode: t.application_cursor_mode(),
             application_keypad_mode: t.application_keypad_mode(),
             bracketed_paste_mode: t.bracketed_paste_mode(),

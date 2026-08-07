@@ -89,14 +89,327 @@ use holder::HolderSpawner;
 /// (the always-connects principle).
 const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `isekai-ssh <destination>` entrypoint on Windows: resolves the config, then
-/// dispatches through the concrete named-pipe channel. Swapping in a different
-/// [`ExclusiveChannel`] implementation later (e.g. a Unix one) is the single
-/// concrete type here.
+/// `isekai-ssh <destination>` entrypoint on Windows: resolves the config,
+/// then dispatches through the concrete named-pipe channel, auto-reconnecting
+/// on [`DispatchOutcome::OwnerLost`] (see [`run_with_reconnect`]). Swapping in
+/// a different [`ExclusiveChannel`] implementation later (e.g. a Unix one) is
+/// the single concrete type here.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let prepared = connect::prepare(args.clone()).await?;
-    dispatch::<local_ipc_mux::WindowsNamedPipeChannel, _>(prepared, args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
+    run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
+}
+
+/// How long a `EXIT_MUX_OWNER_LOST` (the mux holder this process was
+/// relaying through died mid-session) is retried before giving up and
+/// surfacing [`crate::EXIT_MUX_OWNER_LOST`] to the user after all — the
+/// `always-connects.md` principle applied to a case this module's own docs
+/// used to treat as unrecoverable (see [`run_with_reconnect`]'s docs).
+/// Generous rather than a small fixed attempt count, matching
+/// `isekai-pipe::resume_loop`'s own resume-window philosophy: a live
+/// interactive session (this loop only ever runs while the user's terminal
+/// is still open, per `RECONNECT_BACKOFF`'s own cancel path) is worth
+/// reconnecting for a long time, not just a few seconds.
+const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Backoff between `OwnerLost` reconnect attempts — same exponential shape
+/// (no jitter) as `isekai-pipe::resume_loop::RESUME_BACKOFF`, reimplemented
+/// locally rather than depending on `isekai-transport` (whose `BackoffPolicy`
+/// lives in `isekai_transport::backoff`) purely to reuse ~10 lines of pure
+/// math: that crate pulls in `noq`/`quicmux`/`timed-fsm` and the rest of the
+/// QUIC transport stack, none of which `isekai-ssh`'s binary otherwise links
+/// against — not worth the dependency weight for this.
+struct ReconnectBackoff {
+    initial: Duration,
+    max: Duration,
+}
+const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10) };
+
+/// An `OwnerLost` attempt that stayed connected at least this long before
+/// losing its (new) owner again counts as a genuinely separate, later
+/// failure — not a continuation of the same reconnect storm — and resets
+/// `attempt`/`lost_since` back to a fresh [`RECONNECT_BUDGET`] window (see
+/// `run_with_reconnect`'s loop). Without this, `lost_since` stays pinned to
+/// the *first-ever* owner loss for the rest of the process's life: a session
+/// that reconnects successfully and runs happily for 23 hours before its
+/// (new, unrelated) owner dies would only have ~1 hour of budget left,
+/// instead of a fresh 24 hours, purely because the clock never restarted.
+/// Comfortably above `RECONNECT_BACKOFF.max` so a run of purely back-to-back
+/// failed attempts (each shorter than this) never spuriously resets the
+/// budget that's meant to bound exactly that case.
+const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
+
+impl ReconnectBackoff {
+    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let shift = attempt.min(32);
+        let multiplier: u64 = 1u64 << shift;
+        let initial_millis = u64::try_from(self.initial.as_millis()).unwrap_or(u64::MAX);
+        let max_millis = u64::try_from(self.max.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(initial_millis.saturating_mul(multiplier).min(max_millis))
+    }
+}
+
+/// [`run`]'s actual body, generic the same way [`dispatch`] is so it's unit
+/// testable without the concrete Windows named-pipe channel.
+///
+/// On [`DispatchOutcome::OwnerLost`] — the mux holder this process was
+/// relaying through died mid-session (`client::ClientRunResult::OwnerLost`'s
+/// docs) — this used to surface [`crate::EXIT_MUX_OWNER_LOST`] immediately
+/// and tell the user to reconnect by hand (this module's own former "no
+/// special recovery code path" doc comment, from the original M4 plan).
+/// That was fine for the case it was written for (the user closed their last
+/// tab, so the whole owner process — tied to that tab's own foreground shell
+/// at the time — tore down along with it, and there was nothing left to
+/// reconnect *to* yet). It stopped being fine once the holder became a
+/// genuinely detached background process (this module's "Known limitation
+/// (deferred)" paragraph above is itself now stale — a re-exec'd holder has
+/// no foreground shell of its own, see [`run_as_holder`]'s docs): an
+/// unexpected holder death while tabs are still attached is now an
+/// exceptional event (a crash, or the PR #65 class of stale-clock hang this
+/// process's own `isekai-pipe connect` child could still hit while its
+/// *own* resume loop gives up), not "the user is done", and the existing
+/// `dispatch` `NotFound` arm already knows how to spawn a fresh holder and
+/// become its client — exactly what a human manually retyping
+/// `isekai-ssh <host>` would trigger. This function just does that
+/// automatically, with backoff, instead of making the human do it.
+///
+/// A fresh [`connect::Prepared`] is resolved per attempt (`Prepared` isn't
+/// `Clone` — it's a one-shot value `dispatch` consumes) via
+/// `connect::prepare(args.clone())`, same as [`run`] used to do once. This
+/// is safe to redo silently on every retry: by construction, this loop only
+/// starts after a *first* `dispatch` attempt already reached
+/// `DispatchOutcome::OwnerLost`, i.e. after an owner connection was already
+/// established at least once, which means this exact destination's host key
+/// is already in the trust store — `connect::prepare`'s
+/// `TofuConfirmation::AlwaysPrompt` policy only actually prompts for a
+/// destination `build_connection_intent` doesn't yet recognize, so a repeat
+/// call for an already-trusted destination can't reach that prompt (see
+/// `connect::prepare_with_tofu`'s docs). No stale passphrase hand-off is
+/// reused either — each attempt resolves its own, same as a fresh manual
+/// invocation would.
+///
+/// Does **not** hold a single [`console::RawModeGuard`] across the whole
+/// loop (an earlier version of this function did) — that broke a brand-new
+/// destination's TOFU confirmation prompt on the very first iteration
+/// (`connect::prepare`'s own inline auto-bootstrap dial, or the direct-
+/// connect fallback's SSH host-key confirmation inside `dispatch`, both run
+/// in normal/cooked mode and need real line editing/echo), since raw mode
+/// was enabled *before* either could run. Each attempt's own interactive
+/// phase enables its own narrowly-scoped guard instead: `client::run` around
+/// the mux-client relay, `native::connect::run_prepared` around a
+/// single-process fallback's shell I/O loop (both already did this before
+/// this loop existed), and [`wait_or_abort`] around the backoff wait itself
+/// (see its docs for why that one specifically still needs raw mode). None
+/// of these ever overlap in time, so there's no repeat of the "a second
+/// nested enable/disable pair fights this one" hazard a single shared guard
+/// was originally introduced to sidestep.
+///
+/// A `prepare` failure is only ever retried (rather than
+/// propagated immediately) once this loop has already reached that state at
+/// least once (`lost_since.is_some()`) — the very first call, before any
+/// `OwnerLost` has happened, still fails fast on a genuine misconfiguration
+/// (a malformed destination, `--isekai-no-bootstrap` against an unregistered
+/// host) exactly as it always has, rather than retrying it for up to
+/// [`RECONNECT_BUDGET`].
+async fn run_with_reconnect<C, S>(
+    args: Vec<String>,
+    spawner: &S,
+    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+) -> Result<u8>
+where
+    C: ExclusiveChannel + Send + 'static,
+    S: HolderSpawner,
+{
+    let mut attempt: u32 = 0;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        let prepared = match connect::prepare(args.clone()).await {
+            Ok(prepared) => prepared,
+            Err(e) if lost_since.is_some() => {
+                // Already reconnected at least once before, so this exact
+                // destination is known-trusted — a `prepare` failure here is
+                // a transient hiccup (trust-store/log-file I/O, a momentary
+                // DNS/network blip), not a fresh misconfiguration. Retry it
+                // with the same budget/backoff as an `OwnerLost` cycle rather
+                // than aborting the whole reconnect loop over it.
+                log_line!("isekai-ssh: preparing to reconnect failed ({e:#}); retrying");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => continue,
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        // Captured before `prepared` moves into `dispatch` below — used by
+        // the `OwnerLost` arm to decide whether auto-retry is even safe (see
+        // its own comment): re-running a *remote command* invocation
+        // (`isekai-ssh host -- cmd`) from scratch after losing the owner
+        // mid-execution isn't the same as reconnecting an interactive shell —
+        // it could silently repeat a non-idempotent action, so it must not
+        // auto-retry the way an interactive session does.
+        let has_remote_command = prepared.plan().remote_command().is_some();
+        let outcome = match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await {
+            Ok(outcome) => outcome,
+            Err(e) if lost_since.is_some() => {
+                // Same reasoning as the `prepare` failure arm above: once
+                // we've already recovered from a lost owner at least once,
+                // any further error out of `dispatch` (e.g. `client::run`
+                // failing outright, or the direct-connect fallback it can
+                // fall through to failing for a transient reason) is a
+                // retryable hiccup, not a reason to give up the whole
+                // reconnect loop — this was itself found still broken by a
+                // second adversarial review pass after the `prepare`-only
+                // fix above, the exact same bug class one level further down
+                // the same function's error paths.
+                log_line!("isekai-ssh: reconnect attempt failed ({e:#}); retrying");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => continue,
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        match outcome {
+            DispatchOutcome::Done(code) => return Ok(code),
+            DispatchOutcome::OwnerLost => {
+                if has_remote_command {
+                    // A remote-command invocation was interrupted mid-flight
+                    // by the owner dying — auto-retrying would silently
+                    // re-run it from scratch, which is only safe for an
+                    // idempotent command and this crate has no way to know
+                    // whether it was one (found by adversarial review, 2026-08).
+                    // Falls back to the pre-auto-retry behavior: surface the
+                    // loss immediately and let the user judge whether
+                    // reconnecting and rerunning is safe.
+                    log_line!(
+                        "isekai-ssh: connection to the isekai-ssh owner process was lost while running a remote \
+                         command; not auto-retrying (rerunning it could repeat a non-idempotent action) — \
+                         reconnect with `isekai-ssh <host> ...` if that's safe to do."
+                    );
+                    return Ok(crate::EXIT_MUX_OWNER_LOST);
+                }
+                if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
+                    // This attempt ran long enough to count as a genuinely
+                    // separate, later failure rather than a continuation of
+                    // the same storm — see `RECONNECT_STABLE_THRESHOLD`'s docs.
+                    attempt = 0;
+                    lost_since = None;
+                }
+                log_line!("isekai-ssh: connection to the isekai-ssh owner process was lost; reconnecting...");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => {}
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                }
+            }
+        }
+    }
+}
+
+enum ReconnectDecision {
+    Retry,
+    GiveUp(u8),
+}
+
+/// Shared bookkeeping for both places `run_with_reconnect`'s loop can decide
+/// to retry (an `OwnerLost` dispatch outcome, or a `prepare` failure once
+/// already mid-reconnect): checks the [`RECONNECT_BUDGET`] against
+/// `lost_since` (starting the clock on first use), waits out the next
+/// backoff delay (bumping `attempt`), and reports whether the caller should
+/// loop again or give up.
+async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>) -> ReconnectDecision {
+    let lost_at = *lost_since.get_or_insert_with(tokio::time::Instant::now);
+    if lost_at.elapsed() >= RECONNECT_BUDGET {
+        log_line!(
+            "isekai-ssh: automatic reconnection gave up after {RECONNECT_BUDGET:?} — reconnect with `isekai-ssh <host>`."
+        );
+        return ReconnectDecision::GiveUp(crate::EXIT_MUX_OWNER_LOST);
+    }
+    let delay = RECONNECT_BACKOFF.delay_for_attempt(*attempt);
+    *attempt += 1;
+    log_line!("isekai-ssh: reconnecting in {delay:?}...");
+    if wait_or_abort(delay).await == WaitOutcome::Aborted {
+        log_line!("isekai-ssh: reconnect canceled (Ctrl+C).");
+        return ReconnectDecision::GiveUp(crate::EXIT_USER_CANCELED);
+    }
+    ReconnectDecision::Retry
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Elapsed,
+    Aborted,
+}
+
+/// Waits out `delay`, but returns early as [`WaitOutcome::Aborted`] if the
+/// user presses Ctrl+C (`0x03`) on stdin while waiting — otherwise, between
+/// `OwnerLost` reconnect attempts, there is no live remote session to send
+/// that byte *to*, so without this a stuck user's only way out is killing
+/// the whole terminal window (`native/mux/client.rs`'s own module docs flag
+/// this exact gap: no `SIGINT`/`ctrl_c`/`SetConsoleCtrlHandler` handling
+/// exists anywhere in this crate). Any other byte read here (a stray
+/// keypress while reconnecting, which has nowhere meaningful to go) is
+/// discarded, not buffered — reusing
+/// `console_stdin::ConsoleStdin`'s process-wide singleton reader (see its
+/// module docs) so this doesn't race whatever the next attempt's own
+/// `ConsoleStdin::open()` call does.
+///
+/// Enables its own [`console::RawModeGuard`], scoped to this wait only: this
+/// runs strictly between two attempts (the previous one's own guard —
+/// `client::run`'s or `native::connect::run_prepared`'s — has already
+/// dropped, and the next attempt's `connect::prepare`/auth hasn't started
+/// yet), so it never overlaps either. Without raw mode here, Ctrl+C during
+/// the wait would be intercepted by the terminal as a real interrupt signal
+/// instead of arriving as a plain `0x03` byte this function can catch and
+/// turn into a clean [`crate::EXIT_USER_CANCELED`] exit. Best-effort: if
+/// raw mode can't be enabled (non-interactive stdio), the wait still runs,
+/// it just can't recognize Ctrl+C as an early-abort signal.
+async fn wait_or_abort(delay: Duration) -> WaitOutcome {
+    let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
+    wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await
+}
+
+/// [`wait_or_abort`]'s actual logic with stdin injected, so it's testable
+/// against a controlled stream instead of this test process's own real
+/// stdin (whose state — a real console, a closed pipe, `/dev/null` — a test
+/// can't control or rely on, unlike `client::run_inner`'s equivalent
+/// injection for the same reason).
+///
+/// Loops rather than resolving on the first `select!` winner: a naive
+/// single `select!` would let a closed/already-EOF stdin (`Ok(0)` resolves
+/// immediately, never blocking) win the race against `sleep(delay)` on
+/// *every* call, skipping the backoff delay entirely and hot-looping
+/// reconnect attempts with no wait at all (found by real-world review: an
+/// `isekai-ssh` invocation with redirected/closed stdin — a script, `< NUL`
+/// — would never actually back off). A non-abort keypress is discarded and
+/// the wait continues; an EOF or read error means stdin will never usefully
+/// produce more input, so the remaining delay is just waited out directly
+/// rather than re-issuing reads against a stream that can't ever satisfy
+/// them.
+async fn wait_or_abort_over<I: tokio::io::AsyncRead + Unpin>(delay: Duration, stdin: &mut I) -> WaitOutcome {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 64];
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return WaitOutcome::Elapsed,
+            result = stdin.read(&mut buf) => {
+                match result {
+                    Ok(n) if n > 0 && buf[..n].contains(&0x03) => return WaitOutcome::Aborted,
+                    Ok(0) | Err(_) => {
+                        // EOF/error: nothing more this stream can ever tell
+                        // us — stop polling it and just wait out the rest of
+                        // the delay.
+                        sleep.await;
+                        return WaitOutcome::Elapsed;
+                    }
+                    Ok(_) => continue,
+                }
+            }
+        }
+    }
 }
 
 /// The holder re-exec entrypoint: `main.rs` calls this instead of [`run`] when
@@ -139,6 +452,24 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     run_as_holder(prepared, holder_channel, &token_path, handoff).await
 }
 
+/// What one full [`dispatch`] attempt concluded with — kept distinct from a
+/// bare exit code (unlike `dispatch`'s previous `Result<u8>` return type) so
+/// [`run_with_reconnect`] can tell "the owner died mid-session, worth
+/// automatically retrying" apart from every other outcome, including a
+/// remote shell that happens to itself exit with
+/// [`crate::EXIT_MUX_OWNER_LOST`]'s numeric value — see
+/// [`client::ClientRunResult::OwnerLost`]'s docs for why that distinction
+/// has to survive past `client::run` in the first place.
+enum DispatchOutcome {
+    /// This attempt ran to some conclusion; this is this process's own exit
+    /// code (the remote shell's real exit code, whether reached via the mux
+    /// or a plain unmultiplexed connect).
+    Done(u8),
+    /// The mux owner this attempt was relaying through died mid-session —
+    /// see [`run_with_reconnect`]'s docs on what the caller does about it.
+    OwnerLost,
+}
+
 /// The role-selecting core, generic over the IPC channel (and the holder
 /// spawner) so it's testable with `InMemoryChannel`/a fake spawner. The
 /// foreground process is **always a client**: it never claims the channel
@@ -147,13 +478,15 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
 /// and retries as a client; any failure along the way (spawn failure, the
 /// holder never coming up, a genuine pipe-infrastructure problem) falls back
 /// to a plain single-process connect so a mux hiccup never blocks connecting
-/// at all (the always-connects principle).
+/// at all (the always-connects principle). A single call here only ever
+/// tries once — [`run_with_reconnect`], the caller, is what loops on
+/// [`DispatchOutcome::OwnerLost`].
 async fn dispatch<C, S>(
     prepared: Prepared,
     holder_args: Vec<String>,
     spawner: &S,
     prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
-) -> Result<u8>
+) -> Result<DispatchOutcome>
 where
     C: ExclusiveChannel + Send + 'static,
     S: HolderSpawner,
@@ -183,7 +516,7 @@ where
                     Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
                     Err(e) => {
                         log_line!("isekai-ssh: no mux holder ever became reachable ({e}); connecting directly");
-                        connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
+                        connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await.map(DispatchOutcome::Done)
                     }
                 };
             }
@@ -203,13 +536,13 @@ where
             if let Err(e) = spawner.spawn(&holder_args, encoded_handoff.as_deref().map(|z| z.as_slice())) {
                 log_line!("isekai-ssh: failed to spawn a detached mux holder ({e}); connecting directly");
                 drop(spawn_lock);
-                return connect::run_prepared(prepared, None, resolved_handoff).await;
+                return connect::run_prepared(prepared, None, resolved_handoff).await.map(DispatchOutcome::Done);
             }
             let result = match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
                 Ok(conn) => run_as_client_over(prepared, conn, &token_path, resolved_handoff).await,
                 Err(e) => {
                     log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
-                    connect::run_prepared(prepared, None, resolved_handoff).await
+                    connect::run_prepared(prepared, None, resolved_handoff).await.map(DispatchOutcome::Done)
                 }
             };
             // Held across the whole spawn+wait window (not just the spawn
@@ -245,7 +578,7 @@ where
                 Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
                 Err(e) => {
                     log_line!("isekai-ssh: local mux channel still unavailable after retrying ({e}); connecting directly without multiplexing");
-                    connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
+                    connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await.map(DispatchOutcome::Done)
                 }
             }
         }
@@ -318,8 +651,11 @@ where
 /// this process already resolved before spawning that holder, if any) so a
 /// user is never prompted for the same passphrase twice in one invocation
 /// (empty when this connect went straight to an already-live holder, i.e. no
-/// hand-off was ever resolved in the first place).
-async fn run_as_client_over<Conn>(prepared: Prepared, conn: Conn, token_path: &Path, handoff: handoff::HandoffCredentials) -> Result<u8>
+/// hand-off was ever resolved in the first place). Returns
+/// [`DispatchOutcome::OwnerLost`], not an exit code, if the holder died
+/// mid-session — see [`run_with_reconnect`]'s docs for what the caller does
+/// with that.
+async fn run_as_client_over<Conn>(prepared: Prepared, conn: Conn, token_path: &Path, handoff: handoff::HandoffCredentials) -> Result<DispatchOutcome>
 where
     Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -328,11 +664,22 @@ where
     // profile identity Epic P Phase 2's build-profile lookup uses on the Unix
     // path (`resolution.profile()`).
     let host = prepared.resolution().profile().to_string();
+    // `--isekai-tty` is silently ignored when the caller already gave an
+    // explicit trailing remote command — same opportunistic convention as
+    // every other consumer of `WrapperPlan::tty_selection` (see its doc
+    // comment).
+    let tty_exec = if prepared.plan().remote_command().is_none() {
+        crate::tty_attach::resolve_exec_command(prepared.plan().tty_selection(), prepared.resolution().profile())
+    } else {
+        None
+    };
     // Same `-t`/`-T` intent the non-mux path derives via
     // `decide_session_kind`/`wants_pty` (`connect.rs`), sent to the owner in
     // `Hello` so it can make the identical decision — see `client::run`'s
-    // doc comment.
-    let want_pty = connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
+    // doc comment. `--isekai-tty` always forces a PTY (`isekai-pipe tty
+    // attach` needs one to relay through), independent of that computation —
+    // same as the Unix `ssh(1)` path forcing `-t` in `apply_ctl_socket_forward`.
+    let want_pty = tty_exec.is_some() || connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
     let remote_command = prepared.plan().remote_command().map(|cmd| cmd.join(" "));
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
@@ -340,10 +687,11 @@ where
         // file) in the race between our successful connect and now. A mux
         // hiccup must never block connecting (the always-connects
         // principle) — dial SSH ourselves, unmultiplexed.
-        ClientToken::FallBack => return connect::run_prepared(prepared, None, handoff).await,
+        ClientToken::FallBack => return connect::run_prepared(prepared, None, handoff).await.map(DispatchOutcome::Done),
     };
-    match client::run(conn, &token, host, remote_command, want_pty).await? {
-        client::ClientRunResult::ExitCode(code) => Ok(code),
+    match client::run(conn, &token, host, remote_command, want_pty, tty_exec).await? {
+        client::ClientRunResult::ExitCode(code) => Ok(DispatchOutcome::Done(code)),
+        client::ClientRunResult::OwnerLost => Ok(DispatchOutcome::OwnerLost),
         // The holder rejected us before any shell session existed (protocol
         // version mismatch, or a stale token read in the window before a new
         // holder rewrote it — see `ClientOutcome::Rejected`'s docs, and — the
@@ -353,7 +701,7 @@ where
         // rather than fail this invocation outright.
         client::ClientRunResult::Rejected { reason } => {
             log_line!("isekai-ssh: the mux holder rejected this connection ({reason}); connecting directly");
-            connect::run_prepared(prepared, None, handoff).await
+            connect::run_prepared(prepared, None, handoff).await.map(DispatchOutcome::Done)
         }
     }
 }
@@ -588,7 +936,7 @@ mod tests {
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
         let outcome = super::client::run_inner(
-            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true,
+            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None,
         )
         .await
         .unwrap();
@@ -967,5 +1315,110 @@ mod tests {
 
         assert!(result.is_err(), "the eventual fallback direct connect must still fail here (bogus pipe path), but via the follower path");
         assert!(spawner.calls.lock().unwrap().is_empty(), "a follower must never spawn its own holder while another tab's spawn lock is held");
+    }
+
+    // `ReconnectBackoff`/`RECONNECT_BUDGET`/`wait_or_abort`'s decision logic
+    // is exercised directly here — same rationale `isekai-transport::backoff`
+    // and `isekai-pipe::resume_loop` use for their own backoff math: pure,
+    // no real console or real dispatch needed. `run_with_reconnect` itself
+    // stays untested directly, matching the pre-existing boundary
+    // `client::run` had (it needs a real console handle to enable raw mode
+    // and read `ConsoleStdin`, same as `client::run` always did — only
+    // `client::run_inner` was ever unit-tested against injected streams).
+
+    #[test]
+    fn reconnect_backoff_doubles_each_attempt_until_capped() {
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5) };
+        assert_eq!(backoff.delay_for_attempt(0), Duration::from_millis(100));
+        assert_eq!(backoff.delay_for_attempt(1), Duration::from_millis(200));
+        assert_eq!(backoff.delay_for_attempt(2), Duration::from_millis(400));
+        assert_eq!(backoff.delay_for_attempt(3), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn reconnect_backoff_converges_to_and_never_exceeds_max() {
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5) };
+        for attempt in 0..64 {
+            assert!(backoff.delay_for_attempt(attempt) <= backoff.max, "attempt {attempt} exceeded max");
+        }
+        assert_eq!(backoff.delay_for_attempt(63), backoff.max, "backoff must saturate at max for a large attempt count, not overflow/panic");
+    }
+
+    #[test]
+    fn reconnect_stable_threshold_is_comfortably_above_the_max_backoff() {
+        // A run of purely back-to-back failed attempts (each shorter than
+        // `RECONNECT_STABLE_THRESHOLD`) must never spuriously look "stable"
+        // and reset the `RECONNECT_BUDGET` clock — see
+        // `RECONNECT_STABLE_THRESHOLD`'s own docs. If someone raises
+        // `RECONNECT_BACKOFF.max` above (or close to) the threshold without
+        // updating this too, that guarantee quietly breaks.
+        assert!(
+            RECONNECT_STABLE_THRESHOLD > RECONNECT_BACKOFF.max * 2,
+            "RECONNECT_STABLE_THRESHOLD must stay well above RECONNECT_BACKOFF.max"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_never_panics_on_a_huge_attempt_count() {
+        // Mirrors `isekai_transport::backoff::BackoffPolicy`'s own overflow
+        // guard test — `attempt.min(32)` before the `1u64 << shift` is what
+        // makes this safe; a regression here would panic in debug builds.
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(1), max: Duration::from_secs(1) };
+        assert_eq!(backoff.delay_for_attempt(u32::MAX), backoff.max);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_or_abort_elapses_when_the_delay_runs_out_with_no_input() {
+        let mut never_ready = tokio::io::empty();
+        // `tokio::io::empty()` yields `Ok(0)` (EOF) immediately on every
+        // read, same as a genuinely closed stdin — exercises the "read
+        // resolved but produced nothing abort-worthy" arm, not the timer
+        // arm specifically (see the next test for a stdin that never
+        // resolves at all, which does exercise the timer arm).
+        let before = tokio::time::Instant::now();
+        let outcome = wait_or_abort_over(Duration::from_secs(1), &mut never_ready).await;
+        assert_eq!(outcome, WaitOutcome::Elapsed);
+        // Regression guard: an EOF/closed stdin (e.g. `isekai-ssh` run with
+        // redirected/closed stdin, or `< NUL`) must still wait out the full
+        // backoff delay, not resolve instantly just because the read never
+        // blocks — a prior version of this function's `select!` let the
+        // always-immediately-ready EOF read win every race, skipping the
+        // delay entirely and hot-looping reconnect attempts with zero wait.
+        assert!(before.elapsed() >= Duration::from_secs(1), "an EOF stdin must not skip the backoff delay");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_or_abort_elapses_via_the_timer_when_stdin_never_resolves() {
+        // `tokio::io::duplex`'s read half never yields anything as long as
+        // nothing is ever written to its write half (kept alive here by
+        // binding it to `_write_half`, not dropping it — a dropped write
+        // half would make the read half see EOF instead, defeating the
+        // point) — this is what actually exercises `wait_or_abort_over`'s
+        // `tokio::time::sleep` arm winning the `select!`, distinct from the
+        // test above.
+        let (mut read_half, _write_half) = tokio::io::duplex(64);
+        let outcome = wait_or_abort_over(Duration::from_secs(1), &mut read_half).await;
+        assert_eq!(outcome, WaitOutcome::Elapsed);
+    }
+
+    #[tokio::test]
+    async fn wait_or_abort_aborts_on_ctrl_c() {
+        let mut stdin = std::io::Cursor::new(vec![b'x', 0x03, b'y']);
+        let outcome = wait_or_abort_over(Duration::from_secs(30), &mut stdin).await;
+        assert_eq!(outcome, WaitOutcome::Aborted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_or_abort_ignores_ordinary_keystrokes_typed_while_waiting() {
+        // A stray keypress during the reconnect wait has nowhere meaningful
+        // to go (no live remote session yet) and must not be mistaken for
+        // Ctrl+C — the read resolving with ordinary bytes is discarded and
+        // the wait keeps going (not treated as `Elapsed`/`Aborted` on the
+        // spot) until the cursor hits EOF and the remaining delay is waited
+        // out for real — `start_paused` is what keeps that 30s delay from
+        // making this test actually take 30 real seconds.
+        let mut stdin = std::io::Cursor::new(vec![b'h', b'i']);
+        let outcome = wait_or_abort_over(Duration::from_secs(30), &mut stdin).await;
+        assert_eq!(outcome, WaitOutcome::Elapsed);
     }
 }

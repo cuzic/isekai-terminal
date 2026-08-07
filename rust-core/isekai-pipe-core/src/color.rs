@@ -3,7 +3,7 @@
 //! `claude-hookd`'s color env-var resolution (`ISEKAI_PIPE_DESIGN.md` §8
 //! Epic Q). Centralized here (rather than duplicated per crate) because the
 //! `#@isekai` directive path feeds a value straight into the shell command
-//! line `isekai-ssh` execs on connect (`ctl_forward.rs::remote_command_arg`)
+//! line `isekai-ssh` execs on connect (`ctl_forward.rs::build_login_shell_command`)
 //! — an unvalidated or under-validated color string there is a shell
 //! injection / connection-killing bug, not just a cosmetic one, so this
 //! function is the single place that decides what a "valid color" is.

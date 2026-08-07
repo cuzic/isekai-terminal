@@ -20,7 +20,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
-use crate::{NetworkChangeEvent, NetworkChangeMonitor};
+use crate::{NetworkChangeCause, NetworkChangeEvent, NetworkChangeMonitor};
 
 /// The callback `NotifyIpInterfaceChange` invokes on its own internal
 /// (non-tokio) thread whenever any IP interface changes. `caller_context` is
@@ -40,7 +40,7 @@ unsafe extern "system" fn interface_change_callback(
     // already dropped — nothing to do about that from inside an OS
     // callback; `Drop` cancels the underlying registration anyway, so this
     // callback shouldn't fire again after that point.
-    let _ = sender.send(NetworkChangeEvent);
+    let _ = sender.send(NetworkChangeEvent { cause: NetworkChangeCause::InterfaceChange });
 }
 
 pub struct WindowsNetworkChangeMonitor {

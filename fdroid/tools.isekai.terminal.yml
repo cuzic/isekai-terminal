@@ -17,6 +17,9 @@
 #     build server, only against the docs. There is no dedicated Rust/cargo
 #     install field (confirmed against the same doc page), so `sudo:` is the
 #     intended hook for this.
+#   - re-check the pinned zig / cargo-zigbuild versions in the `sudo:` block.
+#     They are pinned (zig with a sha256 of its tarball) so the build stays
+#     reproducible, but nothing bumps them automatically.
 
 Categories:
   - Internet
@@ -66,16 +69,36 @@ Builds:
     # So the symlinks below point straight at the real toolchain binaries
     # under RUSTUP_HOME's toolchains/ dir instead of the shim, which need no
     # env vars at all to run.
+    # The two `*-unknown-linux-musl` targets, zig and cargo-zigbuild are for the
+    # static `isekai-pipe` binaries that isekai-terminal-core `include_bytes!`s
+    # (see rust-core/src/isekai_pipe_quic_transport.rs); without them the
+    # gradle build's `cargo build` fails to compile. zig is what supplies the C
+    # cross-compiler/linker those targets need (ring builds C code), so no
+    # musl-gcc / cross binutils have to be installed.
     sudo:
       - |
         export RUSTUP_HOME=/opt/rustup
         export CARGO_HOME=/opt/cargo
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
         export PATH="/opt/cargo/bin:$PATH"
-        rustup target add aarch64-linux-android --toolchain stable
+        rustup target add aarch64-linux-android x86_64-unknown-linux-musl aarch64-unknown-linux-musl --toolchain stable
+        curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+        echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
+        mkdir -p /opt/zig
+        tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+        cargo install --locked --version 0.23.0 cargo-zigbuild
         TOOLCHAIN_DIR="$(rustup toolchain list | head -n1 | awk '{print $1}')"
         ln -sf "/opt/rustup/toolchains/$TOOLCHAIN_DIR/bin/cargo" /usr/local/bin/cargo
         ln -sf "/opt/rustup/toolchains/$TOOLCHAIN_DIR/bin/rustc" /usr/local/bin/rustc
+        ln -sf /opt/zig/zig /usr/local/bin/zig
+        ln -sf /opt/cargo/bin/cargo-zigbuild /usr/local/bin/cargo-zigbuild
+    # `build:` runs as the non-root build user with cwd = the repo root, before
+    # the `gradle:` build (fdroidserver/build.py runs it as
+    # `bash -e -u -o pipefail -x -c` with cwd=root_dir). That is the only hook
+    # that happens early enough to produce the musl binaries the gradle build's
+    # `cargo build` then embeds.
+    build:
+      - rust-core/scripts/build-isekai-pipe-musl.sh
     gradle:
       - yes
 

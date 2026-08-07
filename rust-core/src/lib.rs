@@ -1095,16 +1095,6 @@ pub struct TabColor {
     pub b: u8,
 }
 
-/// OSC 12(xterm/iTerm2互換、`ESC]12;<spec>ST`)またはOSC 112(リセット)で設定された
-/// カーソル色。RGB各成分は0-255。`ScreenUpdate::cursor_color`が`None`のときは未設定
-/// (UI層は自身の既定カーソル色、Android `TerminalTheme.cursor`を使う)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
-pub struct CursorColor {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     /// 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
@@ -1124,10 +1114,6 @@ pub struct ScreenUpdate {
     /// タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
     /// セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
     pub tab_color: Option<TabColor>,
-    /// xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
-    /// `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
-    /// セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
-    pub cursor_color: Option<CursorColor>,
     pub application_cursor_mode: bool,
     /// DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
     /// (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
