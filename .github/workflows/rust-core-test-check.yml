@@ -83,6 +83,102 @@ jobs:
           restore-keys: |
             rust-core-test-${{ runner.os }}-
 
+      # `test-windows`ジョブは`rust-core/isekai-ssh/tests/*.rs`をファイル名の明示list
+      # (`mux_holder_windows_e2e`/`native_auth_windows_e2e`単独step + 5ファイルループ)
+      # で実行しており、新規e2eファイルを追加してもここへの追加を忘れるとサイレントに
+      # 一切Windows CIで走らない(実際に`native_auth_windows_e2e.rs`追加時に一度
+      # 踏みかけた)。全ファイルが「Windowsで実行する(ALLOWED_WINDOWS)」「実sshd/
+      # `wrapper::run`(`#[cfg(not(windows))]`)前提でWindowsでは原理的に実行できない
+      # (EXCLUDED_UNIX_ONLY)」「技術的理由なく単に未追加(KNOWN_GAP、正直に告知する
+      # ためのバケットで"除外"とは別枠)」のいずれかに分類されているかをここで検証する。
+      # 3つの配列のどれにも属さない新規ファイルがあれば、著者に
+      # `test-windows`ジョブへの追加(または除外理由の追記)を促してこのstepを失敗させる。
+      #
+      # ALLOWED_WINDOWSは手書きの固定配列ではなく、この安全網自身が
+      # `test-windows`ジョブの実行内容(このワークフローファイル自身)からgrepで
+      # 動的に抽出する(adversarial review指摘、2026-08): 手書き配列だと
+      # 「ALLOWED_WINDOWSに追記したが対応する`cargo test --test`step/ループ
+      # エントリを`test-windows`ジョブ側に足し忘れた」場合でもこのチェック自体は
+      # 通ってしまい、この安全網がまさに検出しようとしている「サイレントに
+      # Windows CIで一切走らない」を別の形で再現してしまう。個別step
+      # (`run: cargo test -p isekai-ssh --test <name>`で終わる行)と5本ループの
+      # `for t in ...; do`の両方を実際にparseするので、`test-windows`ジョブ側の
+      # 変更が自動的にここへ反映される。
+      #
+      # 2回目のadversarial review指摘(2026-08)で見つかった2件を追加修正:
+      # (a) 素朴なgrepだと、この抽出ロジック自身を説明するコメント行(上の
+      # 「`for t in ...; do`の両方を実際にparseする」という一文)にまで
+      # マッチしてしまい、`...`という幽霊エントリがALLOWED_WINDOWSへ混入して
+      # いた(実測COUNT=10)。ゼロ件ガード(直後のif)はこのせいで実質発動不能
+      # だった——真に0件になるはずの壊れ方(runフォーマットの変更等)でも
+      # 常に≥1件ヒットしてガードを素通りしてしまう。
+      # (b) 抽出がワークフローファイル全体に対して行われており、
+      # `test`/`test-macos`ジョブに同じ形の`run:`行が追加された場合も
+      # Windows対応済みと誤カウントしてしまう(この安全網自身が防ごうと
+      # している「サイレントな取りこぼし」を別の形で再現する)。
+      #
+      # 修正: `test-windows:`ジョブのYAMLブロックだけに範囲を絞ってから
+      # (awk、次のトップレベルjobキーの手前まで)、コメント行(`#`始まり)を
+      # 除外してgrepする。
+      - name: Verify every isekai-ssh e2e test file is accounted for in Windows CI
+        run: |
+          set -euo pipefail
+          WORKFLOW_FILE=".github/workflows/rust-core-test-check.yml"
+          TEST_WINDOWS_BLOCK=$(awk '
+            /^  test-windows:/ { found=1; print; next }
+            found && /^  [A-Za-z_-]+:$/ { exit }
+            found { print }
+          ' "$WORKFLOW_FILE")
+          if [ -z "$TEST_WINDOWS_BLOCK" ]; then
+            echo "::error::could not locate the test-windows job in $WORKFLOW_FILE — has it been renamed?"
+            exit 1
+          fi
+          mapfile -t ALLOWED_WINDOWS < <(
+            {
+              echo "$TEST_WINDOWS_BLOCK" | grep -vE '^\s*#' | grep -oE 'cargo test -p isekai-ssh --test [A-Za-z0-9_]+$' | awk '{print $NF}'
+              echo "$TEST_WINDOWS_BLOCK" | grep -vE '^\s*#' | grep -oE 'for t in [^;]+; do' | sed -E 's/^for t in //; s/; do$//' | tr ' ' '\n'
+            } | sort -u
+          )
+          if [ "${#ALLOWED_WINDOWS[@]}" -eq 0 ]; then
+            echo "::error::failed to extract any test-windows run entries from $WORKFLOW_FILE — the grep/sed patterns above no longer match this workflow's actual shape (edited without updating this step?)."
+            exit 1
+          fi
+          # 実`/usr/sbin/sshd`+`setsid`前提、または`wrapper::run`
+          # (`main.rs`で`#[cfg(not(windows))]`)経由のコードパスをテストしており、
+          # Windowsでは原理的に実行できないファイル。
+          EXCLUDED_UNIX_ONLY=(
+            real_sshd_bootstrap_e2e
+            real_sshd_multihop_bootstrap_e2e
+            ctl_socket_forward_e2e
+            build_result_push_e2e
+            wrapper_stdout_cleanliness
+            log_file_e2e
+          )
+          # 技術的にWindowsで実行できない理由が見当たらないが、単に`test-windows`
+          # ジョブに追加されていない既知のギャップ。EXCLUDED_UNIX_ONLYと違い
+          # 「正当な除外」ではないことを明示するための別枠。
+          KNOWN_GAP=(
+            login_e2e
+          )
+          missing=0
+          for f in rust-core/isekai-ssh/tests/*.rs; do
+            name=$(basename "$f" .rs)
+            found=0
+            for list in ALLOWED_WINDOWS EXCLUDED_UNIX_ONLY KNOWN_GAP; do
+              declare -n arr="$list"
+              for entry in "${arr[@]}"; do
+                if [ "$entry" = "$name" ]; then
+                  found=1
+                fi
+              done
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "::error::rust-core/isekai-ssh/tests/$name.rs is not accounted for in this workflow's ALLOWED_WINDOWS/EXCLUDED_UNIX_ONLY/KNOWN_GAP lists — add it to the test-windows job's run list, or to one of these lists with a reason, before merging."
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
@@ -261,6 +357,36 @@ jobs:
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test mux_holder_windows_e2e
+
+      # `native_auth_windows_e2e.rs`: 同じ理由(mux_holder_windows_e2e同様、
+      # `main.rs`の`#[cfg(windows)]`アーム経由でしか実行されない)でssh_test_shim
+      # を使わない独立stepとして、5ファイルループより前に配置する。CertificateFile
+      # 認証(非対話)のみを検証する — keyboard-interactive/パスフレーズ対話認証は
+      # このファイルのモジュールdocが説明する通り原理的にe2eで到達不能なため対象外。
+      - name: cargo test -p isekai-ssh --test native_auth_windows_e2e (Windows, CertificateFile auth over the native path)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_auth_windows_e2e
+
+      # `native_agent_auth_windows_e2e.rs`: 同じ理由(main.rsの#[cfg(windows)]
+      # アーム経由でしか実行されない)で独立step。SSH agent認証
+      # (native/agent_auth.rs::connect_agent、実Windows名前付きパイプ経由で
+      # 一度もテストされていなかった経路)をin-process russh_keys::agent::server
+      # 経由で検証する。
+      - name: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e (Windows, SSH agent auth over a named pipe)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e
+
+      # `native_ctl_build_relay_windows_e2e.rs`: 同じ理由で独立step。Windows
+      # native mux経由のctl-socket転送(native/mux/ctl_forward.rs)とEpic P
+      # ビルドトリガーリレー(native/mux/build_relay.rs、ISEKAI_PIPE_DESIGN.md
+      # 自身が実Windows機での検証が一度も行われていないと明記していた経路)を
+      # 実cmd.exe子プロセスの起動まで含めて検証する。
+      - name: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e (Windows, native mux ctl-forward + Epic P build relay)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e
 
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim

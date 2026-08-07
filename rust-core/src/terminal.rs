@@ -3232,6 +3232,60 @@ impl Perform for Terminal {
             (Some(&b"6"), Some(&b"1")) => {
                 self.handle_osc6_iterm2_tab_color(params);
             }
+            // OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`): Windows Terminalのプライベート
+            // 拡張(パレットindex 264をタブ背景色に流用、`microsoft/terminal` PR #13058)。
+            // 通常のOSC 4(パレット色index 0-255の設定)はこのアプリでは未実装のため、
+            // 264だけを個別にmatchして区別する(255以下の通常パレットindexは
+            // フォールスルーで無視され続ける)。
+            //
+            // 制約(Opusレビュー指摘、2026-08。記述をadversarial reviewで訂正、
+            // 2026-08): tmuxはOSC 4を自前で解釈し、標準外のindex(264)を素の
+            // (DCSでラップしていない)まま送ると宛先へ転送しない。ただし
+            // `allow-passthrough on`は無条件に効かないわけではなく、DCSの
+            // パススルーシーケンス(`\ePtmux;...\e\\`)でラップされたペイロード
+            // はtmuxがそのまま宛先へ転送する——`osc-color::wrap_for_tmux_
+            // passthrough`(`claude-hookd`の`TmuxPassthrough`配信モードが使う
+            // 実装)はまさにこのラップを行うためのヘルパーで、それ経由なら
+            // tmux配下でもこのOSC 4;264経路は届く。tmuxを意識しない素の
+            // シェルが無加工でOSC 4;264を吐く場合にのみ、tmuxがそれを飲み
+            // 込んで届かない——その場合のフォールバックとして`CtlMessage::
+            // SetTabColor`(`session.rs`のctlソケット経路、`set_tab_color`
+            // 直接呼び出し)がある。
+            //
+            // xtermのOSC 4は本来`4;idx;spec;idx;spec;...`と複数ペアを1シーケンスに
+            // 詰められるが、ここは`params[1] == "264"`の1ペアのみを見ている
+            // (`4;1;rgb:..;264;rgb:..`のような複合シーケンスの264は現状取りこぼす)。
+            // 通常のパレットOSC 4本体を将来実装する際は、2個ずつ回すループの中で
+            // 264を分岐する形に統合すること。またOSC 10/11と異なり`264;?`という
+            // query(現在値の読み出し)には応答しない——実害はほぼ無いための意図的な
+            // 非対称。
+            (Some(&b"4"), Some(&b"264")) => {
+                if let Some(&spec) = params.get(2) {
+                    if let Some(argb) = parse_osc_color_spec(spec) {
+                        let r = ((argb >> 16) & 0xFF) as u8;
+                        let g = ((argb >> 8) & 0xFF) as u8;
+                        let b = (argb & 0xFF) as u8;
+                        self.tab_color = Some((r, g, b));
+                    }
+                }
+            }
+            // OSC 6;1;bg;<channel>;brightness;<0-255>ST: iTerm2's proprietary
+            // tab background color convention (see iTerm2's "Proprietary
+            // Escape Codes" documentation) — the counterpart to OSC 4;264
+            // above for a client that identifies itself (or defaults, absent
+            // any signal either way) as iTerm2 rather than Windows Terminal.
+            // Without this arm, a remote-side tool that picks its OSC dialect
+            // based on `$TERM_PROGRAM`/an explicit override (this app's own
+            // `isekai-ssh`/`claude-hookd`'s `osc_color::TerminalKind::resolve`
+            // is exactly such a tool) would silently produce no tab color
+            // here whenever it guesses iTerm2 — this custom terminal isn't
+            // actually either real terminal, so recognizing both dialects
+            // (rather than only the one it happened to implement first) is
+            // what keeps it a harmless no-op-or-better regardless of which
+            // one the far end picked (adversarial review finding, 2026-08).
+            (Some(&b"6"), Some(&b"1")) => {
+                self.handle_osc6_iterm2_tab_color(params);
+            }
             // OSC 8(`ESC]8;params;URIST`): ハイパーリンク(タスク#40)。詳細は
             // `handle_osc8_hyperlink`のdocコメント参照。`params.get(1)`が`None`
             // (`ESC]8ST`のようなパラメータ自体が無い形)も含めて丸ごと委譲する

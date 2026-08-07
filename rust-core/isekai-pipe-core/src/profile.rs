@@ -540,10 +540,13 @@ mod tests {
 
         assert_eq!(
             profile.to_legacy_relay_transport(),
+            // Both `.clone()`s, not moves: `HelperTrust` now zeroizes
+            // `cached_session_secret` on drop, which Rust disallows moving
+            // any field (not just the zeroized one) out of.
             Some(IntentTransport::Relay {
-                helper_addr: trust.cached_relay_addr,
+                helper_addr: trust.cached_relay_addr.clone(),
                 server_name: "isekai-helper".to_string(),
-                session_secret_b64: trust.cached_session_secret,
+                session_secret_b64: trust.cached_session_secret.clone(),
             })
         );
     }

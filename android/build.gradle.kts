@@ -83,23 +83,42 @@ val cargoBuildRustCore = tasks.register<Exec>("cargoBuildRustCore") {
     description = "Cross-compiles the Rust isekai-terminal-core native library for arm64-v8a via cargo/NDK."
     workingDir = rustCoreDir
     commandLine("cargo", "build", "--release", "--target", "aarch64-linux-android", "-p", "isekai-terminal-core")
-    inputs.dir(rustCoreDir.resolve("src"))
-    inputs.file(rustCoreDir.resolve("Cargo.toml"))
-    inputs.file(rustCoreDir.resolve("Cargo.lock"))
-    inputs.dir(rustCoreDir.resolve(".cargo"))
+    // isekai-terminal-core(rust-core/src)は同じcargoワークスペースの他クレート
+    // (isekai-protocol/isekai-transport等、rust-core直下に23クレート)にも依存する。
+    // 以前は`rust-core/src`だけをinputsに宣言していたため、それら下位クレートだけを
+    // 変更してもGradleがこのExecタスクをUP-TO-DATEと誤判定し、古い.soがAPKへ
+    // 混入し得た(2026-07-28、書籍原稿の実地検証で発覚)。target/やcargo-mutantsの
+    // 出力ディレクトリ、ワークスペース非メンバーのnoq-multipath-spikeは除外する。
+    inputs.files(
+        fileTree(rustCoreDir) {
+            exclude("target/**", "mutants.out/**", "mutants.out.old/**", "noq-multipath-spike/**")
+        }
+    ).withPropertyName("rustCoreWorkspaceSources").withPathSensitivity(PathSensitivity.RELATIVE)
+    // isekai_pipe_quic_transport.rsが`include_bytes!`で埋め込むmusl静的isekai-pipe
+    // バイナリ(scripts/build-isekai-pipe-musl.shが別途生成、CLAUDE.md参照)。
+    // target/配下だがワークスペースソースの変更では追跡できないため個別に指定する。
+    // ローカルでmuslビルドを未実行の環境(このリポジトリのCI以外の開発環境等)では
+    // 存在しないこともあるためoptionalにする。
+    inputs.files(
+        rustCoreDir.resolve("target/x86_64-unknown-linux-musl/release/isekai-pipe"),
+        rustCoreDir.resolve("target/aarch64-unknown-linux-musl/release/isekai-pipe"),
+    ).withPropertyName("muslIsekaiPipeBinaries").withPathSensitivity(PathSensitivity.RELATIVE).optional()
     outputs.file(rustCoreDir.resolve("target/aarch64-linux-android/release/libisekai_terminal_core.so"))
 }
 
 val copyRustCoreJniLibs = tasks.register<Copy>("copyRustCoreJniLibs") {
-    description = "Copies the cross-compiled isekai-terminal-core .so into jniLibs/arm64-v8a."
+    description = "Copies the cross-compiled isekai-terminal-core .so into a jniLibs source dir."
     dependsOn(cargoBuildRustCore)
     from(rustCoreDir.resolve("target/aarch64-linux-android/release/libisekai_terminal_core.so"))
-    into("src/main/jniLibs/arm64-v8a")
+    into(layout.buildDirectory.dir("rustJniLibs/arm64-v8a"))
 }
 
-tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(copyRustCoreJniLibs)
-}
+// `preBuild`に直接dependsOnせず、jniLibsのsourceSetとして登録する: AGPは実際に
+// .soを消費するタスク(mergeDebugJniLibFolders等のパッケージング系タスク)にだけ
+// 依存を張るため、JVMのみで完結するtestDebugUnitTest(Robolectric)実行のたびに
+// 無関係なNDKクロスビルドが走らなくなる(2026-07-28、書籍原稿の実地検証で発覚した
+// 内側ループの遅さの反面教師に対する修正)。
+android.sourceSets.getByName("main").jniLibs.srcDir(copyRustCoreJniLibs)
 
 dependencies {
     implementation(libs.androidx.core.ktx)

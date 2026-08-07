@@ -4,6 +4,8 @@
 //! mock-`sshd` harness shape as `wrapper_stale_trust_auto_recovery_e2e.rs`,
 //! duplicated per this crate's self-contained-test-file convention.
 
+mod support;
+
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,10 +16,8 @@ use isekai_protocol::handshake::{decode_handshake_json, HandshakeJson};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
-use russh_keys::ssh_key::private::Ed25519Keypair;
-use russh_keys::{PrivateKey, PublicKey};
+use russh_keys::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::Command as TokioCommand;
 
 fn ssh_binary_available() -> bool {
@@ -178,18 +178,7 @@ impl server::Handler for FakeShellHandler {
 /// silent/non-interactive mode and would otherwise block forever on the
 /// `Stdio::null()` stdin these tests use.
 async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> (SocketAddr, String) {
-    let keypair = Ed25519Keypair::from_seed(&[17u8; 32]);
-    let host_key = PrivateKey::from(keypair);
-    let fingerprint = host_key.public_key().fingerprint(russh_keys::HashAlg::Sha256).to_string();
-    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
-    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let mut sh = FakeShellServer { home, accepted_client_key };
-    tokio::spawn(async move {
-        use server::Server as _;
-        let _ = sh.run_on_socket(config, &listener).await;
-    });
-    (addr, fingerprint)
+    support::spawn_sshd(17, FakeShellServer { home, accepted_client_key }).await
 }
 
 /// Seeds `known_ssh_hosts.toml` under `home/.config/isekai-ssh/` with a
