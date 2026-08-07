@@ -264,6 +264,20 @@ async fn read_one_event(stream: tokio::net::UnixStream) -> Option<(String, HookE
 }
 
 async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, HookEvent)> {
+    // Symmetric with `main.rs::send_event`'s own peer-credential check on
+    // the client side (adversarial review, 2026-08: this accept-side check
+    // was missing entirely) — under the `/tmp` fallback (no
+    // `$XDG_RUNTIME_DIR`, see `daemon_sock_dir`'s docs), the socket path is
+    // a deterministic hash any local user can also connect *to* once it
+    // exists, not just pre-bind. Without this, any such connection would be
+    // read as a legitimate hook event (forged `session_id`/`event`,
+    // attacker-controlled tab color/attention-popup state) purely because
+    // it reached the socket at all. Checked before any data is read, so a
+    // mismatched peer can't influence parsing even indirectly.
+    match stream.peer_cred() {
+        Ok(cred) if cred.uid() == unsafe { libc::geteuid() } => {}
+        _ => return None,
+    }
     let mut reader = BufReader::new(stream.take(MAX_EVENT_LINE_LEN));
     let mut line = String::new();
     reader.read_line(&mut line).await.ok()?;

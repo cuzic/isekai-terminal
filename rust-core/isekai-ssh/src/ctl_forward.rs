@@ -457,6 +457,7 @@ async fn run_build(
 /// remote disconnected mid-build / non-zero exit) or `None` (hide) on
 /// success. Same best-effort/no-op-on-failure posture as the start signal —
 /// see the call site in `run_build`.
+#[cfg(unix)]
 fn emit_build_progress_result(success: bool) {
     let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
     if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }, TerminalKind::resolve()) {
