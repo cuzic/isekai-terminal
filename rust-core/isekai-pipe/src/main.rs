@@ -7,6 +7,7 @@ mod connect;
 mod inspect;
 mod probe;
 mod resume_loop;
+mod tty;
 
 use std::process::ExitCode;
 #[cfg(test)]
@@ -308,6 +309,7 @@ async fn run() -> ExitCode {
         Some("inspect") => inspect::inspect_command(args).await,
         Some("ctl") => ctl::ctl_command(args).await,
         Some("claude-hookd") => claude_hookd::claude_hookd_command(args).await,
+        Some("tty") => tty::tty_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");
