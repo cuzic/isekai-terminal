@@ -119,9 +119,24 @@ impl TokenSet {
         client_id: Option<String>,
         fallback_refresh_token: Option<String>,
     ) -> TokenSet {
+        let refresh_token = match response.refresh_token {
+            Some(rotated) => {
+                // The server issued a fresh refresh token (RFC 6749 §6
+                // rotation) — `fallback_refresh_token` is now a stale,
+                // discarded copy of the *old* secret, and a plain drop here
+                // would silently defeat this file's own zeroize-before-drop
+                // fixes (adversarial review, 2026-08: this exact `Option::or`
+                // discard was found to leave that copy un-zeroized).
+                if let Some(mut stale) = fallback_refresh_token {
+                    stale.zeroize();
+                }
+                Some(rotated)
+            }
+            None => fallback_refresh_token,
+        };
         TokenSet {
             access_token: response.access_token,
-            refresh_token: response.refresh_token.or(fallback_refresh_token),
+            refresh_token,
             expires_at: response.expires_in.map(|secs| unix_now() + secs as i64),
             token_endpoint: Some(token_endpoint),
             client_id,
@@ -280,31 +295,44 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
 /// `{"relay_jwt": ...}` schema — use `save_token_set` to persist a full
 /// `TokenSet` (refresh token / expiry / token endpoint included).
 pub fn save_token(path: &Path, relay_jwt: &str) -> Result<(), AuthError> {
-    let serialized = serde_json::to_string_pretty(&TokenFileV1 { relay_jwt: relay_jwt.to_string() })?;
-    write_atomically(path, &serialized)
+    let mut wrapper = TokenFileV1 { relay_jwt: relay_jwt.to_string() };
+    let result = serde_json::to_string_pretty(&wrapper);
+    // `wrapper.relay_jwt` is a second plaintext copy of the secret that
+    // `TokenFileV1` (unlike `TokenSet`) has no `Drop` impl to wipe — zeroize
+    // it explicitly here before it falls out of scope (adversarial review,
+    // 2026-08: the write path had the same un-zeroized-copy bug the read
+    // path (`load_token_set`) was fixed for).
+    wrapper.relay_jwt.zeroize();
+    write_atomically(path, result?)
 }
 
 /// Writes a full `TokenSet` to the token file at `path`, with the same
 /// atomic-write + `0600`/`0700` permission handling as `save_token`.
 pub fn save_token_set(path: &Path, token_set: &TokenSet) -> Result<(), AuthError> {
     let serialized = serde_json::to_string_pretty(token_set)?;
-    write_atomically(path, &serialized)
+    write_atomically(path, serialized)
 }
 
 /// Shared atomic-write body for `save_token`/`save_token_set`: write to a
 /// fresh temp file in `path`'s parent directory (creating it, `0700`, if
 /// needed), set `0600` permissions on the temp file, then rename it over
-/// `path`.
-fn write_atomically(path: &Path, serialized: &str) -> Result<(), AuthError> {
+/// `path`. Takes `serialized` by value (not `&str`) specifically so it can
+/// be zeroized here once the write attempt is done with it — the JSON text
+/// this function's two callers hand it is plaintext containing the actual
+/// secret (`access_token`/`refresh_token`, or the legacy `relay_jwt`), a
+/// third copy alongside the two `load_token_set` already zeroizes on the
+/// read side (adversarial review, 2026-08: this write-side copy was found
+/// still un-zeroized after that fix).
+fn write_atomically(path: &Path, mut serialized: String) -> Result<(), AuthError> {
     let parent = path.parent().ok_or_else(|| AuthError::NoParentDir { path: path.to_path_buf() })?;
     ensure_private_dir(parent)?;
 
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
     set_private_file_permissions(tmp.path())?;
-    tmp.write_all(serialized.as_bytes())
-        .and_then(|_| tmp.flush())
-        .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
+    let write_result = tmp.write_all(serialized.as_bytes()).and_then(|_| tmp.flush());
+    serialized.zeroize();
+    write_result.map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
 
     tmp.persist(path).map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e.error })?;
     Ok(())
