@@ -262,15 +262,26 @@ enum ClientEvent {
 /// confirmed live 2026-08-04 by a temporary `Stop` hook dumping stdin to a
 /// file, same method as `background_tasks`'s own discovery; also
 /// undocumented in the public hooks reference) is non-empty: each entry is
-/// a scheduled self-resume this exact session registered for itself (e.g.
-/// the `ScheduleWakeup` tool, or a `/loop`-style recurring one —
+/// *usually* a scheduled self-resume this exact session registered for
+/// itself (e.g. the `ScheduleWakeup` tool, or a `/loop`-style recurring one —
 /// `recurring: true`/`false` doesn't change the classification, since
 /// either kind still means the session comes back on its own). Unlike
-/// `background_tasks`, no type-filtering is needed here: every
-/// `session_crons` entry unambiguously means Claude Code's own scheduling
-/// infrastructure — not a heuristic on this crate's part — already
-/// committed to resuming this session, which is if anything a *stronger*
-/// self-resolving signal than a `background_tasks` entry. This was the
+/// `background_tasks`, no type-filtering is applied here — **not** because
+/// the array is guaranteed to only ever contain entries scoped to this
+/// session (adversarial review, 2026-08, checked against the real Claude
+/// Code CLI's own logic: `session_crons` also carries *teammate/subagent*-
+/// owned crons an `Agent`/`SendMessage` dispatch pushed into this same
+/// shared list, distinguishable by their own `agentId` field, which the
+/// `Stop` hook payload this function reads does not include at all — the
+/// same kind of ambiguity `has_teammate_background_work`/
+/// `ClientEvent::StopAmbiguousTeammate` exists to disambiguate for
+/// `background_tasks`, but with no equivalent signal available here to do
+/// it with) — but because there is no *cheaper*, more targeted signal
+/// available to filter on, and deferring is still the safer of the two
+/// possible mistakes: a false `StopDeferred` (this session's own genuine
+/// stop delayed by a teammate's unrelated cron) self-corrects via
+/// `state.rs`'s bounded timeout below, while a false `Notify` on a real
+/// self-resume is the original bug this fix exists to close. This was the
 /// actual root cause of a real false-Attention report (2026-08-04, user
 /// noticed a tab going orange while a `ScheduleWakeup`-driven wait was
 /// still in flight): `parse_hook_event` checked `background_tasks` only,
@@ -284,13 +295,22 @@ enum ClientEvent {
 /// `Stop` ambiguous, was reverted the same day after producing false
 /// negatives with no such backstop — self-report alone isn't trustworthy for
 /// this, see `claude-hookd-self-report-marker-failed` in memory). Note this
-/// bound (`MAX_DEFERRAL`, 30 minutes) is shorter than `ScheduleWakeup`'s own
-/// maximum delay (1 hour) — a `session_crons` wait can in principle still
-/// get promoted to `Attention` before its own scheduled time arrives. Left
-/// as-is rather than special-cased: `state.rs`'s self-correction is
-/// deliberately the same safety net regardless of *why* a `Stop` was
-/// deferred, and a late, spurious color flip is a smaller cost than adding
-/// a second deadline-tracking scheme.
+/// bound (`MAX_DEFERRAL`, 30 minutes) is anchored to `ScheduleWakeup`'s own
+/// maximum delay (1 hour) — for that specific tool a `session_crons` wait
+/// can in principle still get promoted to `Attention` before its own
+/// scheduled time arrives, but only by up to that much. A session-scoped
+/// `CronCreate` entry has no such cap at all: its `schedule` is an arbitrary
+/// cron expression (`"0 9 * * 1-5"` fires days apart), so for that case
+/// `MAX_DEFERRAL` doesn't merely risk firing a little early — the color will
+/// almost always flip to `Attention` long before the cron does, for the
+/// entire gap between them. Left as-is rather than special-cased (parsing
+/// `schedule` to compute a real per-entry deadline would need a cron-
+/// expression parser this crate doesn't otherwise need, and would break the
+/// "one safety net regardless of *why* a `Stop` was deferred" property
+/// `state.rs` currently has): `state.rs`'s self-correction still makes this
+/// safe (never a *permanent* misclassification), just not prompt for a
+/// multi-day-scale `CronCreate` wait — a real, currently-accepted trade-off,
+/// not a "this rarely matters" one.
 ///
 /// See the pre-split `isekai-pipe` version's doc comment (git history) for
 /// the detailed rationale behind the other mappings below — carried over
@@ -671,6 +691,27 @@ mod tests {
     fn stop_with_an_empty_session_crons_array_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"Stop","session_crons":[]}"#;
         assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
+    }
+
+    /// Pins the fail-safe direction for a `session_crons` shape this crate
+    /// has never actually observed live (adversarial review, 2026-08):
+    /// `.as_array()` returns `None` for anything that isn't a JSON array,
+    /// so a malformed/unexpected shape here must degrade to whatever
+    /// `background_tasks` alone would decide (`Notify`, empty here) rather
+    /// than panicking or defaulting to the *quieter* `StopDeferred` side.
+    #[test]
+    fn stop_with_a_non_array_session_crons_is_notify_not_a_panic() {
+        for malformed in [br#""not-an-array""#.as_slice(), br#"{}"#.as_slice(), br#"null"#.as_slice()] {
+            let payload = format!(
+                r#"{{"session_id":"s1","hook_event_name":"Stop","session_crons":{}}}"#,
+                std::str::from_utf8(malformed).unwrap()
+            );
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), ClientEvent::Notify, false)),
+                "malformed session_crons {malformed:?} must fail safe to Notify, not defer or panic"
+            );
+        }
     }
 
     #[test]
