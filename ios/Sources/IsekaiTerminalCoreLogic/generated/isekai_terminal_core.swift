@@ -3711,6 +3711,192 @@ public struct ScreenUpdate: Equatable, Hashable {
      * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
      */
     public var cursorColor: CursorColor?
+    public var applicationCursorMode: Bool
+    /**
+     * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+     * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+     * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+     * このRustコアではなくUI層のキーエンコーダーが行う。
+     */
+    public var applicationKeypadMode: Bool
+    public var bracketedPasteMode: Bool
+    /**
+     * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+     * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+     * Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+     */
+    public var mouseReportingMode: MouseReportingMode
+    /**
+     * DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+     * `mouse_reporting_mode`が`Off`でなくても、この値によって
+     * `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+     * レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+     * 将来のプロトコル分岐のために公開しておく。
+     */
+    public var sgrMouseMode: Bool
+    /**
+     * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+     * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+     */
+    public var alternateScroll: Bool
+    /**
+     * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+     * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+     * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+     */
+    public var urxvtMouseMode: Bool
+    /**
+     * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+     */
+    public var cursorVisible: Bool
+    /**
+     * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+     * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+     * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+     * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+     * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+     * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+     * (`ESC]0;title BEL`)はカウントされない。
+     */
+    public var bellGeneration: UInt64
+    /**
+     * ctlソケット経由の`Notify`(`AI_INTEGRATION_DESIGN.md` §6.1)受信のたびに単調増加する
+     * 世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの取りこぼし検知・
+     * 二重フィードバック防止)で、bool ではなく世代カウンタにしてある。呼び出し側は
+     * 前回値と比較し、進んでいれば`notify_kind`/`notify_title`/`notify_body`を読んで
+     * 通知(タブバッジ・システム通知)を1回発火させること。
+     */
+    public var notifyGeneration: UInt64
+    /**
+     * 直近受信した`Notify`の種別。`notify_generation`が進んでいない間は意味を持たない。
+     */
+    public var notifyKind: NotifyKind
+    /**
+     * 直近受信した`Notify`のタイトル。表示専用でRust側は解釈・実行しない
+     * (`AI_INTEGRATION_DESIGN.md` §6.1の信頼境界を参照)。
+     */
+    public var notifyTitle: String
+    /**
+     * 直近受信した`Notify`の本文。`notify_title`と同じく表示専用。
+     */
+    public var notifyBody: String
+    /**
+     * リモートAPC経由(`AI_INTEGRATION_DESIGN.md` §6.2)のパネル提示を受信するたびに
+     * 単調増加する世代カウンタ。`bell_generation`と同じ理由(conflatedチャネルでの
+     * 取りこぼし検知・二重描画防止)で、bool ではなく世代カウンタにしてある。
+     * 呼び出し側は前回値と比較し、進んでいれば`panel_kind`以下のフィールドを
+     * 読んでパネルを再描画すること。
+     */
+    public var panelGeneration: UInt64
+    /**
+     * 直近提示されたパネルの種別。`None`ならパネル無し(未提示、または後述の
+     * クリアの仕様は今後の課題——現状は「一度提示されたパネルは次のパネルが
+     * 来るまで表示され続ける」)。`panel_generation`が進んでいない間は
+     * この値自体に意味は無い(前回提示済みのものをそのまま指すだけ)。
+     */
+    public var panelKind: PanelKind
+    /**
+     * パネルのタイトル。`panel_kind`が`None`の間は空文字列。表示専用でRust側は
+     * 解釈・実行しない(`ai_panel.rs`の信頼境界を参照)。
+     */
+    public var panelTitle: String
+    /**
+     * `panel_kind == Document`の時のみ意味を持つMarkdown本文。
+     */
+    public var panelMarkdown: String
+    /**
+     * `panel_kind == Form`の時のみ意味を持つフィールド一覧。
+     */
+    public var panelFields: [PanelField]
+    /**
+     * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+     */
+    public var cursorShape: CursorShape
+    /**
+     * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+     * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+     * (xtermの既定である「blinking block」に合わせる)。
+     */
+    public var cursorBlink: Bool
+    /**
+     * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+     * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+     * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+     * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+     * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+     * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+     * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+     * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+     * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
+     */
+    public var linkTable: [String]
+    /**
+     * Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
+     */
+    public var images: [ImagePlacement]
+    /**
+     * Kitty keyboard protocol(タスク#54、
+     * <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)でnegotiateされた
+     * 現在有効なprogressive enhancement flagsのビットマスク。既定は`0`
+     * (legacy mode、拡張無効)。ビットの意味:
+     * `0b00001`=disambiguate escape codes、`0b00010`=report event types
+     * (press/repeat/release)、`0b00100`=report alternate keys(shifted/base
+     * layout)、`0b01000`=report all keys as escape codes、`0b10000`=report
+     * associated text。
+     *
+     * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
+     * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
+     * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
+     * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+     *
+     * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+     * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+     * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+     * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+     * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+     * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+     * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+     * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+     * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+     * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+     * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+     * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
+     */
+    public var kittyKeyboardFlags: UInt16
+    /**
+     * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+     * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+     * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+     * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+     * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+     * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+     * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+     * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+     * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+     */
+    public var dirtyRows: [LineDamage]?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+         * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+         * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+         * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+         * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+         * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, 
+        /**
+         * Windows Terminal互換のOSC 4;264、または`CtlMessage::SetTabColor`で設定された
+         * タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
+         * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
+         */tabColor: TabColor?, 
+        /**
+         * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
+         * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+         * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
+         */cursorColor: CursorColor?, applicationCursorMode: Bool, 
         /**
          * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
          * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
@@ -3860,6 +4046,57 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.title = title
         self.tabColor = tabColor
         self.cursorColor = cursorColor
+        self.applicationCursorMode = applicationCursorMode
+        self.applicationKeypadMode = applicationKeypadMode
+        self.bracketedPasteMode = bracketedPasteMode
+        self.mouseReportingMode = mouseReportingMode
+        self.sgrMouseMode = sgrMouseMode
+        self.alternateScroll = alternateScroll
+        self.urxvtMouseMode = urxvtMouseMode
+        self.cursorVisible = cursorVisible
+        self.bellGeneration = bellGeneration
+        self.notifyGeneration = notifyGeneration
+        self.notifyKind = notifyKind
+        self.notifyTitle = notifyTitle
+        self.notifyBody = notifyBody
+        self.panelGeneration = panelGeneration
+        self.panelKind = panelKind
+        self.panelTitle = panelTitle
+        self.panelMarkdown = panelMarkdown
+        self.panelFields = panelFields
+        self.cursorShape = cursorShape
+        self.cursorBlink = cursorBlink
+        self.linkTable = linkTable
+        self.images = images
+        self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.dirtyRows = dirtyRows
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ScreenUpdate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScreenUpdate {
+        return
+            try ScreenUpdate(
+                updateSeq: FfiConverterUInt32.read(from: &buf), 
+                cols: FfiConverterUInt32.read(from: &buf), 
+                rows: FfiConverterUInt32.read(from: &buf), 
+                cells: FfiConverterSequenceTypeCellData.read(from: &buf), 
+                cursorRow: FfiConverterUInt32.read(from: &buf), 
+                cursorCol: FfiConverterUInt32.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf), 
+                tabColor: FfiConverterOptionTypeTabColor.read(from: &buf), 
+                cursorColor: FfiConverterOptionTypeCursorColor.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 applicationKeypadMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
