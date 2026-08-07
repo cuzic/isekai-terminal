@@ -61,19 +61,23 @@ const TAB_SESSION_ENV_CANDIDATES: &[(&str, &str)] = &[
 /// `resolve_name_from`'s own `TtySelection::Named` branch, which ignores
 /// `candidates` entirely) — building the candidate list eagerly regardless
 /// of `selection` used to mean every `Named` call also did 8 real
-/// `std::env::var` reads for nothing, and did them *without*
-/// `HOME_ENV_LOCK` even though `Auto`'s own real-environment tests mutate
-/// that same process-global env state under `cargo test`'s parallel runner
-/// (adversarial review, 2026-08: concurrent `getenv`/`setenv` is UB in
-/// glibc, the exact hazard `HOME_ENV_LOCK` exists to serialize against —
-/// see its own doc comment in `main.rs`). Matching on `selection` first
-/// fixes both: `Named` does zero env reads, and only the `Auto` branch
-/// (which is what actually needs the lock) takes it.
+/// `std::env::var` reads for nothing, and (adversarial review, 2026-08) did
+/// them without any synchronization against this crate's env-mutating
+/// tests (`HOME_ENV_LOCK`, `main.rs`), a real race under `cargo test`'s
+/// default parallel runner. Matching on `selection` first fixes this at the
+/// root: `Named` now does zero env reads, so it has nothing left to race.
+/// `HOME_ENV_LOCK` itself is `#[cfg(test)]`-only (a test-isolation
+/// mechanism, not a production concern — there is exactly one call to
+/// `resolve_name` per process, so there is nothing for it to race with
+/// outside a test binary) and can't be referenced from this always-compiled
+/// production function at all; a future test that wants to exercise the
+/// real-env `Auto` path is responsible for taking that lock itself around
+/// its own call, the same convention every other env-mutating test in this
+/// crate already follows.
 fn resolve_name(selection: &TtySelection, profile: &str) -> String {
     match selection {
         TtySelection::Named(_) => resolve_name_from(selection, profile, &[]),
         TtySelection::Auto => {
-            let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let candidates: Vec<(&str, Option<String>)> =
                 TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, candidate_env_value(var, prefix))).collect();
             resolve_name_from(selection, profile, &candidates)
