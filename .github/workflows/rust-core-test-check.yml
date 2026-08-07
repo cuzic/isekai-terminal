@@ -93,20 +93,31 @@ jobs:
       # ためのバケットで"除外"とは別枠)」のいずれかに分類されているかをここで検証する。
       # 3つの配列のどれにも属さない新規ファイルがあれば、著者に
       # `test-windows`ジョブへの追加(または除外理由の追記)を促してこのstepを失敗させる。
+      #
+      # ALLOWED_WINDOWSは手書きの固定配列ではなく、この安全網自身が
+      # `test-windows`ジョブの実行内容(このワークフローファイル自身)からgrepで
+      # 動的に抽出する(adversarial review指摘、2026-08): 手書き配列だと
+      # 「ALLOWED_WINDOWSに追記したが対応する`cargo test --test`step/ループ
+      # エントリを`test-windows`ジョブ側に足し忘れた」場合でもこのチェック自体は
+      # 通ってしまい、この安全網がまさに検出しようとしている「サイレントに
+      # Windows CIで一切走らない」を別の形で再現してしまう。個別step
+      # (`run: cargo test -p isekai-ssh --test <name>`で終わる行)と5本ループの
+      # `for t in ...; do`の両方を実際にparseするので、`test-windows`ジョブ側の
+      # 変更が自動的にここへ反映される。
       - name: Verify every isekai-ssh e2e test file is accounted for in Windows CI
         run: |
           set -euo pipefail
-          ALLOWED_WINDOWS=(
-            mux_holder_windows_e2e
-            native_auth_windows_e2e
-            native_agent_auth_windows_e2e
-            native_ctl_build_relay_windows_e2e
-            wrapper_auto_bootstrap_e2e
-            doctor_e2e
-            init_e2e
-            wrapper_auto_download_relay_bootstrap_e2e
-            wrapper_stale_trust_auto_recovery_e2e
+          WORKFLOW_FILE=".github/workflows/rust-core-test-check.yml"
+          mapfile -t ALLOWED_WINDOWS < <(
+            {
+              grep -oE 'cargo test -p isekai-ssh --test [A-Za-z0-9_]+$' "$WORKFLOW_FILE" | awk '{print $NF}'
+              grep -oE 'for t in [^;]+; do' "$WORKFLOW_FILE" | sed -E 's/^for t in //; s/; do$//' | tr ' ' '\n'
+            } | sort -u
           )
+          if [ "${#ALLOWED_WINDOWS[@]}" -eq 0 ]; then
+            echo "::error::failed to extract any test-windows run entries from $WORKFLOW_FILE — the grep/sed patterns above no longer match this workflow's actual shape (edited without updating this step?)."
+            exit 1
+          fi
           # 実`/usr/sbin/sshd`+`setsid`前提、または`wrapper::run`
           # (`main.rs`で`#[cfg(not(windows))]`)経由のコードパスをテストしており、
           # Windowsでは原理的に実行できないファイル。
