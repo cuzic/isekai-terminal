@@ -863,6 +863,11 @@ fn dispatch_transport_event(
             // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
             // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
             //
+            // `SetProgress`(2026-08、OSC 9;4プログレスバー)は`isekai-ssh` CLI
+            // ラッパー(外側の実端末のタブアイコン/タスクバー統合)専用として追加した。
+            // Android本体アプリ側にタブ進捗UIができるまでは未サポート(タスク管理上の
+            // 6b)——`SetTabColor`がタブ色UI実装まで無視されていたのと同じ経過。
+            //
             // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
@@ -871,7 +876,8 @@ fn dispatch_transport_event(
             | isekai_protocol::CtlMessage::GetVarResponse { .. }
             | isekai_protocol::CtlMessage::BuildRequest { .. }
             | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
-            | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
+            | isekai_protocol::CtlMessage::BuildFinished { .. }
+            | isekai_protocol::CtlMessage::SetProgress { .. } => EventOutcome::Continue(None),
             // `Notify`は2つの独立した系統を1つのワイヤーメッセージ・型として共有する
             // (統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
             // 2026-07-25)。kindでどちらの系統かを判別し、それぞれ既存の(互いに
@@ -1554,6 +1560,22 @@ mod tests {
 
         let upd = state.make_screen_update();
         assert_eq!(upd.tab_color, Some(crate::TabColor { r: 0x11, g: 0x22, b: 0x33 }));
+    }
+
+    #[test]
+    fn make_screen_update_carries_cursor_color_set_via_osc_12() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.on_stdout(b"\x1b]12;rgb:aa/bb/cc\x1b\\".to_vec());
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.cursor_color, Some(crate::CursorColor { r: 0xaa, g: 0xbb, b: 0xcc }));
+    }
+
+    #[test]
+    fn make_screen_update_cursor_color_is_none_by_default() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let upd = state.make_screen_update();
+        assert_eq!(upd.cursor_color, None);
     }
 
     #[test]

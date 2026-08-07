@@ -355,7 +355,10 @@ where
                                 }
                             }
                             Ok(msg) => {
-                                if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
+                                // iTerm2はmacOS専用でWindowsには存在しないため、この
+                                // Windows-native経路では常にWindowsTerminal互換の変換で
+                                // 固定でよい(`ctl_forward::TerminalKind`のdoc comment参照)。
+                                if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg, crate::ctl_forward::TerminalKind::WindowsTerminal) {
                                     let _ = stderr.write_all(seq.as_bytes()).await;
                                     let _ = stderr.flush().await;
                                 }

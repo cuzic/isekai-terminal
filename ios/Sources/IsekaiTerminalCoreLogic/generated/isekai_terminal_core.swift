@@ -2188,6 +2188,69 @@ public func FfiConverterTypeClipboardPayload_lower(_ value: ClipboardPayload) ->
 }
 
 
+/**
+ * OSC 12(xterm/iTerm2互換、`ESC]12;<spec>ST`)またはOSC 112(リセット)で設定された
+ * カーソル色。RGB各成分は0-255。`ScreenUpdate::cursor_color`が`None`のときは未設定
+ * (UI層は自身の既定カーソル色、Android `TerminalTheme.cursor`を使う)。
+ */
+public struct CursorColor: Equatable, Hashable {
+    public var r: UInt8
+    public var g: UInt8
+    public var b: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(r: UInt8, g: UInt8, b: UInt8) {
+        self.r = r
+        self.g = g
+        self.b = b
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CursorColor: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCursorColor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CursorColor {
+        return
+            try CursorColor(
+                r: FfiConverterUInt8.read(from: &buf), 
+                g: FfiConverterUInt8.read(from: &buf), 
+                b: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CursorColor, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.r, into: &buf)
+        FfiConverterUInt8.write(value.g, into: &buf)
+        FfiConverterUInt8.write(value.b, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorColor_lift(_ buf: RustBuffer) throws -> CursorColor {
+    return try FfiConverterTypeCursorColor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorColor_lower(_ value: CursorColor) -> RustBuffer {
+    return FfiConverterTypeCursorColor.lower(value)
+}
+
+
 public struct CursorState: Equatable, Hashable {
     public var row: UInt32
     public var col: UInt32
@@ -3642,6 +3705,12 @@ public struct ScreenUpdate: Equatable, Hashable {
      * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
      */
     public var tabColor: TabColor?
+    /**
+     * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
+     * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
+     */
+    public var cursorColor: CursorColor?
     public var applicationCursorMode: Bool
     /**
      * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
@@ -3822,7 +3891,12 @@ public struct ScreenUpdate: Equatable, Hashable {
          * Windows Terminal互換のOSC 4;264、または`CtlMessage::SetTabColor`で設定された
          * タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
          * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
-         */tabColor: TabColor?, applicationCursorMode: Bool, 
+         */tabColor: TabColor?, 
+        /**
+         * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
+         * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+         * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
+         */cursorColor: CursorColor?, applicationCursorMode: Bool, 
         /**
          * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
          * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
@@ -3971,6 +4045,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.cursorCol = cursorCol
         self.title = title
         self.tabColor = tabColor
+        self.cursorColor = cursorColor
         self.applicationCursorMode = applicationCursorMode
         self.applicationKeypadMode = applicationKeypadMode
         self.bracketedPasteMode = bracketedPasteMode
@@ -4021,6 +4096,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
                 tabColor: FfiConverterOptionTypeTabColor.read(from: &buf), 
+                cursorColor: FfiConverterOptionTypeCursorColor.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 applicationKeypadMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
@@ -4057,6 +4133,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cursorCol, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
         FfiConverterOptionTypeTabColor.write(value.tabColor, into: &buf)
+        FfiConverterOptionTypeCursorColor.write(value.cursorColor, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
         FfiConverterBool.write(value.applicationKeypadMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
@@ -7980,6 +8057,30 @@ fileprivate struct FfiConverterOptionTypeClipboardPayload: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeClipboardPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCursorColor: FfiConverterRustBuffer {
+    typealias SwiftType = CursorColor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCursorColor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCursorColor.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

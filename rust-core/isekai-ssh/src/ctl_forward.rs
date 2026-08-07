@@ -291,7 +291,7 @@ async fn handle_ctl_connection(
     }
     let msg = decode_ctl_message(line.trim_end_matches('\n').as_bytes())
         .context("malformed ctl message")?;
-    if let Some(seq) = osc_sequence_for(&msg) {
+    if let Some(seq) = osc_sequence_for(&msg, TerminalKind::resolve()) {
         emit_osc(&seq)?;
     }
     match msg {
@@ -349,16 +349,38 @@ async fn run_build(
         )
         .await?;
         send_build_finished(write_half, 127, Vec::new()).await?;
+        // No `emit_build_progress_result` here: `Indeterminate` is only sent
+        // below, once a profile is confirmed to exist — nothing was ever
+        // shown yet for this build attempt, so there is nothing to clear
+        // (calling it anyway used to paint a spurious `Error` state that
+        // then never got cleared, since the `None`-on-success clear only
+        // ever fires past the point a real build actually ran).
         return Ok(());
     };
 
-    let mut child = crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
+    // Epic P × 2026-08のOSC 9;4連携: ビルドの成否は事前に分からないので
+    // `Indeterminate`(スピナー)で開始を知らせる。`emit_build_progress_result`と
+    // 対で、doc commentはそちらを参照。
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }, TerminalKind::resolve()) {
+        let _ = emit_osc(&seq);
+    }
+
+    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // `Indeterminate` was already sent above — every exit past that
+            // point must clear it, this one included, or the spinner is
+            // left stuck on the user's tab/taskbar forever.
+            emit_build_progress_result(false);
+            return Err(e).with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"));
+        }
+    };
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -387,17 +409,27 @@ async fn run_build(
         let _ = child.wait().await;
         let _ = stdout_task.await;
         let _ = stderr_task.await;
+        emit_build_progress_result(false);
         bail!("isekai-ssh: ctl connection closed before the build finished; killed the child process");
     }
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let status = child.wait().await.context("isekai-ssh: failed to wait for the build child process")?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            // Same reasoning as the spawn-failure arm above: `Indeterminate`
+            // is already showing and must be cleared on every exit path.
+            emit_build_progress_result(false);
+            return Err(e).context("isekai-ssh: failed to wait for the build child process");
+        }
+    };
     // `status.code()` is `None` only if the process was killed by a signal
     // (not the `write_failed` kill path above, which already returned) —
     // `-1` is not a valid process exit code on any platform, so it can't be
     // confused with a real one.
     let exit_code = status.code().unwrap_or(-1);
+    emit_build_progress_result(exit_code == 0);
 
     let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
         (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
@@ -412,6 +444,19 @@ async fn run_build(
     }
     send_build_finished(write_half, exit_code, result_paths).await?;
     Ok(())
+}
+
+/// Clears the OSC 9;4 progress indicator `run_build` set to `Indeterminate`
+/// at the start, replacing it with `Error` on failure (no profile found /
+/// remote disconnected mid-build / non-zero exit) or `None` (hide) on
+/// success. Same best-effort/no-op-on-failure posture as the start signal —
+/// see the call site in `run_build`.
+#[cfg(unix)]
+fn emit_build_progress_result(success: bool) {
+    let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }, TerminalKind::resolve()) {
+        let _ = emit_osc(&seq);
+    }
 }
 
 /// Thin wrappers around `build_exec`'s shared encoders that just add the
@@ -444,12 +489,37 @@ async fn send_build_finished(
     Ok(())
 }
 
+/// Which real terminal emulator this `isekai-ssh` process is running inside,
+/// for OSC variants that differ per terminal (currently only `SetTabColor`,
+/// see `osc_sequence_for`). Deliberately NOT read from inside
+/// `osc_sequence_for` itself — that function stays a pure, unit-testable
+/// mapping from `(CtlMessage, TerminalKind)` to a `String`; callers resolve
+/// `TerminalKind` once via [`TerminalKind::resolve`] and pass it in, the same
+/// "resolve once, thread the value through" shape this project already uses
+/// for `TofuConfirmation` (`.claude/rules/always-connects.md`) rather than
+/// having downstream code re-derive intent from raw env/state.
+///
+/// Re-exported from the standalone `osc-color` crate (extracted 2026-08 when
+/// `claude-hookd` was split out into its own isekai-terminal-independent
+/// crate, which needs the identical terminal-detection/OSC-mapping logic
+/// when emitting OSC directly instead of via this ctl-socket path) — kept as
+/// a `pub(crate)` alias here so existing call sites in this crate don't need
+/// to change their imports.
+pub(crate) use osc_color::TerminalKind;
+
 /// Maps an incoming `CtlMessage` to the OSC escape sequence to emit on the
 /// local terminal, or `None` for messages this CLI wrapper doesn't act on.
 /// Shared by the Unix `ssh(1)` path and the Windows-native mux client/owner
-/// paths (`native/mux`).
+/// paths (`native/mux`, which always pass [`TerminalKind::WindowsTerminal`]
+/// — iTerm2 doesn't exist on Windows).
 ///
-/// - `SetTitle` → OSC 0 (icon name + window title).
+/// - `SetTitle` → OSC 0 (icon name + window title). Passed through
+///   [`strip_ascii_control_chars`] first, same reasoning as `Notify` below
+///   (fixed 2026-08: this arm used to embed `value` verbatim, so a remote
+///   host that could reach the ctl socket could smuggle an ESC/BEL inside
+///   the title to terminate the OSC 0 sequence early and inject arbitrary
+///   escape sequences — e.g. a spoofed OSC 52 clipboard write — into the
+///   user's real terminal).
 /// - `Notify`: 2つの独立した系統を1つのワイヤーメッセージが共有する
 ///   (`isekai_protocol::ctl::NotifyKind`のdocコメント参照)ため、kindで分岐する:
 ///   - AI/汎用の注目通知(`Waiting`/`Done`/`Info`、`AI_INTEGRATION_DESIGN.md` §6.1)
@@ -468,10 +538,16 @@ async fn send_build_finished(
 ///     app's job); ignored (`None`) rather than implemented, matching how
 ///     `ClipboardPullRequest` below is also left unimplemented pending a
 ///     capability this wrapper doesn't have yet.
-/// - `SetTabColor` → OSC 4 palette-index 264, Windows Terminal's private
-///   convention for the tab background color (`microsoft/terminal` PR #13058,
-///   which closed the original feature request #6574).
-///   A harmless no-op on terminals that don't recognize that index.
+/// - `SetTabColor` → OSC 4 palette-index 264 (`TerminalKind::WindowsTerminal`,
+///   Windows Terminal's private convention for the tab background color,
+///   `microsoft/terminal` PR #13058, which closed the original feature
+///   request #6574 — a harmless no-op on terminals that don't recognize that
+///   index) or iTerm2's proprietary `OSC 6;1;bg;<channel>;brightness;<0-255>`
+///   (`TerminalKind::ITerm2`, one sequence per RGB channel — see iTerm2's
+///   "Proprietary Escape Codes" documentation).
+/// - `SetProgress` → OSC 9;4 (`ProgressState` doc), ConEmu-originated
+///   progress-bar convention also implemented by Windows Terminal (tab
+///   icon + taskbar integration there). Harmless no-op elsewhere.
 /// - `ClipboardPush` → OSC 52 clipboard-set. `data_b64` is already the
 ///   base64 encoding OSC 52 itself expects — no re-encoding needed.
 /// - `ClipboardPullRequest` → reading the local system clipboard back
@@ -491,9 +567,9 @@ async fn send_build_finished(
 ///   sequence for "run a local command", so this variant is handled by a
 ///   dedicated long-lived branch in `handle_ctl_connection` instead of the
 ///   OSC-emitting path every other variant goes through.
-pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
+pub(crate) fn osc_sequence_for(msg: &CtlMessage, terminal: TerminalKind) -> Option<String> {
     match msg {
-        CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
+        CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{}\x07", strip_ascii_control_chars(value))),
         CtlMessage::Notify { kind, title, body, .. } => match kind {
             NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
                 let title = strip_ascii_control_chars(title);
@@ -503,7 +579,17 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
             }
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => None,
         },
-        CtlMessage::SetTabColor { r, g, b } => Some(format!("\x1b]4;264;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\")),
+        CtlMessage::SetTabColor { r, g, b } => Some(osc_color::tab_color_sequence(terminal, *r, *g, *b)),
+        // ConEmu/Windows Terminal-only: iTerm2 doesn't recognize `OSC 9;4` as
+        // progress at all — it treats bare `OSC 9` as "post a system
+        // notification" (same convention `Notify` above uses for it), so
+        // sending this there wouldn't be the doc comment's claimed "harmless
+        // no-op" — it would pop a spurious notification reading the raw
+        // `4;<state>;<progress>` payload on every build start/end.
+        CtlMessage::SetProgress { state, progress } => match terminal {
+            TerminalKind::ITerm2 => None,
+            TerminalKind::WindowsTerminal => Some(format!("\x1b]9;4;{};{}\x07", *state as u8, progress)),
+        },
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {}
         | CtlMessage::ClipboardPullResponse { .. }
@@ -516,16 +602,26 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     }
 }
 
-/// Removes ASCII C0 control characters (`< 0x20`) and DEL (`0x7F`) from
-/// remote-controlled text before it is embedded in an OSC escape sequence
-/// written to this process's own stderr ([`emit_osc`]). Without this, a
-/// `Notify` title/body containing `ESC`/`BEL` (accidental — e.g. a hook that
-/// captured ANSI-colored output — or crafted) could terminate the intended
-/// `OSC 9 ... BEL` sequence early and inject an arbitrary escape sequence
-/// into the user's real terminal (`AI_INTEGRATION_DESIGN.md` §6.1's "no
-/// execution authority" boundary applies to more than just shell commands).
+/// Removes C0 control characters (`< 0x20`), DEL (`0x7F`), and C1 control
+/// characters (`U+0080..=U+009F`) from remote-controlled text before it is
+/// embedded in an OSC escape sequence written to this process's own stderr
+/// ([`emit_osc`]). Without this, a `Notify` title/body containing
+/// `ESC`/`BEL` (accidental — e.g. a hook that captured ANSI-colored output —
+/// or crafted) could terminate the intended `OSC 9 ... BEL` sequence early
+/// and inject an arbitrary escape sequence into the user's real terminal
+/// (`AI_INTEGRATION_DESIGN.md` §6.1's "no execution authority" boundary
+/// applies to more than just shell commands). C1 controls matter just as
+/// much as C0 here, not merely for completeness: xterm and other
+/// DEC-strict parsers decode C1 bytes from UTF-8 as controls by default
+/// (`allowC1Printable` off) the same way they decode C0 ones, so `U+009D`
+/// (OSC) and `U+009C` (ST) are just as capable of splicing in a second,
+/// attacker-controlled escape sequence — e.g. re-opening the exact `OSC 52`
+/// clipboard-write this function exists to keep out of a title/body — as
+/// their C0 `ESC ]`/`ESC \` equivalents are. `char::is_control` (Unicode
+/// `Cc`) covers both ranges in one filter; `is_ascii_control` only covered
+/// the first.
 fn strip_ascii_control_chars(text: &str) -> String {
-    text.chars().filter(|c| !c.is_ascii_control()).collect()
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Writes an OSC escape sequence to this process's own stderr in a single
@@ -658,32 +754,72 @@ mod tests {
 
     #[test]
     fn osc_sequence_for_set_title_is_osc_0() {
-        let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
+        let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }, TerminalKind::WindowsTerminal).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
+    }
+
+    /// Regression test for the OSC injection this sanitization closes
+    /// (2026-08): a title containing `ESC`/`BEL` could otherwise terminate
+    /// the intended `OSC 0 ... BEL` sequence early and splice an attacker-
+    /// or hook-controlled escape sequence (here, a spoofed OSC 52 clipboard
+    /// write) into the user's real terminal. Mirrors
+    /// `osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body`.
+    #[test]
+    fn osc_sequence_for_set_title_strips_esc_and_bel() {
+        let seq = osc_sequence_for(
+            &CtlMessage::SetTitle { value: "hi\x1b]52;c;cHduZWQ=\x07pwned".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
+        .unwrap();
+        assert_eq!(seq, "\x1b]0;hi]52;c;cHduZWQ=pwned\x07");
+    }
+
+    /// Regression test for the C1 bypass of the fix above (found by
+    /// adversarial review of PR #60, 2026-08): `is_ascii_control` only
+    /// covers C0 (`< 0x20`)/DEL, so a title using the C1 control characters
+    /// `U+009D` (OSC) / `U+009C` (ST) in place of their C0 `ESC ]`/`ESC \`
+    /// equivalents sailed straight through unfiltered — xterm and other
+    /// DEC-strict terminals decode C1 bytes from UTF-8 as controls by
+    /// default, so this re-opens the exact same OSC 52 splice the C0 test
+    /// above closes, just spelled differently.
+    #[test]
+    fn osc_sequence_for_set_title_strips_c1_controls_too() {
+        let seq = osc_sequence_for(
+            &CtlMessage::SetTitle { value: "hi\u{9d}52;c;cHduZWQ=\u{9c}pwned".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
+        .unwrap();
+        assert_eq!(seq, "\x1b]0;hi52;c;cHduZWQ=pwned\x07");
     }
 
     #[test]
     fn osc_sequence_for_notify_joins_title_and_body_with_osc_9() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi".to_string(),
-            body: "there".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi".to_string(),
+                body: "there".to_string(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi: there\x07");
     }
 
     #[test]
     fn osc_sequence_for_notify_omits_separator_when_body_is_empty() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi".to_string(),
-            body: String::new(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi".to_string(),
+                body: String::new(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi\x07");
     }
@@ -691,13 +827,16 @@ mod tests {
     #[test]
     fn osc_sequence_for_notify_tmux_kinds_is_none() {
         for kind in [NotifyKind::Bell, NotifyKind::Activity, NotifyKind::Silence, NotifyKind::JobDone] {
-            let seq = osc_sequence_for(&CtlMessage::Notify {
-                kind,
-                tmux_tag: "session:0".to_string(),
-                seq: 1,
-                title: String::new(),
-                body: String::new(),
-            });
+            let seq = osc_sequence_for(
+                &CtlMessage::Notify {
+                    kind,
+                    tmux_tag: "session:0".to_string(),
+                    seq: 1,
+                    title: String::new(),
+                    body: String::new(),
+                },
+                TerminalKind::WindowsTerminal,
+            );
             assert!(seq.is_none(), "{kind:?} should not produce an OSC sequence");
         }
     }
@@ -708,40 +847,79 @@ mod tests {
     /// hook-controlled escape sequence into the user's real terminal.
     #[test]
     fn osc_sequence_for_notify_strips_esc_and_bel_from_title_and_body() {
-        let seq = osc_sequence_for(&CtlMessage::Notify {
-            kind: NotifyKind::Info,
-            tmux_tag: String::new(),
-            seq: 0,
-            title: "hi\x1b]0;pwned\x07".to_string(),
-            body: "bo\x07dy".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::Notify {
+                kind: NotifyKind::Info,
+                tmux_tag: String::new(),
+                seq: 0,
+                title: "hi\x1b]0;pwned\x07".to_string(),
+                body: "bo\x07dy".to_string(),
+            },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]9;hi]0;pwned: body\x07");
     }
 
     #[test]
-    fn osc_sequence_for_tab_color_is_osc_4_264() {
-        let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }).unwrap();
+    fn osc_sequence_for_tab_color_on_windows_terminal_is_osc_4_264() {
+        let seq =
+            osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0x00 }, TerminalKind::WindowsTerminal)
+                .unwrap();
         assert_eq!(seq, "\x1b]4;264;rgb:ff/00/00\x1b\\");
     }
 
     #[test]
+    fn osc_sequence_for_tab_color_on_iterm2_is_osc_6() {
+        let seq = osc_sequence_for(&CtlMessage::SetTabColor { r: 0xff, g: 0x88, b: 0x00 }, TerminalKind::ITerm2).unwrap();
+        assert_eq!(
+            seq,
+            "\x1b]6;1;bg;red;brightness;255\x07\x1b]6;1;bg;green;brightness;136\x07\x1b]6;1;bg;blue;brightness;0\x07"
+        );
+    }
+
+    // `TerminalKind::resolve_from`自体の判定ロジックのテストは`osc-color`クレート
+    // (再エクスポート元)に移した——ここに残すのは`osc_sequence_for`(このクレート
+    // 自身のCtlMessageディスパッチ)の挙動を検証するテストのみ。
+
+    #[test]
+    fn osc_sequence_for_progress_is_osc_9_4() {
+        let seq = osc_sequence_for(
+            &CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Normal, progress: 42 },
+            TerminalKind::WindowsTerminal,
+        )
+        .unwrap();
+        assert_eq!(seq, "\x1b]9;4;1;42\x07");
+    }
+
+    #[test]
+    fn osc_sequence_for_progress_none_uses_state_zero() {
+        let seq =
+            osc_sequence_for(
+                &CtlMessage::SetProgress { state: isekai_protocol::ProgressState::None, progress: 0 },
+                TerminalKind::WindowsTerminal,
+            )
+            .unwrap();
+        assert_eq!(seq, "\x1b]9;4;0;0\x07");
+    }
+
+    #[test]
     fn osc_sequence_for_clipboard_push_is_osc_52_and_reuses_data_b64_verbatim() {
-        let seq = osc_sequence_for(&CtlMessage::ClipboardPush {
-            mime: ClipboardMime::TextPlain,
-            data_b64: "aGVsbG8=".to_string(),
-        })
+        let seq = osc_sequence_for(
+            &CtlMessage::ClipboardPush { mime: ClipboardMime::TextPlain, data_b64: "aGVsbG8=".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
         .unwrap();
         assert_eq!(seq, "\x1b]52;c;aGVsbG8=\x07");
     }
 
     #[test]
     fn osc_sequence_for_pull_variants_is_none() {
-        assert!(osc_sequence_for(&CtlMessage::ClipboardPullRequest {}).is_none());
-        assert!(osc_sequence_for(&CtlMessage::ClipboardPullResponse {
-            mime: ClipboardMime::TextPlain,
-            data_b64: "aGVsbG8=".to_string(),
-        })
+        assert!(osc_sequence_for(&CtlMessage::ClipboardPullRequest {}, TerminalKind::WindowsTerminal).is_none());
+        assert!(osc_sequence_for(
+            &CtlMessage::ClipboardPullResponse { mime: ClipboardMime::TextPlain, data_b64: "aGVsbG8=".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
         .is_none());
     }
 

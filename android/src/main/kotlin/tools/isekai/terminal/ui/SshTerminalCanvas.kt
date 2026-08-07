@@ -14,6 +14,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
@@ -777,7 +778,13 @@ fun SshTerminalCanvas(
             val cx = update.cursorCol.toInt() * cellW
             val cy = update.cursorRow.toInt() * cellH
             if (cx < size.width && cy < size.height) {
-                cursorPaint.color = theme.cursor.copy(alpha = 0.7f).toArgb()
+                // リモートがOSC 12(またはctlソケット経由、将来分)でカーソル色を指定していれば
+                // それを優先する(Rust側SSOTの`ScreenUpdate.cursorColor`)。未指定(OSC 112で
+                // リセット済み含む)ならこのタブのテーマ既定色にフォールバックする。
+                val remoteCursorColor = update.cursorColor?.let {
+                    Color(red = it.r.toInt(), green = it.g.toInt(), blue = it.b.toInt())
+                }
+                cursorPaint.color = (remoteCursorColor ?: theme.cursor).copy(alpha = 0.7f).toArgb()
                 val nCanvas = drawContext.canvas.nativeCanvas
                 val rect = computeCursorRect(cx, cy, cellW, cellH, update.cursorShape)
                 nCanvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, cursorPaint)

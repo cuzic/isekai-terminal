@@ -383,6 +383,15 @@ pub(crate) struct Terminal {
     /// タイトル(`title`)と同じくRIS(`reset_all`)でクリアされる、
     /// セッション限りの状態(永続化しない)。
     tab_color: Option<(u8, u8, u8)>,
+    /// OSC 12(`ESC]12;<spec>ST`、xterm/iTerm2互換のカーソル色set、タスク#後継)で
+    /// 設定されたカーソル色。`None`はUI層の既定カーソル色(Android
+    /// `TerminalTheme.cursor`)を使うことを意味する。OSC 112(`ESC]112ST`)で
+    /// `None`へ戻る。`tab_color`と同じくRISでクリアされ、永続化しない。
+    /// ctl-socket経由の直接setterは無い——`isekai-ssh`側の調査(2026-08)で、
+    /// リモートが素のOSC 12を送ればtmux自身がterminal-features `ccolour`で
+    /// そのまま外側の実端末へ転送することを確認済みのため、`tab_color`とは
+    /// 異なりtmux迂回のctl-forward経路は不要と判断した。
+    cursor_color: Option<(u8, u8, u8)>,
     /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
     /// 場合、次に`take_pending_clipboard_write()`が呼ばれるまで保持する
     /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M: tmuxが`set-titles`/`allow-passthrough`を
@@ -849,6 +858,7 @@ impl Terminal {
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
             tab_color: None,
+            cursor_color: None,
             pending_clipboard_write: None,
             pending_clipboard_pull_request: false,
             pending_terminal_responses: Vec::new(),
@@ -953,6 +963,7 @@ impl Terminal {
         self.title = Some(title);
     }
     pub(crate) fn tab_color(&self) -> Option<(u8, u8, u8)> { self.tab_color }
+    pub(crate) fn cursor_color(&self) -> Option<(u8, u8, u8)> { self.cursor_color }
 
     /// OSC 4;264 のパース経由ではなく、外部(ctl-socket経由の
     /// `CtlMessage::SetTabColor`)から直接タブ色を設定する。`set_title`と対になる。
@@ -1268,6 +1279,7 @@ impl Terminal {
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
         self.tab_color = None;
+        self.cursor_color = None;
         self.pending_clipboard_write = None;
         self.pending_clipboard_pull_request = false;
         self.pending_terminal_responses.clear();
@@ -2052,21 +2064,30 @@ impl Terminal {
         Some(if focused { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() })
     }
 
-    /// OSC 10(`is_fg == true`)/OSC 11(`is_fg == false`)の set/query 共通処理(タスク#58)。
-    /// `spec == "?"`はquery——現在のtheme既定色を`rgb:RRRR/GGGG/BBBB`形式で
+    /// OSC 10/11/12の set/query 共通処理(タスク#58、カーソル色は2026-08追加)。
+    /// `spec == "?"`はquery——現在の色を`rgb:RRRR/GGGG/BBBB`形式で
     /// `pending_terminal_responses`に積む(応答経路はDA/DSRと同じ、タスク#38)。
-    /// それ以外はsetとして解釈を試み、パースできた場合のみ`self.theme`を更新する
+    /// それ以外はsetとして解釈を試み、パースできた場合のみ状態を更新する
     /// (`set_theme()`のdoc commentの通り、既に解決済みのセルは遡って再着色されない
     /// ——このOSCによるsetも同じ制約を継承する)。パースできない`spec`は無視する
     /// (実端末も未知のcolor specは無視して応答もしない)。
-    fn handle_osc_default_color(&mut self, is_fg: bool, spec: &[u8], bell_terminated: bool) {
+    fn handle_osc_default_color(&mut self, target: DefaultColorTarget, spec: &[u8], bell_terminated: bool) {
         if spec == b"?" {
-            let color = if is_fg { self.theme.default_fg } else { self.theme.default_bg };
-            let r = ((color >> 16) & 0xFF) as u8;
-            let g = ((color >> 8) & 0xFF) as u8;
-            let b = (color & 0xFF) as u8;
+            let (r, g, b) = match target {
+                DefaultColorTarget::Foreground => argb_to_rgb888(self.theme.default_fg),
+                DefaultColorTarget::Background => argb_to_rgb888(self.theme.default_bg),
+                // カーソル色が未設定(OSC 12未送信、またはOSC 112でリセット済み)の間は
+                // 描画側の既定カーソル色(Android `TerminalTheme.cursor`)を持たないので、
+                // 多くの実端末がそうしているように前景色を代用値として返す(あくまで
+                // queryへの近似応答——実際の描画色そのものではない)。
+                DefaultColorTarget::Cursor => self.cursor_color.unwrap_or_else(|| argb_to_rgb888(self.theme.default_fg)),
+            };
             let terminator: &[u8] = if bell_terminated { b"\x07" } else { b"\x1b\\" };
-            let osc_num: &[u8] = if is_fg { b"10" } else { b"11" };
+            let osc_num: &[u8] = match target {
+                DefaultColorTarget::Foreground => b"10",
+                DefaultColorTarget::Background => b"11",
+                DefaultColorTarget::Cursor => b"12",
+            };
             let mut resp = Vec::with_capacity(32);
             resp.extend_from_slice(b"\x1b]");
             resp.extend_from_slice(osc_num);
@@ -2076,22 +2097,28 @@ impl Terminal {
             return;
         }
         if let Some(argb) = parse_osc_color_spec(spec) {
-            if is_fg {
-                // `cur_attrs.fg`はSGR実行時点で`theme.default_fg`から具体値へ解決済み
-                // (`default_for`/SGR `39`)なので、その値が「今の」既定色と一致している
-                // 間はまだ明示的な色指定を受けていない=論理的に"default"を指しているとみなし、
-                // 新しい既定色へ追従させる(codexレビュー指摘: これをしないと、OSC 10/11
-                // set直後SGRリセットを挟まず印字した文字が旧既定色のまま描かれてしまう)。
-                // 既に別の色をSGRで明示指定済みのcur_attrsには影響しない。
-                if self.cur_attrs.fg == self.theme.default_fg {
-                    self.cur_attrs.fg = argb;
+            match target {
+                DefaultColorTarget::Foreground => {
+                    // `cur_attrs.fg`はSGR実行時点で`theme.default_fg`から具体値へ解決済み
+                    // (`default_for`/SGR `39`)なので、その値が「今の」既定色と一致している
+                    // 間はまだ明示的な色指定を受けていない=論理的に"default"を指しているとみなし、
+                    // 新しい既定色へ追従させる(codexレビュー指摘: これをしないと、OSC 10/11
+                    // set直後SGRリセットを挟まず印字した文字が旧既定色のまま描かれてしまう)。
+                    // 既に別の色をSGRで明示指定済みのcur_attrsには影響しない。
+                    if self.cur_attrs.fg == self.theme.default_fg {
+                        self.cur_attrs.fg = argb;
+                    }
+                    self.theme.default_fg = argb;
                 }
-                self.theme.default_fg = argb;
-            } else {
-                if self.cur_attrs.bg == self.theme.default_bg {
-                    self.cur_attrs.bg = argb;
+                DefaultColorTarget::Background => {
+                    if self.cur_attrs.bg == self.theme.default_bg {
+                        self.cur_attrs.bg = argb;
+                    }
+                    self.theme.default_bg = argb;
                 }
-                self.theme.default_bg = argb;
+                DefaultColorTarget::Cursor => {
+                    self.cursor_color = Some(argb_to_rgb888(argb));
+                }
             }
         }
     }
@@ -2416,6 +2443,19 @@ fn contains_disallowed_hyperlink_chars(s: &str) -> bool {
                 | '\u{0080}'..='\u{009F}'
         )
     })
+}
+
+/// OSC 10/11/12(`handle_osc_default_color`)が更新対象を選ぶための識別子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultColorTarget {
+    Foreground,
+    Background,
+    Cursor,
+}
+
+/// `0xAARRGGBB`形式のARGBから`(r, g, b)`の8bit成分を取り出す。
+fn argb_to_rgb888(argb: u32) -> (u8, u8, u8) {
+    (((argb >> 16) & 0xFF) as u8, ((argb >> 8) & 0xFF) as u8, (argb & 0xFF) as u8)
 }
 
 /// OSC 10/11などが使う`Pt`のcolor spec(`rgb:R.../G.../B...`または`#RRGGBB`系)を
@@ -3118,10 +3158,28 @@ impl Perform for Terminal {
             // transport経路を作らず、DA/DSR(タスク#38)と同じ
             // `pending_terminal_responses`→`SideEffect::SendStdin`経路に乗せる。
             (Some(&b"10"), Some(&spec)) => {
-                self.handle_osc_default_color(true, spec, bell_terminated);
+                self.handle_osc_default_color(DefaultColorTarget::Foreground, spec, bell_terminated);
             }
             (Some(&b"11"), Some(&spec)) => {
-                self.handle_osc_default_color(false, spec, bell_terminated);
+                self.handle_osc_default_color(DefaultColorTarget::Background, spec, bell_terminated);
+            }
+            // OSC 12(`ESC]12;<spec>ST`): カーソル色のset/query。標準的なxterm/iTerm2
+            // 互換のOSCで(Windows Terminal固有ではない)、OSC 10/11と全く同じ
+            // `handle_osc_default_color`に相乗りする。カーソル色は`theme`(SGR解決に
+            // 使うANSIパレット)とは独立に`self.cursor_color`として持つ——`None`は
+            // 「UI層の既定カーソル色を使う」を意味する(`ScreenUpdate.cursor_color`
+            // 経由でAndroid/iOSへ公開、`session_state.rs`参照)。
+            (Some(&b"12"), Some(&spec)) => {
+                self.handle_osc_default_color(DefaultColorTarget::Cursor, spec, bell_terminated);
+            }
+            // OSC 112(`ESC]112ST`、パラメータ無し): カーソル色をリセットする
+            // (xterm互換)。OSC 10/11のリセット形(OSC 110/111)は`theme.default_fg/bg`が
+            // 「構築時の値」を別途保持していないため対称な実装コストが高く、今回は
+            // OSC 12とペアのリセットのみ対応する(neovimは起動時にOSC 12でカーソル色を
+            // 設定し終了時にOSC 112で戻すため、112が無いとnvim終了後もカーソルが
+            // 色付いたままになるバグを生む——Opusレビュー指摘)。
+            (Some(&b"112"), _) => {
+                self.cursor_color = None;
             }
             // OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`): Windows Terminalのプライベート
             // 拡張(パレットindex 264をタブ背景色に流用、`microsoft/terminal` PR #13058)。
@@ -3153,10 +3211,7 @@ impl Perform for Terminal {
             (Some(&b"4"), Some(&b"264")) => {
                 if let Some(&spec) = params.get(2) {
                     if let Some(argb) = parse_osc_color_spec(spec) {
-                        let r = ((argb >> 16) & 0xFF) as u8;
-                        let g = ((argb >> 8) & 0xFF) as u8;
-                        let b = (argb & 0xFF) as u8;
-                        self.tab_color = Some((r, g, b));
+                        self.tab_color = Some(argb_to_rgb888(argb));
                     }
                 }
             }
@@ -4594,6 +4649,48 @@ mod tests {
         feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // 既定fgを赤に変更
         feed(&mut t, b"x");
         assert_eq!(t.screen_cells()[0].fg, Theme::default().ansi16[2], "明示指定した緑のまま変わらないこと");
+    }
+
+    // ── OSC 12/112 cursor color のset/query/reset(2026-08、xterm/iTerm2互換) ──────
+
+    #[test]
+    fn test_osc12_query_falls_back_to_default_fg_when_unset() {
+        let mut t = Terminal::new(80, 24, Theme::default()); // default_fg = 0xFFCCCCCC
+        feed(&mut t, b"\x1b]12;?\x07");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]12;rgb:cccc/cccc/cccc\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc12_set_rgb_form_updates_cursor_color_for_subsequent_query() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
+        assert_eq!(t.cursor_color(), Some((0xff, 0x00, 0x00)));
+        feed(&mut t, b"\x1b]12;?\x1b\\");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]12;rgb:ffff/0000/0000\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc12_set_invalid_spec_is_ignored() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]12;not-a-color\x07");
+        assert_eq!(t.cursor_color(), None);
+    }
+
+    #[test]
+    fn test_osc112_resets_cursor_color_to_unset() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
+        assert_eq!(t.cursor_color(), Some((0xff, 0x00, 0x00)));
+        feed(&mut t, b"\x1b]112\x07");
+        assert_eq!(t.cursor_color(), None, "OSC 112はカーソル色を未設定(UI既定色)へ戻す");
+    }
+
+    #[test]
+    fn test_osc12_cursor_color_cleared_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.cursor_color(), None);
     }
 
     #[test]

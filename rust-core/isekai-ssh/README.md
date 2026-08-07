@@ -610,7 +610,8 @@ Windows が無いため、この機能自体はモックSSHサーバーでのユ
 ### Claude Code フック連携によるタブ状態表示(`claude-hookd`)
 
 `#@isekai ctl-socket yes` の上に乗る形で、リモートで動いている Claude Code の状態
-(権限確認待ち・応答待ちなど)に応じて、ローカル(Windows Terminal)のタブ背景色を
+(権限確認待ち・応答待ちなど)に応じて、ローカルの実端末(Windows Terminal または
+iTerm2 — `$TERM_PROGRAM`/`$ISEKAI_TERMINAL_KIND` から自動判別、2026-08)のタブ背景色を
 自動的に変える(`ISEKAI_PIPE_DESIGN.md` §8 Epic Q)。tmux の pane ごとに独立した
 Claude Code セッションとして扱われるので、同じタブ内の複数 pane が互いの状態を
 打ち消し合うことはない。
@@ -631,15 +632,15 @@ hook でも同じ1行、Claude Code のフック JSON を stdin から読んで�
 ```json
 {
   "hooks": {
-    "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
-    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
-    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
+    "Notification":       [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "Stop":               [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "StopFailure":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "claude-hookd event", "timeout": 10 }] }],
+    "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "claude-hookd event", "async": true, "timeout": 10 }] }]
   }
 }
 ```
@@ -669,13 +670,15 @@ idle色へ戻り、何も操作しなくても10分経てば自動的に戻る�
 `idle_prompt`が届く。
 
 裏側では、最初のイベントが来たタイミングでタブごとの小さなdaemon
-(`isekai-pipe claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
+(`claude-hookd __serve`)が遅延起動し、以後のイベントはこのdaemonへ
 転送される。daemonは1時間イベントが無いと自動的に終了する(常駐監視プロセスは
 無い、Epic Mの ctl-socket 自体と同じ方針)。
 
-**明示的にスコープ外**: タブ色を実際に変える部分は `isekai-ssh` + Windows Terminal の
-組み合わせ専用(タブ色自体は OSC 4;264 という Windows Terminal 固有の拡張に依存する
-ため isekai-terminal 本体アプリでは効果が無い)。`ctl notify` のポップアップ部分
+タブ色を実際に変える部分は、`isekai-ssh` が動いているローカルの実端末が Windows Terminal
+なら OSC 4;264、iTerm2 なら `OSC 6;1;bg;...` へ変換して送る(自動判別できない場合は
+`$ISEKAI_TERMINAL_KIND=iterm2` / `windows-terminal` で明示指定できる)。isekai-terminal
+本体アプリ(Android)にもタブ色 UI(タブ行のアクセントドット)があり、同じ
+`CtlMessage::SetTabColor` を反映する(2026-08、`session.rs`)。`ctl notify` のポップアップ部分
 (`AI_INTEGRATION_DESIGN.md` §6.1)は isekai-terminal 本体アプリでも独立に届く——
 Android はバックグラウンドシステム通知として実装済み(2026-07-25)、iOS は
 まだ未実装(`AI_INTEGRATION_DESIGN.md` §9 Epic AI-9)。`.claude/settings.json` への
