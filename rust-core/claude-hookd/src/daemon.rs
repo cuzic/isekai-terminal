@@ -3,6 +3,7 @@
 //! spawned only by [`super::spawn_detached_daemon`], never meant to be
 //! typed by a human.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,6 +34,25 @@ const ATTENTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// reachable before self-exit.
 const MAX_DEFERRAL: Duration = Duration::from_secs(30 * 60);
 
+/// How long a `WireEvent::TeammateDispatched` (a successful, top-level
+/// `Agent`/`SendMessage` `PostToolUse`) stays "recent enough" for a later
+/// `WireEvent::StopAmbiguousTeammate` on the same session to treat a
+/// `type: "teammate"` `background_tasks` entry as plausibly still working
+/// (`HookEvent::StopDeferred`) rather than a long-idle teammate
+/// (`HookEvent::Notify`, the safe default). Deliberately independent of
+/// ever receiving a `TeammateIdle` hook event — this crate has no such hook
+/// wired up yet (2026-08-05 design note: `TeammateIdle` fires reliably but
+/// only tells us a teammate *finished*, not disambiguated by *which*
+/// teammate on a session with several, so treating a bare TTL as the
+/// correctness mechanism and any future `TeammateIdle` wiring as purely an
+/// early-clear optimization keeps this simple and still fail-safe: a
+/// missing/dropped signal just falls back to the TTL, never to a
+/// permanently-stuck `StopDeferred`). Same magnitude as `MAX_DEFERRAL` for
+/// the same reason: a normal delegated task should resolve well within it,
+/// and if it routinely doesn't, all that's gained by a longer TTL is a
+/// delayed false positive.
+const TEAMMATE_DISPATCH_TTL: Duration = Duration::from_secs(30 * 60);
+
 /// How long this daemon keeps running with no events at all before exiting
 /// on its own — its socket file is left for the next `claude-hookd event`
 /// invocation's sweep to reclaim.
@@ -62,13 +82,14 @@ struct DaemonConfig {
     attention_color: (u8, u8, u8),
     waiting_color: (u8, u8, u8),
     /// Overridable only via the undocumented `--attention-timeout-ms`/
-    /// `--max-deferral-ms`/`--idle-exit-ms` flags, which exist solely so
-    /// this module's own tests can drive a real daemon through every
-    /// timeout/promotion path in milliseconds instead of the real
-    /// 10-minute/30-minute/1-hour durations.
+    /// `--max-deferral-ms`/`--idle-exit-ms`/`--teammate-dispatch-ttl-ms`
+    /// flags, which exist solely so this module's own tests can drive a
+    /// real daemon through every timeout/promotion path in milliseconds
+    /// instead of the real 10-minute/30-minute/1-hour durations.
     attention_timeout: Duration,
     max_deferral: Duration,
     idle_exit: Duration,
+    teammate_dispatch_ttl: Duration,
 }
 
 /// Parses `__serve`'s spawn arguments and runs the daemon loop until it
@@ -86,6 +107,7 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
     let mut attention_timeout = ATTENTION_TIMEOUT;
     let mut max_deferral = MAX_DEFERRAL;
     let mut idle_exit = IDLE_EXIT;
+    let mut teammate_dispatch_ttl = TEAMMATE_DISPATCH_TTL;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => sock_path = args.next().map(PathBuf::from),
@@ -108,6 +130,11 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
                     idle_exit = Duration::from_millis(ms);
                 }
             }
+            "--teammate-dispatch-ttl-ms" => {
+                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
+                    teammate_dispatch_ttl = Duration::from_millis(ms);
+                }
+            }
             _ => {}
         }
     }
@@ -123,6 +150,7 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
         attention_timeout,
         max_deferral,
         idle_exit,
+        teammate_dispatch_ttl,
     })
     .await;
     ExitCode::SUCCESS
@@ -189,15 +217,42 @@ async fn run(config: DaemonConfig) {
     });
 
     let mut state = TabState::new();
+    // A separate piece of per-session state from `state: TabState` on
+    // purpose (see `state.rs`'s module docs) — this map answers "did this
+    // session recently dispatch work to a teammate?", not "is this session
+    // pending attention?", and only ever exists to resolve
+    // `WireEvent::StopAmbiguousTeammate` below. Values are the *expiry*
+    // instant (`now + config.teammate_dispatch_ttl` at insertion), not the
+    // dispatch instant — checking `now < expiry` on lookup then also does
+    // this map's only pruning, so no separate sweep task is needed for it
+    // (unlike `TabState`, which has real, popup-worthy actions to fire on
+    // expiry — this map has none: a lookup miss just means "treat as no
+    // recent dispatch," nothing more happens).
+    let mut teammate_dispatch: HashMap<String, Instant> = HashMap::new();
     let mut idle_exit_deadline = Instant::now() + config.idle_exit;
     loop {
         let idle_exit_sleep = tokio::time::sleep(idle_exit_deadline.saturating_duration_since(Instant::now()));
         tokio::select! {
             _ = &mut accept_task => break,
             received = event_rx.recv() => {
-                let Some((session_id, event)) = received else { break };
+                let Some((session_id, wire_event)) = received else { break };
                 idle_exit_deadline = Instant::now() + config.idle_exit;
                 let now = Instant::now();
+                let event = match wire_event {
+                    WireEvent::Notify => HookEvent::Notify,
+                    WireEvent::StopDeferred => HookEvent::StopDeferred,
+                    WireEvent::Resolve => HookEvent::Resolve,
+                    WireEvent::TeammateDispatched => {
+                        teammate_dispatch.insert(session_id.clone(), now + config.teammate_dispatch_ttl);
+                        HookEvent::Resolve
+                    }
+                    WireEvent::StopAmbiguousTeammate => {
+                        match teammate_dispatch.get(&session_id) {
+                            Some(&expiry) if now < expiry => HookEvent::StopDeferred,
+                            _ => HookEvent::Notify,
+                        }
+                    }
+                };
                 let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout, config.max_deferral);
                 state = next_state;
                 execute_actions(&config, &actions).await;
@@ -254,16 +309,34 @@ async fn attention_sleep(state: &TabState) {
     }
 }
 
+/// The daemon's own wire-level event vocabulary — a strict superset of
+/// `state::HookEvent`, mirroring `main.rs`'s `ClientEvent` (the two are kept
+/// as distinct types rather than shared, same as the rest of this wire
+/// format's deliberate decoupling from Claude Code's own hook JSON schema).
+/// `TeammateDispatched`/`StopAmbiguousTeammate` are not themselves valid
+/// inputs to `state::apply_event` — [`run`]'s main loop translates them into
+/// a real `HookEvent` first, using its own `teammate_dispatch` TTL map,
+/// before ever touching `TabState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireEvent {
+    Notify,
+    StopDeferred,
+    Resolve,
+    TeammateDispatched,
+    StopAmbiguousTeammate,
+}
+
 /// Reads exactly one
-/// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"}`
-/// line — the daemon's own minimal wire format, deliberately decoupled from
-/// Claude Code's own hook JSON schema (only `super::parse_hook_event`, the
-/// client side, needs to know that shape).
-async fn read_one_event(stream: tokio::net::UnixStream) -> Option<(String, HookEvent)> {
+/// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"|
+/// "teammate_dispatched"|"stop_ambiguous_teammate"}` line — the daemon's own
+/// minimal wire format, deliberately decoupled from Claude Code's own hook
+/// JSON schema (only `super::parse_hook_event`, the client side, needs to
+/// know that shape).
+async fn read_one_event(stream: tokio::net::UnixStream) -> Option<(String, WireEvent)> {
     tokio::time::timeout(EVENT_READ_TIMEOUT, read_one_event_line(stream)).await.ok()?
 }
 
-async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, HookEvent)> {
+async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, WireEvent)> {
     // Symmetric with `main.rs::send_event`'s own peer-credential check on
     // the client side (adversarial review, 2026-08: this accept-side check
     // was missing entirely) — under the `/tmp` fallback (no
@@ -284,9 +357,11 @@ async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, 
     let value: serde_json::Value = serde_json::from_str(line.trim_end()).ok()?;
     let session_id = value.get("session_id")?.as_str()?.to_string();
     let event = match value.get("event")?.as_str()? {
-        "notify" => HookEvent::Notify,
-        "stop_deferred" => HookEvent::StopDeferred,
-        "resolve" => HookEvent::Resolve,
+        "notify" => WireEvent::Notify,
+        "stop_deferred" => WireEvent::StopDeferred,
+        "resolve" => WireEvent::Resolve,
+        "teammate_dispatched" => WireEvent::TeammateDispatched,
+        "stop_ambiguous_teammate" => WireEvent::StopAmbiguousTeammate,
         _ => return None,
     };
     Some((session_id, event))
@@ -342,6 +417,7 @@ mod tests {
             attention_timeout: Duration::from_millis(100),
             max_deferral: Duration::from_millis(150),
             idle_exit: Duration::from_millis(300),
+            teammate_dispatch_ttl: Duration::from_millis(150),
         }));
 
         // Poll (not a fixed sleep — this project has repeatedly hit CI
@@ -398,6 +474,7 @@ mod tests {
             attention_timeout: Duration::from_millis(100),
             max_deferral: Duration::from_millis(80),
             idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_millis(80),
         }));
 
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
@@ -416,6 +493,136 @@ mod tests {
         // promotes the still-Deferred session to Attention on its own.
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must self-correct to the attention color").await;
         poll_tty_contains(&tty_path, "]9;", "the self-correction must fire the popup, same as a real Notify would").await;
+
+        daemon.abort();
+    }
+
+    /// The 2026-08-05 fix, end to end: a `teammate_dispatched` wire event
+    /// (this session's own `PostToolUse(Agent|SendMessage)`) followed by a
+    /// `stop_ambiguous_teammate` wire event (a `Stop` whose only
+    /// `background_tasks` entry is `type: "teammate"`) must defer — paint
+    /// the waiting color, no popup — exactly like a hard `stop_deferred`
+    /// would, as long as the dispatch is still within `teammate_dispatch_ttl`.
+    #[tokio::test]
+    async fn teammate_dispatch_then_ambiguous_stop_defers_within_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(200),
+            max_deferral: Duration::from_millis(200),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_secs(5),
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"teammate_dispatched\"}\n").await.unwrap();
+        drop(client);
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_ambiguous_teammate\"}\n").await.unwrap();
+        drop(client);
+
+        poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "a recent teammate dispatch must make an ambiguous Stop defer").await;
+        assert!(
+            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;"),
+            "a deferred ambiguous Stop must never emit the attention popup"
+        );
+
+        daemon.abort();
+    }
+
+    /// The other half: with **no** preceding `teammate_dispatched`,
+    /// `stop_ambiguous_teammate` must fall back to the safe default —
+    /// exactly like the old, reverted behavior of treating a `"teammate"`
+    /// `background_tasks` entry as `Notify` — since a long-idle teammate's
+    /// `status` looks identical to a working one.
+    #[tokio::test]
+    async fn ambiguous_stop_without_a_recent_dispatch_notifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(200),
+            max_deferral: Duration::from_millis(200),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_secs(5),
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_ambiguous_teammate\"}\n").await.unwrap();
+        drop(client);
+
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "no recent dispatch must fall back to the attention color").await;
+        poll_tty_contains(&tty_path, "]9;", "the safe fallback must fire the popup, same as a real Notify would").await;
+
+        daemon.abort();
+    }
+
+    /// The TTL half: a `teammate_dispatched` older than
+    /// `teammate_dispatch_ttl` must no longer count — pins the fix's
+    /// fail-safe property (a stale dispatch record must not defer forever)
+    /// independent of ever wiring up a `TeammateIdle` hook.
+    #[tokio::test]
+    async fn a_stale_teammate_dispatch_past_its_ttl_no_longer_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(200),
+            max_deferral: Duration::from_millis(200),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_millis(50),
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"teammate_dispatched\"}\n").await.unwrap();
+        drop(client);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_ambiguous_teammate\"}\n").await.unwrap();
+        drop(client);
+
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "a dispatch past its TTL must not defer an ambiguous Stop").await;
+        poll_tty_contains(&tty_path, "]9;", "an expired dispatch must fall back to the real Notify popup").await;
 
         daemon.abort();
     }
@@ -462,6 +669,7 @@ mod tests {
                 attention_timeout: Duration::from_millis(50),
                 max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
+                teammate_dispatch_ttl: Duration::from_millis(50),
             }),
         )
         .await;
@@ -557,6 +765,7 @@ mod tests {
                 attention_timeout: Duration::from_millis(50),
                 max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
+                teammate_dispatch_ttl: Duration::from_millis(50),
             }),
         )
         .await

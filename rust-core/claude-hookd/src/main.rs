@@ -39,7 +39,6 @@ mod state;
 
 #[cfg(unix)]
 use delivery::Delivery;
-use state::HookEvent;
 
 /// Bounded retry/backoff for the "daemon wasn't running yet, spawned one,
 /// now waiting for it to bind" window. A single retry loses the race when
@@ -146,8 +145,16 @@ async fn event_command() -> ExitCode {
     // `StopDeferred` arriving with no daemon running records nothing at all,
     // and the eventual self-correcting promotion to `Attention` (see
     // `state.rs::apply_timeout`) would silently never happen for that
-    // session.
-    if !matches!(event, HookEvent::Notify | HookEvent::StopDeferred) {
+    // session. `StopAmbiguousTeammate` spawns for the same reason *and*
+    // stays safe when it does: a freshly spawned daemon has no
+    // `teammate_dispatch` history yet (see `daemon.rs::run`), so it
+    // resolves to the safe `Notify` default exactly as if no daemon existed
+    // at all — spawning one here can never manufacture a false
+    // `StopDeferred` out of nothing. `TeammateDispatched` deliberately does
+    // *not* spawn, same as plain `Resolve`: with no daemon running there is
+    // no pending state to update and no `Stop` yet to inform, so recording
+    // the dispatch timestamp would have nothing to do.
+    if !matches!(event, ClientEvent::Notify | ClientEvent::StopDeferred | ClientEvent::StopAmbiguousTeammate) {
         // `SessionEnd` alone still gets one direct, best-effort, idempotent
         // idle-color write — bypassing the daemon/state machine entirely —
         // when no daemon answers. Without this, "the daemon happened to be
@@ -177,10 +184,48 @@ async fn event_command() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A hook event as classified purely from Claude Code's own hook JSON — the
+/// output of [`parse_hook_event`], before any daemon-side state is
+/// consulted. A strict superset of `state::HookEvent` (the pure decision
+/// core's own input): `TeammateDispatched`/`StopAmbiguousTeammate` cannot be
+/// resolved into a final `state::HookEvent` here, because doing so needs
+/// this tab's *history* (has this session recently dispatched work to a
+/// teammate?), and history is daemon-held state that a one-shot,
+/// short-lived `claude-hookd event` process never has — see `daemon.rs`'s
+/// `WireEvent`/`teammate_dispatch` for where that translation actually
+/// happens. Keeping these two variants out of `state::HookEvent` keeps
+/// `state.rs` exactly what its module docs promise: a pure, I/O-free
+/// function that needs nothing beyond `(state, event, now)`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientEvent {
+    Notify,
+    StopDeferred,
+    Resolve,
+    /// `PostToolUse` (success only, not `PostToolUseFailure`) for a
+    /// top-level (`!in_subagent`) `Agent` or `SendMessage` call — this
+    /// session just handed work to some teammate. Treated identically to
+    /// `Resolve` for clearing this tab's pending state (it's real activity,
+    /// same as any other successful tool call), but carries distinct wire
+    /// identity so `daemon.rs` can *also* record it in `teammate_dispatch`.
+    TeammateDispatched,
+    /// A `Stop` whose only relevant-looking `background_tasks` entries are
+    /// `type: "teammate"` — ambiguous in a way plain `HookEvent::StopDeferred`
+    /// isn't: an idle teammate's `status` never stops reading `"running"`
+    /// (confirmed live 2026-08-05 — see this crate's handoff notes), so
+    /// "a teammate entry exists" alone proves nothing. Resolved daemon-side
+    /// by checking `teammate_dispatch` for a *recent* dispatch to this
+    /// session (see `daemon.rs::run`'s translation) — recent dispatch +
+    /// teammate entry ⇒ plausibly still working (`StopDeferred`); no recent
+    /// dispatch ⇒ probably just a long-idle teammate (`Notify`, the safe
+    /// default).
+    StopAmbiguousTeammate,
+}
+
 /// Extracts just the fields `claude-hookd` needs from Claude Code's hook JSON
-/// payload and maps them to this module's own [`HookEvent`] — the one place
-/// in this crate that knows Claude Code's hook schema, deliberately kept
-/// separate from the daemon's own minimal wire format
+/// payload and maps them to this module's own [`ClientEvent`] — the one
+/// place in this crate that knows Claude Code's hook schema, deliberately
+/// kept separate from the daemon's own minimal wire format
 /// (`daemon::read_one_event`) so a future Claude Code schema change touches
 /// only this function. `None` covers both "malformed JSON" and "an event
 /// type `claude-hookd` doesn't act on" identically — both are silent no-ops.
@@ -190,8 +235,8 @@ async fn event_command() -> ExitCode {
 /// site); every other `Resolve` reaching a dead/absent daemon is left alone.
 ///
 /// A `Stop` means "waiting on a background task/agent that will auto-resume
-/// me" (`HookEvent::StopDeferred`, not "blocked on a human"
-/// (`HookEvent::Notify`)) when its `background_tasks` array (present on the
+/// me" (`ClientEvent::StopDeferred`, not "blocked on a human"
+/// (`ClientEvent::Notify`)) when its `background_tasks` array (present on the
 /// real `Stop` hook payload — confirmed 2026-08-03 by reading the zod
 /// schemas embedded in the installed Claude Code CLI binary, then verified
 /// live by dumping a real `Stop` payload from a `Bash(run_in_background)`
@@ -199,16 +244,49 @@ async fn event_command() -> ExitCode {
 /// incomplete for this payload — see `claude-hookd-background-tasks-design`
 /// in the user's memory system for the full trail) contains an entry whose
 /// `type` is `"shell"` or `"subagent"` — the two mechanisms this crate
-/// actually means to detect (`Bash` with `run_in_background`, and a
-/// backgrounded `Agent`/subagent). Deliberately narrower than "array
+/// actually means to detect unconditionally (`Bash` with `run_in_background`,
+/// and a backgrounded `Agent`/subagent). Deliberately narrower than "array
 /// non-empty": the array can also contain `"teammate"`/`"dream"`/
 /// `"auto-mode scan"`/`"monitor"`/etc. entries that can sit `running`
 /// indefinitely (e.g. an idle teammate under `CLAUDE_CODE_TEAMMATE_MODE`),
 /// which an earlier, reverted attempt at this same fix (2026-08-03, believed
 /// at the time to be checking a nonexistent field — it wasn't) learned the
-/// hard way not to trust wholesale. An unrecognized/future `type` also fails
-/// to the safe (still-`Notify`) side, by construction (`matches!` against an
-/// explicit allowlist, not a denylist).
+/// hard way not to trust wholesale. A `"teammate"`-only array no longer
+/// falls straight through to `Notify` either, as of 2026-08 — see
+/// `ClientEvent::StopAmbiguousTeammate`'s docs; every *other* unrecognized/
+/// future `type` still fails to the safe (`Notify`) side, by construction
+/// (`matches!` against an explicit allowlist, not a denylist).
+///
+/// The same `StopDeferred` treatment also applies when `session_crons`
+/// (present on the same `Stop` payload, alongside `background_tasks` —
+/// confirmed live 2026-08-04 by a temporary `Stop` hook dumping stdin to a
+/// file, same method as `background_tasks`'s own discovery; also
+/// undocumented in the public hooks reference) is non-empty: each entry is
+/// *usually* a scheduled self-resume this exact session registered for
+/// itself (e.g. the `ScheduleWakeup` tool, or a `/loop`-style recurring one —
+/// `recurring: true`/`false` doesn't change the classification, since
+/// either kind still means the session comes back on its own). Unlike
+/// `background_tasks`, no type-filtering is applied here — **not** because
+/// the array is guaranteed to only ever contain entries scoped to this
+/// session (adversarial review, 2026-08, checked against the real Claude
+/// Code CLI's own logic: `session_crons` also carries *teammate/subagent*-
+/// owned crons an `Agent`/`SendMessage` dispatch pushed into this same
+/// shared list, distinguishable by their own `agentId` field, which the
+/// `Stop` hook payload this function reads does not include at all — the
+/// same kind of ambiguity `has_teammate_background_work`/
+/// `ClientEvent::StopAmbiguousTeammate` exists to disambiguate for
+/// `background_tasks`, but with no equivalent signal available here to do
+/// it with) — but because there is no *cheaper*, more targeted signal
+/// available to filter on, and deferring is still the safer of the two
+/// possible mistakes: a false `StopDeferred` (this session's own genuine
+/// stop delayed by a teammate's unrelated cron) self-corrects via
+/// `state.rs`'s bounded timeout below, while a false `Notify` on a real
+/// self-resume is the original bug this fix exists to close. This was the
+/// actual root cause of a real false-Attention report (2026-08-04, user
+/// noticed a tab going orange while a `ScheduleWakeup`-driven wait was
+/// still in flight): `parse_hook_event` checked `background_tasks` only,
+/// so a `Stop` with a pending `session_crons` entry but an empty
+/// `background_tasks` array fell through to unconditional `Notify`.
 ///
 /// `StopDeferred` is not a permanent suppression — see `state.rs`'s
 /// `Pending::Deferred`/`apply_timeout` for the bounded self-correction that
@@ -216,40 +294,65 @@ async fn event_command() -> ExitCode {
 /// this fix, having Claude self-report a marker string when *it* judged a
 /// `Stop` ambiguous, was reverted the same day after producing false
 /// negatives with no such backstop — self-report alone isn't trustworthy for
-/// this, see `claude-hookd-self-report-marker-failed` in memory).
+/// this, see `claude-hookd-self-report-marker-failed` in memory). Note this
+/// bound (`MAX_DEFERRAL`, 30 minutes) is anchored to `ScheduleWakeup`'s own
+/// maximum delay (1 hour) — for that specific tool a `session_crons` wait
+/// can in principle still get promoted to `Attention` before its own
+/// scheduled time arrives, but only by up to that much. A session-scoped
+/// `CronCreate` entry has no such cap at all: its `schedule` is an arbitrary
+/// cron expression (`"0 9 * * 1-5"` fires days apart), so for that case
+/// `MAX_DEFERRAL` doesn't merely risk firing a little early — the color will
+/// almost always flip to `Attention` long before the cron does, for the
+/// entire gap between them. Left as-is rather than special-cased (parsing
+/// `schedule` to compute a real per-entry deadline would need a cron-
+/// expression parser this crate doesn't otherwise need, and would break the
+/// "one safety net regardless of *why* a `Stop` was deferred" property
+/// `state.rs` currently has): `state.rs`'s self-correction still makes this
+/// safe (never a *permanent* misclassification), just not prompt for a
+/// multi-day-scale `CronCreate` wait — a real, currently-accepted trade-off,
+/// not a "this rarely matters" one.
 ///
 /// See the pre-split `isekai-pipe` version's doc comment (git history) for
 /// the detailed rationale behind the other mappings below — carried over
 /// unchanged, this is purely a file move.
 #[cfg(unix)]
-fn parse_hook_event(payload: &[u8]) -> Option<(String, HookEvent, bool)> {
+fn parse_hook_event(payload: &[u8]) -> Option<(String, ClientEvent, bool)> {
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let session_id = value.get("session_id")?.as_str()?.to_string();
     let hook_event_name = value.get("hook_event_name")?.as_str()?;
     let tool_name = value.get("tool_name").and_then(|v| v.as_str());
     let in_subagent = value.get("agent_id").is_some();
-    let has_relevant_background_work = value
+    let background_task_types: Vec<&str> = value
         .get("background_tasks")
         .and_then(|v| v.as_array())
-        .is_some_and(|tasks| tasks.iter().any(|t| matches!(t.get("type").and_then(|v| v.as_str()), Some("shell" | "subagent"))));
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("type").and_then(|v| v.as_str()))
+        .collect();
+    let has_relevant_background_work = background_task_types.iter().any(|t| matches!(*t, "shell" | "subagent"));
+    let has_teammate_background_work = background_task_types.contains(&"teammate");
+    let has_pending_session_cron =
+        value.get("session_crons").and_then(|v| v.as_array()).is_some_and(|crons| !crons.is_empty());
 
     let event = match hook_event_name {
         "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
             Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input" | "agent_completed") => {
-                HookEvent::Notify
+                ClientEvent::Notify
             }
-            Some("elicitation_complete" | "elicitation_response") => HookEvent::Resolve,
+            Some("elicitation_complete" | "elicitation_response") => ClientEvent::Resolve,
             Some(_) => return None,
-            None => HookEvent::Notify,
+            None => ClientEvent::Notify,
         },
-        "Stop" if has_relevant_background_work => HookEvent::StopDeferred,
-        "Stop" => HookEvent::Notify,
-        "StopFailure" => HookEvent::Notify,
-        "PermissionRequest" => HookEvent::Notify,
-        "PreToolUse" if tool_name == Some("AskUserQuestion") => HookEvent::Notify,
-        "UserPromptSubmit" => HookEvent::Resolve,
-        "PostToolUse" | "PostToolUseFailure" if !in_subagent => HookEvent::Resolve,
-        "SessionEnd" => HookEvent::Resolve,
+        "Stop" if has_relevant_background_work || has_pending_session_cron => ClientEvent::StopDeferred,
+        "Stop" if has_teammate_background_work => ClientEvent::StopAmbiguousTeammate,
+        "Stop" => ClientEvent::Notify,
+        "StopFailure" => ClientEvent::Notify,
+        "PermissionRequest" => ClientEvent::Notify,
+        "PreToolUse" if tool_name == Some("AskUserQuestion") => ClientEvent::Notify,
+        "UserPromptSubmit" => ClientEvent::Resolve,
+        "PostToolUse" if !in_subagent && matches!(tool_name, Some("Agent" | "SendMessage")) => ClientEvent::TeammateDispatched,
+        "PostToolUse" | "PostToolUseFailure" if !in_subagent => ClientEvent::Resolve,
+        "SessionEnd" => ClientEvent::Resolve,
         _ => return None,
     };
     Some((session_id, event, hook_event_name == "SessionEnd"))
@@ -311,7 +414,7 @@ fn sweep_stale_daemon_sockets() {
 /// retry) already handles that case correctly, it just also now happens to
 /// be the right response to an impostor.
 #[cfg(unix)]
-async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> bool {
+async fn send_event(sock_path: &Path, session_id: &str, event: ClientEvent) -> bool {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::UnixStream;
 
@@ -324,9 +427,11 @@ async fn send_event(sock_path: &Path, session_id: &str, event: HookEvent) -> boo
         _ => return false,
     }
     let event_name = match event {
-        HookEvent::Notify => "notify",
-        HookEvent::StopDeferred => "stop_deferred",
-        HookEvent::Resolve => "resolve",
+        ClientEvent::Notify => "notify",
+        ClientEvent::StopDeferred => "stop_deferred",
+        ClientEvent::Resolve => "resolve",
+        ClientEvent::TeammateDispatched => "teammate_dispatched",
+        ClientEvent::StopAmbiguousTeammate => "stop_ambiguous_teammate",
     };
     let Ok(session_id_json) = serde_json::to_string(session_id) else {
         return false;
@@ -505,7 +610,7 @@ mod tests {
     #[test]
     fn bare_notification_with_no_notification_type_falls_back_to_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"Notification"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
     }
 
     #[test]
@@ -514,7 +619,7 @@ mod tests {
             let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
             assert_eq!(
                 parse_hook_event(payload.as_bytes()),
-                Some(("s1".to_string(), HookEvent::Notify, false)),
+                Some(("s1".to_string(), ClientEvent::Notify, false)),
                 "notification_type {kind:?} should be Notify"
             );
         }
@@ -524,7 +629,7 @@ mod tests {
     fn notification_types_that_close_an_elicitation_are_resolve() {
         for kind in ["elicitation_complete", "elicitation_response"] {
             let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
-            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), HookEvent::Resolve, false)));
+            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), ClientEvent::Resolve, false)));
         }
     }
 
@@ -537,9 +642,9 @@ mod tests {
     #[test]
     fn stop_without_background_tasks_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"Stop"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
         let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
     }
 
     #[test]
@@ -550,65 +655,134 @@ mod tests {
             );
             assert_eq!(
                 parse_hook_event(payload.as_bytes()),
-                Some(("s1".to_string(), HookEvent::StopDeferred, false)),
+                Some(("s1".to_string(), ClientEvent::StopDeferred, false)),
                 "type {kind:?} should defer"
             );
         }
     }
 
     /// The type filter is deliberately an allowlist, not "array non-empty"
-    /// — a long-lived `teammate`/`dream`/`monitor`/etc. entry must not
-    /// suppress attention (see `parse_hook_event`'s doc comment on why the
-    /// original, reverted `!is_empty()` version was too permissive).
+    /// — a long-lived `dream`/`monitor`/etc. entry must not suppress
+    /// attention (see `parse_hook_event`'s doc comment on why the original,
+    /// reverted `!is_empty()` version was too permissive). `"teammate"` is
+    /// excluded from this list on purpose — unlike these other types, it
+    /// gets its own dedicated classification
+    /// (`ClientEvent::StopAmbiguousTeammate`), see
+    /// `stop_with_only_a_teammate_background_task_is_stop_ambiguous_teammate`
+    /// below.
     #[test]
     fn stop_with_only_non_relevant_background_task_types_is_notify() {
-        for kind in ["teammate", "dream", "auto-mode scan", "monitor", "MCP task", "cloud session", "workflow", "some-future-type"] {
+        for kind in ["dream", "auto-mode scan", "monitor", "MCP task", "cloud session", "workflow", "some-future-type"] {
             let payload = format!(
                 r#"{{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{{"id":"t1","type":"{kind}","status":"running"}}]}}"#
             );
             assert_eq!(
                 parse_hook_event(payload.as_bytes()),
-                Some(("s1".to_string(), HookEvent::Notify, false)),
+                Some(("s1".to_string(), ClientEvent::Notify, false)),
                 "type {kind:?} should not defer"
             );
         }
+    }
+
+    /// The 2026-08-05 fix: `"teammate"` alone (no `"shell"`/`"subagent"`, no
+    /// `session_crons`) is ambiguous, not automatically `Notify` — its
+    /// `status` never reflects idle (see this crate's handoff notes), so
+    /// `claude-hookd` needs its *own* recent-dispatch history
+    /// (`daemon.rs`'s `teammate_dispatch`) to disambiguate, which
+    /// `parse_hook_event` alone cannot do.
+    #[test]
+    fn stop_with_only_a_teammate_background_task_is_stop_ambiguous_teammate() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopAmbiguousTeammate, false)));
     }
 
     #[test]
     fn stop_defers_if_any_entry_is_relevant_even_alongside_irrelevant_ones() {
         let payload =
             br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"},{"id":"t2","type":"shell","status":"running"}]}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::StopDeferred, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
+    }
+
+    /// Pins the fix for the real false-Attention report this file's docs
+    /// describe: a `ScheduleWakeup`-driven wait shows up as a non-empty
+    /// `session_crons` array with an empty `background_tasks`, and must
+    /// still defer rather than fall through to `Notify`.
+    #[test]
+    fn stop_with_a_pending_session_cron_is_deferred_even_with_no_background_tasks() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[],"session_crons":[{"id":"c1","schedule":"19 21 * * *","recurring":false}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
+    }
+
+    /// Unlike `background_tasks`, `session_crons` needs no type-filtering —
+    /// a recurring entry (e.g. a `/loop`-style schedule) defers exactly like
+    /// a one-shot `ScheduleWakeup` entry.
+    #[test]
+    fn stop_with_a_recurring_session_cron_is_also_deferred() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","session_crons":[{"id":"c1","schedule":"*/5 * * * *","recurring":true}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
+    }
+
+    #[test]
+    fn stop_with_an_empty_session_crons_array_is_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","session_crons":[]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
+    }
+
+    /// Pins the fail-safe direction for a `session_crons` shape this crate
+    /// has never actually observed live (adversarial review, 2026-08):
+    /// `.as_array()` returns `None` for anything that isn't a JSON array,
+    /// so a malformed/unexpected shape here must degrade to whatever
+    /// `background_tasks` alone would decide (`Notify`, empty here) rather
+    /// than panicking or defaulting to the *quieter* `StopDeferred` side.
+    #[test]
+    fn stop_with_a_non_array_session_crons_is_notify_not_a_panic() {
+        for malformed in [br#""not-an-array""#.as_slice(), br#"{}"#.as_slice(), br#"null"#.as_slice()] {
+            let payload = format!(
+                r#"{{"session_id":"s1","hook_event_name":"Stop","session_crons":{}}}"#,
+                std::str::from_utf8(malformed).unwrap()
+            );
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), ClientEvent::Notify, false)),
+                "malformed session_crons {malformed:?} must fail safe to Notify, not defer or panic"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_defers_from_session_crons_alongside_an_irrelevant_background_task() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"}],"session_crons":[{"id":"c1","schedule":"19 21 * * *","recurring":false}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
     }
 
     #[test]
     fn stop_failure_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"StopFailure"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
     }
 
     #[test]
     fn permission_request_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":"Bash"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
     }
 
     #[test]
     fn parses_user_prompt_submit_as_resolve() {
         let payload = br#"{"session_id":"s1","hook_event_name":"UserPromptSubmit"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Resolve, false)));
     }
 
     #[test]
     fn session_end_is_resolve_and_flagged_for_the_self_heal_fallback() {
         let payload = br#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Resolve, true)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Resolve, true)));
     }
 
     #[test]
     fn pre_tool_use_ask_user_question_is_notify() {
         let payload = br#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}"#;
-        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), HookEvent::Notify, false)));
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Notify, false)));
     }
 
     #[test]
@@ -621,13 +795,49 @@ mod tests {
     fn post_tool_use_resolves_regardless_of_tool_name() {
         for name in ["PostToolUse", "PostToolUseFailure"] {
             let payload = format!(r#"{{"session_id":"s1","hook_event_name":"{name}","tool_name":"Bash"}}"#);
-            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), HookEvent::Resolve, false)));
+            assert_eq!(parse_hook_event(payload.as_bytes()), Some(("s1".to_string(), ClientEvent::Resolve, false)));
         }
     }
 
     #[test]
     fn subagent_post_tool_use_is_ignored() {
         let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":"sub1"}"#;
+        assert_eq!(parse_hook_event(payload), None);
+    }
+
+    /// The 2026-08-05 fix's other half: a successful, top-level dispatch to
+    /// a teammate is the only signal `claude-hookd` has for "this session
+    /// probably still has one running" — recorded (`daemon.rs`'s
+    /// `teammate_dispatch`) so a later ambiguous `Stop` can tell a genuinely
+    /// still-working teammate from a long-idle one whose `status` never
+    /// stops saying `"running"`.
+    #[test]
+    fn post_tool_use_agent_or_send_message_is_teammate_dispatched() {
+        for tool in ["Agent", "SendMessage"] {
+            let payload = format!(r#"{{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"{tool}"}}"#);
+            assert_eq!(
+                parse_hook_event(payload.as_bytes()),
+                Some(("s1".to_string(), ClientEvent::TeammateDispatched, false)),
+                "tool_name {tool:?} should be TeammateDispatched"
+            );
+        }
+    }
+
+    /// A *failed* dispatch never actually handed work to a teammate, so it
+    /// must not be recorded as one — falls through to plain `Resolve` like
+    /// any other `PostToolUseFailure`, not `TeammateDispatched`.
+    #[test]
+    fn post_tool_use_failure_for_agent_is_plain_resolve_not_teammate_dispatched() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUseFailure","tool_name":"Agent"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::Resolve, false)));
+    }
+
+    /// A nested subagent dispatching its own teammate must not register a
+    /// dispatch for the *top-level* session — same `!in_subagent` gate as
+    /// every other `PostToolUse` classification.
+    #[test]
+    fn subagent_post_tool_use_for_agent_is_still_ignored() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Agent","agent_id":"sub1"}"#;
         assert_eq!(parse_hook_event(payload), None);
     }
 
@@ -680,7 +890,7 @@ mod tests {
             }
         });
         assert!(
-            send_event(&sock_path, "s1", HookEvent::Notify).await,
+            send_event(&sock_path, "s1", ClientEvent::Notify).await,
             "a real listener owned by this same process's own uid must be treated as reachable"
         );
     }
