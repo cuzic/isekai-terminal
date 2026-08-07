@@ -140,6 +140,22 @@ impl TokenSet {
 /// `Drop` means fields can no longer be moved out of a `TokenSet` (only
 /// `.clone()`d) — see the call sites in this file that changed to
 /// `.access_token.clone()`/`.client_id.clone()` alongside this impl.
+///
+/// **Known residual exposure, not fully closed by this alone** (found by
+/// adversarial review, 2026-08): every `TokenSet` this eventually drops is
+/// still only the *last* copy of the secret to exist. `load_token_set`'s own
+/// `content` (the raw file, JSON wrapper included) is zeroized separately
+/// right after parsing — but `serde_json`'s `#[serde(untagged)]` decoding
+/// necessarily buffers an intermediate owned representation internally
+/// before it can tell `V2` from `V1` apart, which this crate has no handle
+/// on and can't zeroize. And every caller-side `.access_token.clone()` this
+/// file's own doc comments point to (`load_token`, `get_relay_jwt`, ...)
+/// hands out a copy nothing here ever zeroizes either — closing that would
+/// mean changing every caller's own type to something zeroizing, not just
+/// this one. `Drop` here is real defense-in-depth against the *hottest*
+/// path's original bug (reassigning `access_token` used to silently drop —
+/// not wipe — the prior value on nearly every read, see `load_token_set`'s
+/// trim step), not a guarantee this secret never touches unwiped heap.
 impl Drop for TokenSet {
     fn drop(&mut self) {
         self.access_token.zeroize();
@@ -221,10 +237,18 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
     }
     check_not_world_writable(path)?;
 
-    let content =
+    let mut content =
         fs::read_to_string(path).map_err(|e| AuthError::Read { path: path.to_path_buf(), source: e })?;
-    let schema: TokenFileSchema =
-        serde_json::from_str(&content).map_err(|e| AuthError::Parse { path: path.to_path_buf(), source: e })?;
+    let parsed: Result<TokenFileSchema, _> = serde_json::from_str(&content);
+    // Zeroized as soon as `serde_json::from_str` is done with it, win or
+    // lose — `content` holds the raw secret in plaintext (the whole file,
+    // JSON wrapper included) and, `#[serde(untagged)]`'s own internal
+    // buffering aside (a copy this function has no way to reach), this is
+    // the one copy of it fully within this function's control. Same
+    // reasoning as `TokenSet`'s own `Drop` impl below, just for the
+    // pre-parse stage that impl can't cover.
+    content.zeroize();
+    let schema: TokenFileSchema = parsed.map_err(|e| AuthError::Parse { path: path.to_path_buf(), source: e })?;
 
     let mut token_set = match schema {
         TokenFileSchema::V2(token_set) => token_set,
@@ -235,7 +259,18 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
     if trimmed.is_empty() {
         return Err(AuthError::EmptyToken { path: path.to_path_buf() });
     }
-    token_set.access_token = trimmed.to_string();
+    // `trimmed.to_string()` (not reusing `token_set.access_token` in place)
+    // ends `trimmed`'s borrow, which is what lets the very next line
+    // `.zeroize()` the original untrimmed `String` before it's overwritten —
+    // a plain `token_set.access_token = trimmed.to_string()` would instead
+    // just drop the old `String` normally (a deallocation, not a wipe),
+    // defeating this type's whole `Drop`-based zeroization on every single
+    // `load_token_set` call: the untrimmed copy of the real secret would be
+    // freed-but-not-zeroed on every read, before the caller's own eventual
+    // `TokenSet::drop` ever runs.
+    let retrimmed = trimmed.to_string();
+    token_set.access_token.zeroize();
+    token_set.access_token = retrimmed;
     Ok(token_set)
 }
 
@@ -395,6 +430,25 @@ mod tests {
         let path = dir.path().join("token.json");
 
         save_token(&path, "a-relay-jwt").unwrap();
+        assert_eq!(load_token(&path).unwrap(), "a-relay-jwt");
+    }
+
+    /// Regression guard for the zeroize-then-reassign reordering in
+    /// `load_token_set`'s trim step (adversarial review, 2026-08): confirms
+    /// the observable trimming behavior survived that reordering — a slip
+    /// (e.g. zeroizing before capturing `trimmed.to_string()`, rather than
+    /// after) would silently return a wiped-to-empty or otherwise wrong
+    /// access token instead of the trimmed one.
+    #[test]
+    fn load_token_trims_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        fs::write(&path, r#"{"relay_jwt":"  a-relay-jwt\n"}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(load_token(&path).unwrap(), "a-relay-jwt");
     }
 
