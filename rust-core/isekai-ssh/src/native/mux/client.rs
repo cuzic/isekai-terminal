@@ -69,10 +69,18 @@ pub(crate) enum ClientOutcome {
 
 /// What [`run`] did with an established owner connection.
 pub(crate) enum ClientRunResult {
-    /// The session ran to some conclusion; this is this process's own exit
-    /// code (either the remote shell's real exit code, or
-    /// [`crate::EXIT_MUX_OWNER_LOST`] if the owner was lost mid-session).
+    /// The remote shell exited (cleanly relayed `Exit` frame); this is its
+    /// real exit code.
     ExitCode(u8),
+    /// The owner connection dropped without a clean `Exit` — the owner
+    /// process died mid-session. Kept as its own variant rather than
+    /// collapsed into `ExitCode(crate::EXIT_MUX_OWNER_LOST)` (as this used
+    /// to be): a caller auto-reconnecting on owner loss needs to tell that
+    /// apart from a remote command that happens to itself `exit` with
+    /// `EXIT_MUX_OWNER_LOST`'s numeric value, which a bare `u8` cannot
+    /// distinguish. Callers that don't retry can still map this to
+    /// `crate::EXIT_MUX_OWNER_LOST` at their own boundary.
+    OwnerLost,
     /// The owner rejected the connection before any shell session started
     /// (see [`ClientOutcome::Rejected`]) — the caller should fall back to an
     /// unmultiplexed direct connect rather than treat this as fatal.
@@ -80,12 +88,28 @@ pub(crate) enum ClientRunResult {
 }
 
 /// Drives a client session against `conn` (an established owner connection),
-/// wiring the real local terminal (raw mode + current size) as the I/O. On a
-/// lost owner (after a shell session was already established) it prints the
-/// reconnect guidance and returns [`crate::EXIT_MUX_OWNER_LOST`] as an exit
-/// code — there is nothing left to fall back to at that point. On a rejection
-/// during the handshake (before any shell existed), it instead returns
-/// [`ClientRunResult::Rejected`] so the caller can retry unmultiplexed.
+/// wiring the real local terminal (current size) as the I/O. Returns
+/// [`ClientRunResult::OwnerLost`] if the owner connection drops after a shell
+/// session was already established — see that variant's docs for why the
+/// caller, not this function, now decides what to do about it (this used to
+/// print reconnect guidance and give up here; the mux client's `OwnerLost`
+/// auto-reconnect loop, `super::run_with_reconnect`, is the caller that
+/// decides that today). On a rejection during the handshake (before any
+/// shell existed), it instead returns [`ClientRunResult::Rejected`] so the
+/// caller can retry unmultiplexed.
+///
+/// Manages its own raw terminal mode, scoped to this one attempt only (a
+/// prior version of this function's caller, `super::run_with_reconnect`,
+/// briefly held a single [`super::super::console::RawModeGuard`] across its
+/// *entire* retry loop instead — including every `connect::prepare`/auth
+/// call in between attempts, which broke a brand-new destination's TOFU
+/// confirmation prompt: raw mode suppresses the line editing/echo those
+/// prompts need, so `Enter` arrives as a bare `\r` and the prompt never
+/// resolves. The caller's own backoff wait between `OwnerLost` attempts
+/// enables its own separate, equally narrowly-scoped guard instead — see
+/// `super::wait_or_abort`'s docs). `super::super::console_stdin::ConsoleStdin::open`
+/// is still safe to call once per attempt regardless (see its own docs on
+/// why it's a process-wide singleton under the hood).
 ///
 /// `remote_command`/`want_pty` are sent to the owner in [`Frame::Hello`] and
 /// decide the same `-t`/`-T` `SessionKind` as the non-mux path's
@@ -113,9 +137,17 @@ where
     let (cols, rows) = super::super::console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
+    // By the time this function is reached (the handshake below is next),
+    // the owner is already an established connection — any TOFU/auth prompts
+    // for this destination already happened earlier in the caller's own
+    // `connect::prepare`/`dispatch`, in normal (non-raw) mode. Safe to enable
+    // for the rest of this attempt's lifetime. Best-effort: a terminal that
+    // can't be put in raw mode (piped/non-interactive stdio) shouldn't block
+    // the mux relay itself, only degrade its local key handling.
+    let _raw_mode = super::super::console::RawModeGuard::enable().ok();
+
     let resize_rx = if want_pty { super::super::console::spawn_resize_watcher() } else { None };
 
-    let _raw_mode = super::super::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
     let outcome = run_inner(
         reader,
         &mut writer,
@@ -136,13 +168,7 @@ where
 
     match outcome {
         ClientOutcome::Exited(code) => Ok(ClientRunResult::ExitCode(code)),
-        ClientOutcome::OwnerLost => {
-            log_line!(
-                "isekai-ssh: connection to the isekai-ssh owner process was lost — \
-                 reconnect with `isekai-ssh <host>`."
-            );
-            Ok(ClientRunResult::ExitCode(crate::EXIT_MUX_OWNER_LOST))
-        }
+        ClientOutcome::OwnerLost => Ok(ClientRunResult::OwnerLost),
         ClientOutcome::Rejected { reason } => Ok(ClientRunResult::Rejected { reason }),
     }
 }
