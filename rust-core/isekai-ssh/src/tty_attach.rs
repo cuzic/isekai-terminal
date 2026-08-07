@@ -56,10 +56,29 @@ const TAB_SESSION_ENV_CANDIDATES: &[(&str, &str)] = &[
 /// Resolves a `TtySelection` to the actual `<name>` to hand to
 /// `isekai-pipe tty attach`. See [`resolve_name_from`] for `Auto`'s actual
 /// derivation — this thin wrapper only supplies the real environment.
+///
+/// `Named` never touches the environment at all (matches
+/// `resolve_name_from`'s own `TtySelection::Named` branch, which ignores
+/// `candidates` entirely) — building the candidate list eagerly regardless
+/// of `selection` used to mean every `Named` call also did 8 real
+/// `std::env::var` reads for nothing, and did them *without*
+/// `HOME_ENV_LOCK` even though `Auto`'s own real-environment tests mutate
+/// that same process-global env state under `cargo test`'s parallel runner
+/// (adversarial review, 2026-08: concurrent `getenv`/`setenv` is UB in
+/// glibc, the exact hazard `HOME_ENV_LOCK` exists to serialize against —
+/// see its own doc comment in `main.rs`). Matching on `selection` first
+/// fixes both: `Named` does zero env reads, and only the `Auto` branch
+/// (which is what actually needs the lock) takes it.
 fn resolve_name(selection: &TtySelection, profile: &str) -> String {
-    let candidates: Vec<(&str, Option<String>)> =
-        TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, candidate_env_value(var, prefix))).collect();
-    resolve_name_from(selection, profile, &candidates)
+    match selection {
+        TtySelection::Named(_) => resolve_name_from(selection, profile, &[]),
+        TtySelection::Auto => {
+            let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let candidates: Vec<(&str, Option<String>)> =
+                TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, candidate_env_value(var, prefix))).collect();
+            resolve_name_from(selection, profile, &candidates)
+        }
+    }
 }
 
 /// Reads one [`TAB_SESSION_ENV_CANDIDATES`] entry's real environment value —
