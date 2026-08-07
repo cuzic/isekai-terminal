@@ -399,6 +399,60 @@ fn sweep_stale_daemon_sockets() {
     let _ = ctl_gc::sweep_stale_sockets(&daemon_sock_dir(), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }
 
+/// Checks a connected `UnixStream`'s peer effective uid against this
+/// process's own, used identically by both `send_event` (client side) and
+/// `daemon::read_one_event_line` (server side) — see either call site for
+/// why this check exists at all.
+///
+/// Two increasingly targeted fixes were tried here before this one and
+/// both failed to move CI at all (kept as history in case this needs
+/// revisiting): a bare `stream.peer_cred()` call (macOS `test-macos`,
+/// 2026-08: every `daemon::tests` test that goes through a real
+/// `UnixListener::accept()` failed with the event silently dropped, while
+/// tests that skip straight to `read_one_event`/`read_one_event_line` via
+/// `UnixStream::pair()` did not — `peer_cred()` was the one thing
+/// differing); then retrying that same `stream.peer_cred()` call on `Err`
+/// with increasing budgets (5 * 5ms, then exponential backoff up to
+/// 800ms) — *neither* changed the failing tests' output by even one byte
+/// across CI reruns, which rules out a transient/timing race entirely:
+/// `stream.peer_cred()` is failing *deterministically* for an
+/// accept()ed macOS socket, not intermittently.
+///
+/// Root cause (from reading tokio's own macOS `get_peer_cred`, `tokio-
+/// 1.52.3/src/net/unix/ucred.rs`): it first does a `LOCAL_PEEREPID`
+/// `getsockopt` to fill in a `pid` field this check never reads, and
+/// returns `Err` for the *whole call* if just that part fails — even
+/// though the uid/gid actually needed here come from a separate,
+/// unconditional `getpeereid()` call right after. So on the BSD-family
+/// platforms tokio itself special-cases this way (macOS, plus its
+/// siblings — same `#[cfg(...)]` list tokio's own `impl_macos` module
+/// uses), this calls `getpeereid()` directly instead — the very same libc
+/// function tokio's *own* FreeBSD/DragonFly implementation already uses
+/// uid/gid-only — bypassing the `LOCAL_PEEREPID` lookup entirely. `libc`
+/// only declares `getpeereid` for this BSD family, not Linux (Linux has no
+/// such libc function at all — `SO_PEERCRED` is the only mechanism there,
+/// and tokio's own Linux implementation of it has never been observed to
+/// fail in this crate's CI), so Linux/other Unix keeps using
+/// `stream.peer_cred()` unmodified.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
+async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+
+    let self_uid = unsafe { libc::geteuid() };
+    let mut uid = std::mem::MaybeUninit::uninit();
+    let mut gid = std::mem::MaybeUninit::uninit();
+    let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), uid.as_mut_ptr(), gid.as_mut_ptr()) };
+    ret == 0 && unsafe { uid.assume_init() } == self_uid
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
+async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == unsafe { libc::geteuid() },
+        Err(_) => false,
+    }
+}
+
 /// Connects to the daemon socket and sends one line, this module's own
 /// minimal wire format (see `daemon::read_one_event`). Returns whether the
 /// connect+write succeeded — a proxy for "a daemon is reachable and got
@@ -421,10 +475,8 @@ async fn send_event(sock_path: &Path, session_id: &str, event: ClientEvent) -> b
     let Ok(mut stream) = UnixStream::connect(sock_path).await else {
         return false;
     };
-    let self_uid = unsafe { libc::geteuid() };
-    match stream.peer_cred() {
-        Ok(cred) if cred.uid() == self_uid => {}
-        _ => return false,
+    if !peer_is_same_uid(&stream).await {
+        return false;
     }
     let event_name = match event {
         ClientEvent::Notify => "notify",
