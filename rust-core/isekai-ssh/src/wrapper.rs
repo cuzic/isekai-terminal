@@ -181,10 +181,12 @@ impl WrapperPlan {
 /// `isekai-pipe tty attach <name>` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TtySelection {
-    /// Derives `<name>` — see `tty_attach.rs::resolve_name_from`'s doc
-    /// comment for the actual rule (prefers Windows Terminal's
-    /// `$WT_SESSION`, one daemon per *tab*, falling back to `isekai-<profile>`,
-    /// one daemon per *host*, everywhere else).
+    /// Derives `<name>` — see `tty_attach.rs::TAB_SESSION_ENV_CANDIDATES`'s
+    /// doc comment for the actual priority-ordered rule (an explicit
+    /// `$ISEKAI_TTY_SESSION` opt-in, then whichever supported
+    /// terminal/multiplexer env var is set, one daemon per *tab/pane*,
+    /// falling back to `isekai-<profile>`, one daemon per *host*, when none
+    /// of them are).
     Auto,
     Named(String),
 }

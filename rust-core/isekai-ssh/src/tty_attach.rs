@@ -13,49 +13,84 @@
 
 use crate::wrapper::TtySelection;
 
+/// Priority-ordered `(env var, name prefix)` pairs `Auto` scans to derive a
+/// per-"tab" session key — the first one set (and non-empty) in the
+/// environment wins. Every entry here shares the one property that matters:
+/// its value is stable for as long as the shell/pane that set it stays
+/// alive, *independent* of `isekai-ssh` itself being killed and re-run —
+/// exactly the event `--isekai-tty` exists to survive. Deliberately does
+/// **not** include a raw pty device path (`tty(1)`/`$SSH_TTY`): pty device
+/// numbers are recycled by the kernel once a pane closes, so an unrelated
+/// *new* tab can end up allocated the very same number and silently attach
+/// to a *different*, still-alive-but-abandoned tab's old daemon — every
+/// candidate below is instead an app-owned counter or UUID its owner never
+/// reuses within one run.
+///
+/// - `ISEKAI_TTY_SESSION`: not provided by any terminal — a user opts a
+///   plain, unmultiplexed terminal (or any terminal not in this list) into
+///   the same behavior by exporting this from `.bashrc`/`.zshrc` (see
+///   `README.md`'s `--isekai-tty` section for the exact snippet). Checked
+///   first: an explicit opt-in should win over an app-provided heuristic.
+/// - `WT_SESSION`: Windows Terminal (a GUID).
+/// - `TMUX_PANE`: tmux (`%N`, a permanent id from an ever-incrementing
+///   counter — distinct from tmux's *positional* pane index, which is
+///   reused when panes are closed and renumbered).
+/// - `WEZTERM_PANE`: WezTerm (numeric, also an increasing counter).
+/// - `KITTY_WINDOW_ID`: kitty (numeric, assigned by kitty itself, not
+///   reused within one kitty instance).
+/// - `ITERM_SESSION_ID`: iTerm2 on macOS (UUID-based).
+/// - `STY`: GNU Screen — coarser than the others (a *session*-level name,
+///   not per-window; multiple windows in one `screen` session collide onto
+///   the same key), included anyway as a better-than-nothing fallback ahead
+///   of the profile-only default.
+const TAB_SESSION_ENV_CANDIDATES: &[(&str, &str)] = &[
+    ("ISEKAI_TTY_SESSION", "env"),
+    ("WT_SESSION", "wt"),
+    ("TMUX_PANE", "tmux"),
+    ("WEZTERM_PANE", "wezterm"),
+    ("KITTY_WINDOW_ID", "kitty"),
+    ("ITERM_SESSION_ID", "iterm"),
+    ("STY", "screen"),
+];
+
 /// Resolves a `TtySelection` to the actual `<name>` to hand to
 /// `isekai-pipe tty attach`. See [`resolve_name_from`] for `Auto`'s actual
-/// derivation — this thin wrapper only supplies the real `$WT_SESSION`.
+/// derivation — this thin wrapper only supplies the real environment.
 fn resolve_name(selection: &TtySelection, profile: &str) -> String {
-    resolve_name_from(selection, profile, std::env::var("WT_SESSION").ok().as_deref())
+    let candidates: Vec<(&str, Option<String>)> =
+        TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, std::env::var(var).ok())).collect();
+    resolve_name_from(selection, profile, &candidates)
 }
 
-/// `Auto`'s derivation, with `$WT_SESSION` injected rather than read
-/// directly — lets tests exercise both branches deterministically instead of
-/// depending on whether the test process happens to have it set (this
-/// crate's `HOME_ENV_LOCK` in `main.rs` exists precisely because mutating
-/// real process-global env state under `cargo test`'s default multi-threaded
-/// runner is a real flakiness hazard; reading a var directly in a function
-/// under test has the same problem in miniature, so this sidesteps it by
-/// injection instead).
+/// `Auto`'s derivation, with the candidate env values injected rather than
+/// read directly — lets tests exercise the priority order deterministically
+/// instead of depending on which of these vars the test process happens to
+/// have set (this crate's `HOME_ENV_LOCK` in `main.rs` exists precisely
+/// because mutating real process-global env state under `cargo test`'s
+/// default multi-threaded runner is a real flakiness hazard; reading a var
+/// directly in a function under test has the same problem in miniature, so
+/// this sidesteps it by injection instead).
 ///
-/// `Windows Terminal` sets `$WT_SESSION` to a GUID that stays the same for
-/// the lifetime of one pane/tab, independent of whatever child process is
-/// currently running in it — unlike anything `isekai-ssh` itself controls,
-/// this survives the exact "local process gets killed and re-run" event
-/// `--isekai-tty` exists to survive, which is what makes it a good default
-/// session key: re-running `isekai-ssh --isekai-tty host` from the *same*
-/// Windows Terminal tab reliably lands back on the *same* remote daemon, and
-/// a *different* tab connected to the *same* host gets a distinct one
-/// (`wt-<session>`) — no user-chosen name, and no ambiguity between tabs to
-/// resolve with a picker (considered and set aside: WT_SESSION already
-/// disambiguates this deterministically when it's available).
-///
-/// Falls back to `isekai-<profile>` (one daemon per host, no tab
-/// distinction — the pre-WT_SESSION behavior, and what every non-Windows-Terminal
-/// environment still gets, e.g. tmux, a plain Linux/macOS terminal, or an
-/// older Windows Terminal release without the variable) when `$WT_SESSION`
-/// isn't set. Scoped to Windows Terminal only, deliberately: no other
-/// terminal this project has looked at exposes an equivalently stable
-/// per-pane identity a *child* process can read after being killed and
-/// restarted, and building a cross-terminal picker for the ambiguous case
-/// was explicitly set aside as unnecessary scope for now.
-fn resolve_name_from(selection: &TtySelection, profile: &str, wt_session: Option<&str>) -> String {
+/// `candidates` must be in the same priority order as
+/// [`TAB_SESSION_ENV_CANDIDATES`] (the real caller, [`resolve_name`],
+/// builds it from exactly that list) — the first entry with a non-empty
+/// value wins, becoming `<prefix>-<value>`. Falls back to `isekai-<profile>`
+/// (one daemon per host, no tab distinction — the original, pre-tab-aware
+/// behavior) when none of them are set, which is what a plain terminal with
+/// no multiplexer and no `ISEKAI_TTY_SESSION` opt-in still gets.
+fn resolve_name_from(selection: &TtySelection, profile: &str, candidates: &[(&str, Option<String>)]) -> String {
     match selection {
-        TtySelection::Auto => match wt_session {
-            Some(session) if !session.is_empty() => format!("wt-{session}"),
-            _ => format!("isekai-{profile}"),
-        },
+        TtySelection::Auto => {
+            let tab_session = candidates.iter().find_map(|(prefix, value)| {
+                let value = value.as_deref()?;
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(format!("{prefix}-{value}"))
+                }
+            });
+            tab_session.unwrap_or_else(|| format!("isekai-{profile}"))
+        }
         TtySelection::Named(name) => name.clone(),
     }
 }
@@ -88,27 +123,77 @@ pub(crate) fn resolve_exec_command(selection: Option<&TtySelection>, profile: &s
 mod tests {
     use super::*;
 
-    #[test]
-    fn auto_derives_a_name_from_the_profile_without_wt_session() {
-        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", None), "isekai-prod");
+    /// Builds a `candidates` slice shaped like [`TAB_SESSION_ENV_CANDIDATES`]
+    /// but with only the named prefixes set, for tests that only care about
+    /// a couple of entries — every other slot is `None`, exactly as an
+    /// unset env var would resolve to.
+    fn candidates_with(set: &[(&str, &str)]) -> Vec<(&'static str, Option<String>)> {
+        TAB_SESSION_ENV_CANDIDATES
+            .iter()
+            .map(|(_var, prefix)| (*prefix, set.iter().find(|(p, _)| p == prefix).map(|(_, v)| v.to_string())))
+            .collect()
     }
 
     #[test]
-    fn auto_prefers_wt_session_over_the_profile_when_present() {
-        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", Some("50295e02-2ea3-4f92")), "wt-50295e02-2ea3-4f92");
+    fn auto_derives_a_name_from_the_profile_when_nothing_is_set() {
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[])), "isekai-prod");
     }
 
     #[test]
-    fn auto_falls_back_to_the_profile_for_an_empty_wt_session() {
+    fn auto_uses_wt_session_when_present() {
+        assert_eq!(
+            resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("wt", "50295e02-2ea3-4f92")])),
+            "wt-50295e02-2ea3-4f92"
+        );
+    }
+
+    #[test]
+    fn auto_uses_tmux_pane_when_present() {
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("tmux", "%37")])), "tmux-%37");
+    }
+
+    #[test]
+    fn auto_falls_back_to_screen_sty_as_a_last_resort() {
+        assert_eq!(
+            resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("screen", "1234.pts-2.host")])),
+            "screen-1234.pts-2.host"
+        );
+    }
+
+    #[test]
+    fn auto_prefers_the_explicit_opt_in_over_an_app_provided_signal() {
+        // ISEKAI_TTY_SESSION is checked first in TAB_SESSION_ENV_CANDIDATES
+        // — an explicit .bashrc/.zshrc opt-in should win over whatever
+        // terminal-provided heuristic also happens to be set.
+        assert_eq!(
+            resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("env", "user-chosen-uuid"), ("wt", "some-guid")])),
+            "env-user-chosen-uuid"
+        );
+    }
+
+    #[test]
+    fn auto_prefers_an_earlier_candidate_over_a_later_one_when_both_are_set() {
+        // WT_SESSION precedes TMUX_PANE in the priority list.
+        assert_eq!(
+            resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("tmux", "%37"), ("wt", "some-guid")])),
+            "wt-some-guid"
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_profile_for_an_empty_value() {
         // Defensive: an env var can technically be set-but-empty (distinct
-        // from unset). Treat that the same as unset rather than emitting the
-        // degenerate name "wt-".
-        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", Some("")), "isekai-prod");
+        // from unset). Treat that the same as unset rather than emitting
+        // the degenerate name "wt-".
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("wt", "")])), "isekai-prod");
     }
 
     #[test]
-    fn named_uses_the_explicit_name_verbatim_regardless_of_wt_session() {
-        assert_eq!(resolve_name_from(&TtySelection::Named("work".to_string()), "prod", Some("some-guid")), "work");
+    fn named_uses_the_explicit_name_verbatim_regardless_of_env_candidates() {
+        assert_eq!(
+            resolve_name_from(&TtySelection::Named("work".to_string()), "prod", &candidates_with(&[("wt", "some-guid")])),
+            "work"
+        );
     }
 
     #[test]
