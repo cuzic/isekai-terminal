@@ -643,6 +643,7 @@ name = "claude-hookd"
 version = "0.1.0"
 dependencies = [
  "isekai-protocol",
+ "libc",
  "osc-color",
  "serde_json",
  "tempfile",
