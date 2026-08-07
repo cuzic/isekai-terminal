@@ -399,59 +399,57 @@ fn sweep_stale_daemon_sockets() {
     let _ = ctl_gc::sweep_stale_sockets(&daemon_sock_dir(), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }
 
-/// Total time [`peer_is_same_uid`] is willing to keep retrying a failing
-/// `peer_cred()` call before giving up and treating it as a real
-/// mismatch/absence.
-#[cfg(unix)]
-const PEER_CRED_RETRY_BUDGET: Duration = Duration::from_millis(800);
-/// Delay before the first retry; doubles after each subsequent attempt
-/// (capped — see [`peer_is_same_uid`]) so a fast-resolving CI hiccup pays
-/// almost nothing while a slow one still gets covered within the budget
-/// above.
-#[cfg(unix)]
-const PEER_CRED_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(2);
-#[cfg(unix)]
-const PEER_CRED_RETRY_MAX_DELAY: Duration = Duration::from_millis(50);
-
 /// Checks a connected `UnixStream`'s peer effective uid against this
 /// process's own, used identically by both `send_event` (client side) and
 /// `daemon::read_one_event_line` (server side) — see either call site for
 /// why this check exists at all.
 ///
-/// Retries with exponential backoff on `Err`, up to
-/// [`PEER_CRED_RETRY_BUDGET`] (never on a real `Ok` mismatch, which fails
-/// closed immediately): tokio's macOS `peer_cred()` additionally requires a
-/// `LOCAL_PEEREPID` `getsockopt` to succeed to fill in the (here, unused)
-/// pid field, even though only the uid is read here — and that lookup has
-/// been observed to fail on a freshly-accepted/connected socket under
-/// GitHub Actions' macOS runner (`test-macos` job, 2026-08: every daemon
-/// test that exercises a real `UnixListener::accept()` failed, while tests
-/// that skip straight to `read_one_event`/`read_one_event_line` via
-/// `UnixStream::pair()` — no `accept()` involved — did not), even though
-/// `getpeereid()` alone (the uid/gid this check actually needs) would very
-/// likely have succeeded. A first attempt at this fix used a fixed 5
-/// retries * 5ms — too short a budget: it upgraded the failure from "every
-/// event on macOS CI silently dropped" to "some events on macOS CI
-/// silently dropped" (`teammate_dispatch_then_ambiguous_stop_defers_within_ttl`'s
-/// second CI run showed one of its two events applied, the other still
-/// lost), rather than eliminating it. `PEER_CRED_RETRY_BUDGET` is generous
-/// (800ms) because this check runs at most once per hook event, not on any
-/// hot path, and it still fails closed for a genuine mismatch/permanent
-/// absence well within `EVENT_READ_TIMEOUT`/any caller's own timeout.
-#[cfg(unix)]
+/// Two increasingly targeted fixes were tried here before this one and
+/// both failed to move CI at all (kept as history in case this needs
+/// revisiting): a bare `stream.peer_cred()` call (macOS `test-macos`,
+/// 2026-08: every `daemon::tests` test that goes through a real
+/// `UnixListener::accept()` failed with the event silently dropped, while
+/// tests that skip straight to `read_one_event`/`read_one_event_line` via
+/// `UnixStream::pair()` did not — `peer_cred()` was the one thing
+/// differing); then retrying that same `stream.peer_cred()` call on `Err`
+/// with increasing budgets (5 * 5ms, then exponential backoff up to
+/// 800ms) — *neither* changed the failing tests' output by even one byte
+/// across CI reruns, which rules out a transient/timing race entirely:
+/// `stream.peer_cred()` is failing *deterministically* for an
+/// accept()ed macOS socket, not intermittently.
+///
+/// Root cause (from reading tokio's own macOS `get_peer_cred`, `tokio-
+/// 1.52.3/src/net/unix/ucred.rs`): it first does a `LOCAL_PEEREPID`
+/// `getsockopt` to fill in a `pid` field this check never reads, and
+/// returns `Err` for the *whole call* if just that part fails — even
+/// though the uid/gid actually needed here come from a separate,
+/// unconditional `getpeereid()` call right after. So on the BSD-family
+/// platforms tokio itself special-cases this way (macOS, plus its
+/// siblings — same `#[cfg(...)]` list tokio's own `impl_macos` module
+/// uses), this calls `getpeereid()` directly instead — the very same libc
+/// function tokio's *own* FreeBSD/DragonFly implementation already uses
+/// uid/gid-only — bypassing the `LOCAL_PEEREPID` lookup entirely. `libc`
+/// only declares `getpeereid` for this BSD family, not Linux (Linux has no
+/// such libc function at all — `SO_PEERCRED` is the only mechanism there,
+/// and tokio's own Linux implementation of it has never been observed to
+/// fail in this crate's CI), so Linux/other Unix keeps using
+/// `stream.peer_cred()` unmodified.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
 async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+
     let self_uid = unsafe { libc::geteuid() };
-    let deadline = tokio::time::Instant::now() + PEER_CRED_RETRY_BUDGET;
-    let mut delay = PEER_CRED_RETRY_INITIAL_DELAY;
-    loop {
-        match stream.peer_cred() {
-            Ok(cred) => return cred.uid() == self_uid,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(PEER_CRED_RETRY_MAX_DELAY);
-            }
-            Err(_) => return false,
-        }
+    let mut uid = std::mem::MaybeUninit::uninit();
+    let mut gid = std::mem::MaybeUninit::uninit();
+    let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), uid.as_mut_ptr(), gid.as_mut_ptr()) };
+    ret == 0 && unsafe { uid.assume_init() } == self_uid
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))))]
+async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == unsafe { libc::geteuid() },
+        Err(_) => false,
     }
 }
 
