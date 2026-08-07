@@ -1970,6 +1970,7 @@ dependencies = [
  "ssh-encoding",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
  "ureq",
  "windows-sys 0.59.0",
