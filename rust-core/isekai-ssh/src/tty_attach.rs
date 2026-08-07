@@ -58,8 +58,46 @@ const TAB_SESSION_ENV_CANDIDATES: &[(&str, &str)] = &[
 /// derivation — this thin wrapper only supplies the real environment.
 fn resolve_name(selection: &TtySelection, profile: &str) -> String {
     let candidates: Vec<(&str, Option<String>)> =
-        TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, std::env::var(var).ok())).collect();
+        TAB_SESSION_ENV_CANDIDATES.iter().map(|(var, prefix)| (*prefix, candidate_env_value(var, prefix))).collect();
     resolve_name_from(selection, profile, &candidates)
+}
+
+/// Reads one [`TAB_SESSION_ENV_CANDIDATES`] entry's real environment value —
+/// verbatim for every prefix except `"tmux"` (see below).
+///
+/// `TMUX_PANE` (`%N`) is a per-*server*-instance counter, not a globally
+/// unique id (unlike `WT_SESSION`'s GUID or `KITTY_WINDOW_ID`'s
+/// never-reused-within-one-instance counter, both called out in
+/// [`TAB_SESSION_ENV_CANDIDATES`]'s own docs): it resets to `%0` every time
+/// the tmux *server* process itself restarts, not merely on detach/reattach.
+/// Killing tmux and starting a fresh server, then opening a pane, can
+/// therefore reuse the exact same `%N` a previous, unrelated tmux server's
+/// pane once had — two different machines each landing in pane `%0` of
+/// their own tmux server against the same remote host would silently attach
+/// to (and, dtach-style, preempt/kill) each other's session (adversarial
+/// review finding). Folding in the tmux *server's* own pid — parsed from
+/// `$TMUX`, format `<socket-path>,<pid>,<session-id>` — scopes the derived
+/// name to this exact server instance: stable for as long as this server
+/// lives, different for the next one. Degrades to the bare pane value (the
+/// old behavior, not a new gap) if `$TMUX` is unset/malformed, e.g. someone
+/// sets `TMUX_PANE` by hand outside a real tmux session.
+///
+/// **Known residual gap**, not fixed here: `KITTY_WINDOW_ID`/`WEZTERM_PANE`
+/// are also application-instance counters by this same module's own docs,
+/// and could in principle have an analogous per-instance-restart collision
+/// — left alone because, unlike tmux's well-documented `$TMUX` format, this
+/// crate has no verified-safe field to fold in for either without real
+/// testing against those terminals.
+fn candidate_env_value(var: &str, prefix: &str) -> Option<String> {
+    let value = std::env::var(var).ok()?;
+    if prefix != "tmux" {
+        return Some(value);
+    }
+    let server_pid = std::env::var("TMUX").ok().and_then(|v| v.split(',').nth(1).map(str::to_string));
+    Some(match server_pid {
+        Some(pid) => format!("{value}-{pid}"),
+        None => value,
+    })
 }
 
 /// `Auto`'s derivation, with the candidate env values injected rather than
@@ -84,15 +122,44 @@ fn resolve_name_from(selection: &TtySelection, profile: &str, candidates: &[(&st
             let tab_session = candidates.iter().find_map(|(prefix, value)| {
                 let value = value.as_deref()?;
                 if value.is_empty() {
-                    None
-                } else {
-                    Some(format!("{prefix}-{value}"))
+                    return None;
                 }
+                let name = format!("{prefix}-{value}");
+                // Skip (not error out on) a candidate whose *value* would
+                // derive a name `isekai-pipe`'s own `tty::validate_name`
+                // rejects (path separator, embedded NUL, `.`/`..`, over its
+                // length cap) — a real-world way this happens: a user
+                // exports `ISEKAI_TTY_SESSION` from something that isn't a
+                // plain opaque token (e.g. reusing `$SSH_TTY`, which
+                // contains `/`). Auto-derivation must never be the reason
+                // `--isekai-tty` (which replaces the login shell entirely —
+                // see `attach_command`'s caller) turns an otherwise-working
+                // connection into a hard remote `EX_USAGE` exit with no
+                // fallback; falling through to the next candidate (or
+                // ultimately `isekai-{profile}`, always valid) keeps this
+                // opportunistic like every other candidate here.
+                is_valid_tty_name(&name).then_some(name)
             });
             tab_session.unwrap_or_else(|| format!("isekai-{profile}"))
         }
+        // Explicit `--isekai-tty=<name>` is a deliberate user choice, not an
+        // auto-derived heuristic — an invalid name here is a real user
+        // error worth surfacing (via the remote `validate_name` rejection),
+        // not something to silently paper over.
         TtySelection::Named(name) => name.clone(),
     }
+}
+
+/// Mirrors `isekai-pipe`'s own `tty::validate_name` (private to that crate,
+/// and not something this crate can link against — `isekai-ssh` talks to
+/// `isekai-pipe` only over the wire, per this crate's own independence from
+/// `isekai-pipe`/`isekai-terminal-core`, the same reason this crate's e2e
+/// tests deliberately duplicate mock setup per file rather than sharing it).
+/// Kept minimal and duplicated on purpose rather than factored into a new
+/// shared crate for four rules this simple. If `isekai-pipe`'s rules ever
+/// change, this must be updated to match.
+fn is_valid_tty_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0']) && name.len() <= 200
 }
 
 /// The `isekai-pipe tty attach <name>` command string, safely quoted —
@@ -188,6 +255,28 @@ mod tests {
         assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("wt", "")])), "isekai-prod");
     }
 
+    /// Regression guard (adversarial review finding): a candidate whose
+    /// derived name `isekai-pipe`'s `validate_name` would reject (here, a
+    /// `/` — e.g. from a `.bashrc` that mistakenly exported `$SSH_TTY`
+    /// instead of an opaque token into `ISEKAI_TTY_SESSION`) must be skipped
+    /// in favor of the next candidate, not used verbatim and shipped off to
+    /// fail remotely with no fallback.
+    #[test]
+    fn auto_skips_a_candidate_whose_derived_name_would_be_rejected_remotely() {
+        assert_eq!(
+            resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("env", "/dev/pts/3"), ("wt", "some-guid")])),
+            "wt-some-guid"
+        );
+    }
+
+    /// Same as above, but every candidate is invalid — falls all the way
+    /// through to the always-valid profile-only default rather than
+    /// producing an invalid name.
+    #[test]
+    fn auto_falls_back_to_the_profile_when_every_candidate_is_invalid() {
+        assert_eq!(resolve_name_from(&TtySelection::Auto, "prod", &candidates_with(&[("env", "/dev/pts/3")])), "isekai-prod");
+    }
+
     #[test]
     fn named_uses_the_explicit_name_verbatim_regardless_of_env_candidates() {
         assert_eq!(
@@ -214,11 +303,57 @@ mod tests {
         assert_eq!(resolve_exec_command(None, "prod"), None);
     }
 
+    /// Regression guard for the tmux server-restart collision fix
+    /// (adversarial review finding): `candidate_env_value("TMUX_PANE",
+    /// "tmux")` must fold the server pid parsed from `$TMUX` into the
+    /// derived value, and degrade to the bare pane value when `$TMUX` is
+    /// absent/malformed rather than erroring or dropping the candidate.
+    /// Mutates process-global env vars, so it takes `crate::HOME_ENV_LOCK`
+    /// like every other env-mutating test in this crate (see its own doc
+    /// comment) and restores the originals afterward.
     #[test]
-    fn resolve_exec_command_composes_auto_and_the_profile() {
+    fn tmux_pane_candidate_folds_in_the_tmux_server_pid_from_tmux_env() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_tmux_pane = std::env::var_os("TMUX_PANE");
+        let old_tmux = std::env::var_os("TMUX");
+
+        std::env::set_var("TMUX_PANE", "%0");
+        std::env::set_var("TMUX", "/tmp/tmux-1000/default,54321,0");
+        assert_eq!(candidate_env_value("TMUX_PANE", "tmux"), Some("%0-54321".to_string()));
+
+        std::env::remove_var("TMUX");
         assert_eq!(
-            resolve_exec_command(Some(&TtySelection::Auto), "prod"),
-            Some("isekai-pipe tty attach 'isekai-prod'".to_string())
+            candidate_env_value("TMUX_PANE", "tmux"),
+            Some("%0".to_string()),
+            "a missing/malformed $TMUX must degrade to the bare pane value, not drop the candidate"
+        );
+
+        match old_tmux_pane {
+            Some(v) => std::env::set_var("TMUX_PANE", v),
+            None => std::env::remove_var("TMUX_PANE"),
+        }
+        match old_tmux {
+            Some(v) => std::env::set_var("TMUX", v),
+            None => std::env::remove_var("TMUX"),
+        }
+    }
+
+    #[test]
+    fn resolve_exec_command_composes_named_selection_and_quotes_it() {
+        // Deliberately `Named`, not `Auto`: `resolve_exec_command` calls
+        // `resolve_name`, which reads the *real* process environment (see
+        // its own doc comment on why — this thin wrapper exists precisely
+        // so `resolve_name_from` can be tested via injection instead).
+        // `TtySelection::Auto` here would make this test's outcome depend on
+        // whichever of `TAB_SESSION_ENV_CANDIDATES` happens to be set in
+        // whatever environment runs it — real flakiness, not hypothetical:
+        // `TMUX_PANE` is set in this very sandbox's own dev shell. `Named`
+        // never consults the environment at all (see `resolve_name_from`),
+        // so it exercises the same composition (`resolve_name` →
+        // `attach_command`) deterministically.
+        assert_eq!(
+            resolve_exec_command(Some(&TtySelection::Named("my session".to_string())), "prod"),
+            Some("isekai-pipe tty attach 'my session'".to_string())
         );
     }
 }

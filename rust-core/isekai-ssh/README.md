@@ -511,7 +511,7 @@ myhost` を打ち直すたびに常に**同じリモートシェル**に戻り�
 |---|---|---|
 | 1 | `ISEKAI_TTY_SESSION` | ユーザーによる明示的な opt-in(下記参照) |
 | 2 | `WT_SESSION` | Windows Terminal |
-| 3 | `TMUX_PANE` | tmux(`%37`形式、位置ではなく恒久的なpane ID) |
+| 3 | `TMUX_PANE` | tmux(`%37`形式、位置ではなく恒久的なpane ID。ただしこのカウンタはtmux *server*再起動で`%0`から巻き戻るため、`$TMUX`から読めるtmux server自身のpidも併せて畳み込んでいる — 別々のtmuxサーバー同士がたまたま同じpane番号になっても衝突しない) |
 | 4 | `WEZTERM_PANE` | WezTerm |
 | 5 | `KITTY_WINDOW_ID` | kitty |
 | 6 | `ITERM_SESSION_ID` | iTerm2(macOS) |
@@ -530,6 +530,19 @@ if [ -z "$ISEKAI_TTY_SESSION" ]; then
     export ISEKAI_TTY_SESSION="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$$-$(date +%s%N)")"
 fi
 ```
+
+**既知の制約**:
+
+- タブ単位の名前は自動導出であり、ユーザーが名前を憶えたり管理したりする手段が無い。
+  タブを(リモートシェルを`exit`させずに)閉じただけの場合、リモート側の
+  `isekai-pipe tty daemon`とその配下のシェルはデーモンの設計上(`rust-core/isekai-pipe/
+  src/tty/mod.rs`参照、シェルが`exit`するまで生き続ける)そのまま残り続け、二度と使われ
+  ない孤立プロセスになる。`isekai-pipe`側に一覧・強制終了コマンドは現状無いので、
+  回収するにはリモートに直接入って手動で該当プロセスを`kill`する必要がある。
+- 本機能を導入する前のバージョンで`--isekai-tty`(名前省略)を使っていた場合、導出される
+  名前がタブ単位(このバージョン)に変わるため、それまで`isekai-<profile>`という1個の
+  デーモンに繋がっていたセッションには自動では戻れなくなる。そのシェルへ戻りたい場合は
+  `--isekai-tty=isekai-<profile>`と明示すること。
 
 これは新しいシェル(=新しいタブ)が起動するたびに一度だけ発行され、その中で
 `isekai-ssh` を何度 `kill` して再実行しても同じ値が引き継がれる。
