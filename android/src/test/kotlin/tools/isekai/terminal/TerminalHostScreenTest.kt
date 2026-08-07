@@ -136,20 +136,25 @@ class TerminalHostScreenTest {
     @Test fun tabLabel_showsAccentDot_whenRemoteSetsTabColor() {
         vm.openTab(profile("alpha"))
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
 
         orchestrators[0].simulateConnected()
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        // waitForIdle()だけでは足りない: ScreenUpdateはTerminalSession内部の
-        // Channel(CONFLATED)経由で別コルーチンへ渡されてから状態へ反映されるため、
-        // Composeの側から見ると非同期に届く。実CIで実際にflaky failしていた
-        // (PR #59のadversarial review指摘、2026-08。このテストは共通の祖先コミット
-        // 47bc60e9からこのブランチへも継承されている)。
+        // Two things had to be fixed here, both found only by actually
+        // running this against real CI (PR #59のadversarial review指摘、
+        // 2026-08。このテストは共通の祖先コミット47bc60e9からこのブランチへも
+        // 継承されている): (1) waitForIdle()だけではScreenUpdateの非同期反映
+        // (TerminalSession内部のChannel経由)を待てずレースする — waitUntil
+        // ポーリングに変更。(2) tabColorDotのBoxはtestTag以外のsemanticsを
+        // 持たないため、デフォルトのmerged semantics treeでは囲むTabの
+        // マージ済みノードに吸収され、onNodeWithTag/onAllNodesWithTagが
+        // useUnmergedTree = true無しでは絶対に見つけられない(waitUntilへの
+        // 変更だけでは直っておらず、このテスト内の全ルックアップに必要)。
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertExists()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertExists()
     }
 
     @Test fun tabLabel_hasNoAccentDot_whenTabColorUnset() {
@@ -162,15 +167,15 @@ class TerminalHostScreenTest {
         // assertDoesNotExist()が同じ結果になり、テストとして何も検証できない。
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
 
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
     }
 
     @Test fun clickingInactiveTab_switchesActiveTab() {
