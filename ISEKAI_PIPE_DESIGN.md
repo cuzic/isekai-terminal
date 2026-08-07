@@ -1070,8 +1070,15 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   パターンで`CtlMessage::SetTabColor { r, g, b }`を追加し、Windows Terminal限定の
   OSC 4;264(タブ背景色パレットのプライベート拡張、`microsoft/terminal` PR #13058、
   元の機能要望は#6574)へマッピングする(`isekai-ssh::ctl_forward::osc_sequence_for`)。
-  Android/iOS本体アプリ側は対応するタブ色UIが無いため無視する(黙って無視、
-  `session.rs`)。設計判断の詳細は下記「tab-colorの設計判断」を参照。
+  ✅(2026-08)Android本体アプリ側にもタブ色UI(タブ行のアクセントドット)を
+  追加し、`CtlMessage::SetTabColor`をここでも反映するよう配線した(従来の
+  「黙って無視」から変更、`session.rs`の`set_tab_color_from_ctl`)。
+  PTYストリーム中のOSC 4;264自体も`terminal.rs`のVTEパーサーで直接認識する
+  (`isekai-ssh` CLIラッパー経由に限らない)。ただしタブ背景そのものは
+  染めず、既存の接続状態ドットの隣にアクセントドットとして表示する
+  設計とした——claude-hookdのidle色(`DEFAULT_IDLE_COLOR`)が常時暗色を
+  送り続けるため、背景着色だとタブが常時グレーがかって見えてしまう問題が
+  レビューで見つかったため。設計判断の詳細は下記「tab-colorの設計判断」を参照。
   **未着手のまま(スコープ外として明示)**: この呼び出し元となるClaude Code
   hook連携(`Notification`/`Stop`での色変更、タイムアウトでの自動リセット)。
   段階的実装として、まずこのプリミティブのみ追加した。
@@ -2099,18 +2106,23 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    stdout無出力なので、asyncにしても判定への影響は無い)。
 
 **明示的にスコープ外(v1)**:
-- **isekai-terminal本体アプリ(Android/iOS)には効果が無い**: `SetTabColor`は
-  Android/iOS側では防御的に無視される(`session.rs`)実装のままで、OSC 4;264も
-  Windows Terminal固有。本Epicは`isekai-ssh` + Windows Terminalの組み合わせのみを
-  対象とする(1回目のレビュー指摘: 「参照実装」だけを見ると本体アプリでも動くように
-  誤読されうるため明記する)。`ctl notify`自体はAndroid本体アプリでも受信できるが、
+- ~~isekai-terminal本体アプリ(Android/iOS)には効果が無い~~ →
+  ✅(2026-08)解消済み。Android本体アプリにもタブ色UI(タブ行のアクセント
+  ドット)を実装し、`SetTabColor`をここでも反映するよう配線した
+  (従来「防御的に無視される」としていた`session.rs`の挙動を変更、
+  `set_tab_color_from_ctl`参照)。PTYストリーム中のOSC 4;264自体も
+  `isekai-ssh`経由に限らず`terminal.rs`のVTEパーサーで直接認識する。
+  `ctl notify`自体はAndroid本体アプリでも受信できるが、
   当初「既存の通り本体アプリでも動く」としていたのは誤りだった(2026-07-25訂正):
   tmux hook系kindのバックグラウンドシステム通知は実装済みだったが、AI系kind
   (`Waiting`/`Done`/`Info`、本Epicが送出するもの)はAndroid側で未配線のまま
   ログ出力止まりだった。2026-07-25、`TerminalTabsViewModel.kt`の`onNotify`を
   `TabAlertNotifier`へ配線して解消した(`AI_INTEGRATION_DESIGN.md` §11.1.4参照)。
-  「状態ドット」(タブバーの永続的な視覚インジケータ)は元の設計文にあった記述だが、
-  tmux系・AI系いずれについても実装されていない(バックグラウンドシステム通知のみ)。
+  「状態ドット」(タブバーの永続的な視覚インジケータ)は元の設計文にあった記述で、
+  2026-08にタブ色アクセントドットとして実装された。ただし背景着色ではなく
+  小さなドット表示にとどめている点、tmux系・AI系の通知色を直接タブ色に
+  変換する連携(claude-hookd呼び出し元)自体は依然未実装である点に注意
+  (下記「未着手のまま」参照)。
 - 「元のターミナル既定色に戻す」という意味での真のreset(`SetTabColor`にreset
   プリミティブが無い前提のまま、idle色も明示的なRGB値として扱う——tab-color増分の
   Opusレビュー時の議論と同じ判断を踏襲)。

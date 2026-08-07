@@ -376,6 +376,13 @@ pub(crate) struct Terminal {
     scroll_top: usize,
     scroll_bottom: usize,
     title: Option<String>,
+    /// Windows Terminal 独自拡張 OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`、
+    /// `microsoft/terminal` PR #13058)、iTerm2独自拡張 OSC 6;1;bg;...
+    /// (`handle_osc6_iterm2_tab_color`)、または ctl-socket 経由の
+    /// `CtlMessage::SetTabColor`(`set_tab_color`)で設定されたタブ背景色。
+    /// タイトル(`title`)と同じくRIS(`reset_all`)でクリアされる、
+    /// セッション限りの状態(永続化しない)。
+    tab_color: Option<(u8, u8, u8)>,
     /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
     /// 場合、次に`take_pending_clipboard_write()`が呼ばれるまで保持する
     /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M: tmuxが`set-titles`/`allow-passthrough`を
@@ -841,6 +848,7 @@ impl Terminal {
             cur_attrs: TermAttrs::default_for(&theme),
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
+            tab_color: None,
             pending_clipboard_write: None,
             pending_clipboard_pull_request: false,
             pending_terminal_responses: Vec::new(),
@@ -943,6 +951,13 @@ impl Terminal {
     /// §8 Epic M)から直接タイトルを設定する。
     pub(crate) fn set_title(&mut self, title: String) {
         self.title = Some(title);
+    }
+    pub(crate) fn tab_color(&self) -> Option<(u8, u8, u8)> { self.tab_color }
+
+    /// OSC 4;264 のパース経由ではなく、外部(ctl-socket経由の
+    /// `CtlMessage::SetTabColor`)から直接タブ色を設定する。`set_title`と対になる。
+    pub(crate) fn set_tab_color(&mut self, r: u8, g: u8, b: u8) {
+        self.tab_color = Some((r, g, b));
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn application_keypad_mode(&self) -> bool { self.application_keypad_mode }
@@ -1252,6 +1267,7 @@ impl Terminal {
         self.cur_attrs = TermAttrs::default_for(&theme);
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
+        self.tab_color = None;
         self.pending_clipboard_write = None;
         self.pending_clipboard_pull_request = false;
         self.pending_terminal_responses.clear();
@@ -2078,6 +2094,37 @@ impl Terminal {
                 self.theme.default_bg = argb;
             }
         }
+    }
+
+    /// `osc_dispatch`'s `(6, 1)` arm: iTerm2's tab background color, sent as
+    /// three independent OSC sequences — `bg;red;brightness;<0-255>`,
+    /// `bg;green;brightness;<0-255>`, `bg;blue;brightness;<0-255>` — one per
+    /// channel (`osc_color::tab_color_sequence`'s `TerminalKind::ITerm2`
+    /// encoding, the producer side of this in `isekai-ssh/src/ctl_forward.rs`).
+    /// Unlike OSC 4;264 above (one sequence, all three channels at once),
+    /// this updates only the one channel `params` carries, layered onto
+    /// whatever `tab_color` already holds (black the first time) rather than
+    /// buffering until all three arrive — a real emitter always sends all
+    /// three back-to-back for one logical color change, so this converges to
+    /// the same final `tab_color` either way, while also degrading
+    /// gracefully (a partial color, not nothing at all) if a malformed/
+    /// truncated stream ever drops one of the three.
+    fn handle_osc6_iterm2_tab_color(&mut self, params: &[&[u8]]) {
+        if params.get(2).copied() != Some(b"bg".as_slice()) || params.get(4).copied() != Some(b"brightness".as_slice()) {
+            return;
+        }
+        let Some(&channel) = params.get(3) else { return };
+        let Some(&value_bytes) = params.get(5) else { return };
+        let Ok(value_str) = std::str::from_utf8(value_bytes) else { return };
+        let Ok(value) = value_str.parse::<u8>() else { return };
+        let (mut r, mut g, mut b) = self.tab_color.unwrap_or((0, 0, 0));
+        match channel {
+            b"red" => r = value,
+            b"green" => g = value,
+            b"blue" => b = value,
+            _ => return,
+        }
+        self.tab_color = Some((r, g, b));
     }
 
     /// OSC 8(`ESC]8;params;URIST`、タスク#40)。vteはOSCペイロードを`;`ごとに
@@ -3076,6 +3123,60 @@ impl Perform for Terminal {
             (Some(&b"11"), Some(&spec)) => {
                 self.handle_osc_default_color(false, spec, bell_terminated);
             }
+            // OSC 4;264(`ESC]4;264;rgb:RR/GG/BBST`): Windows Terminalのプライベート
+            // 拡張(パレットindex 264をタブ背景色に流用、`microsoft/terminal` PR #13058)。
+            // 通常のOSC 4(パレット色index 0-255の設定)はこのアプリでは未実装のため、
+            // 264だけを個別にmatchして区別する(255以下の通常パレットindexは
+            // フォールスルーで無視され続ける)。
+            //
+            // 制約(Opusレビュー指摘、2026-08。記述をadversarial reviewで訂正、
+            // 2026-08): tmuxはOSC 4を自前で解釈し、標準外のindex(264)を素の
+            // (DCSでラップしていない)まま送ると宛先へ転送しない。ただし
+            // `allow-passthrough on`は無条件に効かないわけではなく、DCSの
+            // パススルーシーケンス(`\ePtmux;...\e\\`)でラップされたペイロード
+            // はtmuxがそのまま宛先へ転送する——`osc-color::wrap_for_tmux_
+            // passthrough`(`claude-hookd`の`TmuxPassthrough`配信モードが使う
+            // 実装)はまさにこのラップを行うためのヘルパーで、それ経由なら
+            // tmux配下でもこのOSC 4;264経路は届く。tmuxを意識しない素の
+            // シェルが無加工でOSC 4;264を吐く場合にのみ、tmuxがそれを飲み
+            // 込んで届かない——その場合のフォールバックとして`CtlMessage::
+            // SetTabColor`(`session.rs`のctlソケット経路、`set_tab_color`
+            // 直接呼び出し)がある。
+            //
+            // xtermのOSC 4は本来`4;idx;spec;idx;spec;...`と複数ペアを1シーケンスに
+            // 詰められるが、ここは`params[1] == "264"`の1ペアのみを見ている
+            // (`4;1;rgb:..;264;rgb:..`のような複合シーケンスの264は現状取りこぼす)。
+            // 通常のパレットOSC 4本体を将来実装する際は、2個ずつ回すループの中で
+            // 264を分岐する形に統合すること。またOSC 10/11と異なり`264;?`という
+            // query(現在値の読み出し)には応答しない——実害はほぼ無いための意図的な
+            // 非対称。
+            (Some(&b"4"), Some(&b"264")) => {
+                if let Some(&spec) = params.get(2) {
+                    if let Some(argb) = parse_osc_color_spec(spec) {
+                        let r = ((argb >> 16) & 0xFF) as u8;
+                        let g = ((argb >> 8) & 0xFF) as u8;
+                        let b = (argb & 0xFF) as u8;
+                        self.tab_color = Some((r, g, b));
+                    }
+                }
+            }
+            // OSC 6;1;bg;<channel>;brightness;<0-255>ST: iTerm2's proprietary
+            // tab background color convention (see iTerm2's "Proprietary
+            // Escape Codes" documentation) — the counterpart to OSC 4;264
+            // above for a client that identifies itself (or defaults, absent
+            // any signal either way) as iTerm2 rather than Windows Terminal.
+            // Without this arm, a remote-side tool that picks its OSC dialect
+            // based on `$TERM_PROGRAM`/an explicit override (this app's own
+            // `isekai-ssh`/`claude-hookd`'s `osc_color::TerminalKind::resolve`
+            // is exactly such a tool) would silently produce no tab color
+            // here whenever it guesses iTerm2 — this custom terminal isn't
+            // actually either real terminal, so recognizing both dialects
+            // (rather than only the one it happened to implement first) is
+            // what keeps it a harmless no-op-or-better regardless of which
+            // one the far end picked (adversarial review finding, 2026-08).
+            (Some(&b"6"), Some(&b"1")) => {
+                self.handle_osc6_iterm2_tab_color(params);
+            }
             // OSC 8(`ESC]8;params;URIST`): ハイパーリンク(タスク#40)。詳細は
             // `handle_osc8_hyperlink`のdocコメント参照。`params.get(1)`が`None`
             // (`ESC]8ST`のようなパラメータ自体が無い形)も含めて丸ごと委譲する
@@ -3793,6 +3894,81 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
+    }
+
+    #[test]
+    fn test_tab_color_osc_4_264_windows_terminal_convention() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn test_tab_color_osc_ignores_other_palette_indices() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // OSC 4 (regular palette color setting) is otherwise unimplemented —
+        // only index 264 (Windows Terminal's tab-color convention) should
+        // ever populate tab_color.
+        feed(&mut t, b"\x1b]4;1;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), None);
+    }
+
+    #[test]
+    fn test_tab_color_osc_cleared_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
+        assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.tab_color(), None);
+    }
+
+    /// The iTerm2-dialect counterpart to `test_tab_color_osc_4_264_windows_terminal_convention`
+    /// — regression coverage for the adversarial-review finding that this
+    /// convention (`osc_color::tab_color_sequence`'s `TerminalKind::ITerm2`
+    /// encoding) was silently unrecognized. All three per-channel sequences
+    /// (the exact bytes a real emitter sends, back-to-back) must combine
+    /// into one final `tab_color`.
+    #[test]
+    fn test_tab_color_osc_6_1_bg_iterm2_convention() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]6;1;bg;red;brightness;170\x07");
+        feed(&mut t, b"\x1b]6;1;bg;green;brightness;187\x07");
+        feed(&mut t, b"\x1b]6;1;bg;blue;brightness;204\x07");
+        assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
+    }
+
+    /// A real emitter always sends only one channel per sequence — this pins
+    /// the graceful-degradation behavior for whatever arrives *before* all
+    /// three eventually do, not just the fully-combined end state above.
+    #[test]
+    fn test_tab_color_osc_6_1_bg_iterm2_applies_one_channel_at_a_time() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]6;1;bg;red;brightness;170\x07");
+        assert_eq!(t.tab_color(), Some((0xaa, 0x00, 0x00)), "an as-yet-incomplete update should still be visible, not held back until all 3 channels arrive");
+        feed(&mut t, b"\x1b]6;1;bg;blue;brightness;204\x07");
+        assert_eq!(t.tab_color(), Some((0xaa, 0x00, 0xcc)), "a later channel update must not reset the ones already applied");
+    }
+
+    #[test]
+    fn test_tab_color_osc_6_1_bg_ignores_malformed_or_unrecognized_input() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        for malformed in [
+            &b"\x1b]6;1;bg;red;brightness;not-a-number\x07"[..],
+            &b"\x1b]6;1;bg;purple;brightness;170\x07"[..], // unrecognized channel name
+            &b"\x1b]6;1;bg;red;brightness;256\x07"[..],    // out of u8 range
+            &b"\x1b]6;1;fg;red;brightness;170\x07"[..],    // fg, not bg — not the tab-color convention
+            &b"\x1b]6;1;bg;red;170\x07"[..],                // missing the "brightness" literal
+        ] {
+            feed(&mut t, malformed);
+        }
+        assert_eq!(t.tab_color(), None, "no malformed/unrecognized OSC 6;1;bg variant should ever populate tab_color or panic");
+    }
+
+    #[test]
+    fn test_set_tab_color_direct_setter_mirrors_set_title() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_tab_color(0x11, 0x22, 0x33);
+        assert_eq!(t.tab_color(), Some((0x11, 0x22, 0x33)));
     }
 
     #[test]

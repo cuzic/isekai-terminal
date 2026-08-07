@@ -15,7 +15,7 @@ final class TerminalHyperlinkTests: XCTestCase {
     private func makeUpdate(cells: [CellData], cols: Int, rows: Int, linkTable: [String]) -> ScreenUpdate {
         ScreenUpdate(
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
-            cursorRow: 0, cursorCol: 0, title: nil,
+            cursorRow: 0, cursorCol: 0, title: nil, tabColor: nil,
             applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,

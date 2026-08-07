@@ -1,7 +1,7 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
 use crate::kitty_graphics::{ApcInterceptor, ApcStep};
-use crate::{CellData, CursorShape, LineDamage, ScreenUpdate};
+use crate::{CellData, CursorShape, LineDamage, ScreenUpdate, TabColor};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
 use crate::theme::Theme;
@@ -244,6 +244,7 @@ impl SessionState {
             cursor_row: cursor_row as u32,
             cursor_col: cursor_col as u32,
             title: t.title().map(str::to_owned),
+            tab_color: t.tab_color().map(|(r, g, b)| TabColor { r, g, b }),
             application_cursor_mode: t.application_cursor_mode(),
             application_keypad_mode: t.application_keypad_mode(),
             bracketed_paste_mode: t.bracketed_paste_mode(),
@@ -289,6 +290,14 @@ impl SessionState {
     /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
     pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
         self.terminal.set_title(title);
+        ProcessResult { screen_dirty: true, ..Default::default() }
+    }
+
+    /// ctlソケット(`isekai-protocol::CtlMessage::SetTabColor`)経由でリモートから
+    /// 届いたタブ色を、OSC 4;264のパースを経由せず直接反映する。`set_title_from_ctl`
+    /// と同じパターン。
+    pub(crate) fn set_tab_color_from_ctl(&mut self, r: u8, g: u8, b: u8) -> ProcessResult {
+        self.terminal.set_tab_color(r, g, b);
         ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
@@ -591,6 +600,20 @@ mod tests {
         let r = state.set_title_from_ctl("remote title".to_string());
 
         assert_eq!(state.terminal().title(), Some("remote title"));
+        assert!(r.screen_dirty);
+        assert!(r.side_effects.is_empty());
+        assert!(r.timer_cmds.is_empty());
+        assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn set_tab_color_from_ctl_reflects_in_terminal_tab_color_and_marks_screen_dirty() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        assert_eq!(state.terminal().tab_color(), None);
+
+        let r = state.set_tab_color_from_ctl(0x11, 0x22, 0x33);
+
+        assert_eq!(state.terminal().tab_color(), Some((0x11, 0x22, 0x33)));
         assert!(r.screen_dirty);
         assert!(r.side_effects.is_empty());
         assert!(r.timer_cmds.is_empty());

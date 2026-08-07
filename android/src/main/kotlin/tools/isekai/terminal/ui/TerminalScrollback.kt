@@ -57,6 +57,7 @@ fun synthesizeDisplayUpdate(
         cursorRow = live.rows, // カーソルは画面外に隠す(ライブでない行に描く意味が無いため)
         cursorCol = 0u,
         title = live.title,
+        tabColor = live.tabColor,
         applicationCursorMode = live.applicationCursorMode,
         applicationKeypadMode = live.applicationKeypadMode,
         bracketedPasteMode = live.bracketedPasteMode,

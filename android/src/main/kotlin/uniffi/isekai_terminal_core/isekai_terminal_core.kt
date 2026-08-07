@@ -5400,6 +5400,13 @@ data class ScreenUpdate (
     , 
     var `title`: kotlin.String?
     , 
+    /**
+     * Windows Terminal互換のOSC 4;264、または`CtlMessage::SetTabColor`で設定された
+     * タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
+     */
+    var `tabColor`: TabColor?
+    , 
     var `applicationCursorMode`: kotlin.Boolean
     , 
     /**
@@ -5610,6 +5617,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeTabColor.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
@@ -5645,6 +5653,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorRow`) +
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
+            FfiConverterOptionalTypeTabColor.allocationSize(value.`tabColor`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`applicationKeypadMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
@@ -5679,6 +5688,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.write(value.`cursorRow`, buf)
             FfiConverterUInt.write(value.`cursorCol`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
+            FfiConverterOptionalTypeTabColor.write(value.`tabColor`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`applicationKeypadMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
@@ -5863,6 +5873,54 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterBoolean.write(value.`agentForward`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
             FfiConverterBoolean.write(value.`allowNonLoopbackForwardBind`, buf)
+    }
+}
+
+
+
+/**
+ * Windows Terminal 独自拡張 OSC 4;264(`microsoft/terminal` PR #13058)、または
+ * ctl-socket経由の`CtlMessage::SetTabColor`で設定されたタブ背景色。RGB各成分は
+ * 0-255。`ScreenUpdate::tab_color`が`None`のときは未設定(タブUIは既定色を使う)。
+ */
+data class TabColor (
+    var `r`: kotlin.UByte
+    , 
+    var `g`: kotlin.UByte
+    , 
+    var `b`: kotlin.UByte
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTabColor: FfiConverterRustBuffer<TabColor> {
+    override fun read(buf: ByteBuffer): TabColor {
+        return TabColor(
+            FfiConverterUByte.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterUByte.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TabColor) = (
+            FfiConverterUByte.allocationSize(value.`r`) +
+            FfiConverterUByte.allocationSize(value.`g`) +
+            FfiConverterUByte.allocationSize(value.`b`)
+    )
+
+    override fun write(value: TabColor, buf: ByteBuffer) {
+            FfiConverterUByte.write(value.`r`, buf)
+            FfiConverterUByte.write(value.`g`, buf)
+            FfiConverterUByte.write(value.`b`, buf)
     }
 }
 
@@ -8866,6 +8924,38 @@ public object FfiConverterOptionalTypePromptJumpTarget: FfiConverterRustBuffer<P
         } else {
             buf.put(1)
             FfiConverterTypePromptJumpTarget.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeTabColor: FfiConverterRustBuffer<TabColor?> {
+    override fun read(buf: ByteBuffer): TabColor? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeTabColor.read(buf)
+    }
+
+    override fun allocationSize(value: TabColor?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeTabColor.allocationSize(value)
+        }
+    }
+
+    override fun write(value: TabColor?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeTabColor.write(value, buf)
         }
     }
 }

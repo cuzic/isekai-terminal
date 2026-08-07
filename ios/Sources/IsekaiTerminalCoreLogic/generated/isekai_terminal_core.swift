@@ -3636,6 +3636,12 @@ public struct ScreenUpdate: Equatable, Hashable {
     public var cursorRow: UInt32
     public var cursorCol: UInt32
     public var title: String?
+    /**
+     * Windows Terminal互換のOSC 4;264、または`CtlMessage::SetTabColor`で設定された
+     * タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
+     */
+    public var tabColor: TabColor?
     public var applicationCursorMode: Bool
     /**
      * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
@@ -3811,7 +3817,12 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
          * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
          * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
-         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
+         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, 
+        /**
+         * Windows Terminal互換のOSC 4;264、または`CtlMessage::SetTabColor`で設定された
+         * タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
+         * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
+         */tabColor: TabColor?, applicationCursorMode: Bool, 
         /**
          * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
          * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
@@ -3959,6 +3970,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.cursorRow = cursorRow
         self.cursorCol = cursorCol
         self.title = title
+        self.tabColor = tabColor
         self.applicationCursorMode = applicationCursorMode
         self.applicationKeypadMode = applicationKeypadMode
         self.bracketedPasteMode = bracketedPasteMode
@@ -4008,6 +4020,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorRow: FfiConverterUInt32.read(from: &buf), 
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
+                tabColor: FfiConverterOptionTypeTabColor.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 applicationKeypadMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
@@ -4043,6 +4056,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cursorRow, into: &buf)
         FfiConverterUInt32.write(value.cursorCol, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterOptionTypeTabColor.write(value.tabColor, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
         FfiConverterBool.write(value.applicationKeypadMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
@@ -4288,6 +4302,69 @@ public func FfiConverterTypeSshConfig_lift(_ buf: RustBuffer) throws -> SshConfi
 #endif
 public func FfiConverterTypeSshConfig_lower(_ value: SshConfig) -> RustBuffer {
     return FfiConverterTypeSshConfig.lower(value)
+}
+
+
+/**
+ * Windows Terminal 独自拡張 OSC 4;264(`microsoft/terminal` PR #13058)、または
+ * ctl-socket経由の`CtlMessage::SetTabColor`で設定されたタブ背景色。RGB各成分は
+ * 0-255。`ScreenUpdate::tab_color`が`None`のときは未設定(タブUIは既定色を使う)。
+ */
+public struct TabColor: Equatable, Hashable {
+    public var r: UInt8
+    public var g: UInt8
+    public var b: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(r: UInt8, g: UInt8, b: UInt8) {
+        self.r = r
+        self.g = g
+        self.b = b
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TabColor: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTabColor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TabColor {
+        return
+            try TabColor(
+                r: FfiConverterUInt8.read(from: &buf), 
+                g: FfiConverterUInt8.read(from: &buf), 
+                b: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TabColor, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.r, into: &buf)
+        FfiConverterUInt8.write(value.g, into: &buf)
+        FfiConverterUInt8.write(value.b, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTabColor_lift(_ buf: RustBuffer) throws -> TabColor {
+    return try FfiConverterTypeTabColor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTabColor_lower(_ value: TabColor) -> RustBuffer {
+    return FfiConverterTypeTabColor.lower(value)
 }
 
 
@@ -7975,6 +8052,30 @@ fileprivate struct FfiConverterOptionTypePromptJumpTarget: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePromptJumpTarget.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTabColor: FfiConverterRustBuffer {
+    typealias SwiftType = TabColor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTabColor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTabColor.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
