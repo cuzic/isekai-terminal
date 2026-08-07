@@ -139,7 +139,13 @@ class TerminalHostScreenTest {
 
         orchestrators[0].simulateConnected()
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        composeTestRule.waitForIdle()
+        // waitForIdle()だけでは足りない: ScreenUpdateはTerminalSession内部の
+        // Channel(CONFLATED)経由で別コルーチンへ渡されてから状態へ反映されるため、
+        // Composeの側から見ると非同期に届く。実CIで実際にflaky failしていた
+        // (adversarial review指摘、2026-08)。
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+        }
 
         composeTestRule.onNodeWithTag("tabColorDot").assertExists()
     }
@@ -149,8 +155,19 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
+        // まず色ありのScreenUpdateを送って波及を確認してから色なしへ切り替える —
+        // 色なし単発だと「まだ何も反映されていないので存在しないだけ」でも
+        // assertDoesNotExist()が同じ結果になり、テストとして何も検証できない
+        // (adversarial review指摘、2026-08: 「vacuously passes either way」)。
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+        }
+
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        composeTestRule.waitForIdle()
+        composeTestRule.waitUntil(3_000) {
+            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isEmpty()
+        }
 
         composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
     }
