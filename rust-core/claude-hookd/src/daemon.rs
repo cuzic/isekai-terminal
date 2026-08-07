@@ -346,10 +346,11 @@ async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, 
     // read as a legitimate hook event (forged `session_id`/`event`,
     // attacker-controlled tab color/attention-popup state) purely because
     // it reached the socket at all. Checked before any data is read, so a
-    // mismatched peer can't influence parsing even indirectly.
-    match stream.peer_cred() {
-        Ok(cred) if cred.uid() == unsafe { libc::geteuid() } => {}
-        _ => return None,
+    // mismatched peer can't influence parsing even indirectly. Uses
+    // `super::peer_is_same_uid` (not a bare `stream.peer_cred()`) — see its
+    // docs for why a bare call flaked this exact check out on macOS CI.
+    if !super::peer_is_same_uid(&stream).await {
+        return None;
     }
     let mut reader = BufReader::new(stream.take(MAX_EVENT_LINE_LEN));
     let mut line = String::new();

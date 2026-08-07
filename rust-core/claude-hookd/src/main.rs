@@ -399,6 +399,47 @@ fn sweep_stale_daemon_sockets() {
     let _ = ctl_gc::sweep_stale_sockets(&daemon_sock_dir(), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }
 
+/// How many times [`peer_is_same_uid`] retries a failed `peer_cred()` call
+/// before treating it as a real mismatch/absence, and how long it waits
+/// between attempts.
+#[cfg(unix)]
+const PEER_CRED_RETRIES: u32 = 5;
+#[cfg(unix)]
+const PEER_CRED_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+/// Checks a connected `UnixStream`'s peer effective uid against this
+/// process's own, used identically by both `send_event` (client side) and
+/// `daemon::read_one_event_line` (server side) — see either call site for
+/// why this check exists at all.
+///
+/// Retries a bounded number of times on `Err` (never on a real `Ok`
+/// mismatch, which fails closed immediately): tokio's macOS
+/// `peer_cred()` additionally requires a `LOCAL_PEEREPID` `getsockopt` to
+/// succeed to fill in the (here, unused) pid field, even though only the
+/// uid is read here — and that lookup has been observed to fail on a
+/// freshly-accepted/connected socket under GitHub Actions' macOS runner
+/// (`test-macos` job, 2026-08: every daemon test that exercises a real
+/// `UnixListener::accept()` failed, while tests that skip straight to
+/// `read_one_event`/`read_one_event_line` via `UnixStream::pair()` — no
+/// `accept()` involved — did not), even though `getpeereid()` alone (the
+/// uid/gid this check actually needs) would very likely have succeeded.
+/// The retry budget (5 * 5ms = 25ms worst case) is negligible next to this
+/// being a once-per-event check, and still fails closed well within
+/// `EVENT_READ_TIMEOUT`/any caller's own timeout for a genuine mismatch or
+/// permanent absence.
+#[cfg(unix)]
+async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    let self_uid = unsafe { libc::geteuid() };
+    for attempt in 0..PEER_CRED_RETRIES {
+        match stream.peer_cred() {
+            Ok(cred) => return cred.uid() == self_uid,
+            Err(_) if attempt + 1 < PEER_CRED_RETRIES => tokio::time::sleep(PEER_CRED_RETRY_DELAY).await,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Connects to the daemon socket and sends one line, this module's own
 /// minimal wire format (see `daemon::read_one_event`). Returns whether the
 /// connect+write succeeded — a proxy for "a daemon is reachable and got
@@ -421,10 +462,8 @@ async fn send_event(sock_path: &Path, session_id: &str, event: ClientEvent) -> b
     let Ok(mut stream) = UnixStream::connect(sock_path).await else {
         return false;
     };
-    let self_uid = unsafe { libc::geteuid() };
-    match stream.peer_cred() {
-        Ok(cred) if cred.uid() == self_uid => {}
-        _ => return false,
+    if !peer_is_same_uid(&stream).await {
+        return false;
     }
     let event_name = match event {
         ClientEvent::Notify => "notify",
