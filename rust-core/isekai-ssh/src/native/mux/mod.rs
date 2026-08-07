@@ -71,7 +71,7 @@ pub(crate) mod naming;
 pub(crate) mod owner;
 pub(crate) mod protocol;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +123,21 @@ struct ReconnectBackoff {
     max: Duration,
 }
 const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10) };
+
+/// An `OwnerLost` attempt that stayed connected at least this long before
+/// losing its (new) owner again counts as a genuinely separate, later
+/// failure — not a continuation of the same reconnect storm — and resets
+/// `attempt`/`lost_since` back to a fresh [`RECONNECT_BUDGET`] window (see
+/// `run_with_reconnect`'s loop). Without this, `lost_since` stays pinned to
+/// the *first-ever* owner loss for the rest of the process's life: a session
+/// that reconnects successfully and runs happily for 23 hours before its
+/// (new, unrelated) owner dies would only have ~1 hour of budget left,
+/// instead of a fresh 24 hours, purely because the clock never restarted.
+/// Comfortably above `RECONNECT_BACKOFF.max` so a run of purely back-to-back
+/// failed attempts (each shorter than this) never spuriously resets the
+/// budget that's meant to bound exactly that case.
+const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
+
 impl ReconnectBackoff {
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let shift = attempt.min(32);
@@ -172,28 +187,29 @@ impl ReconnectBackoff {
 /// reused either — each attempt resolves its own, same as a fresh manual
 /// invocation would.
 ///
-/// One [`console::RawModeGuard`] is held across the *whole* loop — enabled
-/// once, unconditionally, before the first attempt, not re-acquired per
-/// attempt the way `client::run` used to. This is a real behavior change to
-/// `client::run` (its own per-attempt `RawModeGuard::enable()` call was
-/// removed entirely — see its doc comment), not just an addition: without
-/// *some* caller enabling raw mode for the mux-client path, the ordinary
-/// (never loses its owner) case would silently stop being interactive at
-/// all. Holding exactly one guard here, for the process's entire mux-client
-/// lifetime, is what replaces that — and is also what actually fixes the
-/// bug this function exists for: a per-attempt guard's `Drop` between
-/// `OwnerLost` reconnect attempts would otherwise turn raw mode back off
-/// while this loop is still waiting to retry (`RawModeGuard` only wraps
-/// `crossterm`'s raw-mode call, not a ref count — a second nested
-/// enable/disable pair fights this one, `crossterm::terminal::
-/// disable_raw_mode`'s own semantics: it always restores the *true*
-/// original mode, it does not decrement a count). Held across
-/// `run_prepared`'s single-process fallback attempts too (they manage their
-/// own raw mode internally via `native::connect::run_shell_io_loop`) — safe
-/// only because every such fallback is itself this function's *final*
-/// outcome (`DispatchOutcome::Done`, an immediate `return`), so the two
-/// guards' drops always land back-to-back at the same exit rather than one
-/// disabling raw mode out from under a loop that is still going to retry.
+/// Does **not** hold a single [`console::RawModeGuard`] across the whole
+/// loop (an earlier version of this function did) — that broke a brand-new
+/// destination's TOFU confirmation prompt on the very first iteration
+/// (`connect::prepare`'s own inline auto-bootstrap dial, or the direct-
+/// connect fallback's SSH host-key confirmation inside `dispatch`, both run
+/// in normal/cooked mode and need real line editing/echo), since raw mode
+/// was enabled *before* either could run. Each attempt's own interactive
+/// phase enables its own narrowly-scoped guard instead: `client::run` around
+/// the mux-client relay, `native::connect::run_prepared` around a
+/// single-process fallback's shell I/O loop (both already did this before
+/// this loop existed), and [`wait_or_abort`] around the backoff wait itself
+/// (see its docs for why that one specifically still needs raw mode). None
+/// of these ever overlap in time, so there's no repeat of the "a second
+/// nested enable/disable pair fights this one" hazard a single shared guard
+/// was originally introduced to sidestep.
+///
+/// A `prepare` failure is only ever retried (rather than
+/// propagated immediately) once this loop has already reached that state at
+/// least once (`lost_since.is_some()`) — the very first call, before any
+/// `OwnerLost` has happened, still fails fast on a genuine misconfiguration
+/// (a malformed destination, `--isekai-no-bootstrap` against an unregistered
+/// host) exactly as it always has, rather than retrying it for up to
+/// [`RECONNECT_BUDGET`].
 async fn run_with_reconnect<C, S>(
     args: Vec<String>,
     spawner: &S,
@@ -205,31 +221,73 @@ where
 {
     let mut attempt: u32 = 0;
     let mut lost_since: Option<tokio::time::Instant> = None;
-    let _raw_mode = crate::native::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
 
     loop {
-        let prepared = connect::prepare(args.clone()).await?;
+        let attempt_started = tokio::time::Instant::now();
+        let prepared = match connect::prepare(args.clone()).await {
+            Ok(prepared) => prepared,
+            Err(e) if lost_since.is_some() => {
+                // Already reconnected at least once before, so this exact
+                // destination is known-trusted — a `prepare` failure here is
+                // a transient hiccup (trust-store/log-file I/O, a momentary
+                // DNS/network blip), not a fresh misconfiguration. Retry it
+                // with the same budget/backoff as an `OwnerLost` cycle rather
+                // than aborting the whole reconnect loop over it.
+                log_line!("isekai-ssh: preparing to reconnect failed ({e:#}); retrying");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => continue,
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                }
+            }
+            Err(e) => return Err(e),
+        };
         match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await? {
             DispatchOutcome::Done(code) => return Ok(code),
             DispatchOutcome::OwnerLost => {
-                let lost_at = *lost_since.get_or_insert_with(tokio::time::Instant::now);
-                if lost_at.elapsed() >= RECONNECT_BUDGET {
-                    log_line!(
-                        "isekai-ssh: connection to the isekai-ssh owner process was lost and automatic \
-                         reconnection gave up after {RECONNECT_BUDGET:?} — reconnect with `isekai-ssh <host>`."
-                    );
-                    return Ok(crate::EXIT_MUX_OWNER_LOST);
+                if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
+                    // This attempt ran long enough to count as a genuinely
+                    // separate, later failure rather than a continuation of
+                    // the same storm — see `RECONNECT_STABLE_THRESHOLD`'s docs.
+                    attempt = 0;
+                    lost_since = None;
                 }
-                let delay = RECONNECT_BACKOFF.delay_for_attempt(attempt);
-                attempt += 1;
-                log_line!("isekai-ssh: connection to the isekai-ssh owner process was lost; reconnecting in {delay:?}...");
-                if wait_or_abort(delay).await == WaitOutcome::Aborted {
-                    log_line!("isekai-ssh: reconnect canceled (Ctrl+C).");
-                    return Ok(crate::EXIT_USER_CANCELED);
+                log_line!("isekai-ssh: connection to the isekai-ssh owner process was lost; reconnecting...");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => {}
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
                 }
             }
         }
     }
+}
+
+enum ReconnectDecision {
+    Retry,
+    GiveUp(u8),
+}
+
+/// Shared bookkeeping for both places `run_with_reconnect`'s loop can decide
+/// to retry (an `OwnerLost` dispatch outcome, or a `prepare` failure once
+/// already mid-reconnect): checks the [`RECONNECT_BUDGET`] against
+/// `lost_since` (starting the clock on first use), waits out the next
+/// backoff delay (bumping `attempt`), and reports whether the caller should
+/// loop again or give up.
+async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>) -> ReconnectDecision {
+    let lost_at = *lost_since.get_or_insert_with(tokio::time::Instant::now);
+    if lost_at.elapsed() >= RECONNECT_BUDGET {
+        log_line!(
+            "isekai-ssh: automatic reconnection gave up after {RECONNECT_BUDGET:?} — reconnect with `isekai-ssh <host>`."
+        );
+        return ReconnectDecision::GiveUp(crate::EXIT_MUX_OWNER_LOST);
+    }
+    let delay = RECONNECT_BACKOFF.delay_for_attempt(*attempt);
+    *attempt += 1;
+    log_line!("isekai-ssh: reconnecting in {delay:?}...");
+    if wait_or_abort(delay).await == WaitOutcome::Aborted {
+        log_line!("isekai-ssh: reconnect canceled (Ctrl+C).");
+        return ReconnectDecision::GiveUp(crate::EXIT_USER_CANCELED);
+    }
+    ReconnectDecision::Retry
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -250,7 +308,19 @@ enum WaitOutcome {
 /// `console_stdin::ConsoleStdin`'s process-wide singleton reader (see its
 /// module docs) so this doesn't race whatever the next attempt's own
 /// `ConsoleStdin::open()` call does.
+///
+/// Enables its own [`console::RawModeGuard`], scoped to this wait only: this
+/// runs strictly between two attempts (the previous one's own guard —
+/// `client::run`'s or `native::connect::run_prepared`'s — has already
+/// dropped, and the next attempt's `connect::prepare`/auth hasn't started
+/// yet), so it never overlaps either. Without raw mode here, Ctrl+C during
+/// the wait would be intercepted by the terminal as a real interrupt signal
+/// instead of arriving as a plain `0x03` byte this function can catch and
+/// turn into a clean [`crate::EXIT_USER_CANCELED`] exit. Best-effort: if
+/// raw mode can't be enabled (non-interactive stdio), the wait still runs,
+/// it just can't recognize Ctrl+C as an early-abort signal.
 async fn wait_or_abort(delay: Duration) -> WaitOutcome {
+    let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
     wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await
 }
 
@@ -259,16 +329,39 @@ async fn wait_or_abort(delay: Duration) -> WaitOutcome {
 /// stdin (whose state — a real console, a closed pipe, `/dev/null` — a test
 /// can't control or rely on, unlike `client::run_inner`'s equivalent
 /// injection for the same reason).
+///
+/// Loops rather than resolving on the first `select!` winner: a naive
+/// single `select!` would let a closed/already-EOF stdin (`Ok(0)` resolves
+/// immediately, never blocking) win the race against `sleep(delay)` on
+/// *every* call, skipping the backoff delay entirely and hot-looping
+/// reconnect attempts with no wait at all (found by real-world review: an
+/// `isekai-ssh` invocation with redirected/closed stdin — a script, `< NUL`
+/// — would never actually back off). A non-abort keypress is discarded and
+/// the wait continues; an EOF or read error means stdin will never usefully
+/// produce more input, so the remaining delay is just waited out directly
+/// rather than re-issuing reads against a stream that can't ever satisfy
+/// them.
 async fn wait_or_abort_over<I: tokio::io::AsyncRead + Unpin>(delay: Duration, stdin: &mut I) -> WaitOutcome {
     use tokio::io::AsyncReadExt;
 
     let mut buf = [0u8; 64];
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => WaitOutcome::Elapsed,
-        result = stdin.read(&mut buf) => {
-            match result {
-                Ok(n) if buf[..n].contains(&0x03) => WaitOutcome::Aborted,
-                _ => WaitOutcome::Elapsed,
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return WaitOutcome::Elapsed,
+            result = stdin.read(&mut buf) => {
+                match result {
+                    Ok(n) if n > 0 && buf[..n].contains(&0x03) => return WaitOutcome::Aborted,
+                    Ok(0) | Err(_) => {
+                        // EOF/error: nothing more this stream can ever tell
+                        // us — stop polling it and just wait out the rest of
+                        // the delay.
+                        sleep.await;
+                        return WaitOutcome::Elapsed;
+                    }
+                    Ok(_) => continue,
+                }
             }
         }
     }
@@ -1196,6 +1289,20 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_stable_threshold_is_comfortably_above_the_max_backoff() {
+        // A run of purely back-to-back failed attempts (each shorter than
+        // `RECONNECT_STABLE_THRESHOLD`) must never spuriously look "stable"
+        // and reset the `RECONNECT_BUDGET` clock — see
+        // `RECONNECT_STABLE_THRESHOLD`'s own docs. If someone raises
+        // `RECONNECT_BACKOFF.max` above (or close to) the threshold without
+        // updating this too, that guarantee quietly breaks.
+        assert!(
+            RECONNECT_STABLE_THRESHOLD > RECONNECT_BACKOFF.max * 2,
+            "RECONNECT_STABLE_THRESHOLD must stay well above RECONNECT_BACKOFF.max"
+        );
+    }
+
+    #[test]
     fn reconnect_backoff_never_panics_on_a_huge_attempt_count() {
         // Mirrors `isekai_transport::backoff::BackoffPolicy`'s own overflow
         // guard test — `attempt.min(32)` before the `1u64 << shift` is what
@@ -1212,8 +1319,16 @@ mod tests {
         // resolved but produced nothing abort-worthy" arm, not the timer
         // arm specifically (see the next test for a stdin that never
         // resolves at all, which does exercise the timer arm).
+        let before = tokio::time::Instant::now();
         let outcome = wait_or_abort_over(Duration::from_secs(1), &mut never_ready).await;
         assert_eq!(outcome, WaitOutcome::Elapsed);
+        // Regression guard: an EOF/closed stdin (e.g. `isekai-ssh` run with
+        // redirected/closed stdin, or `< NUL`) must still wait out the full
+        // backoff delay, not resolve instantly just because the read never
+        // blocks — a prior version of this function's `select!` let the
+        // always-immediately-ready EOF read win every race, skipping the
+        // delay entirely and hot-looping reconnect attempts with zero wait.
+        assert!(before.elapsed() >= Duration::from_secs(1), "an EOF stdin must not skip the backoff delay");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1237,12 +1352,15 @@ mod tests {
         assert_eq!(outcome, WaitOutcome::Aborted);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_or_abort_ignores_ordinary_keystrokes_typed_while_waiting() {
         // A stray keypress during the reconnect wait has nowhere meaningful
         // to go (no live remote session yet) and must not be mistaken for
-        // Ctrl+C — the read resolving with ordinary bytes falls through to
-        // `Elapsed`, same as EOF, rather than `Aborted`.
+        // Ctrl+C — the read resolving with ordinary bytes is discarded and
+        // the wait keeps going (not treated as `Elapsed`/`Aborted` on the
+        // spot) until the cursor hits EOF and the remaining delay is waited
+        // out for real — `start_paused` is what keeps that 30s delay from
+        // making this test actually take 30 real seconds.
         let mut stdin = std::io::Cursor::new(vec![b'h', b'i']);
         let outcome = wait_or_abort_over(Duration::from_secs(30), &mut stdin).await;
         assert_eq!(outcome, WaitOutcome::Elapsed);

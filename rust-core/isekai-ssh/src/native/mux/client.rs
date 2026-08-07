@@ -98,12 +98,16 @@ pub(crate) enum ClientRunResult {
 /// shell existed), it instead returns [`ClientRunResult::Rejected`] so the
 /// caller can retry unmultiplexed.
 ///
-/// Deliberately does **not** manage raw terminal mode itself (unlike this
-/// function's previous version) — the caller holds one
-/// [`super::super::console::RawModeGuard`] across every attempt of its own
-/// retry loop, not one per attempt, so the terminal doesn't visibly leave
-/// raw mode (and locally echo/interpret control characters) between
-/// `OwnerLost` reconnect attempts. `super::super::console_stdin::ConsoleStdin::open`
+/// Manages its own raw terminal mode, scoped to this one attempt only (a
+/// prior version of this function's caller, `super::run_with_reconnect`,
+/// briefly held a single [`super::super::console::RawModeGuard`] across its
+/// *entire* retry loop instead — including every `connect::prepare`/auth
+/// call in between attempts, which broke a brand-new destination's TOFU
+/// confirmation prompt: raw mode suppresses the line editing/echo those
+/// prompts need, so `Enter` arrives as a bare `\r` and the prompt never
+/// resolves. The caller's own backoff wait between `OwnerLost` attempts
+/// enables its own separate, equally narrowly-scoped guard instead — see
+/// `super::wait_or_abort`'s docs). `super::super::console_stdin::ConsoleStdin::open`
 /// is still safe to call once per attempt regardless (see its own docs on
 /// why it's a process-wide singleton under the hood).
 ///
@@ -122,6 +126,15 @@ where
     let (reader, mut writer) = tokio::io::split(conn);
     let (cols, rows) = super::super::console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+
+    // By the time this function is reached (the handshake below is next),
+    // the owner is already an established connection — any TOFU/auth prompts
+    // for this destination already happened earlier in the caller's own
+    // `connect::prepare`/`dispatch`, in normal (non-raw) mode. Safe to enable
+    // for the rest of this attempt's lifetime. Best-effort: a terminal that
+    // can't be put in raw mode (piped/non-interactive stdio) shouldn't block
+    // the mux relay itself, only degrade its local key handling.
+    let _raw_mode = super::super::console::RawModeGuard::enable().ok();
 
     let resize_rx = if want_pty { super::super::console::spawn_resize_watcher() } else { None };
 
