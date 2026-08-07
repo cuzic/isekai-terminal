@@ -136,19 +136,30 @@ class TerminalHostScreenTest {
     @Test fun tabLabel_showsAccentDot_whenRemoteSetsTabColor() {
         vm.openTab(profile("alpha"))
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, onNavigateToProfileList = {}, tabsVm = vm) }
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
 
         orchestrators[0].simulateConnected()
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
-        // waitForIdle()だけでは足りない: ScreenUpdateはTerminalSession内部の
-        // Channel(CONFLATED)経由で別コルーチンへ渡されてから状態へ反映されるため、
-        // Composeの側から見ると非同期に届く。実CIで実際にflaky failしていた
-        // (adversarial review指摘、2026-08)。
+        // Two things had to be fixed here, both found only by actually
+        // running this against real CI (adversarial review, 2026-08):
+        // (1) waitForIdle() alone doesn't wait for ScreenUpdate's async
+        // propagation through TerminalSession's internal Channel, so a plain
+        // wait races the state update — waitUntil polling instead.
+        // (2) `tabColorDot`'s Box has no semantics of its own besides the
+        // tag, so in the *merged* semantics tree (Compose's default) it gets
+        // absorbed into the enclosing Tab's merged node, and
+        // `SemanticsProperties.TestTag`'s merge policy keeps only the
+        // parent's own tag — meaning `onNodeWithTag`/`onAllNodesWithTag`
+        // could *never* find it without `useUnmergedTree = true`, on every
+        // lookup in this test, not just the final assertion. This was the
+        // real root cause of the failure the waitUntil rewrite alone didn't
+        // fix (a previous, incomplete pass here misdiagnosed it as purely a
+        // timing race).
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertExists()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertExists()
     }
 
     @Test fun tabLabel_hasNoAccentDot_whenTabColorUnset() {
@@ -162,15 +173,15 @@ class TerminalHostScreenTest {
         // (adversarial review指摘、2026-08: 「vacuously passes either way」)。
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", TabColor(0xffu, 0x88u, 0x00u), false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isNotEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
         }
 
         orchestrators[0].simulateScreenUpdate(ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "alpha", null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null))
         composeTestRule.waitUntil(3_000) {
-            composeTestRule.onAllNodesWithTag("tabColorDot").fetchSemanticsNodes().isEmpty()
+            composeTestRule.onAllNodesWithTag("tabColorDot", useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
         }
 
-        composeTestRule.onNodeWithTag("tabColorDot").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("tabColorDot", useUnmergedTree = true).assertDoesNotExist()
     }
 
     @Test fun clickingInactiveTab_switchesActiveTab() {
