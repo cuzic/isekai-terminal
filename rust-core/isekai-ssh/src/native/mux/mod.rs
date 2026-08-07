@@ -241,9 +241,54 @@ where
             }
             Err(e) => return Err(e),
         };
-        match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await? {
+        // Captured before `prepared` moves into `dispatch` below — used by
+        // the `OwnerLost` arm to decide whether auto-retry is even safe (see
+        // its own comment): re-running a *remote command* invocation
+        // (`isekai-ssh host -- cmd`) from scratch after losing the owner
+        // mid-execution isn't the same as reconnecting an interactive shell —
+        // it could silently repeat a non-idempotent action, so it must not
+        // auto-retry the way an interactive session does.
+        let has_remote_command = prepared.plan().remote_command().is_some();
+        let outcome = match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await {
+            Ok(outcome) => outcome,
+            Err(e) if lost_since.is_some() => {
+                // Same reasoning as the `prepare` failure arm above: once
+                // we've already recovered from a lost owner at least once,
+                // any further error out of `dispatch` (e.g. `client::run`
+                // failing outright, or the direct-connect fallback it can
+                // fall through to failing for a transient reason) is a
+                // retryable hiccup, not a reason to give up the whole
+                // reconnect loop — this was itself found still broken by a
+                // second adversarial review pass after the `prepare`-only
+                // fix above, the exact same bug class one level further down
+                // the same function's error paths.
+                log_line!("isekai-ssh: reconnect attempt failed ({e:#}); retrying");
+                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    ReconnectDecision::Retry => continue,
+                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        match outcome {
             DispatchOutcome::Done(code) => return Ok(code),
             DispatchOutcome::OwnerLost => {
+                if has_remote_command {
+                    // A remote-command invocation was interrupted mid-flight
+                    // by the owner dying — auto-retrying would silently
+                    // re-run it from scratch, which is only safe for an
+                    // idempotent command and this crate has no way to know
+                    // whether it was one (found by adversarial review, 2026-08).
+                    // Falls back to the pre-auto-retry behavior: surface the
+                    // loss immediately and let the user judge whether
+                    // reconnecting and rerunning is safe.
+                    log_line!(
+                        "isekai-ssh: connection to the isekai-ssh owner process was lost while running a remote \
+                         command; not auto-retrying (rerunning it could repeat a non-idempotent action) — \
+                         reconnect with `isekai-ssh <host> ...` if that's safe to do."
+                    );
+                    return Ok(crate::EXIT_MUX_OWNER_LOST);
+                }
                 if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
                     // This attempt ran long enough to count as a genuinely
                     // separate, later failure rather than a continuation of
