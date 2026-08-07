@@ -26,6 +26,16 @@
 //!
 //! Any keyword other than the ones listed above is silently ignored — this
 //! is not a general-purpose `ssh_config(5)` parser.
+//!
+//! # Provenance
+//!
+//! Original implementation — not a fork or port of any upstream crate.
+//! `russh-config` (maintained alongside `russh` itself) was evaluated first
+//! and turned down because it supports neither `Include` nor
+//! `ForwardAgent`/`IdentityAgent`, silently dropping both. This crate was
+//! written from scratch instead, following the `Host`/`Match`/`Include`
+//! resolution `isekai-ssh` already implemented for its own `#@isekai`
+//! directives (`rust-core/isekai-ssh/src/wrapper/directive.rs`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

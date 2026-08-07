@@ -44,6 +44,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::time::unix_now;
 use crate::{refresh, AuthError, TokenProvider, TokenResponse};
@@ -118,12 +119,63 @@ impl TokenSet {
         client_id: Option<String>,
         fallback_refresh_token: Option<String>,
     ) -> TokenSet {
+        let refresh_token = match response.refresh_token {
+            Some(rotated) => {
+                // The server issued a fresh refresh token (RFC 6749 §6
+                // rotation) — `fallback_refresh_token` is now a stale,
+                // discarded copy of the *old* secret, and a plain drop here
+                // would silently defeat this file's own zeroize-before-drop
+                // fixes (adversarial review, 2026-08: this exact `Option::or`
+                // discard was found to leave that copy un-zeroized).
+                if let Some(mut stale) = fallback_refresh_token {
+                    stale.zeroize();
+                }
+                Some(rotated)
+            }
+            None => fallback_refresh_token,
+        };
         TokenSet {
             access_token: response.access_token,
-            refresh_token: response.refresh_token.or(fallback_refresh_token),
+            refresh_token,
             expires_at: response.expires_in.map(|secs| unix_now() + secs as i64),
             token_endpoint: Some(token_endpoint),
             client_id,
+        }
+    }
+}
+
+/// Zeroizes `access_token`/`refresh_token` when a `TokenSet` is dropped.
+/// Unlike the root crate's `SshAuth` (an UniFFI-exported type, which zeroizes
+/// via an explicit `zeroize_ssh_auth()` call because UniFFI-generated types
+/// can't derive `Drop`), `TokenSet` is a plain internal type, so `Drop` is
+/// the safer default here — an explicit-call convention is easy to forget at
+/// one of several call sites, `Drop` is not (2026-07-28, gap found while
+/// fact-checking the isekai-terminal case study for a book manuscript).
+///
+/// `Drop` means fields can no longer be moved out of a `TokenSet` (only
+/// `.clone()`d) — see the call sites in this file that changed to
+/// `.access_token.clone()`/`.client_id.clone()` alongside this impl.
+///
+/// **Known residual exposure, not fully closed by this alone** (found by
+/// adversarial review, 2026-08): every `TokenSet` this eventually drops is
+/// still only the *last* copy of the secret to exist. `load_token_set`'s own
+/// `content` (the raw file, JSON wrapper included) is zeroized separately
+/// right after parsing — but `serde_json`'s `#[serde(untagged)]` decoding
+/// necessarily buffers an intermediate owned representation internally
+/// before it can tell `V2` from `V1` apart, which this crate has no handle
+/// on and can't zeroize. And every caller-side `.access_token.clone()` this
+/// file's own doc comments point to (`load_token`, `get_relay_jwt`, ...)
+/// hands out a copy nothing here ever zeroizes either — closing that would
+/// mean changing every caller's own type to something zeroizing, not just
+/// this one. `Drop` here is real defense-in-depth against the *hottest*
+/// path's original bug (reassigning `access_token` used to silently drop —
+/// not wipe — the prior value on nearly every read, see `load_token_set`'s
+/// trim step), not a guarantee this secret never touches unwiped heap.
+impl Drop for TokenSet {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        if let Some(refresh_token) = self.refresh_token.as_mut() {
+            refresh_token.zeroize();
         }
     }
 }
@@ -180,7 +232,9 @@ pub fn default_token_path() -> Result<PathBuf, AuthError> {
 /// Fails closed: a missing file, a world-writable file/directory, malformed
 /// JSON, or an empty token value are all errors, never a silent empty token.
 pub fn load_token(path: &Path) -> Result<String, AuthError> {
-    Ok(load_token_set(path)?.access_token)
+    // `.clone()`, not a move: `TokenSet` now zeroizes on drop (see `impl Drop
+    // for TokenSet` below), which Rust disallows moving a field out of.
+    Ok(load_token_set(path)?.access_token.clone())
 }
 
 /// Reads the full `TokenSet` out of the token file at `path`. A legacy v1
@@ -198,10 +252,18 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
     }
     check_not_world_writable(path)?;
 
-    let content =
+    let mut content =
         fs::read_to_string(path).map_err(|e| AuthError::Read { path: path.to_path_buf(), source: e })?;
-    let schema: TokenFileSchema =
-        serde_json::from_str(&content).map_err(|e| AuthError::Parse { path: path.to_path_buf(), source: e })?;
+    let parsed: Result<TokenFileSchema, _> = serde_json::from_str(&content);
+    // Zeroized as soon as `serde_json::from_str` is done with it, win or
+    // lose — `content` holds the raw secret in plaintext (the whole file,
+    // JSON wrapper included) and, `#[serde(untagged)]`'s own internal
+    // buffering aside (a copy this function has no way to reach), this is
+    // the one copy of it fully within this function's control. Same
+    // reasoning as `TokenSet`'s own `Drop` impl below, just for the
+    // pre-parse stage that impl can't cover.
+    content.zeroize();
+    let schema: TokenFileSchema = parsed.map_err(|e| AuthError::Parse { path: path.to_path_buf(), source: e })?;
 
     let mut token_set = match schema {
         TokenFileSchema::V2(token_set) => token_set,
@@ -212,7 +274,18 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
     if trimmed.is_empty() {
         return Err(AuthError::EmptyToken { path: path.to_path_buf() });
     }
-    token_set.access_token = trimmed.to_string();
+    // `trimmed.to_string()` (not reusing `token_set.access_token` in place)
+    // ends `trimmed`'s borrow, which is what lets the very next line
+    // `.zeroize()` the original untrimmed `String` before it's overwritten —
+    // a plain `token_set.access_token = trimmed.to_string()` would instead
+    // just drop the old `String` normally (a deallocation, not a wipe),
+    // defeating this type's whole `Drop`-based zeroization on every single
+    // `load_token_set` call: the untrimmed copy of the real secret would be
+    // freed-but-not-zeroed on every read, before the caller's own eventual
+    // `TokenSet::drop` ever runs.
+    let retrimmed = trimmed.to_string();
+    token_set.access_token.zeroize();
+    token_set.access_token = retrimmed;
     Ok(token_set)
 }
 
@@ -222,31 +295,44 @@ pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
 /// `{"relay_jwt": ...}` schema — use `save_token_set` to persist a full
 /// `TokenSet` (refresh token / expiry / token endpoint included).
 pub fn save_token(path: &Path, relay_jwt: &str) -> Result<(), AuthError> {
-    let serialized = serde_json::to_string_pretty(&TokenFileV1 { relay_jwt: relay_jwt.to_string() })?;
-    write_atomically(path, &serialized)
+    let mut wrapper = TokenFileV1 { relay_jwt: relay_jwt.to_string() };
+    let result = serde_json::to_string_pretty(&wrapper);
+    // `wrapper.relay_jwt` is a second plaintext copy of the secret that
+    // `TokenFileV1` (unlike `TokenSet`) has no `Drop` impl to wipe — zeroize
+    // it explicitly here before it falls out of scope (adversarial review,
+    // 2026-08: the write path had the same un-zeroized-copy bug the read
+    // path (`load_token_set`) was fixed for).
+    wrapper.relay_jwt.zeroize();
+    write_atomically(path, result?)
 }
 
 /// Writes a full `TokenSet` to the token file at `path`, with the same
 /// atomic-write + `0600`/`0700` permission handling as `save_token`.
 pub fn save_token_set(path: &Path, token_set: &TokenSet) -> Result<(), AuthError> {
     let serialized = serde_json::to_string_pretty(token_set)?;
-    write_atomically(path, &serialized)
+    write_atomically(path, serialized)
 }
 
 /// Shared atomic-write body for `save_token`/`save_token_set`: write to a
 /// fresh temp file in `path`'s parent directory (creating it, `0700`, if
 /// needed), set `0600` permissions on the temp file, then rename it over
-/// `path`.
-fn write_atomically(path: &Path, serialized: &str) -> Result<(), AuthError> {
+/// `path`. Takes `serialized` by value (not `&str`) specifically so it can
+/// be zeroized here once the write attempt is done with it — the JSON text
+/// this function's two callers hand it is plaintext containing the actual
+/// secret (`access_token`/`refresh_token`, or the legacy `relay_jwt`), a
+/// third copy alongside the two `load_token_set` already zeroizes on the
+/// read side (adversarial review, 2026-08: this write-side copy was found
+/// still un-zeroized after that fix).
+fn write_atomically(path: &Path, mut serialized: String) -> Result<(), AuthError> {
     let parent = path.parent().ok_or_else(|| AuthError::NoParentDir { path: path.to_path_buf() })?;
     ensure_private_dir(parent)?;
 
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
     set_private_file_permissions(tmp.path())?;
-    tmp.write_all(serialized.as_bytes())
-        .and_then(|_| tmp.flush())
-        .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
+    let write_result = tmp.write_all(serialized.as_bytes()).and_then(|_| tmp.flush());
+    serialized.zeroize();
+    write_result.map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
 
     tmp.persist(path).map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e.error })?;
     Ok(())
@@ -336,8 +422,9 @@ impl FileTokenProvider {
         })?;
 
         let response = refresh::refresh_access_token(&token_endpoint, current.client_id.as_deref(), &refresh_token)?;
+        // `.clone()`, not a move: see the `impl Drop for TokenSet` comment above.
         let refreshed =
-            TokenSet::from_token_response(response, token_endpoint, current.client_id, Some(refresh_token));
+            TokenSet::from_token_response(response, token_endpoint, current.client_id.clone(), Some(refresh_token));
         self.save_token_set(&refreshed)?;
         Ok(refreshed)
     }
@@ -351,11 +438,13 @@ impl TokenProvider for FileTokenProvider {
     /// are returned as-is, matching this method's pre-phase-S-5 behavior
     /// exactly — `needs_refresh()` is always `false` for them.
     fn get_relay_jwt(&self) -> Result<String, AuthError> {
+        // Both `.clone()`s below, not moves: see the `impl Drop for
+        // TokenSet` comment above.
         let token_set = load_token_set(&self.path)?;
         if !token_set.needs_refresh() {
-            return Ok(token_set.access_token);
+            return Ok(token_set.access_token.clone());
         }
-        Ok(self.refresh_and_save(token_set)?.access_token)
+        Ok(self.refresh_and_save(token_set)?.access_token.clone())
     }
 }
 
@@ -369,6 +458,25 @@ mod tests {
         let path = dir.path().join("token.json");
 
         save_token(&path, "a-relay-jwt").unwrap();
+        assert_eq!(load_token(&path).unwrap(), "a-relay-jwt");
+    }
+
+    /// Regression guard for the zeroize-then-reassign reordering in
+    /// `load_token_set`'s trim step (adversarial review, 2026-08): confirms
+    /// the observable trimming behavior survived that reordering — a slip
+    /// (e.g. zeroizing before capturing `trimmed.to_string()`, rather than
+    /// after) would silently return a wiped-to-empty or otherwise wrong
+    /// access token instead of the trimmed one.
+    #[test]
+    fn load_token_trims_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        fs::write(&path, r#"{"relay_jwt":"  a-relay-jwt\n"}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(load_token(&path).unwrap(), "a-relay-jwt");
     }
 

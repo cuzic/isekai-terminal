@@ -21,6 +21,11 @@ russh-stream-session = { path = "../russh-stream-session" }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["rt"] }
 log = "0.4"
+# `HelperTrust::cached_session_secret`をdrop時にゼロ化するために使う
+# (`schema.rs`の`impl Drop for HelperTrust`)。この秘密自体は`known_helpers.toml`に
+# 平文base64のまま永続化される設計のため防げる範囲は限定的だが、`isekai-auth::TokenSet`
+# と対策の対称性を取る(2026-07-28、書籍原稿の実地検証で発覚した非対称性の是正)。
+zeroize = "1"
 
 [dev-dependencies]
 # host_key_verifier.rs tests need the multi-thread runtime + timers to prove
