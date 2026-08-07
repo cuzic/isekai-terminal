@@ -130,12 +130,22 @@ async fn spawn_seeded_agent(pipe_name: &str, key: &PrivateKey) {
     let stream = UnboundedReceiverStream::new(rx);
     tokio::spawn(russh_keys::agent::server::serve(stream, ()));
 
-    // Give the accept loop a moment to create the first pipe instance before
-    // dialing it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut seeding_client = russh_keys::agent::client::AgentClient::connect_named_pipe(pipe_name)
-        .await
-        .expect("failed to connect to the freshly-spawned test agent to seed it");
+    // Retry-until-deadline rather than a single fixed sleep before dialing:
+    // a fixed delay (a prior version of this test used a flat 200ms) is a
+    // load-dependent flake on a busy CI runner, where the spawned accept
+    // loop above may not have gotten around to `ServerOptions::create`ing
+    // the first pipe instance yet, making `connect_named_pipe` fail with no
+    // retry left to recover.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut seeding_client = loop {
+        match russh_keys::agent::client::AgentClient::connect_named_pipe(pipe_name).await {
+            Ok(client) => break client,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("failed to connect to the freshly-spawned test agent to seed it: {e}"),
+        }
+    };
     seeding_client.add_identity(key, &[]).await.expect("failed to add the test identity to the agent");
 }
 
