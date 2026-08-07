@@ -65,8 +65,14 @@ mod tests {
     #[test]
     fn attach_command_safely_quotes_a_hostile_name() {
         let cmd = attach_command("$(rm -rf /); evil'; exec sh");
-        assert!(!cmd.contains("'; exec sh'"), "an embedded single quote must not prematurely close the quoting: {cmd:?}");
-        assert!(cmd.starts_with("isekai-pipe tty attach '"));
+        // The single embedded `'` must become POSIX single-quoting's standard
+        // close-quote/escaped-quote/reopen-quote sequence (`'\''`), not be
+        // left bare (which really would prematurely close the argument) —
+        // computed by hand from `wrapper::shell_quote`'s documented
+        // algorithm, not just pattern-matched against a substring that (as
+        // an earlier version of this test wrongly did) can coincidentally
+        // appear as part of a *correctly* escaped string too.
+        assert_eq!(cmd, "isekai-pipe tty attach '$(rm -rf /); evil'\\''; exec sh'");
     }
 
     #[test]

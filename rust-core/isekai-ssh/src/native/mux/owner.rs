@@ -1154,7 +1154,11 @@ mod tests {
         })
         .await
         .expect("timed out waiting for exec output — tty_exec likely fell back to a plain login shell (no shell_request handler on the mock server)");
-        assert_eq!(seen, b"ran: isekai-pipe tty attach 'work'\n", "tty_exec must be exec'd even with ctl-socket off");
+        // `build_login_shell_command` always wraps its target in `exec <target>`
+        // (there's no ctl-socket export here to prefix it, but the `exec`
+        // itself is unconditional) — this is what `EchoExecHandler` actually
+        // receives as the exec'd command string.
+        assert_eq!(seen, b"ran: exec isekai-pipe tty attach 'work'\n", "tty_exec must be exec'd even with ctl-socket off");
 
         drop(client);
         let _ = relay.await.unwrap();
