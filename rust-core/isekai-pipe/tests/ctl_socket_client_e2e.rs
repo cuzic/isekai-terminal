@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio as StdStdio;
+use std::time::Duration;
 
 use base64::Engine as _;
 use isekai_protocol::{decode_ctl_message, BuildOutputStream, CtlMessage, NotifyKind, VarScope};
@@ -84,6 +85,19 @@ async fn run_ctl_no_sock(args: &[&str]) -> (Option<i32>, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// Awaits a `run_stub_listener` task with a deadline, so a regression that
+/// makes the client stop dialing `--sock` (e.g. preferring `$ISEKAI_CTL_SOCK`
+/// instead) — which would otherwise leave the stub's `accept()` waiting for
+/// a connection that never arrives — fails this test outright instead of
+/// hanging until the whole CI job's own timeout, the same convention every
+/// other e2e file in this crate already follows for its own I/O waits.
+async fn await_server(server: tokio::task::JoinHandle<Vec<CtlMessage>>) -> Vec<CtlMessage> {
+    tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .expect("stub ctl-socket listener did not receive the expected connection(s) in time")
+        .expect("stub ctl-socket listener task panicked")
 }
 
 /// Accepts exactly `connections` ctl-socket connections in sequence,
@@ -167,7 +181,7 @@ async fn setvar_then_getvar_roundtrips_through_the_ctl_socket() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(stdout, "myvalue", "getvar must print the value with no trailing newline");
 
-    let received = server.await.unwrap();
+    let received = await_server(server).await;
     assert_eq!(received[0], CtlMessage::SetVar { scope: VarScope::Session, key: "mykey".to_string(), value: "myvalue".to_string() });
     assert_eq!(received[1], CtlMessage::GetVarRequest { scope: VarScope::Session, key: "mykey".to_string() });
 }
@@ -175,7 +189,9 @@ async fn setvar_then_getvar_roundtrips_through_the_ctl_socket() {
 #[tokio::test]
 async fn getvar_scopes_are_isolated_from_each_other() {
     let (_dir, sock_path, listener) = bind_stub_socket();
-    let server = tokio::spawn(run_stub_listener(listener, sock_path.clone(), 3));
+    // 4 connections: 2 setvar + 2 getvar (one per scope) — see the fix note
+    // below on why both getvars matter, not just the global one.
+    let server = tokio::spawn(run_stub_listener(listener, sock_path.clone(), 4));
 
     let (code, ..) = run_ctl(&sock_path, &["setvar", "--scope", "tab", "k", "tab-value"]).await;
     assert_eq!(code, Some(0));
@@ -186,7 +202,21 @@ async fn getvar_scopes_are_isolated_from_each_other() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(stdout, "global-value");
 
-    server.await.unwrap();
+    // Regression guard (adversarial review finding): this test used to only
+    // ever query `--scope global`, so it would still pass unchanged even if
+    // `--scope tab` on the CLI silently failed to reach the wire (e.g. a
+    // regression that always sent `VarScope::Global` regardless of the flag)
+    // — the isolation this test's name promises was actually coming entirely
+    // from the stub's own `HashMap` keyed by `{scope:?}:{key}` (see
+    // `handle_one_connection`), never from anything this test itself
+    // checked. Querying `--scope tab` too and asserting it returns the
+    // *other* value proves the client actually threads a distinct scope per
+    // call, not just that the stub can tell two scopes apart.
+    let (code, stdout, stderr) = run_ctl(&sock_path, &["getvar", "--scope", "tab", "k"]).await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stdout, "tab-value");
+
+    await_server(server).await;
 }
 
 #[tokio::test]
@@ -199,7 +229,7 @@ async fn getvar_on_an_unset_key_exits_nonzero_with_no_stdout() {
     assert!(stdout.is_empty(), "{stdout:?}");
     assert!(!stderr.is_empty());
 
-    server.await.unwrap();
+    await_server(server).await;
 }
 
 #[tokio::test]
@@ -210,7 +240,7 @@ async fn tab_color_sends_the_set_tab_color_frame() {
     let (code, _stdout, stderr) = run_ctl(&sock_path, &["tab-color", "#ff00aa"]).await;
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
-    let received = server.await.unwrap();
+    let received = await_server(server).await;
     assert_eq!(received[0], CtlMessage::SetTabColor { r: 0xff, g: 0x00, b: 0xaa });
 }
 
@@ -222,7 +252,7 @@ async fn notify_tmux_kind_carries_tag_and_seq() {
     let (code, _stdout, stderr) = run_ctl(&sock_path, &["notify", "--kind", "bell", "--tag", "win1.pane2", "--seq", "5"]).await;
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
-    let received = server.await.unwrap();
+    let received = await_server(server).await;
     assert_eq!(
         received[0],
         CtlMessage::Notify { kind: NotifyKind::Bell, tmux_tag: "win1.pane2".to_string(), seq: 5, title: String::new(), body: String::new() }
@@ -245,7 +275,7 @@ async fn notify_ai_kind_carries_title_and_body() {
     let (code, _stdout, stderr) = run_ctl(&sock_path, &["notify", "--kind", "waiting", "Permission needed", "Claude wants to run rm"]).await;
     assert_eq!(code, Some(0), "stderr: {stderr}");
 
-    let received = server.await.unwrap();
+    let received = await_server(server).await;
     assert_eq!(
         received[0],
         CtlMessage::Notify {
@@ -276,7 +306,7 @@ async fn build_streams_output_chunks_and_propagates_the_exit_code() {
     assert!(stdout.contains("compiling..."), "stdout: {stdout:?}");
     assert!(stderr.contains("a warning"), "stderr: {stderr:?}");
 
-    let received = server.await.unwrap();
+    let received = await_server(server).await;
     assert_eq!(received[0], CtlMessage::BuildRequest { profile: "my-profile".to_string() });
 }
 
