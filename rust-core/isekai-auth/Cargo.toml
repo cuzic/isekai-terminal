@@ -23,3 +23,8 @@ isekai-fs-guard = { path = "../isekai-fs-guard" }
 # in this workspace (isekai-transport, isekai-terminal-core) rather than pulling in a
 # second async HTTP stack just for a handful of sequential POSTs.
 ureq = "3"
+# `TokenSet`(access_token/refresh_token)をdrop時にゼロ化するために使う
+# (`file_provider.rs`の`impl Drop for TokenSet`)。ルートクレートの`SshAuth`が
+# 同じzeroizeで明示呼び出し方式なのに対し、こちらはUniFFI公開型ではないため
+# Drop方式を採れる(2026-07-28、書籍原稿の実地検証で発覚した非対称性の是正)。
+zeroize = "1"

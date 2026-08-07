@@ -53,6 +53,50 @@ pub(crate) trait HolderSpawner {
 /// redesign; see `super`'s module docs).
 pub(crate) struct DetachedProcessSpawner;
 
+/// RAII guard: while alive, this process's own STDIN/STDOUT/STDERR handles
+/// are marked non-inheritable, so a `Command::spawn()` made while it's alive
+/// doesn't leak them into the child (see the call site in
+/// [`DetachedProcessSpawner::spawn`] for why this matters). Restores
+/// inheritance on drop — ambient inheritable-by-default is relied on
+/// elsewhere in this process (`child_stdio.rs`'s deliberate
+/// `.stderr(Stdio::inherit())` for the separate `isekai-pipe connect
+/// --stdio` child), so this must not be a permanent, process-wide change,
+/// only a narrow window around the one spawn that must not leak.
+#[cfg(windows)]
+struct NonInheritableStdHandlesGuard {
+    changed: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl NonInheritableStdHandlesGuard {
+    fn new() -> Self {
+        use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+        let mut changed = Vec::new();
+        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(std_handle) };
+            if handle.is_null() || handle == (-1isize as HANDLE) {
+                continue;
+            }
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                changed.push(handle);
+            }
+        }
+        Self { changed }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NonInheritableStdHandlesGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for handle in self.changed.drain(..) {
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+        }
+    }
+}
+
 #[cfg(windows)]
 impl HolderSpawner for DetachedProcessSpawner {
     fn spawn(&self, args: &[String], handoff: Option<&[u8]>) -> io::Result<()> {
@@ -73,7 +117,24 @@ impl HolderSpawner for DetachedProcessSpawner {
             .stderr(std::process::Stdio::null());
         command.stdin(if handoff.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
 
-        let mut child = command.spawn()?;
+        // `CreateProcess`'s `bInheritHandles=TRUE` (required here since
+        // stdio is explicitly redirected above) duplicates *every*
+        // inheritable handle open in this process into the child, not just
+        // the three assigned via `Stdio::null()`/`Stdio::piped()` — including
+        // this CLI's own stdout/stderr as inherited from *its* caller (e.g. a
+        // script piping `isekai-ssh`'s output). The detached holder then
+        // holds that duplicate open for its full `IDLE_GRACE` lifetime, so
+        // the caller's pipe never sees EOF until the holder exits ~10s later
+        // even though this process itself returns immediately — found via a
+        // real, live-reproduced hang (`isekai-ssh ... | Out-String` blocking
+        // ~10s past actual completion, 2026-08). Scoped to just this
+        // `spawn()` call — see `NonInheritableStdHandlesGuard`'s docs on why
+        // it must not be left disabled process-wide (`child_stdio.rs`
+        // deliberately relies on inherited stderr for a different child).
+        let mut child = {
+            let _guard = NonInheritableStdHandlesGuard::new();
+            command.spawn()?
+        };
         if let Some(bytes) = handoff {
             // Write on a dedicated OS thread rather than blocking `spawn`'s
             // caller (a `dispatch`/`tokio` task) on `write_all`: a named

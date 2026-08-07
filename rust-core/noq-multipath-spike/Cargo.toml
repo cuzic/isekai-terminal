@@ -26,6 +26,10 @@ name = "dual-fd-loopback-test"
 path = "src/bin/dual_fd_loopback_test.rs"
 
 [[bin]]
+name = "dual-fd-loopback-test-v6dual"
+path = "src/bin/dual_fd_loopback_test_v6dual.rs"
+
+[[bin]]
 name = "compat-check"
 path = "src/bin/compat_check.rs"
 

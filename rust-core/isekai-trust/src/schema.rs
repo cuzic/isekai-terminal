@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// How `isekai-ssh connect` is allowed to accept a re-deployed
 /// `isekai-helper` binary without re-running `init`.
@@ -72,6 +73,23 @@ pub struct HelperTrust {
     /// unchanged, with this simply absent/`None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_stun_observed_addr: Option<String>,
+}
+
+/// Zeroizes `cached_session_secret` when a `HelperTrust` is dropped, mirroring
+/// `isekai-auth::TokenSet`'s `Drop` impl. This has limited effect on its own —
+/// `cached_session_secret` is persisted to `known_helpers.toml` as plain
+/// base64 by design (see the field's docs above), so the file on disk is the
+/// bigger exposure — but it keeps this crate's in-memory handling symmetric
+/// with `TokenSet`'s instead of being the one secret-bearing type in the
+/// workspace that doesn't bother (2026-07-28, gap found while fact-checking
+/// the isekai-terminal case study for a book manuscript).
+///
+/// Like `TokenSet`, `Drop` means `cached_session_secret` can no longer be
+/// moved out of a `HelperTrust` (only `.clone()`d).
+impl Drop for HelperTrust {
+    fn drop(&mut self) {
+        self.cached_session_secret.zeroize();
+    }
 }
 
 /// The whole `known_helpers.toml` document.

@@ -52,6 +52,8 @@ mod app_ack;
 
 pub use app_ack::{AppAckCounters, AppAckTasks, spawn_app_ack_tasks};
 
+use std::time::Duration;
+
 use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::hello::Proof;
 use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
@@ -83,6 +85,14 @@ pub const APP_ACK: u8 = 0x12;
 const CONTROL_HELLO_FRAME_LEN: usize = 1 + isekai_protocol::hello::PROOF_LEN;
 const CONTROL_ACK_FRAME_LEN: usize = 1 + SESSION_ID_LEN;
 
+/// Bounds each network round trip in `reconnect_and_resume` and
+/// `open_control_stream` — see `TransportError::TimedOut`'s docs for why
+/// this doesn't just trust `noq`'s own idle-timeout/keepalive to fire.
+/// Generous relative to a healthy handshake (normally well under a second)
+/// to avoid false trips on a slow/lossy link, while still being far shorter
+/// than "hangs forever".
+const TRANSPORT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// A successfully-established control stream (`archive/ISEKAI_SSH_DESIGN.md`
 /// "接続確立順序" step 2), plus the `session_id` isekai-helper echoed back
 /// (`#18-4`: the client itself generated this value before ever connecting
@@ -99,24 +109,34 @@ pub struct ControlStream {
 /// computed from the same connection's exporter with an empty `extra`, so
 /// they are always equal; recomputing would just waste an HMAC call
 /// (`isekai_pipe_quic_transport.rs::open_control_stream`'s same shortcut).
+///
+/// Bounded end-to-end by [`TRANSPORT_STEP_TIMEOUT`] (`reconnect_and_resume`'s
+/// docs explain why) — this is called both on a brand-new connection
+/// (`connect_via_relay_resumable`) and, via `isekai-pipe connect`'s
+/// `reestablish_control_stream`, on every connection a `RESUME` just handed
+/// back, so it sits squarely in the same post-suspend hang-prone path.
 pub async fn open_control_stream(conn: &AnyMuxConnection, proof: &Proof) -> Result<ControlStream, TransportError> {
-    let mut stream = conn.open_bi().await.map_err(TransportError::Mux)?;
+    tokio::time::timeout(TRANSPORT_STEP_TIMEOUT, async {
+        let mut stream = conn.open_bi().await.map_err(TransportError::Mux)?;
 
-    let mut hello = Vec::with_capacity(CONTROL_HELLO_FRAME_LEN);
-    hello.push(CONTROL_HELLO);
-    hello.extend_from_slice(proof.as_bytes());
-    stream.write_all(&hello).await.map_err(TransportError::Mux)?;
+        let mut hello = Vec::with_capacity(CONTROL_HELLO_FRAME_LEN);
+        hello.push(CONTROL_HELLO);
+        hello.extend_from_slice(proof.as_bytes());
+        stream.write_all(&hello).await.map_err(TransportError::Mux)?;
 
-    let mut ack = [0u8; CONTROL_ACK_FRAME_LEN];
-    read_exact(&mut stream, &mut ack).await?;
-    if ack[0] != CONTROL_ACK {
-        return Err(TransportError::ControlHandshake(format!(
-            "unexpected control response byte {:#x}",
-            ack[0]
-        )));
-    }
-    let session_id = decode_session_id(&ack[1..CONTROL_ACK_FRAME_LEN])?;
-    Ok(ControlStream { stream, session_id })
+        let mut ack = [0u8; CONTROL_ACK_FRAME_LEN];
+        read_exact(&mut stream, &mut ack).await?;
+        if ack[0] != CONTROL_ACK {
+            return Err(TransportError::ControlHandshake(format!(
+                "unexpected control response byte {:#x}",
+                ack[0]
+            )));
+        }
+        let session_id = decode_session_id(&ack[1..CONTROL_ACK_FRAME_LEN])?;
+        Ok(ControlStream { stream, session_id })
+    })
+    .await
+    .map_err(|_| TransportError::TimedOut { stage: "open_control_stream" })?
 }
 
 /// The result of establishing a brand-new (non-resumed) relay connection with
@@ -661,6 +681,16 @@ pub(crate) fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_p
 /// current C2H-sent / H2C-delivered offsets (`archive/ISEKAI_SSH_DESIGN.md`'s
 /// naming) — the caller (`isekai-ssh`) owns that bookkeeping; this function
 /// only knows how to put them on the wire and parse the response.
+///
+/// The dial and the RESUME request are each bounded by
+/// [`TRANSPORT_STEP_TIMEOUT`] rather than left to wait on `noq`'s own
+/// idle-timeout/keepalive indefinitely (`always-connects.md`'s "OS-level
+/// bound alone isn't trusted" pattern, already used for STUN DNS lookups in
+/// `isekai-ssh/src/wrapper.rs`). Without this, a host suspend/resume can
+/// leave this call hanging forever: a monotonic clock commonly excludes
+/// suspended time, so the very timer meant to declare the old connection
+/// dead can undercount how much real time actually passed and never fire,
+/// while the peer (never suspended) has long since discarded its side.
 pub async fn reconnect_and_resume(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -669,14 +699,17 @@ pub async fn reconnect_and_resume(
     client_delivered_offset: H2cClientDeliveredOffset,
 ) -> Result<ResumeAckOutcome, TransportError> {
     let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
-    let conn = endpoint
-        .connect(RemoteSpec {
+    let conn = tokio::time::timeout(
+        TRANSPORT_STEP_TIMEOUT,
+        endpoint.connect(RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
             cert_sha256_hex: target.cert_sha256_hex.clone(),
-        })
-        .await
-        .map_err(TransportError::Mux)?;
+        }),
+    )
+    .await
+    .map_err(|_| TransportError::TimedOut { stage: "reconnect_and_resume: connect" })?
+    .map_err(TransportError::Mux)?;
     // Taken before `endpoint` goes out of scope at the end of this function
     // — see `connect_via_relay_resumable`'s identical comment.
     let network_rebinder = endpoint.rebinder();
@@ -691,14 +724,18 @@ pub async fn reconnect_and_resume(
     // 揃えたもの。
     let resume_proof_bytes = compute_proof(&conn, &target.session_secret, session_id.as_bytes()).await?;
 
-    let outcome = quicmux::request_resume(
-        &conn,
-        session_id.as_bytes(),
-        resume_proof_bytes.as_bytes(),
-        client_sent_offset.get(),
-        client_delivered_offset.get(),
+    let outcome = tokio::time::timeout(
+        TRANSPORT_STEP_TIMEOUT,
+        quicmux::request_resume(
+            &conn,
+            session_id.as_bytes(),
+            resume_proof_bytes.as_bytes(),
+            client_sent_offset.get(),
+            client_delivered_offset.get(),
+        ),
     )
     .await
+    .map_err(|_| TransportError::TimedOut { stage: "reconnect_and_resume: request_resume" })?
     .map_err(|e| match e {
         quicmux::ResumeRequestError::Mux(mux_err) => TransportError::Mux(mux_err),
         quicmux::ResumeRequestError::Rejected(reason) => TransportError::ResumeRejected(map_reject_reason(reason)),

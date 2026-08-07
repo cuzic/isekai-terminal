@@ -351,7 +351,7 @@ fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
 /// whole `isekai-ssh <host>` connection attempt, over a typo in a purely
 /// cosmetic feature. Validating the *syntax* here still matters even though
 /// a failure is non-fatal: an unvalidated value would otherwise reach
-/// `ctl_forward.rs::remote_command_arg`, which embeds it directly into the
+/// `ctl_forward.rs::build_login_shell_command`, which embeds it directly into the
 /// shell command line `isekai-ssh` execs on the remote to establish the
 /// session (see that function's doc comment on why bare validated hex,
 /// never arbitrary text, is required there) — this function is what

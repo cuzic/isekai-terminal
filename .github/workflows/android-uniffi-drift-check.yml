@@ -1,0 +1,117 @@
+name: Android UniFFI binding drift check
+
+# `android/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt` は
+# UniFFI が rust-core のメタデータから生成するファイルであり、手編集してはいけない。
+# iOS側は ios-rust-core-check.yml(Swiftバインディング)と ios-logic-linux-check.yml
+# (Linux向けFFI)が「再生成して`git diff --exit-code`」方式でdriftを機械的に検知して
+# いるが、Android側には同等のチェックが無く、
+#   - 生成物が手編集された
+#   - Rust側のpublic APIを変えたのにバインディング再生成を忘れた
+# のどちらも検知できなかった(regenerate-uniffi-bindings.ymlは手動実行専用で、
+# 生成物をartifactに出すだけでdriftの検証はしない)。このワークフローはその穴を塞ぐ。
+#
+# uniffiの`--library`方式はコンパイル済みバイナリのメタデータを読むだけなので、
+# ホストのデフォルトターゲット向けdebugビルド
+# (rust-core/target/debug/libisekai_terminal_core.so)で十分で、Android向けの
+# NDKクロスビルドは不要(そのためこのジョブはandroid-test-check.ymlより大幅に軽い)。
+# ただし rust-core/src/isekai_pipe_quic_transport.rs が `include_bytes!` で
+# Linux muslの静的バイナリを無条件に埋め込むため、build-isekai-pipe-musl.sh は
+# 他ワークフローと同様に先に必要。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "android/src/main/kotlin/uniffi/**"
+      - ".github/workflows/android-uniffi-drift-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "android/src/main/kotlin/uniffi/**"
+      - ".github/workflows/android-uniffi-drift-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-uniffi-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: android-uniffi-drift-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            android-uniffi-drift-${{ runner.os }}-
+
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
+
+      - name: Build isekai-terminal-core (host debug)
+        working-directory: rust-core
+        run: cargo build -p isekai-terminal-core
+
+      - name: Regenerate Kotlin bindings
+        working-directory: rust-core
+        run: |
+          set -euo pipefail
+          rm -rf ../android/src/main/kotlin/uniffi/isekai_terminal_core
+          cargo run -p uniffi-bindgen -- generate \
+            --library target/debug/libisekai_terminal_core.so \
+            --language kotlin \
+            --out-dir ../android/src/main/kotlin
+
+      - name: Check for drift
+        # `git diff --exit-code`だけでは、UniFFIが新規ファイルを生成した場合
+        # (未追跡ファイルになる)を取りこぼすため、`git status --porcelain`でも
+        # 同じパスを確認する。
+        run: |
+          set -euo pipefail
+          GENERATED_DIR=android/src/main/kotlin/uniffi
+          if ! git diff --exit-code -- "$GENERATED_DIR" \
+            || [ -n "$(git status --porcelain -- "$GENERATED_DIR")" ]; then
+            echo "::error::$GENERATED_DIR is stale or was hand-edited. Regenerate it with 'cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_terminal_core.so --language kotlin --out-dir ../android/src/main/kotlin' (from rust-core/) and commit the result." >&2
+            git status --porcelain -- "$GENERATED_DIR"
+            git diff -- "$GENERATED_DIR"
+            exit 1
+          fi
+
+      - name: Upload regenerated bindings on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uniffi-kotlin-bindings-regenerated
+          path: android/src/main/kotlin/uniffi/isekai_terminal_core/
+          retention-days: 7

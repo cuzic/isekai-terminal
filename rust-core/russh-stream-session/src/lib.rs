@@ -15,6 +15,14 @@
 //! and open one session channel (shell or exec)"; the I/O loop past that
 //! point is left to the caller.
 //!
+//! # Provenance
+//!
+//! Original implementation — not a fork or port of any upstream crate.
+//! `russh` is an ordinary dependency here, neither vendored nor patched. The
+//! code was extracted out of this repository's own `isekai-terminal-core` SSH
+//! transport (`rust-core/src/transport/ssh_handler.rs`) and generalized so
+//! that no `isekai-*` type appears in the public API.
+//!
 //! [`russh`]: https://docs.rs/russh
 
 use std::collections::HashMap;

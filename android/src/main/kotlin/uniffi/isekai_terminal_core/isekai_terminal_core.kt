@@ -4544,6 +4544,11 @@ data class IsekaiLinkRelayConfig (
      * `relay_addr`への認証に使うBearerトークン(JWT)。取得・更新はKotlin側の責務
      * （PLAN.md Phase 10-4、JWT発行・配布フロー参照）——rust-core側はトークン文字列を
      * 受け取るだけで、その取得方法には関知しない。
+     *
+     * `auth: SshAuth` と違い、このフィールドは**意図的にゼロ化していない**
+     * (`transport::zeroize_ssh_auth`相当の処理を持たない)。SSHの秘密鍵/パスワードが
+     * 長寿命で漏洩コストが高いのに対し、relay JWTは短寿命かつKotlin側から再取得する
+     * コストも低いため、ヒープ上の残留を消すための追加の複雑さに見合わないと判断している。
      */
     var `relayJwt`: kotlin.String
     

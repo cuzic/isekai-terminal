@@ -33,25 +33,31 @@ Rust 側は SSH/QUIC と実際に通信し、トランスポートの実際の�
 Rust の状態と食い違い得る「もう1つの状態のコピー」が増える。これは抽象的な懸念ではなく、
 実際にこのプロジェクトで一度発生し、発見されるまで気づかれなかった不具合である(下記参照)。
 
-## 実例: `notifyNetworkLost()` の修正(Phase 8-4d)
+## 実例: `notifyNetworkPathChanged()` の修正(Phase 8-4d)
+
+(当時の名前は `notifyNetworkLost()` / `notify_network_lost()`。その後、喪失だけでなく
+復帰も同じ経路で転送するようになり現在の名前にリネームされている。)
 
 - **問題**: `TerminalSession.kt` の docstring には元々「セッション状態の SSOT は Rust 側に持つ」
-  と書いてあったにもかかわらず、`notifyNetworkLost()`(ハンドシェイク中/TCP接続中は切断、
+  と書いてあったにもかかわらず、この処理(ハンドシェイク中/TCP接続中は切断、
   QUIC接続中は無視、という判断)は Kotlin 側のミラー状態(`_state`)を見て判断していた。
 - **修正**: `rust-core/src/orchestrator.rs` の `SessionOrchestrator` に `ConnPhase`
-  (`Idle`/`Connecting`/`Connected`)を追加し、`SessionOrchestrator::notify_network_lost()`
+  (`Idle`/`Connecting`/`Connected`)を追加し、`SessionOrchestrator::notify_network_path_changed()`
   として判断ロジックを Rust 側に一元化した。
 - **結果**: `android/src/main/kotlin/tools/isekai/terminal/session/TerminalSession.kt` の
-  `notifyNetworkLost()` は次の1行に縮小された:
+  当該メソッドは次の1行に縮小された:
 
   ```kotlin
-  fun notifyNetworkLost() = orchestrator.notifyNetworkLost()
+  fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
   ```
 
   判断結果は既存の `onConnectionStateChanged` コールバック経由でそのまま UI に反映される。
 
 ## 参照実装
 
-- `rust-core/src/orchestrator.rs`: `SessionOrchestrator` / `ConnPhase`
-- `android/src/main/kotlin/tools/isekai/terminal/session/TerminalSession.kt`: `notifyNetworkLost()`
-- `android/src/main/kotlin/tools/isekai/terminal/TerminalViewModel.kt`: `notifyNetworkLost()` の呼び出し元
+- `rust-core/src/orchestrator.rs`: `SessionOrchestrator` / `ConnPhase` /
+  `notify_network_path_changed()`
+- `android/src/main/kotlin/tools/isekai/terminal/session/TerminalSession.kt`:
+  `notifyNetworkPathChanged()`
+- `android/src/main/kotlin/tools/isekai/terminal/TerminalTabsViewModel.kt`:
+  `onNetworkPathChanged()`(`notifyNetworkPathChanged()` の呼び出し元、全タブ/全paneへファンアウト)

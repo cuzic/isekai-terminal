@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 isekai-pipe-core = { path = "../isekai-pipe-core" }
 isekai-protocol = { path = "../isekai-protocol" }
+# `tty` module's `resolve_home_dir` (locating `~/.cache/isekai-pipe/tty`).
+isekai-fs-guard = { path = "../isekai-fs-guard" }
 # `qmux-relay`: isekai-pipe already unconditionally depends on
 # `isekai-link-masque`, which itself unconditionally needs `h3-qmux`/`qmux`
 # (`#qmux-leg2`), so enabling this here (`#qmux-leg1`, isekai-pipe connect's
@@ -50,6 +52,17 @@ bytes = "1"
 # events (`resume_loop.rs::notify_os`) — a lightweight stand-in for a full
 # tssh-style in-terminal overlay, which is a separate, larger follow-up.
 notify-rust = "4"
+
+# `tty` module (`isekai-pipe tty daemon`/`tty attach`): PTY spawning
+# (`openpty`/`login_tty`), `flock`, and `SO_PEERCRED` are all POSIX-only —
+# the daemon/attach client only ever run on the remote host, which this
+# project already assumes is always Linux (`ctl_forward.rs`'s equivalent
+# assumption on the isekai-ssh side). `isekai-pipe` itself still builds on
+# Windows/macOS for the local `connect` client role; `tty` is simply absent
+# there (`main.rs`'s dispatch rejects the subcommand with a clear message
+# rather than failing to compile).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
