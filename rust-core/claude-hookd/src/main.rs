@@ -399,45 +399,60 @@ fn sweep_stale_daemon_sockets() {
     let _ = ctl_gc::sweep_stale_sockets(&daemon_sock_dir(), DAEMON_SOCK_PREFIX, Duration::from_secs(60 * 60));
 }
 
-/// How many times [`peer_is_same_uid`] retries a failed `peer_cred()` call
-/// before treating it as a real mismatch/absence, and how long it waits
-/// between attempts.
+/// Total time [`peer_is_same_uid`] is willing to keep retrying a failing
+/// `peer_cred()` call before giving up and treating it as a real
+/// mismatch/absence.
 #[cfg(unix)]
-const PEER_CRED_RETRIES: u32 = 5;
+const PEER_CRED_RETRY_BUDGET: Duration = Duration::from_millis(800);
+/// Delay before the first retry; doubles after each subsequent attempt
+/// (capped — see [`peer_is_same_uid`]) so a fast-resolving CI hiccup pays
+/// almost nothing while a slow one still gets covered within the budget
+/// above.
 #[cfg(unix)]
-const PEER_CRED_RETRY_DELAY: Duration = Duration::from_millis(5);
+const PEER_CRED_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(2);
+#[cfg(unix)]
+const PEER_CRED_RETRY_MAX_DELAY: Duration = Duration::from_millis(50);
 
 /// Checks a connected `UnixStream`'s peer effective uid against this
 /// process's own, used identically by both `send_event` (client side) and
 /// `daemon::read_one_event_line` (server side) — see either call site for
 /// why this check exists at all.
 ///
-/// Retries a bounded number of times on `Err` (never on a real `Ok`
-/// mismatch, which fails closed immediately): tokio's macOS
-/// `peer_cred()` additionally requires a `LOCAL_PEEREPID` `getsockopt` to
-/// succeed to fill in the (here, unused) pid field, even though only the
-/// uid is read here — and that lookup has been observed to fail on a
-/// freshly-accepted/connected socket under GitHub Actions' macOS runner
-/// (`test-macos` job, 2026-08: every daemon test that exercises a real
-/// `UnixListener::accept()` failed, while tests that skip straight to
-/// `read_one_event`/`read_one_event_line` via `UnixStream::pair()` — no
-/// `accept()` involved — did not), even though `getpeereid()` alone (the
-/// uid/gid this check actually needs) would very likely have succeeded.
-/// The retry budget (5 * 5ms = 25ms worst case) is negligible next to this
-/// being a once-per-event check, and still fails closed well within
-/// `EVENT_READ_TIMEOUT`/any caller's own timeout for a genuine mismatch or
-/// permanent absence.
+/// Retries with exponential backoff on `Err`, up to
+/// [`PEER_CRED_RETRY_BUDGET`] (never on a real `Ok` mismatch, which fails
+/// closed immediately): tokio's macOS `peer_cred()` additionally requires a
+/// `LOCAL_PEEREPID` `getsockopt` to succeed to fill in the (here, unused)
+/// pid field, even though only the uid is read here — and that lookup has
+/// been observed to fail on a freshly-accepted/connected socket under
+/// GitHub Actions' macOS runner (`test-macos` job, 2026-08: every daemon
+/// test that exercises a real `UnixListener::accept()` failed, while tests
+/// that skip straight to `read_one_event`/`read_one_event_line` via
+/// `UnixStream::pair()` — no `accept()` involved — did not), even though
+/// `getpeereid()` alone (the uid/gid this check actually needs) would very
+/// likely have succeeded. A first attempt at this fix used a fixed 5
+/// retries * 5ms — too short a budget: it upgraded the failure from "every
+/// event on macOS CI silently dropped" to "some events on macOS CI
+/// silently dropped" (`teammate_dispatch_then_ambiguous_stop_defers_within_ttl`'s
+/// second CI run showed one of its two events applied, the other still
+/// lost), rather than eliminating it. `PEER_CRED_RETRY_BUDGET` is generous
+/// (800ms) because this check runs at most once per hook event, not on any
+/// hot path, and it still fails closed for a genuine mismatch/permanent
+/// absence well within `EVENT_READ_TIMEOUT`/any caller's own timeout.
 #[cfg(unix)]
 async fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
     let self_uid = unsafe { libc::geteuid() };
-    for attempt in 0..PEER_CRED_RETRIES {
+    let deadline = tokio::time::Instant::now() + PEER_CRED_RETRY_BUDGET;
+    let mut delay = PEER_CRED_RETRY_INITIAL_DELAY;
+    loop {
         match stream.peer_cred() {
             Ok(cred) => return cred.uid() == self_uid,
-            Err(_) if attempt + 1 < PEER_CRED_RETRIES => tokio::time::sleep(PEER_CRED_RETRY_DELAY).await,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(PEER_CRED_RETRY_MAX_DELAY);
+            }
             Err(_) => return false,
         }
     }
-    false
 }
 
 /// Connects to the daemon socket and sends one line, this module's own
