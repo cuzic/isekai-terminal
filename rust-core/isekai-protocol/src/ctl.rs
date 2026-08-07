@@ -84,6 +84,14 @@ pub const MAX_BUILD_RESULT_PATHS: usize = 64;
 /// Cap on a single `result_paths` entry's byte length.
 pub const MAX_BUILD_RESULT_PATH_LEN: usize = 4 * 1024;
 
+/// Cap on a `SetTitle`'s `value` byte length. Generous compared to
+/// `MAX_NOTIFY_TITLE_LEN` (a real window/tab title can legitimately be a
+/// full remote path or profile description, not just a short label) but
+/// still far below `MAX_CTL_MESSAGE_LINE_LEN` — without this, `value` was
+/// the one `CtlMessage` string field with no upper bound at all short of the
+/// whole message's 8 MiB cap, straight into an `OSC 0` sequence.
+pub const MAX_TITLE_LEN: usize = 4 * 1024;
+
 /// Cap on a `notify`'s `title` byte length (`AI_INTEGRATION_DESIGN.md` §6.1).
 /// Shares `MAX_VAR_KEY_LEN`'s order of magnitude: this is a short
 /// notification-bar-style label, not body text.
@@ -407,6 +415,12 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
                     reason: "must be non-empty".to_string(),
                 });
             }
+            if value.len() > MAX_TITLE_LEN {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "value",
+                    reason: format!("is {} bytes, exceeding the {MAX_TITLE_LEN} byte limit", value.len()),
+                });
+            }
             Ok(())
         }
         // r/g/b are u8, already bounded to 0..=255 by the type itself.
@@ -635,6 +649,22 @@ mod tests {
     fn rejects_empty_title() {
         let json = br#"{"op":"title","value":""}"#;
         let err = decode_ctl_message(json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField { field: "value", .. }
+        ));
+    }
+
+    /// Regression guard (found by adversarial review of PR #60): `SetTitle`
+    /// used to be the one `CtlMessage` string field with no upper bound
+    /// short of the whole message's `MAX_CTL_MESSAGE_LINE_LEN` (8 MiB),
+    /// unlike every structurally similar field (`Notify.title`, `setvar`'s
+    /// value, ...) which all have their own tighter cap.
+    #[test]
+    fn rejects_title_over_the_length_limit() {
+        let value = "x".repeat(MAX_TITLE_LEN + 1);
+        let json = serde_json::to_vec(&serde_json::json!({"op": "title", "value": value})).unwrap();
+        let err = decode_ctl_message(&json).unwrap_err();
         assert!(matches!(
             err,
             ProtocolError::CtlMessageField { field: "value", .. }
