@@ -599,7 +599,7 @@ mod tests {
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
         let outcome = super::client::run_inner(
-            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true,
+            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None,
         )
         .await
         .unwrap();

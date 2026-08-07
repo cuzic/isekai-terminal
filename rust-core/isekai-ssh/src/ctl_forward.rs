@@ -589,6 +589,7 @@ mod tests {
         assert!(!cmd.contains("ISEKAI_TAB_ATTENTION_COLOR"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_command_exports_the_remote_path_and_execs_the_given_exec_target() {
         let forward = fixture_forward();
