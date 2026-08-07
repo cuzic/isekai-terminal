@@ -74,12 +74,48 @@ pub(crate) async fn tty_command(mut args: impl Iterator<Item = String>) -> ExitC
     }
 }
 
+/// `<name>` becomes a bare path component under `~/.cache/isekai-pipe/tty/`
+/// (`unix_socket::private_runtime_dir().join(format!("{name}.sock"))` /
+/// `daemon_lock`'s equivalent `.lock` join) — **neither of those call sites
+/// validates it**, so an unchecked `name` containing `/` (e.g. `../../etc/x`)
+/// would resolve outside that private directory entirely, a real path
+/// traversal (found while wiring `isekai-ssh --isekai-tty=<name>`, which
+/// feeds a locally-user-controlled string straight into this). This is the
+/// one shared place both `daemon` and `attach` obtain `name` from, so it is
+/// the correct single point to reject a hostile one before it ever reaches a
+/// `.join()`, rather than duplicating the check in both `daemon::run` and
+/// `attach::run`.
+#[cfg(unix)]
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("{name:?} is not a valid session name"));
+    }
+    if name.contains(['/', '\0']) {
+        return Err(format!("{name:?} must not contain '/' or a NUL byte"));
+    }
+    // Generous but bounded: keeps `<name>.sock`/`<name>.lock` well under
+    // every relevant filesystem's filename length limit (Linux: 255 bytes)
+    // with room to spare, without the name itself needing to be anywhere
+    // near that long in practice.
+    if name.len() > 200 {
+        return Err("must be 200 bytes or fewer".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn tty_daemon_command(mut args: impl Iterator<Item = String>) -> ExitCode {
     let Some(name) = args.next() else {
         eprintln!("isekai-pipe tty daemon: a <name> is required");
         return ExitCode::from(crate::EX_USAGE);
     };
+    if let Err(e) = validate_name(&name) {
+        eprintln!("isekai-pipe tty daemon: invalid <name>: {e}");
+        return ExitCode::from(crate::EX_USAGE);
+    }
     // Everything after an optional `--` is the command to run in place of
     // the default login shell; `next()` already consumed `name`, so a bare
     // `--` (with nothing before it in `args`) is exactly "no command given
@@ -114,6 +150,10 @@ async fn tty_attach_command(mut args: impl Iterator<Item = String>) -> ExitCode 
         eprintln!("isekai-pipe tty attach: a <name> is required");
         return ExitCode::from(crate::EX_USAGE);
     };
+    if let Err(e) = validate_name(&name) {
+        eprintln!("isekai-pipe tty attach: invalid <name>: {e}");
+        return ExitCode::from(crate::EX_USAGE);
+    }
     match attach::run(&name).await {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
@@ -133,4 +173,41 @@ async fn tty_daemon_command(_args: impl Iterator<Item = String>) -> ExitCode {
 async fn tty_attach_command(_args: impl Iterator<Item = String>) -> ExitCode {
     eprintln!("isekai-pipe tty attach: only supported on Unix (the remote host this feature targets is always Linux)");
     ExitCode::from(crate::EX_USAGE)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::validate_name;
+
+    #[test]
+    fn rejects_empty_and_dot_names() {
+        assert!(validate_name("").is_err());
+        assert!(validate_name(".").is_err());
+        assert!(validate_name("..").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal_attempts() {
+        assert!(validate_name("../../etc/cron.d/x").is_err());
+        assert!(validate_name("a/b").is_err());
+        assert!(validate_name("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_a_nul_byte() {
+        assert!(validate_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn rejects_an_overly_long_name() {
+        assert!(validate_name(&"a".repeat(201)).is_err());
+        assert!(validate_name(&"a".repeat(200)).is_ok());
+    }
+
+    #[test]
+    fn accepts_ordinary_names() {
+        assert!(validate_name("work").is_ok());
+        assert!(validate_name("isekai-prod-host").is_ok());
+        assert!(validate_name("session.1").is_ok());
+    }
 }
