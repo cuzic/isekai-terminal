@@ -137,19 +137,13 @@ fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
     }
 }
 
-/// Parses a `rrggbb` (optionally `#`-prefixed) color argument into its three
-/// channel bytes.
+/// `isekai-pipe ctl tab-color`'s own error-message prefix around the shared
+/// validator (`isekai-pipe-core::parse_hex_color`, also used by `#@isekai
+/// tab-idle-color`/`tab-attention-color` directive validation and
+/// `claude-hookd`'s color env-var resolution — `ISEKAI_PIPE_DESIGN.md` §8
+/// Epic Q).
 fn parse_hex_color(value: &str) -> Result<(u8, u8, u8), String> {
-    let hex = value.strip_prefix('#').unwrap_or(value);
-    if hex.len() != 6 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "isekai-pipe ctl tab-color: {value:?} is not a valid color (expected 6 hex digits, e.g. ff0000 or '#ff0000')"
-        ));
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).expect("validated hex digits");
-    let g = u8::from_str_radix(&hex[2..4], 16).expect("validated hex digits");
-    let b = u8::from_str_radix(&hex[4..6], 16).expect("validated hex digits");
-    Ok((r, g, b))
+    isekai_pipe_core::parse_hex_color(value).map_err(|e| format!("isekai-pipe ctl tab-color: {e}"))
 }
 
 fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
@@ -852,8 +846,13 @@ fn secret_preamble(sock_path: &Path) -> Vec<u8> {
     line
 }
 
+/// `pub(crate)` (not private) so `claude_hookd`'s daemon can send
+/// `CtlMessage`s in-process rather than shelling out to a second
+/// `isekai-pipe ctl` invocation (`ISEKAI_PIPE_DESIGN.md` §8 Epic Q, Opus
+/// review: avoids a `PATH` dependency, a fork per color/popup transition,
+/// and the opacity of a subprocess exit code).
 #[cfg(unix)]
-async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
+pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
     let mut stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;

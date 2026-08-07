@@ -63,7 +63,17 @@ const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestTty {
     /// No explicit `-t`/`-T` given: allocate a PTY for an interactive
-    /// (no-remote-command) session, skip it for a one-shot remote command.
+    /// (no-remote-command) session. **Diverges from real `ssh(1)`, which
+    /// skips the PTY for a one-shot remote command under `Auto`** — this
+    /// codebase's `decide_session_kind`/`wants_pty` (`native/connect.rs`)
+    /// deliberately still allocates one (`SessionKind::Shell { command:
+    /// Some(_), .. }`, execing the command over that PTY) so a command
+    /// needing a real terminal (an editor, a pager, `sudo` prompting for a
+    /// password) keeps working without the caller having to remember `-t`.
+    /// The tradeoff — CRLF newline translation and merged stdout/stderr on
+    /// the PTY, same as real `ssh -t host cmd` — matches this project's
+    /// history of choosing convenience for interactive terminal use over
+    /// strict `ssh(1)` parity elsewhere. Pass `-T` to opt out.
     Auto,
     /// `-t`: force PTY allocation even for a remote command.
     Yes,
@@ -153,6 +163,30 @@ impl WrapperPlan {
         let tail = &self.ssh_args[self.destination_index + 1..];
         if tail.is_empty() { None } else { Some(tail) }
     }
+
+    /// `--isekai-tty[=<name>]` (`tty_attach.rs`), if given. Every consumer
+    /// (`apply_ctl_socket_forward`, `native::connect::run_authenticated_session`,
+    /// `native::mux::mod::run_as_client_over`) only honors this when
+    /// [`Self::remote_command`] is `None` — an explicit trailing remote
+    /// command always wins silently, the same opportunistic-fallback
+    /// convention `#@isekai ctl-socket` already follows (never blocks a
+    /// connection over an optional feature).
+    pub(crate) fn tty_selection(&self) -> Option<&TtySelection> {
+        self.isekai.tty.as_ref()
+    }
+}
+
+/// `--isekai-tty` (bare) vs `--isekai-tty=<name>` — see `tty_attach.rs`'s
+/// `resolve_exec_command` for how each resolves to an actual
+/// `isekai-pipe tty attach <name>` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TtySelection {
+    /// Derive `<name>` from the connection profile (`isekai-<profile>`) —
+    /// one daemon per host by default, the same default `--isekai-tmux`
+    /// used for its own `Auto` variant in the abandoned tmux-based design
+    /// this superseded.
+    Auto,
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +213,8 @@ struct WrapperIsekaiOptions {
     /// — and by extension `isekai-pipe connect`'s — stderr) into a file, in
     /// addition to the terminal.
     log_file: Option<PathBuf>,
+    /// `--isekai-tty[=<name>]` — see [`WrapperPlan::tty_selection`].
+    tty: Option<TtySelection>,
 }
 
 impl Default for WrapperIsekaiOptions {
@@ -193,6 +229,7 @@ impl Default for WrapperIsekaiOptions {
             helper_release_repo: crate::helper_download::ReleaseSource::DEFAULT_REPO.to_string(),
             helper_release_tag: None,
             log_file: None,
+            tty: None,
         }
     }
 }
@@ -249,6 +286,16 @@ struct IsekaiConfig {
     /// works even when this connection ends up sharing an underlying
     /// transport via ControlMaster/ControlPersist (see `ctl_forward.rs`).
     ctl_socket_enabled: bool,
+    /// `#@isekai tab-idle-color <rrggbb>` (`ISEKAI_PIPE_DESIGN.md` §8 Epic
+    /// Q): the tab background color `claude-hookd` restores once no Claude
+    /// Code session on this tab needs attention. `None` (no directive) means
+    /// "use the built-in default" — resolved on the remote side by
+    /// `claude-hookd`, not here, since `ISEKAI_TAB_IDLE_COLOR` is only
+    /// exported into the remote session's environment when this is `Some`.
+    tab_idle_color: Option<(u8, u8, u8)>,
+    /// `#@isekai tab-attention-color <rrggbb>`, the counterpart to
+    /// `tab_idle_color` for the "a session needs your input" state.
+    tab_attention_color: Option<(u8, u8, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +379,20 @@ impl WrapperResolution {
     /// private field directly (same module).
     pub(crate) fn ctl_socket_enabled(&self) -> bool {
         self.isekai.ctl_socket_enabled
+    }
+
+    /// `#@isekai tab-idle-color <rrggbb>` (Epic Q), already validated and
+    /// parsed at config-resolution time. Both the Unix (`ctl_forward.rs`,
+    /// same module) and native (`native/connect.rs`, `native/mux/owner.rs`)
+    /// paths need this to build the login-shell command's `export` clauses.
+    pub(crate) fn tab_idle_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_idle_color
+    }
+
+    /// `#@isekai tab-attention-color <rrggbb>` (Epic Q), `tab_idle_color`'s
+    /// counterpart.
+    pub(crate) fn tab_attention_color(&self) -> Option<(u8, u8, u8)> {
+        self.isekai.tab_attention_color
     }
 
     /// `{hostname}:{port}` for this destination, using the same
@@ -563,10 +624,14 @@ pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, sh
 /// and zero-cost to this stdio wiring (`run_ssh_with_connect_failure_recovery`).
 /// Prepares the opportunistic `#@isekai ctl-socket` `-R` forward (if enabled
 /// and the session is interactive) and appends the ssh(1) args in the right
-/// order: any `-R` option *before* the destination, then the destination and
-/// its args, then the `export ISEKAI_CTL_SOCK=...` remote command *after* it.
-/// Unix-only — this is the `ssh(1)` ProxyCommand path; the Windows-native path
-/// handles ctl-socket on its own `russh` handle (`native/mux/ctl_forward.rs`).
+/// order: any `-R` option *before* the destination, then (if `--isekai-tty`
+/// needs one) a forced `-t`, then the destination and its args, then the
+/// `export ISEKAI_CTL_SOCK=...; exec <target>` remote command *after* it —
+/// composing ctl-socket and `--isekai-tty` into that one remote command
+/// (`ctl_forward::build_login_shell_command`) rather than one silently
+/// disabling the other. Unix-only — this is the `ssh(1)` ProxyCommand path;
+/// the Windows-native path handles both on its own `russh` handle
+/// (`native/mux/ctl_forward.rs`).
 #[cfg(unix)]
 async fn apply_ctl_socket_forward(
     command: &mut Command,
@@ -594,17 +659,38 @@ async fn apply_ctl_socket_forward(
     } else {
         None
     };
+    // `--isekai-tty` is silently ignored (not an error) when the caller
+    // already gave an explicit trailing remote command — same opportunistic
+    // convention as ctl-socket's own `should_attempt_ctl_forward` gate,
+    // `WrapperPlan::tty_selection`'s doc comment.
+    let tty_exec = if plan.remote_command().is_none() {
+        crate::tty_attach::resolve_exec_command(plan.tty_selection(), resolution.profile())
+    } else {
+        None
+    };
 
     if let Some(forward) = &ctl_forward {
         // `-R` is an ssh(1) option, so it must precede the destination
         // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`).
         command.args(crate::ctl_forward::forward_option_args(forward));
     }
+    if tty_exec.is_some() && plan.request_tty == RequestTty::Auto {
+        // Real `ssh(1)` only allocates a PTY for a remote command when `-t`
+        // is given — `isekai-pipe tty attach` needs one to relay through
+        // (`login_tty` on the daemon side). An explicit `-t`/`-tt`/`-T` the
+        // caller already gave (anything but `Auto`) is left untouched.
+        command.arg("-t");
+    }
     command.args(&plan.ssh_args);
-    if let Some(forward) = &ctl_forward {
+    if ctl_forward.is_some() || tty_exec.is_some() {
         // Anything appended after the destination is the remote command, not
         // an option, to ssh(1).
-        command.arg(crate::ctl_forward::remote_command_arg(forward));
+        command.arg(crate::ctl_forward::build_login_shell_command(
+            ctl_forward.as_ref().map(|forward| forward.remote_path.as_str()),
+            resolution.isekai.tab_idle_color,
+            resolution.isekai.tab_attention_color,
+            tty_exec.as_deref(),
+        ));
     }
 }
 
@@ -1207,6 +1293,16 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
             }
             "--isekai-log-file" => {
                 isekai.log_file = Some(PathBuf::from(next_value(&mut iter, "--isekai-log-file")?));
+            }
+            "--isekai-tty" => isekai.tty = Some(TtySelection::Auto),
+            _ if arg.starts_with("--isekai-tty=") => {
+                let name = arg["--isekai-tty=".len()..].to_string();
+                if name.is_empty() {
+                    return Err(anyhow!(
+                        "isekai-ssh: --isekai-tty=<name> requires a non-empty session name (use bare --isekai-tty to derive one automatically)"
+                    ));
+                }
+                isekai.tty = Some(TtySelection::Named(name));
             }
             _ => ssh_args.push(arg),
         }
@@ -1882,7 +1978,11 @@ fn windows_short_path(_path: &str) -> Option<String> {
     None
 }
 
-fn shell_quote(value: &str) -> String {
+/// POSIX `/bin/sh` single-quote escaping. `pub(crate)` so `tty_attach.rs` can
+/// reuse it to quote a `--isekai-tty=<name>` value the same way this module
+/// already quotes a hostile `#@isekai` directive value or proxy-command arg
+/// — one escaping implementation, not a second hand-rolled copy.
+pub(crate) fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
@@ -2033,6 +2133,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2091,6 +2193,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2183,6 +2287,41 @@ mod tests {
 
         let plan = parse_wrapper(s(&["--isekai-log-file", "/tmp/isekai-ssh.log", "production"])).unwrap();
         assert_eq!(plan.isekai.log_file, Some(PathBuf::from("/tmp/isekai-ssh.log")));
+    }
+
+    #[test]
+    fn tty_selection_defaults_to_none() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        assert_eq!(plan.tty_selection(), None);
+    }
+
+    #[test]
+    fn bare_isekai_tty_selects_auto() {
+        let plan = parse_wrapper(s(&["--isekai-tty", "production"])).unwrap();
+        assert_eq!(plan.tty_selection(), Some(&TtySelection::Auto));
+    }
+
+    #[test]
+    fn isekai_tty_with_a_name_selects_named() {
+        let plan = parse_wrapper(s(&["--isekai-tty=work", "production"])).unwrap();
+        assert_eq!(plan.tty_selection(), Some(&TtySelection::Named("work".to_string())));
+    }
+
+    #[test]
+    fn isekai_tty_with_an_empty_name_is_a_parse_error() {
+        let err = parse_wrapper(s(&["--isekai-tty=", "production"])).unwrap_err();
+        assert!(err.to_string().contains("--isekai-tty=<name>"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn isekai_tty_parses_fine_alongside_an_explicit_remote_command() {
+        // Not a parse-time error (`--isekai-tty` + an explicit trailing
+        // remote command is a valid, if redundant, combination) — resolution
+        // silently prefers the explicit remote command at each call site
+        // (`WrapperPlan::tty_selection`'s doc comment), not here.
+        let plan = parse_wrapper(s(&["--isekai-tty", "production", "uptime"])).unwrap();
+        assert_eq!(plan.tty_selection(), Some(&TtySelection::Auto));
+        assert_eq!(plan.remote_command(), Some(&["uptime".to_string()][..]));
     }
 
     #[test]
@@ -2314,6 +2453,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
@@ -2375,6 +2516,8 @@ mod tests {
         // | `remote-log-level`     | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --log-level`, no `ConnectionIntent` field exists for it) |
         // | `remote-bind-port-range` | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
         // | `local-bind-port-range` | (a) `intent.local_bind_port_range`                                                |
+        // | `tab-idle-color`       | `ctl_forward.rs`'s `build_login_shell_command` (opt-in env var export at connect time only; no `ConnectionIntent` field exists for it — same category as the pre-existing `ctl-socket`/`bootstrap-relay` gaps in this table) |
+        // | `tab-attention-color`  | ditto (`tab-idle-color`'s counterpart)                                            |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2546,6 +2689,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,

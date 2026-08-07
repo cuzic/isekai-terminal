@@ -439,6 +439,7 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
         None => builder.target(env_logger::Target::Stderr),
     };
     builder.init();
+    crate::install_panic_hook();
 
     let profile_for_outcome = launch.profile.clone().unwrap_or_default();
     match run_connect(launch).await {

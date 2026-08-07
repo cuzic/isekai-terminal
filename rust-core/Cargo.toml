@@ -107,14 +107,18 @@ quicmux = { path = "quicmux", features = ["noq"] }
 android_logger = "0.15"
 
 [profile.release]
-panic = "abort"
-# isekai-ssh/isekai-pipeのリリースバイナリが想定より大きかった調査から追加
-# (このprofileはworkspace全体、`isekai-terminal-core`のcdylib/Androidビルドにも
-# 効く)。`strip`/`lto`/`codegen-units=1`は実行時挙動を変えない純粋なサイズ・
-# ビルド時間のトレードオフなのでここに含めるが、`opt-level`("s"/"z"でさらに
-# 縮む余地はある)はQUIC/VTE/crypto等のホットパスの実行速度を犠牲にする判断が
-# 要るため、`isekai-terminal-core`(Android実機のSSHセッション)にも及ぶこの
-# workspace共通profileでは意図的にここでは変更していない。
+# `panic = "abort"`はisekai-ssh/isekai-pipeのリリースバイナリが想定より大きかった
+# 調査から一時追加していたが、2026-07-25に撤去した。`isekai-pipe serve`
+# (`isekai-pipe/src/engine/mod.rs`の`tokio::spawn(handle_incoming)`)も
+# isekai-sshのControlPersist mux holder(`isekai-ssh/src/native/mux/owner.rs`の
+# `serve_clients`/`relay_client`)も、1セッションごとに個別の`tokio::spawn`で
+# 隔離する設計になっている。tokioのこの隔離は`panic = "unwind"`(既定)が前提
+# ——1タスクのpanicは`JoinHandle`の`JoinError`として局所化されるだけで済むはずが、
+# `panic = "abort"`下では隔離が効かずプロセス全体が即abortしていた
+# (長時間使用中に低頻度のpanicを1回踏むだけでisekai-ssh全体が落ちる原因の
+# 最有力仮説として特定)。`uniffi_core`はFFI呼び出しを`catch_unwind`で包む設計
+# ([uniffi_core::ffi::rustcalls])なので、`isekai-terminal-core`のcdylib/Android
+# 側でこの変更がFFI境界越しのUBを新たに生むことはない。
 strip = true
 lto = true
 codegen-units = 1

@@ -54,7 +54,27 @@ class TerminalSessionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val label = intent?.getStringExtra(EXTRA_SESSION_LABEL) ?: "SSH セッション"
+        if (intent == null) {
+            // プロセスがkillされた後にSTART_STICKYの仕様でOSが自動再起動した呼び出し
+            // (再起動時は元のIntentが再送されずnullになる)。プロセス全体が死んだ時点で
+            // Rust側のセッション状態(SessionOrchestrator等)もJVMごと消えており、この
+            // サービス単体を空のまま前面化しても復元できるセッションは無い——実際の
+            // 「黙示的セッション再アタッチ」(タスク#14)はTerminalTabsViewModelが
+            // コールドスタート時(アプリを開き直した時)に行う。
+            //
+            // ここで無条件にstartForeground()していた旧実装は、Android 15以降
+            // dataSync/mediaProcessing等のFGSがバックグラウンドから起動されると
+            // システムに短時間で強制終了され(ForegroundServiceDidNotStopInTimeException、
+            // 当時の型はdataSyncだった。現在はremoteMessagingへ変更済みだが、
+            // このnullチェック自体は型に関係なく必要な修正)、
+            // それによる2回目の自動再起動がmAllowStartForeground=falseで即
+            // ForegroundServiceStartNotAllowedExceptionとなり、"アプリが繰り返し
+            // 停止しています"の無限クラッシュループに陥ることを実機で確認した
+            // (2026-07-27)。中身の無い再起動はそもそも試みず即座に自分を停止する。
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val label = intent.getStringExtra(EXTRA_SESSION_LABEL) ?: "SSH セッション"
         startForegroundWithNotification(label)
         return START_STICKY
     }

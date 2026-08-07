@@ -6,7 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.net.ConnectivityManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import tools.isekai.terminal.TerminalSessionService
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.KeystoreKek
@@ -28,6 +33,7 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     @Volatile private var isServiceBound = false
     @Volatile private var terminalService: TerminalSessionService? = null
     private var pathMonitor: NetworkPathMonitor? = null
+    private var lifecycleObserver: DefaultLifecycleObserver? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -87,6 +93,28 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     override fun unregisterNetworkCallbacks() {
         pathMonitor?.stop()
         pathMonitor = null
+    }
+
+    override fun registerLifecycleCallbacks(onBackground: () -> Unit, onForeground: () -> Unit) {
+        val observer = object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) = onBackground()
+            override fun onStart(owner: LifecycleOwner) = onForeground()
+        }
+        lifecycleObserver = observer
+        // `ProcessLifecycleOwner`への`addObserver`はメインスレッド必須。呼び出し元
+        // (`TerminalTabsViewModel`のinitブロック)がメインスレッドである保証が
+        // `registerNetworkCallbacks`ほど自明ではないため、明示的にpostする。
+        Handler(Looper.getMainLooper()).post {
+            ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
+        }
+    }
+
+    override fun unregisterLifecycleCallbacks() {
+        val observer = lifecycleObserver ?: return
+        lifecycleObserver = null
+        Handler(Looper.getMainLooper()).post {
+            ProcessLifecycleOwner.get().lifecycle.removeObserver(observer)
+        }
     }
 
     override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathAcquisition {

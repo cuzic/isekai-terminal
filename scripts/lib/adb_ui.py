@@ -201,6 +201,31 @@ def cmd_type(args):
     print(f"typed {args.value!r} into field ({locator})")
 
 
+def cmd_type_terminal(args):
+    """接続済みSSHターミナル(`TerminalInputView`、標準EditTextではなくカスタム
+    `InputConnection`)へテキストを送る。
+
+    `input text` の素の空白(%s)は、日本語IME(SwiftKey/Gboard等)がローマ字/かな変換中の
+    区切りとして先に消費してしまい、単語の切れ目がまるごと欠落することを実機で確認した
+    (2026-07-27、`isekai-pipe ctl notify --help` のつもりが `isekaipipectlnotify--help` の
+    ように送信された)。単語ごとに `input text` を分け、区切りは commitText を経由しない
+    素のキーイベント(`KEYCODE_SPACE`)として個別に送ることでIME変換に飲み込まれず確実に
+    届く。`cmd_type` と違い、対象は標準フィールドではないため resource-id/label 探索や
+    既存値クリアは行わない(呼び出し前にターミナルがフォーカス済みである前提)。
+    """
+    words = args.value.split(" ")
+    for i, word in enumerate(words):
+        if i > 0:
+            adb(args.device, "shell", "input", "keyevent", "62")  # KEYCODE_SPACE
+        escaped = word.replace("\\", "\\\\")
+        for ch in ("&", "(", ")", "<", ">", "|", ";", "'", '"', "`", "$"):
+            escaped = escaped.replace(ch, f"\\{ch}")
+        if escaped:
+            adb(args.device, "shell", f"input text {escaped}")
+        time.sleep(0.1)
+    print(f"sent to terminal: {args.value!r}")
+
+
 def cmd_scroll_to(args):
     for i in range(args.max_swipes):
         found = find_all(args.device, text=args.text, contains=args.contains, resource_id=args.resource_id)
@@ -293,6 +318,13 @@ def main():
     ty.add_argument("--timeout", type=float, default=8.0)
     ty.add_argument("--interval", type=float, default=0.4)
     ty.set_defaults(func=cmd_type)
+
+    tt = sub.add_parser(
+        "type-terminal",
+        help="接続済みSSHターミナル(カスタムInputConnection)へ単語区切りで送信(IMEのスペース欠落を回避)",
+    )
+    tt.add_argument("--value", required=True)
+    tt.set_defaults(func=cmd_type_terminal)
 
     sc = sub.add_parser("scroll-to", help="指定テキスト/resource-idが見つかるまで下スワイプ")
     sc.add_argument("--text")

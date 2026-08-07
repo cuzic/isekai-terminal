@@ -124,11 +124,6 @@ class TerminalSession(
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
 
-    // 「WiFiはあるがupstreamが死んでいる」等、マルチパスtransportがQUIC自身の視点で
-    // 「応答が一切返ってこない」ことを検知した際に発火する（Rust側`PathBroker`起点）。
-    private val _noViablePathEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val noViablePathEvent: SharedFlow<Unit> = _noViablePathEvent.asSharedFlow()
-
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
 
@@ -307,9 +302,12 @@ class TerminalSession(
             _pendingDownloadFile.value = Pair(fileName ?: "download", data)
         }
 
+        // 診断ログのみ。以前はここでKotlin側にもFlowを流し独自にセルラーへ
+        // rebindしていたが、RebindManager(Rust側FSM)が同じイベントで既に
+        // PerformRebindToCellularを行うため撤去した(rust-ssot.md準拠、二重
+        // rebindになっていたバグの修正)。
         override fun onNoViablePath() {
             RemoteLogger.w("IsekaiTerminalSSH", "no viable path (QUIC sees no response on any path)")
-            _noViablePathEvent.tryEmit(Unit)
         }
 
         override fun onForwardStateChanged(id: String, state: ForwardState) {
@@ -542,9 +540,12 @@ class TerminalSession(
      *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
     fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
 
-    /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
-     *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
-    fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
+    /** `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`喪失、
+     *  Rust側のQUICパスヘルスとは無関係な独自シグナル)が検知した「WiFiは繋がっている
+     *  がupstreamが死んでいる」を、判断・rebind実行を一切せずRust側`RebindManager`へ
+     *  そのまま転送するだけ(`rust-ssot.md`準拠)。マルチパス以外のtransportや
+     *  `enableUpstreamFailover`が無効な場合はRust側で無視される。 */
+    fun notifyUpstreamHealthDegraded() = orchestrator.notifyUpstreamHealthDegraded()
 
     /** #11: 「今すぐWiFiに戻す」。疎通確認だけは省略されないが、静けさ待ち・セルラー
      *  最小滞在はバイパスされる(`RebindManager::handle_manual_force_return`参照)。
@@ -558,6 +559,18 @@ class TerminalSession(
      *  (rust-ssot)。呼び出し元([TerminalScreenBody]の`isActive && hasFocus`)は
      *  生の可視性/フォーカス状態を渡すだけでよい。 */
     fun notifyFocusChange(focused: Boolean) = orchestrator.notifyFocusChange(focused)
+
+    /** アプリ全体がバックグラウンドへ遷移した(`ProcessLifecycleOwner.onStop`相当)ことを
+     *  そのままRust側へ転送する。`budgetMs`はAndroidではForeground Service経由で
+     *  セッションを維持するため猶予概念が無く、常に0を渡す(Rust側もこの引数は現状
+     *  未使用)。tmux通知の抑制判断(`SessionOrchestrator::on_notify`)を含む「今アプリが
+     *  前景か」の生の事実として使われる(`rust-ssot.md`、実機検証2026-07-28で
+     *  これが未配線のためtmux通知が常に抑制されるバグを修正)。 */
+    fun notifyDidEnterBackground() = orchestrator.notifyDidEnterBackground(0u)
+
+    /** アプリがフォアグラウンドへ復帰した(`ProcessLifecycleOwner.onStart`相当)ことを
+     *  そのままRust側へ転送する。[notifyDidEnterBackground]と対称。 */
+    fun notifyWillEnterForeground() = orchestrator.notifyWillEnterForeground()
 
     // ── Host key ──────────────────────────────────────────────────────
 

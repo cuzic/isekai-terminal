@@ -26,7 +26,7 @@
 //!
 //! `isekai-ssh` has no `[lib]` target (bin-only crate, matching this
 //! project's other `tests/*_e2e.rs` files), so this can't call
-//! `ctl_forward::remote_command_arg` directly; it reconstructs the same
+//! `ctl_forward::build_login_shell_command` directly; it reconstructs the same
 //! prefix shape ssh(1)-side instead, cross-checked against that function's
 //! own unit test (`remote_command_exports_the_remote_path_and_execs_a_login_shell`)
 //! for the exact string content. This intentionally does *not* go through
@@ -146,7 +146,7 @@ fn spawn_real_sshd(workdir: &std::path::Path, authorized_keys_pub: &str) -> Real
 }
 
 /// `export ISEKAI_CTL_SOCK=<path>; <rest>` — the exact prefix shape
-/// `ctl_forward::remote_command_arg` produces (see that function's own
+/// `ctl_forward::build_login_shell_command` produces (see that function's own
 /// unit test for the precise string) — actually delivers the env var to
 /// `<rest>` when sshd runs it via `$SHELL -c "..."`.
 #[test]
@@ -161,7 +161,7 @@ fn exported_env_var_prefix_reaches_the_wrapped_remote_command() {
 
     let marker_path = workdir.path().join("env-marker.txt");
     let fake_remote_path = "/tmp/isekai-ctl-e2e-fake-path.sock";
-    // Same shape as `ctl_forward::remote_command_arg`'s
+    // Same shape as `ctl_forward::build_login_shell_command`'s
     // `export ISEKAI_CTL_SOCK={:?}; exec "${SHELL:-/bin/sh}" -i -l`, with
     // the `exec` tail replaced by a deterministic, non-interactive
     // diagnostic (an interactive login shell has no clean termination

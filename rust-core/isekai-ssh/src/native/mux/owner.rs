@@ -4,11 +4,14 @@
 //! remote shell over that shared connection.
 //!
 //! Per the M4 design, this is `ControlMaster`, not screen sharing: for each
-//! accepted client the owner opens a brand-new SSH shell channel on the shared
-//! handle ([`open_channel`] with [`SessionKind::Shell`], or a
-//! `$ISEKAI_CTL_SOCK`-exporting login shell when `#@isekai ctl-socket` is on,
-//! see [`relay_client`]) and relays *that one channel's* traffic to *that one
-//! client*. Clients never see each other's terminals; only the authenticated
+//! accepted client the owner opens a brand-new SSH shell/exec channel on the
+//! shared handle ([`open_channel`], via the same
+//! `native::connect::decide_session_kind` the non-mux path uses so a
+//! client's `remote_command`/`want_pty` get the identical `-t`/`-T`
+//! treatment — see [`relay_client`]), or a `$ISEKAI_CTL_SOCK`-exporting login
+//! shell when `#@isekai ctl-socket` is on and no `remote_command` was
+//! requested, and relays *that one channel's* traffic to *that one client*.
+//! Clients never see each other's terminals; only the authenticated
 //! connection (and the auth/TOFU work behind it) is shared. When ctl-socket is
 //! on, each client also gets its own *private* remote-forward whose messages
 //! are relayed to it as [`Frame::Ctl`], never crossing between clients.
@@ -28,7 +31,7 @@
 use anyhow::{anyhow, Context, Result};
 use local_ipc_mux::ExclusiveChannel;
 use russh::client;
-use russh_stream_session::{open_channel, ForwardRoutes, SessionKind};
+use russh_stream_session::{open_channel, ForwardRoutes};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +57,19 @@ const WARMUP_GRACE: Duration = Duration::from_secs(30);
 /// another to the same host.
 const IDLE_GRACE: Duration = Duration::from_secs(10);
 
+/// How long [`relay_client`] waits for a connected client to send its
+/// [`Frame::Hello`] before giving up on it (crash-focused review,
+/// 2026-07-31). Without this, a peer that connects to the named pipe and
+/// never sends anything holds this client slot — and the authenticated SSH
+/// connection behind it — forever, since nothing else in this file ever
+/// times out an unread `Hello`. Set equal to `mod.rs`'s `HOLDER_STARTUP_TIMEOUT`
+/// value for consistency with this crate's one existing "local IPC handshake
+/// budget" constant, and *not* shorter: a well-behaved client's own
+/// `read_owner_token` (`mod.rs`) retries for up to 2s after connecting and
+/// before it ever writes `Hello`, so anything close to that leaves too
+/// little headroom under load. 10s gives 5x that legitimate worst case.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Accepts clients on `channel` until either `accept` itself fails (the
 /// underlying IPC channel died — a genuine local-pipe infrastructure
 /// problem), or the client count drops to (and stays at) zero for the
@@ -75,6 +91,8 @@ pub(crate) async fn serve_clients<C, H>(
     handle: Arc<Mutex<client::Handle<H>>>,
     token: Arc<Vec<u8>>,
     ctl_routes: Option<ForwardRoutes>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 ) -> Result<()>
 where
     C: ExclusiveChannel,
@@ -119,7 +137,10 @@ where
                 let active_clients = active_clients.clone();
                 let count_changed = count_changed.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref()).await {
+                    if let Err(e) =
+                        relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref(), tab_idle_color, tab_attention_color)
+                            .await
+                    {
                         // One client's session ending badly must not disturb the
                         // owner or its other clients (session isolation).
                         log_line!("isekai-ssh mux owner: a client session ended with an error: {e:#}");
@@ -157,6 +178,23 @@ async fn wait_for_idle_exit(active_clients: &AtomicUsize, count_changed: &Notify
     }
 }
 
+/// Turns one client's `Frame::Hello` fields into the `SessionKind` to open on
+/// the shared handle — the mux-side half of the same `-t`/`-T` decision
+/// `native::connect::run_authenticated_session` makes for the non-mux path,
+/// routed through the identical `decide_session_kind` (kept in one function
+/// both paths call — see its doc comment for why re-deriving this logic
+/// separately would risk the exact shell-then-exec double-request bug it was
+/// written to prevent). Split out of [`relay_client`] as its own pure
+/// function purely so it's unit-testable without a real SSH connection —
+/// `relay_client`'s own tests exercise it only through the `want_pty: true`
+/// case (real exec/shell channel opens), so the `want_pty: false` case
+/// (`SessionKind::Exec`) had no coverage at all before this split.
+fn session_kind_for_hello(term: &str, cols: u16, rows: u16, want_pty: bool, remote_command: Option<&str>) -> russh_stream_session::SessionKind {
+    let remote_cmd_words = remote_command.map(|cmd| vec![cmd.to_string()]);
+    let request_tty = if remote_command.is_some() && !want_pty { crate::wrapper::RequestTty::No } else { crate::wrapper::RequestTty::Yes };
+    super::connect::decide_session_kind(remote_cmd_words.as_deref(), request_tty, term, cols as u32, rows as u32, &[])
+}
+
 /// Serves exactly one client: reads its [`Frame::Hello`] (validating the
 /// protocol version and auth token), opens a private remote shell channel with
 /// the client's requested PTY geometry, then relays until either side ends.
@@ -169,6 +207,8 @@ pub(crate) async fn relay_client<Conn, H>(
     handle: &Mutex<client::Handle<H>>,
     expected_token: &[u8],
     ctl_routes: Option<&ForwardRoutes>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
 ) -> Result<()>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -176,13 +216,21 @@ where
 {
     let (mut reader, mut writer) = tokio::io::split(conn);
 
-    let hello = read_frame(&mut reader)
+    // `read_frame` is not cancel-safe (see its own doc comment: don't use it
+    // in a `select!` arm) — that's fine here because on timeout this whole
+    // connection is discarded rather than resumed, so losing whatever partial
+    // bytes were mid-read is not observable. Bounded by `HELLO_READ_TIMEOUT`
+    // (crash-focused review, 2026-07-31): a peer that connects and never
+    // sends `Hello` must not hold this client slot — and the shared
+    // authenticated SSH connection behind it — forever.
+    let hello = tokio::time::timeout(HELLO_READ_TIMEOUT, read_frame(&mut reader))
         .await
+        .map_err(|_| anyhow!("isekai-ssh mux owner: no Hello within {HELLO_READ_TIMEOUT:?}; dropping the connection"))?
         .context("isekai-ssh mux owner: reading the client Hello failed")?
         .ok_or_else(|| anyhow!("isekai-ssh mux owner: client closed before sending Hello"))?;
 
-    let (term, cols, rows) = match hello {
-        Frame::Hello { version, token, term, cols, rows } => {
+    let (term, cols, rows, want_pty, remote_command, tty_exec) = match hello {
+        Frame::Hello { version, token, term, cols, rows, want_pty, remote_command, tty_exec } => {
             if version != MUX_PROTOCOL_VERSION {
                 let reason = format!("protocol version mismatch: owner speaks {MUX_PROTOCOL_VERSION}, client speaks {version}");
                 let _ = write_frame(&mut writer, &Frame::Rejected { reason: reason.clone() }).await;
@@ -192,16 +240,23 @@ where
                 let _ = write_frame(&mut writer, &Frame::Rejected { reason: "authentication token mismatch".to_string() }).await;
                 return Err(anyhow!("isekai-ssh mux owner: rejected client — invalid auth token"));
             }
-            (term, cols, rows)
+            (term, cols, rows, want_pty, remote_command, tty_exec)
         }
         other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
     };
+    let session_kind = session_kind_for_hello(&term, cols, rows, want_pty, remote_command.as_deref());
 
     // This client's own private ctl-socket forward (opportunistic: a failed
-    // setup just leaves `ctl` as `None`).
+    // setup just leaves `ctl` as `None`). Skipped entirely for a
+    // `remote_command` request (mirrors `native::connect::run_authenticated_session`'s
+    // own `ctl_enabled && remote_cmd.is_none()` check): ctl-socket forwarding
+    // is for this tab's *interactive* login shell (OSC title/clipboard,
+    // Epic P builds), which a one-shot remote command has no use for.
+    // `tty_exec` (`--isekai-tty`) is gated the same way for the same reason,
+    // but independently — the two compose (see `Frame::Hello`'s doc comment).
     let ctl = match ctl_routes {
-        Some(routes) => ctl_forward::request(handle, routes).await,
-        None => None,
+        Some(routes) if remote_command.is_none() => ctl_forward::request(handle, routes).await,
+        _ => None,
     };
 
     let open_result = {
@@ -210,13 +265,21 @@ where
         // guard is dropped at the end of this block, before any `ctl_forward`
         // cleanup below re-locks the handle.
         let guard = handle.lock().await;
-        match &ctl {
-            Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols as u32, rows as u32, &fwd.remote_path)
-                .await
-                .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client"),
-            None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32, terminal_modes: vec![] })
-                .await
-                .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
+        if ctl.is_some() || tty_exec.is_some() {
+            ctl_forward::open_login_shell(
+                &guard,
+                &term,
+                cols as u32,
+                rows as u32,
+                ctl.as_ref().map(|fwd| fwd.remote_path.as_str()),
+                tab_idle_color,
+                tab_attention_color,
+                tty_exec.as_deref(),
+            )
+            .await
+            .context("isekai-ssh mux owner: failed to open a login shell for the client")
+        } else {
+            open_channel(&guard, &session_kind).await.context("isekai-ssh mux owner: failed to open a session channel for the client")
         }
     };
     // `HelloAck` is deliberately sent only *after* the channel-open above
@@ -532,10 +595,54 @@ mod tests {
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
     use russh_stream_session::{
         authenticate_session, establish_over_stream, verifying_handler, verifying_handler_with_routes, Credential, HostKeyVerifier,
-        VerifyOutcome,
+        SessionKind, VerifyOutcome,
     };
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
+
+    // -- session_kind_for_hello (pure, no real SSH connection needed) -----
+
+    /// `want_pty: false` + a command must produce `SessionKind::Exec` (no
+    /// PTY) — before `session_kind_for_hello` was split out as its own
+    /// function, this branch of `relay_client`'s behavior had no coverage at
+    /// all (every existing owner.rs test used `want_pty: true`).
+    #[test]
+    fn session_kind_for_hello_no_pty_with_a_command_is_exec() {
+        let kind = session_kind_for_hello("xterm", 80, 24, false, Some("echo hi"));
+        match kind {
+            SessionKind::Exec { command } => assert_eq!(command, "echo hi"),
+            SessionKind::Shell { .. } => panic!("want_pty: false with a remote command must skip the PTY"),
+        }
+    }
+
+    /// `want_pty: true` + a command must produce `SessionKind::Shell` with
+    /// that command set (exec'd over the PTY, not a login shell).
+    #[test]
+    fn session_kind_for_hello_with_pty_and_a_command_is_shell_with_the_command_set() {
+        let kind = session_kind_for_hello("xterm", 80, 24, true, Some("echo hi"));
+        match kind {
+            SessionKind::Shell { command, term, cols, rows, .. } => {
+                assert_eq!(command.as_deref(), Some("echo hi"));
+                assert_eq!((term.as_str(), cols, rows), ("xterm", 80, 24));
+            }
+            SessionKind::Exec { .. } => panic!("want_pty: true must allocate a PTY even with a remote command"),
+        }
+    }
+
+    /// No `remote_command` at all is always an interactive login shell,
+    /// regardless of `want_pty` (mirrors `decide_session_kind`'s own
+    /// `None` arm — a client can't ask for a PTY-less login shell, there's
+    /// nothing to `exec`).
+    #[test]
+    fn session_kind_for_hello_with_no_command_is_always_a_login_shell() {
+        for want_pty in [true, false] {
+            let kind = session_kind_for_hello("xterm", 80, 24, want_pty, None);
+            match kind {
+                SessionKind::Shell { command, .. } => assert_eq!(command, None, "want_pty={want_pty}"),
+                SessionKind::Exec { .. } => panic!("no remote_command must never produce SessionKind::Exec (want_pty={want_pty})"),
+            }
+        }
+    }
 
     struct AcceptAllHostKeys;
     #[async_trait]
@@ -635,7 +742,7 @@ mod tests {
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
-        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
 
         // One client connects, sends Hello, then immediately disconnects
         // (drops without Shutdown) — `relay_client`'s per-client task now
@@ -650,7 +757,7 @@ mod tests {
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
-            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
                 .await
                 .unwrap();
             // conn drops here.
@@ -678,7 +785,7 @@ mod tests {
         let handle = Arc::new(Mutex::new(authed_test_handle().await));
 
         let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
-        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
 
         // First client connects then disconnects immediately — like the
         // idle-exit test above, its relay task's real (post-auth,
@@ -690,7 +797,7 @@ mod tests {
         {
             let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
             let (_r, mut w) = tokio::io::split(conn);
-            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -699,7 +806,7 @@ mod tests {
         // same reason, before the clock is paused below.
         let conn2 = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
         let (mut r2, mut w2) = tokio::io::split(conn2);
-        write_frame(&mut w2, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        write_frame(&mut w2, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
         match read_frame(&mut r2).await.unwrap().unwrap() {
             Frame::HelloAck { .. } => {}
             other => panic!("expected HelloAck, got {other:?}"),
@@ -715,6 +822,46 @@ mod tests {
 
         drop(w2);
         serve_task.abort();
+    }
+
+    /// End-to-end companion to `relay_client_times_out_a_peer_that_never_
+    /// sends_hello`: a client that connects to the real accept loop and then
+    /// sends nothing at all must not prevent `serve_clients` from eventually
+    /// idle-exiting — first `HELLO_READ_TIMEOUT` gives up on that one client
+    /// (decrementing `active_clients` back to zero), then `IDLE_GRACE`
+    /// elapses with nobody else connected.
+    #[tokio::test]
+    async fn serve_clients_exits_after_a_silent_client_times_out_and_the_idle_grace_elapses() {
+        let name = "isekai-ssh-mux-hello-timeout-then-idle-exit-test";
+        let token = Arc::new(b"tok".to_vec());
+        let handle = Arc::new(Mutex::new(authed_test_handle().await));
+
+        let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
+
+        // Connects but never sends anything — held alive by `_conn` so the
+        // owner's `accept()` sees a genuine open connection, not a dropped
+        // one. No real SSH activity happens for this client (it never gets
+        // past the Hello read), so unlike the other `serve_clients` tests
+        // above there is no round trip that needs real time to complete
+        // first.
+        let _conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::pause();
+        tokio::time::advance(HELLO_READ_TIMEOUT + Duration::from_secs(1)).await;
+        // Let the per-client task's `fetch_sub`/`notify_one` (spawned in
+        // response to the timeout above) actually run before advancing
+        // further — the idle-exit wait only re-checks on notification, so
+        // if the count-changed signal from *this* client's departure hasn't
+        // landed yet, advancing straight to `IDLE_GRACE` could jump past a
+        // still-nonzero count without ever re-checking it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_GRACE + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+        assert!(result.is_ok(), "serve_clients must exit once the silent client's Hello timeout and then the idle grace both elapse, not hang forever");
+        assert!(result.unwrap().unwrap().is_ok(), "an idle-exit is a clean Ok(()), not an error");
     }
 
     /// A mock sshd whose shell echoes back a fixed banner plus whatever stdin
@@ -772,6 +919,22 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_echo_server`] but for [`EchoExecServer`] (only answers
+    /// `exec`, never `shell_request`) — used to prove a `Frame::Hello`
+    /// carrying `remote_command` actually reaches an `exec`, not a shell.
+    async fn spawn_exec_echo_server(seed: u8) -> SocketAddr {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = EchoExecServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        addr
+    }
+
     async fn authed_handle(addr: SocketAddr) -> client::Handle<russh_stream_session::VerifyingHandler<AcceptAllHostKeys>> {
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -794,10 +957,10 @@ mod tests {
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         // Client sends Hello, then some stdin, then Shutdown.
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"correct-horse-battery-staple".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"correct-horse-battery-staple".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
 
         // First owner frame must be HelloAck.
         match read_frame(&mut client).await.unwrap().unwrap() {
@@ -829,6 +992,178 @@ mod tests {
         let _ = relay.await.unwrap();
     }
 
+    /// A mock sshd that only answers `exec` (never `shell_request`) — echoes
+    /// the exec'd command back as a single banner line plus exit status 0.
+    /// Modeled on `russh_stream_session`'s own `EchoExecServer`.
+    #[derive(Clone)]
+    struct EchoExecServer;
+
+    impl server::Server for EchoExecServer {
+        type Handler = EchoExecHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> EchoExecHandler {
+            EchoExecHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct EchoExecHandler;
+
+    #[async_trait]
+    impl server::Handler for EchoExecHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(&mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(&mut self, channel: russh::ChannelId, data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+            let command = String::from_utf8_lossy(data).into_owned();
+            session.data(channel, CryptoVec::from(format!("ran: {command}\n").into_bytes()))?;
+            session.exit_status_request(channel, 0)?;
+            Ok(())
+        }
+    }
+
+    /// Regression for the mux path's own version of the shell-then-exec bug
+    /// (2026-07-28): a client's `Frame::Hello { remote_command: Some(_), .. }`
+    /// must make the owner `exec` that command over the shared connection —
+    /// before this fix, `relay_client` unconditionally opened
+    /// `SessionKind::Shell` (login shell) and dropped `remote_command`
+    /// entirely, so `isekai-ssh host cmd` silently landed in an interactive
+    /// shell instead of running `cmd` whenever a mux owner was already up
+    /// for that host. `EchoExecServer` only answers `exec_request` (no
+    /// `shell_request` handler at all), so this test fails outright — no
+    /// banner, no stdout — if `relay_client` regresses to always opening a
+    /// login shell.
+    #[tokio::test]
+    async fn relay_client_execs_a_remote_command_instead_of_opening_a_shell() {
+        let addr = spawn_exec_echo_server(124).await;
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+
+        write_frame(
+            &mut client,
+            &Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: b"tok".to_vec(),
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                want_pty: true,
+                remote_command: Some("echo hi".to_string()),
+                tty_exec: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Timeout, not a bare `.await`: if this regresses to `SessionKind::Shell`
+        // (no command), `EchoExecServer` has no `shell_request` handler at
+        // all — `russh`'s default implementation is a silent `Ok(())]` that
+        // never sends data, an exit status, or closes the channel — so a
+        // regression would hang here forever instead of failing outright.
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            match read_frame(&mut client).await.unwrap().unwrap() {
+                Frame::HelloAck { version } => assert_eq!(version, MUX_PROTOCOL_VERSION),
+                other => panic!("expected HelloAck, got {other:?}"),
+            }
+
+            let mut seen = Vec::new();
+            loop {
+                match read_frame(&mut client).await.unwrap() {
+                    Some(Frame::Stdout(data)) => {
+                        seen.extend_from_slice(&data);
+                        if seen.windows(3).any(|w| w == b"ran") {
+                            break;
+                        }
+                    }
+                    Some(Frame::Exit(_)) | None => break,
+                    Some(_) => {}
+                }
+            }
+            seen
+        })
+        .await
+        .expect("timed out waiting for exec output — SessionKind likely regressed to Shell (no shell_request handler on the mock server)");
+        assert_eq!(seen, b"ran: echo hi\n", "the remote_command must be exec'd, not silently dropped in favor of a login shell");
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// `--isekai-tty`'s whole reason for a separate `Frame::Hello` field
+    /// (rather than reusing `remote_command`) is that it must route through
+    /// `open_login_shell` — and therefore actually reach `exec_request`, not
+    /// silently fall back to a plain login shell — **even when ctl-socket is
+    /// off** (`ctl_routes: None` here). `EchoExecServer` has no
+    /// `shell_request` handler, so this hangs/fails outright if `relay_client`
+    /// regresses to the plain `session_kind_for_hello`/`open_channel` path
+    /// for a `tty_exec`-only Hello.
+    #[tokio::test]
+    async fn relay_client_execs_tty_exec_even_without_ctl_socket() {
+        let addr = spawn_exec_echo_server(125).await;
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+
+        write_frame(
+            &mut client,
+            &Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: b"tok".to_vec(),
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                want_pty: true,
+                remote_command: None,
+                tty_exec: Some("isekai-pipe tty attach 'work'".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            match read_frame(&mut client).await.unwrap().unwrap() {
+                Frame::HelloAck { version } => assert_eq!(version, MUX_PROTOCOL_VERSION),
+                other => panic!("expected HelloAck, got {other:?}"),
+            }
+
+            let mut seen = Vec::new();
+            loop {
+                match read_frame(&mut client).await.unwrap() {
+                    Some(Frame::Stdout(data)) => {
+                        seen.extend_from_slice(&data);
+                        if seen.windows(3).any(|w| w == b"ran") {
+                            break;
+                        }
+                    }
+                    Some(Frame::Exit(_)) | None => break,
+                    Some(_) => {}
+                }
+            }
+            seen
+        })
+        .await
+        .expect("timed out waiting for exec output — tty_exec likely fell back to a plain login shell (no shell_request handler on the mock server)");
+        // `build_login_shell_command` always wraps its target in `exec <target>`
+        // (there's no ctl-socket export here to prefix it, but the `exec`
+        // itself is unconditional) — this is what `EchoExecHandler` actually
+        // receives as the exec'd command string.
+        assert_eq!(seen, b"ran: exec isekai-pipe tty attach 'work'\n", "tty_exec must be exec'd even with ctl-socket off");
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
     #[tokio::test]
     async fn relay_client_rejects_a_version_mismatch() {
         let addr = spawn_echo_server(121).await;
@@ -836,9 +1171,9 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION + 1, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION + 1, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
 
         match read_frame(&mut client).await.unwrap().unwrap() {
             Frame::Rejected { reason } => assert!(reason.contains("version"), "reject reason should mention version, got {reason:?}"),
@@ -854,9 +1189,9 @@ mod tests {
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"a-wrong-token".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"a-wrong-token".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
 
         match read_frame(&mut client).await.unwrap().unwrap() {
             Frame::Rejected { reason } => assert!(reason.contains("token"), "reject reason should mention the token, got {reason:?}"),
@@ -874,10 +1209,42 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");
+    }
+
+    /// Pins the fix for the Hello-read hang (crash-focused review,
+    /// 2026-07-31): a client that connects and then sends nothing at all —
+    /// not even a malformed frame — must not hold this slot (and the shared
+    /// authenticated connection behind it) forever. `handle`'s own real SSH
+    /// handshake runs to completion under real time first (same caution as
+    /// `authed_test_handle`'s doc comment); only the wait for
+    /// `HELLO_READ_TIMEOUT` itself, which is pure local I/O on `owner_side`,
+    /// is under the paused clock.
+    #[tokio::test]
+    async fn relay_client_times_out_a_peer_that_never_sends_hello() {
+        let addr = spawn_echo_server(125).await;
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (_client, owner_side) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        // `tokio::spawn` doesn't poll the task inline, and `tokio::time::advance`
+        // moves the clock *before* its own internal yield (Opus review,
+        // 2026-07-31) — without this yield, `relay`'s `timeout(HELLO_READ_TIMEOUT, ..)`
+        // would only register *after* the clock has already jumped, pushing its
+        // deadline a full `HELLO_READ_TIMEOUT` further out than intended and
+        // making the outer guard below fire first instead.
+        tokio::task::yield_now().await;
+
+        tokio::time::pause();
+        tokio::time::advance(HELLO_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(HELLO_READ_TIMEOUT * 3, relay).await;
+        assert!(result.is_ok(), "relay_client must give up once HELLO_READ_TIMEOUT elapses, not hang forever");
+        assert!(result.unwrap().unwrap().is_err(), "a Hello timeout must be a clean Err, not a hang");
     }
 
     /// A mock sshd that, when a client's per-tab `streamlocal_forward` is
@@ -955,9 +1322,9 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
             .unwrap();
         match read_frame(&mut client).await.unwrap().unwrap() {
@@ -982,6 +1349,84 @@ mod tests {
         let msg = isekai_protocol::decode_ctl_message(&ctl_bytes).expect("the relayed ctl bytes must decode");
         assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "tab-title".to_string() });
 
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// A `remote_command` Hello must skip the ctl-socket forward entirely —
+    /// mirrors `native::connect::run_authenticated_session`'s own
+    /// `ctl_enabled && remote_cmd.is_none()` check (ctl-socket/OSC
+    /// title-clipboard is for this tab's *interactive* login shell, which a
+    /// one-shot remote command has no use for). Reuses
+    /// `CtlPushShellServer`, which would proactively push a `SetTitle` ctl
+    /// message the moment the owner calls `streamlocal_forward` — since that
+    /// call only happens inside `ctl_forward::request` (skipped here), no
+    /// push can ever fire, so seeing *zero* `Frame::Ctl` for the whole
+    /// session is a direct proof the skip took effect, not a timing-dependent
+    /// absence.
+    #[tokio::test]
+    async fn relay_client_skips_the_ctl_forward_for_a_remote_command() {
+        let keypair = Ed25519Keypair::from_seed(&[132; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = CtlPushShellServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        // `Some(&routes)`: ctl-socket *is* on for this connection — the skip
+        // being tested is specific to this one Hello carrying a
+        // remote_command, not the forward being unavailable altogether.
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+
+        write_frame(
+            &mut client,
+            &Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: b"tok".to_vec(),
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                want_pty: true,
+                remote_command: Some("echo hi".to_string()),
+                tty_exec: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut saw_exec_banner = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match read_frame(&mut client).await.unwrap() {
+                    Some(Frame::HelloAck { .. }) => {}
+                    Some(Frame::Ctl(bytes)) => panic!("ctl-socket forward must be skipped for a remote_command, got a Frame::Ctl: {bytes:?}"),
+                    Some(Frame::Stdout(data)) if data == b"login-ready\n" => {
+                        saw_exec_banner = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("owner closed before the exec banner arrived"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the exec banner");
+        assert!(saw_exec_banner, "expected the mock sshd's exec banner");
+
+        write_frame(&mut client, &Frame::Shutdown).await.unwrap();
         drop(client);
         let _ = relay.await.unwrap();
     }
@@ -1065,9 +1510,9 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
             .unwrap();
         match read_frame(&mut client).await.unwrap().unwrap() {
@@ -1252,9 +1697,9 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
             .unwrap();
         match read_frame(&mut client).await.unwrap().unwrap() {
@@ -1391,9 +1836,9 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
 
-        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
             .unwrap();
         // Review finding: `HelloAck` is now sent only *after* the login-shell

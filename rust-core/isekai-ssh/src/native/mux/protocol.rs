@@ -42,8 +42,24 @@ use tokio::sync::mpsc;
 
 /// Bumped only on an *incompatible* change to this frame protocol. The owner
 /// refuses a client whose `Hello` carries a different version (loud failure,
-/// not silent misbehavior — an M4 review requirement).
-pub const MUX_PROTOCOL_VERSION: u16 = 1;
+/// not silent misbehavior — an M4 review requirement). Bumped 1→2 when
+/// `Frame::Hello` grew `want_pty`/`remote_command` (generic remote-command
+/// execution over the mux, mirroring `native::connect::decide_session_kind`'s
+/// `-t`/`-T` semantics); bumped 2→3 when it grew `tty_exec` (`--isekai-tty`,
+/// `tty_attach.rs`) as a **separate** field from `remote_command` rather than
+/// reusing it — `remote_command` being `Some` is also what gates skipping the
+/// per-client ctl-socket forward (`super::owner::relay_client`), and
+/// `--isekai-tty` is meant to *compose* with ctl-socket (both the tab
+/// title/clipboard control-plane and the tty-attach exec target active at
+/// once), not disable it the way an ordinary explicit remote command does.
+/// An old owner or client has no way to represent a field it doesn't know
+/// about, so a mismatch here must fail loudly rather than silently ignore a
+/// requested remote command or tty-attach target. A mismatch degrades
+/// safely: [`super::client::run_inner`] and [`super::owner::relay_client`]
+/// both treat it as [`Frame::Rejected`], which the caller falls back to an
+/// unmultiplexed direct connect from (`always-connects.md`) — no staged
+/// rollout is needed for this single-user project.
+pub const MUX_PROTOCOL_VERSION: u16 = 3;
 
 /// Largest payload any single frame may carry. Terminal stdin/stdout chunks
 /// are a few KiB in practice (the relay reads into an 8 KiB buffer); this cap
@@ -59,6 +75,20 @@ const MAX_FRAME_LEN: usize = 1 + MAX_FRAME_PAYLOAD;
 /// type name is short; this only exists so a peer can't smuggle a large
 /// allocation in through the `Hello` frame's variable-length field.
 const MAX_TERM_LEN: usize = 256;
+
+/// Cap on the optional remote-command string carried in [`Frame::Hello`].
+/// Generous — real remote commands are at most a few hundred bytes — while
+/// still meaningfully bounding a hostile peer's forced allocation (well
+/// below the `u16` length field's own 64 KiB ceiling), same rationale as
+/// [`MAX_TERM_LEN`].
+const MAX_REMOTE_COMMAND_LEN: usize = 4096;
+
+/// Cap on the optional `tty_exec` string (`--isekai-tty`'s `isekai-pipe tty
+/// attach '<name>'` command) — same rationale and same value as
+/// [`MAX_REMOTE_COMMAND_LEN`], kept as a separate constant since the two
+/// fields are semantically distinct (see [`MUX_PROTOCOL_VERSION`]'s doc
+/// comment) even though their size bound happens to coincide.
+const MAX_TTY_EXEC_LEN: usize = 4096;
 
 // Frame type tags. Grouped by direction for readability, but the reader
 // accepts any tag on either side — role enforcement (a client must not send
@@ -82,7 +112,22 @@ const TAG_CTL: u8 = 0x23;
 pub enum Frame {
     /// First frame a client sends. `cols`/`rows`/`term` let the owner open
     /// the per-client shell channel with the right initial PTY geometry.
-    Hello { version: u16, token: Vec<u8>, term: String, cols: u16, rows: u16 },
+    /// `want_pty`/`remote_command` mirror `native::connect::decide_session_kind`'s
+    /// `-t`/`-T` semantics: `remote_command` is `None` for an interactive
+    /// login shell; `want_pty == false` with `Some(cmd)` opens a PTY-less
+    /// `SessionKind::Exec`, anything else opens a PTY (`SessionKind::Shell`)
+    /// and, if `remote_command` is also `Some`, execs it over that PTY
+    /// instead of a login shell.
+    ///
+    /// `tty_exec` (`--isekai-tty`) is deliberately a **separate** field from
+    /// `remote_command`, not folded into it — see [`MUX_PROTOCOL_VERSION`]'s
+    /// doc comment for why (composing with ctl-socket rather than disabling
+    /// it). When `Some`, the owner routes the session through
+    /// `native::mux::ctl_forward::open_login_shell` as its `exec_target`
+    /// (`super::owner::relay_client`) instead of the plain
+    /// `session_kind_for_hello` path, always allocating a PTY, regardless of
+    /// `want_pty`.
+    Hello { version: u16, token: Vec<u8>, term: String, cols: u16, rows: u16, want_pty: bool, remote_command: Option<String>, tty_exec: Option<String> },
     /// Owner's acknowledgement that the version matched and the token was
     /// accepted; the client may now stream stdin/resize.
     HelloAck { version: u16 },
@@ -121,7 +166,7 @@ impl Frame {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Frame::Hello { version, token, term, cols, rows } => {
+            Frame::Hello { version, token, term, cols, rows, want_pty, remote_command, tty_exec } => {
                 out.push(TAG_HELLO);
                 out.extend_from_slice(&version.to_be_bytes());
                 out.extend_from_slice(&cols.to_be_bytes());
@@ -129,6 +174,13 @@ impl Frame {
                 let term_bytes = term.as_bytes();
                 out.extend_from_slice(&(term_bytes.len() as u16).to_be_bytes());
                 out.extend_from_slice(term_bytes);
+                out.push(if *want_pty { 1 } else { 0 });
+                // `remote_command`/`tty_exec` sit between `term` and `token`
+                // (not appended after) because `token` deliberately consumes
+                // the rest of the payload on decode (see below) — a
+                // variable-length field placed after it would be unreadable.
+                encode_optional_string(&mut out, remote_command);
+                encode_optional_string(&mut out, tty_exec);
                 out.extend_from_slice(token);
             }
             Frame::HelloAck { version } => {
@@ -176,7 +228,8 @@ impl Frame {
     fn decode(tag: u8, payload: &[u8]) -> io::Result<Frame> {
         match tag {
             TAG_HELLO => {
-                // version(2) + cols(2) + rows(2) + term_len(2) + term + token(rest)
+                // version(2) + cols(2) + rows(2) + term_len(2) + term
+                //   + want_pty(1) + remote_command(opt) + tty_exec(opt) + token(rest)
                 let version = read_u16(payload, 0)?;
                 let cols = read_u16(payload, 2)?;
                 let rows = read_u16(payload, 4)?;
@@ -192,8 +245,14 @@ impl Frame {
                 let term = std::str::from_utf8(&payload[term_start..term_end])
                     .map_err(|_| malformed("Hello term string is not valid UTF-8"))?
                     .to_string();
-                let token = payload[term_end..].to_vec();
-                Ok(Frame::Hello { version, token, term, cols, rows })
+
+                let want_pty = *payload.get(term_end).ok_or_else(|| malformed("Hello frame truncated before want_pty"))? != 0;
+                let (remote_command, offset) =
+                    decode_optional_string(payload, term_end + 1, MAX_REMOTE_COMMAND_LEN, "remote_command")?;
+                let (tty_exec, offset) = decode_optional_string(payload, offset, MAX_TTY_EXEC_LEN, "tty_exec")?;
+
+                let token = payload[offset..].to_vec();
+                Ok(Frame::Hello { version, token, term, cols, rows, want_pty, remote_command, tty_exec })
             }
             TAG_HELLO_ACK => Ok(Frame::HelloAck { version: read_u16(payload, 0)? }),
             TAG_REJECTED => {
@@ -215,6 +274,48 @@ impl Frame {
     }
 }
 
+/// Shared wire encoding for `Frame::Hello`'s two optional-string fields
+/// (`remote_command`, `tty_exec`): a 1-byte presence tag, then — only if
+/// present — a `u16` length prefix and the UTF-8 bytes. Extracted once both
+/// fields needed the exact same shape rather than duplicating it a second
+/// time (the way `remote_command`'s original, since-removed inline version
+/// would have required).
+fn encode_optional_string(out: &mut Vec<u8>, value: &Option<String>) {
+    match value {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            let bytes = s.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+}
+
+/// Decodes one [`encode_optional_string`]-shaped field starting at `offset`
+/// in `payload`, enforcing `cap` on its byte length. Returns the decoded
+/// value and the offset immediately past it, so callers can chain multiple
+/// optional-string fields in sequence (`remote_command` then `tty_exec`)
+/// without each one needing to know the others' widths up front.
+fn decode_optional_string(payload: &[u8], offset: usize, cap: usize, field_name: &str) -> io::Result<(Option<String>, usize)> {
+    let has_value = *payload.get(offset).ok_or_else(|| malformed(&format!("Hello frame truncated before {field_name} tag")))?;
+    if has_value == 0 {
+        return Ok((None, offset + 1));
+    }
+    let len_offset = offset + 1;
+    let len = read_u16(payload, len_offset)? as usize;
+    if len > cap {
+        return Err(malformed(&format!("Hello {field_name} exceeds the cap")));
+    }
+    let start = len_offset + 2;
+    let end = start.checked_add(len).ok_or_else(|| malformed(&format!("Hello {field_name} length overflow")))?;
+    if payload.len() < end {
+        return Err(malformed(&format!("Hello frame truncated before end of {field_name}")));
+    }
+    let s = std::str::from_utf8(&payload[start..end]).map_err(|_| malformed(&format!("Hello {field_name} is not valid UTF-8")))?.to_string();
+    Ok((Some(s), end))
+}
+
 fn read_u16(payload: &[u8], offset: usize) -> io::Result<u16> {
     let end = offset.checked_add(2).ok_or_else(|| malformed("u16 field offset overflow"))?;
     let slice = payload.get(offset..end).ok_or_else(|| malformed("frame truncated before a u16 field"))?;
@@ -229,6 +330,24 @@ fn malformed(msg: &str) -> io::Error {
 /// Returns an error if the payload exceeds [`MAX_FRAME_PAYLOAD`] (so a bug on
 /// the *sending* side surfaces here rather than tripping the peer's reader).
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
+    // Checked *before* `encode()`, not left to `decode()` on the peer's side:
+    // `remote_command`/`tty_exec`'s on-wire length prefix is a `u16` (max
+    // 65535), so a value past that would silently wrap and truncate instead
+    // of being rejected — this check catches both that case and the (far
+    // more likely) 4097..=65535-byte case, which `encode()` would otherwise
+    // happily emit even though it's guaranteed to fail the peer's own cap
+    // check on decode (a real but harmless-in-practice bug found in review:
+    // the peer's `Frame::Rejected` degrades safely to an unmultiplexed direct
+    // connect either way, per `always-connects.md` — this just fails it
+    // earlier and more clearly, on the sending side).
+    if let Frame::Hello { remote_command, tty_exec, .. } = frame {
+        if remote_command.as_ref().is_some_and(|cmd| cmd.len() > MAX_REMOTE_COMMAND_LEN) {
+            return Err(malformed("outgoing Hello remote_command exceeds the cap"));
+        }
+        if tty_exec.as_ref().is_some_and(|cmd| cmd.len() > MAX_TTY_EXEC_LEN) {
+            return Err(malformed("outgoing Hello tty_exec exceeds the cap"));
+        }
+    }
     let body = frame.encode();
     if body.len() > MAX_FRAME_LEN {
         return Err(malformed("outgoing frame exceeds the size cap"));
@@ -337,7 +456,36 @@ mod tests {
 
     fn sample_frames() -> Vec<Frame> {
         vec![
-            Frame::Hello { version: MUX_PROTOCOL_VERSION, token: vec![9u8; 32], term: "xterm-256color".to_string(), cols: 120, rows: 40 },
+            Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: vec![9u8; 32],
+                term: "xterm-256color".to_string(),
+                cols: 120,
+                rows: 40,
+                want_pty: true,
+                remote_command: None,
+                tty_exec: None,
+            },
+            Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: vec![9u8; 32],
+                term: "xterm-256color".to_string(),
+                cols: 120,
+                rows: 40,
+                want_pty: false,
+                remote_command: Some("echo hi".to_string()),
+                tty_exec: None,
+            },
+            Frame::Hello {
+                version: MUX_PROTOCOL_VERSION,
+                token: vec![9u8; 32],
+                term: "xterm-256color".to_string(),
+                cols: 120,
+                rows: 40,
+                want_pty: true,
+                remote_command: None,
+                tty_exec: Some("isekai-pipe tty attach 'work'".to_string()),
+            },
             Frame::HelloAck { version: MUX_PROTOCOL_VERSION },
             Frame::Rejected { reason: "protocol version mismatch".to_string() },
             Frame::Stdin(b"ls -la\n".to_vec()),
@@ -432,6 +580,49 @@ mod tests {
         let too_big = Frame::Stdin(vec![0u8; MAX_FRAME_PAYLOAD + 1]);
         let err = write_frame(&mut w, &too_big).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "a payload past the cap must be refused on the sending side");
+    }
+
+    /// A `Hello.remote_command` past [`MAX_REMOTE_COMMAND_LEN`] must be
+    /// refused on the sending side, same as an oversized `Stdin` payload
+    /// above — `decode()`'s own cap would reject it on the peer's side
+    /// anyway, but only after a byte length past `u16::MAX` had already
+    /// silently wrapped/truncated on encode (found in review).
+    #[tokio::test]
+    async fn writing_a_hello_with_an_oversized_remote_command_fails_on_the_sender() {
+        let (mut w, _r) = duplex(1024);
+        let too_big = Frame::Hello {
+            version: MUX_PROTOCOL_VERSION,
+            token: vec![],
+            term: "xterm".to_string(),
+            cols: 80,
+            rows: 24,
+            want_pty: false,
+            remote_command: Some("x".repeat(MAX_REMOTE_COMMAND_LEN + 1)),
+            tty_exec: None,
+        };
+        let err = write_frame(&mut w, &too_big).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "a remote_command past the cap must be refused on the sending side");
+    }
+
+    /// Same as the `remote_command` case above, but for `tty_exec`
+    /// (`--isekai-tty`) — added when that field was introduced
+    /// (`MUX_PROTOCOL_VERSION` 2→3) so it doesn't silently regress to
+    /// wrapping/truncating instead of being refused.
+    #[tokio::test]
+    async fn writing_a_hello_with_an_oversized_tty_exec_fails_on_the_sender() {
+        let (mut w, _r) = duplex(1024);
+        let too_big = Frame::Hello {
+            version: MUX_PROTOCOL_VERSION,
+            token: vec![],
+            term: "xterm".to_string(),
+            cols: 80,
+            rows: 24,
+            want_pty: true,
+            remote_command: None,
+            tty_exec: Some("x".repeat(MAX_TTY_EXEC_LEN + 1)),
+        };
+        let err = write_frame(&mut w, &too_big).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "a tty_exec past the cap must be refused on the sending side");
     }
 
     #[test]

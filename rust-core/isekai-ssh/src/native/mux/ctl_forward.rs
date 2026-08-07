@@ -88,22 +88,29 @@ pub(crate) async fn cancel<H: client::Handler>(handle: &Mutex<client::Handle<H>>
     routes.unregister(remote_path);
 }
 
-/// Opens an interactive login-shell channel that also exports
-/// `$ISEKAI_CTL_SOCK=<remote_path>`, so the remote `isekai-pipe ctl` can find
-/// this tab's forward. Uses a PTY + `exec` of the same
-/// `export ...; exec "$SHELL" -i -l` replacement command the Unix `-R` path
-/// hands `sshd`, rather than a plain `request_shell`, because `SetEnv`/env
-/// requests would need a remote `sshd_config` opt-in most users don't control.
+/// Opens a login-shell-shaped channel that also exports
+/// `$ISEKAI_CTL_SOCK=<remote_path>` when `remote_path` is `Some` (this tab's
+/// ctl-socket forward), and/or execs `exec_target` in place of an ordinary
+/// login shell when that's `Some` (`--isekai-tty`, `tty_attach.rs`) — the two
+/// compose into one remote command line via
+/// [`crate::ctl_forward::build_login_shell_command`] rather than one
+/// disabling the other. Always requests a PTY + `exec`s the composed
+/// command, rather than a plain `request_shell`, both because `SetEnv`/env
+/// requests would need a remote `sshd_config` opt-in most users don't
+/// control, and because `exec_target` (when present) needs one regardless.
 pub(crate) async fn open_login_shell<H: client::Handler>(
     handle: &client::Handle<H>,
     term: &str,
     cols: u32,
     rows: u32,
-    remote_path: &str,
+    remote_path: Option<&str>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
+    exec_target: Option<&str>,
 ) -> Result<russh::Channel<client::Msg>, russh::Error> {
     let channel = handle.channel_open_session().await?;
     channel.request_pty(false, term, cols, rows, 0, 0, &[]).await?;
-    let command = format!("export ISEKAI_CTL_SOCK={remote_path:?}; exec \"${{SHELL:-/bin/sh}}\" -i -l");
+    let command = crate::ctl_forward::build_login_shell_command(remote_path, tab_idle_color, tab_attention_color, exec_target);
     channel.exec(false, command.as_str()).await?;
     Ok(channel)
 }

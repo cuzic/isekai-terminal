@@ -15,12 +15,12 @@
 //! bridge through, because the forwarded `Channel` is already an in-process
 //! SSH-protocol object no other local process can connect to. Only the pure,
 //! platform-independent helpers here — [`should_attempt_ctl_forward`],
-//! [`new_ctl_token`], [`osc_sequence_for`], [`emit_osc`], and
-//! [`REMOTE_SOCK_PREFIX`] — are shared between the two paths; the socket-bridge
-//! pieces ([`CtlForward`], [`prepare_ctl_forward`], [`spawn_ctl_listener`],
-//! [`forward_option_args`], [`remote_command_arg`], [`handle_ctl_connection`])
-//! are `#[cfg(unix)]`-only, since `ssh(1)`'s `-R` is the only thing that needs
-//! a real local listener.
+//! [`new_ctl_token`], [`osc_sequence_for`], [`emit_osc`], [`REMOTE_SOCK_PREFIX`],
+//! and [`build_login_shell_command`] — are shared between the two paths; the
+//! socket-bridge pieces ([`CtlForward`], [`prepare_ctl_forward`],
+//! [`spawn_ctl_listener`], [`forward_option_args`], [`handle_ctl_connection`])
+//! are `#[cfg(unix)]`-only, since `ssh(1)`'s `-R`
+//! is the only thing that needs a real local listener.
 //!
 //! Deliberately scoped to interactive sessions only (no explicit remote
 //! command trailing the destination): a one-shot remote command has no
@@ -133,18 +133,58 @@ pub(crate) fn forward_option_args(forward: &CtlForward) -> [String; 2] {
     ["-R".to_string(), format!("{}:{}", forward.remote_path, forward.local_path.display())]
 }
 
-/// The replacement remote command: since there is no pre-existing remote
-/// command by construction (see `should_attempt_ctl_forward`), this becomes
-/// the sole arg **after** the destination, exporting `$ISEKAI_CTL_SOCK` and
-/// exec'ing an interactive login shell in its place (replicating what
-/// `sshd` would have run implicitly had no remote command been given at
-/// all).
-#[cfg(unix)]
-pub(crate) fn remote_command_arg(forward: &CtlForward) -> String {
-    format!(
-        "export ISEKAI_CTL_SOCK={:?}; exec \"${{SHELL:-/bin/sh}}\" -i -l",
-        forward.remote_path
-    )
+/// Builds the `export ...; exec <target>` remote command string shared by
+/// the Unix `ssh(1)` path (`wrapper::apply_ctl_socket_forward`, which passes
+/// `Some(&forward.remote_path)` when a [`CtlForward`] is active) and the
+/// Windows-native path (`native/mux/ctl_forward.rs`) — and, via `exec_target`, also by
+/// `--isekai-tty` (`tty_attach.rs`), so the two opt-in features compose into
+/// one remote command instead of one silently disabling the other (see this
+/// module's doc comment).
+///
+/// `remote_path` is `None` when ctl-socket forwarding isn't active for this
+/// invocation (disabled, or `--isekai-tty` is the only reason this function
+/// is being called at all) — in that case the `ISEKAI_CTL_SOCK` export is
+/// simply omitted, same as if this whole function had never run.
+///
+/// `exec_target` is `None` for the plain ctl-socket-only case (an ordinary
+/// login shell, the historical behavior) and `Some("isekai-pipe tty attach
+/// '<name>'")`-shaped for `--isekai-tty` — already safely quoted by the
+/// caller (`tty_attach::attach_command`), spliced in as raw shell syntax the
+/// same way the default `"${SHELL:-/bin/sh}" -i -l` always has been.
+///
+/// `tab_idle_color`/`tab_attention_color` come from `#@isekai
+/// tab-idle-color`/`tab-attention-color`, already validated and parsed to
+/// `(u8, u8, u8)` at config-resolution time
+/// (`wrapper/config.rs::parse_tab_color`). This is deliberate defense in
+/// depth, not redundant validation: by the time a color reaches this
+/// function it is a *type* that cannot represent shell metacharacters (three
+/// bytes, formatted as exactly two lowercase hex digits each via
+/// [`isekai_pipe_core::format_hex_color`]), so this function has no way to
+/// reintroduce the shell-injection bug even if a future caller forgot to
+/// validate — unlike passing the raw `#@isekai` argument `String` straight
+/// through, which is what the original (buggy) implementation effectively
+/// did via `{:?}` Rust `Debug`-escaping (that escapes `"`/`\`/control bytes,
+/// not `$`/backtick, and doesn't stop a leading `#` from turning the whole
+/// `export` line into a shell comment that silently skips the `exec` and
+/// kills the SSH session — `.claude/rules/always-connects.md`).
+pub(crate) fn build_login_shell_command(
+    remote_path: Option<&str>,
+    tab_idle_color: Option<(u8, u8, u8)>,
+    tab_attention_color: Option<(u8, u8, u8)>,
+    exec_target: Option<&str>,
+) -> String {
+    let mut exports = String::new();
+    if let Some(remote_path) = remote_path {
+        exports.push_str(&format!("export ISEKAI_CTL_SOCK={remote_path:?}; "));
+    }
+    if let Some(color) = tab_idle_color {
+        exports.push_str(&format!("export ISEKAI_TAB_IDLE_COLOR={}; ", isekai_pipe_core::format_hex_color(color)));
+    }
+    if let Some(color) = tab_attention_color {
+        exports.push_str(&format!("export ISEKAI_TAB_ATTENTION_COLOR={}; ", isekai_pipe_core::format_hex_color(color)));
+    }
+    let exec_target = exec_target.unwrap_or("\"${SHELL:-/bin/sh}\" -i -l");
+    format!("{exports}exec {exec_target}")
 }
 
 /// No abnormal-exit cleanup runs continuously (`ISEKAI_PIPE_DESIGN.md` §8
@@ -542,9 +582,64 @@ mod tests {
     #[test]
     fn remote_command_exports_the_remote_path_and_execs_a_login_shell() {
         let forward = fixture_forward();
-        let cmd = remote_command_arg(&forward);
+        let cmd = build_login_shell_command(Some(&forward.remote_path), None, None, None);
         assert!(cmd.contains("ISEKAI_CTL_SOCK=\"/tmp/isekai-pipe-ctl-aaaa.sock\""));
         assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -i -l"));
+        assert!(!cmd.contains("ISEKAI_TAB_IDLE_COLOR"));
+        assert!(!cmd.contains("ISEKAI_TAB_ATTENTION_COLOR"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_exports_the_remote_path_and_execs_the_given_exec_target() {
+        let forward = fixture_forward();
+        let cmd = build_login_shell_command(Some(&forward.remote_path), None, None, Some("isekai-pipe tty attach 'work'"));
+        assert!(cmd.contains("ISEKAI_CTL_SOCK=\"/tmp/isekai-pipe-ctl-aaaa.sock\""));
+        assert!(cmd.ends_with("exec isekai-pipe tty attach 'work'"));
+    }
+
+    #[test]
+    fn build_login_shell_command_exports_configured_tab_colors() {
+        let cmd = build_login_shell_command(Some("/tmp/isekai-pipe-ctl-aaaa.sock"), Some((0x20, 0x20, 0x20)), Some((0xff, 0x88, 0x00)), None);
+        assert!(cmd.contains("ISEKAI_CTL_SOCK=\"/tmp/isekai-pipe-ctl-aaaa.sock\""));
+        assert!(cmd.contains("export ISEKAI_TAB_IDLE_COLOR=202020;"));
+        assert!(cmd.contains("export ISEKAI_TAB_ATTENTION_COLOR=ff8800;"));
+        assert!(cmd.ends_with("exec \"${SHELL:-/bin/sh}\" -i -l"));
+    }
+
+    #[test]
+    fn build_login_shell_command_omits_unset_colors() {
+        let cmd = build_login_shell_command(Some("/tmp/isekai-pipe-ctl-aaaa.sock"), None, None, None);
+        assert!(!cmd.contains("ISEKAI_TAB_IDLE_COLOR"));
+        assert!(!cmd.contains("ISEKAI_TAB_ATTENTION_COLOR"));
+    }
+
+    #[test]
+    fn build_login_shell_command_omits_the_ctl_sock_export_when_remote_path_is_none() {
+        let cmd = build_login_shell_command(None, None, None, Some("isekai-pipe tty attach 'work'"));
+        assert!(!cmd.contains("ISEKAI_CTL_SOCK"));
+        assert_eq!(cmd, "exec isekai-pipe tty attach 'work'");
+    }
+
+    #[test]
+    fn build_login_shell_command_never_emits_a_hash_prefix_or_shell_metacharacters() {
+        // The concrete bug this (r, g, b) — not `String` — signature exists
+        // to make structurally impossible: exporting a value that starts
+        // with '#' (a shell comment) or contains '$'/backtick would silently
+        // skip the trailing `exec` and kill the SSH session
+        // (`.claude/rules/always-connects.md`). Exhaustive over all 256
+        // values per channel would be excessive; spot-check the bytes whose
+        // ASCII value could plausibly render as a shell metacharacter.
+        for byte in [0x00, 0x23, 0x24, 0x27, 0x60, 0xff] {
+            let cmd = build_login_shell_command(Some("/tmp/x.sock"), Some((byte, byte, byte)), None, None);
+            let exported = cmd
+                .split("ISEKAI_TAB_IDLE_COLOR=")
+                .nth(1)
+                .and_then(|rest| rest.split(';').next())
+                .unwrap();
+            assert_eq!(exported.len(), 6);
+            assert!(exported.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
     }
 
     #[cfg(unix)]

@@ -32,8 +32,8 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var trzszAcceptUploadCount = 0
     var trzszCancelCount = 0
     var trzszDismissCalled = false
-    var rebindToFdCalls = mutableListOf<Pair<Int, String>>()
     var forceReturnToWifiCallCount = 0
+    var notifyUpstreamHealthDegradedCallCount = 0
     var cancelReconnectCalled = false
 
     @Throws(SshException::class)
@@ -95,8 +95,12 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun cancelReconnect() { cancelReconnectCalled = true }
     // iOSセッションライフサイクル用のRustコールバック(このファイルが対象とする複数タブ/pane
     // まわりのテストでは未検証、no-opで足りる)。
-    override fun notifyDidEnterBackground(budgetMs: UInt) {}
-    override fun notifyWillEnterForeground() {}
+    // 実機検証(2026-07-28)のバグ修正で、TerminalTabsViewModelのファンアウトを検証
+    // できるよう呼び出し回数を記録する(notifyNetworkPathChangedCallsと同じ形)。
+    var notifyDidEnterBackgroundCallCount = 0
+    var notifyWillEnterForegroundCallCount = 0
+    override fun notifyDidEnterBackground(budgetMs: UInt) { notifyDidEnterBackgroundCallCount++ }
+    override fun notifyWillEnterForeground() { notifyWillEnterForegroundCallCount++ }
     override fun notifyBackgroundBudgetExpired() {}
     override fun notifyMemoryWarning() {}
     override fun send(data: ByteArray) { sentBytes.add(data) }
@@ -120,8 +124,18 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszSendChunk(data: ByteArray, isLast: Boolean) {}
     override fun trzszCancel() { trzszCancelCount++ }
     override fun notifyError(message: String) {}
-    override fun rebindToFd(fd: Int, localIp: String) { rebindToFdCalls.add(fd to localIp) }
     override fun forceReturnToWifi() { forceReturnToWifiCallCount++ }
+    // クラッシュ観点レビュー(2026-07-31)で追加: `TerminalTabsViewModel`の
+    // `forwardToRust`(OSコールバックスレッド→UniFFI境界の防御的catch)が
+    // 実際に例外を握り潰すことをテストできるよう、本番のUniFFI生成
+    // バインディングが投げ得る`InternalException`/`IllegalStateException`
+    // (握り潰す側は`Exception`全般をcatchするので、テストではどちらでも
+    // 代表できる)をここから注入できるようにする。
+    var notifyUpstreamHealthDegradedError: Throwable? = null
+    override fun notifyUpstreamHealthDegraded() {
+        notifyUpstreamHealthDegradedCallCount++
+        notifyUpstreamHealthDegradedError?.let { throw it }
+    }
 
     override fun isQuic(): Boolean = quic
 
@@ -133,8 +147,14 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     // isSatisfied=true は切断判断には寄与しないが、呼び出し自体がこのペインまで届いたことは
     // notifyNetworkPathChangedCalls で検証できるようにする。
     val notifyNetworkPathChangedCalls = mutableListOf<Boolean>()
+    // クラッシュ観点レビュー(2026-07-31): `notifyUpstreamHealthDegradedError`と
+    // 同じ目的の注入フック。fan-out(`onNetworkPathChanged`が全ペインへ配信)の
+    // 途中で1ペインが例外を投げても、他のペインへの配信が止まらないことを
+    // 検証するために使う。
+    var notifyNetworkPathChangedError: Throwable? = null
     override fun notifyNetworkPathChanged(isSatisfied: Boolean) {
         notifyNetworkPathChangedCalls.add(isSatisfied)
+        notifyNetworkPathChangedError?.let { throw it }
         if (isSatisfied) return
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {

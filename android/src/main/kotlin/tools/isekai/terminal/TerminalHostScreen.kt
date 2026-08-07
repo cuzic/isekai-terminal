@@ -67,10 +67,16 @@ private const val CHROME_AUTO_HIDE_DELAY_MS = 2500L
  * `TerminalSession` を持ち([TerminalTabsViewModel.PaneState])、キーボード入力・trzsz転送
  * シート・host key確認ダイアログ等の「1つしか存在しない」UIはフォーカス中のペインに対して
  * 表示する([TerminalScreenBody] の `hasFocus` パラメータ)。
+ *
+ * タブ内の「戻る」([onNavigateToProfileList])はプロファイル一覧へ遷移するだけで、タブ/
+ * セッションは破棄しない(タブの破棄はタブ行の「×」[TerminalTabsViewModel.closeTab]のみ)。
+ * 同一プロファイルへもう1セッション増やしたい場合は、プロファイル一覧に戻らずタブ行の
+ * 「+」からその場で新規タブを開ける。
  */
 @Composable
 fun TerminalHostScreen(
     onAllTabsClosed: () -> Unit,
+    onNavigateToProfileList: () -> Unit,
     tabsVm: TerminalTabsViewModel = viewModel(),
 ) {
     val tabs by tabsVm.tabs.collectAsStateWithLifecycle()
@@ -106,25 +112,35 @@ fun TerminalHostScreen(
                 enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
                 exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
             ) {
-                ScrollableTabRow(
-                    selectedTabIndex = selectedIndex,
-                    containerColor = Color(0xFF1A1A2E),
-                    contentColor = Color.White,
-                    edgePadding = 4.dp,
-                ) {
-                    tabs.forEachIndexed { index, tab ->
-                        Tab(
-                            selected = index == selectedIndex,
-                            onClick = { tabsVm.setActiveTab(tab.tabId) },
-                            text = {
-                                TabLabel(
-                                    tabsVm = tabsVm,
-                                    tab = tab,
-                                    otherTabs = tabs.filterNot { it.tabId == tab.tabId },
-                                    onClose = { tabsVm.closeTab(tab.tabId) },
-                                )
-                            },
-                        )
+                // タブ数が変わる(特に増える)瞬間、ScrollableTabRowが「新しいタブがまだ計測されて
+                // いないのにselectedTabIndexだけ先にその新タブを指す」状態を1フレーム経由することが
+                // あり、Compose Material3側の内部position配列アクセスでIndexOutOfBoundsExceptionを
+                // 起こす(タブ追加と同時にその新タブをアクティブ化するopenTab()の直後、既にマウント
+                // 済みのScrollableTabRowへ「+」ボタンからタブを追加した際に実機クラッシュとして発見、
+                // タスク#57フォローアップ)。tabs.sizeをkeyにしてタブ数が変わるたびにScrollableTabRow
+                // 自体を作り直させる(内部のtabPositions等の派生状態を新しいタブ数に対して最初から
+                // 組み立て直させる)ことで、この“成長途中の1フレーム”を経由させない。
+                key(tabs.size) {
+                    ScrollableTabRow(
+                        selectedTabIndex = selectedIndex,
+                        containerColor = Color(0xFF1A1A2E),
+                        contentColor = Color.White,
+                        edgePadding = 4.dp,
+                    ) {
+                        tabs.forEachIndexed { index, tab ->
+                            Tab(
+                                selected = index == selectedIndex,
+                                onClick = { tabsVm.setActiveTab(tab.tabId) },
+                                text = {
+                                    TabLabel(
+                                        tabsVm = tabsVm,
+                                        tab = tab,
+                                        otherTabs = tabs.filterNot { it.tabId == tab.tabId },
+                                        onClose = { tabsVm.closeTab(tab.tabId) },
+                                    )
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -140,7 +156,10 @@ fun TerminalHostScreen(
                                 tab = tab,
                                 tabsVm = tabsVm,
                                 isActive = isActive,
-                                onCloseTab = { tabsVm.closeTab(tab.tabId) },
+                                // タブ内の「戻る」はタブを閉じない(プロファイル一覧へ遷移するだけ、
+                                // セッションはバックグラウンドで生き続ける)。タブの破棄はタブ行の
+                                // 「×」(onClose、上のTabLabel参照)のみが行う。
+                                onBack = onNavigateToProfileList,
                                 chromeVisible = chromeVisible,
                                 onUserActivity = revealChrome,
                             )
@@ -168,6 +187,8 @@ private fun TabLabel(
     // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
     // SplitPaneDialogを閉じてこちらのpending方向を使ってPasswordDialogを表示する。
     var pendingSplitNewDirection by remember { mutableStateOf<SplitDirection?>(null) }
+    // 「+」(同一プロファイルへの新規タブ追加)がパスワード認証プロファイルの場合のPasswordDialog表示。
+    var showNewSessionPasswordDialog by remember { mutableStateOf(false) }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -210,8 +231,46 @@ private fun TabLabel(
         IconButton(onClick = { showThemeDialog = true }, modifier = Modifier.size(20.dp)) {
             Text("🎨", fontSize = 12.sp)
         }
+        // 同一プロファイルへの新規タブ追加(同じサーバーへもう1セッション増やしたい場合の
+        // 最短経路。プロファイル一覧に戻ってタップし直す必要がない)。分割ペインの
+        // 「新規接続（同じプロファイル）」と同じくtabsVm.openTabを直接呼ぶ。
+        val profile = tab.profile
+        if (profile != null) {
+            IconButton(
+                onClick = {
+                    val needsPasswordPrompt = profile.authTypeEnum == AuthType.PASSWORD ||
+                        (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD)
+                    if (needsPasswordPrompt) {
+                        showNewSessionPasswordDialog = true
+                    } else {
+                        tabsVm.openTab(profile)
+                    }
+                },
+                modifier = Modifier.size(20.dp).testTag("addSessionButton"),
+            ) {
+                Text("+", color = Color(0xFFAAAAAA), fontSize = 14.sp)
+            }
+        }
         IconButton(onClick = onClose, modifier = Modifier.size(20.dp).testTag("closeTabButton")) {
             Text("×", color = Color(0xFFAAAAAA), fontSize = 16.sp)
+        }
+    }
+
+    if (showNewSessionPasswordDialog) {
+        val profile = tab.profile
+        if (profile == null) {
+            showNewSessionPasswordDialog = false
+        } else {
+            PasswordDialog(
+                label = profile.label,
+                showMainField = profile.authTypeEnum == AuthType.PASSWORD,
+                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
+                onDismiss = { showNewSessionPasswordDialog = false },
+                onConfirm = { password, jumpPassword ->
+                    tabsVm.openTab(profile, password, jumpPassword)
+                    showNewSessionPasswordDialog = false
+                },
+            )
         }
     }
 
@@ -318,7 +377,7 @@ private fun TerminalTabScreen(
     tab: TerminalTabsViewModel.TabState,
     tabsVm: TerminalTabsViewModel,
     isActive: Boolean,
-    onCloseTab: () -> Unit,
+    onBack: () -> Unit,
     chromeVisible: Boolean,
     onUserActivity: () -> Unit,
 ) {
@@ -334,7 +393,7 @@ private fun TerminalTabScreen(
             tabsVm = tabsVm,
             isActive = isActive,
             hasFocus = true,
-            onCloseTab = onCloseTab,
+            onBack = onBack,
             chromeVisible = chromeVisible,
             onUserActivity = onUserActivity,
         )
@@ -347,7 +406,7 @@ private fun TerminalTabScreen(
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     TerminalPaneScreen(
                         tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onCloseTab = onCloseTab,
+                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
                         chromeVisible = chromeVisible, onUserActivity = onUserActivity,
                     )
                 }
@@ -355,7 +414,7 @@ private fun TerminalTabScreen(
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     TerminalPaneScreen(
                         tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onCloseTab = onCloseTab,
+                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
                         onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
                         chromeVisible = chromeVisible, onUserActivity = onUserActivity,
                     )
@@ -366,7 +425,7 @@ private fun TerminalTabScreen(
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                     TerminalPaneScreen(
                         tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onCloseTab = onCloseTab,
+                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
                         chromeVisible = chromeVisible, onUserActivity = onUserActivity,
                     )
                 }
@@ -374,7 +433,7 @@ private fun TerminalTabScreen(
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                     TerminalPaneScreen(
                         tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onCloseTab = onCloseTab,
+                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
                         onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
                         chromeVisible = chromeVisible, onUserActivity = onUserActivity,
                     )
@@ -396,7 +455,7 @@ private fun TerminalPaneScreen(
     tabsVm: TerminalTabsViewModel,
     isActive: Boolean,
     hasFocus: Boolean,
-    onCloseTab: () -> Unit,
+    onBack: () -> Unit,
     onCloseSplit: (() -> Unit)? = null,
     chromeVisible: Boolean,
     onUserActivity: () -> Unit,
@@ -428,9 +487,7 @@ private fun TerminalPaneScreen(
                     onConnect = { tabsVm.reconnectPane(address) },
                     onDisconnect = { tabsVm.disconnectPane(address) },
                     onCancelReconnect = { tabsVm.cancelReconnectPane(address) },
-                    // タブ内の「戻る」/切断確認ダイアログはタブを閉じる（＝タブ行の × と同じ操作）。
-                    // 全タブが閉じられると呼び出し側 (TerminalHostScreen) が自動でリストへ戻る。
-                    onBack = onCloseTab,
+                    onBack = onBack,
                     onSend = { bytes -> tabsVm.sendToPane(address, bytes) },
                     onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
                     onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },

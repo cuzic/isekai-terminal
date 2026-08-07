@@ -358,7 +358,8 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             cols: cols,
             rows: rows,
             jump: jump,
-            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) }
+            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) },
+            enableUpstreamFailover: profile.enableUpstreamFailover
         )
     }
 

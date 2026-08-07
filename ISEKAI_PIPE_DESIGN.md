@@ -1840,3 +1840,295 @@ stdout/stderrへ書き出すだけで、追加の表示経路なしにリモー�
   `send_build_finished`/`spawn_result_push`/`push_result_file`/`build_push_remote_command`
 - `rust-core/isekai-pipe/src/ctl.rs`: `CtlLaunch::Build`/`stream_build`
 - `rust-core/isekai-ssh/tests/build_result_push_e2e.rs`
+
+### Epic Q: Claude Codeフック連携によるタブ状態表示(claude-hookd)— 実装済み・未マージ(2026-07-25、Opusレビュー2回反映後、`feat/claude-hookd`ブランチ)
+
+**実装状況**: 状態機械(`claude_hookd::state`)・常駐daemon(`claude_hookd::daemon`)・
+`isekai-pipe claude-hookd event`/`__serve`サブコマンド・`#@isekai tab-idle-color`/
+`tab-attention-color`ディレクティブ・README(`rust-core/isekai-ssh/README.md`)は
+すべてこのworktree上に実装済み。まだ`main`にはマージされていない。以下は着手前に
+書かれた設計節をほぼそのまま残しているため、意思決定の経緯としてはそのまま有効だが、
+「未着手」ではなく「この設計の通りに実装され、実機/単体テストで検証済み」と読むこと
+(状態機械は`.claude/rules/rust-ssot.md`の方針通りI/O無し純粋関数として単体テストされ
+ている——`claude_hookd::state`のテストを参照)。`PermissionRequest`/`timeout`の追加
+(2026-07-25、下記4参照)は実運用中のtmuxプラグイン2種の設定を調査した上での増分修正。
+
+**動機**: `AI_INTEGRATION_DESIGN.md` §6.1(`ctl notify`)は「注目通知」を一過性のポップアップ
+(OSC 9)・システム通知として実装したが(「状態ドット」は当初の設計文にあった記述で、
+実際にはタブバーの永続的な視覚インジケータとしては実装されていない——2026-07-25訂正、
+`AI_INTEGRATION_DESIGN.md` §11参照)、これは**状態を持たない**——通知は
+出た瞬間で終わりで、「まだ対応待ちか」「もう対応済みか」を見た目で持続的に示すものが
+無い。Epic M-tab-color(2026-07-24、`isekai-pipe ctl tab-color`)は「タブの背景色を
+明示的に設定する」プリミティブを追加したが、これも単発のfire-and-forgetで、
+「Claude Codeの状態に応じて自動的に色を変え、対応(または放置タイムアウト)で
+自動的に戻す」というdebounce付きの持続的表示は、呼び出し側(hookスクリプト)が
+自分で作る必要があった。
+
+hookスクリプトは呼ばれるたびに新しいプロセスとして起動・終了する(Claude Code側の
+呼び出し規約であり変更できない)ため、「直前のイベントより新しいイベントが来たら
+タイムアウトを延長する」というdebounceを、hookスクリプト側の使い捨てプロセスの
+中だけで安全に実現するのは難しい(PIDファイルをkillし合う方式はPID再利用・
+「そのPIDがまだ自分のタイマーか」の判定など別の競合を生む——検討過程の詳細は
+tab-color増分のコミット時のOpusレビュー会話を参照)。そこで、debounce状態を
+持つ小さな常駐daemon(`claude-hookd`)を、hookが呼ぶ側に1つ挟む設計にする。
+
+**満たすべき制約**:
+- **`rust-ssot.md`と同じ原則をここにも適用する**: 「今どの状態か」の判断ロジックは
+  daemon側(Rust)に一元化し、hookスクリプト(シェル)側に判断を持たせない。
+  hookスクリプトがやってよいのは「生イベントをそのままdaemonに転送する」ことだけ。
+  `SessionOrchestrator`の`ConnPhase`と同型の設計。1回目のOpusレビューで、
+  「`Notification`/`Stop`はnotify、`UserPromptSubmit`はresolve」というイベント名→
+  意味の対応表自体が`.claude/settings.json`(シェル側)に固定化されていて、これは
+  「hookは生イベントを転送するだけ」という主張と矛盾する、と指摘された。v2では
+  `.claude/settings.json`側のコマンドを**`isekai-pipe claude-hookd event`1本**に
+  統一し、hookのJSONペイロード(`hook_event_name`・`session_id`・`tool_name`等)を
+  そのままstdinで渡して、意味付けは完全にdaemon側で行う(下記4)。
+- **新しいSSH/QUICチャネルは作らない**: daemonはリモートホストにローカルに閉じた
+  常駐プロセスであり、実際にタブの見た目を変える操作は既存の`isekai-pipe ctl`が
+  使っているのと同じ送出経路(`isekai_protocol::CtlMessage`をctlソケットへ書く関数)を
+  **同一プロセス内で直接呼ぶ**(1回目のレビュー指摘: daemon自身が`isekai-pipe`
+  そのものなので、`Command::new("isekai-pipe")`でサブプロセスとしてシェルアウトする
+  必要が無い——PATH依存・fork・任意文字列を経由する必要が消える)。Epic Mの
+  ctl-socket forward機構を再利用し、daemon自身が新しいSSHチャネルを要求することは
+  無い。
+- **常駐監視プロセスは置かない(Epic Mと同じ opportunistic 方針)**: daemonは最初の
+  `claude-hookd event`呼び出し時に遅延起動し、一定時間(既定1時間)イベントが
+  無ければ自分で終了する。`isekai-ssh doctor`のような明示的な起動・停止コマンドは
+  作らない。ただし後述(4)の通り、自己終了そのものが次回起動を壊さないことを
+  設計として保証する。
+
+**設計**:
+
+1. **色の設定場所**: `~/.config/isekai-ssh/config.toml`のような新規グローバル設定
+   ファイルは作らない。既存の`#@isekai`ディレクティブ(`ctl-socket yes`と同じ仕組み、
+   Host block継承・デフォルト解決を`wrapper/config.rs`が既に持つ)に
+   `#@isekai tab-idle-color <rrggbb>`・`#@isekai tab-attention-color <rrggbb>`の
+   2つを追加する。
+   - **前段の「profileはローカル概念だからリモートには届かない」という判断
+     (2026-07-25)は誤りだった**: 色は**接続確立時にローカル(client)側で解決して
+     env var に埋め込む**方式(下記2)を既に採っているため、per-host設定はこの
+     仕組みの上に自然に乗る(1回目のOpusレビューで指摘、撤回を再撤回する)。
+   - 未指定時はRust側の定数(idle・attentionそれぞれ)にフォールバックする。
+   - **attention色も設定可能にする**(1回目のレビュー指摘: idleだけ設定可能で
+     attentionが固定なのは非対称で理由が無い)。
+2. **env var伝播**: `isekai-ssh`が接続確立時に組み立てる置換リモートコマンド
+   (`export ISEKAI_CTL_SOCK=...; exec "$SHELL" -i -l`)に
+   `export ISEKAI_TAB_IDLE_COLOR=<hex>; export ISEKAI_TAB_ATTENTION_COLOR=<hex>;`を
+   追加する。
+   - **`remote_command_arg`をプラットフォーム非依存にする**(1回目のレビュー指摘:
+     現状Unix版`ctl_forward.rs`とWindows-native版`native/mux/ctl_forward.rs`に
+     同じ文字列組み立てが重複しており、2箇所を毎回同期させる必要があった。
+     `remote_path`だけを受け取る純粋関数に切り出し、両方から呼ぶ形に統合する)。
+   - **値は`isekai-pipe ctl tab-color`が既に持つ`parse_hex_color`で検証してから
+     6桁の裸のhexとして埋め込む**(1回目のレビューで発見された重大な問題:
+     `remote_command_arg`は`{:?}`というRustのDebugエスケープを使っており、
+     `$`やbacktickを止めない。設定ファイルにシェルコマンドを注入されると
+     ログインのたびに実行されてしまい、`#ff0000`のような`#`始まりの値だと
+     シェルコメント扱いで`exec`自体が実行されずSSHセッションが死ぬ——
+     `always-connects.md`が最優先とする原則への直接的な違反になる)。
+     パース失敗・ファイル欠落時はエラーにせず**サイレントにRust側既定値へ
+     フォールバック**する(Epic Mの opportunistic 方針と同じ)。
+   - **既知の制限(Epic AI-3への回答)**: tmuxを別のSSH接続を跨いで再アタッチした
+     場合、`$ISEKAI_CTL_SOCK`同様これらの環境変数も古い接続時点の値のまま残る
+     (Epic M「既知の制限」と同じ性質・同じ理由)。daemonからの`ctl`呼び出しが
+     古いsocketを指して黙って失敗するだけで、新しいペイン/ウィンドウでは正しい
+     値に差し替わる。
+   - `ctl-socket`は既定`no`(opt-in)なので、`$ISEKAI_CTL_SOCK`が未設定の環境では
+     `claude-hookd event`はdaemonを起動せずサイレントにexit 0する。
+3. **`isekai-pipe claude-hookd event`**(唯一の新サブコマンド、`isekai-pipe`本体に
+   追加——新しいバイナリは作らない):
+   - stdinからhookのJSONペイロード全体を読み、`hook_event_name`・`session_id`・
+     (`PreToolUse`/`PostToolUse`のときのみ)`tool_name`を取り出す。
+   - **必ずexit 0、stdoutには何も書かない**(1回目のレビュー指摘: `PreToolUse`
+     hookが非0で終了するとツール呼び出しをブロックし、stdoutへのJSON出力は
+     許可判定を変えうる。daemon起動失敗のような一時的な不調が「Claude Code側の
+     ツール実行を拒否する」という誤った副作用を持ってはならない)。
+   - daemonの識別は従来通り`$ISEKAI_CTL_SOCK`のトークンから導出するが、
+     **ソケットは既存の`sweep_stale_sockets`の対象prefixに乗せる**:
+     `/tmp/isekai-pipe-ctl-hookd-<token>.sock`(1回目のレビュー指摘: 独自の
+     `runtime_dir`案は誤りだった——`runtime_dir`はclient側の概念で、daemonは
+     remote側で動くため対応する場所が無い。remoteが実際に持っているのは
+     `$ISEKAI_CTL_SOCK`の値そのものだけ)。
+   - 接続を試み、失敗なら**bind前に`is_abandoned`で古いソケットファイルを掃除
+     してから**detach起動(1回目のレビューで発見された致命的な問題: 掃除せずに
+     `bind`すると、daemonの自己終了(4)やクラッシュのたびに`EADDRINUSE`で
+     二度と起動できなくなり、そのタブのhookが永久にサイレントno-opになる)。
+   - 起動待ち→再接続は**バウンドされたリトライ+短いbackoff**にする(1回だけの
+     リトライだと、2つのhookがほぼ同時にdaemon不在を検知して両方ともspawnを
+     試みるレースで負けた側のイベントが失われる。勝った側が`bind`し終える前に
+     負けた側が1回だけ再接続を試みると`ECONNREFUSED`のまま諦めてしまうため)。
+     `bind`で`EADDRINUSE`になった側(=自分は不要だった)は、エラーを出さず
+     サイレントにexit 0する(既に別プロセスが同じタブを担当している、が
+     正しい結末なので)。
+   - detachする際は`setsid`+標準入出力3本を`/dev/null`にリダイレクトする
+     (`isekai-bootstrap/src/openssh.rs`の`setsid ... </dev/null >... 2>...`
+     パターンを再利用)。**hookの標準出力パイプをdaemonに継がせない**——
+     継がせたままだとClaude Code側の「hook出力をEOFまで読む」処理が、daemonが
+     生きている間(最長1時間)ブロックし続ける(1回目のレビューで発見された
+     もう一つの致命的な問題)。
+4. **daemon本体の状態機械**: **`session_id`(tmuxの1 pane = Claude Codeの1
+   セッション)ごと**に`Idle | Attention{deadline}`を持つ(1回目のレビューで発見:
+   `$ISEKAI_CTL_SOCK`はタブ単位=SSH接続単位で、同じタブ内の複数tmux paneが
+   同じ値を共有する。session_id単位でなくタブ単位で1個の状態しか持たないと、
+   pane Aが`AskUserQuestion`でブロック中にpane Bで`UserPromptSubmit`すると
+   pane Aの注意喚起が消え、逆にpane Bの`Stop`がpane Aのdebounceとして握りつぶ
+   される)。タブの実際の色は**集約値**: いずれかの`session_id`が`Attention`なら
+   attention色、全て`Idle`ならidle色。
+   ```
+   (session_id, Idle) --Notify--> (session_id, Attention(deadline = now + timeout))
+   (session_id, Attention) --Notify--> (session_id, Attention(deadlineを延長、debounce))
+   (session_id, Attention) --Resolve--> (session_id, Idle)
+   (session_id, Attention) --deadline経過--> (session_id, Idle)
+   ```
+   状態機械はI/O無しの純粋関数として実装し単体テストする(1回目のレビュー指摘:
+   `isekai-bootstrap-plan`の「I/OなしのBootstrapPlan共通層」と同じ形。
+   `fn apply(state: &TabState, session_id, event: HookEvent, now: Instant) ->
+   (TabState, Vec<Action>)`。10分/1時間の実時間待ちなしで全遷移をテストできる)。
+   非同期の実行ループはこの純粋関数の結果(`Action`のリスト: `SetColor`/
+   `SendPopup`)をI/Oに変換するだけの薄いラッパーにする。
+   - **イベント→意味の対応はdaemon側で決める**(上記の制約参照)。2026-07-25、
+     Opusによる設計相談(公式ドキュメント`code.claude.com/docs/en/hooks.md`の
+     生テキストを直接確認、レンダリング済みページの要約は`Stop`の該当フィールドを
+     欠落させることが判明したため`.md`直取得で裏取り済み)を経て、当初案から
+     以下の点を修正した:
+     - **Notify**: `hook_event_name == "Notification"`かつ`notification_type`が
+       `permission_prompt`/`idle_prompt`/`elicitation_dialog`/
+       `agent_needs_input`/`agent_completed`のいずれか(`notification_type`
+       欠落時は後方互換のため無条件Notify)。`hook_event_name == "Stop"`かつ
+       `background_tasks`(Claude Code v2.1.145+)が空またはフィールド自体が
+       無い場合。`hook_event_name == "StopFailure"`(APIエラー等で`Stop`の
+       代わりに発火、無条件)。`hook_event_name == "PermissionRequest"`
+       (無条件、`Notification`の`permission_prompt`と意図的に併用——下記
+       参照)。`hook_event_name == "PreToolUse"`かつ
+       `tool_name == "AskUserQuestion"`。
+     - **Resolve**: `hook_event_name == "UserPromptSubmit"`。
+       `hook_event_name == "SessionEnd"`(セッション自体が無くなればもう
+       誰も待っていない、taskタイムアウト・daemon起動時自己修復のどちらも
+       塞がない「ユーザーがattention中にClaude Codeごと終了する」隙間を
+       埋める)。`hook_event_name`が`PostToolUse`または
+       `PostToolUseFailure`かつ`agent_id`フィールドが無い(=subagent発火では
+       ない)場合、`tool_name`を問わず無条件。
+     - **無視**(Notify/Resolveどちらでもない): `notification_type`が
+       `auth_success`(何も待っていない状態を示すだけ)。`background_tasks`が
+       空でない`Stop`(実際にはまだ一時停止中——完了時に改めて空配列の`Stop`
+       か`Notification(idle_prompt)`が届くので取りこぼさない)。それ以外の
+       `hook_event_name`。
+     - **`PermissionRequest`(独立したhookイベント)も`Notification`の
+       `permission_prompt`と併用する**(2026-07-25、当初の「使わない」判断
+       (下記括弧内)を撤回): `accessd/tmux-agent-indicator`(⭐81、`Permission
+       Request`を主信号に使用)・`sandudorogan/tmux-pane-tree`(両方をmatcher
+       無しで登録)という実運用されている2つのtmuxプラグインの`.claude/
+       settings.json`配線を確認したところ、どちらも`PermissionRequest`を
+       使っていた。当初の懸念(ダイアログが実際に表示される**前**に発火する
+       同期的な判定hookのため、他の`PermissionRequest`hookが自動承認すれば
+       ユーザーは何も見ないままattention色になりうる)は、本設計では実害が
+       小さい: 誤ってNotifyしても、承認されたツールが実際に走れば無条件
+       `PostToolUse`が即座にResolveするため、一瞬色が点いて消えるだけの
+       自己修復可能な誤検知で済む。両方から発火しても実害は無い(同一
+       `session_id`が既にAttentionならdebounceとして握りつぶされるだけ)。
+     - **`PostToolUse`から`AskUserQuestion`のmatcherを外した**(1回目のレビューで
+       発見: `AskUserQuestion`への`PreToolUse`には対応する`PostToolUse`が無く、
+       回答してもツール呼び出し自体は`UserPromptSubmit`を発火しないため、
+       10分のタイムアウトまでAttentionが残り続けていた)。無条件Resolveは
+       既にIdleのsessionへのno-opとしてテスト済みなので安全で、`Notification`
+       の`permission_prompt`が承認されて実際にツールが走った場合の解消にも
+       この経路がそのまま使える。
+     - **`agent_id`ガードが必須な理由**: subagentは親と同じ`session_id`を共有し、
+       Claude Code v2.1.198+ではデフォルトでバックグラウンド実行されるため、
+       matcherを外した`PostToolUse`をそのまま使うと、メインターンの`Stop`が
+       付けたattentionを、後から届くsubagent自身のツール完了イベントが
+       即座に解除してしまう。
+     - **`Stop`を`Resolve`にはしない・`stop_hook_active`も見ない**:
+       `Stop`hook実行時点では他のhookがこの後ブロックするかどうか分からず、
+       `stop_hook_active: true`はstop-hookループの最終的な本当の終了時にも
+       現れうるため、ここでResolveすると「実は完了した」ターンをidle色のまま
+       誤魔化しかねない。多少無駄にattention色が続く方の実害が小さいと判断した。
+   - あるタブで初めて(=集約値がidleからattentionに変わる瞬間)`SetColor(attention)`
+     と`isekai-pipe ctl notify --kind waiting <title> <body>`
+     (`AI_INTEGRATION_DESIGN.md` §6.1、`NotifyKind::Waiting`)の両方を実行する。
+     既に他の`session_id`がAttention中の場合や、同一`session_id`内のdebounceでは
+     どちらも再送しない。
+   - 集約値がattentionからidleに戻る瞬間(最後の`session_id`が解消/timeout)に
+     `SetColor(idle)`を実行する。
+   - **自己修復**(1回目のレビュー指摘: crashやEpic Mの既知の制限で古い
+     `$ISEKAI_CTL_SOCK`を掴んだままになった等でタブがattention色のまま
+     取り残されるケースへの対処): daemonは起動時に一度`SetColor(idle)`を送る。
+     加えて`claude-hookd event`は、`SessionEnd`(=もうこのセッションから
+     イベントは二度と来ない)がdaemonに届かなかった場合に限り、daemonを
+     新規起動せずに`SetColor(idle)`だけを1回冪等に直接送る(2026-07-25、
+     Opus相談で発見: これが無いと、attention中にdaemonがクラッシュしたまま
+     セッションが終了すると、二度と塗り直されず永久にattention色のまま
+     残る)。他の`Resolve`(`PostToolUse`等、matcherを外して常時発火する
+     もの)では行わない——ほとんどの場合そのタブは一度もattentionになった
+     ことが無くdaemonも元々不要なので、ツール呼び出しのたびに冗長な
+     `SetColor(idle)`をctlソケットへ送り続けるだけの無駄になる。
+   - 既定タイムアウト: attention→idleへの自動復帰は10分。将来
+     `#@isekai tab-attention-timeout-secs <n>`等での上書きは増分として残す。
+   - daemon自身は最後のイベントから1時間イベントが無ければ自発的に終了する
+     (ソケットは3で述べた通り既存のstale sweepの対象になるため、次回起動を
+     壊さない)。
+5. **hook配線**(ユーザー自身が`.claude/settings.json`に手動追加、
+   `AI_INTEGRATION_DESIGN.md` Epic AI-2への回答: **自動配布はしない**。設定ファイルへの
+   書き込みはEpic Mの「no general-purpose exec RPC」方針に隣接する懸念があるとされた
+   経緯があり、v1では踏み込まない)。コマンドはどのhookでも同じ1行:
+   ```json
+   {
+     "hooks": {
+       "Notification":       [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PermissionRequest":  [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "Stop":               [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "StopFailure":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "UserPromptSubmit":   [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "SessionEnd":         [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "PreToolUse":         [{ "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "timeout": 10 }] }],
+       "PostToolUse":        [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }],
+       "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "isekai-pipe claude-hookd event", "async": true, "timeout": 10 }] }]
+     }
+   }
+   ```
+   `timeout`(秒)は`accessd/tmux-agent-indicator`・`sandudorogan/tmux-pane-tree`
+   の実運用設定を参考に全hookへ明示した(`claude-hookd`自身の最悪ケース——
+   daemon起動待ちのバウンドリトライ——は~1.55秒なので10秒で十分な余裕がある)。
+   `matcher`が要るのは`PreToolUse`(`AskUserQuestion`のみ)だけ。それ以外の
+   hookは全件登録し、実際にNotify/Resolveのどちらを意味するか(`tool_name`
+   の`AskUserQuestion`一致・`notification_type`の値・`background_tasks`の
+   有無・`agent_id`の有無等)の判断は上記4の通りdaemon側で一元的に行う。
+   `PostToolUse`/`PostToolUseFailure`/`Notification`はマッチャー無しで
+   ツール呼び出しのたびに発火するため、Claude Code本体をブロックしないよう
+   `"async": true`を付ける(`claude-hookd event`は元々exitコード常に0・
+   stdout無出力なので、asyncにしても判定への影響は無い)。
+
+**明示的にスコープ外(v1)**:
+- **isekai-terminal本体アプリ(Android/iOS)には効果が無い**: `SetTabColor`は
+  Android/iOS側では防御的に無視される(`session.rs`)実装のままで、OSC 4;264も
+  Windows Terminal固有。本Epicは`isekai-ssh` + Windows Terminalの組み合わせのみを
+  対象とする(1回目のレビュー指摘: 「参照実装」だけを見ると本体アプリでも動くように
+  誤読されうるため明記する)。`ctl notify`自体はAndroid本体アプリでも受信できるが、
+  当初「既存の通り本体アプリでも動く」としていたのは誤りだった(2026-07-25訂正):
+  tmux hook系kindのバックグラウンドシステム通知は実装済みだったが、AI系kind
+  (`Waiting`/`Done`/`Info`、本Epicが送出するもの)はAndroid側で未配線のまま
+  ログ出力止まりだった。2026-07-25、`TerminalTabsViewModel.kt`の`onNotify`を
+  `TabAlertNotifier`へ配線して解消した(`AI_INTEGRATION_DESIGN.md` §11.1.4参照)。
+  「状態ドット」(タブバーの永続的な視覚インジケータ)は元の設計文にあった記述だが、
+  tmux系・AI系いずれについても実装されていない(バックグラウンドシステム通知のみ)。
+- 「元のターミナル既定色に戻す」という意味での真のreset(`SetTabColor`にreset
+  プリミティブが無い前提のまま、idle色も明示的なRGB値として扱う——tab-color増分の
+  Opusレビュー時の議論と同じ判断を踏襲)。
+- `claude-hookd`自体の自動配布・`.claude/settings.json`の自動書き換え(Epic AI-2)。
+- タイムアウト値のCLI/設定オプション化(将来の増分、状態機械自体は上記の通り
+  最初から`Duration`を注入可能な形で作るので実装コストは小さいはず)。
+
+**参照実装**(実装着手時に更新):
+- `rust-core/isekai-ssh/src/wrapper/config.rs`: `#@isekai`ディレクティブのパーサ
+  (`ctl-socket yes`と同じパターンに`tab-idle-color`/`tab-attention-color`を追加)
+- `rust-core/isekai-ssh/src/ctl_forward.rs`: `remote_command_arg`(プラットフォーム
+  非依存にした上でUnix/Windows-native双方から呼ぶ)
+- `rust-core/isekai-pipe/src/ctl.rs`: `parse_hex_color`(env var検証に再利用)・
+  `CtlLaunch::TabColor`・`CtlLaunch::Notify`(daemonが同一プロセス内で呼ぶ送出経路)
+- `rust-core/isekai-pipe-core/src/ctl_gc.rs`: `sweep_stale_sockets`/`is_abandoned`
+  (daemonソケットのbind前クリーンアップに再利用)
+- `rust-core/isekai-bootstrap/src/openssh.rs`: `setsid`によるdetach起動パターン
+- `rust-core/isekai-bootstrap-plan`: I/O無し純粋関数層(daemon状態機械の設計テンプレート)
+- `rust-core/src/orchestrator.rs`: `SessionOrchestrator`/`ConnPhase`(状態機械の設計
+  テンプレート、`.claude/rules/rust-ssot.md`参照)
+- `AI_INTEGRATION_DESIGN.md` §6.1・§9 Epic AI-2/AI-3(本Epicが回答する既知のギャップ)

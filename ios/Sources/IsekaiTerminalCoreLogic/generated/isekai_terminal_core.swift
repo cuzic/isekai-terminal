@@ -1277,6 +1277,16 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func notifyNetworkPathChanged(isSatisfied: Bool) 
     
     /**
+     * Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+     * そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+     * (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+     * マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+     * Rust側で無視される。
+     */
+    func notifyUpstreamHealthDegraded() 
+    
+    /**
      * アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
      * `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
      * (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
@@ -1286,13 +1296,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * 何もしない。
      */
     func notifyWillEnterForeground() 
-    
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */
-    func rebindToFd(fd: Int32, localIp: String) 
     
     func removeForward(id: String) 
     
@@ -1737,6 +1740,21 @@ open func notifyNetworkPathChanged(isSatisfied: Bool)  {try! rustCall() {
 }
     
     /**
+     * Android `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`
+     * 喪失検知、Rust側のQUICパスヘルスとは無関係な独自シグナル)から、生イベントを
+     * そのまま転送するために呼ぶ。判断・rebind実行は一切せず`RebindManager`
+     * (`RebindEvent::UpstreamHealthDegraded`)へ委譲するだけ(`rust-ssot.md`準拠)。
+     * マルチパス以外のtransportや未接続時、`enableUpstreamFailover`が無効な場合は
+     * Rust側で無視される。
+     */
+open func notifyUpstreamHealthDegraded()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_upstream_health_degraded(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
      * アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
      * `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
      * (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
@@ -1748,20 +1766,6 @@ open func notifyNetworkPathChanged(isSatisfied: Bool)  {try! rustCall() {
 open func notifyWillEnterForeground()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
             self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
-     * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
-     * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
-     */
-open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(
-            self.uniffiCloneHandle(),
-        FfiConverterInt32.lower(fd),
-        FfiConverterString.lower(localIp),$0
     )
 }
 }
@@ -3001,6 +3005,18 @@ public struct MultipathIsekaiPipeQuicConfig: Equatable, Hashable {
      * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
      */
     public var bindPort: UInt16?
+    /**
+     * #22: `RebindManager`(WiFi⇔セルラー自動フェイルオーバーFSM)を有効にするか
+     * (`ConnectionProfile.enableUpstreamFailover`の値をそのまま渡す)。`false`
+     * なら`NoViablePath`/`UpstreamHealthDegraded`を検知しても`RebindManager`は
+     * 一切反応しない(`establish_multipath_connection`呼び出し時に`rebind_driver`
+     * 引数を`None`にする、`notify_upstream_health_degraded`も早期returnする)。
+     * 以前はこの値がRust側に伝わっておらず、Kotlin側`onWifiUpstreamBroken`の
+     * 起動条件としてしか使われていなかったため、この設定を無効にしていても
+     * `RebindManager`自体は常時反応していた(実害: 意図せずセルラー[従量課金]へ
+     * 切り替わる、opusレビューで発見)。
+     */
+    public var enableUpstreamFailover: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3044,7 +3060,18 @@ public struct MultipathIsekaiPipeQuicConfig: Equatable, Hashable {
          * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
          * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
          * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
-         */bindPort: UInt16?) {
+         */bindPort: UInt16?, 
+        /**
+         * #22: `RebindManager`(WiFi⇔セルラー自動フェイルオーバーFSM)を有効にするか
+         * (`ConnectionProfile.enableUpstreamFailover`の値をそのまま渡す)。`false`
+         * なら`NoViablePath`/`UpstreamHealthDegraded`を検知しても`RebindManager`は
+         * 一切反応しない(`establish_multipath_connection`呼び出し時に`rebind_driver`
+         * 引数を`None`にする、`notify_upstream_health_degraded`も早期returnする)。
+         * 以前はこの値がRust側に伝わっておらず、Kotlin側`onWifiUpstreamBroken`の
+         * 起動条件としてしか使われていなかったため、この設定を無効にしていても
+         * `RebindManager`自体は常時反応していた(実害: 意図せずセルラー[従量課金]へ
+         * 切り替わる、opusレビューで発見)。
+         */enableUpstreamFailover: Bool) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.directHost = directHost
@@ -3059,6 +3086,7 @@ public struct MultipathIsekaiPipeQuicConfig: Equatable, Hashable {
         self.rows = rows
         self.jump = jump
         self.bindPort = bindPort
+        self.enableUpstreamFailover = enableUpstreamFailover
     }
 
     
@@ -3090,7 +3118,8 @@ public struct FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuf
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
                 jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
-                bindPort: FfiConverterOptionUInt16.read(from: &buf)
+                bindPort: FfiConverterOptionUInt16.read(from: &buf), 
+                enableUpstreamFailover: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -3109,6 +3138,7 @@ public struct FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuf
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
         FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
+        FfiConverterBool.write(value.enableUpstreamFailover, into: &buf)
     }
 }
 
@@ -8864,10 +8894,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed() != 22300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_upstream_health_degraded() != 13087) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {

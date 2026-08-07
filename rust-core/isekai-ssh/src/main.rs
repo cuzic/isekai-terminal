@@ -20,6 +20,7 @@ mod init;
 mod log_file;
 mod login;
 mod native;
+mod tty_attach;
 mod wrapper;
 
 /// Serializes tests (across `init.rs`/`wrapper.rs`) that mutate the

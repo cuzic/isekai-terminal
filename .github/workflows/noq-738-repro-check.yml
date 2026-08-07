@@ -1,0 +1,107 @@
+name: noq #738 repro check (on-demand, throwaway)
+
+# n0-computer/noq issue #738(open_path()にlocal_ipを明示指定した2本目のpathで
+# PATH_RESPONSEがon_path_response_receivedへ届かずValidationFailedになる不具合)の
+# 再現・修正候補検証専用。rust-core/noq-multipath-spike/src/bin/dual_fd_loopback_test.rs
+# が、issue本文で報告されたバグの構成(default socket経由path0 + local_ip明示指定の
+# secondary path1)をloopbackエイリアス(127.0.0.1/127.0.0.2)だけで忠実に再現している
+# ため、実機Android不要でこのシナリオを検証できる。
+#
+# noq_git_rev入力で `[patch.crates-io]` の対象git revを指定する(空文字列なら
+# 未パッチ=crates.io版1.0.1のベースライン確認)。使い捨てワークフロー: 検証が終われば
+# 削除して構わない(CLAUDE.mdの「実験的コード」方針、noq-multipath-spike自体も
+# 使い捨てコードという位置づけと同じ)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      noq_git_rev:
+        description: "noq/noq-proto/noq-udpをpatchするgit rev(空なら未パッチのcrates.io 1.0.1)"
+        required: false
+        default: ""
+      bin_name:
+        description: "実行するbinターゲット"
+        required: false
+        default: "dual-fd-loopback-test"
+        type: choice
+        options:
+          - dual-fd-loopback-test
+          - dual-fd-loopback-test-v6dual
+
+concurrency:
+  group: noq-738-repro-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_LOG: noq=trace,noq_proto=trace,noq_udp=trace,dual_fd_loopback_test=trace,dual_fd_loopback_test_v6dual=trace
+      BIN_NAME: ${{ github.event.inputs.bin_name || 'dual-fd-loopback-test' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo (noq-multipath-spike)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/noq-multipath-spike/target
+          key: noq-738-repro-${{ runner.os }}-${{ github.event.inputs.noq_git_rev }}-${{ hashFiles('rust-core/noq-multipath-spike/Cargo.toml') }}
+          restore-keys: |
+            noq-738-repro-${{ runner.os }}-${{ github.event.inputs.noq_git_rev }}-
+            noq-738-repro-${{ runner.os }}-
+
+      - name: Apply [patch.crates-io] for noq_git_rev (if given)
+        if: ${{ github.event.inputs.noq_git_rev != '' }}
+        working-directory: rust-core/noq-multipath-spike
+        run: |
+          set -euo pipefail
+          cat >> Cargo.toml <<EOF
+
+          [patch.crates-io]
+          noq = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
+          noq-proto = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
+          noq-udp = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
+          EOF
+          echo "--- patched Cargo.toml tail ---"
+          tail -10 Cargo.toml
+
+      - name: Build
+        working-directory: rust-core/noq-multipath-spike
+        run: cargo build --bin "$BIN_NAME"
+
+      - name: "Run (30s timeout: bug reproduces as a hang on open_path)"
+        working-directory: rust-core/noq-multipath-spike
+        run: |
+          set -uo pipefail
+          timeout 30 cargo run --bin "$BIN_NAME" 2>&1 | tee /tmp/noq-738-repro.log
+          rc=$?
+          echo "exit code: $rc"
+          if [ "$rc" -eq 124 ]; then
+            echo "::warning::run timed out after 30s (consistent with issue #738: open_path() never validates)"
+          fi
+          if grep -q "DUAL-FD SOCKET SMOKE TEST OK" /tmp/noq-738-repro.log; then
+            echo "::notice::SUCCESS marker found — path1 (secondary/local_ip) validated correctly"
+          else
+            echo "::warning::SUCCESS marker NOT found — consistent with issue #738 reproducing"
+          fi
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noq-738-repro-log-${{ env.BIN_NAME }}-${{ github.event.inputs.noq_git_rev || 'baseline-1.0.1' }}
+          path: /tmp/noq-738-repro.log
+          retention-days: 14
