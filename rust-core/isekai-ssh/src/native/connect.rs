@@ -687,6 +687,14 @@ async fn run_authenticated_session(
     } else {
         None
     };
+    // `--isekai-tty` is silently ignored when there's already an explicit
+    // trailing remote command — same opportunistic convention as ctl-socket's
+    // own gate just above (`WrapperPlan::tty_selection`'s doc comment).
+    let tty_exec = if remote_cmd.is_none() {
+        crate::tty_attach::resolve_exec_command(plan.tty_selection(), resolution.profile())
+    } else {
+        None
+    };
 
     let open_result = {
         // Held only for the open; released before the I/O loop so sibling
@@ -694,19 +702,21 @@ async fn run_authenticated_session(
         // The guard is dropped at the end of this block, before any
         // `ctl_forward` cleanup below re-locks the handle.
         let guard = handle.lock().await;
-        match &ctl {
-            Some(fwd) => ctl_forward::open_login_shell(
+        if ctl.is_some() || tty_exec.is_some() {
+            ctl_forward::open_login_shell(
                 &guard,
                 &term,
                 cols,
                 rows,
-                &fwd.remote_path,
+                ctl.as_ref().map(|fwd| fwd.remote_path.as_str()),
                 resolution.tab_idle_color(),
                 resolution.tab_attention_color(),
+                tty_exec.as_deref(),
             )
             .await
-            .context("isekai-ssh: failed to open a ctl-socket login shell"),
-            None => open_channel(&guard, &session_kind).await.context("isekai-ssh: failed to open a session channel"),
+            .context("isekai-ssh: failed to open a login shell")
+        } else {
+            open_channel(&guard, &session_kind).await.context("isekai-ssh: failed to open a session channel")
         }
     };
     let mut channel = match open_result {

@@ -476,6 +476,38 @@ unit/統合テスト(`streamlocal_forward` の往復・`Frame::Ctl` 中継・OSC
 Unix(実 `ssh(1)` の `ProxyCommand` 経路)の ctl-socket は従来どおり `-R` + UNIX ドメイン
 ソケットで変わらない。
 
+### `--isekai-tty[=<name>]`: ローカルプロセスを完全に殺しても同じリモートシェルへ戻る
+
+QUIC トランスポート層の resume(ローミング・完全切断からの再接続)は既に既定で効くが、
+これは「ネットワークが切れても SSH セッションのプロセス自体は生きている」場合のみで、
+`isekai-ssh` プロセス自体を `kill`/端末ごと閉じるなどして**ローカル側のSSHプロトコル状態
+(暗号化・シーケンス番号)ごと失った場合は復旧できない**(SSHプロトコル自体の状態は
+サーバーと直接喋っている当のプロセスのメモリ内にしか無いため)。
+
+`--isekai-tty=<name>` を付けると、リモートコマンドを平のログインシェルの代わりに
+`isekai-pipe tty attach <name>`(mosh/dtach 風の自前 pty 常駐デーモン、無ければ自動起動)
+に差し替える。これにより、ローカルの `isekai-ssh` プロセスを完全に `kill` した後で
+再度 `isekai-ssh --isekai-tty=<name> myhost` を実行すると、**同じリモートシェルプロセス**
+に戻れる(デーモンはシェルが exit するまで生き続ける — tmux が要らない設計上の理由・
+同時多重アタッチ非対応などの詳細は `rust-core/isekai-pipe/src/tty/mod.rs` のモジュール
+doc を参照)。
+
+```
+--isekai-tty              : isekai-<profile> という名前で使う(ホストごとに1つの既定デーモン)
+--isekai-tty=<name>       : デーモン名を明示指定(同じホストに複数の名前付きセッションを持てる)
+```
+
+- **既定は指定なし(現状維持)**。オプトイン機能で、指定しない限り従来どおりの平のログイン
+  シェル。
+- 明示的なリモートコマンド(`isekai-ssh host 'cmd'`)を同時に指定した場合は**黙って無視**
+  される(このプロジェクトの opportunistic fallback の流儀、ctl-socket と同じ)。
+- `ctl-socket yes` と**共存する**(タブタイトル・クリップボード連携が tty-attach 中も
+  動く)——`--isekai-tmux` の検討時に見つかった「一方が他方を暗黙に無効化する」設計は
+  採用せず、mux プロトコル(Windows ネイティブ経路)に専用フィールドを追加して両立させて
+  いる(`native/mux/protocol.rs::MUX_PROTOCOL_VERSION` 3)。
+- `<name>` はリモート側の `~/.cache/isekai-pipe/tty/` 配下のファイル名の一部になるため、
+  `isekai-pipe` 側で検証される(`/`・NUL・空文字・200バイト超は拒否)。
+
 ### リモートビルドトリガー(`build-profile`、Unix/macOS クライアントのみ)
 
 `#@isekai ctl-socket yes` の上に乗る形で、リモートの対話シェルから**このマシン(クライアント)

@@ -328,11 +328,22 @@ where
     // profile identity Epic P Phase 2's build-profile lookup uses on the Unix
     // path (`resolution.profile()`).
     let host = prepared.resolution().profile().to_string();
+    // `--isekai-tty` is silently ignored when the caller already gave an
+    // explicit trailing remote command — same opportunistic convention as
+    // every other consumer of `WrapperPlan::tty_selection` (see its doc
+    // comment).
+    let tty_exec = if prepared.plan().remote_command().is_none() {
+        crate::tty_attach::resolve_exec_command(prepared.plan().tty_selection(), prepared.resolution().profile())
+    } else {
+        None
+    };
     // Same `-t`/`-T` intent the non-mux path derives via
     // `decide_session_kind`/`wants_pty` (`connect.rs`), sent to the owner in
     // `Hello` so it can make the identical decision — see `client::run`'s
-    // doc comment.
-    let want_pty = connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
+    // doc comment. `--isekai-tty` always forces a PTY (`isekai-pipe tty
+    // attach` needs one to relay through), independent of that computation —
+    // same as the Unix `ssh(1)` path forcing `-t` in `apply_ctl_socket_forward`.
+    let want_pty = tty_exec.is_some() || connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
     let remote_command = prepared.plan().remote_command().map(|cmd| cmd.join(" "));
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
@@ -342,7 +353,7 @@ where
         // principle) — dial SSH ourselves, unmultiplexed.
         ClientToken::FallBack => return connect::run_prepared(prepared, None, handoff).await,
     };
-    match client::run(conn, &token, host, remote_command, want_pty).await? {
+    match client::run(conn, &token, host, remote_command, want_pty, tty_exec).await? {
         client::ClientRunResult::ExitCode(code) => Ok(code),
         // The holder rejected us before any shell session existed (protocol
         // version mismatch, or a stale token read in the window before a new
@@ -588,7 +599,7 @@ mod tests {
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
         let outcome = super::client::run_inner(
-            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true,
+            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None,
         )
         .await
         .unwrap();

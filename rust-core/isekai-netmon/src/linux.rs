@@ -46,7 +46,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::{NetworkChangeEvent, NetworkChangeMonitor};
+use crate::{NetworkChangeCause, NetworkChangeEvent, NetworkChangeMonitor};
 
 /// `<linux/netlink.h>`'s `NETLINK_ROUTE` — an ABI-stable kernel UAPI
 /// constant (always `0`), hardcoded here rather than pulled from `libc`
@@ -146,7 +146,7 @@ impl LinuxNetworkChangeMonitor {
                     // (this monitor) has been dropped, at which point
                     // `Drop` has already set `stop` — this loop exits on
                     // its own next iteration either way.
-                    let _ = tx.send(NetworkChangeEvent);
+                    let _ = tx.send(NetworkChangeEvent { cause: NetworkChangeCause::InterfaceChange });
                 }
                 // `n <= 0` covers both the expected `SO_RCVTIMEO` timeout
                 // (EAGAIN/EWOULDBLOCK, fired every `STOP_POLL_INTERVAL` —
