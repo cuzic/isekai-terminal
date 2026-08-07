@@ -355,7 +355,12 @@ async fn run_build(
         )
         .await?;
         send_build_finished(write_half, 127, Vec::new()).await?;
-        emit_build_progress_result(false);
+        // No `emit_build_progress_result` here: `Indeterminate` is only sent
+        // below, once a profile is confirmed to exist — nothing was ever
+        // shown yet for this build attempt, so there is nothing to clear
+        // (calling it anyway used to paint a spurious `Error` state that
+        // then never got cleared, since the `None`-on-success clear only
+        // ever fires past the point a real build actually ran).
         return Ok(());
     };
 
@@ -366,13 +371,22 @@ async fn run_build(
         let _ = emit_osc(&seq);
     }
 
-    let mut child = crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
+    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // `Indeterminate` was already sent above — every exit past that
+            // point must clear it, this one included, or the spinner is
+            // left stuck on the user's tab/taskbar forever.
+            emit_build_progress_result(false);
+            return Err(e).with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"));
+        }
+    };
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -407,7 +421,15 @@ async fn run_build(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let status = child.wait().await.context("isekai-ssh: failed to wait for the build child process")?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            // Same reasoning as the spawn-failure arm above: `Indeterminate`
+            // is already showing and must be cleared on every exit path.
+            emit_build_progress_result(false);
+            return Err(e).context("isekai-ssh: failed to wait for the build child process");
+        }
+    };
     // `status.code()` is `None` only if the process was killed by a signal
     // (not the `write_failed` kill path above, which already returned) —
     // `-1` is not a valid process exit code on any platform, so it can't be
@@ -563,9 +585,16 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage, terminal: TerminalKind) -> Opti
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => None,
         },
         CtlMessage::SetTabColor { r, g, b } => Some(osc_color::tab_color_sequence(terminal, *r, *g, *b)),
-        CtlMessage::SetProgress { state, progress } => {
-            Some(format!("\x1b]9;4;{};{}\x07", *state as u8, progress))
-        }
+        // ConEmu/Windows Terminal-only: iTerm2 doesn't recognize `OSC 9;4` as
+        // progress at all — it treats bare `OSC 9` as "post a system
+        // notification" (same convention `Notify` above uses for it), so
+        // sending this there wouldn't be the doc comment's claimed "harmless
+        // no-op" — it would pop a spurious notification reading the raw
+        // `4;<state>;<progress>` payload on every build start/end.
+        CtlMessage::SetProgress { state, progress } => match terminal {
+            TerminalKind::ITerm2 => None,
+            TerminalKind::WindowsTerminal => Some(format!("\x1b]9;4;{};{}\x07", *state as u8, progress)),
+        },
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {}
         | CtlMessage::ClipboardPullResponse { .. }
@@ -578,16 +607,26 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage, terminal: TerminalKind) -> Opti
     }
 }
 
-/// Removes ASCII C0 control characters (`< 0x20`) and DEL (`0x7F`) from
-/// remote-controlled text before it is embedded in an OSC escape sequence
-/// written to this process's own stderr ([`emit_osc`]). Without this, a
-/// `Notify` title/body containing `ESC`/`BEL` (accidental — e.g. a hook that
-/// captured ANSI-colored output — or crafted) could terminate the intended
-/// `OSC 9 ... BEL` sequence early and inject an arbitrary escape sequence
-/// into the user's real terminal (`AI_INTEGRATION_DESIGN.md` §6.1's "no
-/// execution authority" boundary applies to more than just shell commands).
+/// Removes C0 control characters (`< 0x20`), DEL (`0x7F`), and C1 control
+/// characters (`U+0080..=U+009F`) from remote-controlled text before it is
+/// embedded in an OSC escape sequence written to this process's own stderr
+/// ([`emit_osc`]). Without this, a `Notify` title/body containing
+/// `ESC`/`BEL` (accidental — e.g. a hook that captured ANSI-colored output —
+/// or crafted) could terminate the intended `OSC 9 ... BEL` sequence early
+/// and inject an arbitrary escape sequence into the user's real terminal
+/// (`AI_INTEGRATION_DESIGN.md` §6.1's "no execution authority" boundary
+/// applies to more than just shell commands). C1 controls matter just as
+/// much as C0 here, not merely for completeness: xterm and other
+/// DEC-strict parsers decode C1 bytes from UTF-8 as controls by default
+/// (`allowC1Printable` off) the same way they decode C0 ones, so `U+009D`
+/// (OSC) and `U+009C` (ST) are just as capable of splicing in a second,
+/// attacker-controlled escape sequence — e.g. re-opening the exact `OSC 52`
+/// clipboard-write this function exists to keep out of a title/body — as
+/// their C0 `ESC ]`/`ESC \` equivalents are. `char::is_control` (Unicode
+/// `Cc`) covers both ranges in one filter; `is_ascii_control` only covered
+/// the first.
 fn strip_ascii_control_chars(text: &str) -> String {
-    text.chars().filter(|c| !c.is_ascii_control()).collect()
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Writes an OSC escape sequence to this process's own stderr in a single
@@ -722,6 +761,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seq, "\x1b]0;hi]52;c;cHduZWQ=pwned\x07");
+    }
+
+    /// Regression test for the C1 bypass of the fix above (found by
+    /// adversarial review of PR #60, 2026-08): `is_ascii_control` only
+    /// covers C0 (`< 0x20`)/DEL, so a title using the C1 control characters
+    /// `U+009D` (OSC) / `U+009C` (ST) in place of their C0 `ESC ]`/`ESC \`
+    /// equivalents sailed straight through unfiltered — xterm and other
+    /// DEC-strict terminals decode C1 bytes from UTF-8 as controls by
+    /// default, so this re-opens the exact same OSC 52 splice the C0 test
+    /// above closes, just spelled differently.
+    #[test]
+    fn osc_sequence_for_set_title_strips_c1_controls_too() {
+        let seq = osc_sequence_for(
+            &CtlMessage::SetTitle { value: "hi\u{9d}52;c;cHduZWQ=\u{9c}pwned".to_string() },
+            TerminalKind::WindowsTerminal,
+        )
+        .unwrap();
+        assert_eq!(seq, "\x1b]0;hi52;c;cHduZWQ=pwned\x07");
     }
 
     #[test]
