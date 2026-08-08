@@ -14,7 +14,7 @@ class SnippetTemplatesTest {
     @Test
     fun allContainsEveryDeclaredTemplate() {
         assertEquals(
-            listOf("tmuxセッション選択", "ディスク使用量確認"),
+            listOf("tmuxセッション選択", "ディスク使用量確認", "CPU/メモリ使用率上位プロセスをkill"),
             SnippetTemplates.ALL.map { it.label },
         )
     }
@@ -34,5 +34,18 @@ class SnippetTemplatesTest {
         // 内側から`attach`すると"sessions should be nested with care"エラーになるため、
         // `$TMUX`(非空ならtmux内)を見て`switch-client`に分岐する必要がある。
         assertTrue(SnippetTemplates.TMUX_SESSION_PICKER.command.contains("switch-client"))
+    }
+
+    @Test
+    fun killHighUsageProcessIsASingleLine() {
+        assertFalse(SnippetTemplates.KILL_HIGH_USAGE_PROCESS.command.contains('\n'))
+    }
+
+    /** kill は破壊的操作のため、無条件実行ではなく確認ステップを経由することをピン留めする。 */
+    @Test
+    fun killHighUsageProcessAsksForConfirmationBeforeKilling() {
+        val command = SnippetTemplates.KILL_HIGH_USAGE_PROCESS.command
+        assertTrue(command.contains("[y/N]"))
+        assertTrue(command.contains("case \"\$ans\" in [Yy]*)"))
     }
 }

@@ -57,5 +57,38 @@ object SnippetTemplates {
         command = "df -h",
     )
 
-    val ALL: List<SnippetTemplate> = listOf(TMUX_SESSION_PICKER, DISK_USAGE)
+    /**
+     * CPU/メモリ使用率が高い順にプロセスを並べて選択し、確認の上で `kill`(SIGTERM)する。
+     * [TMUX_SESSION_PICKER] と同じ fzf/`select` フォールバック構成・1行化の理由付けを踏襲。
+     *
+     * `ps`の出力はPID列が右詰め(先頭に空白)なので、選択した1行から先頭フィールドを
+     * 取り出す際に `${sel%% *}` のような文字列操作を使うと空文字列になってしまう
+     * (先頭の空白そのものが最初の"語"として扱われるため)。代わりに `set -- $sel` の
+     * 無quote展開(標準的な語分割で先頭・連続する空白を自動的に読み飛ばす)で
+     * `$1`として取り出している。
+     *
+     * `kill`は破壊的操作のため、選んだ後も対象PIDを表示した上で `[y/N]` の確認を挟み、
+     * 既定(Enterのみ等)ではキャンセル扱いにする。シグナルは常にSIGTERM(既定)——
+     * プロセスに後始末の機会を与えるため。応答しないプロセスへの `-9` 等が必要な場合は
+     * 手動で打ち直すことを想定し、このテンプレートではシグナル選択までは提供しない。
+     */
+    val KILL_HIGH_USAGE_PROCESS = SnippetTemplate(
+        label = "CPU/メモリ使用率上位プロセスをkill",
+        command = "list=\$(ps -eo pid,%cpu,%mem,comm --sort=-%cpu,-%mem --no-headers | head -20); " +
+            "if [ -z \"\$list\" ]; then echo 'ps: no processes'; " +
+            "else " +
+            "if command -v fzf >/dev/null 2>&1; then " +
+            "sel=\$(printf '%s\\n' \"\$list\" | fzf --prompt='kill> '); " +
+            "else " +
+            "oldifs=\$IFS; IFS=\$'\\n'; set -- \$list; IFS=\$oldifs; " +
+            "PS3='process> '; select sel in \"\$@\"; do [ -n \"\$sel\" ] && break; done; " +
+            "fi; " +
+            "if [ -n \"\$sel\" ]; then " +
+            "set -- \$sel; pid=\$1; " +
+            "printf 'kill PID %s? [y/N] ' \"\$pid\"; read ans; " +
+            "case \"\$ans\" in [Yy]*) kill \"\$pid\" && echo \"sent SIGTERM to \$pid\";; *) echo cancelled;; esac; " +
+            "fi; fi",
+    )
+
+    val ALL: List<SnippetTemplate> = listOf(TMUX_SESSION_PICKER, DISK_USAGE, KILL_HIGH_USAGE_PROCESS)
 }
