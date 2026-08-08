@@ -90,5 +90,39 @@ object SnippetTemplates {
             "fi; fi",
     )
 
-    val ALL: List<SnippetTemplate> = listOf(TMUX_SESSION_PICKER, DISK_USAGE, KILL_HIGH_USAGE_PROCESS)
+    /**
+     * Claude Code運用で頻出するコマンド4種。`claude --resume`/`claude --continue`は
+     * シェルプロンプトで打つコマンド(前者は過去の会話一覧から選んで再開、後者は
+     * カレントディレクトリの直近の会話をそのまま継続)。`/rewind`/`/clear`は逆に、
+     * 既にclaudeの対話セッション内にいる状態で打つスラッシュコマンド(前者は直前の
+     * チェックポイントへ巻き戻す、後者は現在の会話コンテキストを破棄する)——
+     * どちらもシェルコマンドではないため、フォアグラウンドがclaude REPLでない
+     * タイミングで送っても実行はされず、単に画面に文字列として現れるだけ(壊れはしない)。
+     */
+    val CLAUDE_RESUME = SnippetTemplate(
+        label = "claude --resume(会話一覧から再開)",
+        command = "claude --resume",
+    )
+    val CLAUDE_CONTINUE = SnippetTemplate(
+        label = "claude --continue(直前の会話を継続)",
+        command = "claude --continue",
+    )
+    val CLAUDE_REWIND = SnippetTemplate(
+        label = "/rewind(直前のチェックポイントへ巻き戻す)",
+        command = "/rewind",
+    )
+    val CLAUDE_CLEAR = SnippetTemplate(
+        label = "/clear(会話コンテキストを破棄)",
+        command = "/clear",
+    )
+
+    val ALL: List<SnippetTemplate> = listOf(
+        TMUX_SESSION_PICKER,
+        DISK_USAGE,
+        KILL_HIGH_USAGE_PROCESS,
+        CLAUDE_RESUME,
+        CLAUDE_CONTINUE,
+        CLAUDE_REWIND,
+        CLAUDE_CLEAR,
+    )
 }

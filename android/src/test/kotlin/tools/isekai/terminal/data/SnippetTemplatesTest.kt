@@ -14,7 +14,15 @@ class SnippetTemplatesTest {
     @Test
     fun allContainsEveryDeclaredTemplate() {
         assertEquals(
-            listOf("tmuxセッション選択", "ディスク使用量確認", "CPU/メモリ使用率上位プロセスをkill"),
+            listOf(
+                "tmuxセッション選択",
+                "ディスク使用量確認",
+                "CPU/メモリ使用率上位プロセスをkill",
+                "claude --resume(会話一覧から再開)",
+                "claude --continue(直前の会話を継続)",
+                "/rewind(直前のチェックポイントへ巻き戻す)",
+                "/clear(会話コンテキストを破棄)",
+            ),
             SnippetTemplates.ALL.map { it.label },
         )
     }

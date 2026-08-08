@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
@@ -125,7 +127,10 @@ fun SnippetListScreen(
             onDismissRequest = { showTemplatePicker = false },
             title = { Text("テンプレートから追加") },
             text = {
-                Column {
+                // テンプレートが増える(現在7個)ほど、`AlertDialog`のtext領域の高さ上限を
+                // 超えて内容が見切れうるため、`verticalScroll`でスクロール可能にしている
+                // (テンプレートが1個だけだった頃はScrollなしでも問題にならなかった)。
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                     SnippetTemplates.ALL.forEach { template ->
                         Text(
                             text = template.label,
