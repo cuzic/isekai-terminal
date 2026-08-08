@@ -113,12 +113,26 @@ val copyRustCoreJniLibs = tasks.register<Copy>("copyRustCoreJniLibs") {
     into(layout.buildDirectory.dir("rustJniLibs/arm64-v8a"))
 }
 
-// `preBuild`に直接dependsOnせず、jniLibsのsourceSetとして登録する: AGPは実際に
-// .soを消費するタスク(mergeDebugJniLibFolders等のパッケージング系タスク)にだけ
-// 依存を張るため、JVMのみで完結するtestDebugUnitTest(Robolectric)実行のたびに
-// 無関係なNDKクロスビルドが走らなくなる(2026-07-28、書籍原稿の実地検証で発覚した
-// 内側ループの遅さの反面教師に対する修正)。
+// `preBuild`に直接dependsOnせず、jniLibsのsourceSetとして登録する: JVMのみで完結する
+// testDebugUnitTest(Robolectric)実行のたびに無関係なNDKクロスビルドが走らないように
+// するため(2026-07-28、書籍原稿の実地検証で発覚した内側ループの遅さの反面教師に
+// 対する修正)。
+//
+// ただし`jniLibs.srcDir(...)`の登録**だけ**では、AGPが実際にパッケージング系タスク
+// (`merge<Variant>JniLibFolders`)からこのタスクへの依存を自動的に汲み取ってくれる
+// という当初の想定(Opus・Codexのセカンドオピニオンを踏まえたもの)が誤りだった
+// (2026-08、実機インストールで発覚: `mergeDebugJniLibFolders`が`copyRustCoreJniLibs`
+// より一切依存せずに実行され、.soを一切含まない`android-debug.apk`が生成されて
+// `UnsatisfiedLinkError: library "libisekai_terminal_core.so" not found`で
+// 起動直後にクラッシュしていた——ユニットテストはネイティブライブラリを必要としない
+// ため、この非同期漏れはCIのどのテストにも引っかからず、実際にAPKを実機へ
+// インストールして起動するまで誰も気づかなかった)。`merge*JniLibFolders`という
+// 名前のタスク(バリアントごとに動的に生成される)へ明示的に`dependsOn`することで、
+// srcDir登録だけに頼らず確実に依存させる。
 android.sourceSets.getByName("main").jniLibs.srcDir(copyRustCoreJniLibs)
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(copyRustCoreJniLibs)
+}
 
 dependencies {
     implementation(libs.androidx.core.ktx)
