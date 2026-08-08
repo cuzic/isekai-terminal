@@ -263,10 +263,17 @@ fun AppRoot() {
             SnippetListScreen(
                 onAddSnippet = {
                     navVm.pendingEditSnippet = null
+                    navVm.pendingSnippetTemplate = null
+                    navController.navigate(AppRoutes.SNIPPET_EDIT)
+                },
+                onAddFromTemplate = { template ->
+                    navVm.pendingEditSnippet = null
+                    navVm.pendingSnippetTemplate = template
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onEditSnippet = { snippet ->
                     navVm.pendingEditSnippet = snippet
+                    navVm.pendingSnippetTemplate = null
                     navController.navigate(AppRoutes.SNIPPET_EDIT)
                 },
                 onBack = { navController.popBackStack() },
@@ -275,9 +282,18 @@ fun AppRoot() {
 
         composable(AppRoutes.SNIPPET_EDIT) {
             val editing = navVm.pendingEditSnippet
-            RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
+            val template = navVm.pendingSnippetTemplate
+            RemoteLogger.i(
+                "IsekaiTerminalNav",
+                "→ ${
+                    if (editing != null) "SnippetEdit(id=${editing.id} '${editing.label}')"
+                    else if (template != null) "SnippetEdit(template='${template.label}')"
+                    else "SnippetEdit(new)"
+                }",
+            )
             SnippetEditScreen(
                 snippet = editing,
+                template = template,
                 onSave = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
             )

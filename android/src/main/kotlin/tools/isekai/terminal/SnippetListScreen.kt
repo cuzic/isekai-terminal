@@ -13,6 +13,9 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
@@ -21,6 +24,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -30,18 +36,22 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.data.SnippetTemplate
+import tools.isekai.terminal.data.SnippetTemplates
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
 fun SnippetListScreen(
     onAddSnippet: () -> Unit,
+    onAddFromTemplate: (SnippetTemplate) -> Unit,
     onEditSnippet: (Snippet) -> Unit,
     onBack: () -> Unit,
 ) {
     val vm: SnippetListViewModel = viewModel()
     val snippets by vm.snippets.collectAsStateWithLifecycle()
     val deleteTarget by vm.deleteTarget.collectAsStateWithLifecycle()
+    var showTemplatePicker by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -58,7 +68,10 @@ fun SnippetListScreen(
                     fontSize = 18.sp,
                     modifier = Modifier.align(Alignment.CenterVertically),
                 )
-                TextButton(onClick = onBack) { Text("戻る") }
+                Row {
+                    TextButton(onClick = { showTemplatePicker = true }) { Text("テンプレート") }
+                    TextButton(onClick = onBack) { Text("戻る") }
+                }
             }
         },
         floatingActionButton = {
@@ -106,6 +119,35 @@ fun SnippetListScreen(
             message = "「${target.label}」を削除しますか？",
             onConfirm = { vm.confirmDelete(target) },
             onDismiss = { vm.dismissDelete() },
+        )
+    }
+
+    if (showTemplatePicker) {
+        AlertDialog(
+            onDismissRequest = { showTemplatePicker = false },
+            title = { Text("テンプレートから追加") },
+            text = {
+                // テンプレートが増える(現在6個)ほど、`AlertDialog`のtext領域の高さ上限を
+                // 超えて内容が見切れうるため、`verticalScroll`でスクロール可能にしている
+                // (テンプレートが1個だけだった頃はScrollなしでも問題にならなかった)。
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    SnippetTemplates.ALL.forEach { template ->
+                        Text(
+                            text = template.label,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    showTemplatePicker = false
+                                    onAddFromTemplate(template)
+                                }
+                                .padding(vertical = 12.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showTemplatePicker = false }) { Text("キャンセル") }
+            },
         )
     }
 }

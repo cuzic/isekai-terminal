@@ -37,12 +37,14 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.data.SnippetTemplate
 import tools.isekai.terminal.util.RemoteLogger
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SnippetEditScreen(
     snippet: Snippet? = null,
+    template: SnippetTemplate? = null,
     onSave: () -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -50,9 +52,9 @@ fun SnippetEditScreen(
     val profiles by vm.profiles.collectAsStateWithLifecycle()
     val isSaving by vm.isSaving.collectAsStateWithLifecycle()
 
-    var label by remember { mutableStateOf(snippet?.label ?: "") }
-    var command by remember { mutableStateOf(snippet?.command ?: "") }
-    var appendNewline by remember { mutableStateOf(snippet?.appendNewline ?: true) }
+    var label by remember { mutableStateOf(snippet?.label ?: template?.label ?: "") }
+    var command by remember { mutableStateOf(snippet?.command ?: template?.command ?: "") }
+    var appendNewline by remember { mutableStateOf(snippet?.appendNewline ?: template?.appendNewline ?: true) }
     var profileId by remember { mutableStateOf(snippet?.profileId) }
     var profileMenuExpanded by remember { mutableStateOf(false) }
 

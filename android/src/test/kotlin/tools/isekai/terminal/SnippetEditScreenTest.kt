@@ -24,6 +24,7 @@ import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.data.SnippetTemplate
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -50,6 +51,16 @@ class SnippetEditScreenTest {
         composeTestRule.onNodeWithText("定型コマンド編集").assertExists()
         composeTestRule.onNodeWithText("list files").assertExists()
         composeTestRule.onNodeWithText("ls -la").assertExists()
+    }
+
+    @Test fun newSnippetFromTemplate_showsAddTitle_andPrefillsFields() {
+        val template = SnippetTemplate(label = "tmuxセッション選択", command = "tmux attach")
+        composeTestRule.setContent {
+            SnippetEditScreen(snippet = null, template = template, onSave = {}, onCancel = {})
+        }
+        composeTestRule.onNodeWithText("定型コマンド追加").assertExists()
+        composeTestRule.onNodeWithText("tmuxセッション選択").assertExists()
+        composeTestRule.onNodeWithText("tmux attach").assertExists()
     }
 
     @Test fun saveButton_disabledInitially() {
