@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+# Raw external datasets (CRAWDAD/IEEE DataPort — berlin_v2x, ucsb_meshnet,
+# isti_rural, due_packet_delivery). Large (~480MB combined) and re-obtainable
+# via a free IEEE DataPort account; see TRACE_CALIBRATION_NOTES.md for the
+# per-dataset download source. Never committed, per that note's own stated
+# convention.
+data/
