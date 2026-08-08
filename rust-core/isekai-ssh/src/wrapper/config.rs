@@ -14,7 +14,7 @@ use isekai_pipe_core::{ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS, DEFAULT_REL
 use super::directive::{load_isekai_directives, IsekaiDirective};
 use super::{
     BootstrapCandidate, BootstrapPolicy, BootstrapRelayTarget, InstallMode, IsekaiConfig, OpenSshEffectiveConfig,
-    WrapperPlan,
+    TtyDirective, WrapperPlan,
 };
 
 pub(super) fn resolve_isekai_config(
@@ -52,6 +52,7 @@ pub(super) fn resolve_isekai_config(
         local_bind_port_range: None,
         tab_idle_color: None,
         tab_attention_color: None,
+        tty: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -114,6 +115,7 @@ pub(super) fn resolve_isekai_config(
         local_bind_port_range: builder.local_bind_port_range,
         tab_idle_color: builder.tab_idle_color,
         tab_attention_color: builder.tab_attention_color,
+        tty: builder.tty,
     })
 }
 
@@ -140,6 +142,7 @@ struct IsekaiConfigBuilder {
     local_bind_port_range: Option<(u16, u16)>,
     tab_idle_color: Option<(u8, u8, u8)>,
     tab_attention_color: Option<(u8, u8, u8)>,
+    tty: Option<TtyDirective>,
 }
 
 fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDirective) -> Result<()> {
@@ -261,6 +264,7 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
             apply_optional_tab_color(&mut builder.tab_attention_color, "tab-attention-color", &directive);
             Ok(())
         }
+        "tty" => set_once(&mut builder.tty, parse_tty_directive(one_arg(&directive)?), "tty"),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -316,6 +320,25 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
     amount
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
+}
+
+/// Parses `#@isekai tty auto|off|<name>`'s single argument. `auto`/`off` are
+/// reserved keywords, not sanitized against as a literal session name — the
+/// same small, accepted trade-off `sanitize_session_name` used to document
+/// in the abandoned `--isekai-tmux` design (superseded by this feature, see
+/// `tty_attach.rs`'s module docs): a directory or project actually named
+/// `auto`/`off` couldn't be selected this way, but that's vanishingly
+/// unlikely next to the value of not needing a separate keyword syntax. An
+/// explicit `<name>` is passed through unvalidated here, same as
+/// `--isekai-tty=<name>`'s own CLI parsing — `isekai-pipe` validates it
+/// server-side (rejects `/`, NUL, empty, >200 bytes) since that's the only
+/// place it's actually used as a filename component.
+fn parse_tty_directive(value: &str) -> TtyDirective {
+    match value {
+        "auto" => TtyDirective::Auto,
+        "off" => TtyDirective::Off,
+        name => TtyDirective::Named(name.to_string()),
+    }
 }
 
 /// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
@@ -562,6 +585,42 @@ mod tests {
         assert_eq!(builder.tab_idle_color, Some((0x20, 0x20, 0x20)));
     }
 
+    #[test]
+    fn tty_directive_parses_auto_off_and_a_literal_name() {
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Auto));
+
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["off"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Off));
+
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["work"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Named("work".to_string())));
+    }
+
+    #[test]
+    fn tty_directive_is_set_once() {
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto"]) }).unwrap();
+        // A later `Host` block's `tty off` must not override an earlier
+        // match's `tty auto`, same first-match-wins rule as every other
+        // directive in this file.
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["off"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Auto));
+    }
+
+    #[test]
+    fn tty_directive_requires_exactly_one_argument() {
+        let mut builder = empty_builder();
+        assert!(apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[]) }).is_err());
+        assert!(
+            apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto", "extra"]) })
+                .is_err()
+        );
+    }
+
     /// Pins the fix for the bug Codex code review found (2026-07-25): a
     /// malformed `tab-idle-color`/`tab-attention-color` value used to
     /// propagate its parse error out of `apply_isekai_directive` via `?`,
@@ -608,6 +667,7 @@ mod tests {
             local_bind_port_range: None,
             tab_idle_color: None,
             tab_attention_color: None,
+            tty: None,
         }
     }
 }

@@ -164,16 +164,6 @@ impl WrapperPlan {
         if tail.is_empty() { None } else { Some(tail) }
     }
 
-    /// `--isekai-tty[=<name>]` (`tty_attach.rs`), if given. Every consumer
-    /// (`apply_ctl_socket_forward`, `native::connect::run_authenticated_session`,
-    /// `native::mux::mod::run_as_client_over`) only honors this when
-    /// [`Self::remote_command`] is `None` — an explicit trailing remote
-    /// command always wins silently, the same opportunistic-fallback
-    /// convention `#@isekai ctl-socket` already follows (never blocks a
-    /// connection over an optional feature).
-    pub(crate) fn tty_selection(&self) -> Option<&TtySelection> {
-        self.isekai.tty.as_ref()
-    }
 }
 
 /// `--isekai-tty` (bare) vs `--isekai-tty=<name>` — see `tty_attach.rs`'s
@@ -189,6 +179,43 @@ pub(crate) enum TtySelection {
     /// of them are).
     Auto,
     Named(String),
+}
+
+/// `#@isekai tty auto|off|<name>` — the config-directive counterpart to
+/// `--isekai-tty[=<name>]`. A separate type from [`TtySelection`] rather
+/// than reusing it because a directive needs a third state a CLI flag
+/// doesn't: `Off`, so a narrower `Host` block can opt back out of a broader
+/// `Host *` directive (`ssh_config(5)` first-match-wins semantics) — e.g.
+/// `Host *` turns tty-attach on everywhere, one particular `Host` still
+/// wants a plain login shell. See [`resolved_tty_selection`] for how this
+/// combines with the CLI flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TtyDirective {
+    Auto,
+    Named(String),
+    Off,
+}
+
+/// `--isekai-tty[=<name>]` (CLI, [`WrapperIsekaiOptions::tty`]) combined
+/// with `#@isekai tty auto|off|<name>` (config directive,
+/// [`IsekaiConfig::tty`]) — the CLI flag always wins when both are given
+/// (matching [`should_bootstrap`]'s CLI-over-config precedence), so a
+/// config-enabled default can still be overridden per invocation. Every
+/// consumer (`apply_ctl_socket_forward`, `native::connect::run_authenticated_session`,
+/// `native::mux::mod::run_as_client_over`) only honors the result when
+/// [`WrapperPlan::remote_command`] is `None` — an explicit trailing remote
+/// command always wins silently, the same opportunistic-fallback convention
+/// `#@isekai ctl-socket` already follows (never blocks a connection over an
+/// optional feature).
+pub(crate) fn resolved_tty_selection(plan: &WrapperPlan, resolution: &WrapperResolution) -> Option<TtySelection> {
+    if let Some(selection) = &plan.isekai.tty {
+        return Some(selection.clone());
+    }
+    match resolution.isekai.tty.as_ref()? {
+        TtyDirective::Auto => Some(TtySelection::Auto),
+        TtyDirective::Named(name) => Some(TtySelection::Named(name.clone())),
+        TtyDirective::Off => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +242,7 @@ struct WrapperIsekaiOptions {
     /// — and by extension `isekai-pipe connect`'s — stderr) into a file, in
     /// addition to the terminal.
     log_file: Option<PathBuf>,
-    /// `--isekai-tty[=<name>]` — see [`WrapperPlan::tty_selection`].
+    /// `--isekai-tty[=<name>]` — see [`resolved_tty_selection`].
     tty: Option<TtySelection>,
 }
 
@@ -298,6 +325,9 @@ struct IsekaiConfig {
     /// `#@isekai tab-attention-color <rrggbb>`, the counterpart to
     /// `tab_idle_color` for the "a session needs your input" state.
     tab_attention_color: Option<(u8, u8, u8)>,
+    /// `#@isekai tty auto|off|<name>` — see [`resolved_tty_selection`] for
+    /// how this combines with `--isekai-tty[=<name>]`.
+    tty: Option<TtyDirective>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,9 +694,9 @@ async fn apply_ctl_socket_forward(
     // `--isekai-tty` is silently ignored (not an error) when the caller
     // already gave an explicit trailing remote command — same opportunistic
     // convention as ctl-socket's own `should_attempt_ctl_forward` gate,
-    // `WrapperPlan::tty_selection`'s doc comment.
+    // `resolved_tty_selection`'s doc comment.
     let tty_exec = if plan.remote_command().is_none() {
-        crate::tty_attach::resolve_exec_command(plan.tty_selection(), resolution.profile())
+        crate::tty_attach::resolve_exec_command(resolved_tty_selection(plan, resolution).as_ref(), resolution.profile())
     } else {
         None
     };
@@ -2140,6 +2170,7 @@ mod tests {
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
+                tty: None,
             },
         };
 
@@ -2200,6 +2231,7 @@ mod tests {
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
+                tty: None,
             },
         };
 
@@ -2291,22 +2323,61 @@ mod tests {
         assert_eq!(plan.isekai.log_file, Some(PathBuf::from("/tmp/isekai-ssh.log")));
     }
 
+    /// A `WrapperResolution` with no `#@isekai` directives applied — every
+    /// `IsekaiConfig` field at its `resolve_isekai_config` default. Lets
+    /// `resolved_tty_selection` tests below spell out only the one field
+    /// (`isekai.tty`) they actually care about, instead of every unrelated
+    /// field the bootstrap/`ConnectionIntent` tests elsewhere in this module
+    /// need to.
+    fn resolution_with_no_directives(profile: &str) -> WrapperResolution {
+        WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: profile.to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: Vec::new(),
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+                ctl_socket_enabled: false,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                local_bind_port_range: None,
+                tab_idle_color: None,
+                tab_attention_color: None,
+                tty: None,
+            },
+        }
+    }
+
     #[test]
     fn tty_selection_defaults_to_none() {
         let plan = parse_wrapper(s(&["production"])).unwrap();
-        assert_eq!(plan.tty_selection(), None);
+        let resolution = resolution_with_no_directives("production");
+        assert_eq!(resolved_tty_selection(&plan, &resolution), None);
     }
 
     #[test]
     fn bare_isekai_tty_selects_auto() {
         let plan = parse_wrapper(s(&["--isekai-tty", "production"])).unwrap();
-        assert_eq!(plan.tty_selection(), Some(&TtySelection::Auto));
+        let resolution = resolution_with_no_directives("production");
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Auto));
     }
 
     #[test]
     fn isekai_tty_with_a_name_selects_named() {
         let plan = parse_wrapper(s(&["--isekai-tty=work", "production"])).unwrap();
-        assert_eq!(plan.tty_selection(), Some(&TtySelection::Named("work".to_string())));
+        let resolution = resolution_with_no_directives("production");
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Named("work".to_string())));
     }
 
     #[test]
@@ -2320,10 +2391,51 @@ mod tests {
         // Not a parse-time error (`--isekai-tty` + an explicit trailing
         // remote command is a valid, if redundant, combination) — resolution
         // silently prefers the explicit remote command at each call site
-        // (`WrapperPlan::tty_selection`'s doc comment), not here.
+        // (`resolved_tty_selection`'s doc comment), not here.
         let plan = parse_wrapper(s(&["--isekai-tty", "production", "uptime"])).unwrap();
-        assert_eq!(plan.tty_selection(), Some(&TtySelection::Auto));
+        let resolution = resolution_with_no_directives("production");
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Auto));
         assert_eq!(plan.remote_command(), Some(&["uptime".to_string()][..]));
+    }
+
+    #[test]
+    fn tty_directive_auto_resolves_when_no_cli_flag_is_given() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        let mut resolution = resolution_with_no_directives("production");
+        resolution.isekai.tty = Some(TtyDirective::Auto);
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Auto));
+    }
+
+    #[test]
+    fn tty_directive_with_a_name_resolves_when_no_cli_flag_is_given() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        let mut resolution = resolution_with_no_directives("production");
+        resolution.isekai.tty = Some(TtyDirective::Named("work".to_string()));
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Named("work".to_string())));
+    }
+
+    #[test]
+    fn tty_directive_off_resolves_to_no_tty_attach() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        let mut resolution = resolution_with_no_directives("production");
+        resolution.isekai.tty = Some(TtyDirective::Off);
+        assert_eq!(resolved_tty_selection(&plan, &resolution), None);
+    }
+
+    #[test]
+    fn cli_flag_overrides_a_tty_directive_in_either_direction() {
+        let plan = parse_wrapper(s(&["--isekai-tty=work", "production"])).unwrap();
+
+        // Directive says `auto` — the explicit `--isekai-tty=work` still wins.
+        let mut resolution = resolution_with_no_directives("production");
+        resolution.isekai.tty = Some(TtyDirective::Auto);
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Named("work".to_string())));
+
+        // Directive says `off` — the CLI flag still wins (an explicit
+        // `--isekai-tty` always means "yes, attach", never silently
+        // overridden by config).
+        resolution.isekai.tty = Some(TtyDirective::Off);
+        assert_eq!(resolved_tty_selection(&plan, &resolution), Some(TtySelection::Named("work".to_string())));
     }
 
     #[test]
@@ -2460,6 +2572,7 @@ mod tests {
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
+                tty: None,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -2520,6 +2633,7 @@ mod tests {
         // | `local-bind-port-range` | (a) `intent.local_bind_port_range`                                                |
         // | `tab-idle-color`       | `ctl_forward.rs`'s `build_login_shell_command` (opt-in env var export at connect time only; no `ConnectionIntent` field exists for it — same category as the pre-existing `ctl-socket`/`bootstrap-relay` gaps in this table) |
         // | `tab-attention-color`  | ditto (`tab-idle-color`'s counterpart)                                            |
+        // | `tty`                  | `resolved_tty_selection` (opt-in remote-command substitution at connect time only; no `ConnectionIntent` field exists for it — same category as `ctl-socket`/tab colors above; see `tty_directive_*` tests in `wrapper/config.rs` and this module) |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2696,6 +2810,7 @@ mod tests {
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
                 local_bind_port_range: None,
+                tty: None,
             },
         };
 
