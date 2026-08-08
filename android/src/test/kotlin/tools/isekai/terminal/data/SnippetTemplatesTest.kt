@@ -1,0 +1,38 @@
+package tools.isekai.terminal.data
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * [SnippetTemplates]は[SnippetCommands.toBytes]経由で対話シェルへ逐次キー入力として
+ * 送られる([SnippetTemplates.TMUX_SESSION_PICKER]のKDoc参照)。ここでは実際のシェル実行
+ * ではなく、その前提が壊れていないことだけを検証する。
+ */
+class SnippetTemplatesTest {
+    @Test
+    fun allContainsEveryDeclaredTemplate() {
+        assertEquals(
+            listOf("tmuxセッション選択", "ディスク使用量確認"),
+            SnippetTemplates.ALL.map { it.label },
+        )
+    }
+
+    /**
+     * 複数行のまま送ると、フォアグラウンドが必ずしもシェルとは限らない(ページャ実行中等)
+     * 場合に一部の行が意図しない形で解釈されうる(adversarial review指摘、2026-08)。
+     * 改行を含まない1行であることを直接ピン留めする。
+     */
+    @Test
+    fun tmuxSessionPickerIsASingleLine() {
+        assertFalse(SnippetTemplates.TMUX_SESSION_PICKER.command.contains('\n'))
+    }
+
+    @Test
+    fun tmuxSessionPickerHandlesBeingAlreadyInsideTmux() {
+        // 内側から`attach`すると"sessions should be nested with care"エラーになるため、
+        // `$TMUX`(非空ならtmux内)を見て`switch-client`に分岐する必要がある。
+        assertTrue(SnippetTemplates.TMUX_SESSION_PICKER.command.contains("switch-client"))
+    }
+}

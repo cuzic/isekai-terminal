@@ -12,27 +12,50 @@ data class SnippetTemplate(
 
 object SnippetTemplates {
     /**
-     * tmux のセッション一覧を出して選んだセッションに attach する。fzf があれば絞り込み検索、
-     * なければ bash 組み込みの `select` で番号選択にフォールバックする。
+     * tmux のセッション一覧を出して選んだセッションに attach/switch する。fzf があれば絞り込み
+     * 検索、なければ bash 組み込みの `select` で番号選択にフォールバックする。
      *
      * ターミナルへは(スクリプトファイルとしてではなく)対話シェルへの逐次入力として送られる
-     * ([SnippetCommands.toBytes] が各行末に CR を付けて送信するため)。そのため `exit` で
-     * 接続自体を落とすような書き方や、シバン行は書かない。
+     * ([SnippetCommands.toBytes] が送信するため)。そのため `exit` で接続自体を落とすような
+     * 書き方や、シバン行は書かない。複数行のまま送ると、フォアグラウンドが必ずしもシェルとは
+     * 限らない(ページャ実行中等)場合に一部の行が意図しない形で解釈されうるため、`;` で
+     * 繋いだ1行にまとめている(adversarial review指摘、2026-08)。
+     *
+     * `select`/`PS3` は bash/ksh/zsh 限定(dash/fishでは動かない)——それ以外の行は
+     * 意図的にPOSIX風に書いているが、fzf不在時のフォールバック経路がこの制約を持つため
+     * 全体としてもこれら3シェルが既定ログインシェルであることが前提。
      */
     val TMUX_SESSION_PICKER = SnippetTemplate(
         label = "tmuxセッション選択",
-        command = """
-            sessions=${'$'}(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-            if [ -z "${'$'}sessions" ]; then
-              echo "tmux session not found"
-            elif command -v fzf >/dev/null 2>&1; then
-              s=${'$'}(printf '%s\n' "${'$'}sessions" | fzf) && tmux attach -t "${'$'}s"
-            else
-              PS3="session> "
-              select s in ${'$'}sessions; do [ -n "${'$'}s" ] && tmux attach -t "${'$'}s"; break; done
-            fi
-        """.trimIndent(),
+        command = "if ! command -v tmux >/dev/null 2>&1; then echo 'tmux: not installed'; " +
+            "else " +
+            "s=\$(tmux list-sessions -F '#{session_name}' 2>/dev/null); " +
+            "if [ -z \"\$s\" ]; then echo 'tmux: no sessions'; " +
+            "else " +
+            // 既にtmux内(`$TMUX`が非空)から`attach`すると"sessions should be nested with
+            // care"エラーになるため、内側なら`switch-client`、外側なら`attach`に分岐する。
+            "go() { if [ -n \"\$TMUX\" ]; then tmux switch-client -t \"\$1\"; else tmux attach -t \"\$1\"; fi; }; " +
+            "if command -v fzf >/dev/null 2>&1; then " +
+            "p=\$(printf '%s\\n' \"\$s\" | fzf) && go \"\$p\"; " +
+            "else " +
+            // `IFS`を改行のみに切り替えてから`set --`で展開することで、セッション名に
+            // スペースが含まれていても(tmuxは許容する)1セッション=1要素として扱う
+            // ——`select s in $s`のように無quoteで直接渡すとword-splitで壊れるため。
+            "oldifs=\$IFS; IFS=\$'\\n'; set -- \$s; IFS=\$oldifs; " +
+            "PS3='session> '; select p in \"\$@\"; do [ -n \"\$p\" ] && go \"\$p\"; break; done; " +
+            "fi; fi; fi",
     )
 
-    val ALL: List<SnippetTemplate> = listOf(TMUX_SESSION_PICKER)
+    /**
+     * ディスク使用量を確認する簡単な例。tmux専用ではない汎用コマンドの例として、
+     * 「テンプレート」機能が特定用途専用ではなく任意の定型コマンドを登録できる一般的な
+     * 仕組みであることを示す([TMUX_SESSION_PICKER] だけだと「tmux接続専用機能」に
+     * 見えてしまうため、design review指摘、2026-08)。
+     */
+    val DISK_USAGE = SnippetTemplate(
+        label = "ディスク使用量確認",
+        command = "df -h",
+    )
+
+    val ALL: List<SnippetTemplate> = listOf(TMUX_SESSION_PICKER, DISK_USAGE)
 }
