@@ -200,11 +200,13 @@ pub(crate) fn attach_command(name: &str) -> String {
 
 /// `apply_ctl_socket_forward`/`native::connect::run_authenticated_session`/
 /// `native::mux::mod::run_as_client_over`'s shared entry point: `None` when
-/// `--isekai-tty` wasn't given, `Some(command)` otherwise. Callers are
-/// responsible for only calling this when there is no explicit trailing
-/// remote command already (`WrapperPlan::remote_command().is_none()`) — see
-/// `WrapperPlan::tty_selection`'s doc comment for why that check lives at
-/// each call site rather than here.
+/// neither `--isekai-tty` nor `#@isekai tty auto|<name>` resolved to
+/// anything (`crate::wrapper::resolved_tty_selection`), `Some(command)`
+/// otherwise. Callers are responsible for only calling this when there is no
+/// explicit trailing remote command already
+/// (`WrapperPlan::remote_command().is_none()`) — see
+/// `crate::wrapper::resolved_tty_selection`'s doc comment for why that check
+/// lives at each call site rather than here.
 pub(crate) fn resolve_exec_command(selection: Option<&TtySelection>, profile: &str) -> Option<String> {
     selection.map(|selection| attach_command(&resolve_name(selection, profile)))
 }
