@@ -163,7 +163,6 @@ impl WrapperPlan {
         let tail = &self.ssh_args[self.destination_index + 1..];
         if tail.is_empty() { None } else { Some(tail) }
     }
-
 }
 
 /// `--isekai-tty` (bare) vs `--isekai-tty=<name>` — see `tty_attach.rs`'s
@@ -198,9 +197,12 @@ enum TtyDirective {
 
 /// `--isekai-tty[=<name>]` (CLI, [`WrapperIsekaiOptions::tty`]) combined
 /// with `#@isekai tty auto|off|<name>` (config directive,
-/// [`IsekaiConfig::tty`]) — the CLI flag always wins when both are given
-/// (matching [`should_bootstrap`]'s CLI-over-config precedence), so a
-/// config-enabled default can still be overridden per invocation. Every
+/// [`IsekaiConfig::tty`]) — an explicit CLI flag always wins, in *both*
+/// directions, over whatever the directive says (including `Off`), so a
+/// config-enabled default can still be overridden per invocation. Not the
+/// same shape as [`should_bootstrap`], despite the superficial CLI/config
+/// resemblance: there, config's `bootstrap-policy never` is a *veto* over an
+/// explicit `--isekai-bootstrap` — there is no equivalent veto here. Every
 /// consumer (`apply_ctl_socket_forward`, `native::connect::run_authenticated_session`,
 /// `native::mux::mod::run_as_client_over`) only honors the result when
 /// [`WrapperPlan::remote_command`] is `None` — an explicit trailing remote
@@ -2924,6 +2926,44 @@ Host *
         assert_eq!(resolved.candidate_race_delay_ms, 250);
         assert_eq!(resolved.relay_delay_ms, 900);
         assert_eq!(resolved.install_mode, InstallMode::User);
+    }
+
+    /// The actual motivating scenario `TtyDirective::Off` exists for: a
+    /// broad `Host *` block turns tty-attach on for every host, one specific
+    /// host opts back out. `ssh_config(5)`'s first-match-wins semantics mean
+    /// this only works if the specific `Host` block is listed *before*
+    /// `Host *` — end to end through `resolve_isekai_config`, not just the
+    /// lower-level `apply_isekai_directive`/`resolved_tty_selection` unit
+    /// tests, which pin `set_once` and the CLI/config merge in isolation but
+    /// don't exercise real multi-`Host`-block file parsing.
+    #[test]
+    fn a_specific_host_can_opt_out_of_a_broader_tty_auto_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            r#"
+Host noisy-legacy-box
+    #@isekai tty off
+
+Host *
+    #@isekai tty auto
+"#,
+        )
+        .unwrap();
+
+        let opted_out = parse_wrapper(s(&["-F", config.to_str().unwrap(), "noisy-legacy-box"])).unwrap();
+        let resolved = resolve_isekai_config(&opted_out, &OpenSshEffectiveConfig::default()).unwrap();
+        assert_eq!(resolved.tty, Some(TtyDirective::Off));
+        assert_eq!(resolved_tty_selection(&opted_out, &WrapperResolution { openssh: OpenSshEffectiveConfig::default(), isekai: resolved }), None);
+
+        let everyone_else = parse_wrapper(s(&["-F", config.to_str().unwrap(), "some-other-host"])).unwrap();
+        let resolved = resolve_isekai_config(&everyone_else, &OpenSshEffectiveConfig::default()).unwrap();
+        assert_eq!(resolved.tty, Some(TtyDirective::Auto));
+        assert_eq!(
+            resolved_tty_selection(&everyone_else, &WrapperResolution { openssh: OpenSshEffectiveConfig::default(), isekai: resolved }),
+            Some(TtySelection::Auto)
+        );
     }
 
     #[test]

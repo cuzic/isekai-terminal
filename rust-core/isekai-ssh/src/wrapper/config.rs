@@ -264,7 +264,10 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
             apply_optional_tab_color(&mut builder.tab_attention_color, "tab-attention-color", &directive);
             Ok(())
         }
-        "tty" => set_once(&mut builder.tty, parse_tty_directive(one_arg(&directive)?), "tty"),
+        "tty" => {
+            apply_optional_tty(&mut builder.tty, &directive);
+            Ok(())
+        }
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -322,23 +325,58 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
 }
 
-/// Parses `#@isekai tty auto|off|<name>`'s single argument. `auto`/`off` are
-/// reserved keywords, not sanitized against as a literal session name — the
-/// same small, accepted trade-off `sanitize_session_name` used to document
-/// in the abandoned `--isekai-tmux` design (superseded by this feature, see
-/// `tty_attach.rs`'s module docs): a directory or project actually named
-/// `auto`/`off` couldn't be selected this way, but that's vanishingly
-/// unlikely next to the value of not needing a separate keyword syntax. An
-/// explicit `<name>` is passed through unvalidated here, same as
-/// `--isekai-tty=<name>`'s own CLI parsing — `isekai-pipe` validates it
-/// server-side (rejects `/`, NUL, empty, >200 bytes) since that's the only
-/// place it's actually used as a filename component.
-fn parse_tty_directive(value: &str) -> TtyDirective {
-    match value {
-        "auto" => TtyDirective::Auto,
-        "off" => TtyDirective::Off,
-        name => TtyDirective::Named(name.to_string()),
+/// Applies a `tty` directive leniently, matching [`apply_optional_tab_color`]'s
+/// warn-and-ignore convention (`.claude/rules/always-connects.md`) rather
+/// than this file's usual `?`-propagating fail-closed one: unlike most
+/// directives here, a bad `tty` value must not be the reason
+/// `isekai-ssh <host>` refuses to connect at all — a typo'd or
+/// space-containing value in a broadly-matching `Host *` block would
+/// otherwise break every host it matches. Two ways a value can be bad, both
+/// handled the same way (warn to stderr, leave `slot` unset so the caller
+/// falls through to a plain login shell):
+///
+/// - Wrong argument count (`one_arg`'s own failure mode) — e.g. a bare
+///   `#@isekai tty` or an unquoted name containing whitespace.
+/// - An explicit `<name>` that `is_valid_tty_name` would reject (path
+///   separator, `.`/`..`, embedded NUL, empty, or over 200 bytes) — mirrors
+///   how `resolve_name_from`'s `Auto` branch already *skips* (never errors
+///   on) an invalid *derived* candidate; treating an explicit directive
+///   value more strictly than an auto-derived one would be inconsistent, and
+///   would otherwise only be caught after a wasted connection attempt (the
+///   remote `isekai-pipe tty attach` exits immediately with `EX_USAGE`).
+///
+/// `auto`/`off` are reserved keywords, not validated against as a literal
+/// session name: a project genuinely named `auto`/`off` can't be selected
+/// this way (use `--isekai-tty=auto`/`--isekai-tty=off` instead, which has
+/// no such ambiguity — see `README.md`'s `--isekai-tty` section), a small,
+/// deliberately accepted trade-off next to not needing a separate keyword
+/// syntax.
+fn apply_optional_tty(slot: &mut Option<TtyDirective>, directive: &IsekaiDirective) {
+    if slot.is_some() {
+        // `set_once` semantics: first match wins, matching every other
+        // directive in this file.
+        return;
     }
+    let value = match one_arg(directive) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("isekai-ssh: ignoring #@isekai tty: {e} — connecting with a plain login shell instead");
+            return;
+        }
+    };
+    *slot = match value {
+        "auto" => Some(TtyDirective::Auto),
+        "off" => Some(TtyDirective::Off),
+        name if crate::tty_attach::is_valid_tty_name(name) => Some(TtyDirective::Named(name.to_string())),
+        name => {
+            eprintln!(
+                "isekai-ssh: ignoring #@isekai tty {name:?}: not a valid isekai-pipe tty session name \
+                 (must not be empty/\".\"/\"..\", must not contain '/' or NUL, must be <= 200 bytes) — \
+                 connecting with a plain login shell instead"
+            );
+            None
+        }
+    };
 }
 
 /// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
@@ -611,14 +649,40 @@ mod tests {
         assert_eq!(builder.tty, Some(TtyDirective::Auto));
     }
 
+    /// Unlike most directives in this file, a malformed `tty` value must
+    /// never abort config resolution (and therefore the whole `isekai-ssh
+    /// <host>` connection attempt) — same `always-connects.md` convention
+    /// `invalid_tab_color_directive_does_not_abort_config_resolution` pins
+    /// for `tab-idle-color`/`tab-attention-color`. The wrong-argument-count
+    /// case (`one_arg`'s own failure mode) is a no-op, same as an invalid
+    /// explicit `<name>` below.
     #[test]
-    fn tty_directive_requires_exactly_one_argument() {
+    fn a_malformed_tty_directive_is_a_no_op_not_an_error() {
         let mut builder = empty_builder();
-        assert!(apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[]) }).is_err());
-        assert!(
-            apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto", "extra"]) })
-                .is_err()
-        );
+        let result = apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[]) });
+        assert!(result.is_ok(), "a malformed directive must never abort config resolution");
+        assert_eq!(builder.tty, None);
+
+        let result =
+            apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto", "extra"]) });
+        assert!(result.is_ok());
+        assert_eq!(builder.tty, None);
+    }
+
+    /// Mirrors how `resolve_name_from`'s `Auto` branch already treats an
+    /// invalid *derived* candidate (skip, don't error) — an explicit
+    /// directive value getting stricter treatment would be inconsistent,
+    /// and would otherwise only surface after a wasted connection attempt
+    /// (the remote `isekai-pipe tty attach` rejects it with `EX_USAGE`).
+    #[test]
+    fn tty_directive_with_an_invalid_name_is_a_no_op_not_an_error() {
+        for invalid in ["", ".", "..", "has/slash", &"x".repeat(201)] {
+            let mut builder = empty_builder();
+            let result =
+                apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[invalid]) });
+            assert!(result.is_ok(), "{invalid:?} must not abort config resolution");
+            assert_eq!(builder.tty, None, "{invalid:?} must not be accepted as a session name");
+        }
     }
 
     /// Pins the fix for the bug Codex code review found (2026-07-25): a

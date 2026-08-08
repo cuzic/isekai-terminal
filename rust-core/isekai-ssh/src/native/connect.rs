@@ -692,7 +692,10 @@ async fn run_authenticated_session(
     // own gate just above (`crate::wrapper::resolved_tty_selection`'s doc
     // comment).
     let tty_exec = if remote_cmd.is_none() {
-        crate::tty_attach::resolve_exec_command(crate::wrapper::resolved_tty_selection(plan, resolution).as_ref(), resolution.profile())
+        crate::tty_attach::resolve_exec_command(
+            crate::wrapper::resolved_tty_selection(plan, resolution).as_ref(),
+            resolution.profile(),
+        )
     } else {
         None
     };
