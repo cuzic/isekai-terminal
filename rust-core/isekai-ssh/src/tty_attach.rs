@@ -1,4 +1,5 @@
-//! Resolves `--isekai-tty[=<name>]` (`wrapper::TtySelection`) into the
+//! Resolves `--isekai-tty[=<name>]`/`#@isekai tty auto|off|<name>`
+//! (`wrapper::TtySelection`/`wrapper::resolved_tty_selection`) into the
 //! `isekai-pipe tty attach <name>` remote command string, composed with
 //! ctl-socket's login-shell builder via `ctl_forward::build_login_shell_command`'s
 //! `exec_target` parameter — see that function's doc comment for how the two
@@ -180,15 +181,21 @@ fn resolve_name_from(selection: &TtySelection, profile: &str, candidates: &[(&st
 /// tests deliberately duplicate mock setup per file rather than sharing it).
 /// Kept minimal and duplicated on purpose rather than factored into a new
 /// shared crate for four rules this simple. If `isekai-pipe`'s rules ever
-/// change, this must be updated to match.
-fn is_valid_tty_name(name: &str) -> bool {
+/// change, this must be updated to match. `pub(crate)`: also reused by
+/// `wrapper/config.rs`'s `#@isekai tty <name>` directive parsing, so an
+/// invalid explicit name is rejected (leniently — see that module's
+/// `apply_optional_tty`) at the same point `Auto`'s own candidates already
+/// are, rather than only being caught remotely after a wasted connection
+/// attempt.
+pub(crate) fn is_valid_tty_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0']) && name.len() <= 200
 }
 
 /// The `isekai-pipe tty attach <name>` command string, safely quoted —
-/// `<name>` can come straight from a `--isekai-tty=<name>` CLI argument, so
-/// it must be treated as untrusted shell input the same way any other
-/// `#@isekai` directive value already is (`wrapper::shell_quote`).
+/// `<name>` can come straight from a `--isekai-tty=<name>` CLI argument or a
+/// `#@isekai tty <name>` directive, so it must be treated as untrusted shell
+/// input the same way any other `#@isekai` directive value already is
+/// (`wrapper::shell_quote`).
 /// `isekai-pipe`'s own `tty::validate_name` is the authoritative rejection
 /// of a structurally invalid name (path traversal, embedded NUL, etc.) —
 /// this function's job is narrower: whatever name reaches the remote shell
@@ -200,11 +207,13 @@ pub(crate) fn attach_command(name: &str) -> String {
 
 /// `apply_ctl_socket_forward`/`native::connect::run_authenticated_session`/
 /// `native::mux::mod::run_as_client_over`'s shared entry point: `None` when
-/// `--isekai-tty` wasn't given, `Some(command)` otherwise. Callers are
-/// responsible for only calling this when there is no explicit trailing
-/// remote command already (`WrapperPlan::remote_command().is_none()`) — see
-/// `WrapperPlan::tty_selection`'s doc comment for why that check lives at
-/// each call site rather than here.
+/// neither `--isekai-tty` nor `#@isekai tty auto|<name>` resolved to
+/// anything (`crate::wrapper::resolved_tty_selection`), `Some(command)`
+/// otherwise. Callers are responsible for only calling this when there is no
+/// explicit trailing remote command already
+/// (`WrapperPlan::remote_command().is_none()`) — see
+/// `crate::wrapper::resolved_tty_selection`'s doc comment for why that check
+/// lives at each call site rather than here.
 pub(crate) fn resolve_exec_command(selection: Option<&TtySelection>, profile: &str) -> Option<String> {
     selection.map(|selection| attach_command(&resolve_name(selection, profile)))
 }

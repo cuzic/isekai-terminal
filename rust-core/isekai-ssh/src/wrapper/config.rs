@@ -14,7 +14,7 @@ use isekai_pipe_core::{ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS, DEFAULT_REL
 use super::directive::{load_isekai_directives, IsekaiDirective};
 use super::{
     BootstrapCandidate, BootstrapPolicy, BootstrapRelayTarget, InstallMode, IsekaiConfig, OpenSshEffectiveConfig,
-    WrapperPlan,
+    TtyDirective, WrapperPlan,
 };
 
 pub(super) fn resolve_isekai_config(
@@ -52,6 +52,7 @@ pub(super) fn resolve_isekai_config(
         local_bind_port_range: None,
         tab_idle_color: None,
         tab_attention_color: None,
+        tty: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -114,6 +115,7 @@ pub(super) fn resolve_isekai_config(
         local_bind_port_range: builder.local_bind_port_range,
         tab_idle_color: builder.tab_idle_color,
         tab_attention_color: builder.tab_attention_color,
+        tty: builder.tty,
     })
 }
 
@@ -140,6 +142,7 @@ struct IsekaiConfigBuilder {
     local_bind_port_range: Option<(u16, u16)>,
     tab_idle_color: Option<(u8, u8, u8)>,
     tab_attention_color: Option<(u8, u8, u8)>,
+    tty: Option<TtyDirective>,
 }
 
 fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDirective) -> Result<()> {
@@ -261,6 +264,10 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
             apply_optional_tab_color(&mut builder.tab_attention_color, "tab-attention-color", &directive);
             Ok(())
         }
+        "tty" => {
+            apply_optional_tty(&mut builder.tty, &directive);
+            Ok(())
+        }
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -316,6 +323,60 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
     amount
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
+}
+
+/// Applies a `tty` directive leniently, matching [`apply_optional_tab_color`]'s
+/// warn-and-ignore convention (`.claude/rules/always-connects.md`) rather
+/// than this file's usual `?`-propagating fail-closed one: unlike most
+/// directives here, a bad `tty` value must not be the reason
+/// `isekai-ssh <host>` refuses to connect at all — a typo'd or
+/// space-containing value in a broadly-matching `Host *` block would
+/// otherwise break every host it matches. Two ways a value can be bad, both
+/// handled the same way (warn to stderr, leave `slot` unset so the caller
+/// falls through to a plain login shell):
+///
+/// - Wrong argument count (`one_arg`'s own failure mode) — e.g. a bare
+///   `#@isekai tty` or an unquoted name containing whitespace.
+/// - An explicit `<name>` that `is_valid_tty_name` would reject (path
+///   separator, `.`/`..`, embedded NUL, empty, or over 200 bytes) — mirrors
+///   how `resolve_name_from`'s `Auto` branch already *skips* (never errors
+///   on) an invalid *derived* candidate; treating an explicit directive
+///   value more strictly than an auto-derived one would be inconsistent, and
+///   would otherwise only be caught after a wasted connection attempt (the
+///   remote `isekai-pipe tty attach` exits immediately with `EX_USAGE`).
+///
+/// `auto`/`off` are reserved keywords, not validated against as a literal
+/// session name: a project genuinely named `auto`/`off` can't be selected
+/// this way (use `--isekai-tty=auto`/`--isekai-tty=off` instead, which has
+/// no such ambiguity — see `README.md`'s `--isekai-tty` section), a small,
+/// deliberately accepted trade-off next to not needing a separate keyword
+/// syntax.
+fn apply_optional_tty(slot: &mut Option<TtyDirective>, directive: &IsekaiDirective) {
+    if slot.is_some() {
+        // `set_once` semantics: first match wins, matching every other
+        // directive in this file.
+        return;
+    }
+    let value = match one_arg(directive) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("isekai-ssh: ignoring #@isekai tty: {e} — connecting with a plain login shell instead");
+            return;
+        }
+    };
+    *slot = match value {
+        "auto" => Some(TtyDirective::Auto),
+        "off" => Some(TtyDirective::Off),
+        name if crate::tty_attach::is_valid_tty_name(name) => Some(TtyDirective::Named(name.to_string())),
+        name => {
+            eprintln!(
+                "isekai-ssh: ignoring #@isekai tty {name:?}: not a valid isekai-pipe tty session name \
+                 (must not be empty/\".\"/\"..\", must not contain '/' or NUL, must be <= 200 bytes) — \
+                 connecting with a plain login shell instead"
+            );
+            None
+        }
+    };
 }
 
 /// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
@@ -562,6 +623,68 @@ mod tests {
         assert_eq!(builder.tab_idle_color, Some((0x20, 0x20, 0x20)));
     }
 
+    #[test]
+    fn tty_directive_parses_auto_off_and_a_literal_name() {
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Auto));
+
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["off"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Off));
+
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["work"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Named("work".to_string())));
+    }
+
+    #[test]
+    fn tty_directive_is_set_once() {
+        let mut builder = empty_builder();
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto"]) }).unwrap();
+        // A later `Host` block's `tty off` must not override an earlier
+        // match's `tty auto`, same first-match-wins rule as every other
+        // directive in this file.
+        apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["off"]) }).unwrap();
+        assert_eq!(builder.tty, Some(TtyDirective::Auto));
+    }
+
+    /// Unlike most directives in this file, a malformed `tty` value must
+    /// never abort config resolution (and therefore the whole `isekai-ssh
+    /// <host>` connection attempt) — same `always-connects.md` convention
+    /// `invalid_tab_color_directive_does_not_abort_config_resolution` pins
+    /// for `tab-idle-color`/`tab-attention-color`. The wrong-argument-count
+    /// case (`one_arg`'s own failure mode) is a no-op, same as an invalid
+    /// explicit `<name>` below.
+    #[test]
+    fn a_malformed_tty_directive_is_a_no_op_not_an_error() {
+        let mut builder = empty_builder();
+        let result = apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[]) });
+        assert!(result.is_ok(), "a malformed directive must never abort config resolution");
+        assert_eq!(builder.tty, None);
+
+        let result =
+            apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&["auto", "extra"]) });
+        assert!(result.is_ok());
+        assert_eq!(builder.tty, None);
+    }
+
+    /// Mirrors how `resolve_name_from`'s `Auto` branch already treats an
+    /// invalid *derived* candidate (skip, don't error) — an explicit
+    /// directive value getting stricter treatment would be inconsistent,
+    /// and would otherwise only surface after a wasted connection attempt
+    /// (the remote `isekai-pipe tty attach` rejects it with `EX_USAGE`).
+    #[test]
+    fn tty_directive_with_an_invalid_name_is_a_no_op_not_an_error() {
+        for invalid in ["", ".", "..", "has/slash", &"x".repeat(201)] {
+            let mut builder = empty_builder();
+            let result =
+                apply_isekai_directive(&mut builder, IsekaiDirective { name: "tty".to_string(), args: s(&[invalid]) });
+            assert!(result.is_ok(), "{invalid:?} must not abort config resolution");
+            assert_eq!(builder.tty, None, "{invalid:?} must not be accepted as a session name");
+        }
+    }
+
     /// Pins the fix for the bug Codex code review found (2026-07-25): a
     /// malformed `tab-idle-color`/`tab-attention-color` value used to
     /// propagate its parse error out of `apply_isekai_directive` via `?`,
@@ -608,6 +731,7 @@ mod tests {
             local_bind_port_range: None,
             tab_idle_color: None,
             tab_attention_color: None,
+            tty: None,
         }
     }
 }

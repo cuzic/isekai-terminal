@@ -666,10 +666,13 @@ where
     let host = prepared.resolution().profile().to_string();
     // `--isekai-tty` is silently ignored when the caller already gave an
     // explicit trailing remote command — same opportunistic convention as
-    // every other consumer of `WrapperPlan::tty_selection` (see its doc
-    // comment).
+    // every other consumer of `crate::wrapper::resolved_tty_selection` (see
+    // its doc comment).
     let tty_exec = if prepared.plan().remote_command().is_none() {
-        crate::tty_attach::resolve_exec_command(prepared.plan().tty_selection(), prepared.resolution().profile())
+        crate::tty_attach::resolve_exec_command(
+            crate::wrapper::resolved_tty_selection(prepared.plan(), prepared.resolution()).as_ref(),
+            prepared.resolution().profile(),
+        )
     } else {
         None
     };

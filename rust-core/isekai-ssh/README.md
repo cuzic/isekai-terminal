@@ -289,6 +289,7 @@ Host production
     #@isekai ctl-socket yes
     #@isekai tab-idle-color 202020
     #@isekai tab-attention-color ff8800
+    #@isekai tty auto
 ```
 
 これで `isekai-ssh production`(または `-L 5432:127.0.0.1:5432 production` で `service postgres`
@@ -321,12 +322,13 @@ Host production
 | `remote-log-level` | `error`\|`warn`\|`info`\|`debug`\|`trace` | `info` | 自動 bootstrap で起動するリモート側 `isekai-pipe serve` の `--log-level`。接続不良の切り分け時だけ `debug`/`trace` に上げ、常用ホストでは既定(`info`)のままにしておくのが推奨(ホストごとに設定できる) |
 | `remote-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | 自動 bootstrap で起動するリモート側 `isekai-pipe serve --bind-port-range`。この範囲だけをホスト側ファイアウォールで許可すればよくなる(既定は Linux の ephemeral port range 全体を開ける必要がある) |
 | `local-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | `isekai-ssh`(`isekai-pipe connect`)自身がこのマシンで張るQUICソケットのbindポート範囲。手元のファイアウォール/NATが outbound UDP を特定範囲にしか通さない場合に使う。`remote-bind-port-range` とは独立した設定(片方だけ・両方同時に設定してよい) |
+| `tty` | `auto`\|`off`\|`<name>` | (指定なし=`--isekai-tty`相当のフラグが無ければ平のログインシェル) | `--isekai-tty[=<name>]`(下記「`--isekai-tty[=<name>]`」参照)のホスト単位デフォルト。`auto`はタブ単位の自動命名、`<name>`は固定デーモン名を指定、`off`はより広い`Host`ブロック(例`Host *`)で有効にした設定をこのホストだけ明示的に無効化する。`--isekai-tty[=<name>]`をコマンドラインで指定した場合は(`off`であっても)常にそちらが優先される |
 
 `bootstrap-candidate`/`link`/`rendezvous`/`stun`/`relay`/`service` は複数行書くと追記されていく。
 それ以外(`enabled`/`bootstrap-policy`/`profile`/`remote-path`/`resume-grace`/
 `candidate-race-delay`/`relay-delay`/`install-mode`/`ctl-socket`/`tab-idle-color`/
 `tab-attention-color`/`remote-log-level`/
-`remote-bind-port-range`/`local-bind-port-range`)は最初に出てきた値が採用される
+`remote-bind-port-range`/`local-bind-port-range`/`tty`)は最初に出てきた値が採用される
 (OpenSSH 本体の `Host`/`Match` と同じ first-value-wins 規則)。
 
 ### オプション: STUN による低遅延 P2P(`--mode stun`)
@@ -543,6 +545,15 @@ fi
   名前がタブ単位(このバージョン)に変わるため、それまで`isekai-<profile>`という1個の
   デーモンに繋がっていたセッションには自動では戻れなくなる。そのシェルへ戻りたい場合は
   `--isekai-tty=isekai-<profile>`と明示すること。
+- `#@isekai tty <name>`ディレクティブの`<name>`に文字通り`auto`/`off`という名前は
+  使えない(その2語は予約されたキーワードとして解釈される)。そのような名前を使いたい
+  場合は代わりに`--isekai-tty=auto`/`--isekai-tty=off`とコマンドラインで明示すること
+  (CLIフラグの構文には元々この曖昧さが無い)。
+- `tty`ディレクティブの引数が不正(個数違い、`isekai-pipe`が拒否する名前——`/`・NUL・
+  空文字・`.`/`..`・200バイト超)な場合、`isekai-ssh <host>`自体は失敗させず、標準
+  エラーへ警告を出した上で平のログインシェルにフォールバックする(このプロジェクトの
+  opportunistic fallback の流儀、`tab-idle-color`等と同じ)。`Host *`のような広い
+  ブロックに書いたタイポが、それにマッチする全ホストへの接続を巻き添えにしないため。
 
 これは新しいシェル(=新しいタブ)が起動するたびに一度だけ発行され、その中で
 `isekai-ssh` を何度 `kill` して再実行しても同じ値が引き継がれる。
@@ -552,6 +563,14 @@ fi
 
 - **既定は指定なし(現状維持)**。オプトイン機能で、指定しない限り従来どおりの平のログイン
   シェル。
+- 毎回 `--isekai-tty` を打たなくて済むよう、`~/.ssh/config` の `Host` ブロックへ
+  `#@isekai tty auto|off|<name>` を書けば、ホストごとの既定として同じ効果になる
+  (上記「`.ssh/config` 設定例」参照)。コマンドラインの `--isekai-tty[=<name>]` は
+  常にこのディレクティブより優先される(`off` を設定していても、明示的にフラグを
+  渡せばその回だけ tty-attach する)。`off` は、より広い `Host` ブロック(例
+  `Host *` に `#@isekai tty auto`)で有効にした既定を、特定のホストだけ明示的に
+  無効化したいときに使う(OpenSSH の first-match-wins に従い、より具体的な
+  `Host` ブロックを先に書く)。
 - 明示的なリモートコマンド(`isekai-ssh host 'cmd'`)を同時に指定した場合は**黙って無視**
   される(このプロジェクトの opportunistic fallback の流儀、ctl-socket と同じ)。
 - `ctl-socket yes` と**共存する**(タブタイトル・クリップボード連携が tty-attach 中も

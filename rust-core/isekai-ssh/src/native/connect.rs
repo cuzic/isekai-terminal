@@ -689,9 +689,13 @@ async fn run_authenticated_session(
     };
     // `--isekai-tty` is silently ignored when there's already an explicit
     // trailing remote command — same opportunistic convention as ctl-socket's
-    // own gate just above (`WrapperPlan::tty_selection`'s doc comment).
+    // own gate just above (`crate::wrapper::resolved_tty_selection`'s doc
+    // comment).
     let tty_exec = if remote_cmd.is_none() {
-        crate::tty_attach::resolve_exec_command(plan.tty_selection(), resolution.profile())
+        crate::tty_attach::resolve_exec_command(
+            crate::wrapper::resolved_tty_selection(plan, resolution).as_ref(),
+            resolution.profile(),
+        )
     } else {
         None
     };
