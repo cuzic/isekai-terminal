@@ -129,7 +129,18 @@ val copyRustCoreJniLibs = tasks.register<Copy>("copyRustCoreJniLibs") {
 // インストールして起動するまで誰も気づかなかった)。`merge*JniLibFolders`という
 // 名前のタスク(バリアントごとに動的に生成される)へ明示的に`dependsOn`することで、
 // srcDir登録だけに頼らず確実に依存させる。
-android.sourceSets.getByName("main").jniLibs.srcDir(copyRustCoreJniLibs)
+//
+// `jniLibs.srcDir(...)`にはABIディレクトリの**親**を渡す必要がある(AGPは
+// `<srcDir>/<ABI名>/*.so`という構造を期待し、`<srcDir>`自体の直下に.soがあると
+// `IllegalStateException: ... is not an ABI`で`mergeDebugNativeLibs`が落ちる)。
+// `copyRustCoreJniLibs`をそのまま`srcDir(copyRustCoreJniLibs)`のように渡すと、
+// Copyタスクの出力(`into`で指定した`rustJniLibs/arm64-v8a`そのもの)がsrcDirとして
+// 解決されてしまい、ABIディレクトリ自身を指してしまう(2026-08、上記のdependsOn
+// 修正で`mergeDebugJniLibFolders`が実際に走るようになって初めて表面化したバグ——
+// 今までは`copyRustCoreJniLibs`自体が一度も実行されていなかったため、この構造の
+// 誤りも連鎖的に隠れていた)。`rustJniLibs`(`arm64-v8a`の親)を明示的に渡すことで
+// `<srcDir>/arm64-v8a/libisekai_terminal_core.so`という期待される構造にする。
+android.sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("rustJniLibs"))
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
     dependsOn(copyRustCoreJniLibs)
 }
