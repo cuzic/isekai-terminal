@@ -47,17 +47,6 @@ object SnippetTemplates {
     )
 
     /**
-     * ディスク使用量を確認する簡単な例。tmux専用ではない汎用コマンドの例として、
-     * 「テンプレート」機能が特定用途専用ではなく任意の定型コマンドを登録できる一般的な
-     * 仕組みであることを示す([TMUX_SESSION_PICKER] だけだと「tmux接続専用機能」に
-     * 見えてしまうため、design review指摘、2026-08)。
-     */
-    val DISK_USAGE = SnippetTemplate(
-        label = "ディスク使用量確認",
-        command = "df -h",
-    )
-
-    /**
      * CPU/メモリ使用率が高い順にプロセスを並べて選択し、確認の上で `kill`(SIGTERM)する。
      * [TMUX_SESSION_PICKER] と同じ fzf/`select` フォールバック構成・1行化の理由付けを踏襲。
      *
@@ -118,7 +107,6 @@ object SnippetTemplates {
 
     val ALL: List<SnippetTemplate> = listOf(
         TMUX_SESSION_PICKER,
-        DISK_USAGE,
         KILL_HIGH_USAGE_PROCESS,
         CLAUDE_RESUME,
         CLAUDE_CONTINUE,

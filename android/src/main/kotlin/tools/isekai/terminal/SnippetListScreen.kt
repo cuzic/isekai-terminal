@@ -127,7 +127,7 @@ fun SnippetListScreen(
             onDismissRequest = { showTemplatePicker = false },
             title = { Text("テンプレートから追加") },
             text = {
-                // テンプレートが増える(現在7個)ほど、`AlertDialog`のtext領域の高さ上限を
+                // テンプレートが増える(現在6個)ほど、`AlertDialog`のtext領域の高さ上限を
                 // 超えて内容が見切れうるため、`verticalScroll`でスクロール可能にしている
                 // (テンプレートが1個だけだった頃はScrollなしでも問題にならなかった)。
                 Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
