@@ -1298,66 +1298,69 @@ impl Terminal {
     }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
+    /// RIS(`ESC c`、Reset to Initial State)。
+    ///
+    /// **実装方針(重要)**: 個々のフィールドへ初期値を代入していくのではなく、
+    /// 一度`Terminal::new`で作り直した「まっさらな状態」で丸ごと置き換えてから、
+    /// RISを跨いで生き残るべき状態だけを旧stateから移し戻す。
+    ///
+    /// 以前は約40個の初期値代入を`Terminal::new`と二重管理しており、
+    /// 新しいフィールドを追加したときに片方への追記を忘れると、RIS後だけ
+    /// 古い値が残る(あるいは初期化されない)というサイレントな挙動差が
+    /// 生まれる構造になっていた。この形なら**新しいフィールドの既定は
+    /// 「RISでリセットされる」側**になり、生き残らせたい場合だけ下の
+    /// 明示的なリストへ足すことになる(RISの意味からしてこちらが安全側)。
+    ///
+    /// 生き残るのは次の3種類だけ:
+    /// 1. 端末そのものの属性(`theme`/`cols`/`rows`)——RISはリサイズでも
+    ///    テーマ変更でもない。
+    /// 2. 「過去」を指す履歴・単調増加id(`pending_scrollback`/`link_table`/
+    ///    `link_ids`/`next_image_id`/`total_scrolled_lines`/`prompt_marks`/
+    ///    `last_command_output`)——リセットするとscrollbackに既に流れた
+    ///    セルの`link_id`や過去のプロンプトマークの絶対行番号が別の意味に
+    ///    化けてしまう(各フィールドのdocコメント参照)。
+    /// 3. 端末エミュレーション外部との受け渡し状態——`bell_generation`/
+    ///    `notify_*`/`panel_*`(conflatedチャネルの世代カウンタと直近内容。
+    ///    リモートのRISでUI通知を取りこぼさない)、`panel_enabled`
+    ///    (`set_panel_enabled`でホスト側が設定するopt-inフラグであり、
+    ///    リモートが送るRISで勝手にON/OFFされてはいけない)、
+    ///    `last_panel_update_at`(レート制限状態。RISでリセットできると
+    ///    制限を回避できてしまう)、`kitty`/`sixel_decoder`(チャンク転送・
+    ///    DCSデコードの途中組み立て状態。RIS前後で挙動を変えない)。
     fn reset_all(&mut self) {
-        let theme = self.theme;
-        let blank = blank_cell_for_theme(&theme);
-        let cells = vec![blank; self.cols * self.rows];
-        self.main_cells = cells.clone();
-        self.alt_cells = cells;
-        self.alt_active = false;
-        self.saved_cursor_main = None;
-        self.saved_cursor_alt = None;
-        self.cursor_row = 0; self.cursor_col = 0;
-        self.cur_attrs = TermAttrs::default_for(&theme);
-        self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
-        self.title = None;
-        self.tab_color = None;
-        self.tab_progress = None;
-        self.cursor_color = None;
-        self.pending_clipboard_write = None;
-        self.pending_clipboard_pull_request = false;
-        self.pending_terminal_responses.clear();
-        self.application_cursor_mode = false;
-        self.application_keypad_mode = false;
-        self.bracketed_paste_mode = false;
-        self.synchronized_output_active = false;
-        // RISは画面全体を初期化する——行差分では追随できないので全画面dirty(#93)。
+        let (cols, rows, theme) = (self.cols, self.rows, self.theme);
+        let old = std::mem::replace(self, Terminal::new(cols, rows, theme));
+
+        // ── ここから下がRISを跨いで生き残る状態(上記docコメント参照) ──
+        // 2. 「過去」を指す履歴・単調増加id
+        self.pending_scrollback = old.pending_scrollback;
+        self.link_table = old.link_table;
+        self.link_ids = old.link_ids;
+        self.next_image_id = old.next_image_id;
+        self.total_scrolled_lines = old.total_scrolled_lines;
+        self.prompt_marks = old.prompt_marks;
+        self.last_command_output = old.last_command_output;
+        // 3. 端末エミュレーション外部との受け渡し状態
+        self.bell_generation = old.bell_generation;
+        self.notify_generation = old.notify_generation;
+        self.notify_kind = old.notify_kind;
+        self.notify_title = old.notify_title;
+        self.notify_body = old.notify_body;
+        self.panel_generation = old.panel_generation;
+        self.panel_kind = old.panel_kind;
+        self.panel_title = old.panel_title;
+        self.panel_markdown = old.panel_markdown;
+        self.panel_fields = old.panel_fields;
+        self.panel_enabled = old.panel_enabled;
+        self.last_panel_update_at = old.last_panel_update_at;
+        self.kitty = old.kitty;
+        self.sixel_decoder = old.sixel_decoder;
+
+        // `Terminal::new`との唯一の意図的な差分: RISは画面全体を初期化する
+        // ——行差分では追随できないので全画面dirty(#93)。新規`Terminal`は
+        // まだ一度も描画していないので`false`だが、RIS後は既存の描画内容を
+        // 全て捨てさせる必要がある。
         self.full_damage_pending = true;
-        self.focus_reporting_mode = false;
-        self.cursor_visible = true;
-        self.cursor_shape = CursorShape::Block;
-        self.cursor_blink = true;
-        self.autowrap_mode = true;
-        self.origin_mode = false;
-        self.last_graphic_cell = None;
-        self.g0_charset = Charset::Ascii;
-        self.g1_charset = Charset::Ascii;
-        self.gl_is_g1 = false;
-        self.mouse_reporting_mode = MouseReportingMode::Off;
-        self.sgr_mouse_mode = false;
-        self.alternate_scroll = false;
-        self.urxvt_mouse_mode = false;
-        // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
-        // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
-        self.active_link_id = None;
-        // RIS(`ESC c`)はタブストップも既定(8列おき)へ戻す(実端末の挙動、タスク#61)。
-        self.tab_stops = default_tab_stops(self.cols);
-        // Sixel(タスク#42): RISは画面内容自体を全消去するため、画像配置も道連れに
-        // 消す(`next_image_id`自体はリセットしない、[Terminal]のdocコメント参照)。
-        self.clear_images();
-        // Kitty keyboard protocol(タスク#54): RISはmain/alt両方のflagsスタックを
-        // 空(legacy mode)へ戻す。他のDECモード([mouse_reporting_mode]等)と同じく
-        // RISはセッション全体の状態を初期化する操作なので、main/alt独立という
-        // 仕様上の制約とは矛盾しない(両方を初期化するだけ)。
-        self.main_kitty_flags_stack.clear();
-        self.alt_kitty_flags_stack.clear();
-        // OSC 133(タスク#13): `total_scrolled_lines`/`prompt_marks`/`last_command_output`
-        // は`link_table`と同じ理由でRISでもクリアしない(過去マークの絶対行番号の
-        // 意味が変わってしまうため)。「今」の一時的な状態のみリセットする。
-        self.input_line_active = false;
-        self.capturing_command_output = false;
-        self.current_output_line.clear();
-        self.current_output_lines.clear();
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -1586,6 +1589,41 @@ impl Terminal {
         new_cells
     }
 
+    /// 現在のカーソル状態(位置・SGR属性・文字セット状態)を[SavedCursor]として
+    /// 切り出す。DECSC(`save_cursor_decsc`)とalt画面切替(`switch_to_alt`)は
+    /// **同じフィールド集合**を保存する(`?1049h`が仕様上「DECSCとして保存」を
+    /// 兼ねるため——[Terminal]の`saved_cursor_main`フィールドdocコメント参照)。
+    /// どちらのスロットへ入れるかは呼び出し元が決める。
+    fn capture_cursor(&self) -> SavedCursor {
+        SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            attrs: self.cur_attrs,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            gl_is_g1: self.gl_is_g1,
+        }
+    }
+
+    /// [capture_cursor]で保存した状態を現在のカーソルへ適用する([capture_cursor]の
+    /// 逆操作)。
+    ///
+    /// 画面サイズへのクランプはここでは**行わない**——DECRC
+    /// ([restore_cursor_decrc])だけが適用後に別途クランプする、という既存の
+    /// 非対称性をそのまま維持するため(`switch_to_main`側は
+    /// `resize_preserving_state`が`saved_cursor_*`自体をリサイズに追従させて
+    /// いるためクランプしていない)。スロットを`take`するかどうかも同じ理由で
+    /// 呼び出し元の責務にしてある(alt→mainの復帰は使い切りで消すが、DECRCは
+    /// 何度でも同じ位置へ戻れるよう残す)。
+    fn apply_saved_cursor(&mut self, saved: SavedCursor) {
+        self.cursor_row = saved.row;
+        self.cursor_col = saved.col;
+        self.cur_attrs = saved.attrs;
+        self.g0_charset = saved.g0;
+        self.g1_charset = saved.g1;
+        self.gl_is_g1 = saved.gl_is_g1;
+    }
+
     fn switch_to_alt(&mut self, save_cursor: bool) {
         // 既にalt画面ならno-op(クラッシュ観点レビュー、2026-07-31、対になる
         // `switch_to_main`の`if !self.alt_active { return; }`と対称のガード)。
@@ -1600,14 +1638,8 @@ impl Terminal {
         // alt画面への切替は画面内容を丸ごと差し替える——全画面dirty(#93)。
         self.full_damage_pending = true;
         if save_cursor {
-            self.saved_cursor_main = Some(SavedCursor {
-                row: self.cursor_row,
-                col: self.cursor_col,
-                attrs: self.cur_attrs,
-                g0: self.g0_charset,
-                g1: self.g1_charset,
-                gl_is_g1: self.gl_is_g1,
-            });
+            let captured = self.capture_cursor();
+            self.saved_cursor_main = Some(captured);
         }
         let theme = self.theme;
         self.main_cells = self.cells().clone();
@@ -1642,13 +1674,10 @@ impl Terminal {
         self.full_damage_pending = true;
         self.alt_active = false;
         if restore_cursor {
+            // `take`する(alt→main復帰は使い切り)——DECRCと違い同じスロットへ
+            // 戻り続ける必要がないため、既存挙動をそのまま維持する。
             if let Some(saved) = self.saved_cursor_main.take() {
-                self.cursor_row = saved.row;
-                self.cursor_col = saved.col;
-                self.cur_attrs = saved.attrs;
-                self.g0_charset = saved.g0;
-                self.g1_charset = saved.g1;
-                self.gl_is_g1 = saved.gl_is_g1;
+                self.apply_saved_cursor(saved);
             }
         }
         self.active_link_id = None;
@@ -1662,14 +1691,7 @@ impl Terminal {
     /// スロットを共有する設計の理由は[Terminal]の`saved_cursor_main`フィールド
     /// docコメント参照。
     fn save_cursor_decsc(&mut self) {
-        let saved = Some(SavedCursor {
-            row: self.cursor_row,
-            col: self.cursor_col,
-            attrs: self.cur_attrs,
-            g0: self.g0_charset,
-            g1: self.g1_charset,
-            gl_is_g1: self.gl_is_g1,
-        });
+        let saved = Some(self.capture_cursor());
         if self.alt_active {
             self.saved_cursor_alt = saved;
         } else {
@@ -1683,17 +1705,15 @@ impl Terminal {
     fn restore_cursor_decrc(&mut self) {
         let saved = if self.alt_active { self.saved_cursor_alt } else { self.saved_cursor_main };
         if let Some(saved) = saved {
+            self.apply_saved_cursor(saved);
             // 保存後にresizeで画面が縮んでいる可能性を考慮し、現在のcols/rowsへ
-            // クランプする。`resize_preserving_state`は`saved_cursor_*`自体を
+            // クランプする(この後段クランプがDECRC固有の差分——`apply_saved_cursor`
+            // のdocコメント参照)。`resize_preserving_state`は`saved_cursor_*`自体を
             // resize時に追従更新するが(念のため多重に安全側でもクランプする)、
             // colはprintの遅延折り返し状態(`== cols`)を許容する必要があるため
             // `cols`ちょうどまでは許容し、それを超える場合のみ切り詰める。
-            self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
-            self.cursor_col = saved.col.min(self.cols);
-            self.cur_attrs = saved.attrs;
-            self.g0_charset = saved.g0;
-            self.g1_charset = saved.g1;
-            self.gl_is_g1 = saved.gl_is_g1;
+            self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
+            self.cursor_col = self.cursor_col.min(self.cols);
         }
     }
 
@@ -1722,13 +1742,88 @@ impl Terminal {
         }
     }
 
+    /// 行範囲`[top, bot]`(両端含む)の`n`行を空行(現在のSGR属性を引き継ぐ
+    /// [Self::blank])で埋める。[shift_rows_up]/[shift_rows_down]の「空いた側を
+    /// 埋める」部分の実体。
+    ///
+    /// 呼び出し元は`start + n <= rows`を保証すること(いずれの呼び出し元も
+    /// `n`をregion幅へクランプ済みなので満たされる)。
+    fn blank_rows(&mut self, start: usize, n: usize) {
+        if n == 0 { return; }
+        let cols = self.cols;
+        let blank = self.blank();
+        let from = start * cols;
+        let to = (start + n) * cols;
+        self.cells_mut()[from..to].fill(blank);
+    }
+
+    /// scroll region的な行範囲`[top, bot]`(両端含む)の内容を`n`行分**上**へ
+    /// シフトし、空いた下端`n`行を空行で埋める(SU/DL/LF/インデックス操作の共通実体)。
+    ///
+    /// - `n`は領域幅(`bot - top + 1`)へクランプする。`n == 領域幅`のときはシフト
+    ///   対象が0行になるため、シフトループ自体をスキップする — `bot - n`を
+    ///   `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
+    ///   (タスク#69: `Ps`がフルスクロール領域幅以上のときに実際に踏んでいた既存
+    ///   バグの修正)。空行埋めの開始行も`bot - n + 1`ではなく
+    ///   `top + (region_size - n)`(＝同じ値)の順序で計算し、同じ理由の
+    ///   アンダーフローを避ける。
+    /// - **行を丸ごと**移動するので、全角(wide)文字の本体セルとその
+    ///   `is_wide_placeholder`は常に同じ行に留まり、対応関係は崩れない
+    ///   ([sanitize_wide_row]が必要になるのはICH/DCHのような行内シフトだけ)。
+    /// - scrollbackへのpush・`full_damage_pending`・[Self::clear_images]は
+    ///   **呼び出し元の責務**——SU(`scroll_up_region`)だけがscrollbackへ積み、
+    ///   DL(`delete_lines`)は積んではいけない、という差がここに埋もれないようにする。
+    fn shift_rows_up(&mut self, top: usize, bot: usize, n: usize) {
+        // 防御的ガード(クラッシュ観点): 呼び出し元は全て`top <= bot < rows`を
+        // 満たすが、`Terminal`自身の不変量を呼び出し元の実装に依存させない。
+        if top > bot || bot >= self.rows { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let cols = self.cols;
+        if n < region_size {
+            // 上へ詰めるので、行番号の小さい方から順にコピーする(書き込み先
+            // `row`はこの時点で既に読み終わっている)。
+            for row in top..=(bot - n) {
+                let dst = row * cols;
+                let src = (row + n) * cols;
+                let cells = self.cells_mut();
+                // `dst + cols <= src`(n >= 1)なのでsplit_at_mutで重なりなく
+                // 行単位でコピーできる。per-cellのcloneと同じ結果。
+                let (head, tail) = cells.split_at_mut(src);
+                head[dst..dst + cols].clone_from_slice(&tail[..cols]);
+            }
+        }
+        self.blank_rows(top + (region_size - n), n);
+    }
+
+    /// [shift_rows_up]の逆向き(SD/IL/RI共通)。行範囲`[top, bot]`の内容を`n`行分
+    /// **下**へシフトし、空いた上端`n`行(`top..top+n`)を空行で埋める。
+    /// クランプ・アンダーフロー回避・wide文字の扱い・呼び出し元責務は
+    /// [shift_rows_up]と同じ。
+    fn shift_rows_down(&mut self, top: usize, bot: usize, n: usize) {
+        if top > bot || bot >= self.rows { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let cols = self.cols;
+        if n < region_size {
+            // 下へ押し出すので、行番号の大きい方から順にコピーする(書き込み先
+            // `row + n`がまだ読んでいない元データを上書きしないようにする)。
+            for row in (top..=(bot - n)).rev() {
+                let src = row * cols;
+                let dst = (row + n) * cols;
+                let cells = self.cells_mut();
+                let (head, tail) = cells.split_at_mut(dst);
+                tail[..cols].clone_from_slice(&head[src..src + cols]);
+            }
+        }
+        self.blank_rows(top, n);
+    }
+
     /// SU(`CSI Ps S`)。scroll region内を`n`行分上方向へシフトし、下端を空行で
-    /// 埋める。[scroll_down_region](SD)と同じ理由で、シフト対象が0行になる
-    /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
-    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
-    /// (タスク#69: `Ps`がフルスクロール領域幅以上のときに実際に踏んでいた既存
-    /// バグの修正。空行埋めの範囲も`bot - n + 1`ではなく`bot + 1 - n`の順序で
-    /// 計算し同じ理由のアンダーフローを避ける)。
+    /// 埋める([shift_rows_up]が実体)。`top == 0`かつmain画面の場合に限り、
+    /// 押し出された行をscrollbackへ積む——この点だけが[delete_lines](DL)との差。
     fn scroll_up_region(&mut self, n: usize) {
         // スクロールは行座標をずらすので行差分では追随できない——全画面dirty(#93)。
         self.full_damage_pending = true;
@@ -1762,20 +1857,7 @@ impl Terminal {
             self.trim_pending_scrollback();
         }
 
-        if n < region_size {
-            for row in top..=(bot - n) {
-                for col in 0..cols {
-                    let src = self.cells_mut()[(row + n) * cols + col].clone();
-                    self.cells_mut()[row * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in (bot + 1 - n)..=bot {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_up(top, bot, n);
     }
 
     /// SD(`CSI Ps T`)。scroll region([scroll_top, scroll_bottom])の内容を`n`行分
@@ -1788,30 +1870,14 @@ impl Terminal {
     ///
     /// [insert_lines]/[delete_lines]と同じ理由で、シフト対象が0行になる
     /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
-    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため。
+    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
+    /// ([shift_rows_down]が実体)。
     fn scroll_down_region(&mut self, n: usize) {
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-
-        if n < region_size {
-            for row in (top..=(bot - n)).rev() {
-                for col in 0..cols {
-                    let src = self.cells_mut()[row * cols + col].clone();
-                    self.cells_mut()[(row + n) * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in top..(top + n) {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_down(top, bot, n);
     }
 
     /// IL(`CSI Ps L`)。カーソル行に`n`個の空行を挿入し、カーソル行〜scroll_bottomの
@@ -1834,25 +1900,9 @@ impl Terminal {
         if top < self.scroll_top || top > bot { return; }
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-        if n < region_size {
-            // 下から上へ(行番号の大きい方から)コピーすることで、書き込み先
-            // (row + n)がまだ読んでいない元データを上書きしないようにする。
-            for row in (top..=(bot - n)).rev() {
-                for col in 0..cols {
-                    let src = self.cells_mut()[row * cols + col].clone();
-                    self.cells_mut()[(row + n) * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in top..(top + n) {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        // `scroll_down_region`(SD)と実体は同一で、`top`が`scroll_top`ではなく
+        // カーソル行になる点だけが違う([shift_rows_down])。
+        self.shift_rows_down(top, bot, n);
     }
 
     /// DL(`CSI Ps M`)。カーソル行から`n`行を削除し、それより下(〜scroll_bottom)の
@@ -1863,31 +1913,17 @@ impl Terminal {
     /// アンダーフロー回避のため、空行で埋める開始行を`bot - n + 1`ではなく
     /// `top + (region_size - n)`として計算する(`n == region_size`の時
     /// `bot - n + 1`は`usize`の直接減算だと桁あふれし得るが、こちらは
-    /// `region_size - n >= 0`が`n`のクランプにより保証されているため安全)。
+    /// `region_size - n >= 0`が`n`のクランプにより保証されているため安全)——
+    /// この計算も含めて実体は[shift_rows_up]と共有する。`scroll_up_region`(SU)
+    /// との唯一の差は、SUが行うscrollbackへのpushをここでは**行わない**こと
+    /// (上記の理由)。
     fn delete_lines(&mut self, n: usize) {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-        if n < region_size {
-            for row in top..=(bot - n) {
-                for col in 0..cols {
-                    let src = self.cells_mut()[(row + n) * cols + col].clone();
-                    self.cells_mut()[row * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        let blank_start = top + (region_size - n);
-        for row in blank_start..=bot {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_up(top, bot, n);
     }
 
     /// [insert_chars]/[delete_chars] が行内で全角(wide)文字の片割れを分断してしまった
@@ -3346,17 +3382,17 @@ impl Perform for Terminal {
                     self.full_damage_pending = true;
                     let top = self.scroll_top;
                     let bot = self.scroll_bottom;
-                    let cols = self.cols;
-                    for row in (top + 1..=bot).rev() {
-                        for col in 0..cols {
-                            let src = self.cells_mut()[(row - 1) * cols + col].clone();
-                            self.cells_mut()[row * cols + col] = src;
-                        }
-                    }
-                    let blank = self.blank();
-                    for col in 0..cols {
-                        self.cells_mut()[top * cols + col] = blank.clone();
-                    }
+                    // Sixel/Kitty(タスク#42): 領域内シフトは画像が乗っていた
+                    // グリッド位置の内容を別の内容へ置き換える——sibling
+                    // (`scroll_up_region`/`scroll_down_region`/`insert_lines`/
+                    // `delete_lines`)は全て`clear_images`を呼んでいたのに、
+                    // ここだけ漏れていた(`full_damage_pending`が同じ形で漏れて
+                    // いたのと同じ見落とし)。画像だけが古い行位置に取り残される
+                    // ので、`clear_images`docコメントの方針どおり消す。
+                    self.clear_images();
+                    // SD(`scroll_down_region`)/IL(`insert_lines`)と同じ1行分の
+                    // 下方向シフト([shift_rows_down])。
+                    self.shift_rows_down(top, bot, 1);
                 } else if self.cursor_row > 0 {
                     self.cursor_row -= 1;
                 }
@@ -5522,6 +5558,202 @@ mod tests {
         assert_eq!(t.bell_generation(), 3, "RIS後もカウントは継続する");
     }
 
+    // ── RIS(`ESC c`)で「生き残る状態」/「リセットされる状態」の全数固定 ─────
+    //
+    // `reset_all`は`Terminal::new`で丸ごと作り直してから生き残るべき状態だけを
+    // 移し戻す実装になっている(`reset_all`のdocコメント参照)。この2つのテストは
+    // その「生き残るリスト」を全数で固定する——リストから漏れた/余計に入った
+    // フィールドは、scrollback履歴の消失やUI通知の取りこぼしとして実際に
+    // ユーザーへ見える回帰になるため。
+
+    #[test]
+    fn test_ris_preserves_exactly_the_documented_survivor_fields() {
+        let theme = Theme::default();
+        let mut t = Terminal::new(10, 4, theme);
+
+        // 1. 端末そのものの属性(cols/rows/theme)。
+        //    別テーマを渡して「RISがテーマを既定へ戻さない」ことも見る。
+        let custom_theme = Theme { default_fg: 0xFF00FF00, ..Theme::default() };
+        t.set_theme(custom_theme);
+
+        // 2. 「過去」を指す履歴・単調増加id。
+        feed(&mut t, b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let scrolled_out = t.pending_scrollback.len();
+        assert!(scrolled_out > 0, "前提: 何行かはscrollbackへ押し出されている");
+        let total_scrolled = t.total_scrolled_lines;
+        assert!(total_scrolled > 0, "前提: total_scrolled_linesも進んでいる");
+        feed(&mut t, b"\x1b]8;;https://example.com/a\x1b\\X\x1b]8;;\x1b\\");
+        assert_eq!(t.link_table().len(), 1, "前提: link_tableへ1件intern済み");
+        let image_id = t.push_image(1, 1, vec![0u8, 0, 0, 255]);
+        t.prompt_marks.push_back(PromptMark { kind: PromptMarkKind::PromptStart, row: 3 });
+        t.last_command_output = Some(vec!["out".to_string()]);
+
+        // 3. 端末エミュレーション外部との受け渡し状態。
+        feed(&mut t, b"\x07"); // bell_generation を進める
+        let bell = t.bell_generation();
+        t.notify_generation = 7;
+        t.notify_kind = NotifyKind::JobDone;
+        t.notify_title = "title".to_string();
+        t.notify_body = "body".to_string();
+        t.panel_generation = 9;
+        t.panel_kind = PanelKind::Document;
+        t.panel_title = "ptitle".to_string();
+        t.panel_markdown = "# md".to_string();
+        t.panel_fields = vec![PanelField {
+            id: "f".to_string(),
+            label: "l".to_string(),
+            kind: crate::PanelFieldKind::Text,
+            options: Vec::new(),
+        }];
+        t.panel_enabled = true;
+        let panel_at = std::time::Instant::now();
+        t.last_panel_update_at = Some(panel_at);
+
+        feed(&mut t, b"\x1bc"); // RIS
+
+        assert_eq!(t.cols(), 10, "RISはリサイズではない");
+        assert_eq!(t.rows(), 4, "RISはリサイズではない");
+        assert_eq!(t.theme().default_fg, 0xFF00FF00, "RISはテーマ変更ではない");
+
+        assert_eq!(
+            t.pending_scrollback.len(),
+            scrolled_out,
+            "scrollback履歴はRISで失われてはいけない"
+        );
+        assert_eq!(
+            t.pending_scrollback[0].iter().map(|c| c.ch.as_str()).collect::<String>(),
+            "line0     ",
+            "scrollbackの中身もそのまま"
+        );
+        assert_eq!(t.total_scrolled_lines, total_scrolled, "絶対行番号の基準はRISで巻き戻さない");
+        assert_eq!(t.link_table().len(), 1, "link_tableはRISでクリアしない(過去セルのidが指す先)");
+        assert_eq!(t.link_table()[0], "https://example.com/a");
+        assert_eq!(
+            t.push_image(1, 1, vec![0u8, 0, 0, 255]),
+            image_id + 1,
+            "next_image_idはRISでも単調増加を維持する"
+        );
+        assert_eq!(t.prompt_marks.len(), 1, "prompt_marksはRISでクリアしない");
+        assert_eq!(t.last_command_output, Some(vec!["out".to_string()]));
+
+        assert_eq!(t.bell_generation(), bell, "bell_generationはRISでリセットしない");
+        assert_eq!(t.notify_generation, 7);
+        assert_eq!(t.notify_kind, NotifyKind::JobDone);
+        assert_eq!(t.notify_title, "title");
+        assert_eq!(t.notify_body, "body");
+        assert_eq!(t.panel_generation, 9);
+        assert_eq!(t.panel_kind, PanelKind::Document);
+        assert_eq!(t.panel_title, "ptitle");
+        assert_eq!(t.panel_markdown, "# md");
+        assert_eq!(t.panel_fields.len(), 1);
+        assert!(t.panel_enabled, "AIパネルのopt-inフラグをリモートのRISで落としてはいけない");
+        assert_eq!(
+            t.last_panel_update_at,
+            Some(panel_at),
+            "パネルのレート制限状態をRISで巻き戻せてはいけない(制限回避になる)"
+        );
+    }
+
+    #[test]
+    fn test_ris_resets_every_non_survivor_field() {
+        let mut t = Terminal::new(10, 4, Theme::default());
+        // 画面・カーソル・保存カーソル・SGR・各種モードを一通り既定から動かす。
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(saved_cursor_mainも埋まる)
+        feed(&mut t, b"ABC");
+        feed(&mut t, b"\x1b7"); // DECSC(alt側スロット)
+        feed(&mut t, b"\x1b[41;1m"); // 赤背景+bold
+        feed(&mut t, b"\x1b[2;3r"); // scroll region
+        feed(&mut t, b"\x1b]0;title\x07"); // title
+        feed(&mut t, b"\x1b]4;264;rgb:11/22/33\x1b\\"); // tab color
+        feed(&mut t, b"\x1b]12;rgb:44/55/66\x1b\\"); // cursor color
+        feed(&mut t, b"\x1b]52;c;aGk=\x07"); // pending clipboard write
+        feed(&mut t, b"\x1b]52;c;?\x07"); // pending clipboard pull
+        feed(&mut t, b"\x1b[c"); // DA → pending_terminal_responses
+        feed(&mut t, b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?2026h"); // DECCKM/keypad/bracketed/sync
+        feed(&mut t, b"\x1b[?1004h\x1b[?25l"); // focus reporting / cursor hidden
+        feed(&mut t, b"\x1b[4 q"); // DECSCUSR: steady underline
+        feed(&mut t, b"\x1b[?7l\x1b[?6h"); // DECAWM off / DECOM on
+        feed(&mut t, b"\x1b)0\x0e"); // G1=DEC special graphics, SO(GL=G1)
+        feed(&mut t, b"\x1b[?1003h\x1b[?1006h\x1b[?1007h\x1b[?1015h"); // mouse modes
+        feed(&mut t, b"\x1b]8;;https://example.com/b\x1b\\"); // active link open
+        feed(&mut t, b"\x1b[3g\x1bH"); // TBC(全消去)+HTS(現在列にタブストップ)
+        feed(&mut t, b"\x1b[>1u"); // kitty keyboard flags push
+        feed(&mut t, b"\x1b]133;C\x1b\\"); // OSC 133;C: コマンド出力キャプチャ開始
+        feed(&mut t, b"captured\n");
+        t.set_tab_progress(ProgressState::Normal, 50);
+        t.push_image(1, 1, vec![0u8, 0, 0, 255]);
+        // `input_line_active`はOSC 133;Bでのみ立ち、;Cで落ちる(両立しない)ので
+        // 直接立てておく——RIS後にfalseへ戻ることを空振りでなく確認するため。
+        t.input_line_active = true;
+
+        // 前提: RIS前に「リセットされるべき状態」が実際に既定から動いている。
+        assert!(t.alt_active && t.saved_cursor_main.is_some() && t.saved_cursor_alt.is_some());
+        assert!(t.title().is_some() && t.tab_color().is_some() && t.cursor_color().is_some());
+        assert!(t.capturing_command_output && !t.current_output_lines.is_empty());
+        assert!(t.cursor_shape() != CursorShape::Block && !t.cursor_visible());
+        assert!(t.gl_is_g1 && t.g1_charset == Charset::DecSpecialGraphics);
+        assert!(t.active_link_id.is_some() && t.kitty_keyboard_flags() != 0);
+        assert!(t.tab_stops != default_tab_stops(10) && !t.images().is_empty());
+        assert!(t.tab_progress().is_some() && t.origin_mode && !t.autowrap_mode);
+
+        feed(&mut t, b"\x1bc"); // RIS
+
+        // 画面(main/alt両方)・カーソル・保存カーソル。
+        assert!(!t.alt_active, "RISはmain画面へ戻す");
+        for row in 0..4 {
+            assert_eq!(row_text(&t, row), "          ", "row {row} は空行");
+        }
+        assert!(t.alt_cells.iter().all(|c| c.ch.as_str() == " "), "alt画面も消去される");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(t.saved_cursor_main.is_none() && t.saved_cursor_alt.is_none());
+        // SGR属性・scroll region(`TermAttrs`はPartialEq/Debugを持たないので個別に見る)。
+        let default_attrs = TermAttrs::default_for(&Theme::default());
+        assert_eq!(t.cur_attrs.fg, default_attrs.fg);
+        assert_eq!(t.cur_attrs.bg, default_attrs.bg, "赤背景SGRはRISで既定へ戻る");
+        assert!(!t.cur_attrs.bold && !t.cur_attrs.reverse && !t.cur_attrs.underline);
+        assert_eq!((t.scroll_top, t.scroll_bottom), (0, 3));
+        // OSC由来のセッション状態。
+        assert_eq!(t.title(), None);
+        assert_eq!(t.tab_color(), None);
+        assert_eq!(t.tab_progress(), None);
+        assert_eq!(t.cursor_color(), None);
+        assert_eq!(t.take_pending_clipboard_write(), None);
+        assert!(!t.take_pending_clipboard_pull_request());
+        assert!(t.take_pending_terminal_responses().is_empty());
+        // DECモード群。
+        assert!(!t.application_cursor_mode());
+        assert!(!t.application_keypad_mode());
+        assert!(!t.bracketed_paste_mode());
+        assert!(!t.synchronized_output_active());
+        assert!(!t.focus_reporting_mode());
+        assert!(t.cursor_visible());
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+        assert!(t.cursor_blink());
+        assert!(t.autowrap_mode);
+        assert!(!t.origin_mode);
+        assert!(t.last_graphic_cell.is_none());
+        // `Charset`はDebugを持たないので`assert!`で比較する。
+        assert!(t.g0_charset == Charset::Ascii);
+        assert!(t.g1_charset == Charset::Ascii, "G1のDEC Special GraphicsもRISで戻る");
+        assert!(!t.gl_is_g1, "SOによるGL=G1もRISで戻る");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+        assert!(!t.sgr_mouse_mode);
+        assert!(!t.alternate_scroll);
+        assert!(!t.urxvt_mouse_mode);
+        // ハイパーリンク(アクティブ状態のみ)・タブストップ・画像・kitty flags。
+        assert!(t.active_link_id.is_none(), "アクティブなリンクはRISで閉じる");
+        assert_eq!(t.tab_stops, default_tab_stops(10), "タブストップは既定(8列おき)へ戻る");
+        assert!(t.images().is_empty(), "画像配置はRISで消える");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "kitty keyboard flagsはlegacyへ戻る");
+        // OSC 133の「今」の状態。
+        assert!(!t.input_line_active);
+        assert!(!t.capturing_command_output);
+        assert!(t.current_output_line.is_empty());
+        assert!(t.current_output_lines.is_empty());
+        // `Terminal::new`との唯一の意図的な差分。
+        assert!(t.take_full_damage_pending(), "RISは全画面dirtyを立てる");
+    }
+
     #[test]
     fn test_resize_preserving_state_preserves_cursor_visibility() {
         let mut t = Terminal::new(80, 24, Theme::default());
@@ -5786,6 +6018,251 @@ mod tests {
         assert_eq!(cell(&t, 3, 3), "4", "旧row4がカーソル行(3)へ詰められる");
         assert_eq!(cell(&t, 4, 0), " ", "region下端(scroll_bottom=4)が空行で埋まる");
         assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はDLの影響を受けない");
+    }
+
+    // ── 行シフト共通ヘルパー(shift_rows_up/shift_rows_down)の等価性 ────────
+    //
+    // Phase 2のクリーンアップで、SU(`CSI S`)/SD(`CSI T`)/IL(`CSI L`)/
+    // DL(`CSI M`)/RI(`ESC M`)の5箇所にコピペされていた「行をN行ずらして
+    // 空いた側を空行で埋める」ループを`shift_rows_up`/`shift_rows_down`
+    // (+`blank_rows`)へ統合した。統合の前後で**どのセルがどこへ移るか**が
+    // 1文字も変わっていないことを、セル単体ではなく行全体の文字列で固定する
+    // (レンダリング結果に直結するため、「panicしない」では不十分)。
+
+    /// 行`row`の全列を1つの文字列として取り出す。行全体を突き合わせることで、
+    /// シフト範囲の1行/1列ズレを見逃さない。
+    fn row_text(t: &Terminal, row: usize) -> String {
+        let cols = t.cols();
+        t.screen_cells()[row * cols..(row + 1) * cols]
+            .iter()
+            .map(|c| c.ch.as_str())
+            .collect()
+    }
+
+    /// 6列×5行に`L0abcd`〜`L4abcd`を1行ずつ書き込んだ端末(全列が埋まっている
+    /// ので、行の一部だけがずれた場合も`row_text`の比較で必ず落ちる)。
+    fn filled_6x5() -> Terminal {
+        let mut t = Terminal::new(6, 5, Theme::default());
+        feed(&mut t, b"L0abcd\r\nL1abcd\r\nL2abcd\r\nL3abcd\r\nL4abcd");
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "前提: 初期内容");
+        }
+        t
+    }
+
+    #[test]
+    fn test_su_shifts_exact_rows_and_pushes_scrollback() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2S");
+        assert_eq!(row_text(&t, 0), "L2abcd");
+        assert_eq!(row_text(&t, 1), "L3abcd");
+        assert_eq!(row_text(&t, 2), "L4abcd");
+        assert_eq!(row_text(&t, 3), "      ", "下端2行は空行");
+        assert_eq!(row_text(&t, 4), "      ");
+        // SUだけが持つscrollbackへのpush(DLとの唯一の差)。
+        let pending = t.take_scrollback();
+        assert_eq!(pending.len(), 2);
+        let pushed: Vec<String> = pending
+            .iter()
+            .map(|r| r.iter().map(|c| c.ch.as_str()).collect())
+            .collect();
+        assert_eq!(pushed, vec!["L0abcd".to_string(), "L1abcd".to_string()]);
+        assert_eq!(t.total_scrolled_lines, 2);
+    }
+
+    #[test]
+    fn test_sd_shifts_exact_rows_and_never_touches_scrollback() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2T");
+        assert_eq!(row_text(&t, 0), "      ");
+        assert_eq!(row_text(&t, 1), "      ");
+        assert_eq!(row_text(&t, 2), "L0abcd");
+        assert_eq!(row_text(&t, 3), "L1abcd");
+        assert_eq!(row_text(&t, 4), "L2abcd");
+        assert!(t.take_scrollback().is_empty(), "SDはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_il_shifts_exact_rows_from_cursor_row() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;1H\x1b[2L"); // カーソル行1に2行挿入
+        assert_eq!(row_text(&t, 0), "L0abcd", "カーソル行より上は不変");
+        assert_eq!(row_text(&t, 1), "      ");
+        assert_eq!(row_text(&t, 2), "      ");
+        assert_eq!(row_text(&t, 3), "L1abcd");
+        assert_eq!(row_text(&t, 4), "L2abcd");
+        assert!(t.take_scrollback().is_empty(), "ILはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_dl_shifts_exact_rows_from_cursor_row() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;1H\x1b[2M"); // カーソル行1から2行削除
+        assert_eq!(row_text(&t, 0), "L0abcd", "カーソル行より上は不変");
+        assert_eq!(row_text(&t, 1), "L3abcd");
+        assert_eq!(row_text(&t, 2), "L4abcd");
+        assert_eq!(row_text(&t, 3), "      ");
+        assert_eq!(row_text(&t, 4), "      ");
+        assert!(t.take_scrollback().is_empty(), "DLはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_ri_at_scroll_top_shifts_exact_rows_down_by_one() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[1;1H"); // カーソルを scroll_top(行0)へ
+        feed(&mut t, b"\x1bM"); // RI
+        assert_eq!(row_text(&t, 0), "      ", "空いた上端1行だけが空行になる");
+        assert_eq!(row_text(&t, 1), "L0abcd");
+        assert_eq!(row_text(&t, 2), "L1abcd");
+        assert_eq!(row_text(&t, 3), "L2abcd");
+        assert_eq!(row_text(&t, 4), "L3abcd");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0), "RIのスクロール時はカーソル不動");
+        assert!(t.take_scrollback().is_empty(), "RIはscrollbackへ積まない");
+    }
+
+    #[test]
+    fn test_ri_inside_non_full_scroll_region_touches_only_that_region() {
+        // RIのシフトも`[scroll_top, scroll_bottom]`に閉じている(region外の行は不変)。
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3(0-indexed)
+        feed(&mut t, b"\x1b[2;1H"); // カーソルを scroll_top(行1)へ
+        feed(&mut t, b"\x1bM"); // RI
+        assert_eq!(row_text(&t, 0), "L0abcd", "region上端より上は不変");
+        assert_eq!(row_text(&t, 1), "      ", "region上端が空行になる");
+        assert_eq!(row_text(&t, 2), "L1abcd");
+        assert_eq!(row_text(&t, 3), "L2abcd");
+        assert_eq!(row_text(&t, 4), "L4abcd", "region下端より下は不変(旧row3は破棄)");
+    }
+
+    #[test]
+    fn test_su_sd_inside_non_full_scroll_region_touch_only_that_region() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3
+        feed(&mut t, b"\x1b[1S"); // SU 1行
+        assert_eq!(row_text(&t, 0), "L0abcd", "region外(上)は不変");
+        assert_eq!(row_text(&t, 1), "L2abcd");
+        assert_eq!(row_text(&t, 2), "L3abcd");
+        assert_eq!(row_text(&t, 3), "      ", "region下端が空行");
+        assert_eq!(row_text(&t, 4), "L4abcd", "region外(下)は不変");
+        assert!(
+            t.take_scrollback().is_empty(),
+            "scroll_top != 0 のSUはscrollbackへ積まない(既存仕様)"
+        );
+
+        let mut t2 = filled_6x5();
+        feed(&mut t2, b"\x1b[2;4r");
+        feed(&mut t2, b"\x1b[1T"); // SD 1行
+        assert_eq!(row_text(&t2, 0), "L0abcd");
+        assert_eq!(row_text(&t2, 1), "      ", "region上端が空行");
+        assert_eq!(row_text(&t2, 2), "L1abcd");
+        assert_eq!(row_text(&t2, 3), "L2abcd");
+        assert_eq!(row_text(&t2, 4), "L4abcd");
+    }
+
+    #[test]
+    fn test_row_shift_preserves_wide_char_body_placeholder_pairing() {
+        // 行シフトは**行を丸ごと**動かすので、全角文字の本体セルと右隣の
+        // `is_wide_placeholder`は必ず同じ行に留まる(ICH/DCHのような行内シフトと
+        // 違い`sanitize_wide_row`が要らない理由。bulkコピー化で崩れていないことを固定)。
+        let mut t = Terminal::new(6, 4, Theme::default());
+        feed(&mut t, "あい\r\n".as_bytes());
+        feed(&mut t, b"plain2");
+        let wide_row_is_intact = |t: &Terminal, row: usize| {
+            let cols = t.cols();
+            let r = &t.screen_cells()[row * cols..(row + 1) * cols];
+            assert_eq!(r[0].ch.as_str(), "あ");
+            assert!(!r[0].is_wide_placeholder);
+            assert!(r[1].is_wide_placeholder, "全角1文字目の右隣はプレースホルダ");
+            assert_eq!(r[2].ch.as_str(), "い");
+            assert!(!r[2].is_wide_placeholder);
+            assert!(r[3].is_wide_placeholder, "全角2文字目の右隣はプレースホルダ");
+        };
+        wide_row_is_intact(&t, 0);
+
+        // 下方向シフト(SD)の後も対応関係が保たれる。
+        feed(&mut t, b"\x1b[1T");
+        wide_row_is_intact(&t, 1);
+        // 上方向シフト(SU)で元の位置へ戻しても同じ。
+        feed(&mut t, b"\x1b[1S");
+        wide_row_is_intact(&t, 0);
+    }
+
+    #[test]
+    fn test_su_sd_ri_blank_fill_uses_current_sgr_bg() {
+        // IL/DLについては`test_il_dl_blank_uses_current_sgr_bg`が固定済み。
+        // 共通化した`blank_rows`が同じく現在のSGR属性を引き継ぐことを、
+        // SU/SD/RIの3経路でも固定する。
+        let red_bg = Theme::default().ansi16[1];
+
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[41m\x1b[1S"); // 赤背景 + SU → 下端(行4)が空行
+        assert_eq!(t.screen_cells()[4 * 6].bg, red_bg, "SUの空行は現在のSGR背景色");
+
+        let mut t2 = filled_6x5();
+        feed(&mut t2, b"\x1b[41m\x1b[1T"); // SD → 上端(行0)が空行
+        assert_eq!(t2.screen_cells()[0].bg, red_bg, "SDの空行は現在のSGR背景色");
+
+        let mut t3 = filled_6x5();
+        feed(&mut t3, b"\x1b[1;1H\x1b[41m\x1bM"); // RI at scroll_top
+        assert_eq!(t3.screen_cells()[0].bg, red_bg, "RIの空行は現在のSGR背景色");
+    }
+
+    #[test]
+    fn test_shift_rows_helpers_direct_edge_cases() {
+        // ヘルパー自体の境界条件(エスケープシーケンス経由では作れないものを含む)。
+        // - `n == 0`は完全なno-op
+        // - `n >= 領域幅`は領域全体を空行にする(アンダーフローしない)
+        // - 1行だけの領域(DECSTBMは`top < bot`しか受け付けないので直接呼ぶ)
+        let mut t = filled_6x5();
+        t.shift_rows_up(1, 3, 0);
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "n==0のshift_rows_upはno-op");
+        }
+        t.shift_rows_down(1, 3, 0);
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "n==0のshift_rows_downはno-op");
+        }
+
+        let mut t2 = filled_6x5();
+        t2.shift_rows_up(1, 3, 99);
+        assert_eq!(row_text(&t2, 0), "L0abcd");
+        assert_eq!(row_text(&t2, 1), "      ");
+        assert_eq!(row_text(&t2, 2), "      ");
+        assert_eq!(row_text(&t2, 3), "      ");
+        assert_eq!(row_text(&t2, 4), "L4abcd");
+
+        let mut t3 = filled_6x5();
+        t3.shift_rows_down(1, 3, 99);
+        assert_eq!(row_text(&t3, 0), "L0abcd");
+        assert_eq!(row_text(&t3, 1), "      ");
+        assert_eq!(row_text(&t3, 2), "      ");
+        assert_eq!(row_text(&t3, 3), "      ");
+        assert_eq!(row_text(&t3, 4), "L4abcd");
+
+        // 1行だけの領域: シフト対象は0行、その1行が空行になるだけ。
+        let mut t4 = filled_6x5();
+        t4.shift_rows_down(2, 2, 1);
+        assert_eq!(row_text(&t4, 1), "L1abcd");
+        assert_eq!(row_text(&t4, 2), "      ");
+        assert_eq!(row_text(&t4, 3), "L3abcd");
+        let mut t5 = filled_6x5();
+        t5.shift_rows_up(2, 2, 1);
+        assert_eq!(row_text(&t5, 1), "L1abcd");
+        assert_eq!(row_text(&t5, 2), "      ");
+        assert_eq!(row_text(&t5, 3), "L3abcd");
+
+        // 不正な範囲(top > bot / bot が画面外)は防御的にno-op(panicしない)。
+        let mut t6 = filled_6x5();
+        t6.shift_rows_up(3, 1, 1);
+        t6.shift_rows_down(3, 1, 1);
+        t6.shift_rows_up(0, 99, 1);
+        t6.shift_rows_down(0, 99, 1);
+        for row in 0..5 {
+            assert_eq!(row_text(&t6, row), format!("L{row}abcd"), "不正範囲はno-op");
+        }
     }
 
     #[test]
@@ -6355,6 +6832,96 @@ mod tests {
         feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(?1049hが上書き保存した位置に復元)
         assert_eq!(t.cursor_row(), 1);
         assert_eq!(t.cursor_col(), 2);
+    }
+
+    // ── SavedCursorのcapture/apply共通化(Phase 2)の等価性 ─────────────
+    //
+    // DECSC/DECRC・`?1047`/`?1049`の4箇所に開き書きされていたカーソル保存/復元を
+    // `capture_cursor`/`apply_saved_cursor`へ統合した。「保存対象のフィールド集合が
+    // 4箇所で同一であること」と「意図的に残した3つの差分」をここで固定する。
+
+    #[test]
+    fn test_decsc_decrc_roundtrips_every_saved_cursor_field() {
+        // `SavedCursor`の6フィールド(row/col/attrs/g0/g1/gl_is_g1)が1回の
+        // DECSC→DECRCで**まとめて**往復することを固定する(1つでも
+        // `capture_cursor`/`apply_saved_cursor`から漏れれば落ちる)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H"); // row=2, col=4
+        feed(&mut t, b"\x1b[1;4;41m"); // bold + underline + 赤背景
+        feed(&mut t, b"\x1b(0"); // G0 = DEC Special Graphics
+        feed(&mut t, b"\x1b)0\x0e"); // G1 = DEC Special Graphics, SO で GL=G1
+        feed(&mut t, b"\x1b7"); // DECSC
+
+        // 保存後に全部を別の値へ動かす。
+        feed(&mut t, b"\x1b[1;1H\x1b[0m\x1b(B\x1b)B\x0f");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(!t.cur_attrs.bold && !t.gl_is_g1);
+
+        feed(&mut t, b"\x1b8"); // DECRC
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4), "位置が戻る");
+        assert!(t.cur_attrs.bold, "boldが戻る");
+        assert!(t.cur_attrs.underline, "underlineが戻る");
+        assert_eq!(t.cur_attrs.bg, Theme::default().ansi16[1], "背景色が戻る");
+        assert!(t.g0_charset == Charset::DecSpecialGraphics, "G0が戻る");
+        assert!(t.g1_charset == Charset::DecSpecialGraphics, "G1が戻る");
+        assert!(t.gl_is_g1, "GL(SI/SO)の選択状態が戻る");
+    }
+
+    #[test]
+    fn test_alt_screen_switch_saves_and_restores_the_same_field_set_as_decsc() {
+        // `?1049h`/`?1049l`の暗黙保存/復元も、DECSC/DECRCと**同じフィールド集合**を
+        // 対象にする(`capture_cursor`/`apply_saved_cursor`を共有している)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H");
+        feed(&mut t, b"\x1b[1;4;41m");
+        feed(&mut t, b"\x1b(0\x1b)0\x0e");
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(暗黙DECSC)
+        // alt画面側はフレッシュな既定から始まる。
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(!t.cur_attrs.bold);
+        assert!(t.g0_charset == Charset::Ascii && t.g1_charset == Charset::Ascii && !t.gl_is_g1);
+
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(暗黙DECRC)
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4));
+        assert!(t.cur_attrs.bold);
+        assert!(t.cur_attrs.underline);
+        assert_eq!(t.cur_attrs.bg, Theme::default().ansi16[1]);
+        assert!(t.g0_charset == Charset::DecSpecialGraphics);
+        assert!(t.g1_charset == Charset::DecSpecialGraphics);
+        assert!(t.gl_is_g1);
+    }
+
+    #[test]
+    fn test_decrc_does_not_consume_the_saved_slot() {
+        // 意図的な差分1: DECRCはスロットを`take`しない(何度でも同じ位置へ戻れる)。
+        // alt→main復帰(`switch_to_main`)側が`take`する既存挙動との非対称性は
+        // `test_naked_decrc_after_1049_exit_without_new_decsc_is_noop`が固定している。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b7"); // (2,4)を保存
+        feed(&mut t, b"\x1b[1;1H\x1b8");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4));
+        feed(&mut t, b"\x1b[1;1H\x1b8"); // 2回目のDECRCも同じ位置へ戻れる
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4), "DECRCのスロットは使い切りではない");
+    }
+
+    #[test]
+    fn test_decrc_clamps_restored_position_to_current_screen_size() {
+        // 意図的な差分2: DECRCだけが復元後に現在のcols/rowsへクランプする
+        // (`apply_saved_cursor`自体はクランプしない)。通常は
+        // `resize_preserving_state`が`saved_cursor_*`を追従更新するので到達
+        // しないが、多重の安全策としてこのクランプは残してある。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        t.saved_cursor_main = Some(SavedCursor {
+            row: 99,
+            col: 99,
+            attrs: t.cur_attrs,
+            g0: Charset::Ascii,
+            g1: Charset::Ascii,
+            gl_is_g1: false,
+        });
+        feed(&mut t, b"\x1b8"); // DECRC
+        assert_eq!(t.cursor_row(), 4, "行は rows-1 へクランプ");
+        assert_eq!(t.cursor_col(), 20, "列は cols ちょうど(遅延折り返し位置)まで許容");
     }
 
     #[test]
@@ -7422,6 +7989,23 @@ mod tests {
             feed(&mut t, b"\r\n");
         }
         assert!(t.images().is_empty(), "スクロールで既存の画像配置は消去される");
+    }
+
+    #[test]
+    fn test_ri_scroll_clears_sixel_images_like_its_siblings() {
+        // RI(`ESC M`)がscroll_top上でスクロールする経路も、SU/SD/IL/DLと同じく
+        // 画像配置を消す(Phase 2で判明した抜け)。カーソル移動だけで済む
+        // 通常のRIは画面内容を動かさないので消さない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1b[5;1H"); // scroll_top(行0)ではない位置へ
+        feed(&mut t, b"\x1bM"); // RI: カーソルが上へ動くだけ
+        assert_eq!(t.cursor_row(), 3);
+        assert_eq!(t.images().len(), 1, "スクロールしないRIでは画像を消さない");
+        feed(&mut t, b"\x1b[1;1H"); // scroll_top へ
+        feed(&mut t, b"\x1bM"); // RI: 領域内シフトが起きる
+        assert!(t.images().is_empty(), "RIによるスクロールでも画像配置は消去される");
     }
 
     #[test]
