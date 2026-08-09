@@ -130,6 +130,18 @@ pub(crate) fn next_arg(
         .ok_or_else(|| format!("isekai-pipe {command}: {flag} requires a value"))
 }
 
+/// Prints `e` and converts it into the `EX_USAGE` exit code — the same
+/// `.map_err(|e| { eprintln!("{e}"); ExitCode::from(EX_USAGE) })?` four-liner
+/// used to be repeated at every `next_arg(...)`/simple-validation call site
+/// across ctl.rs/connect.rs/main.rs/ctl_file.rs/probe.rs/inspect.rs (30+
+/// occurrences); most of them just need `.map_err(usage_err)?` now. Call
+/// sites whose error message needs more than `{e}` alone (a custom prefix,
+/// extra context) still write their own `map_err` closure.
+pub(crate) fn usage_err(e: impl std::fmt::Display) -> ExitCode {
+    eprintln!("{e}");
+    ExitCode::from(EX_USAGE)
+}
+
 fn validate_connect_service(value: &str) -> Result<ServiceSpec, ExitCode> {
     let spec = ServiceSpec::new(isekai_pipe_core::ServiceName::new(value), "legacy-connect")
         .map_err(|e| {
@@ -208,20 +220,14 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 return Ok(None);
             }
             "--profile" => {
-                let value = next_arg("connect", &mut iter, "--profile").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, "--profile").map_err(usage_err)?;
                 if profile.replace(value).is_some() {
                     eprintln!("isekai-pipe connect: only one --profile is supported");
                     return Err(ExitCode::from(EX_USAGE));
                 }
             }
             "--service" => {
-                let value = next_arg("connect", &mut iter, "--service").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, "--service").map_err(usage_err)?;
                 let spec = validate_connect_service(&value)?;
                 if service.replace(spec).is_some() {
                     eprintln!("isekai-pipe connect: only one --service is supported");
@@ -230,10 +236,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
             }
             "--stdio" => stdio = true,
             "--mode" => {
-                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, &arg).map_err(usage_err)?;
                 mode = match value.as_str() {
                     "relay" => ConnectMode::Relay,
                     "stun" => ConnectMode::Stun,
@@ -244,16 +247,10 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 };
             }
             "--stun-server" => {
-                stun_servers.push(next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                stun_servers.push(next_arg("connect", &mut iter, &arg).map_err(usage_err)?);
             }
             "--resume-window" => {
-                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, &arg).map_err(usage_err)?;
                 let secs: u64 = value.parse().map_err(|_| {
                     eprintln!("isekai-pipe connect: --resume-window must be a number of seconds");
                     ExitCode::from(EX_USAGE)
@@ -262,20 +259,14 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
             }
             "--experimental-network-rebind" => experimental_network_rebind = true,
             "--relay-transport" => {
-                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, &arg).map_err(usage_err)?;
                 relay_transport = value.parse().map_err(|e| {
                     eprintln!("isekai-pipe connect: {e}");
                     ExitCode::from(EX_USAGE)
                 })?;
             }
             "--bind-port-range" => {
-                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, &arg).map_err(usage_err)?;
                 let (start, end) = value.split_once('-').ok_or_else(|| {
                     eprintln!("isekai-pipe connect: invalid --bind-port-range value {value:?} (expected <START>-<END>)");
                     ExitCode::from(EX_USAGE)
@@ -294,10 +285,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 bind_port_range = Some((start, end));
             }
             "--tethering-interface" => {
-                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("connect", &mut iter, &arg).map_err(usage_err)?;
                 if tethering_interface.replace(value).is_some() {
                     eprintln!("isekai-pipe connect: only one --tethering-interface is supported");
                     return Err(ExitCode::from(EX_USAGE));

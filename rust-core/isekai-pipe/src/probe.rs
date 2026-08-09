@@ -15,7 +15,7 @@ use isekai_transport::{
 };
 use std::process::ExitCode;
 
-use crate::connect::{decode_secret, next_arg};
+use crate::connect::{decode_secret, next_arg, usage_err};
 use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const PROBE_SCHEMA_VERSION: u32 = 1;
@@ -222,20 +222,14 @@ fn parse_probe(args: impl Iterator<Item = String>) -> Result<Option<ProbeLaunch>
                 return Ok(None);
             }
             "--profile" => {
-                let value = next_arg("probe", &mut iter, "--profile").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("probe", &mut iter, "--profile").map_err(usage_err)?;
                 if profile.replace(value).is_some() {
                     eprintln!("isekai-pipe probe: only one --profile is supported");
                     return Err(ExitCode::from(EX_USAGE));
                 }
             }
             "--stun-server" => {
-                stun_servers.push(next_arg("probe", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                stun_servers.push(next_arg("probe", &mut iter, &arg).map_err(usage_err)?);
             }
             "--json" => json = true,
             other if other.starts_with('-') => {

@@ -24,7 +24,7 @@ use tokio::net::unix::OwnedReadHalf;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::connect::next_arg;
+use crate::connect::{next_arg, usage_err};
 use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
@@ -218,10 +218,7 @@ fn parse_ctl_title(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl title", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl title", &mut args, "--sock").map_err(usage_err)?);
             }
             other if value.is_none() => value = Some(other.to_string()),
             other => {
@@ -247,16 +244,10 @@ fn parse_ctl_tab_color(mut args: impl Iterator<Item = String>) -> Result<Option<
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl tab-color", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl tab-color", &mut args, "--sock").map_err(usage_err)?);
             }
             other if color.is_none() => {
-                color = Some(parse_hex_color(other).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                color = Some(parse_hex_color(other).map_err(usage_err)?);
             }
             other => {
                 eprintln!("isekai-pipe ctl tab-color: unexpected extra argument {other:?}");
@@ -281,16 +272,10 @@ fn parse_ctl_progress(mut args: impl Iterator<Item = String>) -> Result<Option<C
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl progress", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl progress", &mut args, "--sock").map_err(usage_err)?);
             }
             other if state.is_none() => {
-                state = Some(parse_progress_state(other).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                state = Some(parse_progress_state(other).map_err(usage_err)?);
             }
             other => match other.parse::<u16>() {
                 Ok(n) if n <= 100 => progress = n as u8,
@@ -319,20 +304,11 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--sock" => {
-                        sock = Some(next_arg("ctl clip push", &mut args, "--sock").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        sock = Some(next_arg("ctl clip push", &mut args, "--sock").map_err(usage_err)?);
                     }
                     "--mime" => {
-                        let value = next_arg("ctl clip push", &mut args, "--mime").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?;
-                        mime = Some(parse_mime(&value).map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        let value = next_arg("ctl clip push", &mut args, "--mime").map_err(usage_err)?;
+                        mime = Some(parse_mime(&value).map_err(usage_err)?);
                     }
                     other => {
                         eprintln!("isekai-pipe ctl clip push: unknown argument {other:?}");
@@ -351,10 +327,7 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--sock" => {
-                        sock = Some(next_arg("ctl clip pull", &mut args, "--sock").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        sock = Some(next_arg("ctl clip pull", &mut args, "--sock").map_err(usage_err)?);
                     }
                     other => {
                         eprintln!("isekai-pipe ctl clip pull: unknown argument {other:?}");
@@ -440,20 +413,11 @@ fn parse_ctl_setvar(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl setvar", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl setvar", &mut args, "--sock").map_err(usage_err)?);
             }
             "--scope" => {
-                let raw = next_arg("ctl setvar", &mut args, "--scope").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                scope = Some(parse_var_scope(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl setvar", &mut args, "--scope").map_err(usage_err)?;
+                scope = Some(parse_var_scope(&raw).map_err(usage_err)?);
             }
             other if key.is_none() => key = Some(other.to_string()),
             other if value.is_none() => value = Some(other.to_string()),
@@ -481,20 +445,11 @@ fn parse_ctl_getvar(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl getvar", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl getvar", &mut args, "--sock").map_err(usage_err)?);
             }
             "--scope" => {
-                let raw = next_arg("ctl getvar", &mut args, "--scope").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                scope = Some(parse_var_scope(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl getvar", &mut args, "--scope").map_err(usage_err)?;
+                scope = Some(parse_var_scope(&raw).map_err(usage_err)?);
             }
             other if key.is_none() => key = Some(other.to_string()),
             other => {
@@ -525,32 +480,17 @@ fn parse_ctl_notify(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl notify", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl notify", &mut args, "--sock").map_err(usage_err)?);
             }
             "--kind" => {
-                let raw = next_arg("ctl notify", &mut args, "--kind").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                kind = Some(parse_notify_kind(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl notify", &mut args, "--kind").map_err(usage_err)?;
+                kind = Some(parse_notify_kind(&raw).map_err(usage_err)?);
             }
             "--tag" => {
-                tmux_tag = Some(next_arg("ctl notify", &mut args, "--tag").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                tmux_tag = Some(next_arg("ctl notify", &mut args, "--tag").map_err(usage_err)?);
             }
             "--seq" => {
-                let value = next_arg("ctl notify", &mut args, "--seq").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("ctl notify", &mut args, "--seq").map_err(usage_err)?;
                 seq = Some(value.parse::<u64>().map_err(|_| {
                     eprintln!("isekai-pipe ctl notify: --seq must be a non-negative integer, got {value:?}");
                     ExitCode::from(EX_USAGE)
@@ -600,10 +540,7 @@ fn parse_ctl_build(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl build", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl build", &mut args, "--sock").map_err(usage_err)?);
             }
             other if profile.is_none() => profile = Some(other.to_string()),
             other => {

@@ -43,7 +43,7 @@ use std::process::ExitCode;
 use base64::Engine as _;
 use serde::Serialize;
 
-use crate::connect::next_arg;
+use crate::connect::{next_arg, usage_err};
 use crate::{EX_IOERR, EX_USAGE};
 
 /// Cap on the number of bytes a single `file cat` call reads, regardless of
@@ -250,17 +250,11 @@ fn parse_file(mut args: impl Iterator<Item = String>) -> Result<Option<FileLaunc
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--offset" => {
-                        let raw = next_arg("file cat", &mut args, "--offset").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?;
+                        let raw = next_arg("file cat", &mut args, "--offset").map_err(usage_err)?;
                         offset = parse_u64("cat", "--offset", &raw)?;
                     }
                     "--length" => {
-                        let raw = next_arg("file cat", &mut args, "--length").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?;
+                        let raw = next_arg("file cat", &mut args, "--length").map_err(usage_err)?;
                         length = Some(parse_u64("cat", "--length", &raw)?);
                     }
                     other if path.is_none() => path = Some(other.to_string()),

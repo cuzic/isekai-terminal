@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use isekai_pipe_core::{default_profiles_dir, load_persistent_profile};
 use std::process::ExitCode;
 
-use crate::connect::next_arg;
+use crate::connect::{next_arg, usage_err};
 use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const INSPECT_SCHEMA_VERSION: u32 = 1;
@@ -39,10 +39,7 @@ fn parse_inspect(args: impl Iterator<Item = String>) -> Result<Option<InspectLau
                 return Ok(None);
             }
             "--profile" => {
-                let value = next_arg("inspect", &mut iter, "--profile").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("inspect", &mut iter, "--profile").map_err(usage_err)?;
                 if profile.replace(value).is_some() {
                     eprintln!("isekai-pipe inspect: only one --profile is supported");
                     return Err(ExitCode::from(EX_USAGE));
