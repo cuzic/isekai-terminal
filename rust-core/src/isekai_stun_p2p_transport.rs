@@ -32,15 +32,10 @@ use base64::Engine as _;
 use log::{info, warn};
 use russh::client;
 
-use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
-use crate::isekai_pipe_quic_transport::{
-    self, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION,
-};
+use crate::helper_bootstrap::{IsekaiPipeHandshake, IsekaiPipeP2pMode};
+use crate::isekai_pipe_quic_transport;
 use crate::resume_client;
-use crate::transport::{
-    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
-    TransportCommand, TransportEvent,
-};
+use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
 use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
@@ -211,11 +206,10 @@ async fn try_connect_isekai_stun_p2p(
 }
 
 /// ProxyJump対応のSSH接続を張り、`--stun-server`/`--punch-peer`付きでisekai-helperを
-/// ブートストラップ起動する。`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`と
-/// ほぼ同じ処理だが、STUN関連の2引数を渡す点のみ異なるため、コード共有はせず
-/// そのまま複製している（呼び出し元の型(`IsekaiStunP2pConfig`/`IsekaiPipeQuicConfig`)が
-/// 異なり、関数抽出すると引数が増えて可読性が落ちるため）。ホスト鍵検証ループ
-/// (`spawn_bootstrap_host_key_forwarder`)自体は共有する。
+/// ブートストラップ起動する。WU-R1(rust-core cleanup)以前は
+/// `isekai_pipe_quic_transport::bootstrap_helper_via_ssh`をそのまま複製していたが、
+/// 同関数に`stun_servers`引数を足したことで薄いラッパーに縮小した。ホスト鍵検証ループ
+/// (`spawn_bootstrap_host_key_forwarder`)自体は元々共有していた。
 async fn bootstrap_via_ssh_with_punch(
     config: &IsekaiStunP2pConfig,
     stun_server: SocketAddr,
@@ -223,35 +217,11 @@ async fn bootstrap_via_ssh_with_punch(
     stun_servers: &[SocketAddr],
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<IsekaiPipeHandshake, String> {
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
-    spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
-
-    let russh_config = Arc::new(client::Config::default());
-    let mut established = connect_via_jump_or_direct(
-        &config.jump, russh_config, &config.ssh_host, config.ssh_port, event_tx,
-    )
-    .await
-    .map_err(|e| format!("bootstrap SSH connect failed: {e}"))?;
-
-    let (authenticated, _) =
-        authenticate_session(&mut established.handle, &config.username, &config.auth).await;
-    if !authenticated {
-        return Err("bootstrap SSH authentication failed".to_string());
-    }
-
-    let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
     let p2p_mode = IsekaiPipeP2pMode::Stun { stun_server, punch_peer: Some(punch_peer) };
-    helper_bootstrap::ensure_helper_running(
-        &mut established.handle,
-        &binaries,
-        ISEKAI_PIPE_VERSION,
-        "127.0.0.1:22",
-        None,
-        &p2p_mode,
-        stun_servers,
-    )
-    .await
-    .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
+    isekai_pipe_quic_transport::bootstrap_helper_via_ssh(
+        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
+        None, &p2p_mode, stun_servers, host_key_callback,
+    ).await
 }
 
 // ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────

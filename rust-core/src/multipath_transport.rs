@@ -949,7 +949,7 @@ async fn try_connect_multipath(
     let rebind_callback = host_key_callback.clone();
     let handshake = isekai_pipe_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
-        &crate::helper_bootstrap::IsekaiPipeP2pMode::None, host_key_callback,
+        &crate::helper_bootstrap::IsekaiPipeP2pMode::None, &[], host_key_callback,
     )
     .await?;
 

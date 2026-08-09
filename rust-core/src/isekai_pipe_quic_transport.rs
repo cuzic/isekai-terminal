@@ -56,7 +56,12 @@ const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 // （ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照）。ATTACH v2 のフレーム
 // 定数・codec は各ファイルが直接 `isekai_protocol::attach` から import する（HELLO/ACK
 // v1 のフレーム定数はサーバー側で撤去されたため re-export しない）。
-pub(crate) use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+pub(crate) use isekai_protocol::hello::EXPORTER_LABEL;
+// `ALPN`は非testビルドではこのモジュール外に消費者が居ない
+// (`multipath_transport.rs`の唯一の参照元は`#[cfg(test)] mod tests`)ため、
+// re-export自体もcfg(test)にして通常ビルドのunused importを避ける。
+#[cfg(test)]
+pub(crate) use isekai_protocol::hello::ALPN;
 
 /// `isekai-pipe/Cargo.toml` の version と一致させる（`isekai-pipe --version` の出力に
 /// この文字列が部分一致することを`check_existing_version`が確認する）。バージョン
@@ -208,7 +213,7 @@ async fn bootstrap_via_ssh(
 ) -> Result<IsekaiPipeHandshake, String> {
     bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
-        config.bind_port, &IsekaiPipeP2pMode::None, host_key_callback,
+        config.bind_port, &IsekaiPipeP2pMode::None, &[], host_key_callback,
     ).await
 }
 
@@ -262,6 +267,15 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 /// (`isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`)専用。他の呼び出し元は
 /// 常に `&IsekaiPipeP2pMode::None` を渡す。
 ///
+/// `stun_servers`: `p2p_mode`が`Stun`のときにclient_candidates(自クライアント側の追加STUN
+/// 観測)へ渡すSTUNサーバー一覧(`isekai_stun_p2p_transport.rs`専用)。それ以外の呼び出し元は
+/// STUN観測自体を行わないため常に`&[]`を渡す(`--bootstrap-request-file`封筒自体は一貫して
+/// 送る。isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。WU-R1(rust-core cleanup)
+/// 以前は、この差分だけを理由に`isekai_stun_p2p_transport::bootstrap_via_ssh_with_punch`/
+/// `isekai_link_relay_transport::bootstrap_via_ssh_with_relay`としてこの関数全体を複製して
+/// いたが、複製する理由(「引数が増えて可読性が落ちる」)は`p2p_mode`引数を追加した時点で
+/// 既に成立しなくなっていたため、この引数を足して複製を解消した。
+///
 /// `host_key_callback`: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵を、
 /// 本セッションと同じ known_hosts エントリ(Kotlin 側 `KnownHostRepository`)で検証する
 /// ための callback。呼び出し元は `SessionCore::callback()` から取得したものをそのまま
@@ -274,6 +288,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     jump: &Option<JumpConfig>,
     bind_port: Option<u16>,
     p2p_mode: &IsekaiPipeP2pMode,
+    stun_servers: &[SocketAddr],
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<IsekaiPipeHandshake, String> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
@@ -290,11 +305,8 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     }
 
     let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
-    // このtransportにはSTUNサーバー設定が無いため常に空スライス
-    // (client_candidatesは付かないが、`--bootstrap-request-file`封筒自体は
-    // 一貫して送る。isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。
     helper_bootstrap::ensure_helper_running(
-        &mut established.handle, &binaries, ISEKAI_PIPE_VERSION, "127.0.0.1:22", bind_port, p2p_mode, &[],
+        &mut established.handle, &binaries, ISEKAI_PIPE_VERSION, "127.0.0.1:22", bind_port, p2p_mode, stun_servers,
     )
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
