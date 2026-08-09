@@ -17,8 +17,8 @@
 //! `archive/ISEKAI_SSH_DESIGN.md`'s "配布対象プラットフォーム" note that only Linux
 //! is targeted today.
 
+#[cfg(test)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -38,20 +38,13 @@ pub const SSH_HOST_KEY_TRUST_STORE_FILE_NAME: &str = "known_ssh_hosts.toml";
 const SSH_HOST_KEY_TRUST_STORE_LOCK_KEY: &str = "known_ssh_hosts";
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
-/// `archive/ISEKAI_SSH_DESIGN.md`). Resolves the home directory via
-/// `isekai_fs_guard::resolve_home_dir` (`$HOME`, falling back to
-/// `%USERPROFILE%` on Windows where `HOME` isn't reliably set).
+/// `archive/ISEKAI_SSH_DESIGN.md`). Delegates to
+/// `isekai_fs_guard::resolve_config_dir` (`$HOME`, falling back to
+/// `%USERPROFILE%` on Windows where `HOME` isn't reliably set) — the same
+/// join `isekai-auth::file_provider::default_config_dir` resolves, moved to
+/// the shared crate (WU-M3) since both used to carry an identical copy.
 pub fn default_config_dir() -> Result<PathBuf, TrustError> {
-    let home = isekai_fs_guard::resolve_home_dir().ok_or(TrustError::NoHomeDir)?;
-    Ok(config_dir_from_home(&home))
-}
-
-/// Pure helper split out of `default_config_dir` so the path-joining logic
-/// can be unit-tested without mutating the process-wide `HOME` env var
-/// (`std::env::set_var` is process-global and not safe to toggle from
-/// concurrently-running tests).
-fn config_dir_from_home(home: &Path) -> PathBuf {
-    home.join(".config").join(CONFIG_DIR_NAME)
+    Ok(isekai_fs_guard::resolve_config_dir(CONFIG_DIR_NAME)?)
 }
 
 /// `~/.config/isekai-ssh/known_helpers.toml`.
@@ -112,7 +105,9 @@ pub fn with_locked_ssh_host_key_trust_store<T>(
     path: &Path,
     f: impl FnOnce(&mut SshHostKeyTrustStore) -> Result<T, TrustError>,
 ) -> Result<T, TrustError> {
-    let dir = path.parent().ok_or_else(|| TrustError::NoParentDir { path: path.to_path_buf() })?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| isekai_fs_guard::FsGuardErrorAt::NoParentDir { path: path.to_path_buf() })?;
     // Must run before `with_exclusive_lock`, not after: that call's own
     // `fs::create_dir_all(dir)` (needed so the `<key>.lock` file itself has
     // somewhere to live) would otherwise create a fresh `dir` with
@@ -122,7 +117,7 @@ pub fn with_locked_ssh_host_key_trust_store<T>(
     // check, not a world-*readable* one, so the "new directories are
     // created private" invariant would silently break for exactly the case
     // this function exists to protect (Codex review finding).
-    ensure_private_dir(dir)?;
+    isekai_fs_guard::ensure_private_dir_checked(dir)?;
     let outcome = isekai_fs_guard::with_exclusive_lock(dir, SSH_HOST_KEY_TRUST_STORE_LOCK_KEY, || -> Result<T, TrustError> {
         let mut store = load_toml_store::<SshHostKeyTrustStore>(path)?;
         let before = store.clone();
@@ -151,73 +146,24 @@ pub fn with_locked_ssh_host_key_trust_store<T>(
 /// regardless of which store type `T` is, since both are separate files
 /// under the same `~/.config/isekai-ssh` directory with the same threat
 /// model (a world-writable file/dir means someone other than the owner
-/// could plant trust entries).
+/// could plant trust entries). The permission-checked read itself is
+/// `isekai_fs_guard::read_checked`, shared with `isekai-auth`'s token file
+/// (WU-M3).
 fn load_toml_store<T: Default + DeserializeOwned>(path: &Path) -> Result<T, TrustError> {
-    if let Some(parent) = path.parent() {
-        if parent.exists() {
-            check_not_world_writable(parent)?;
-        }
-    }
-
-    if !path.exists() {
+    let Some(content) = isekai_fs_guard::read_checked(path)? else {
         return Ok(T::default());
-    }
-    check_not_world_writable(path)?;
-
-    let content =
-        fs::read_to_string(path).map_err(|e| TrustError::Read { path: path.to_path_buf(), source: e })?;
+    };
     let store: T = toml::from_str(&content)
         .map_err(|e| TrustError::Parse { path: path.to_path_buf(), source: Box::new(e) })?;
     Ok(store)
 }
 
 /// Generic save shared by [`save_trust_store`]/[`save_ssh_host_key_trust_store`].
+/// The atomic-write body itself is `isekai_fs_guard::write_private_atomically`,
+/// shared with `isekai-auth`'s token file (WU-M3).
 fn save_toml_store<T: Serialize>(path: &Path, store: &T) -> Result<(), TrustError> {
-    let parent = path.parent().ok_or_else(|| TrustError::NoParentDir { path: path.to_path_buf() })?;
-    ensure_private_dir(parent)?;
-
     let serialized = toml::to_string_pretty(store)?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| TrustError::Write { path: path.to_path_buf(), source: e })?;
-    set_private_file_permissions(tmp.path())?;
-    tmp.write_all(serialized.as_bytes())
-        .and_then(|_| tmp.flush())
-        .map_err(|e| TrustError::Write { path: path.to_path_buf(), source: e })?;
-
-    tmp.persist(path).map_err(|e| TrustError::Write { path: path.to_path_buf(), source: e.error })?;
-    Ok(())
-}
-
-/// Translates a `FsGuardError` (path-less by design, see its docs) into this
-/// crate's own `TrustError`, attaching `path` back.
-fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> TrustError {
-    use isekai_fs_guard::FsGuardError;
-    match err {
-        FsGuardError::CreateDir(source) => TrustError::CreateDir { path: path.to_path_buf(), source },
-        FsGuardError::Stat(source) => TrustError::Stat { path: path.to_path_buf(), source },
-        FsGuardError::SetPermissions(source) => TrustError::Write { path: path.to_path_buf(), source },
-        FsGuardError::WorldWritable { mode } => TrustError::WorldWritable { path: path.to_path_buf(), mode },
-        FsGuardError::InsecureAcl { principal, rights } => {
-            TrustError::InsecureAcl { path: path.to_path_buf(), principal, rights }
-        }
-    }
-}
-
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
-fn ensure_private_dir(dir: &Path) -> Result<(), TrustError> {
-    isekai_fs_guard::ensure_private_dir(dir).map_err(|e| map_fs_guard_err(dir, e))
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), TrustError> {
-    isekai_fs_guard::set_private_file_permissions(path).map_err(|e| map_fs_guard_err(path, e))
-}
-
-/// Fails closed if `path` is writable by users other than its owner
-/// (mode bit `0o002`). Unix-only; a no-op elsewhere.
-fn check_not_world_writable(path: &Path) -> Result<(), TrustError> {
-    isekai_fs_guard::check_not_world_writable(path).map_err(|e| map_fs_guard_err(path, e))
+    Ok(isekai_fs_guard::write_private_atomically(path, serialized.as_bytes())?)
 }
 
 #[cfg(test)]
@@ -317,7 +263,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
 
         let err = load_trust_store(&path).unwrap_err();
-        assert!(matches!(err, TrustError::WorldWritable { .. }));
+        assert!(matches!(
+            err,
+            TrustError::FsGuard(isekai_fs_guard::FsGuardErrorAt::WorldWritable { .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -333,7 +282,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let err = load_trust_store(&path).unwrap_err();
-        assert!(matches!(err, TrustError::WorldWritable { .. }));
+        assert!(matches!(
+            err,
+            TrustError::FsGuard(isekai_fs_guard::FsGuardErrorAt::WorldWritable { .. })
+        ));
     }
 
     #[test]
@@ -375,11 +327,9 @@ last_seen_at = "2026-07-04T00:00:00Z"
         assert!(matches!(err, TrustError::Parse { .. }));
     }
 
-    #[test]
-    fn config_dir_is_joined_under_home() {
-        let home = Path::new("/home/example-user");
-        assert_eq!(config_dir_from_home(home), home.join(".config").join("isekai-ssh"));
-    }
+    // `config_dir_from_home`'s own join logic is now
+    // `isekai_fs_guard::config_dir_from_home` — see that crate's
+    // `config_dir_is_joined_under_home` test instead.
 
     #[test]
     fn ssh_host_key_trust_store_round_trips_through_save_and_load() {
@@ -443,8 +393,7 @@ last_seen_at = "2026-07-04T00:00:00Z"
         // when rooted at the same config directory — that's the whole
         // point of keeping them as separate files (schema.rs docs).
         assert_ne!(TRUST_STORE_FILE_NAME, SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
-        let home = Path::new("/home/example-user");
-        let config_dir = config_dir_from_home(home);
+        let config_dir = Path::new("/home/example-user").join(".config").join(CONFIG_DIR_NAME);
         assert_ne!(
             config_dir.join(TRUST_STORE_FILE_NAME),
             config_dir.join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME)

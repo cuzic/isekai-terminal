@@ -5,6 +5,14 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# FsGuardErrorAt (resolve_config_dir/read_checked/write_private_atomically's
+# shared, path-attached error type — WU-M3 isekai-trust/isekai-auth
+# consolidation).
+thiserror = "2.0.18"
+# write_private_atomically's atomic temp-file-then-rename body, moved here
+# from isekai-trust/isekai-auth (which used to each depend on this directly
+# for the exact same NamedTempFile::new_in-based sequence).
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # with_exclusive_lock's Unix backend (flock(2)). Same crate+version
@@ -24,6 +32,3 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-tempfile = "3"

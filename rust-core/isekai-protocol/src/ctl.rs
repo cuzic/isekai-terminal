@@ -408,21 +408,7 @@ pub fn decode_ctl_message(bytes: &[u8]) -> Result<CtlMessage, ProtocolError> {
 
 pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
     match msg {
-        CtlMessage::SetTitle { value } => {
-            if value.is_empty() {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "value",
-                    reason: "must be non-empty".to_string(),
-                });
-            }
-            if value.len() > MAX_TITLE_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "value",
-                    reason: format!("is {} bytes, exceeding the {MAX_TITLE_LEN} byte limit", value.len()),
-                });
-            }
-            Ok(())
-        }
+        CtlMessage::SetTitle { value } => non_empty_bounded("value", value, MAX_TITLE_LEN),
         // r/g/b are u8, already bounded to 0..=255 by the type itself.
         CtlMessage::SetTabColor { .. } => Ok(()),
         CtlMessage::SetProgress { progress, .. } => {
@@ -436,105 +422,34 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
         }
         CtlMessage::ClipboardPush { mime, data_b64 }
         | CtlMessage::ClipboardPullResponse { mime, data_b64 } => {
-            validate_clipboard_payload(*mime, data_b64)
+            bounded_b64("data_b64", data_b64, mime.max_decoded_len())
         }
         CtlMessage::ClipboardPullRequest {} => Ok(()),
         // kindがtmux由来かAI/汎用かで検証対象フィールドを切り替える
         // (`NotifyKind`/`CtlMessage::Notify`のdocコメント参照、統合の経緯)。
         CtlMessage::Notify { kind, tmux_tag, title, body, .. } => match kind {
             NotifyKind::Bell | NotifyKind::Activity | NotifyKind::Silence | NotifyKind::JobDone => {
-                validate_notify_tag(tmux_tag)
+                non_empty_bounded("tmux_tag", tmux_tag, MAX_NOTIFY_TAG_LEN)
             }
             NotifyKind::Waiting | NotifyKind::Done | NotifyKind::Info => {
-                if title.is_empty() {
-                    return Err(ProtocolError::CtlMessageField {
-                        field: "title",
-                        reason: "must be non-empty".to_string(),
-                    });
-                }
-                if title.len() > MAX_NOTIFY_TITLE_LEN {
-                    return Err(ProtocolError::CtlMessageField {
-                        field: "title",
-                        reason: format!(
-                            "is {} bytes, exceeding the {MAX_NOTIFY_TITLE_LEN} byte limit",
-                            title.len()
-                        ),
-                    });
-                }
-                if body.len() > MAX_NOTIFY_BODY_LEN {
-                    return Err(ProtocolError::CtlMessageField {
-                        field: "body",
-                        reason: format!(
-                            "is {} bytes, exceeding the {MAX_NOTIFY_BODY_LEN} byte limit",
-                            body.len()
-                        ),
-                    });
-                }
-                Ok(())
+                non_empty_bounded("title", title, MAX_NOTIFY_TITLE_LEN)?;
+                bounded("body", body, MAX_NOTIFY_BODY_LEN)
             }
         },
         CtlMessage::SetVar { key, value, .. } => {
-            validate_var_key(key)?;
-            if value.len() > MAX_VAR_VALUE_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "value",
-                    reason: format!(
-                        "is {} bytes, exceeding the {MAX_VAR_VALUE_LEN} byte limit",
-                        value.len()
-                    ),
-                });
-            }
-            Ok(())
+            non_empty_bounded("key", key, MAX_VAR_KEY_LEN)?;
+            bounded("value", value, MAX_VAR_VALUE_LEN)
         }
-        CtlMessage::GetVarRequest { key, .. } => validate_var_key(key),
-        CtlMessage::GetVarResponse { value } => {
-            if let Some(value) = value {
-                if value.len() > MAX_VAR_VALUE_LEN {
-                    return Err(ProtocolError::CtlMessageField {
-                        field: "value",
-                        reason: format!(
-                            "is {} bytes, exceeding the {MAX_VAR_VALUE_LEN} byte limit",
-                            value.len()
-                        ),
-                    });
-                }
-            }
-            Ok(())
-        }
+        CtlMessage::GetVarRequest { key, .. } => non_empty_bounded("key", key, MAX_VAR_KEY_LEN),
+        CtlMessage::GetVarResponse { value } => match value {
+            Some(value) => bounded("value", value, MAX_VAR_VALUE_LEN),
+            None => Ok(()),
+        },
         CtlMessage::BuildRequest { profile } => {
-            if profile.is_empty() {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "profile",
-                    reason: "must be non-empty".to_string(),
-                });
-            }
-            if profile.len() > MAX_BUILD_PROFILE_NAME_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "profile",
-                    reason: format!(
-                        "is {} bytes, exceeding the {MAX_BUILD_PROFILE_NAME_LEN} byte limit",
-                        profile.len()
-                    ),
-                });
-            }
-            Ok(())
+            non_empty_bounded("profile", profile, MAX_BUILD_PROFILE_NAME_LEN)
         }
         CtlMessage::BuildOutputChunk { data_b64, .. } => {
-            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
-                .map_err(|e| ProtocolError::CtlMessageField {
-                    field: "data_b64",
-                    reason: e.to_string(),
-                })?;
-            if decoded.len() > MAX_BUILD_CHUNK_DECODED_LEN {
-                return Err(ProtocolError::CtlMessageField {
-                    field: "data_b64",
-                    reason: format!(
-                        "decodes to {} bytes, exceeding the {MAX_BUILD_CHUNK_DECODED_LEN} byte limit",
-                        decoded.len()
-                    ),
-                });
-            }
-            Ok(())
+            bounded_b64("data_b64", data_b64, MAX_BUILD_CHUNK_DECODED_LEN)
         }
         CtlMessage::BuildFinished { result_paths, .. } => {
             if result_paths.len() > MAX_BUILD_RESULT_PATHS {
@@ -547,70 +462,45 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
                 });
             }
             for path in result_paths {
-                if path.len() > MAX_BUILD_RESULT_PATH_LEN {
-                    return Err(ProtocolError::CtlMessageField {
-                        field: "result_paths",
-                        reason: format!(
-                            "entry is {} bytes, exceeding the {MAX_BUILD_RESULT_PATH_LEN} byte limit",
-                            path.len()
-                        ),
-                    });
-                }
+                bounded("result_paths", path, MAX_BUILD_RESULT_PATH_LEN)?;
             }
             Ok(())
         }
     }
 }
 
-fn validate_var_key(key: &str) -> Result<(), ProtocolError> {
-    if key.is_empty() {
+/// Rejects `value` if it exceeds `max` bytes. No emptiness requirement —
+/// callers that also require non-empty use [`non_empty_bounded`].
+fn bounded(field: &'static str, value: &str, max: usize) -> Result<(), ProtocolError> {
+    if value.len() > max {
         return Err(ProtocolError::CtlMessageField {
-            field: "key",
-            reason: "must be non-empty".to_string(),
-        });
-    }
-    if key.len() > MAX_VAR_KEY_LEN {
-        return Err(ProtocolError::CtlMessageField {
-            field: "key",
-            reason: format!("is {} bytes, exceeding the {MAX_VAR_KEY_LEN} byte limit", key.len()),
+            field,
+            reason: format!("is {} bytes, exceeding the {max} byte limit", value.len()),
         });
     }
     Ok(())
 }
 
-fn validate_clipboard_payload(mime: ClipboardMime, data_b64: &str) -> Result<(), ProtocolError> {
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
-        .map_err(|e| ProtocolError::CtlMessageField {
-            field: "data_b64",
-            reason: e.to_string(),
-        })?;
-    let max = mime.max_decoded_len();
+/// Same as [`bounded`], but also rejects an empty `value`.
+fn non_empty_bounded(field: &'static str, value: &str, max: usize) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Err(ProtocolError::CtlMessageField {
+            field,
+            reason: "must be non-empty".to_string(),
+        });
+    }
+    bounded(field, value, max)
+}
+
+/// Base64-decodes `value` and rejects it if the *decoded* length exceeds
+/// `max` bytes.
+fn bounded_b64(field: &'static str, value: &str, max: usize) -> Result<(), ProtocolError> {
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
+        .map_err(|e| ProtocolError::CtlMessageField { field, reason: e.to_string() })?;
     if decoded.len() > max {
         return Err(ProtocolError::CtlMessageField {
-            field: "data_b64",
-            reason: format!(
-                "decodes to {} bytes, exceeding the {max} byte limit for {mime:?}",
-                decoded.len()
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_notify_tag(tmux_tag: &str) -> Result<(), ProtocolError> {
-    if tmux_tag.is_empty() {
-        return Err(ProtocolError::CtlMessageField {
-            field: "tmux_tag",
-            reason: "must be non-empty".to_string(),
-        });
-    }
-    if tmux_tag.len() > MAX_NOTIFY_TAG_LEN {
-        return Err(ProtocolError::CtlMessageField {
-            field: "tmux_tag",
-            reason: format!(
-                "is {} bytes, exceeding the {MAX_NOTIFY_TAG_LEN} byte limit",
-                tmux_tag.len()
-            ),
+            field,
+            reason: format!("decodes to {} bytes, exceeding the {max} byte limit", decoded.len()),
         });
     }
     Ok(())

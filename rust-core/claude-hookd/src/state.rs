@@ -4,9 +4,9 @@
 //! which [`Action`]s (if any) the async driver should perform.
 //!
 //! Deliberately I/O-free and takes `now`/durations as parameters rather than
-//! reading real time internally — the same "pure `(state, event) -> (state,
-//! actions)` function, tested without waiting on real timers" shape as
-//! `isekai-bootstrap-plan`'s `BootstrapPlan`. Every transition, including
+//! reading real time internally — the same "pure function, tested without
+//! waiting on real timers or touching the network" shape as
+//! `isekai-bootstrap-plan`'s `validate_jump_chain`. Every transition, including
 //! both timeout paths, is exercised in this module's tests in microseconds,
 //! not the real 10-minute/30-minute timeouts.
 //!

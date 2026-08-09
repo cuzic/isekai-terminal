@@ -177,7 +177,7 @@ fn parse_via_chain(target: &HostSpec, via: &[String]) -> Result<Vec<JumpSpec>> {
         via.iter().map(|spec| parse_jump_spec(spec)).collect::<Result<_>>().with_context(|| {
             format!("isekai-ssh: invalid --via spec in {via:?}")
         })?;
-    isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(target, &chain)
+    isekai_bootstrap_plan::validate_jump_chain(target, &chain)
         .with_context(|| format!("isekai-ssh: invalid --via chain {via:?}"))?;
     Ok(chain)
 }

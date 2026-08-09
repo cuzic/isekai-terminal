@@ -15,17 +15,13 @@ pub enum AuthError {
     #[error("token file not found at {path}")]
     TokenFileNotFound { path: PathBuf },
 
-    #[error("failed to read token file at {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to write token file at {path}: {source}")]
-    Write { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to create config directory {path}: {source}")]
-    CreateDir { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to inspect permissions of {path}: {source}")]
-    Stat { path: PathBuf, #[source] source: std::io::Error },
+    /// Every read/write/permission/config-directory failure this crate can
+    /// hit — `isekai_fs_guard::FsGuardErrorAt` is the single shared,
+    /// path-attached type both this crate and `isekai-trust` build on
+    /// (WU-M3; this used to be eight separate variants declared
+    /// independently here).
+    #[error(transparent)]
+    FsGuard(#[from] isekai_fs_guard::FsGuardErrorAt),
 
     #[error("failed to parse token file at {path}: {source}")]
     Parse { path: PathBuf, #[source] source: serde_json::Error },
@@ -35,18 +31,6 @@ pub enum AuthError {
 
     #[error("token file at {path} has an empty relay_jwt value")]
     EmptyToken { path: PathBuf },
-
-    #[error("{path} is world-writable (mode {mode:o}); refusing to use it")]
-    WorldWritable { path: PathBuf, mode: u32 },
-
-    #[error("{path} grants write access to {principal} (rights {rights}); refusing to use it")]
-    InsecureAcl { path: PathBuf, principal: String, rights: String },
-
-    #[error("could not determine the home directory (HOME is not set)")]
-    NoHomeDir,
-
-    #[error("path {path} has no parent directory")]
-    NoParentDir { path: PathBuf },
 
     // --- Device Authorization Grant (RFC 8628, `device_flow.rs`) / refresh_token
     // (RFC 6749 §6, `refresh.rs`) errors, phase S-5. ---

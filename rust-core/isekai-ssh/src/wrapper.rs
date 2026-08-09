@@ -1033,7 +1033,7 @@ pub(crate) enum TofuConfirmation {
 /// `LaunchSpec::Direct` (`direct-by-bootstrap-host`, no relay, no STUN launch
 /// mode). `candidate.via` may chain through any number of hops
 /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic K) — validated with the same
-/// `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain` cycle/hop-count
+/// `isekai_bootstrap_plan::validate_jump_chain` cycle/hop-count
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
@@ -1120,7 +1120,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             Ok(spec)
         })
         .collect::<Result<_>>()?;
-    isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(&target, &via)
+    isekai_bootstrap_plan::validate_jump_chain(&target, &via)
         .with_context(|| format!("invalid --via chain {:?}", candidate.via))?;
 
     // `plan.openssh_path` (defaults to bare `"ssh"`, PATH-resolved; overridable
@@ -2422,7 +2422,7 @@ mod tests {
         // A looping chain (repeats the destination, same host *and* port —
         // cycle detection is port-sensitive, matching `plan.rs`'s own
         // `distinct_ports_on_the_same_host_are_not_a_cycle`) is still
-        // rejected, now via `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain`
+        // rejected, now via `isekai_bootstrap_plan::validate_jump_chain`
         // rather than the old single-hop-only guard.
         let looping = resolution_with_via(vec!["bastion-a".to_string(), "production:22".to_string()]);
         let err = bootstrap_and_register(&plan, &looping, TofuConfirmation::AlwaysPrompt).await.unwrap_err();

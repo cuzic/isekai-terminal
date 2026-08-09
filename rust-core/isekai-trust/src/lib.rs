@@ -16,8 +16,9 @@
 //! - Writes are atomic (write to a sibling temp file, then `rename`;
 //!   see `store::save_trust_store`).
 //! - The store file and its parent directory must not be world-writable;
-//!   loading/saving fails closed if they are (`store::check_not_world_writable`,
-//!   private but exercised via `load_trust_store`/`save_trust_store`).
+//!   loading/saving fails closed if they are
+//!   (`isekai_fs_guard::check_not_world_writable`, exercised via
+//!   `load_trust_store`/`save_trust_store`).
 //! - Malformed TOML fails closed (`TrustError::Parse`, no silent fallback to
 //!   an empty/default store).
 //! - Unknown `update_policy` values fail closed (rejected by

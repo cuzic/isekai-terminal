@@ -8,9 +8,6 @@ license = "MIT OR Apache-2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.18"
-# Used for atomic writes (write to a sibling temp file, then rename) in
-# file_provider.rs. Also reused by tests as a scratch directory factory.
-tempfile = "3"
 # 0600/0700 permission + world-writable checks, shared with isekai-trust's
 # trust store (see isekai-fs-guard's crate docs).
 isekai-fs-guard = { path = "../isekai-fs-guard" }
@@ -28,3 +25,9 @@ ureq = "3"
 # 同じzeroizeで明示呼び出し方式なのに対し、こちらはUniFFI公開型ではないため
 # Drop方式を採れる(2026-07-28、書籍原稿の実地検証で発覚した非対称性の是正)。
 zeroize = "1"
+
+[dev-dependencies]
+# Test-only scratch directory factory now that file_provider.rs's own
+# atomic-write body moved into isekai-fs-guard::write_private_atomically
+# (WU-M3).
+tempfile = "3"
