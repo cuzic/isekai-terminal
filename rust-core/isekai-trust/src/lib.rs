@@ -35,6 +35,7 @@ pub mod host_key_verifier;
 pub mod normalize;
 pub mod schema;
 pub mod store;
+pub mod time;
 
 pub use error::TrustError;
 pub use host_key_verifier::FileBackedHostKeyVerifier;
@@ -45,3 +46,4 @@ pub use store::{
     load_ssh_host_key_trust_store, load_trust_store, save_ssh_host_key_trust_store, save_trust_store,
     with_locked_ssh_host_key_trust_store,
 };
+pub use time::{format_rfc3339_utc, now_rfc3339};
