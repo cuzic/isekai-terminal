@@ -15,9 +15,9 @@
 //!
 //! Wraps the resulting `noq::Connection` via the new
 //! `quicmux::AnyMuxConnection::from_noq_connection` constructor (added
-//! alongside this test) so `isekai-pipe`'s `datagram_relay` module (or any
-//! other `AnyMuxConnection`-based caller) could drive its datagram plane the
-//! same way over a multipath connection as over an ordinary single-path one.
+//! alongside this test) so any `AnyMuxConnection`-based caller could drive
+//! its datagram plane the same way over a multipath connection as over an
+//! ordinary single-path one.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
