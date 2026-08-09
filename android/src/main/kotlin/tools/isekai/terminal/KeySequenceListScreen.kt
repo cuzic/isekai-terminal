@@ -36,7 +36,6 @@ import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.KeySequencePackInstallation
 import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.previewText
-import tools.isekai.terminal.input.shortLabel
 import tools.isekai.terminal.pack.KeySequencePack
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.ListItemCard

@@ -295,21 +295,6 @@ internal class GridRenderCache {
         return GridRenderPlan.Partial(dirtyRowIndices)
     }
 
-    /**
-     * グリッド全走査(背景+文字)の再描画が必要かどうか([GridRenderPlan.Reuse] 以外)。
-     * [planRender] のBoolean版で、`update`参照/セル寸法/テーマ背景/typeface/blink位相の
-     * いずれかが変わったか(または`dirty_rows`が全画面dirty)を判定する薄いラッパー。
-     */
-    fun needsRerender(
-        update: ScreenUpdate,
-        cellW: Float,
-        cellH: Float,
-        themeBgArgb: Int,
-        typeface: Typeface,
-        blinkPhase: Boolean,
-    ): Boolean =
-        planRender(update, cellW, cellH, themeBgArgb, typeface, blinkPhase) != GridRenderPlan.Reuse
-
     fun markRendered(
         update: ScreenUpdate,
         cellW: Float,
