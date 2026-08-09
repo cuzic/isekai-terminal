@@ -205,6 +205,31 @@ pub(crate) fn tmux_exit_status_is_success(exit_status: Option<u32>) -> bool {
     exit_status == Some(0)
 }
 
+/// `run_exec`系(タスク#61)が返す`ExecOutput`を、`RemoteTmuxCommandRunner::run`が
+/// 期待する`Result<String, TmuxRunError>`へ変換する。`OrchestratorTmuxRunner`
+/// (orchestrator.rs、#60の`ensure_tmux_tab_window`向け)と`SshHandleTmuxRunner`
+/// (transport/ssh_handler.rs、#57の通知フックインストール向け)が本質的に同じ
+/// 変換(`run_exec`の呼び出し方だけが違う——前者は`SessionOrchestrator::run_exec`、
+/// 後者は`run_exec_on_handle`)を個別に実装していたためここへ集約した。
+///
+/// stdoutのUTF-8デコードは`from_utf8_lossy`で常に成功させる(`tmux`が返す
+/// セッション名/タグ等の実データが非UTF-8になることは実質無いため、以前
+/// `OrchestratorTmuxRunner`だけが使っていた厳密な`from_utf8`を保つ実利は無い
+/// ——統合にあたって、失敗しない方(lossy)へ統一した)。
+pub(crate) fn exec_output_to_tmux_result(
+    cmd: &str,
+    out: crate::transport::ExecOutput,
+) -> Result<String, TmuxRunError> {
+    if !tmux_exit_status_is_success(out.exit_status) {
+        return Err(TmuxRunError(format!(
+            "tmux command {cmd:?} exited with status {:?} (stdout: {:?})",
+            out.exit_status,
+            String::from_utf8_lossy(&out.stdout),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// [`TmuxLocatorResolver::resolve`]/[`TmuxLocatorResolver::assign_tag`]の失敗。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum TmuxLocatorError {

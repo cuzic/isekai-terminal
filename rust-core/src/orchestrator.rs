@@ -1643,9 +1643,8 @@ impl SessionOrchestrator {
 
 /// [`crate::tmux_session::ensure_tab_window`]が要求する
 /// [`crate::tmux_locator::RemoteTmuxCommandRunner`]の、`SessionOrchestrator::run_exec`
-/// (#61)への薄いアダプタ。`ExecOutput`(stdout + 終了ステータス)を
-/// `RemoteTmuxCommandRunner`が期待する`Result<String, TmuxRunError>`へ変換する
-/// (非ゼロ終了・非UTF-8出力もここでエラーとして畳み込む)。
+/// (#61)への薄いアダプタ。`ExecOutput`→`Result<String, TmuxRunError>`の変換自体は
+/// `tmux_locator::exec_output_to_tmux_result`(`SshHandleTmuxRunner`と共有)に委ねる。
 struct OrchestratorTmuxRunner<'a> {
     orchestrator: &'a SessionOrchestrator,
 }
@@ -1659,15 +1658,8 @@ impl<'a> crate::tmux_locator::RemoteTmuxCommandRunner for OrchestratorTmuxRunner
         let cmd = cmd.to_string();
         async move {
             use crate::tmux_locator::TmuxRunError;
-            let output = orchestrator.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
-            if !crate::tmux_locator::tmux_exit_status_is_success(output.exit_status) {
-                return Err(TmuxRunError(format!(
-                    "tmux command exited with status {:?} (stdout: {:?})",
-                    output.exit_status,
-                    String::from_utf8_lossy(&output.stdout),
-                )));
-            }
-            String::from_utf8(output.stdout).map_err(|e| TmuxRunError(format!("non-utf8 tmux output: {e}")))
+            let output = orchestrator.run_exec(cmd.clone()).await.map_err(|e| TmuxRunError(e.to_string()))?;
+            crate::tmux_locator::exec_output_to_tmux_result(&cmd, output)
         }
     }
 }

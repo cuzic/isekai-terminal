@@ -744,11 +744,10 @@ async fn run_exec_on_handle_inner(
 // ── タスク#59: tmuxロケータの`RemoteTmuxCommandRunner`シームへのアダプタ ──
 
 /// [`crate::tmux_locator::RemoteTmuxCommandRunner`](#62のシーム)を、上の
-/// `run_exec_on_handle`(タスク#61)へ薄く実装する本番アダプタ。tmux管理コマンド
-/// (`tmux list-windows`/`set-option`等)は必ず標準出力・終了コード0を期待する
-/// 短命コマンドなので、非ゼロ終了は`stderr`の内容が読めない(`run_exec_on_handle`は
-/// stdoutのみ返す設計、タスク#61のスコープ)なりに終了コードだけを含めた
-/// `TmuxRunError`にする。
+/// `run_exec_on_handle`(タスク#61)へ薄く実装する本番アダプタ。`ExecOutput`→
+/// `Result<String, TmuxRunError>`の変換自体は
+/// `tmux_locator::exec_output_to_tmux_result`(`OrchestratorTmuxRunner`と共有)に
+/// 委ねる。
 struct SshHandleTmuxRunner {
     handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
 }
@@ -762,15 +761,7 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
         let cmd = cmd.to_string();
         async move {
             match run_exec_on_handle(&handle, &cmd).await {
-                Ok(ExecOutput { stdout, exit_status }) => {
-                    if !crate::tmux_locator::tmux_exit_status_is_success(exit_status) {
-                        return Err(crate::tmux_locator::TmuxRunError(format!(
-                            "command {cmd:?} exited with status {:?}",
-                            exit_status
-                        )));
-                    }
-                    Ok(String::from_utf8_lossy(&stdout).into_owned())
-                }
+                Ok(output) => crate::tmux_locator::exec_output_to_tmux_result(&cmd, output),
                 Err(e) => Err(crate::tmux_locator::TmuxRunError(e.to_string())),
             }
         }
