@@ -524,7 +524,7 @@ async fn run_authenticated_session(
         .destination_user()
         .map(String::from)
         .or_else(|| host_config.user.clone())
-        .or_else(local_username)
+        .or_else(openssh_config::local_username)
         .ok_or_else(|| anyhow!("isekai-ssh: no username configured (ssh_config User, $USER, %USERNAME%) for {host_port}"))?;
 
     let store_path = isekai_trust::default_ssh_host_key_trust_store_path()
@@ -743,10 +743,6 @@ async fn run_authenticated_session(
     drop(handle);
 
     Ok(exit_code)
-}
-
-fn local_username() -> Option<String> {
-    std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
 /// Real interactive TOFU prompt for a never-before-seen host key —

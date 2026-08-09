@@ -1157,7 +1157,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         };
         e.context(BootstrapFailure::RemoteBinaryMissing)
     })?;
-    let helper_sha256 = hex_sha256(&helper_binary);
+    let helper_sha256 = isekai_trust::hex_sha256(&helper_binary);
 
     let stun_servers = resolve_stun_servers(&resolution.isekai.stun_servers).await;
 
@@ -1332,7 +1332,7 @@ pub(crate) fn register_helper_trust(
     let profiles_dir =
         default_profiles_dir().context("could not determine the profiles directory (is $HOME set?)")?;
     let key = isekai_trust::normalize_host_port(profile).with_context(|| format!("invalid profile {profile:?}"))?;
-    let now = now_rfc3339();
+    let now = isekai_trust::now_rfc3339();
     let identity = handshake.cert_sha256().to_string();
     let trust = HelperTrust {
         identity_pubkey: identity.clone(),
@@ -1352,42 +1352,6 @@ pub(crate) fn register_helper_trust(
     let path = write_persistent_profile(&profiles_dir, &stored)
         .with_context(|| format!("failed to write profile to {}", profiles_dir.display()))?;
     Ok((key, path))
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Current UTC time formatted as RFC 3339, matching `init.rs`'s own
-/// `now_rfc3339`/`format_rfc3339_utc` (duplicated rather than shared across
-/// two ~60-line modules for a single timestamp helper).
-fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format_rfc3339_utc(secs)
-}
-
-fn format_rfc3339_utc(unix_secs: u64) -> String {
-    let days = unix_secs / 86_400;
-    let secs_of_day = unix_secs % 86_400;
-    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
-
-    let z = days as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
@@ -2238,19 +2202,6 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
-    }
-
-    /// `init.rs` used to carry an identical `format_rfc3339_utc`/test pair
-    /// (deleted when `register_helper_trust` was extracted here and became
-    /// this function's sole remaining caller) — moved here rather than
-    /// dropped, so this crate keeps direct coverage of the civil-calendar
-    /// conversion `HelperTrust.trusted_at`/`last_seen_at` depend on.
-    #[test]
-    fn rfc3339_formats_a_known_timestamp() {
-        // 2026-07-04T00:00:00Z, matching the fixtures used across
-        // isekai-trust's own tests.
-        let unix_secs = 1_783_123_200u64;
-        assert_eq!(format_rfc3339_utc(unix_secs), "2026-07-04T00:00:00Z");
     }
 
     #[test]

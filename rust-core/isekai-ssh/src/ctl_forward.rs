@@ -103,14 +103,9 @@ pub(crate) struct CtlForward {
 /// encoding) so a squatting attacker cannot feasibly pre-guess the path.
 pub(crate) fn new_ctl_token() -> String {
     use rand::RngCore as _;
-    use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    isekai_trust::hex(&bytes)
 }
 
 /// Pure decision of whether to attempt a ctl-socket forward for this

@@ -18,6 +18,9 @@ russh-stream-session = { path = "../russh-stream-session" }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["rt"] }
 log = "0.4"
+# encoding.rs::hex_sha256, shared by isekai-ssh/isekai-bootstrap's own
+# hex_sha256 call sites (see that module's docs).
+sha2 = "0.10"
 # `HelperTrust::cached_session_secret`をdrop時にゼロ化するために使う
 # (`schema.rs`の`impl Drop for HelperTrust`)。この秘密自体は`known_helpers.toml`に
 # 平文base64のまま永続化される設計のため防げる範囲は限定的だが、`isekai-auth::TokenSet`

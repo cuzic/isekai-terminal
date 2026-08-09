@@ -26,7 +26,6 @@ use std::io::Write as _;
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
 use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cli::InitArgs;
@@ -50,7 +49,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "isekai-ssh: no --helper-binary given and auto-download failed; pass --helper-binary explicitly \
          (or check --helper-release-repo/--helper-release-tag)",
     )?;
-    let helper_sha256 = hex_sha256(&helper_binary);
+    let helper_sha256 = isekai_trust::hex_sha256(&helper_binary);
 
     let relay_jwt = resolve_relay_jwt(&args)?;
     let relay = RelayLaunchSpec {
@@ -144,11 +143,6 @@ fn resolve_relay_jwt(args: &InitArgs) -> Result<String> {
     }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Parses a `[user@]host[:port]` spec into a `HostSpec`, reusing
 /// `isekai_trust::split_user_host_port`'s tokenization but keeping user/port
 /// as separate optional fields (as `HostSpec`/`ssh(1)` want them) instead of
@@ -238,12 +232,6 @@ mod tests {
     fn jump_spec_parses_the_same_way() {
         let js = parse_jump_spec("bastion.example.com:2200").unwrap();
         assert_eq!(js, JumpSpec::new("bastion.example.com").with_port(2200));
-    }
-
-    #[test]
-    fn hex_sha256_matches_known_vector() {
-        // sha256("") — a standard test vector.
-        assert_eq!(hex_sha256(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
 
     fn sample_init_args() -> InitArgs {

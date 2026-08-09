@@ -29,13 +29,23 @@
 //! (`normalize::normalize_host_port`); `--via` (jumphost) is recorded only
 //! as the informational `HelperTrust::last_via` field, not as part of the
 //! key.
+//!
+//! [`encoding`] and [`time`] are small, dependency-free string-formatting
+//! helpers (hex encoding, RFC 3339 timestamps) that don't otherwise belong
+//! to this crate's trust-store concern — they live here because this crate
+//! already sits below both `isekai-ssh` and `isekai-bootstrap` in the
+//! dependency graph (both depend on it, it depends on neither), making it a
+//! safe shared home without introducing a cycle.
 
+pub mod encoding;
 pub mod error;
 pub mod host_key_verifier;
 pub mod normalize;
 pub mod schema;
 pub mod store;
+pub mod time;
 
+pub use encoding::{hex, hex_sha256};
 pub use error::TrustError;
 pub use host_key_verifier::FileBackedHostKeyVerifier;
 pub use normalize::{normalize_host_port, split_user_host_port};
@@ -45,3 +55,4 @@ pub use store::{
     load_ssh_host_key_trust_store, load_trust_store, save_ssh_host_key_trust_store, save_trust_store,
     with_locked_ssh_host_key_trust_store,
 };
+pub use time::{format_rfc3339_utc, now_rfc3339};

@@ -418,7 +418,7 @@ async fn resolve_hop(
     let username = explicit_user
         .map(str::to_string)
         .or_else(|| host_config.user.clone())
-        .or_else(local_username)
+        .or_else(openssh_config::local_username)
         .ok_or_else(|| BootstrapError::NoUsername { host: host.to_string() })?;
 
     let identity_paths = match identity_file_override {
@@ -430,10 +430,6 @@ async fn resolve_hop(
     };
 
     Ok(ResolvedHop { hostname, port, username, identity_paths })
-}
-
-fn local_username() -> Option<String> {
-    std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
 /// Reads one candidate identity file into a [`Credential::PublicKey`], or
@@ -681,12 +677,6 @@ async fn run_russh_command_inner<H: client::Handler>(
     Ok(SshOutput { status, stdout, stderr })
 }
 
-fn hex_sha256(binary: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(binary);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn normalize_uname_arch(uname_m: &str) -> Result<String, BootstrapError> {
     match uname_m.trim() {
         "x86_64" => Ok("x86_64".to_string()),
@@ -776,7 +766,7 @@ impl RusshBackend {
         let lock_path = lock_file_path(remote_binary_path);
         let state_path = state_file_path(remote_binary_path, &fingerprint);
         let pid_path = pid_file_path(remote_binary_path, &fingerprint);
-        let expected_sha256 = hex_sha256(binary);
+        let expected_sha256 = isekai_trust::hex_sha256(binary);
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
         let encoded_len = encoded.len();
         let upload_failed_marker = UPLOAD_FAILED_MARKER;

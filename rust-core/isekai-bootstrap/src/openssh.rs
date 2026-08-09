@@ -433,7 +433,7 @@ impl OpenSshBackend {
         let lock_path = lock_file_path(remote_binary_path);
         let state_path = state_file_path(remote_binary_path, &fingerprint);
         let pid_path = pid_file_path(remote_binary_path, &fingerprint);
-        let expected_sha256 = hex_sha256(binary);
+        let expected_sha256 = isekai_trust::hex_sha256(binary);
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
         let encoded_len = encoded.len();
         let upload_failed_marker = UPLOAD_FAILED_MARKER;
@@ -582,18 +582,6 @@ fi
             _ => Err(BootstrapError::UnexpectedStdout { extra_lines: non_empty_lines.len() - 1 }),
         }
     }
-}
-
-/// Hex-encoded SHA-256 of `binary`'s bytes — matches (and is deliberately not
-/// deduplicated with) `isekai-ssh`'s own `hex_sha256` copies in `init.rs`/
-/// `wrapper.rs`, which hash the same bytes for a different purpose (the
-/// `HelperTrust`/`PersistentProfile` digest pin shown to the operator/stored
-/// in the trust store) — this one is purely an internal input to the reuse
-/// script's `sha256sum` comparison and never surfaces to the user.
-fn hex_sha256(binary: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(binary);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 struct SshOutput {
