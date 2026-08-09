@@ -417,7 +417,26 @@ async fn connect_isekai_pipe_quic_stream(
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
         .await
         .map_err(|e| e.to_string())?;
-    info!("isekai_pipe_quic: ATTACH ok — handing off to SSH");
+    Ok(finish_quic_stream("isekai_pipe_quic", conn, data_stream, proof, target).await)
+}
+
+/// WU-R1: `connect_isekai_pipe_quic_stream`(このファイル)・
+/// `isekai_link_relay_transport::connect_relay_stream`・
+/// `isekai_stun_p2p_transport::connect_stun_p2p_stream`が共有する、ATTACH成功後
+/// (`(conn, data_stream, proof)`取得後)の後処理。3経路の差分は接続確立方法
+/// (direct-by-bootstrap-host DNS解決/relay直接dial/STUN穴あけソケット)だけなので、
+/// 呼び出し元がそれぞれ`(conn, data_stream, proof)`とreattach用の`RelayTarget`を
+/// 用意してから渡す(STUN版はreattach用に`peer_addr`を`helper_addr`とした仮の
+/// `RelayTarget`を組み立ててから渡す——`isekai_stun_p2p_transport.rs`参照)。
+/// `tag`はログ行の識別子("isekai_pipe_quic"/"isekai_link_relay"/"isekai_stun_p2p")。
+pub(crate) async fn finish_quic_stream(
+    tag: &'static str,
+    conn: quicmux::AnyMuxConnection,
+    data_stream: quicmux::AnyByteStream,
+    proof: isekai_protocol::hello::Proof,
+    target: isekai_transport::RelayTarget,
+) -> resume_client::ReattachableStream {
+    info!("{tag}: ATTACH ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
         DEFAULT_RESUME_BUFFER_SIZE,
@@ -445,7 +464,7 @@ async fn connect_isekai_pipe_quic_stream(
                 Ok(Ok(control)) => {
                     let session_id = *control.session_id.as_bytes();
                     info!(
-                        "isekai_pipe_quic: control stream established (resume support enabled), session_id={}",
+                        "{tag}: control stream established (resume support enabled), session_id={}",
                         session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
@@ -454,10 +473,10 @@ async fn connect_isekai_pipe_quic_stream(
                     spawn_app_ack_bridge(resume_state, counters);
                 }
                 Ok(Err(e)) => {
-                    info!("isekai_pipe_quic: control stream handshake failed ({e}), continuing without resume support");
+                    info!("{tag}: control stream handshake failed ({e}), continuing without resume support");
                 }
                 Err(_) => {
-                    info!("isekai_pipe_quic: control stream not accepted within timeout, continuing without resume support");
+                    info!("{tag}: control stream not accepted within timeout, continuing without resume support");
                 }
             }
         });
@@ -481,9 +500,9 @@ async fn connect_isekai_pipe_quic_stream(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+                info!("{tag}: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
                 spawn_control_stream_reestablishment_after_resume(
-                    "isekai_pipe_quic",
+                    tag,
                     outcome.connection.clone(),
                     target.session_secret.clone(),
                     resume_state,
@@ -495,7 +514,7 @@ async fn connect_isekai_pipe_quic_stream(
     });
 
     let (data_read, data_write) = data_stream.split();
-    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
+    resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn)
 }
 
 /// isekai-transportの`AppAckCounters`(atomicベース)とAndroid側の

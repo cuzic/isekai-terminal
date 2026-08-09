@@ -36,7 +36,7 @@ use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPi
 use crate::isekai_pipe_quic_transport::{
     self, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION,
 };
-use crate::resume_client::{self, ClientResumeState};
+use crate::resume_client;
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
     TransportCommand, TransportEvent,
@@ -44,10 +44,6 @@ use crate::transport::{
 use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
-/// C→S input replay buffer の既定上限（`isekai_pipe_quic_transport.rs` と揃える）。
-const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-/// control stream を開く/CONTROL_ACK を待つタイムアウト。
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// simultaneous open のための probe 送信回数・間隔。isekai-helper 側
 /// （`isekai-helper/src/main.rs`）と同じ値を使う。
 const PUNCH_PROBE_COUNT: u32 = 5;
@@ -287,41 +283,6 @@ async fn connect_stun_p2p_stream(
         isekai_transport::connect_stun_p2p_on_socket(&factory, socket, &target, identity)
             .await
             .map_err(|e| e.to_string())?;
-    info!("isekai_stun_p2p: ATTACH ok — handing off to SSH");
-
-    let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
-        DEFAULT_RESUME_BUFFER_SIZE,
-    )));
-
-    {
-        let resume_state = resume_state.clone();
-        RUNTIME.spawn(async move {
-            match tokio::time::timeout(
-                CONTROL_STREAM_TIMEOUT,
-                isekai_transport::resume::open_control_stream(&conn, &proof),
-            )
-            .await
-            {
-                Ok(Ok(control)) => {
-                    let session_id = *control.session_id.as_bytes();
-                    info!(
-                        "isekai_stun_p2p: control stream established (resume support enabled), session_id={}",
-                        session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    );
-                    resume_state.lock().unwrap().session_id = Some(session_id);
-                    let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
-                    isekai_pipe_quic_transport::spawn_app_ack_bridge(resume_state, counters);
-                }
-                Ok(Err(e)) => {
-                    info!("isekai_stun_p2p: control stream handshake failed ({e}), continuing without resume support");
-                }
-                Err(_) => {
-                    info!("isekai_stun_p2p: control stream not accepted within timeout, continuing without resume support");
-                }
-            }
-        });
-    }
 
     // Phase 10 の既知の制約: reattach(RESUME) は穴あけ済みの元ソケットを再利用せず、
     // 新規エフェメラルソケットから `peer_addr` へ直接繋ぎ直すだけで、STUN再問い合わせ・
@@ -331,46 +292,18 @@ async fn connect_stun_p2p_stream(
     // relay版は relay が常時経路に残るためこの制約が無い、というのが2方式の設計上の
     // トレードオフ(PLAN.md Phase 10参照)。isekai-transportのSTUN P2Pにはresume概念自体が
     // 無いため(stun_p2p.rsのモジュールdoc参照)、reattachは`RelayTarget{helper_addr:
-    // peer_addr, ..}`とみなしてreconnect_and_resume(直接dial+RESUME)を呼ぶだけにする。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
-        let resume_state = resume_state.clone();
-        move |session_id, client_sent_offset, client_delivered_offset| {
-            let target = isekai_transport::RelayTarget {
-                helper_addr: peer_addr,
-                server_name: target.server_name.clone(),
-                cert_sha256_hex: target.cert_sha256_hex.clone(),
-                session_secret: target.session_secret.clone(),
-                // No local-port-range restriction on Android's STUN P2P path
-                // today (see `isekai_pipe_quic_transport.rs`'s equivalent site).
-                local_bind_port_range: None,
-            };
-            let factory = crate::android_quic_endpoint::factory();
-            let resume_state = resume_state.clone();
-            Box::pin(async move {
-                let outcome = isekai_transport::resume::reconnect_and_resume(
-                    &factory,
-                    &target,
-                    isekai_transport::SessionId::from_bytes(session_id),
-                    isekai_transport::C2hSentOffset::new(client_sent_offset),
-                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                info!("isekai_stun_p2p: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-                isekai_pipe_quic_transport::spawn_control_stream_reestablishment_after_resume(
-                    "isekai_stun_p2p",
-                    outcome.connection.clone(),
-                    target.session_secret.clone(),
-                    resume_state,
-                );
-                let (read, write) = outcome.data_stream.split();
-                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-            })
-        }
-    });
-
-    let (data_read, data_write) = data_stream.split();
-    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
+    // peer_addr, ..}`とみなしてreconnect_and_resume(直接dial+RESUME)を呼ぶだけにする——
+    // その`RelayTarget`をここで組み立てて、共通の後処理(`finish_quic_stream`)に渡す。
+    let relay_target = isekai_transport::RelayTarget {
+        helper_addr: peer_addr,
+        server_name: target.server_name.clone(),
+        cert_sha256_hex: target.cert_sha256_hex.clone(),
+        session_secret: target.session_secret.clone(),
+        // No local-port-range restriction on Android's STUN P2P path
+        // today (see `isekai_pipe_quic_transport.rs`'s equivalent site).
+        local_bind_port_range: None,
+    };
+    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_stun_p2p", conn, data_stream, proof, relay_target).await)
 }
 
 async fn run_over_stream(

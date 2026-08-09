@@ -26,7 +26,7 @@ use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPi
 use crate::isekai_pipe_quic_transport::{
     self, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION,
 };
-use crate::resume_client::{self, ClientResumeState};
+use crate::resume_client;
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
     TransportCommand, TransportEvent,
@@ -34,8 +34,6 @@ use crate::transport::{
 use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
-const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// relayへのブートストラップ + QUIC接続確立全体のタイムアウト。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -217,77 +215,11 @@ async fn connect_relay_stream(
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
         .await
         .map_err(|e| e.to_string())?;
-    info!("isekai_link_relay: ATTACH ok — handing off to SSH");
-
-    let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
-        DEFAULT_RESUME_BUFFER_SIZE,
-    )));
-
-    {
-        let resume_state = resume_state.clone();
-        RUNTIME.spawn(async move {
-            match tokio::time::timeout(
-                CONTROL_STREAM_TIMEOUT,
-                isekai_transport::resume::open_control_stream(&conn, &proof),
-            )
-            .await
-            {
-                Ok(Ok(control)) => {
-                    let session_id = *control.session_id.as_bytes();
-                    info!(
-                        "isekai_link_relay: control stream established (resume support enabled), session_id={}",
-                        session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    );
-                    resume_state.lock().unwrap().session_id = Some(session_id);
-                    let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
-                    isekai_pipe_quic_transport::spawn_app_ack_bridge(resume_state, counters);
-                }
-                Ok(Err(e)) => {
-                    info!("isekai_link_relay: control stream handshake failed ({e}), continuing without resume support");
-                }
-                Err(_) => {
-                    info!("isekai_link_relay: control stream not accepted within timeout, continuing without resume support");
-                }
-            }
-        });
-    }
-
     // reattach(RESUME)はrelay公開アドレスへ新規エフェメラルソケットから繋ぎ直すだけ。
     // relayは常時経路に残る(常にトンネルを維持している)ため、STUN版のような
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
-        let resume_state = resume_state.clone();
-        move |session_id, client_sent_offset, client_delivered_offset| {
-            let factory = crate::android_quic_endpoint::factory();
-            let target = target.clone();
-            let resume_state = resume_state.clone();
-            Box::pin(async move {
-                let outcome = isekai_transport::resume::reconnect_and_resume(
-                    &factory,
-                    &target,
-                    isekai_transport::SessionId::from_bytes(session_id),
-                    isekai_transport::C2hSentOffset::new(client_sent_offset),
-                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-                isekai_pipe_quic_transport::spawn_control_stream_reestablishment_after_resume(
-                    "isekai_link_relay",
-                    outcome.connection.clone(),
-                    target.session_secret.clone(),
-                    resume_state,
-                );
-                let (read, write) = outcome.data_stream.split();
-                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-            })
-        }
-    });
-
-    let (data_read, data_write) = data_stream.split();
-    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
+    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_link_relay", conn, data_stream, proof, target).await)
 }
 
 async fn run_over_stream(
