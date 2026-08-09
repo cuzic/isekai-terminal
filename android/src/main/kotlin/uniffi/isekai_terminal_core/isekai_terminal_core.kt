@@ -5456,6 +5456,13 @@ data class ScreenUpdate (
     var `tabColor`: TabColor?
     , 
     /**
+     * ctlソケット経由の`CtlMessage::SetProgress`(`isekai-ssh`ではOSC 9;4)で設定された
+     * タブ進捗。`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[TabProgress]参照。
+     */
+    var `tabProgress`: TabProgress?
+    , 
+    /**
      * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
      * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
      * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
@@ -5673,6 +5680,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeTabColor.read(buf),
+            FfiConverterOptionalTypeTabProgress.read(buf),
             FfiConverterOptionalTypeCursorColor.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
@@ -5710,6 +5718,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterOptionalTypeTabColor.allocationSize(value.`tabColor`) +
+            FfiConverterOptionalTypeTabProgress.allocationSize(value.`tabProgress`) +
             FfiConverterOptionalTypeCursorColor.allocationSize(value.`cursorColor`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`applicationKeypadMode`) +
@@ -5746,6 +5755,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.write(value.`cursorCol`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterOptionalTypeTabColor.write(value.`tabColor`, buf)
+            FfiConverterOptionalTypeTabProgress.write(value.`tabProgress`, buf)
             FfiConverterOptionalTypeCursorColor.write(value.`cursorColor`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`applicationKeypadMode`, buf)
@@ -5979,6 +5989,51 @@ public object FfiConverterTypeTabColor: FfiConverterRustBuffer<TabColor> {
             FfiConverterUByte.write(value.`r`, buf)
             FfiConverterUByte.write(value.`g`, buf)
             FfiConverterUByte.write(value.`b`, buf)
+    }
+}
+
+
+
+/**
+ * ctl-socket経由の`CtlMessage::SetProgress`(`isekai-pipe ctl progress`/`ctl build`、
+ * `isekai-ssh`ではOSC 9;4へ変換される)で設定されたタブ進捗。`state ==
+ * ProgressState::Normal`の時のみ`progress`(0-100)が意味を持つ。
+ * `ScreenUpdate::tab_progress`が`None`のときは未設定(タブUIは進捗インジケータを
+ * 表示しない)。
+ */
+data class TabProgress (
+    var `state`: ProgressState
+    , 
+    var `progress`: kotlin.UByte
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTabProgress: FfiConverterRustBuffer<TabProgress> {
+    override fun read(buf: ByteBuffer): TabProgress {
+        return TabProgress(
+            FfiConverterTypeProgressState.read(buf),
+            FfiConverterUByte.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TabProgress) = (
+            FfiConverterTypeProgressState.allocationSize(value.`state`) +
+            FfiConverterUByte.allocationSize(value.`progress`)
+    )
+
+    override fun write(value: TabProgress, buf: ByteBuffer) {
+            FfiConverterTypeProgressState.write(value.`state`, buf)
+            FfiConverterUByte.write(value.`progress`, buf)
     }
 }
 
@@ -7203,6 +7258,49 @@ public object FfiConverterTypePanelKind: FfiConverterRustBuffer<PanelKind> {
     override fun allocationSize(value: PanelKind) = 4UL
 
     override fun write(value: PanelKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * `isekai_protocol::ctl::ProgressState`(uniffiに依存しないpure crate側の型)を
+ * UniFFI境界越しに公開するための同型(`ClipboardMimeKind`/`NotifyKind`と同じ理由で
+ * ミラーが必要)。ConEmu/Windows Terminal互換のOSC 9;4(タブアイコンの進捗リング+
+ * タスクバー統合)が表現する進捗状態。
+ */
+
+enum class ProgressState {
+    
+    NONE,
+    NORMAL,
+    ERROR,
+    INDETERMINATE,
+    WARNING;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeProgressState: FfiConverterRustBuffer<ProgressState> {
+    override fun read(buf: ByteBuffer) = try {
+        ProgressState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: ProgressState) = 4UL
+
+    override fun write(value: ProgressState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -9046,6 +9144,38 @@ public object FfiConverterOptionalTypeTabColor: FfiConverterRustBuffer<TabColor?
         } else {
             buf.put(1)
             FfiConverterTypeTabColor.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeTabProgress: FfiConverterRustBuffer<TabProgress?> {
+    override fun read(buf: ByteBuffer): TabProgress? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeTabProgress.read(buf)
+    }
+
+    override fun allocationSize(value: TabProgress?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeTabProgress.allocationSize(value)
+        }
+    }
+
+    override fun write(value: TabProgress?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeTabProgress.write(value, buf)
         }
     }
 }

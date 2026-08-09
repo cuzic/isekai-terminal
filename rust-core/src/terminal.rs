@@ -5,7 +5,7 @@ use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
 use crate::{
     CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, NotifyKind, PanelField, PanelKind,
-    TerminalKeyModifiers,
+    ProgressState, TerminalKeyModifiers,
 };
 
 /// Sixel(タスク#42)の名目セルサイズ(ピクセル)。実フォントのピクセルサイズは
@@ -383,6 +383,11 @@ pub(crate) struct Terminal {
     /// タイトル(`title`)と同じくRIS(`reset_all`)でクリアされる、
     /// セッション限りの状態(永続化しない)。
     tab_color: Option<(u8, u8, u8)>,
+    /// ctl-socket 経由の `CtlMessage::SetProgress`(`set_tab_progress`、
+    /// `isekai-ssh`ではOSC 9;4へ変換される)で設定されたタブ進捗。`state ==
+    /// ProgressState::Normal`の時のみ`progress`(0-100)が意味を持つ。`tab_color`と
+    /// 同じくRIS(`reset_all`)でクリアされる、セッション限りの状態(永続化しない)。
+    tab_progress: Option<(ProgressState, u8)>,
     /// OSC 12(`ESC]12;<spec>ST`、xterm/iTerm2互換のカーソル色set、タスク#後継)で
     /// 設定されたカーソル色。`None`はUI層の既定カーソル色(Android
     /// `TerminalTheme.cursor`)を使うことを意味する。OSC 112(`ESC]112ST`)で
@@ -858,6 +863,7 @@ impl Terminal {
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
             tab_color: None,
+            tab_progress: None,
             cursor_color: None,
             pending_clipboard_write: None,
             pending_clipboard_pull_request: false,
@@ -963,12 +969,21 @@ impl Terminal {
         self.title = Some(title);
     }
     pub(crate) fn tab_color(&self) -> Option<(u8, u8, u8)> { self.tab_color }
+    pub(crate) fn tab_progress(&self) -> Option<(ProgressState, u8)> { self.tab_progress }
     pub(crate) fn cursor_color(&self) -> Option<(u8, u8, u8)> { self.cursor_color }
 
     /// OSC 4;264 のパース経由ではなく、外部(ctl-socket経由の
     /// `CtlMessage::SetTabColor`)から直接タブ色を設定する。`set_title`と対になる。
     pub(crate) fn set_tab_color(&mut self, r: u8, g: u8, b: u8) {
         self.tab_color = Some((r, g, b));
+    }
+
+    /// 外部(ctl-socket経由の`CtlMessage::SetProgress`)から直接タブ進捗を設定する。
+    /// `set_tab_color`と対になる。`state == ProgressState::None`はOSC 9;4の
+    /// 慣習(`OSC 9;4;0`が「進捗表示をクリアする」を意味する)をそのまま引き継ぎ、
+    /// `tab_progress`自体を`None`に戻す(`progress`値は無視する)。
+    pub(crate) fn set_tab_progress(&mut self, state: ProgressState, progress: u8) {
+        self.tab_progress = if matches!(state, ProgressState::None) { None } else { Some((state, progress)) };
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn application_keypad_mode(&self) -> bool { self.application_keypad_mode }
@@ -1279,6 +1294,7 @@ impl Terminal {
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
         self.tab_color = None;
+        self.tab_progress = None;
         self.cursor_color = None;
         self.pending_clipboard_write = None;
         self.pending_clipboard_pull_request = false;
@@ -4024,6 +4040,34 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         t.set_tab_color(0x11, 0x22, 0x33);
         assert_eq!(t.tab_color(), Some((0x11, 0x22, 0x33)));
+    }
+
+    #[test]
+    fn test_set_tab_progress_direct_setter_mirrors_set_tab_color() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.tab_progress(), None);
+        t.set_tab_progress(ProgressState::Normal, 42);
+        assert_eq!(t.tab_progress(), Some((ProgressState::Normal, 42)));
+    }
+
+    #[test]
+    fn test_set_tab_progress_none_state_clears_regardless_of_progress_value() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_tab_progress(ProgressState::Indeterminate, 0);
+        assert!(t.tab_progress().is_some());
+        // OSC 9;4;0の慣習(進捗をクリアする)を踏襲: stateがNoneなら`progress`の
+        // 値に関わらずクリアする。
+        t.set_tab_progress(ProgressState::None, 99);
+        assert_eq!(t.tab_progress(), None);
+    }
+
+    #[test]
+    fn test_set_tab_progress_cleared_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.set_tab_progress(ProgressState::Error, 0);
+        assert!(t.tab_progress().is_some());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.tab_progress(), None);
     }
 
     #[test]

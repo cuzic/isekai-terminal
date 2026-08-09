@@ -20,7 +20,7 @@ import uniffi.isekai_terminal_core.ScreenUpdate
 class ConnectionStateMapperTest {
 
     private fun screenUpdate() = ScreenUpdate(
-        0u, 80u, 24u, emptyList(), 0u, 0u, null, null, null, false, false, false,
+        0u, 80u, 24u, emptyList(), 0u, 0u, null, null, null, null, false, false, false,
         MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(),
         emptyList(), 0u, null)
 

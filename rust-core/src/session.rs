@@ -757,6 +757,18 @@ fn notify_kind_from_protocol(kind: isekai_protocol::NotifyKind) -> NotifyKind {
     }
 }
 
+/// `isekai_protocol::ctl::ProgressState`とUniFFI境界越しに公開する`crate::ProgressState`
+/// (`notify_kind_from_protocol`と同じ理由の別々の型)を変換する。
+fn progress_state_from_protocol(state: isekai_protocol::ProgressState) -> crate::ProgressState {
+    match state {
+        isekai_protocol::ProgressState::None => crate::ProgressState::None,
+        isekai_protocol::ProgressState::Normal => crate::ProgressState::Normal,
+        isekai_protocol::ProgressState::Error => crate::ProgressState::Error,
+        isekai_protocol::ProgressState::Indeterminate => crate::ProgressState::Indeterminate,
+        isekai_protocol::ProgressState::Warning => crate::ProgressState::Warning,
+    }
+}
+
 /// `dispatch_transport_event`の戻り値。`TransportEvent::Disconnected`/
 /// event_rx正常close相当のケースを`break 'outer`できるよう、通常の
 /// `Option<ProcessResult>`とは別に`Break`を持つ。
@@ -838,6 +850,16 @@ fn dispatch_transport_event(
             isekai_protocol::CtlMessage::SetTabColor { r, g, b } => {
                 EventOutcome::Continue(Some(state.set_tab_color_from_ctl(r, g, b)))
             }
+            // `SetTabColor`と同じ経路: `isekai-ssh`ではOSC 9;4(タブアイコンの進捗
+            // リング+タスクバー統合)へ変換される`CtlMessage::SetProgress`を、
+            // Android/iOS本体アプリ側は自前のタブ進捗UI(`ScreenUpdate::tab_progress`
+            // 経由)へ直接反映する(2026-08、`SetTabColor`が無視→タブ色UI実装、
+            // という経過を踏襲)。
+            isekai_protocol::CtlMessage::SetProgress { state: progress_state, progress } => {
+                EventOutcome::Continue(Some(
+                    state.set_tab_progress_from_ctl(progress_state_from_protocol(progress_state), progress),
+                ))
+            }
             isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
                 if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
                     let cb = Arc::clone(callback);
@@ -863,11 +885,6 @@ fn dispatch_transport_event(
             // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
             // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
             //
-            // `SetProgress`(2026-08、OSC 9;4プログレスバー)は`isekai-ssh` CLI
-            // ラッパー(外側の実端末のタブアイコン/タスクバー統合)専用として追加した。
-            // Android本体アプリ側にタブ進捗UIができるまでは未サポート(タスク管理上の
-            // 6b)——`SetTabColor`がタブ色UI実装まで無視されていたのと同じ経過。
-            //
             // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
@@ -876,8 +893,7 @@ fn dispatch_transport_event(
             | isekai_protocol::CtlMessage::GetVarResponse { .. }
             | isekai_protocol::CtlMessage::BuildRequest { .. }
             | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
-            | isekai_protocol::CtlMessage::BuildFinished { .. }
-            | isekai_protocol::CtlMessage::SetProgress { .. } => EventOutcome::Continue(None),
+            | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
             // `Notify`は2つの独立した系統を1つのワイヤーメッセージ・型として共有する
             // (統合の経緯は`isekai_protocol::ctl::NotifyKind`のdocコメント参照、
             // 2026-07-25)。kindでどちらの系統かを判別し、それぞれ既存の(互いに
@@ -1560,6 +1576,26 @@ mod tests {
 
         let upd = state.make_screen_update();
         assert_eq!(upd.tab_color, Some(crate::TabColor { r: 0x11, g: 0x22, b: 0x33 }));
+    }
+
+    #[test]
+    fn make_screen_update_carries_tab_progress_set_via_ctl_message() {
+        // `TransportEvent::CtlMessage(SetProgress)`は`dispatch_transport_event`が
+        // `state.set_tab_progress_from_ctl`へ配線する(以前は防御的に無視していた
+        // アームから2026-08にここへ移した——`tab_color`と同じく回帰しやすい箇所
+        // なので、ctlソケット経由の反映が`make_screen_update`まで届くことを検証する)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.set_tab_progress_from_ctl(crate::ProgressState::Warning, 70);
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.tab_progress, Some(crate::TabProgress { state: crate::ProgressState::Warning, progress: 70 }));
+    }
+
+    #[test]
+    fn make_screen_update_tab_progress_is_none_by_default() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let upd = state.make_screen_update();
+        assert_eq!(upd.tab_progress, None);
     }
 
     #[test]
