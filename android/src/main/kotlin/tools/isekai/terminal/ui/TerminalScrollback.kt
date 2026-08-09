@@ -58,6 +58,7 @@ fun synthesizeDisplayUpdate(
         cursorCol = 0u,
         title = live.title,
         tabColor = live.tabColor,
+        tabProgress = live.tabProgress,
         cursorColor = live.cursorColor,
         applicationCursorMode = live.applicationCursorMode,
         applicationKeypadMode = live.applicationKeypadMode,

@@ -27,7 +27,7 @@ class TerminalHyperlinkTest {
         cells = cells,
         cursorRow = 0u,
         cursorCol = 0u,
-        title = null, tabColor = null, cursorColor = null,
+        title = null, tabColor = null, tabProgress = null, cursorColor = null,
         applicationCursorMode = false,
         applicationKeypadMode = false,
         bracketedPasteMode = false,

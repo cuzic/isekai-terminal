@@ -1105,6 +1105,30 @@ pub struct CursorColor {
     pub b: u8,
 }
 
+/// `isekai_protocol::ctl::ProgressState`(uniffiに依存しないpure crate側の型)を
+/// UniFFI境界越しに公開するための同型(`ClipboardMimeKind`/`NotifyKind`と同じ理由で
+/// ミラーが必要)。ConEmu/Windows Terminal互換のOSC 9;4(タブアイコンの進捗リング+
+/// タスクバー統合)が表現する進捗状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ProgressState {
+    None,
+    Normal,
+    Error,
+    Indeterminate,
+    Warning,
+}
+
+/// ctl-socket経由の`CtlMessage::SetProgress`(`isekai-pipe ctl progress`/`ctl build`、
+/// `isekai-ssh`ではOSC 9;4へ変換される)で設定されたタブ進捗。`state ==
+/// ProgressState::Normal`の時のみ`progress`(0-100)が意味を持つ。
+/// `ScreenUpdate::tab_progress`が`None`のときは未設定(タブUIは進捗インジケータを
+/// 表示しない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TabProgress {
+    pub state: ProgressState,
+    pub progress: u8,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     /// 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
@@ -1124,6 +1148,10 @@ pub struct ScreenUpdate {
     /// タブ背景色。`title`と同じくRIS/新規セッションで`None`にリセットされる、
     /// セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
     pub tab_color: Option<TabColor>,
+    /// ctlソケット経由の`CtlMessage::SetProgress`(`isekai-ssh`ではOSC 9;4)で設定された
+    /// タブ進捗。`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+    /// セッション限りの状態(永続化しない)。詳細は[TabProgress]参照。
+    pub tab_progress: Option<TabProgress>,
     /// xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
     /// `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
     /// セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。

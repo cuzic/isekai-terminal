@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
@@ -42,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.AuthType
+import uniffi.isekai_terminal_core.ProgressState
 
 /**
  * 上部バー(タブ行・[TerminalScreenBody]のステータス行)を、操作が無いまま自動で隠すまでの
@@ -220,6 +222,37 @@ private fun TabLabel(
                     .background(Color(red = tabColor.r.toInt(), green = tabColor.g.toInt(), blue = tabColor.b.toInt()))
                     .testTag("tabColorDot"),
             )
+        }
+        // isekai-ssh(ctl_forward.rs::osc_sequence_for)がConEmu/Windows Terminal互換の
+        // OSC 9;4へ変換するのと同じ CtlMessage::SetProgress を、tabColor と同じ経路
+        // (Rust側SSOTである ScreenUpdate.tab_progress を直接読むだけ)で反映する
+        // (isekai-pipe ctl progress/ctl build 起点、2026-08)。タブの進捗インジケータは
+        // 常時点灯するものではない(ビルド等の一時的な状態)ため、tabColorDot と違って
+        // 背景着色との衝突は起きない。
+        uiState.screenUpdate?.tabProgress?.let { tabProgress ->
+            val indicatorColor = when (tabProgress.state) {
+                ProgressState.ERROR -> Color(0xFFFF5252)
+                ProgressState.WARNING -> Color(0xFFFFC107)
+                else -> Color(0xFF64B5F6)
+            }
+            val indicatorModifier = Modifier
+                .padding(start = 3.dp)
+                .size(10.dp)
+                .testTag("tabProgressIndicator")
+            if (tabProgress.state == ProgressState.INDETERMINATE) {
+                CircularProgressIndicator(
+                    modifier = indicatorModifier,
+                    color = indicatorColor,
+                    strokeWidth = 1.5.dp,
+                )
+            } else {
+                CircularProgressIndicator(
+                    progress = { tabProgress.progress.toInt() / 100f },
+                    modifier = indicatorModifier,
+                    color = indicatorColor,
+                    strokeWidth = 1.5.dp,
+                )
+            }
         }
         Text(
             // リモートの OSC 0/2 タイトル変更があればそれを優先表示する(セッション/Rust側の

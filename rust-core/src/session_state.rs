@@ -1,7 +1,7 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
 use crate::kitty_graphics::{ApcInterceptor, ApcStep};
-use crate::{CellData, CursorColor, CursorShape, LineDamage, ScreenUpdate, TabColor};
+use crate::{CellData, CursorColor, CursorShape, LineDamage, ScreenUpdate, TabColor, TabProgress};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
 use crate::theme::Theme;
@@ -245,6 +245,7 @@ impl SessionState {
             cursor_col: cursor_col as u32,
             title: t.title().map(str::to_owned),
             tab_color: t.tab_color().map(|(r, g, b)| TabColor { r, g, b }),
+            tab_progress: t.tab_progress().map(|(state, progress)| TabProgress { state, progress }),
             cursor_color: t.cursor_color().map(|(r, g, b)| CursorColor { r, g, b }),
             application_cursor_mode: t.application_cursor_mode(),
             application_keypad_mode: t.application_keypad_mode(),
@@ -299,6 +300,14 @@ impl SessionState {
     /// と同じパターン。
     pub(crate) fn set_tab_color_from_ctl(&mut self, r: u8, g: u8, b: u8) -> ProcessResult {
         self.terminal.set_tab_color(r, g, b);
+        ProcessResult { screen_dirty: true, ..Default::default() }
+    }
+
+    /// ctlソケット(`isekai-protocol::CtlMessage::SetProgress`、`isekai-ssh`では
+    /// OSC 9;4)経由でリモートから届いたタブ進捗を、OSC 9;4のパースを経由せず
+    /// 直接反映する。`set_tab_color_from_ctl`と同じパターン。
+    pub(crate) fn set_tab_progress_from_ctl(&mut self, state: crate::ProgressState, progress: u8) -> ProcessResult {
+        self.terminal.set_tab_progress(state, progress);
         ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
@@ -615,6 +624,20 @@ mod tests {
         let r = state.set_tab_color_from_ctl(0x11, 0x22, 0x33);
 
         assert_eq!(state.terminal().tab_color(), Some((0x11, 0x22, 0x33)));
+        assert!(r.screen_dirty);
+        assert!(r.side_effects.is_empty());
+        assert!(r.timer_cmds.is_empty());
+        assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn set_tab_progress_from_ctl_reflects_in_terminal_tab_progress_and_marks_screen_dirty() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        assert_eq!(state.terminal().tab_progress(), None);
+
+        let r = state.set_tab_progress_from_ctl(crate::ProgressState::Normal, 42);
+
+        assert_eq!(state.terminal().tab_progress(), Some((crate::ProgressState::Normal, 42)));
         assert!(r.screen_dirty);
         assert!(r.side_effects.is_empty());
         assert!(r.timer_cmds.is_empty());
