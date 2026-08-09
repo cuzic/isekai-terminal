@@ -535,9 +535,16 @@ mod tests {
         // Both effects of the same `Action::SetAttentionColorAndPopup` must
         // land — the OSC write is not blocked on the hook, nor vice versa.
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "notify must still paint attention color").await;
-        poll_until(Duration::from_secs(2), || out_path.with_extension("arg").exists() && out_path.with_extension("stdin").exists())
-            .await
-            .expect("the on-attention hook must run");
+        // Polls on parseable JSON, not mere existence — see `hooks.rs`'s
+        // matching test for why an existence-only check flaked under load.
+        poll_until(Duration::from_secs(2), || {
+            out_path.with_extension("arg").exists()
+                && std::fs::read_to_string(out_path.with_extension("stdin"))
+                    .ok()
+                    .is_some_and(|s| serde_json::from_str::<serde_json::Value>(&s).is_ok())
+        })
+        .await
+        .expect("the on-attention hook must run");
 
         assert_eq!(std::fs::read_to_string(out_path.with_extension("arg")).unwrap().trim(), "attention");
         let stdin_json: serde_json::Value =

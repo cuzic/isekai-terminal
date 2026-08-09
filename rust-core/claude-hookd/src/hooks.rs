@@ -188,9 +188,20 @@ mod tests {
             crate::state::apply_event(&TabState::new(), "s1", crate::state::HookEvent::Notify, now, Duration::from_secs(600), Duration::from_secs(1800));
         run_hook(Some(dir.path()), "attention", &state, now).await;
 
-        poll_until(Duration::from_secs(2), || out.with_extension("arg").exists() && out.with_extension("stdin").exists())
-            .await
-            .expect("hook script must run and produce both output files");
+        // Polls on the *stdin* file actually containing complete, parseable
+        // JSON — not merely existing (adversarial review, 2026-08-09: under
+        // load, `> file` truncate-creates it before the redirected `cat`
+        // has copied every byte from the pipe, so an existence-only check
+        // flaked with a real, reproducible "EOF while parsing a value" on
+        // this exact sandbox).
+        poll_until(Duration::from_secs(2), || {
+            out.with_extension("arg").exists()
+                && std::fs::read_to_string(out.with_extension("stdin"))
+                    .ok()
+                    .is_some_and(|s| serde_json::from_str::<serde_json::Value>(&s).is_ok())
+        })
+        .await
+        .expect("hook script must run and produce both output files");
 
         assert_eq!(std::fs::read_to_string(out.with_extension("arg")).unwrap().trim(), "attention");
         let stdin_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.with_extension("stdin")).unwrap()).unwrap();
