@@ -117,15 +117,6 @@ pub(crate) enum TmuxTargetKind {
     Pane,
 }
 
-impl TmuxTargetKind {
-    fn user_option(self) -> &'static str {
-        match self {
-            Self::Window => WINDOW_TAG_OPTION,
-            Self::Pane => PANE_TAG_OPTION,
-        }
-    }
-}
-
 /// このロケータが指すウィンドウ/ペインが属するtmuxセッション(またはセッション
 /// グループ)の識別。「1セッション名だけをハードコードする」設計を避け、
 /// session groupの存在(上記モジュールdoc参照)を後から配線できるようにする。
@@ -424,7 +415,6 @@ impl AppPaneId {
 /// 1つのアプリペインについて、対応表が保持する情報一式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TmuxTabEntry {
-    pub(crate) app_pane: AppPaneId,
     pub(crate) locator: TmuxLocator,
     /// このタブが現在使っているEpic M ctl-socketのリモートパス
     /// (`transport::ctl_streamlocal::new_ctl_socket_path`が発行する、
@@ -450,9 +440,6 @@ pub(crate) struct TmuxTabEntry {
 #[derive(Debug, Default)]
 pub(crate) struct TmuxLocatorRegistry {
     by_app_pane: HashMap<AppPaneId, TmuxTabEntry>,
-    /// 逆引き用の索引。`register`/`unregister`が`by_app_pane`と同時に
-    /// 整合を保つ(下記参照)。
-    by_locator: HashMap<TmuxLocator, AppPaneId>,
     /// タスク#59実機検証(2026-07-27)で判明: `push_ctl_socket_to_tmux`は
     /// ctl-socket forward確立直後にspawnされ、`register()`(`ensure_tmux_tab_window`、
     /// Kotlin側の接続確認コールバックを経由するため1往復分遅れる)より先に
@@ -473,28 +460,11 @@ impl TmuxLocatorRegistry {
 
     /// `app_pane`のタブが接続/再接続した際に、その対応表エントリを登録/更新
     /// する。既に`app_pane`のエントリが存在していれば(再接続で別のtmux
-    /// ウィンドウ/ペインに繋ぎ直った場合を含め)完全に上書きし、古い
-    /// `locator`の逆引きエントリは`by_locator`から確実に取り除く
-    /// (取り除かないと、再接続後にその古いロケータで`app_pane_for`を
-    /// 引いた際、既にこのペインのものではなくなった古い対応を返してしまう)。
+    /// ウィンドウ/ペインに繋ぎ直った場合を含め)完全に上書きする。
     pub(crate) fn register(&mut self, app_pane: AppPaneId, locator: TmuxLocator, ctl_socket_path: Option<String>) {
-        if let Some(old) = self.by_app_pane.get(&app_pane) {
-            self.by_locator.remove(&old.locator);
-        }
-        // 別のapp_paneが既に同じlocatorを持っていた場合、そちらのby_app_pane
-        // エントリも取り除く(opusレビューLow指摘: これをしないとby_locatorだけ
-        // 上書きされ、古いapp_pane側にはもう他人のものになったlocatorへの参照が
-        // stale状態のまま残る——その古いapp_paneが後でunregisterされた際、既に
-        // 別のapp_paneが正当に使っているby_locatorエントリを誤って消してしまう)。
-        if let Some(prev_owner) = self.by_locator.get(&locator) {
-            if *prev_owner != app_pane {
-                self.by_app_pane.remove(prev_owner);
-            }
-        }
-        self.by_locator.insert(locator.clone(), app_pane.clone());
         self.by_app_pane.insert(
-            app_pane.clone(),
-            TmuxTabEntry { app_pane, locator, ctl_socket_path, notify_hooks_enabled: false },
+            app_pane,
+            TmuxTabEntry { locator, ctl_socket_path, notify_hooks_enabled: false },
         );
     }
 
@@ -522,11 +492,6 @@ impl TmuxLocatorRegistry {
     /// `app_pane`に対応するtmuxロケータを引く。
     pub(crate) fn locator_for(&self, app_pane: &AppPaneId) -> Option<&TmuxLocator> {
         self.by_app_pane.get(app_pane).map(|e| &e.locator)
-    }
-
-    /// `locator`に対応するアプリのタブ/ペインIDを引く(逆引き)。
-    pub(crate) fn app_pane_for(&self, locator: &TmuxLocator) -> Option<&AppPaneId> {
-        self.by_locator.get(locator)
     }
 
     /// `app_pane`が現在使っているctl-socketパスを引く。
@@ -568,16 +533,6 @@ impl TmuxLocatorRegistry {
         self.pending_ctl_socket_paths.remove(app_pane)
     }
 
-    /// `app_pane`のエントリを対応表から取り除く(タブが閉じられた際など)。
-    pub(crate) fn unregister(&mut self, app_pane: &AppPaneId) -> Option<TmuxTabEntry> {
-        // `register()`が一度も呼ばれないままタブが閉じられた場合(接続直後に
-        // すぐ閉じる等)、`pending_ctl_socket_paths`にエントリが残ったままに
-        // なりうるので、`by_app_pane`の有無によらず必ず掃除する。
-        self.pending_ctl_socket_paths.remove(app_pane);
-        let entry = self.by_app_pane.remove(app_pane)?;
-        self.by_locator.remove(&entry.locator);
-        Some(entry)
-    }
 }
 
 // ── タスク#59: プロセス全体で共有するレジストリ + ctl-socketパスの伝播 ──
@@ -597,10 +552,9 @@ impl TmuxLocatorRegistry {
 ///
 /// なぜ`OrchestratorShared`(タブごとのインスタンス)ではなくプロセス全体の
 /// シングルトンにするか: `TmuxLocatorRegistry`は本来「アプリ全体でどのタブが
-/// どのtmuxウィンドウ/ペインを使っているか」を横断的に把握するための対応表
-/// (逆引き`app_pane_for`が典型的にそう)であり、1タブに閉じた状態ではない。
-/// また`SSH_POOL`と同様、キー(`AppPaneId`)自体が既にタブを一意に識別するため、
-/// 複数タブが同じマップを共有しても衝突しない。
+/// どのtmuxウィンドウ/ペインを使っているか」を横断的に把握するための対応表であり、
+/// 1タブに閉じた状態ではない。また`SSH_POOL`と同様、キー(`AppPaneId`)自体が既に
+/// タブを一意に識別するため、複数タブが同じマップを共有しても衝突しない。
 pub(crate) static TMUX_LOCATOR_REGISTRY: LazyLock<Mutex<TmuxLocatorRegistry>> =
     LazyLock::new(|| Mutex::new(TmuxLocatorRegistry::new()));
 
@@ -961,7 +915,7 @@ mod tests {
         {
             let r = registry.lock();
             assert_eq!(r.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-a.sock"));
-            // ロケータ自体・逆引きは変わらない。
+            // ロケータ自体は変わらない。
             assert_eq!(r.locator_for(&app_pane), Some(&loc));
         }
 
@@ -982,7 +936,6 @@ mod tests {
             let r = registry.lock();
             assert_eq!(r.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-b.sock"));
             assert_eq!(r.locator_for(&app_pane), Some(&loc));
-            assert_eq!(r.app_pane_for(&loc), Some(&app_pane));
         }
     }
 
@@ -1048,14 +1001,13 @@ mod tests {
     }
 
     #[test]
-    fn register_then_lookup_both_directions() {
+    fn register_then_lookup() {
         let mut registry = TmuxLocatorRegistry::new();
         let app_pane = pane("tab-1", "pane-primary");
         let loc = locator("tag-1");
         registry.register(app_pane.clone(), loc.clone(), Some("/tmp/isekai-pipe-ctl-a.sock".to_string()));
 
         assert_eq!(registry.locator_for(&app_pane), Some(&loc));
-        assert_eq!(registry.app_pane_for(&loc), Some(&app_pane));
         assert_eq!(registry.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-a.sock"));
     }
 
@@ -1069,36 +1021,6 @@ mod tests {
         let updated = registry.set_ctl_socket_path(&app_pane, Some("/tmp/isekai-pipe-ctl-b.sock".to_string()));
         assert!(updated);
         assert_eq!(registry.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-b.sock"));
-    }
-
-    #[test]
-    fn register_same_locator_for_a_different_app_pane_evicts_the_previous_owners_entry() {
-        // opusレビューLow指摘: by_locatorだけ上書きされ、古いapp_pane側の
-        // by_app_paneエントリがstaleなlocator参照を持ったまま残ると、その古い
-        // app_paneが後でunregisterされた際に、既に新しいapp_paneが正当に使って
-        // いるby_locatorエントリを誤って消してしまう。
-        let mut registry = TmuxLocatorRegistry::new();
-        let old_pane = pane("tab-old", "pane-primary");
-        let new_pane = pane("tab-new", "pane-primary");
-        let loc = locator("tag-shared");
-        registry.register(old_pane.clone(), loc.clone(), None);
-        registry.register(new_pane.clone(), loc.clone(), None);
-
-        assert_eq!(
-            registry.locator_for(&old_pane),
-            None,
-            "古いapp_pane側のエントリごと消えているはず"
-        );
-        assert_eq!(registry.app_pane_for(&loc), Some(&new_pane));
-
-        // 古いapp_pane(既にエントリが無い)をunregisterしても、新しいapp_pane
-        // が正当に持っているby_locatorエントリは壊れないはず。
-        assert_eq!(registry.unregister(&old_pane), None);
-        assert_eq!(
-            registry.app_pane_for(&loc),
-            Some(&new_pane),
-            "古いapp_paneのunregisterで新しいapp_paneの逆引きが壊れてはいけない"
-        );
     }
 
     #[test]
@@ -1124,15 +1046,12 @@ mod tests {
         registry.register(app_pane.clone(), loc.clone(), Some("/tmp/new.sock".to_string()));
 
         assert_eq!(registry.ctl_socket_path_for(&app_pane), Some("/tmp/new.sock"));
-        // 逆引きも壊れていない。
-        assert_eq!(registry.app_pane_for(&loc), Some(&app_pane));
     }
 
     #[test]
-    fn reconnect_to_a_different_tmux_window_replaces_the_locator_and_drops_the_stale_reverse_entry() {
+    fn reconnect_to_a_different_tmux_window_replaces_the_locator() {
         // タブが再接続の際に(tmuxセッションが一度落ちて新しく張り直された等の
-        // 理由で)別のtmuxウィンドウにアタッチし直したケース。古いロケータの
-        // 逆引きエントリが残って誤ったapp_paneを指し続けないことを確認する。
+        // 理由で)別のtmuxウィンドウにアタッチし直したケース。
         let mut registry = TmuxLocatorRegistry::new();
         let app_pane = pane("tab-1", "pane-primary");
         let old_locator = locator("tag-old");
@@ -1142,40 +1061,15 @@ mod tests {
         registry.register(app_pane.clone(), new_locator.clone(), Some("/tmp/new.sock".to_string()));
 
         assert_eq!(registry.locator_for(&app_pane), Some(&new_locator));
-        assert_eq!(registry.app_pane_for(&new_locator), Some(&app_pane));
-        // 古いロケータはもう誰も指していない(stale状態のクリーンアップ)。
-        assert_eq!(registry.app_pane_for(&old_locator), None);
     }
 
     #[test]
-    fn lookup_of_unknown_app_pane_or_stale_locator_returns_none() {
+    fn lookup_of_unknown_app_pane_returns_none() {
         let registry = TmuxLocatorRegistry::new();
         let unknown_pane = pane("nope", "nope");
-        let unknown_locator = locator("never-registered");
 
         assert_eq!(registry.locator_for(&unknown_pane), None);
-        assert_eq!(registry.app_pane_for(&unknown_locator), None);
         assert_eq!(registry.ctl_socket_path_for(&unknown_pane), None);
-    }
-
-    #[test]
-    fn unregister_removes_both_forward_and_reverse_entries() {
-        let mut registry = TmuxLocatorRegistry::new();
-        let app_pane = pane("tab-1", "pane-primary");
-        let loc = locator("tag-1");
-        registry.register(app_pane.clone(), loc.clone(), Some("/tmp/a.sock".to_string()));
-
-        let removed = registry.unregister(&app_pane).unwrap();
-        assert_eq!(removed.locator, loc);
-
-        assert_eq!(registry.locator_for(&app_pane), None);
-        assert_eq!(registry.app_pane_for(&loc), None);
-    }
-
-    #[test]
-    fn unregister_unknown_app_pane_returns_none() {
-        let mut registry = TmuxLocatorRegistry::new();
-        assert_eq!(registry.unregister(&pane("nope", "nope")), None);
     }
 
     #[test]
