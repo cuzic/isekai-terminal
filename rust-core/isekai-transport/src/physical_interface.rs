@@ -100,11 +100,8 @@ fn bind_physical_interface_with_port_range(
 /// Creates an endpoint via `factory` — bound to `interface` specifically if
 /// given (via [`bind_physical_interface`]), or to OS-default routing
 /// otherwise — and dials `remote` on it. This is the "maybe-interface-bound
-/// dial" step shared by [`crate::warm_standby::WarmStandby`]'s own dial and
-/// [`crate::dual_path::connect_dual_path`]: both need exactly the same
-/// bind-or-wrap-then-connect sequence, just for different reasons (a warm
-/// spare vs. a second actively-used connection), so it lives here once
-/// rather than being duplicated per caller.
+/// dial" step used by [`crate::warm_standby::WarmStandby`]'s own dial, so it
+/// lives here once rather than being duplicated per caller.
 ///
 /// The bind address always matches `remote`'s own IPv4/IPv6 family (see
 /// [`unspecified_addr_for`]), and `port_range` narrows the local port the
@@ -305,8 +302,7 @@ mod tests {
     /// Regression test for the IPv4-only bind this crate used to have:
     /// `connect_via_interface` must bind an address matching the remote's
     /// own family, not always IPv4 — otherwise an IPv6-only remote (e.g. a
-    /// 464XLAT/NAT64 cellular interface, this crate's own motivating case
-    /// for `dual_path.rs`) could never be dialed at all.
+    /// 464XLAT/NAT64 cellular interface) could never be dialed at all.
     ///
     /// A `test-windows` CI run once failed here with
     /// `MuxError::EndpointSetup("...os error 10022...")` (`WSAEINVAL`), on

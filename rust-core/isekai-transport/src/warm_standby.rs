@@ -207,13 +207,10 @@ impl WarmStandby {
 
     /// Binds (either OS-default or, if [`WarmStandby::new_bound_to_interface`]
     /// was used, restricted to `self.interface`) a fresh local socket and
-    /// dials `self.target`, via [`crate::physical_interface::connect_via_interface`]
-    /// (shared with [`crate::dual_path::connect_dual_path`], which needs the
-    /// exact same "maybe-interface-bound dial" step for its own two
-    /// connections). Also applies `self.target.local_bind_port_range`, the
-    /// same narrowed-outbound-port-range knob `relay.rs`/`race.rs`/
-    /// `resume.rs` already honor for their own dials — previously silently
-    /// ignored here.
+    /// dials `self.target`, via [`crate::physical_interface::connect_via_interface`].
+    /// Also applies `self.target.local_bind_port_range`, the same
+    /// narrowed-outbound-port-range knob `relay.rs`/`race.rs`/`resume.rs`
+    /// already honor for their own dials — previously silently ignored here.
     async fn dial(&self) -> Result<AnyMuxConnection, TransportError> {
         let remote = RemoteSpec {
             addr: self.target.helper_addr,
