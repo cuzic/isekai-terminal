@@ -56,7 +56,7 @@ const DEFAULT_SCRIPT: &str = include_str!("../default-tab-color.sh");
 /// a silent no-op, and a failing custom script is that script author's own
 /// business, same trust model as `hooks.rs`'s command hooks.
 ///
-/// The *embedded default* failing outright (no `/bin/sh`, no `cut` — a
+/// The *embedded default* failing outright (no `/bin/sh` at all — a
 /// genuinely broken environment, not a deliberate downgrade decision, which
 /// only a real override script can express) instead falls back to
 /// [`compiled_in_fallback`]: this crate's one remaining compiled-in OSC
@@ -111,8 +111,12 @@ async fn run(path: &Path, hex: &str) -> Option<String> {
 /// other test reading those two vars concurrently (`cargo test` runs in
 /// parallel within one process by default), so tests instead override just
 /// the child's view of them. Only those two vars are ever touched — not a
-/// full `env_clear()`, which also drops `$PATH` and breaks the script's own
-/// `cut` call (found live, 2026-08-09).
+/// full `env_clear()`: an earlier version of this test helper used
+/// `env_clear()`, which also drops `$PATH` and broke `default-tab-color.sh`'s
+/// then-`cut`-based hex slicing (found live, 2026-08-09) — that specific
+/// failure mode no longer applies now that the script uses POSIX parameter
+/// expansion instead of `cut`, but `env_remove` for just the two vars under
+/// test remains the more precise choice regardless.
 async fn run_embedded_default(hex: &str, env_override: Option<&[(&str, &str)]>) -> Option<String> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(DEFAULT_SCRIPT).arg("tab-color").arg(hex).stdin(Stdio::null()).kill_on_drop(true);
@@ -255,11 +259,15 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_default_failing_to_run_at_all_falls_back_to_the_compiled_in_sequence() {
-        // Simulates "sh isn't available" by using a `hooks_dir` override
-        // that also can't run — proves the *embedded default's own*
-        // execution failure (not a custom script's) reaches
-        // `compiled_in_fallback` rather than collapsing to empty like a
-        // custom script's failure does.
-        assert_eq!(compiled_in_fallback(0xab, 0xcd, 0xef), "\x1b]4;264;rgb:ab/cd/ef\x1b\\");
+        // Actually drives `resolve`'s own fallback branch (not just
+        // `compiled_in_fallback` in isolation, which the previous version of
+        // this test did despite its doc comment claiming otherwise —
+        // adversarial review, 2026-08-09): overriding `$PATH` to a directory
+        // with no `sh` in it makes `Command::new("sh")` fail to spawn at
+        // all, simulating a genuinely broken environment rather than a
+        // custom script's own deliberate failure.
+        let seq = resolve_with_isolated_env(None, 0xab, 0xcd, 0xef, &[("PATH", "/nonexistent-dir-for-this-test-xyz")]).await;
+        assert_eq!(seq, compiled_in_fallback(0xab, 0xcd, 0xef));
+        assert_eq!(seq, "\x1b]4;264;rgb:ab/cd/ef\x1b\\");
     }
 }

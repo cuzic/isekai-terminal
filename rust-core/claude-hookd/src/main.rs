@@ -172,6 +172,18 @@ async fn event_command() -> ExitCode {
         // `Resolve`.
         if is_session_end {
             let (r, g, b) = idle_color.unwrap_or(DEFAULT_IDLE_COLOR);
+            // Note for anyone reading `tab_color`'s/`hooks`'s module docs
+            // alongside this call: their "runs with the daemon process's
+            // environment" claim doesn't apply here specifically — this one
+            // direct write happens in this short-lived `claude-hookd event`
+            // process itself (no daemon involved at all), so a `tab-color`
+            // script invoked from *this* call site sees the actual Claude
+            // Code session's own environment, not some other session's that
+            // happened to win an earlier spawn race. Harmless in practice
+            // (if anything, more accurate), but worth knowing if you're
+            // debugging why `$TERM_PROGRAM` looks different here. This path
+            // also never fires `on-idle` (see `daemon.rs::run`'s startup
+            // self-heal comment for the same non-firing behavior and why).
             delivery::send_tab_color(&delivery, (r, g, b), hooks_dir().as_deref()).await;
         }
         return ExitCode::SUCCESS;
