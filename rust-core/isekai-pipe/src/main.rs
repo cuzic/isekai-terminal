@@ -63,6 +63,52 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// own default) rather than a separately-tracked literal.
 pub(crate) const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS);
 
+/// `--relay-transport <udp|qmux>`: which transport is used to reach the
+/// relay, on whichever leg of the path the subcommand owns —
+/// `connect`'s client→relay-assigned-helper-endpoint leg (`#qmux-leg1`,
+/// `connect::relay_endpoint_factory`) or `serve`'s helper→relay leg
+/// (`#qmux-leg2`, `engine::run_from_args`). Default `Udp`.
+///
+/// Per `ISEKAI_PIPE_DESIGN.md` Epic G/H's "single evidence-gated selection,
+/// no runtime fallback" policy, this is chosen once up front and never
+/// re-picked mid-connection — a `Udp` failure does *not* automatically retry
+/// over `Qmux`. Which leg gets `Qmux` is decided statically much earlier, by
+/// `isekai-bootstrap` assembling the launch command line from an
+/// `#@isekai bootstrap-relay transport=qmux` directive.
+///
+/// `connect` and `serve` each used to declare their own private copy of this
+/// enum — same two variants, same `Default`, same `FromStr`, character-for-
+/// character the same error message — justified by a comment arguing "the
+/// two sides have no other coupling". They do have one: this is a single
+/// CLI flag spelling, parsed out of the same binary's argv, and its accepted
+/// values and diagnostic have to agree between the two subcommands whether
+/// or not anything else does. Two copies could only ever drift apart
+/// silently, so it lives here, at the crate root both halves already reach
+/// into (`crate::install_panic_hook`, `crate::DEFAULT_RESUME_WINDOW`).
+///
+/// `FromStr::Err` is `String` so this stays free of any particular error
+/// library; `engine`'s `anyhow`-based argument parser maps it with
+/// `map_err(|e| anyhow!("{e}"))`, which reproduces its previous message
+/// exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RelayTransportKind {
+    #[default]
+    Udp,
+    Qmux,
+}
+
+impl std::str::FromStr for RelayTransportKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "udp" => Ok(RelayTransportKind::Udp),
+            "qmux" => Ok(RelayTransportKind::Qmux),
+            other => Err(format!("invalid --relay-transport value: {other} (expected udp|qmux)")),
+        }
+    }
+}
+
 fn print_help() {
     println!("isekai-pipe - data plane for isekai-ssh");
     println!();

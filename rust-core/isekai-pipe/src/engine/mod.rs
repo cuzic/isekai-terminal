@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use attach_runtime::{AttachRuntime, EstablishedLease, HelloOutcome};
 use base64::Engine as _;
+use crate::RelayTransportKind;
 use hmac::{Hmac, Mac};
 use isekai_protocol::attach::{
     attach_hello_proof_transcript, cancel_attach_proof_transcript, decode_attach_activate, decode_attach_hello,
@@ -67,27 +68,6 @@ const ALPN: &[u8] = b"isekai-pipe/1";
 const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// See `Args::relay_transport`'s doc comment for the design rationale
-/// (evidence-gated opt-in, not a runtime fallback).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum RelayTransportKind {
-    #[default]
-    Udp,
-    Qmux,
-}
-
-impl std::str::FromStr for RelayTransportKind {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "udp" => Ok(RelayTransportKind::Udp),
-            "qmux" => Ok(RelayTransportKind::Qmux),
-            other => Err(anyhow!("invalid --relay-transport value: {other} (expected udp|qmux)")),
-        }
-    }
-}
 
 struct Args {
     target: SocketAddr,
@@ -338,7 +318,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
             "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
             "--relay-transport" => {
-                relay_transport = next_val(&mut iter, "--relay-transport")?.parse()?;
+                // `RelayTransportKind::Err`は`String`(`crate::RelayTransportKind`
+                // のdocs参照)なので、この`anyhow`ベースのパーサー用に包み直す。
+                // メッセージ本文は以前この関数が自前で持っていたものと同一。
+                relay_transport = next_val(&mut iter, "--relay-transport")?
+                    .parse::<RelayTransportKind>()
+                    .map_err(|e| anyhow!("{e}"))?;
             }
             "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
             "--relay-jwt-file" => relay_jwt_file = Some(next_val(&mut iter, "--relay-jwt-file")?),

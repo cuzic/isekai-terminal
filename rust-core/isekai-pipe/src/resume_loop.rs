@@ -20,7 +20,8 @@ use isekai_transport::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::connect::{attach_stale_trust_signal, relay_endpoint_factory, RelayTransportKind};
+use crate::connect::{attach_stale_trust_signal, relay_endpoint_factory};
+use crate::RelayTransportKind;
 use crate::DEFAULT_RESUME_WINDOW;
 
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
