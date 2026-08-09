@@ -1691,13 +1691,7 @@ fn apply_cli_overrides(host_config: &mut openssh_config::HostConfig, ssh_args: &
 /// `openssh_config::HostConfig`. First occurrence wins per keyword.
 fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
     let mut overrides = CliOverrides::default();
-    let mut i = 0;
-    while i < ssh_args.len() {
-        let arg = ssh_args[i].as_str();
-        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
-            break;
-        }
-        let value = ssh_args.get(i + 1).map(String::as_str);
+    for (arg, value) in ssh_options_before_destination(ssh_args) {
         match (arg, value) {
             ("-p", Some(v)) => {
                 let port = v
@@ -1719,7 +1713,6 @@ fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
             }
             _ => {}
         }
-        i += ssh_option_width(arg);
     }
     Ok(overrides)
 }
@@ -1782,25 +1775,12 @@ fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()
 /// Finds an explicit `-F <path>` in `ssh_args` (the portion before the
 /// destination — mirroring `ssh_args_through_destination`'s scope, since a
 /// `-F` appearing *after* the destination is a remote command argument, not
-/// an option). Walks option widths the same way `find_destination_index`
-/// does so this stays in sync with `ssh_option_width` if that list of
-/// value-taking flags ever changes. Only recognizes the spaced `-F value`
-/// form (matching this function's only two callers/tests) — a concatenated
-/// `-Fvalue` isn't handled by `find_destination_index` either, so this is
-/// consistent with the wrapper's existing `-F` support, not a new gap.
+/// an option). Only recognizes the spaced `-F value` form (matching this
+/// function's only two callers/tests) — a concatenated `-Fvalue` isn't
+/// handled by `find_destination_index` either, so this is consistent with
+/// the wrapper's existing `-F` support, not a new gap.
 fn dash_f_config_path(ssh_args: &[String]) -> Option<PathBuf> {
-    let mut i = 0;
-    while i < ssh_args.len() {
-        let arg = ssh_args[i].as_str();
-        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
-            return None;
-        }
-        if arg == "-F" {
-            return ssh_args.get(i + 1).map(PathBuf::from);
-        }
-        i += ssh_option_width(arg);
-    }
-    None
+    ssh_options_before_destination(ssh_args).find(|(arg, _)| *arg == "-F")?.1.map(PathBuf::from)
 }
 
 async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {
@@ -2130,18 +2110,76 @@ pub(crate) fn shell_quote(value: &str) -> String {
 }
 
 fn find_destination_index(args: &[String]) -> Option<usize> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            return (i + 1 < args.len()).then_some(i + 1);
-        }
-        if !arg.starts_with('-') || arg == "-" {
-            return Some(i);
-        }
-        i += ssh_option_width(arg);
+    let mut walk = ssh_options_before_destination(args);
+    for _ in walk.by_ref() {}
+    let i = walk.stopped_at();
+    match args.get(i) {
+        // `--` explicitly terminates option parsing (`ssh(1)`'s own
+        // convention): the destination is whatever immediately follows it,
+        // if anything.
+        Some(arg) if arg == "--" => (i + 1 < args.len()).then_some(i + 1),
+        // A non-option arg (or a bare `-`, treated as non-option — matches
+        // `ssh_options_before_destination`'s own stopping condition) is the
+        // destination itself.
+        Some(_) => Some(i),
+        // Ran out of args without ever finding `--` or a non-option — every
+        // arg was consumed as an option (or an option's value).
+        None => None,
     }
-    None
+}
+
+/// Walks `args`' leading `ssh(1)` options (skipping each value-taking
+/// flag's value via [`ssh_option_width`]), yielding `(option, value)` for
+/// every option encountered before the destination — mirrors `ssh(1)`'s own
+/// argv shape: `--`, or the first arg that isn't itself an option (or is a
+/// bare `-`), ends option parsing, and everything from there on is the
+/// destination and (optionally) a trailing remote command, never another
+/// option. `value` is `Some` only for a value-taking flag (`ssh_option_width`
+/// returning `2`) that actually has a following arg; a non-value-taking flag
+/// always yields `None` regardless of what follows it.
+///
+/// [`find_destination_index`], [`dash_f_config_path`], and
+/// [`collect_cli_overrides`] each used to hand-roll this exact walk (the
+/// same `arg == "--" || !arg.starts_with('-') || arg == "-"` stopping guard,
+/// the same `i += ssh_option_width(arg)` stepping), differing only in what
+/// they did with each option — or, for `find_destination_index`, in wanting
+/// the stopping index rather than the pairs themselves, which
+/// [`SshOptionsBeforeDestination::stopped_at`] exposes for exactly that
+/// caller.
+fn ssh_options_before_destination(args: &[String]) -> SshOptionsBeforeDestination<'_> {
+    SshOptionsBeforeDestination { args, i: 0 }
+}
+
+struct SshOptionsBeforeDestination<'a> {
+    args: &'a [String],
+    i: usize,
+}
+
+impl<'a> Iterator for SshOptionsBeforeDestination<'a> {
+    type Item = (&'a str, Option<&'a str>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let arg = self.args.get(self.i)?.as_str();
+        if arg == "--" || !arg.starts_with('-') || arg == "-" {
+            return None;
+        }
+        let width = ssh_option_width(arg);
+        let value = if width == 2 { self.args.get(self.i + 1).map(String::as_str) } else { None };
+        self.i += width;
+        Some((arg, value))
+    }
+}
+
+impl SshOptionsBeforeDestination<'_> {
+    /// The index in `args` where iteration stopped — either `--`'s index, a
+    /// non-option's (the destination itself), or `args.len()` if every arg
+    /// was consumed as an option/its value. Only meaningful once the
+    /// iterator is exhausted; [`find_destination_index`] is the only caller
+    /// that needs it (the other two consumers only care about the `(option,
+    /// value)` pairs themselves).
+    fn stopped_at(&self) -> usize {
+        self.i
+    }
 }
 
 fn ssh_option_width(arg: &str) -> usize {
