@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use attach_runtime::{AttachRuntime, EstablishedLease, HelloOutcome};
 use base64::Engine as _;
+use crate::RelayTransportKind;
 use hmac::{Hmac, Mac};
 use isekai_protocol::attach::{
     attach_hello_proof_transcript, cancel_attach_proof_transcript, decode_attach_activate, decode_attach_hello,
@@ -67,27 +68,6 @@ const ALPN: &[u8] = b"isekai-pipe/1";
 const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// See `Args::relay_transport`'s doc comment for the design rationale
-/// (evidence-gated opt-in, not a runtime fallback).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum RelayTransportKind {
-    #[default]
-    Udp,
-    Qmux,
-}
-
-impl std::str::FromStr for RelayTransportKind {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "udp" => Ok(RelayTransportKind::Udp),
-            "qmux" => Ok(RelayTransportKind::Qmux),
-            other => Err(anyhow!("invalid --relay-transport value: {other} (expected udp|qmux)")),
-        }
-    }
-}
 
 struct Args {
     target: SocketAddr,
@@ -338,7 +318,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
             "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
             "--relay-transport" => {
-                relay_transport = next_val(&mut iter, "--relay-transport")?.parse()?;
+                // `RelayTransportKind::Err`は`String`(`crate::RelayTransportKind`
+                // のdocs参照)なので、この`anyhow`ベースのパーサー用に包み直す。
+                // メッセージ本文は以前この関数が自前で持っていたものと同一。
+                relay_transport = next_val(&mut iter, "--relay-transport")?
+                    .parse::<RelayTransportKind>()
+                    .map_err(|e| anyhow!("{e}"))?;
             }
             "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
             "--relay-jwt-file" => relay_jwt_file = Some(next_val(&mut iter, "--relay-jwt-file")?),
@@ -976,7 +961,7 @@ async fn handle_cancel_attach(
 ) -> Result<()> {
     let cancel = decode_cancel_attach(&cancel_bytes).context("failed to decode CancelAttach")?;
     let transcript = cancel_attach_proof_transcript(&cancel.session_id, cancel.generation, &cancel.attempt_id);
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
+    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"", &transcript).await?;
     if !cancel.proof.ct_eq(&AttachProof::new(expected)) {
         return Err(anyhow!("CancelAttach proof mismatch, ignoring"));
     }
@@ -1166,7 +1151,7 @@ async fn handle_attach_stream(
         &hello.attempt_id,
         hello.requested_resume_grace_secs,
     );
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
+    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"", &transcript).await?;
     if !hello.proof.ct_eq(&AttachProof::new(expected)) {
         reject_attach(&mut send, AttachRejectReason::Auth).await;
         return Err(anyhow!("ATTACH_HELLO proof mismatch, rejecting"));
@@ -1288,31 +1273,13 @@ async fn handle_attach_stream(
     let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
     control_task.abort();
 
-    match outcome {
-        RelayOutcome::TcpDied => {
-            lease.release().await;
-            sessions.remove(&session_id_bytes).await;
-            if let Some(guard) = table_guard {
-                guard.disarm();
-            }
-        }
-        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
-            // まだ`Established`のまま(=fencing slotを保持したまま)にする —
-            // 一致する`RESUME`がこのsession_idの元へ戻ってこられるように。
-            lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            drop(session);
-            // park済み(=parked_sinceがSome)になったので、既存の
-            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
-            // 回収可能な状態になった — `table_guard`のDropフォールバックは
-            // もう不要。
-            if let Some(guard) = table_guard {
-                guard.disarm();
-            }
-        }
-    }
+    // `handle_resume_stream`の末尾と全く同じ後始末 — 以前はここに同じ
+    // `TcpDied`/`DataStreamDied`分岐を独立に書き下していたが、
+    // 「後始末を2箇所がそれぞれ覚えていなければならない」形そのものが
+    // `.claude/rules/always-connects.md`が記録している過去2件の
+    // fencing slotリーク(`sweep_expired_parked`/`insert_existing`)の
+    // 原因なので、共通のヘルパーへ一本化した。
+    finish_or_park_session(&sessions, lease, table_guard, session_id_bytes, handle, outcome).await;
     Ok(())
 }
 
@@ -1322,12 +1289,13 @@ async fn handle_attach_stream(
 /// `token`=session_id・`auth_blob`=resume proof はquicmuxにとって完全に
 /// opaqueなbytesなので、その意味付け(HMAC検証・SessionTable/AttachRuntime
 /// との突き合わせ)はすべてこの関数(呼び出し側)の責務になる —
-/// `quicmux::resume`モジュールdocsの「ResumeAcceptorが担う一点」そのもの
-/// (ただしここでは`dyn ResumeAcceptor`を経由せず、`decode_resume_request`/
-/// `respond_resume_*`を直接呼んでいる。理由: `handle_connection`は既に
-/// ATTACH_HELLO/CancelAttachと同じ一本のstreamの先頭1byteで種別分岐して
-/// いるため、`accept_resume`のように新規`accept_bi()`を自前で行う版は
-/// 使えない)。
+/// `quicmux::resume`モジュールdocsが「呼び出し側が持つ」と定めている責務
+/// そのもの。`handle_connection`は既にATTACH_HELLO/CancelAttachと同じ一本の
+/// streamの先頭1byteで種別分岐しており、frame typeバイトもstream自体も
+/// 消費済みなので、自前で`accept_bi()`を行うラッパーは構造的に使えない —
+/// これがquicmux側に`accept_resume`/`ResumeAcceptor`(かつてこの経路と並行して
+/// 存在し、production呼び出し元が1つも無かった)を置かず、
+/// `decode_resume_request`/`respond_resume_*`を直接公開している理由でもある。
 async fn handle_resume_stream(
     conn: AnyMuxConnection,
     mut send: AnyByteStreamWriteHalf,
@@ -1351,10 +1319,11 @@ async fn handle_resume_stream(
     })?;
     // quicmuxはauth_blobの中身を一切解釈しない — このHMAC検証はisekai-pipe
     // 独自のポリシーとしてここで行う(`quicmux::resume`モジュールdocs参照)。
-    let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    mac.update(&session_id);
-    let expected = mac.finalize().into_bytes();
+    // 計算式は上のコメントどおり HMAC(secret, exporter || session_id) で不変。
+    // ATTACH側と同じ`proof_from_exporter`を通す(`extra`=session_id)。
+    // `exporter`は`decode_resume_request`にも渡す必要があるため、
+    // `compute_proof`ではなくこちらを使って再exportを避ける。
+    let expected = proof_from_exporter(&session_secret, &exporter, &session_id);
     if request.auth_blob.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::Auth).await;
         return Err(anyhow!("resume proof mismatch, rejecting"));
@@ -1467,7 +1436,7 @@ async fn handle_resume_stream(
     )
     .await;
     control_task.abort();
-    finish_or_park_session(&sessions, lease, table_guard, Some(session_id), handle, outcome).await;
+    finish_or_park_session(&sessions, lease, Some(table_guard), session_id, handle, outcome).await;
     Ok(())
 }
 
@@ -1499,8 +1468,24 @@ fn effective_resume_grace(requested_resume_grace_secs: u32, max_resume_grace_sec
     }
 }
 
-/// `session_secret` と QUIC connection の exporter から proof を計算する
-/// （data stream HELLO と control stream CONTROL_HELLO で共通のロジック）。
+/// `proof = HMAC-SHA256(session_secret, exporter || extra)` — この
+/// バイナリが計算する proof は **すべて** この1関数を通る
+/// (`isekai_transport::proof::compute_proof`の`extra`パラメータと対称)。
+///
+/// 以前はここに3つの実装が並んでいた: `extra`なしの`compute_proof`
+/// (CONTROL_HELLO用)、`extra`=transcriptの`compute_attach_proof`
+/// (ATTACH_HELLO/CancelAttach用)、そして`handle_resume_stream`が
+/// `extra`=session_idで手書きしていたもの。3つとも同じ鍵・同じexporter・
+/// 同じ順序でHMACへ食わせていたので、`extra`の1パラメータだけが違う。
+///
+/// **ワイヤ互換性**: 既に配布済みのヘルパー/クライアントと相互運用する
+/// ため、HMACへ食わせるバイト列とその順序は絶対に変えてはならない
+/// (変えると既存セッションのresumeが一斉に壊れる —
+/// `.claude/rules/always-connects.md`)。`extra`が空の場合に
+/// `mac.update(&[])`を呼ぶのは、呼ばないのと完全に同一(HMACは長さ0の
+/// 入力を吸収しても内部状態が変わらない)なので、旧`compute_proof`とも
+/// バイト単位で一致する。
+///
 /// `quicmux::AnyMuxConnection::export_keying_material`が非同期(qmuxバックエンドは
 /// 一度captureした値を返すだけだが、noqバックエンドは呼び出し毎に計算するため
 /// 将来的な非同期化に備えて両方ともasync)になったため、この関数もasyncにした。
@@ -1509,29 +1494,28 @@ async fn compute_proof(
     session_secret: &[u8; 32],
     label: &[u8],
     context: &[u8],
+    extra: &[u8],
 ) -> Result<[u8; 32]> {
     let exporter = conn
         .export_keying_material(label, context)
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(proof_from_exporter(session_secret, &exporter, extra))
 }
 
-/// `ATTACH_HELLO`/`CancelAttach`のproof計算(`#18`): 通常の`compute_proof`と
-/// 同じexporterを使うが、`isekai_transport::proof::compute_proof`の`extra`
-/// パラメータと対称になるよう、`transcript`(`attach_hello_proof_transcript`
-/// 等が返すbyte列)をHMACに追加で混ぜ込む。
-async fn compute_attach_proof(conn: &AnyMuxConnection, session_secret: &[u8; 32], transcript: &[u8]) -> Result<[u8; 32]> {
-    let exporter = conn
-        .export_keying_material(EXPORTER_LABEL, b"")
-        .await
-        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+/// [`compute_proof`]のHMAC部分だけ。`handle_resume_stream`専用に切り出して
+/// ある——あちらはexporterを`quicmux::decode_resume_request`の
+/// `conn_exporter`引数にも渡す必要があるため、既に手元にあるexporterを
+/// そのまま使う(`compute_proof`を呼ぶと`export_keying_material`が2回
+/// 走ることになる。TLS exporterは決定的なので結果は同じだが、
+/// 元の実装は1回しか呼んでおらず、そこを変える理由が無い)。
+/// MACの計算自体はこの1箇所にしか無いので、`extra`の混ぜ方が
+/// 経路ごとにずれることはない。
+fn proof_from_exporter(session_secret: &[u8; 32], exporter: &[u8], extra: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    mac.update(transcript);
-    Ok(mac.finalize().into_bytes().into())
+    mac.update(exporter);
+    mac.update(extra);
+    mac.finalize().into_bytes().into()
 }
 
 /// control stream を accept し、`CONTROL_HELLO` を検証して`CONTROL_ACK`を返す。
@@ -1553,7 +1537,8 @@ async fn accept_control_stream(
     if hello[0] != resume::CONTROL_HELLO {
         return Err(anyhow!("unexpected control frame type: {:#x}", hello[0]));
     }
-    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"").await?;
+    // CONTROL_HELLOのproofは`extra`なし = HMAC(secret, exporter)。
+    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"", b"").await?;
     if hello[1..33].ct_eq(&expected).unwrap_u8() != 1 {
         return Err(anyhow!("CONTROL_HELLO proof mismatch"));
     }
@@ -1573,22 +1558,31 @@ async fn accept_control_stream(
 /// `Session::parked_tcp` に戻して resume を待てるようにし(`AttachArbiter`は
 /// `Established`のまま、`lease`もfencing slotを占有し続ける)、TCP 自体が
 /// 死んでいるなら`AttachRuntime::relay_ended`でslotを解放しテーブルから
-/// 破棄する。`id`が`None`なのは起こり得ない(#18-4以降、session_idは常に
-/// `ATTACH_HELLO`の時点で存在する)が、呼び出し側の型を単純に保つため
-/// `Option`のまま残す。
+/// 破棄する。
+///
+/// `handle_attach_stream`(新規ATTACH)と`handle_resume_stream`(RESUME)の
+/// **唯一**の後始末経路。「どちらの呼び出し元も同じ後始末を独立に覚えている」
+/// 形は`.claude/rules/always-connects.md`が禁じている(過去2件の
+/// fencing slotリークが実際にその形で起きた)。
+///
+/// `id`は以前`Option<SessionId>`だったが、`None`分岐は#18-4以降(session_idは
+/// 常に`ATTACH_HELLO`の時点で存在する)到達不能な死んだ分岐であり、しかも
+/// その分岐は`lease.keep()`だけしてpark情報を書かない
+/// =slotを`Established`のまま孤児化させる、まさにこのルールが禁じる
+/// 挙動だったため、`Option`ごと取り除いた(現在の呼び出し元2箇所はどちらも
+/// 具体的な`session_id`を持っている)。
+///
+/// `table_guard`が`None`になるのは`insert_existing`が`InsertOutcome::Rejected`
+/// を返した場合だけ(このsessionは`SessionTable`に載っていない=守るエントリが
+/// 無い)。その場合の`sessions.remove`は空振りするだけで害はない。
 async fn finish_or_park_session(
     sessions: &SessionTable,
     lease: EstablishedLease,
-    table_guard: SessionTableEntryGuard,
-    id: Option<resume::SessionId>,
+    table_guard: Option<SessionTableEntryGuard>,
+    id: resume::SessionId,
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
-    let Some(id) = id else {
-        lease.keep();
-        table_guard.disarm();
-        return;
-    };
     match outcome {
         RelayOutcome::TcpDied => {
             log::info!(
@@ -1597,7 +1591,9 @@ async fn finish_or_park_session(
             );
             lease.release().await;
             sessions.remove(&id).await;
-            table_guard.disarm();
+            if let Some(table_guard) = table_guard {
+                table_guard.disarm();
+            }
         }
         RelayOutcome::DataStreamDied {
             tcp_read,
@@ -1612,9 +1608,13 @@ async fn finish_or_park_session(
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
             drop(session);
-            // park済みになったので、既存のsweep_expired_parked/insert_existing
-            // のLRU立ち退きで正しく回収可能な状態になった。
-            table_guard.disarm();
+            // park済み(=parked_sinceがSome)になったので、既存の
+            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
+            // 回収可能な状態になった — `table_guard`のDropフォールバックは
+            // もう不要。
+            if let Some(table_guard) = table_guard {
+                table_guard.disarm();
+            }
             // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
             // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
         }

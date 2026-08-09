@@ -6,7 +6,6 @@
 //! needed a background task (`spawn_reconnect_signal`) rather than racing
 //! `run_data_pump` directly in one `select!`.
 
-use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,7 +20,8 @@ use isekai_transport::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::connect::{attach_stale_trust_signal, relay_endpoint_factory, RelayTransportKind};
+use crate::connect::{attach_stale_trust_signal, relay_endpoint_factory};
+use crate::RelayTransportKind;
 use crate::DEFAULT_RESUME_WINDOW;
 
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
@@ -1180,7 +1180,19 @@ async fn pump_c2h(
             .write_all(&buf[..n])
             .await
             .context("writing to remote stream failed")?;
-        replay.lock().unwrap().append(&buf[..n]);
+        // `read_len`が`remaining_capacity()`で頭打ちにしてあり、`advance_start`は
+        // 空きを増やすことしかしないため、ここが`false`になることは無い。それでも
+        // 握り潰さないのは、もし起きた場合の被害が「replayバッファに載らないまま
+        // QUICへ送出済みのバイトができる」=`end_offset()`由来の
+        // `client_sent_offset`がhelper側とずれる、というresume不能状態だから
+        // (`.claude/rules/always-connects.md`)。接続ごと畳んでしまえば
+        // `run_resume_loop`が再接続からやり直せるので、そちらの方が安全側に倒れる。
+        if !replay.lock().unwrap().append(&buf[..n]) {
+            anyhow::bail!(
+                "C2H replay buffer had no room after a capacity-bounded read ({n} bytes); \
+                 dropping this connection rather than desyncing client_sent_offset"
+            );
+        }
     }
 }
 
@@ -1207,88 +1219,37 @@ async fn pump_h2c(
     }
 }
 
-struct C2hReplayBuffer {
-    data: VecDeque<u8>,
-    start_offset: u64,
-    capacity: usize,
-}
-
-impl C2hReplayBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            data: VecDeque::with_capacity(capacity.min(1 << 20)),
-            start_offset: 0,
-            capacity,
-        }
-    }
-
-    fn is_full(&self) -> bool {
-        self.data.len() >= self.capacity
-    }
-
-    fn remaining_capacity(&self) -> usize {
-        self.capacity.saturating_sub(self.data.len())
-    }
-
-    fn append(&mut self, bytes: &[u8]) {
-        debug_assert!(
-            self.data.len() + bytes.len() <= self.capacity,
-            "C2hReplayBuffer::append called past capacity"
-        );
-        self.data.extend(bytes.iter().copied());
-    }
-
-    fn advance_start(&mut self, confirmed_offset: u64) {
-        let wanted = confirmed_offset.saturating_sub(self.start_offset) as usize;
-        let drop_count = wanted.min(self.data.len());
-        self.data.drain(..drop_count);
-        self.start_offset += drop_count as u64;
-        if confirmed_offset > self.start_offset {
-            self.start_offset = confirmed_offset;
-        }
-    }
-
-    fn end_offset(&self) -> u64 {
-        self.start_offset + self.data.len() as u64
-    }
-
-    fn replay_from(&self, from: u64) -> Option<Vec<u8>> {
-        if from < self.start_offset || from > self.end_offset() {
-            return None;
-        }
-        let skip = (from - self.start_offset) as usize;
-        Some(self.data.iter().skip(skip).copied().collect())
-    }
-}
+/// C→H 方向（client → helper）に送出したバイト列の再送用バッファ。
+///
+/// 実体は[`quicmux::ReplayBuffer`]。以前はこのファイルに専用の
+/// `VecDeque<u8>`+`start_offset`+`capacity`実装を持っていたが、
+/// `engine/resume.rs`の`OutputBuffer`・quicmuxの`ReplayBuffer`と
+/// ほぼ同一で、しかも`advance_start`の範囲外挙動だけが静かに
+/// 食い違っていた(こちらは`start_offset`を`confirmed_offset`まで
+/// 飛ばす、quicmux/`OutputBuffer`はend_offsetでclampする)。
+/// clamp側へ一本化した — 詳しい理由は
+/// [`quicmux::ReplayBuffer::advance_start`]のdocs参照。
+///
+/// ここでjump-aheadが問題にならなかったのは、このファイル固有の構造の
+/// おかげでしかない: `pump_c2h`は単一タスク内で「appendしてから次の周回で
+/// advance_start」の順に実行するため、`engine/mod.rs`側にある
+/// 「peerへ送出済みだがappend前」の窓がそもそも開かない。加えて
+/// `replay_and_advance`が`replay_from`で範囲外offsetを先に弾くため、
+/// この分岐は到達不能だった。
+type C2hReplayBuffer = quicmux::ReplayBuffer;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn replay_buffer_replays_unconfirmed_suffix() {
-        let mut buffer = C2hReplayBuffer::new(16);
-        buffer.append(b"hello ");
-        buffer.append(b"world");
-
-        assert_eq!(buffer.end_offset(), 11);
-        assert_eq!(buffer.replay_from(6).unwrap(), b"world");
-        buffer.advance_start(6);
-        assert_eq!(buffer.remaining_capacity(), 11);
-        assert!(buffer.replay_from(0).is_none());
-    }
-
-    #[test]
-    fn replay_buffer_replay_from_beyond_end_offset_is_none() {
-        // The other boundary of `replay_from`'s range check (the "helper
-        // claims to have committed bytes this client never even sent" case
-        // `replay_and_advance` must treat as a protocol inconsistency, not
-        // "nothing to replay" — codex review, quicmux-server-resume).
-        let mut buffer = C2hReplayBuffer::new(16);
-        buffer.append(b"hello");
-        assert_eq!(buffer.end_offset(), 5);
-        assert!(buffer.replay_from(6).is_none());
-    }
+    // `C2hReplayBuffer`(= `quicmux::ReplayBuffer`)自体の
+    // append/replay_from/advance_start/容量まわりのユニットテストは、型の
+    // 定義と同じ場所(`quicmux::resume`)へ一本化した。ここにあった
+    // `replay_buffer_replays_unconfirmed_suffix`/
+    // `replay_buffer_replay_from_beyond_end_offset_is_none`/
+    // `replay_buffer_backpressures_at_capacity`はそちらと1対1で重複していた。
+    // isekai-pipe側にしか無いロジック(`replay_and_advance`が範囲外の
+    // committed_offsetをどう扱うか)のテストは下に残してある。
 
     #[test]
     fn resume_window_for_zero_falls_back_to_the_default_window_instead_of_zero_seconds() {
@@ -1302,18 +1263,6 @@ mod tests {
     #[test]
     fn resume_window_for_a_real_value_uses_it_verbatim() {
         assert_eq!(resume_window_for(180), Duration::from_secs(180));
-    }
-
-    #[test]
-    fn replay_buffer_backpressures_at_capacity() {
-        let mut buffer = C2hReplayBuffer::new(4);
-        buffer.append(b"abcd");
-
-        assert!(buffer.is_full());
-        assert_eq!(buffer.remaining_capacity(), 0);
-        buffer.advance_start(2);
-        assert!(!buffer.is_full());
-        assert_eq!(buffer.replay_from(2).unwrap(), b"cd");
     }
 
     /// A `NetworkChangeMonitor` that fires exactly one event, then never
@@ -1713,7 +1662,7 @@ mod tests {
             let mut stream = conn.open_bi().await.unwrap();
 
             let replay = Mutex::new(C2hReplayBuffer::new(1024));
-            replay.lock().unwrap().append(b"hello");
+            assert!(replay.lock().unwrap().append(b"hello"));
 
             // The helper claims committed_offset=999, but this client never
             // sent more than 5 bytes — a protocol inconsistency that must
@@ -1732,7 +1681,7 @@ mod tests {
             let mut stream = conn.open_bi().await.unwrap();
 
             let replay = Mutex::new(C2hReplayBuffer::new(1024));
-            replay.lock().unwrap().append(b"hello world");
+            assert!(replay.lock().unwrap().append(b"hello world"));
 
             let ok = replay_and_advance(&replay, 6, &mut stream).await;
             assert!(ok);

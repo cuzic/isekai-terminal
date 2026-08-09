@@ -25,7 +25,7 @@ use isekai_transport::{
 use std::process::ExitCode;
 
 use crate::resume_loop::{relay_stdio, run_relay_resumable, run_relay_resumable_with_fallback, run_stun_p2p_with_fallback};
-use crate::{DEFAULT_RESUME_WINDOW, EX_USAGE, EX_UNAVAILABLE};
+use crate::{RelayTransportKind, DEFAULT_RESUME_WINDOW, EX_USAGE, EX_UNAVAILABLE};
 
 #[derive(Debug)]
 struct ConnectLaunch {
@@ -52,14 +52,9 @@ struct ConnectLaunch {
     experimental_network_rebind: bool,
     /// `--relay-transport <udp|qmux>` (`#qmux-leg1`, default `Udp`): which
     /// transport this side uses to reach the relay-assigned `isekai-helper`
-    /// endpoint. Mirrors `engine::RelayTransportKind` (`isekai-pipe serve`'s
-    /// own equivalent for the `isekai-helper→relay` leg, `#qmux-leg2`) —
-    /// deliberately a separate, locally-scoped type rather than shared
-    /// across the `connect`/`serve` sides of this binary, since the two
-    /// sides have no other coupling. Per `ISEKAI_PIPE_DESIGN.md` Epic G/H's
-    /// "single evidence-gated selection, no runtime fallback" policy, this
-    /// is chosen once up front — never retried automatically if the `Udp`
-    /// path fails.
+    /// endpoint. Shares `crate::RelayTransportKind` with `isekai-pipe
+    /// serve`'s own `isekai-helper→relay` leg (`#qmux-leg2`) — see that
+    /// type's docs, including why the two are one type and not two.
     relay_transport: RelayTransportKind,
     /// `--bind-port-range <START>-<END>`: narrows this connection's local
     /// QUIC socket to that inclusive UDP port range instead of an
@@ -81,26 +76,6 @@ struct ConnectLaunch {
     /// stun` (STUN P2P has no resume/control-stream concept at all, see
     /// `stun_p2p.rs`'s module docs).
     tethering_interface: Option<String>,
-}
-
-/// See `ConnectLaunch::relay_transport`'s doc comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum RelayTransportKind {
-    #[default]
-    Udp,
-    Qmux,
-}
-
-impl std::str::FromStr for RelayTransportKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "udp" => Ok(RelayTransportKind::Udp),
-            "qmux" => Ok(RelayTransportKind::Qmux),
-            other => Err(format!("invalid --relay-transport value: {other} (expected udp|qmux)")),
-        }
-    }
 }
 
 /// `connect_via_relay_resumable`/`_with_fallback`/`reconnect_and_resume`
@@ -752,33 +727,58 @@ fn intent_session_secret_b64(transport: &IntentTransport) -> &str {
 /// point (including which transport variant to dial) reads `candidate.route`,
 /// not `intent.transport`, directly.
 async fn resolve_single_candidate(intent: &ConnectionIntent) -> Result<Candidate> {
-    // `isekai_transport::candidate_provider` reads a `TransportIntent`
-    // (`#31`), not this crate's SSH-specific `ConnectionIntent` — convert at
-    // this boundary so `isekai-transport` never needs to depend on
-    // `isekai-pipe-core`.
+    let candidates = gather_sorted(&isekai_transport::LegacyIntentProvider, intent, "candidate discovery").await?;
+
+    let [candidate] = candidates.as_slice() else {
+        anyhow::bail!(
+            "isekai-pipe connect: expected exactly one candidate from the legacy provider, got {}",
+            candidates.len()
+        );
+    };
+    Ok(candidate.clone())
+}
+
+/// The candidate-gathering preamble every `resolve_*_candidates` function
+/// shares: convert this crate's SSH-specific [`ConnectionIntent`] into the
+/// `TransportIntent` `isekai_transport::candidate_provider` actually reads
+/// (`#31` — converting at this boundary is what keeps `isekai-transport`
+/// from having to depend on `isekai-pipe-core`), build the [`GatherContext`],
+/// run `provider`, feed the batch through a fresh [`CandidatePool`], and
+/// return the candidates sorted by priority rank.
+///
+/// `label` names this gather in both error messages ("`{label}` failed").
+///
+/// The sort is explicit rather than relying on [`CandidatePool`]'s own
+/// (currently coincidentally priority-matching) internal ordering: the
+/// fallback order is a correctness property — `ISEKAI_PIPE_DESIGN.md` task
+/// #12's acceptance criteria for relay, mirrored by `#11` for STUN, require
+/// deterministic configured-order fallback — not an implementation detail to
+/// leave implicit. `resolve_single_candidate` asserts exactly one candidate
+/// came back, so sorting is a no-op for it either way.
+async fn gather_sorted(
+    provider: &dyn CandidateProvider,
+    intent: &ConnectionIntent,
+    label: &str,
+) -> Result<Vec<Candidate>> {
     let transport_intent = intent.to_transport_intent();
     let ctx = GatherContext {
         generation: CandidateGeneration::INITIAL,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         intent: &transport_intent,
     };
-    let batch = isekai_transport::LegacyIntentProvider
+    let batch = provider
         .gather(&ctx)
         .await
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: candidate discovery failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: {label} failed: {e}"))?;
 
     let mut pool = CandidatePool::new();
     let snapshot = pool
         .replace_generation(batch)
         .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
 
-    let [candidate] = snapshot.candidates.as_slice() else {
-        anyhow::bail!(
-            "isekai-pipe connect: expected exactly one candidate from the legacy provider, got {}",
-            snapshot.candidates.len()
-        );
-    };
-    Ok(candidate.clone())
+    let mut candidates = snapshot.candidates;
+    candidates.sort_by_key(|c| c.priority.rank);
+    Ok(candidates)
 }
 
 /// Runs `intent.relay_endpoints` through `ConfigRelayProvider` → `CandidatePool`,
@@ -794,30 +794,7 @@ async fn resolve_relay_candidates(
     intent: &ConnectionIntent,
     session_secret: &[u8],
 ) -> Result<Vec<SequentialRelayCandidate>> {
-    let transport_intent = intent.to_transport_intent();
-    let ctx = GatherContext {
-        generation: CandidateGeneration::INITIAL,
-        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-        intent: &transport_intent,
-    };
-    let batch = ConfigRelayProvider
-        .gather(&ctx)
-        .await
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: relay candidate discovery failed: {e}"))?;
-
-    let mut pool = CandidatePool::new();
-    let snapshot = pool
-        .replace_generation(batch)
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
-
-    // Explicit sort by priority rank, rather than relying on
-    // `CandidatePool`'s own (currently coincidentally priority-matching)
-    // internal ordering — the fallback order is a correctness property
-    // (`ISEKAI_PIPE_DESIGN.md` task #12's acceptance criteria: deterministic,
-    // configured-order fallback), not an implementation detail to leave
-    // implicit.
-    let mut candidates = snapshot.candidates;
-    candidates.sort_by_key(|c| c.priority.rank);
+    let candidates = gather_sorted(&ConfigRelayProvider, intent, "relay candidate discovery").await?;
 
     candidates
         .into_iter()
@@ -857,29 +834,7 @@ async fn resolve_stun_candidates(
         anyhow::bail!("isekai-pipe connect: resolve_stun_candidates requires an IntentTransport::StunP2p intent (bug)");
     };
 
-    let transport_intent = intent.to_transport_intent();
-    let ctx = GatherContext {
-        generation: CandidateGeneration::INITIAL,
-        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-        intent: &transport_intent,
-    };
-    let batch = ConfigStunProvider
-        .gather(&ctx)
-        .await
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: STUN candidate discovery failed: {e}"))?;
-
-    let mut pool = CandidatePool::new();
-    let snapshot = pool
-        .replace_generation(batch)
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
-
-    // Explicit sort by priority rank — same rationale as
-    // `resolve_relay_candidates`'s own sort (`ISEKAI_PIPE_DESIGN.md` task
-    // `#12`'s acceptance criteria, mirrored for `#11`): deterministic,
-    // configured-order fallback is a correctness property, not an
-    // implementation detail to leave implicit.
-    let mut candidates = snapshot.candidates;
-    candidates.sort_by_key(|c| c.priority.rank);
+    let candidates = gather_sorted(&ConfigStunProvider, intent, "STUN candidate discovery").await?;
 
     let target = StunP2pTarget {
         peer_addr: peer_addr.parse().context("isekai-pipe connect: invalid peer_addr in IntentTransport::StunP2p")?,

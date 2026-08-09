@@ -48,11 +48,12 @@
 //!   [`WarmStandbyError::AlreadyPromoting`] immediately rather than racing
 //!   its own resume attempt — the caller should treat that as "someone else
 //!   is already handling this," not retry. This is a client-side efficiency/
-//!   clarity guard, not the sole correctness backstop: the server's own
-//!   `ResumeAcceptor::try_resume` contract (quicmux-server-resume Stage B)
-//!   already makes a second *concurrent* resume attempt for the same
-//!   session fail closed (`UnknownToken`) even if this guard somehow didn't
-//!   exist, since a session can only be "claimed" once server-side.
+//!   clarity guard, not the sole correctness backstop: the server
+//!   (`isekai-pipe serve`'s `handle_resume_stream`) already makes a second
+//!   *concurrent* resume attempt for the same session fail closed
+//!   (`UnknownToken`) even if this guard somehow didn't exist, because it
+//!   claims the session by `parked_tcp.take()` under the session lock — so
+//!   only one attempt can ever find a parked connection to resume onto.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -60,16 +61,15 @@ use std::time::Duration;
 use log::{info, warn};
 use tokio::sync::Mutex;
 
-use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
+use isekai_protocol::offset::{C2hSentOffset, H2cClientDeliveredOffset};
 use isekai_protocol::session_id::SessionId;
-use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, MuxError};
+use quicmux::{AnyMuxConnection, AnyMuxFactory, MuxError};
 
 use crate::physical_interface::InterfaceIndex;
 
 use crate::error::TransportError;
-use crate::proof::compute_proof;
 use crate::relay::RelayTarget;
-use crate::resume::map_reject_reason;
+use crate::resume::{resume_on_connection, ResumeAckOutcome};
 
 /// How long [`WarmStandby::ensure_warm`]'s probe (open a stream, close it)
 /// may take before the standby is judged dead and re-established. Short —
@@ -79,24 +79,20 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A successful [`WarmStandby::promote`]: the resumed connection and data
 /// stream (ready for raw pass-through, exactly like a fresh `HELLO`/`ACK`'d
-/// or `reconnect_and_resume`d connection), plus the offsets the acceptor
+/// or `reconnect_and_resume`d connection), plus the offsets the server
 /// reported so the caller knows what it may safely discard from its own C2H
 /// replay buffer.
-pub struct PromotedConnection {
-    pub connection: AnyMuxConnection,
-    pub data_stream: AnyByteStream,
-    pub helper_committed_offset: C2hHelperCommittedOffset,
-    pub helper_sent_offset: H2cSentOffset,
-}
-
-impl std::fmt::Debug for PromotedConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromotedConnection")
-            .field("helper_committed_offset", &self.helper_committed_offset)
-            .field("helper_sent_offset", &self.helper_sent_offset)
-            .finish_non_exhaustive()
-    }
-}
+///
+/// Literally [`ResumeAckOutcome`]: this used to be a separate struct with
+/// the same four fields, differing only in lacking
+/// [`ResumeAckOutcome::network_rebinder`]. Since both are produced by the
+/// one shared [`resume_on_connection`] and describe the same thing ("a
+/// connection that has just completed a RESUME"), they are now one type —
+/// promotion simply always reports `network_rebinder: None`, because it
+/// resumes onto a connection whose endpoint it holds no rebinder for. The
+/// name is kept as an alias so `promote`'s signature still reads as what it
+/// means at the call site.
+pub type PromotedConnection = ResumeAckOutcome;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WarmStandbyError {
@@ -257,33 +253,28 @@ impl WarmStandby {
     ) -> Result<PromotedConnection, WarmStandbyError> {
         let conn = self.standby.lock().await.take().ok_or(WarmStandbyError::NoStandby)?;
 
-        // Same proof scheme `resume::reconnect_and_resume` uses — see that
-        // function's identical comment for why `session_id` is mixed in.
-        let resume_proof = compute_proof(&conn, &self.target.session_secret, self.session_id.as_bytes()).await?;
-
-        let outcome = quicmux::request_resume(
-            &conn,
-            self.session_id.as_bytes(),
-            resume_proof.as_bytes(),
-            client_sent_offset.get(),
-            client_delivered_offset.get(),
+        // Identical to what `resume::reconnect_and_resume` does once *it* has
+        // a connection in hand — same proof scheme (see `resume_on_connection`
+        // for why `session_id` is mixed in), same error mapping, same offset
+        // bookkeeping. The only difference is that this connection was kept
+        // warm rather than freshly dialed, so there is no endpoint rebinder
+        // to hand back.
+        let promoted = resume_on_connection(
+            conn,
+            &self.target.session_secret,
+            self.session_id,
+            client_sent_offset,
+            client_delivered_offset,
+            None,
+            "warm_standby::promote: request_resume",
         )
-        .await
-        .map_err(|e| match e {
-            quicmux::ResumeRequestError::Mux(mux_err) => TransportError::Mux(mux_err),
-            quicmux::ResumeRequestError::Rejected(reason) => TransportError::ResumeRejected(map_reject_reason(reason)),
-        })?;
+        .await?;
 
         info!(
             "warm_standby: promoted standby, session_id={}, helper_committed_offset={}",
-            self.session_id, outcome.committed_offset
+            self.session_id, promoted.helper_committed_offset
         );
-        Ok(PromotedConnection {
-            connection: conn,
-            data_stream: outcome.stream,
-            helper_committed_offset: C2hHelperCommittedOffset::new(outcome.committed_offset),
-            helper_sent_offset: H2cSentOffset::new(outcome.sent_offset),
-        })
+        Ok(promoted)
     }
 }
 

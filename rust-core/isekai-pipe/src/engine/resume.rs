@@ -1,9 +1,10 @@
 //! Phase 8-1/8-3: helper 側 output buffer と reattach（`RESUME`）処理。
 //! 契約の詳細は `/HELPER_PROTOCOL.md` §7 を参照。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use quicmux::ReplayBuffer;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, Notify};
 
@@ -20,88 +21,19 @@ pub const APP_ACK: u8 = 0x12;
 pub type SessionId = [u8; 16];
 
 /// S→C 方向（helper → client）に送出したバイト列を保持するバウンデッドバッファ。
-/// `start_offset` は `data` の先頭バイトの絶対オフセット、`end_offset` は
-/// 送出済みバイト数の累計（= `archive/HELPER_PROTOCOL.md` の `helper_sent_offset`）。
-pub struct OutputBuffer {
-    data: VecDeque<u8>,
-    start_offset: u64,
-    capacity: usize,
-}
-
-impl OutputBuffer {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            data: VecDeque::with_capacity(capacity.min(1 << 20)),
-            start_offset: 0,
-            capacity,
-        }
-    }
-
-    pub fn remaining_capacity(&self) -> usize {
-        self.capacity.saturating_sub(self.data.len())
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.remaining_capacity() == 0
-    }
-
-    /// 送出したバイト列をバッファに書き足す。上限を超える場合は何も書かず
-    /// `false` を返す。呼び出し側は `remaining_capacity()` 以下だけ読み込む
-    /// ことで、古い未確認データを失わず TCP backpressure をかける。
-    pub fn append(&mut self, bytes: &[u8]) -> bool {
-        if bytes.len() > self.remaining_capacity() {
-            return false;
-        }
-        self.data.extend(bytes.iter().copied());
-        true
-    }
-
-    /// 相手（client）が `client_delivered_offset` として確認した位置まで、
-    /// 安全に破棄してよいバイトを実際に破棄する。
-    pub fn advance_start(&mut self, confirmed_offset: u64) {
-        while self.start_offset < confirmed_offset && !self.data.is_empty() {
-            self.data.pop_front();
-            self.start_offset += 1;
-        }
-        if confirmed_offset > self.start_offset {
-            // データが既に無い（confirmed が end_offset を超えている等）場合は
-            // start_offset だけ進める必要はない（end_offset 側で整合性が取れる）。
-        }
-    }
-
-    pub fn end_offset(&self) -> u64 {
-        self.start_offset + self.data.len() as u64
-    }
-
-    /// `from` 以降、現在の `end_offset` までのバイト列を返す。
-    /// `from` が既に破棄済みの範囲（`start_offset` より前）なら `None`
-    /// （呼び出し側は `REJECT_OFFSET_GONE` を返すべき）。
-    /// `from` が `end_offset` を超える不正な値の場合も `None`。
-    pub fn replay_from(&self, from: u64) -> Option<Vec<u8>> {
-        if from < self.start_offset || from > self.end_offset() {
-            return None;
-        }
-        let skip = (from - self.start_offset) as usize;
-        Some(self.data.iter().skip(skip).copied().collect())
-    }
-}
-
-// テストだけが参照するアクセサ（本番コードは remaining_capacity/is_full/
-// end_offset/append/advance_start/replay_from だけで完結する）。
-#[cfg(test)]
-impl OutputBuffer {
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn start_offset(&self) -> u64 {
-        self.start_offset
-    }
-}
+/// `start_offset` は先頭バイトの絶対オフセット、`end_offset` は送出済みバイト数の
+/// 累計（= `archive/HELPER_PROTOCOL.md` の `helper_sent_offset`）。
+///
+/// 実体は[`quicmux::ReplayBuffer`]。以前はこのファイル(`OutputBuffer`)と
+/// `resume_loop.rs`(`C2hReplayBuffer`)とquicmuxに、ほぼ同一の
+/// `VecDeque<u8>`+`start_offset`+`capacity`実装が3つ並存していた。しかも
+/// `advance_start`の範囲外挙動だけが静かに食い違っており、片方
+/// (`C2hReplayBuffer`のjump-ahead)はこのサーバー側の使い方では
+/// offsetを壊す(`quicmux::ReplayBuffer::advance_start`のdocs参照 —
+/// このサーバーはack読み取りタスクと中継ループが別タスクで同じsession lockを
+/// 奪い合うため、「peerへ送出済みだがappend前」の窓が実際に開く)。
+/// 正しい方(clamp)へ一本化した。
+pub type OutputBuffer = ReplayBuffer;
 
 /// [`SessionTable::insert_existing`]'s result — see that method's docs for
 /// why `InsertedAfterEvicting` carries the evicted `SessionId`.
@@ -393,63 +325,11 @@ impl SessionTable {
 mod tests {
     use super::*;
 
-    #[test]
-    fn append_and_replay_full_range() {
-        let mut buf = OutputBuffer::new(1024);
-        assert!(buf.append(b"hello"));
-        assert!(buf.append(b" world"));
-        assert_eq!(buf.end_offset(), 11);
-        assert_eq!(buf.replay_from(0).unwrap(), b"hello world");
-        assert_eq!(buf.replay_from(5).unwrap(), b" world");
-        assert_eq!(buf.replay_from(11).unwrap(), b"");
-    }
-
-    #[test]
-    fn replay_from_beyond_end_is_none() {
-        let mut buf = OutputBuffer::new(1024);
-        assert!(buf.append(b"hi"));
-        assert!(buf.replay_from(3).is_none());
-    }
-
-    #[test]
-    fn advance_start_discards_confirmed_prefix() {
-        let mut buf = OutputBuffer::new(1024);
-        assert!(buf.append(b"0123456789"));
-        buf.advance_start(4);
-        assert_eq!(buf.start_offset(), 4);
-        assert_eq!(buf.replay_from(4).unwrap(), b"456789");
-        assert!(
-            buf.replay_from(0).is_none(),
-            "破棄済み範囲は None を返すべき"
-        );
-    }
-
-    #[test]
-    fn capacity_overflow_is_rejected_without_evicting_oldest_bytes() {
-        let mut buf = OutputBuffer::new(4);
-        assert!(buf.append(b"abcd"));
-        assert!(!buf.append(b"e"));
-        assert_eq!(buf.start_offset(), 0);
-        assert_eq!(buf.end_offset(), 4);
-        assert_eq!(buf.len(), 4);
-        assert_eq!(buf.capacity(), 4);
-        assert!(buf.is_full());
-        assert_eq!(buf.remaining_capacity(), 0);
-        assert_eq!(buf.replay_from(0).unwrap(), b"abcd");
-    }
-
-    #[test]
-    fn advance_start_frees_capacity_for_later_appends() {
-        let mut buf = OutputBuffer::new(10);
-        assert!(buf.append(b"abcdefghij"));
-        assert!(buf.is_full());
-        buf.advance_start(6);
-        assert_eq!(buf.start_offset(), 6);
-        assert_eq!(buf.remaining_capacity(), 6);
-        assert!(buf.append(b"klmnop"));
-        assert_eq!(buf.end_offset(), 16);
-        assert_eq!(buf.replay_from(6).unwrap(), b"ghijklmnop");
-    }
+    // `OutputBuffer`(= `quicmux::ReplayBuffer`)自体のappend/replay_from/
+    // advance_start/容量まわりのユニットテストは、型の定義と同じ場所
+    // (`quicmux::resume`)に一本化した。ここに置いていた同名のテスト群は
+    // そちらと1対1で重複していたので削除した(範囲外advance_startの
+    // clamp挙動については、そちらに新しい回帰テストを足してある)。
 
     #[tokio::test]
     async fn session_table_insert_remove_roundtrip() {

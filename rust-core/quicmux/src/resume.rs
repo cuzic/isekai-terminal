@@ -17,27 +17,45 @@
 //! the same session is never a fencing conflict) — `RESUME` there already
 //! bypasses `AttachArbiter::hello`'s fencing entirely and only checks
 //! `AttachRuntime::established_lease_for(session_id)`, i.e. "does this
-//! token currently occupy an established slot". [`ResumeAcceptor::try_resume`]
-//! is this crate's equivalent of that one check, left to the caller to
-//! implement however its own session bookkeeping needs to.
+//! token currently occupy an established slot" — that one check is left to
+//! the caller to implement however its own session bookkeeping needs to.
 //!
 //! # Division of responsibility
 //!
 //! - **This module owns**: the wire framing for the resume request/response
-//!   exchange ([`request_resume`]/[`accept_resume`]), and a generic
-//!   offset-based [`ReplayBuffer`] a caller can use to buffer bytes it has
-//!   sent so it can honor a resume request that asks to replay from an
-//!   earlier offset.
+//!   exchange ([`request_resume`] on the client side; [`decode_resume_request`]
+//!   plus [`respond_resume_accepted`]/[`respond_resume_rejected`] on the
+//!   server side), and a generic offset-based [`ReplayBuffer`] a caller uses
+//!   to buffer bytes it has sent so it can honor a resume request that asks
+//!   to replay from an earlier offset.
 //! - **The caller owns**: what a `token`/`auth_blob` mean, how to verify
 //!   `auth_blob` (this crate has no authentication layer of its own — see
 //!   [`crate::MuxError::AuthenticationFailed`]'s docs), and all session
 //!   bookkeeping (mapping a token to a parked connection/buffer, deciding
 //!   whether a token is currently resumable, single-flight-ing concurrent
-//!   resume attempts for the same token). [`ResumeAcceptor::try_resume`] is
-//!   the one seam between the two: a single atomic operation, not a
-//!   lookup-then-take-then-check sequence, specifically so a caller's
-//!   implementation can make "only one concurrent resume attempt for the
-//!   same token succeeds" an actual contract instead of a lookup-time race.
+//!   resume attempts for the same token).
+//!
+//! # Why there is no server-side `accept_resume`/`ResumeAcceptor`
+//!
+//! This module used to also offer an `accept_resume(conn, &dyn ResumeAcceptor)`
+//! that performed its own `accept_bi()` and dispatched into a caller-supplied
+//! trait object. The only real server in this workspace —
+//! `isekai-pipe serve`'s `handle_connection` — structurally cannot use that
+//! shape: it already reads the first frame-type byte off a single stream to
+//! choose between its own `ATTACH_HELLO`/`CancelAttach` frames and this
+//! module's [`FRAME_RESUME`], so by the time it knows the frame is a resume,
+//! both the stream and its type byte are already consumed. It therefore
+//! called [`decode_resume_request`]/[`respond_resume_accepted`]/
+//! [`respond_resume_rejected`] directly, and the trait-object API ended up
+//! with no callers outside this module's own tests.
+//!
+//! It was deleted rather than kept "for future generality": a second,
+//! never-exercised-in-production code path through the same resume wire
+//! format is exactly the kind of drift this workspace's reconnect code
+//! cannot afford (`.claude/rules/always-connects.md`), and it made the
+//! tests below assert against a parallel implementation instead of the one
+//! that actually ships. Those tests now drive the same direct API the real
+//! server uses.
 
 use std::collections::VecDeque;
 
@@ -54,17 +72,18 @@ pub const FRAME_RESUME: u8 = 0x01;
 pub const FRAME_RESUME_ACK: u8 = 0x02;
 pub const FRAME_RESUME_REJECT: u8 = 0x03;
 
-/// Why [`ResumeAcceptor::try_resume`] declined to resume.
+/// Why the server declined to resume — the wire vocabulary of
+/// [`respond_resume_rejected`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeRejectReason {
     /// `auth_blob` did not verify.
     Auth,
-    /// `token` does not name any session the acceptor currently knows
+    /// `token` does not name any session the server currently knows
     /// about (never existed, already resumed by a concurrent attempt, or
     /// evicted).
     UnknownToken,
     /// `token` is known, but the requested `client_delivered_offset` is no
-    /// longer covered by the acceptor's replay buffer (it already
+    /// longer covered by the server's replay buffer (it already
     /// discarded that range).
     OffsetGone,
 }
@@ -88,9 +107,8 @@ impl ResumeRejectReason {
     }
 }
 
-/// A resume attempt, as decoded off the wire and handed to
-/// [`ResumeAcceptor::try_resume`]. Every field is caller-interpreted —
-/// this crate only carries the bytes.
+/// A resume attempt, as decoded off the wire by [`decode_resume_request`].
+/// Every field is caller-interpreted — this crate only carries the bytes.
 pub struct ResumeRequest {
     /// Opaque session identifier. This crate never interprets its bytes;
     /// the caller's own session bookkeeping (e.g. a `HashMap<Vec<u8>, _>`
@@ -113,48 +131,9 @@ pub struct ResumeRequest {
     /// application byte stream, not this frame's own wire bytes).
     pub client_sent_offset: u64,
     /// How many bytes of the caller's *previous* replay buffer the client
-    /// has already received and processed — the offset
-    /// [`ResumeAcceptor::try_resume`] should replay from.
+    /// has already received and processed — the offset the server should
+    /// replay from.
     pub client_delivered_offset: u64,
-}
-
-/// What [`ResumeAcceptor::try_resume`] decided.
-pub enum ResumeDecision {
-    /// Resume accepted. `replay` is sent back to the client immediately
-    /// after the [`FRAME_RESUME_ACK`] frame, on the same stream — the
-    /// client should treat it exactly like ordinary application data that
-    /// arrived on a fresh connection, since (from the client's point of
-    /// view) it's the tail end of what it already sent/received before the
-    /// disconnect.
-    Accepted {
-        /// The acceptor's own record of how many bytes of the client's
-        /// C→S stream it has durably committed — the caller-side
-        /// equivalent of `isekai-pipe`'s `helper_committed_offset`.
-        committed_offset: u64,
-        /// How many bytes the acceptor has sent in total on the S→C
-        /// direction (`replay`'s bytes are the suffix of this ending at
-        /// this offset) — lets the client cross-check its own bookkeeping.
-        sent_offset: u64,
-        /// Bytes to replay, starting at the request's
-        /// `client_delivered_offset`. Empty if the client was already
-        /// fully caught up.
-        replay: Vec<u8>,
-    },
-    /// Resume declined; see [`ResumeRejectReason`].
-    Rejected(ResumeRejectReason),
-}
-
-/// Caller-supplied resume policy — the one seam between this crate's wire
-/// framing and the caller's own session bookkeeping/authentication. See
-/// this module's docs for why this must be a single atomic operation
-/// rather than a lookup-then-take-then-check sequence: a caller's
-/// implementation is expected to make this the single-flight point (e.g.
-/// by holding a lock or using `take()` on a parked resource inside this one
-/// call) so that two concurrent resume attempts for the same `token` can
-/// never both succeed.
-#[async_trait::async_trait]
-pub trait ResumeAcceptor: Send + Sync {
-    async fn try_resume(&self, request: ResumeRequest) -> ResumeDecision;
 }
 
 fn encode_resume_request(req: &ResumeRequestToSend<'_>) -> Result<Vec<u8>, MuxError> {
@@ -211,9 +190,10 @@ async fn read_exact(recv: &mut AnyByteStreamReadHalf, buf: &mut [u8]) -> Result<
 /// kind of frame this is — e.g. `isekai-pipe serve`'s `handle_connection`,
 /// which reads one byte to choose between its own `ATTACH_HELLO`/
 /// `CancelAttach` frames and this module's `FRAME_RESUME`, so by the time it
-/// knows to call this function the type byte is already consumed. A caller
-/// that owns the whole exchange from scratch should use [`accept_resume`]
-/// instead of calling this directly.
+/// knows to call this function the type byte is already consumed — which is
+/// why this, and not a `accept_resume(conn, &dyn ResumeAcceptor)` wrapper
+/// that does its own `accept_bi()`, is this module's server-side entry point
+/// (see the module docs).
 pub async fn decode_resume_request(recv: &mut AnyByteStreamReadHalf, conn_exporter: [u8; 32]) -> Result<ResumeRequest, MuxError> {
     let mut token_len = [0u8; 2];
     read_exact(recv, &mut token_len).await?;
@@ -326,41 +306,6 @@ pub enum ResumeRequestError {
     Rejected(ResumeRejectReason),
 }
 
-/// The server side of a resume exchange: accepts the stream the client's
-/// [`request_resume`] opened, decodes the request, asks `acceptor` to
-/// decide, and writes the response. On [`ResumeDecision::Accepted`],
-/// returns the still-open stream (recombined via [`AnyByteStream::unsplit`])
-/// for the caller to keep relaying application traffic on (the same stream,
-/// now repurposed) — on
-/// [`ResumeDecision::Rejected`], waits for the peer to observe the reject
-/// frame (see [`crate::AnyByteStream::wait_for_close`]'s docs for why: the
-/// same "peer never saw the response before the connection died" race
-/// `isekai-pipe`'s own `reject()` exists to close) before returning the
-/// error.
-pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAcceptor) -> Result<AnyByteStream, ResumeRequestError> {
-    let conn_exporter = conn.export_keying_material(b"quicmux-resume-v1", b"").await.map_err(ResumeRequestError::Mux)?;
-    let stream = conn.accept_bi().await.map_err(ResumeRequestError::Mux)?;
-    let (mut recv, mut send) = stream.split();
-
-    let mut frame_type = [0u8; 1];
-    read_exact(&mut recv, &mut frame_type).await.map_err(ResumeRequestError::Mux)?;
-    if frame_type[0] != FRAME_RESUME {
-        return Err(ResumeRequestError::Mux(MuxError::ProtocolViolation(format!("expected RESUME frame, got {:#x}", frame_type[0]))));
-    }
-    let request = decode_resume_request(&mut recv, conn_exporter).await.map_err(ResumeRequestError::Mux)?;
-
-    match acceptor.try_resume(request).await {
-        ResumeDecision::Accepted { committed_offset, sent_offset, replay } => {
-            respond_resume_accepted(&mut send, committed_offset, sent_offset, &replay).await.map_err(ResumeRequestError::Mux)?;
-            Ok(AnyByteStream::unsplit(recv, send))
-        }
-        ResumeDecision::Rejected(reason) => {
-            respond_resume_rejected(&mut send, reason).await;
-            Err(ResumeRequestError::Rejected(reason))
-        }
-    }
-}
-
 /// Writes a [`FRAME_RESUME_ACK`] response, followed by `replay` as plain,
 /// unframed continuation of the same stream — deliberately **not** a
 /// length-prefixed field inside the ACK frame itself. A caller resuming a
@@ -371,9 +316,8 @@ pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAccepto
 /// framing replay as a separate structured field would force every such
 /// caller to un-frame it again before feeding it back into the same plain
 /// byte-stream abstraction it already uses everywhere else. `pub` for the
-/// same reason as [`decode_resume_request`] — a caller integrating this into
-/// its own existing frame dispatch (rather than going through
-/// [`accept_resume`]) still needs to send the response itself.
+/// same reason as [`decode_resume_request`]: a caller integrating this into
+/// its own existing frame dispatch needs to send the response itself.
 pub async fn respond_resume_accepted(send: &mut AnyByteStreamWriteHalf, committed_offset: u64, sent_offset: u64, replay: &[u8]) -> Result<(), MuxError> {
     let mut ack = Vec::with_capacity(1 + 8 + 8);
     ack.push(FRAME_RESUME_ACK);
@@ -410,6 +354,33 @@ pub async fn respond_resume_rejected(send: &mut AnyByteStreamWriteHalf, reason: 
 /// moved here verbatim in spirit, with explicit overflow handling on the
 /// offset arithmetic added (flagged in review as the class of bug this
 /// project has hit before in adjacent offset-tracking code).
+///
+/// This is the **single** replay-buffer implementation in the workspace.
+/// `isekai-pipe` previously carried two near-identical copies of it
+/// (`engine::resume::OutputBuffer` on the server side, `resume_loop::
+/// C2hReplayBuffer` on the client side) which had silently drifted apart on
+/// [`Self::advance_start`]'s out-of-range behavior — see that method's docs
+/// for which behavior is correct and why the other one would corrupt
+/// offsets. Both now use this type.
+///
+/// # Overflow policy: reject, never evict
+///
+/// [`Self::append`] refuses to write anything that would exceed `capacity`
+/// and reports that as `false`; it never evicts the oldest bytes to make
+/// room. That is the only policy that makes sense for a *replay* buffer:
+/// the oldest bytes are precisely the ones a resuming peer is most likely
+/// to still need, so dropping them to accept newer ones converts a
+/// recoverable "slow down" into an unrecoverable
+/// [`ResumeRejectReason::OffsetGone`]. Callers are expected to apply real
+/// backpressure by never reading more than [`Self::remaining_capacity`]
+/// bytes from their source in the first place, which makes a `false` return
+/// a should-never-happen defensive signal rather than routine flow control.
+///
+/// (`isekai-pipe`'s `tty::ring_buffer` deliberately does the opposite —
+/// evicting oldest-first — because it is a scrollback buffer, where losing
+/// the oldest lines is the *intended* behavior and there is no peer whose
+/// offsets could desync. It is not a member of this family and must not be
+/// folded into it.)
 pub struct ReplayBuffer {
     data: VecDeque<u8>,
     start_offset: u64,
@@ -457,8 +428,9 @@ impl ReplayBuffer {
     /// Appends `bytes`. Returns `false` (writing nothing) if `bytes` would
     /// exceed `remaining_capacity()` — the caller is expected to only ever
     /// read up to `remaining_capacity()` bytes from its own source before
-    /// calling this (matching every existing caller of `OutputBuffer`), so
-    /// this is a defensive check, not the primary backpressure mechanism.
+    /// calling this, so this is a defensive check, not the primary
+    /// backpressure mechanism. See the type's docs for why the answer to
+    /// overflow is "refuse" and never "evict the oldest bytes".
     pub fn append(&mut self, bytes: &[u8]) -> bool {
         if bytes.len() > self.remaining_capacity() {
             return false;
@@ -468,10 +440,42 @@ impl ReplayBuffer {
     }
 
     /// Discards bytes the peer has confirmed receiving up to
-    /// `confirmed_offset`. A `confirmed_offset` at or before the current
-    /// `start_offset` is a no-op (already discarded, or a stale/duplicate
-    /// ack) rather than an error — acks can legitimately arrive
-    /// out of order or be resent.
+    /// `confirmed_offset`.
+    ///
+    /// A `confirmed_offset` at or before the current `start_offset` is a
+    /// no-op (already discarded, or a stale/duplicate ack) rather than an
+    /// error — acks can legitimately arrive out of order or be resent.
+    ///
+    /// A `confirmed_offset` beyond `end_offset()` **clamps**: the buffer is
+    /// drained and `start_offset` stops at the old `end_offset()`. It
+    /// deliberately does *not* jump `start_offset` ahead to
+    /// `confirmed_offset`, even though that would look like the tidier
+    /// postcondition, because that is unsound in the presence of the
+    /// send-then-append ordering every caller here uses:
+    ///
+    /// 1. The caller writes `n` bytes to the peer.
+    /// 2. The caller appends those same `n` bytes to this buffer.
+    ///
+    /// Between (1) and (2) the peer can legitimately receive, process, and
+    /// ack those bytes, so an ack naming an offset past the current
+    /// `end_offset()` is a *normal race*, not a protocol violation —
+    /// `isekai-pipe serve` hits exactly this window, since its ack reader
+    /// runs in a task spawned separately from its relay loop and the two
+    /// contend for the same session lock. Jumping `start_offset` to
+    /// `confirmed_offset` there would mislabel the bytes that step (2) is
+    /// about to append: they belong at the *old* `end_offset()`, so the
+    /// buffer would then hand a resuming peer already-delivered bytes under
+    /// a higher offset, silently duplicating data and desyncing both sides'
+    /// offset accounting. Clamping keeps step (2)'s bytes correctly
+    /// labelled.
+    ///
+    /// (`isekai-pipe`'s client-side copy of this buffer used to jump ahead
+    /// instead. It was safe only by accident of its own structure — there,
+    /// append and `advance_start` run sequentially in one task with append
+    /// first, so the window never opens — and it was never reachable anyway,
+    /// because `replay_and_advance` rejects an out-of-range offset via
+    /// `replay_from` before calling this. Consolidating on the clamping
+    /// behavior loses nothing and removes the trap.)
     pub fn advance_start(&mut self, confirmed_offset: u64) {
         while self.start_offset < confirmed_offset && !self.data.is_empty() {
             self.data.pop_front();
@@ -561,6 +565,40 @@ mod tests {
         assert_eq!(buf.replay_from(6).unwrap(), b"ghijklmnop");
     }
 
+    /// Regression guard for the send-then-append race described in
+    /// `advance_start`'s docs: an ack that names bytes already written to
+    /// the peer but not yet appended here must clamp, so that the append
+    /// which follows still lands at the offset those bytes actually have.
+    /// The "jump `start_offset` to `confirmed_offset`" variant this
+    /// consolidation removed would leave `start_offset == 110` here and then
+    /// mislabel `"0123456789"` as offsets 110..120.
+    #[test]
+    fn advance_start_past_end_clamps_so_a_racing_append_stays_correctly_labelled() {
+        let mut buf = ReplayBuffer::new(64);
+        assert!(buf.append(b"0123456789"));
+        buf.advance_start(10);
+        assert_eq!(buf.start_offset(), 10);
+        assert!(buf.is_empty());
+
+        // The caller has just written offsets 10..20 to the peer but has not
+        // reached its own `append` yet; the peer acks all 20 bytes first.
+        buf.advance_start(20);
+        assert_eq!(buf.start_offset(), 10, "must clamp at end_offset, not jump to 20");
+        assert_eq!(buf.end_offset(), 10);
+
+        // Now the append lands. Those bytes are offsets 10..20 and must be
+        // replayable as such.
+        assert!(buf.append(b"abcdefghij"));
+        assert_eq!(buf.start_offset(), 10);
+        assert_eq!(buf.end_offset(), 20);
+        assert_eq!(buf.replay_from(10).unwrap(), b"abcdefghij");
+        assert_eq!(buf.replay_from(20).unwrap(), b"");
+        // The ack is re-delivered (the peer resends it); still consistent.
+        buf.advance_start(20);
+        assert_eq!(buf.start_offset(), 20);
+        assert!(buf.is_empty());
+    }
+
     #[test]
     fn end_offset_saturates_instead_of_panicking_near_u64_max() {
         let mut buf = ReplayBuffer::new(4);
@@ -585,12 +623,19 @@ mod tests {
     }
 }
 
-/// End-to-end tests driving [`request_resume`]/[`accept_resume`] over a real
-/// `noq` connection — the unit tests above cover the pure encode/decode/
+/// End-to-end tests driving [`request_resume`] against the same direct
+/// server-side API the real server (`isekai-pipe serve`'s
+/// `handle_connection`) uses — [`decode_resume_request`] +
+/// [`respond_resume_accepted`]/[`respond_resume_rejected`] — over a real
+/// `noq` connection. The unit tests above cover the pure encode/decode/
 /// buffer logic in isolation, but the framing itself (frame-type byte
 /// ordering, length-prefixed fields, stream reuse after the handshake) is
 /// only genuinely exercised by actually round-tripping bytes over a live
 /// connection.
+///
+/// These deliberately do *not* go through a test-only acceptor abstraction:
+/// the removed `accept_resume`/`ResumeAcceptor` pair made these tests assert
+/// against a code path no shipped binary ever executed (see the module docs).
 #[cfg(all(test, feature = "noq"))]
 mod noq_e2e_tests {
     use super::*;
@@ -598,9 +643,6 @@ mod noq_e2e_tests {
     use crate::types::BindSpec;
     use crate::{AnyMuxConnection, AnyMuxFactory, AnyMuxListener};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     fn test_client_config() -> MuxClientConfig {
         MuxClientConfig {
@@ -640,37 +682,26 @@ mod noq_e2e_tests {
         (config, cert_sha256_hex)
     }
 
-    /// The simplest possible [`ResumeAcceptor`]: a single fixed token is
-    /// resumable exactly once (matching the single-flight contract this
-    /// module's docs describe — a second attempt for the same token, or any
-    /// unrecognized token, is `UnknownToken`), with a fixed reply buffer and
-    /// a counter so tests can assert how many times it was actually called.
-    struct OnceAcceptor {
-        token: Vec<u8>,
-        replay: Vec<u8>,
-        committed_offset: u64,
-        sent_offset: u64,
-        claimed: Mutex<bool>,
-        call_count: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl ResumeAcceptor for OnceAcceptor {
-        async fn try_resume(&self, request: ResumeRequest) -> ResumeDecision {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            if request.token != self.token {
-                return ResumeDecision::Rejected(ResumeRejectReason::UnknownToken);
-            }
-            let mut claimed = self.claimed.lock().await;
-            if *claimed {
-                return ResumeDecision::Rejected(ResumeRejectReason::UnknownToken);
-            }
-            if request.client_delivered_offset < self.sent_offset - self.replay.len() as u64 {
-                return ResumeDecision::Rejected(ResumeRejectReason::OffsetGone);
-            }
-            *claimed = true;
-            ResumeDecision::Accepted { committed_offset: self.committed_offset, sent_offset: self.sent_offset, replay: self.replay.clone() }
-        }
+    /// Reproduces `isekai-pipe serve`'s `handle_connection` server-side
+    /// preamble exactly: accept the stream, read the single frame-type byte
+    /// its own dispatch reads before it knows this is a resume at all, then
+    /// hand the *rest* of the body to [`decode_resume_request`]. Returning
+    /// the split halves lets each test decide the response itself, which is
+    /// the whole point — the decision is the caller's, not this crate's.
+    async fn accept_resume_request(
+        conn: &AnyMuxConnection,
+    ) -> (ResumeRequest, AnyByteStreamReadHalf, AnyByteStreamWriteHalf) {
+        let conn_exporter = conn
+            .export_keying_material(b"quicmux-resume-test-v1", b"")
+            .await
+            .expect("export_keying_material failed");
+        let stream = conn.accept_bi().await.expect("accept_bi failed");
+        let (mut recv, send) = stream.split();
+        let mut frame_type = [0u8; 1];
+        read_exact(&mut recv, &mut frame_type).await.expect("frame type read failed");
+        assert_eq!(frame_type[0], FRAME_RESUME, "client should have sent a RESUME frame");
+        let request = decode_resume_request(&mut recv, conn_exporter).await.expect("decode_resume_request failed");
+        (request, recv, send)
     }
 
     async fn connect_pair(server_config: MuxServerConfig, cert_sha256_hex: String) -> (AnyMuxConnection, AnyMuxConnection) {
@@ -693,30 +724,30 @@ mod noq_e2e_tests {
     }
 
     #[tokio::test]
-    async fn request_resume_and_accept_resume_roundtrip_on_acceptance() {
+    async fn request_resume_roundtrips_against_the_direct_server_api_on_acceptance() {
         let (server_config, cert_sha256_hex) = test_server_config();
         let (client_conn, server_conn) = connect_pair(server_config, cert_sha256_hex).await;
 
-        let acceptor = Arc::new(OnceAcceptor {
-            token: b"session-42".to_vec(),
-            replay: b"tail bytes".to_vec(),
-            committed_offset: 100,
-            sent_offset: 200,
-            claimed: Mutex::new(false),
-            call_count: AtomicUsize::new(0),
+        let server_task = tokio::spawn(async move {
+            let (request, recv, mut send) = accept_resume_request(&server_conn).await;
+            // Every field the client passed must survive the wire exactly —
+            // this is the only place the length-prefixed encoding is checked
+            // against a real decode rather than a same-process unit test.
+            assert_eq!(request.token, b"session-42");
+            assert_eq!(request.auth_blob, b"proof-bytes");
+            assert_eq!(request.client_sent_offset, 300);
+            assert_eq!(request.client_delivered_offset, 190);
+            respond_resume_accepted(&mut send, 100, 200, b"tail bytes")
+                .await
+                .expect("respond_resume_accepted failed");
+            AnyByteStream::unsplit(recv, send)
         });
-
-        let server_task = {
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move { accept_resume(&server_conn, acceptor.as_ref()).await })
-        };
 
         let outcome = request_resume(&client_conn, b"session-42", b"proof-bytes", 300, 190).await.expect("resume should be accepted");
         assert_eq!(outcome.committed_offset, 100);
         assert_eq!(outcome.sent_offset, 200);
-        assert_eq!(acceptor.call_count.load(Ordering::SeqCst), 1);
 
-        let mut server_stream = server_task.await.expect("server task panicked").expect("accept_resume should succeed");
+        let mut server_stream = server_task.await.expect("server task panicked");
         let mut client_stream = outcome.stream;
 
         // `replay` isn't a separate field on `ResumeAckOutcome` — it arrives
@@ -740,52 +771,44 @@ mod noq_e2e_tests {
         let (server_config, cert_sha256_hex) = test_server_config();
         let (client_conn, server_conn) = connect_pair(server_config, cert_sha256_hex).await;
 
-        let acceptor = Arc::new(OnceAcceptor {
-            token: b"session-42".to_vec(),
-            replay: vec![],
-            committed_offset: 0,
-            sent_offset: 0,
-            claimed: Mutex::new(false),
-            call_count: AtomicUsize::new(0),
+        let server_task = tokio::spawn(async move {
+            let (request, _recv, mut send) = accept_resume_request(&server_conn).await;
+            assert_eq!(request.token, b"wrong-token");
+            respond_resume_rejected(&mut send, ResumeRejectReason::UnknownToken).await;
         });
-
-        let server_task = { let acceptor = acceptor.clone(); tokio::spawn(async move { accept_resume(&server_conn, acceptor.as_ref()).await }) };
 
         let err = request_resume(&client_conn, b"wrong-token", b"proof-bytes", 0, 0).await.expect_err("unknown token should be rejected");
         assert!(matches!(err, ResumeRequestError::Rejected(ResumeRejectReason::UnknownToken)));
 
-        let server_result = server_task.await.expect("server task panicked");
-        assert!(matches!(server_result, Err(ResumeRequestError::Rejected(ResumeRejectReason::UnknownToken))));
+        server_task.await.expect("server task panicked");
     }
 
+    /// Every [`ResumeRejectReason`] must survive the real wire, not just the
+    /// in-process `to_wire`/`from_wire` round-trip the unit tests cover: a
+    /// reason byte that decodes to something else (or to a
+    /// `ProtocolViolation`) on the client would turn a recoverable, retryable
+    /// rejection into an opaque failure, which is precisely the class of
+    /// "never automatically recovers" bug `.claude/rules/always-connects.md`
+    /// exists to prevent.
     #[tokio::test]
-    async fn a_second_concurrent_resume_for_the_same_token_is_rejected_single_flight() {
-        let (server_config, cert_sha256_hex) = test_server_config();
-        let (client_conn, server_conn) = connect_pair(server_config, cert_sha256_hex).await;
+    async fn every_reject_reason_survives_the_real_wire() {
+        for reason in [ResumeRejectReason::Auth, ResumeRejectReason::UnknownToken, ResumeRejectReason::OffsetGone] {
+            let (server_config, cert_sha256_hex) = test_server_config();
+            let (client_conn, server_conn) = connect_pair(server_config, cert_sha256_hex).await;
 
-        let acceptor = Arc::new(OnceAcceptor {
-            token: b"session-42".to_vec(),
-            replay: vec![],
-            committed_offset: 0,
-            sent_offset: 0,
-            claimed: Mutex::new(false),
-            call_count: AtomicUsize::new(0),
-        });
+            let server_task = tokio::spawn(async move {
+                let (_request, _recv, mut send) = accept_resume_request(&server_conn).await;
+                respond_resume_rejected(&mut send, reason).await;
+            });
 
-        // First resume claims the token via the real wire protocol.
-        let server_task = { let acceptor = acceptor.clone(); tokio::spawn(async move { accept_resume(&server_conn, acceptor.as_ref()).await }) };
-        let first = request_resume(&client_conn, b"session-42", b"proof-bytes", 0, 0).await;
-        assert!(first.is_ok());
-        server_task.await.expect("server task panicked").expect("first accept_resume should succeed");
-
-        // A second attempt for the same token against the same acceptor
-        // (simulating a racing/retried resume) must be rejected — proves
-        // `try_resume`'s single atomic call is enough to make this safe
-        // without any additional locking at the quicmux layer.
-        let second_decision = acceptor
-            .try_resume(ResumeRequest { token: b"session-42".to_vec(), auth_blob: vec![], conn_exporter: [0u8; 32], client_sent_offset: 0, client_delivered_offset: 0 })
-            .await;
-        assert!(matches!(second_decision, ResumeDecision::Rejected(ResumeRejectReason::UnknownToken)));
-        assert_eq!(acceptor.call_count.load(Ordering::SeqCst), 2);
+            let err = request_resume(&client_conn, b"session-42", b"proof-bytes", 0, 0)
+                .await
+                .expect_err("the server rejected, so the client must see an error");
+            match err {
+                ResumeRequestError::Rejected(observed) => assert_eq!(observed, reason),
+                other => panic!("expected Rejected({reason:?}), got {other:?}"),
+            }
+            server_task.await.expect("server task panicked");
+        }
     }
 }
