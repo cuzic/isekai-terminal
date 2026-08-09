@@ -874,6 +874,29 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
 fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) -> Result<(), SshError> {
     shared.state.lock().phase = ConnPhase::Connecting;
     let adapter = OrchestratorAdapter::new(shared.clone());
+    build_and_store_session(shared, attempt, adapter)
+}
+
+/// `attempt`が指すトランスポートのセッションを1つ生成・接続し、成功したら
+/// `shared.session`へ格納する。手動接続([`SessionOrchestrator::start_manual_connect`])と
+/// 自動再接続([`connect_via`])の両方がここを通るため、**トランスポート分岐の
+/// matchはこの1箇所だけ**になる —— 以前は`connect_via`と7つの`connect_*`が
+/// 同じ「セッション生成→connect→`ActiveSession`格納」を二重に持っており、
+/// 新しいトランスポートを足すたびに2つのリストを同期させる必要があった。
+///
+/// `adapter`を呼び出し側から受け取るのは、[`OrchestratorAdapter::new`]が
+/// `session_generation`をインクリメントする(=古いセッションからの遅延
+/// コールバックをそこで一斉に無効化する)副作用を持つため —— そのタイミングは
+/// 呼び出し側の手順(手動接続なら`begin_connect`のstate更新+`Connecting`通知の
+/// 直後)に合わせる必要があり、この関数の中へ動かしてよいものではない。
+///
+/// `connect`が`Err`を返した場合は`shared.session`を書き換えないまま伝播する
+/// (直前のセッションを壊さない)。
+fn build_and_store_session(
+    shared: &Arc<OrchestratorShared>,
+    attempt: LastConnectAttempt,
+    adapter: OrchestratorAdapter,
+) -> Result<(), SshError> {
     let session = match attempt {
         LastConnectAttempt::Ssh(config) => {
             let session = crate::create_ssh_session(config);
@@ -1109,8 +1132,9 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
 
 impl SessionOrchestrator {
     /// 各`connect_*`が共通で行う「state更新→Connecting通知→adapter生成」を
-    /// 一箇所にまとめる。session生成・接続・`ActiveSession`格納は呼び出し側が
-    /// トランスポートごとに行う（`connect`のエラー型/セッション型がそれぞれ違うため）。
+    /// 一箇所にまとめる。実際のsession生成・接続・`ActiveSession`格納は、
+    /// 自動再接続経路と共有する[`build_and_store_session`]が引き受ける
+    /// (呼び出し元は[`SessionOrchestrator::start_manual_connect`])。
     ///
     /// phaseが既に`Connecting`(=前の`connect_*`呼び出しがまだ実行中)の間の新規呼び出しは
     /// 拒否する(真の二重start防止、Task #9)。`Connected`中の呼び出しは意図的に許可する
@@ -1148,76 +1172,58 @@ impl SessionOrchestrator {
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         Ok(OrchestratorAdapter::new(self.shared.clone()))
     }
+
+    /// すべての手動接続(`connect_*`)の共通実装。`begin_connect`で状態遷移と
+    /// `Connecting`通知を済ませてから、[`build_and_store_session`]で実際の
+    /// セッションを生成する。トランスポートごとに違うのは`LastConnectAttempt`の
+    /// バリアントだけなので、各`connect_*`はこれを1回呼ぶだけの薄いUniFFI入口に
+    /// なる(生成手順そのものは自動再接続経路[`connect_via`]と共有する)。
+    fn start_manual_connect(&self, attempt: LastConnectAttempt) -> Result<(), SshError> {
+        let adapter = self.begin_connect(attempt.clone())?;
+        build_and_store_session(&self.shared, attempt, adapter)
+    }
 }
 
 #[uniffi::export]
 impl SessionOrchestrator {
     pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::Ssh(config.clone()))?;
-        let session = crate::create_ssh_session(config);
-        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::Ssh(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::Ssh(config))
     }
 
     pub fn connect_quic(&self, config: QuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::Quic(config.clone()))?;
-        let session = crate::quic_transport::create_quic_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::Quic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::Quic(config))
     }
 
     /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
     /// （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
     pub fn connect_isekai_pipe_quic(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::IsekaiPipeQuic(config.clone()))?;
-        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiPipeQuic(config))
     }
 
     /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
     /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
     pub fn connect_isekai_pipe_quic_auto(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::IsekaiPipeQuicAuto(config.clone()))?;
-        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect_auto(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiPipeQuicAuto(config))
     }
 
     /// Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
     /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
     /// 受動的マルチパスで接続する。
     pub fn connect_multipath_isekai_pipe_quic(&self, config: MultipathIsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::MultipathIsekaiPipeQuic(config.clone()))?;
-        let session = crate::multipath_transport::create_multipath_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::MultipathIsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::MultipathIsekaiPipeQuic(config))
     }
 
     /// Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
     /// STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
     /// 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
     pub fn connect_isekai_stun_p2p(&self, config: IsekaiStunP2pConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::IsekaiStunP2p(config.clone()))?;
-        let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiStunP2p(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiStunP2p(config))
     }
 
     /// Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
     /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
     pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(LastConnectAttempt::IsekaiLinkRelay(config.clone()))?;
-        let session = crate::isekai_link_relay_transport::create_isekai_link_relay_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiLinkRelay(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiLinkRelay(config))
     }
 
     pub fn disconnect(&self) {
