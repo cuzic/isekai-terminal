@@ -248,12 +248,12 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
         ),
         "remote-bind-port-range" => set_once(
             &mut builder.remote_bind_port_range,
-            parse_bind_port_range(one_arg(&directive)?)?,
+            parse_bind_port_range(one_arg(&directive)?, "remote-bind-port-range")?,
             "remote-bind-port-range",
         ),
         "local-bind-port-range" => set_once(
             &mut builder.local_bind_port_range,
-            parse_bind_port_range(one_arg(&directive)?)?,
+            parse_bind_port_range(one_arg(&directive)?, "local-bind-port-range")?,
             "local-bind-port-range",
         ),
         "tab-idle-color" => {
@@ -379,26 +379,28 @@ fn apply_optional_tty(slot: &mut Option<TtyDirective>, directive: &IsekaiDirecti
     };
 }
 
-/// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
-/// `(start, end)` pair, passed straight through to `isekai-helper
-/// --bind-port-range` (`engine::parse_bind_port_range` in `isekai-pipe`
-/// applies the identical `start <= end` validation server-side; this
-/// duplicate client-side check exists only to fail closed at config
-/// resolution time instead of after an SSH round-trip).
-fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
-    let (start, end) = value.split_once('-').ok_or_else(|| {
-        anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range {value:?} (expected <START>-<END>)")
-    })?;
-    let start: u16 = start
-        .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range start {start:?}"))?;
-    let end: u16 = end
-        .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range end {end:?}"))?;
+/// Parses `#@isekai remote-bind-port-range`/`local-bind-port-range
+/// <START>-<END>` into an inclusive `(start, end)` pair. The
+/// `remote-bind-port-range` value is passed straight through to
+/// `isekai-helper --bind-port-range` (`engine::parse_bind_port_range` in
+/// `isekai-pipe` applies the identical `start <= end` validation
+/// server-side; this duplicate client-side check exists only to fail closed
+/// at config resolution time instead of after an SSH round-trip);
+/// `local-bind-port-range` is client-side only and has no such server-side
+/// counterpart. `field` (matching the `parse_duration_ms`/`parse_tab_color`
+/// pattern above) names the actual directive in every error message — this
+/// function used to hardcode `"remote-bind-port-range"` in all four even
+/// when called for `local-bind-port-range`, copy-paste residue from when
+/// there was only the one caller, which produced a misleading error message
+/// pointing at the wrong directive.
+fn parse_bind_port_range(value: &str, field: &str) -> Result<(u16, u16)> {
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| anyhow!("isekai-ssh: invalid #@isekai {field} {value:?} (expected <START>-<END>)"))?;
+    let start: u16 = start.parse().map_err(|_| anyhow!("isekai-ssh: invalid #@isekai {field} start {start:?}"))?;
+    let end: u16 = end.parse().map_err(|_| anyhow!("isekai-ssh: invalid #@isekai {field} end {end:?}"))?;
     if start > end {
-        return Err(anyhow!(
-            "isekai-ssh: invalid #@isekai remote-bind-port-range {value:?}: start must be <= end"
-        ));
+        return Err(anyhow!("isekai-ssh: invalid #@isekai {field} {value:?}: start must be <= end"));
     }
     Ok((start, end))
 }
