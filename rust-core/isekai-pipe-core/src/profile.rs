@@ -2,10 +2,10 @@
 //! on-disk store `isekai-ssh`/`isekai-pipe` read and write
 //! (`ISEKAI_PIPE_DESIGN.md` §8 Epic B). The legacy `known_helpers.toml`
 //! trust store (`isekai_trust::schema::{TrustStore, HelperTrust}`) is no
-//! longer read by any live code path -- `migrate_legacy_helper_trust`/
-//! `migrate_trust_store` below remain only as one-off conversion helpers for
-//! a caller that still has an old `known_helpers.toml` lying around and
-//! wants to hand-convert it.
+//! longer read by any live code path -- `migrate_legacy_helper_trust`
+//! below remains only as a one-off conversion helper for a caller that
+//! still has an old `known_helpers.toml` lying around and wants to
+//! hand-convert it.
 //!
 //! `known_helpers.toml` was keyed by `host:port` and stored a single cached
 //! relay address/session secret per entry, plus release-trust metadata
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use isekai_trust::schema::{HelperTrust, TrustStore, UpdatePolicy};
+use isekai_trust::schema::{HelperTrust, UpdatePolicy};
 
 use crate::{IntentTransport, RelayPolicy, ServerIdentity};
 
@@ -176,19 +176,6 @@ impl PersistentProfile {
     }
 }
 
-/// Migrates every entry in a loaded `known_helpers.toml` document. Pure
-/// (no I/O): callers load the `TrustStore` with `isekai_trust::load_trust_store`
-/// as they already do, and separately decide whether/where to persist the
-/// result (`write_persistent_profile` below, or nothing at all for a
-/// dry-run/inspection use).
-pub fn migrate_trust_store(store: &TrustStore) -> Vec<PersistentProfile> {
-    store
-        .helpers
-        .iter()
-        .map(|(key, trust)| PersistentProfile::migrate_legacy_helper_trust(key, trust))
-        .collect()
-}
-
 /// `chatgpt.md` §33's `state/profiles/` layout, rooted the same way
 /// `default_runtime_dir` roots `runtime/` (an env override, else a
 /// platform-conventional per-user directory).
@@ -212,47 +199,25 @@ pub fn migrate_trust_store(store: &TrustStore) -> Vec<PersistentProfile> {
 /// non-Windows-fallback branch for cross-compiled/unusual Windows-adjacent
 /// targets that don't set `LOCALAPPDATA` either.
 pub fn default_profiles_dir() -> io::Result<PathBuf> {
-    resolve_profiles_dir(
-        std::env::var_os("ISEKAI_PIPE_PROFILES_DIR"),
-        std::env::var_os("XDG_STATE_HOME"),
-        // Folded in here (rather than checked inside `resolve_profiles_dir`)
-        // so that function stays a pure, OS-agnostic priority list —
-        // `cfg!(windows)` is a compile-time constant per build target, which
-        // would make a Windows-only branch untestable on a non-Windows CI
-        // runner; passing `None` here for a non-Windows build has the exact
-        // same effect and needs no `cfg`-gating in the tests below.
-        cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten(),
-        std::env::var_os("HOME"),
-    )
+    let (explicit, xdg, windows_local_app_data, home) = state_path_env_lookup("ISEKAI_PIPE_PROFILES_DIR");
+    resolve_profiles_dir(explicit, xdg, windows_local_app_data, home)
 }
 
 /// Pure priority list behind [`default_profiles_dir`], split out so every
 /// branch (including the Windows-only `LOCALAPPDATA` one) is unit-testable
 /// without mutating this process's real environment variables or depending
-/// on which OS the test happens to run on.
+/// on which OS the test happens to run on. Thin wrapper around
+/// [`resolve_state_path`] (shared with [`resolve_log_file`]) that only
+/// supplies this store's own path suffix/fallback.
 fn resolve_profiles_dir(
     explicit_override: Option<std::ffi::OsString>,
     xdg_state_home: Option<std::ffi::OsString>,
     windows_local_app_data: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> io::Result<PathBuf> {
-    if let Some(path) = explicit_override {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = xdg_state_home {
-        return Ok(PathBuf::from(path).join("isekai").join("profiles"));
-    }
-    if let Some(local_app_data) = windows_local_app_data {
-        return Ok(PathBuf::from(local_app_data).join("isekai").join("profiles"));
-    }
-    if let Some(home) = home {
-        return Ok(PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("isekai")
-            .join("profiles"));
-    }
-    Ok(std::env::temp_dir().join("isekai-profiles"))
+    resolve_state_path(explicit_override, xdg_state_home, windows_local_app_data, home, &["profiles"], &[
+        "isekai-profiles",
+    ])
 }
 
 /// Default destination for the always-on verbose diagnostic log that
@@ -265,41 +230,80 @@ fn resolve_profiles_dir(
 /// `isekai-pipe connect` where to write its own diagnostic log (same
 /// convention as `ISEKAI_INTENT_ID`/`ISEKAI_PIPE_RUNTIME_DIR`).
 pub fn default_log_file() -> io::Result<PathBuf> {
-    resolve_log_file(
-        std::env::var_os("ISEKAI_PIPE_LOG_FILE"),
-        std::env::var_os("XDG_STATE_HOME"),
-        cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten(),
-        std::env::var_os("HOME"),
-    )
+    let (explicit, xdg, windows_local_app_data, home) = state_path_env_lookup("ISEKAI_PIPE_LOG_FILE");
+    resolve_log_file(explicit, xdg, windows_local_app_data, home)
 }
 
 /// Pure priority list behind [`default_log_file`], mirroring
 /// `resolve_profiles_dir`'s structure so it stays unit-testable without
-/// mutating this process's real environment variables.
+/// mutating this process's real environment variables. Thin wrapper around
+/// [`resolve_state_path`] that only supplies this store's own path
+/// suffix/fallback.
 fn resolve_log_file(
     explicit_override: Option<std::ffi::OsString>,
     xdg_state_home: Option<std::ffi::OsString>,
     windows_local_app_data: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> io::Result<PathBuf> {
+    resolve_state_path(explicit_override, xdg_state_home, windows_local_app_data, home, &["logs", "isekai-ssh.log"], &[
+        "isekai-logs",
+        "isekai-ssh.log",
+    ])
+}
+
+/// The four env-var lookups both [`default_profiles_dir`] and
+/// [`default_log_file`] need, gathered in one place so neither repeats the
+/// same four `std::env::var_os` calls plus the same
+/// `cfg!(windows).then(...)` trick. `explicit_var` is the one lookup that
+/// differs per caller (`ISEKAI_PIPE_PROFILES_DIR` vs. `ISEKAI_PIPE_LOG_FILE`);
+/// `XDG_STATE_HOME`/`LOCALAPPDATA`/`HOME` are shared verbatim.
+fn state_path_env_lookup(
+    explicit_var: &str,
+) -> (Option<std::ffi::OsString>, Option<std::ffi::OsString>, Option<std::ffi::OsString>, Option<std::ffi::OsString>) {
+    (
+        std::env::var_os(explicit_var),
+        std::env::var_os("XDG_STATE_HOME"),
+        // `cfg!(windows)` is a compile-time constant per build target, which
+        // would make a Windows-only branch untestable on a non-Windows CI
+        // runner; passing `None` here for a non-Windows build has the exact
+        // same effect and needs no `cfg`-gating in `resolve_state_path`'s
+        // own tests (they call `resolve_profiles_dir`/`resolve_log_file`
+        // directly, bypassing this function entirely).
+        cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten(),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure OS-path priority list shared by [`resolve_profiles_dir`]/
+/// [`resolve_log_file`]: explicit override → `XDG_STATE_HOME` → Windows
+/// `LOCALAPPDATA` → `HOME` → process temp dir. `suffix` is the path
+/// components appended after the shared `isekai` parent for the XDG/
+/// `LOCALAPPDATA`/`HOME` branches (e.g. `&["profiles"]` or
+/// `&["logs", "isekai-ssh.log"]`); `fallback` is joined directly onto
+/// `std::env::temp_dir()` (no `isekai` parent — matches each store's own
+/// pre-existing temp-dir naming).
+fn resolve_state_path(
+    explicit_override: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    windows_local_app_data: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    suffix: &[&str],
+    fallback: &[&str],
+) -> io::Result<PathBuf> {
     if let Some(path) = explicit_override {
         return Ok(PathBuf::from(path));
     }
+    let under_isekai = |root: PathBuf| suffix.iter().fold(root.join("isekai"), |acc, part| acc.join(part));
     if let Some(path) = xdg_state_home {
-        return Ok(PathBuf::from(path).join("isekai").join("logs").join("isekai-ssh.log"));
+        return Ok(under_isekai(PathBuf::from(path)));
     }
     if let Some(local_app_data) = windows_local_app_data {
-        return Ok(PathBuf::from(local_app_data).join("isekai").join("logs").join("isekai-ssh.log"));
+        return Ok(under_isekai(PathBuf::from(local_app_data)));
     }
     if let Some(home) = home {
-        return Ok(PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("isekai")
-            .join("logs")
-            .join("isekai-ssh.log"));
+        return Ok(under_isekai(PathBuf::from(home).join(".local").join("state")));
     }
-    Ok(std::env::temp_dir().join("isekai-logs").join("isekai-ssh.log"))
+    Ok(fallback.iter().fold(std::env::temp_dir(), |acc, part| acc.join(part)))
 }
 
 /// Escapes characters that are reserved in Windows filenames -- most
@@ -579,20 +583,6 @@ mod tests {
             cached_stun_observed_addr: None,
         };
         assert_eq!(profile.to_legacy_relay_transport(), None);
-    }
-
-    #[test]
-    fn migrates_every_entry_in_a_trust_store() {
-        let mut store = TrustStore::default();
-        store.insert("host-a:22".to_string(), sample_trust());
-        store.insert("host-b:22".to_string(), sample_trust());
-
-        let mut profiles = migrate_trust_store(&store);
-        profiles.sort_by(|a, b| a.profile.cmp(&b.profile));
-
-        assert_eq!(profiles.len(), 2);
-        assert_eq!(profiles[0].profile, "host-a:22");
-        assert_eq!(profiles[1].profile, "host-b:22");
     }
 
     #[test]

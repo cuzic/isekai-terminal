@@ -221,8 +221,7 @@ pub struct CandidateId(pub u64);
 /// A candidate-collection round. Belongs to a *batch* of candidates
 /// ([`CandidateDraftBatch`]/`CandidateSnapshot`), not to an individual
 /// candidate — a `CandidatePool` uses this to reject stale results from a
-/// superseded collection round, distinct from `PunchGeneration` (STUN
-/// hole-punch retry counter, `isekai-pipe-core`) and any future
+/// superseded collection round, distinct from any future
 /// `ConnectionGeneration` (attach generation, `#18`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CandidateGeneration(pub u64);

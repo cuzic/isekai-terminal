@@ -37,16 +37,6 @@ impl OutputBuffer {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     pub fn remaining_capacity(&self) -> usize {
         self.capacity.saturating_sub(self.data.len())
     }
@@ -79,11 +69,6 @@ impl OutputBuffer {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn start_offset(&self) -> u64 {
-        self.start_offset
-    }
-
     pub fn end_offset(&self) -> u64 {
         self.start_offset + self.data.len() as u64
     }
@@ -101,6 +86,23 @@ impl OutputBuffer {
     }
 }
 
+// テストだけが参照するアクセサ（本番コードは remaining_capacity/is_full/
+// end_offset/append/advance_start/replay_from だけで完結する）。
+#[cfg(test)]
+impl OutputBuffer {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+}
+
 /// [`SessionTable::insert_existing`]'s result — see that method's docs for
 /// why `InsertedAfterEvicting` carries the evicted `SessionId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +110,6 @@ pub enum InsertOutcome {
     Inserted,
     InsertedAfterEvicting(SessionId),
     Rejected,
-}
-
-impl InsertOutcome {
-    #[allow(dead_code)]
-    pub fn inserted(&self) -> bool {
-        !matches!(self, InsertOutcome::Rejected)
-    }
 }
 
 /// resume 可能な 1 セッション分の状態。
@@ -157,9 +152,14 @@ impl Session {
     }
 }
 
-/// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。
+/// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。以前は
+/// `engine::hex_lower`(`mod.rs`、`&[u8]` 版)と全く同じ1行を自前で再実装
+/// していたが、`&SessionId`(`[u8; 16]`)は呼び出し箇所で `&[u8]` に自動で
+/// coerceされるため、単にそちらへ委譲するだけにした。呼び出し側
+/// (`insert_existing`/`claim_oldest_parked`/`sweep_expired_parked`、いずれも
+/// 本 work unit の予約範囲)はシグネチャ・呼び出し方とも一切変えていない。
 fn hex_lower(id: &SessionId) -> String {
-    id.iter().map(|b| format!("{b:02x}")).collect()
+    super::hex_lower(id)
 }
 
 /// Scans an already-locked table for the session with the oldest
@@ -218,24 +218,6 @@ impl SessionTable {
     /// `AttachRuntime::session_count()` without duplicating the number.
     pub fn max_sessions(&self) -> usize {
         self.max_sessions
-    }
-
-    /// production側では#18-4以降未使用(session_idはクライアントが
-    /// `ATTACH_HELLO`で決める)——この crate 内のテストが任意のsession_idを
-    /// 作るためだけに使う。
-    #[allow(dead_code)]
-    pub fn generate_session_id() -> SessionId {
-        use rand::RngCore;
-        let mut id = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut id);
-        id
-    }
-
-    #[allow(dead_code)]
-    pub async fn insert(&self, id: SessionId, session: Session) -> Arc<Mutex<Session>> {
-        let handle = Arc::new(Mutex::new(session));
-        self.inner.lock().await.insert(id, handle.clone());
-        handle
     }
 
     /// 既に中継が使い始めている `Arc<Mutex<Session>>` handle をそのまま登録する。
@@ -326,11 +308,6 @@ impl SessionTable {
         self.inner.lock().await.remove(id)
     }
 
-    #[allow(dead_code)]
-    pub async fn contains(&self, id: &SessionId) -> bool {
-        self.inner.lock().await.contains_key(id)
-    }
-
     /// `parked_tcp` に入れられてから `max_parked` 以上経過したセッションを
     /// 破棄する（TCP 接続を close して session_id をテーブルから除く）。
     /// アクティブなセッション（`parked_tcp` が `None`）には触れない。
@@ -386,6 +363,29 @@ impl SessionTable {
 impl Default for SessionTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// production側では#18-4以降未使用(session_idはクライアントが`ATTACH_HELLO`で
+// 決める)——この crate 内のテストだけが任意の session_id を作ったり、
+// insert_existing を経由せず直接テーブルへ挿入・存在確認したりするために使う。
+#[cfg(test)]
+impl SessionTable {
+    pub fn generate_session_id() -> SessionId {
+        use rand::RngCore;
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        id
+    }
+
+    pub async fn insert(&self, id: SessionId, session: Session) -> Arc<Mutex<Session>> {
+        let handle = Arc::new(Mutex::new(session));
+        self.inner.lock().await.insert(id, handle.clone());
+        handle
+    }
+
+    pub async fn contains(&self, id: &SessionId) -> bool {
+        self.inner.lock().await.contains_key(id)
     }
 }
 

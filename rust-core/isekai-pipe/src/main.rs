@@ -1,6 +1,5 @@
 mod ctl;
 mod ctl_file;
-mod datagram_relay;
 mod engine;
 mod connect;
 mod inspect;
@@ -110,10 +109,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 return Ok(None);
             }
             "--service" => {
-                let value = connect::next_arg("serve", &mut iter, "--service").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = connect::next_arg("serve", &mut iter, "--service").map_err(connect::usage_err)?;
                 let spec = ServiceSpec::parse(&value).map_err(|e| {
                     eprintln!("isekai-pipe serve: invalid --service {value:?}: {e}");
                     ExitCode::from(EX_USAGE)
@@ -130,10 +126,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 }
             }
             "--target" => {
-                let value = connect::next_arg("serve", &mut iter, "--target").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = connect::next_arg("serve", &mut iter, "--target").map_err(connect::usage_err)?;
                 let spec = ServiceSpec::ssh_target(value).map_err(|e| {
                     eprintln!("isekai-pipe serve: invalid --target: {e}");
                     ExitCode::from(EX_USAGE)
@@ -158,10 +151,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
             | "--relay-jwt-file"
             | "--bootstrap-request-file"
             | "--log-level" => {
-                let value = connect::next_arg("serve", &mut iter, &arg).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = connect::next_arg("serve", &mut iter, &arg).map_err(connect::usage_err)?;
                 helper_args.push(arg);
                 helper_args.push(value);
             }
