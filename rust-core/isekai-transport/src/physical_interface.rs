@@ -19,8 +19,6 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use rand::Rng as _;
-
 use crate::error::TransportError;
 
 // Re-exported (not just `InterfaceIndex`) so callers outside this crate
@@ -54,57 +52,31 @@ fn unspecified_addr_for(remote: SocketAddr) -> SocketAddr {
     }
 }
 
-/// The local ports to try binding to, in order: `addr`'s own port when no
-/// range is given, otherwise every port in `port_range` (inclusive) starting
-/// from a random offset so multiple sockets bound in quick succession don't
-/// all race for the low end of the range. Mirrors `quicmux::noq_backend`'s
-/// own (private) `candidate_ports` helper — that one drives
-/// `AnyMuxFactory::create_endpoint`'s plain-socket bind, this one drives
-/// [`bind_physical_interface`]'s interface-restricted bind, so it can't
-/// reuse that helper directly, but the retry policy should stay identical.
-fn candidate_ports(addr: SocketAddr, port_range: Option<(u16, u16)>) -> Vec<u16> {
-    match port_range {
-        None => vec![addr.port()],
-        Some((start, end)) => {
-            let span = u32::from(end) - u32::from(start) + 1;
-            let offset = rand::rngs::OsRng.gen_range(0..span);
-            (0..span).map(|i| start + ((offset + i) % span) as u16).collect()
-        }
-    }
-}
-
 /// Binds a UDP socket restricted to `interface`, trying each port
-/// [`candidate_ports`] yields for `port_range` in turn via
-/// [`bind_physical_interface`] until one succeeds. Split out of
-/// [`connect_via_interface`] purely so this port-selection behavior itself
-/// (independent of the QUIC handshake that follows it) can be unit-tested
-/// directly rather than only observable end-to-end.
+/// `quicmux::noq_backend::candidate_ports` yields for `port_range` in turn
+/// via [`bind_physical_interface`] until one succeeds — the same
+/// port-selection/retry policy `quicmux::noq_backend`'s own plain-socket
+/// bind uses for `AnyMuxFactory::create_endpoint`, reused here via
+/// `quicmux::noq_backend::bind_with_port_range` rather than hand-duplicated
+/// (this function used to carry its own private `candidate_ports` copy).
+/// Split out of [`connect_via_interface`] purely so this port-selection
+/// behavior itself (independent of the QUIC handshake that follows it) can
+/// be unit-tested directly rather than only observable end-to-end.
 fn bind_physical_interface_with_port_range(
     interface: InterfaceIndex,
     unspecified: SocketAddr,
     port_range: Option<(u16, u16)>,
 ) -> Result<std::net::UdpSocket, TransportError> {
-    let mut last_err = None;
-    for port in candidate_ports(unspecified, port_range) {
-        match bind_physical_interface(interface, SocketAddr::new(unspecified.ip(), port)) {
-            Ok(socket) => return Ok(socket),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(TransportError::Mux(quicmux::MuxError::Bind {
-        addr: unspecified,
-        source: last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty port range")),
-    }))
+    let bind = quicmux::BindSpec { local_addr: unspecified, port_range };
+    quicmux::noq_backend::bind_with_port_range(&bind, |addr| bind_physical_interface(interface, addr))
+        .map_err(TransportError::Mux)
 }
 
 /// Creates an endpoint via `factory` — bound to `interface` specifically if
 /// given (via [`bind_physical_interface`]), or to OS-default routing
 /// otherwise — and dials `remote` on it. This is the "maybe-interface-bound
-/// dial" step shared by [`crate::warm_standby::WarmStandby`]'s own dial and
-/// [`crate::dual_path::connect_dual_path`]: both need exactly the same
-/// bind-or-wrap-then-connect sequence, just for different reasons (a warm
-/// spare vs. a second actively-used connection), so it lives here once
-/// rather than being duplicated per caller.
+/// dial" step used by [`crate::warm_standby::WarmStandby`]'s own dial, so it
+/// lives here once rather than being duplicated per caller.
 ///
 /// The bind address always matches `remote`'s own IPv4/IPv6 family (see
 /// [`unspecified_addr_for`]), and `port_range` narrows the local port the
@@ -168,19 +140,10 @@ mod tests {
             .expect("this machine should have a loopback interface")
     }
 
-    #[test]
-    fn candidate_ports_without_a_range_is_just_the_addrs_own_port() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5555);
-        assert_eq!(candidate_ports(addr, None), vec![5555]);
-    }
-
-    #[test]
-    fn candidate_ports_with_a_range_covers_every_port_exactly_once() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let mut ports = candidate_ports(addr, Some((40500, 40504)));
-        ports.sort_unstable();
-        assert_eq!(ports, vec![40500, 40501, 40502, 40503, 40504]);
-    }
+    // `candidate_ports`'s own port-selection behavior (no range == just the
+    // addr's own port; a range covers every port in it exactly once) is
+    // covered by `quicmux::noq_backend`'s own tests now that this module
+    // reuses that function instead of keeping a private copy.
 
     #[test]
     fn unspecified_addr_for_matches_the_remotes_own_family() {
@@ -305,8 +268,7 @@ mod tests {
     /// Regression test for the IPv4-only bind this crate used to have:
     /// `connect_via_interface` must bind an address matching the remote's
     /// own family, not always IPv4 — otherwise an IPv6-only remote (e.g. a
-    /// 464XLAT/NAT64 cellular interface, this crate's own motivating case
-    /// for `dual_path.rs`) could never be dialed at all.
+    /// 464XLAT/NAT64 cellular interface) could never be dialed at all.
     ///
     /// A `test-windows` CI run once failed here with
     /// `MuxError::EndpointSetup("...os error 10022...")` (`WSAEINVAL`), on

@@ -62,7 +62,7 @@ use tokio::sync::Mutex;
 
 use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 use isekai_protocol::session_id::SessionId;
-use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, MuxError, RemoteSpec};
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, MuxError};
 
 use crate::physical_interface::InterfaceIndex;
 
@@ -207,20 +207,25 @@ impl WarmStandby {
 
     /// Binds (either OS-default or, if [`WarmStandby::new_bound_to_interface`]
     /// was used, restricted to `self.interface`) a fresh local socket and
-    /// dials `self.target`, via [`crate::physical_interface::connect_via_interface`]
-    /// (shared with [`crate::dual_path::connect_dual_path`], which needs the
-    /// exact same "maybe-interface-bound dial" step for its own two
-    /// connections). Also applies `self.target.local_bind_port_range`, the
-    /// same narrowed-outbound-port-range knob `relay.rs`/`race.rs`/
-    /// `resume.rs` already honor for their own dials — previously silently
-    /// ignored here.
+    /// dials `self.target`, via [`crate::physical_interface::connect_via_interface`].
+    /// Also applies `self.target.local_bind_port_range`, the same
+    /// narrowed-outbound-port-range knob `relay.rs`/`race.rs`/`resume.rs`
+    /// already honor for their own dials — previously silently ignored here.
     async fn dial(&self) -> Result<AnyMuxConnection, TransportError> {
-        let remote = RemoteSpec {
-            addr: self.target.helper_addr,
-            server_name: self.target.server_name.clone(),
-            cert_sha256_hex: self.target.cert_sha256_hex.clone(),
-        };
-        crate::physical_interface::connect_via_interface(&self.factory, self.interface, remote, self.target.local_bind_port_range).await
+        // `connect_via_interface` takes the port range separately (not a
+        // full `BindSpec`, unlike this crate's other dial sites) since it
+        // still needs to compute its own bind address matching `remote`'s
+        // IPv4/IPv6 family (`unspecified_addr_for`) — so only the
+        // `RemoteSpec` half of `RelayTarget`'s two dial-preamble helpers
+        // applies here; `self.target.local_bind_port_range` is passed
+        // through as-is, unchanged from before.
+        crate::physical_interface::connect_via_interface(
+            &self.factory,
+            self.interface,
+            self.target.remote_spec(),
+            self.target.local_bind_port_range,
+        )
+        .await
     }
 
     /// Promotes the standby connection: issues a `quicmux::resume` RESUME

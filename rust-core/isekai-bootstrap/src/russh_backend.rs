@@ -51,7 +51,7 @@ use isekai_protocol::bootstrap::{
 use isekai_trust::FileBackedHostKeyVerifier;
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler_with_reason, ConnectionLeg,
+    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, ConnectionLeg,
     Credential, JumpHost, RejectionReason, Session, SessionKind, VerifyingHandler,
 };
 
@@ -308,7 +308,7 @@ impl RusshBackend {
                     .expect("connect_via_jump_or_direct only builds a Jump leg when a JumpHost was passed"),
                 ConnectionLeg::Target => target_verifier_for_closure.clone(),
             };
-            verifying_handler_with_reason(&verifier, &rejection_for_closure)
+            verifying_handler(&verifier).with_rejection_reason(&rejection_for_closure)
         };
 
         let jump_host = jump.as_ref().map(|(jh, _)| jh);

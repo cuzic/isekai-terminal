@@ -185,14 +185,10 @@ pub async fn connect_via_relay_resumable(
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<ResumableRelaySession, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await.map_err(TransportError::Mux)?;
     let (conn, data_stream, proof, effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
-        RemoteSpec {
-            addr: target.helper_addr,
-            server_name: target.server_name.clone(),
-            cert_sha256_hex: target.cert_sha256_hex.clone(),
-        },
+        target.remote_spec(),
         &target.session_secret,
         random_session_id(),
         ConnectionGeneration::INITIAL,
@@ -425,7 +421,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                 id: &candidate.candidate_id,
             };
 
-            let endpoint = match factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(candidate.target.local_bind_port_range)).await {
+            let endpoint = match factory.create_endpoint(candidate.target.bind_spec()).await {
                 Ok(endpoint) => endpoint,
                 Err(source) => {
                     // Binding our own local socket never touches the remote
@@ -440,11 +436,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
 
             let attempt = connect_and_handshake(
                 &endpoint,
-                RemoteSpec {
-                    addr: candidate.target.helper_addr,
-                    server_name: candidate.target.server_name.clone(),
-                    cert_sha256_hex: candidate.target.cert_sha256_hex.clone(),
-                },
+                candidate.target.remote_spec(),
                 &candidate.target.session_secret,
                 round.session_id,
                 round.generation,
