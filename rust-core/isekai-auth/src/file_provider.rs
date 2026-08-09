@@ -39,8 +39,8 @@
 //! added later as a sibling to `FileTokenProvider` behind the same trait
 //! without touching this module.
 
+#[cfg(test)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -206,19 +206,13 @@ enum TokenFileSchema {
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
 /// `archive/ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
-/// `known_helpers.toml`). Resolves the home directory via
-/// `isekai_fs_guard::resolve_home_dir` (`$HOME`, falling back to
-/// `%USERPROFILE%` on Windows where `HOME` isn't reliably set).
+/// `known_helpers.toml`). Delegates to `isekai_fs_guard::resolve_config_dir`
+/// (`$HOME`, falling back to `%USERPROFILE%` on Windows where `HOME` isn't
+/// reliably set) — the same join `isekai-trust::store::default_config_dir`
+/// resolves, moved to the shared crate (WU-M3) since both used to carry an
+/// identical copy.
 pub fn default_config_dir() -> Result<PathBuf, AuthError> {
-    let home = isekai_fs_guard::resolve_home_dir().ok_or(AuthError::NoHomeDir)?;
-    Ok(config_dir_from_home(&home))
-}
-
-/// Pure helper split out of `default_config_dir` so the path-joining logic
-/// can be unit-tested without mutating the process-wide `HOME` env var
-/// (mirrors `isekai-trust::store::config_dir_from_home`).
-fn config_dir_from_home(home: &Path) -> PathBuf {
-    home.join(".config").join(CONFIG_DIR_NAME)
+    Ok(isekai_fs_guard::resolve_config_dir(CONFIG_DIR_NAME)?)
 }
 
 /// `~/.config/isekai-ssh/token.json`.
@@ -241,19 +235,13 @@ pub fn load_token(path: &Path) -> Result<String, AuthError> {
 /// (plain `relay_jwt`) file comes back as a `TokenSet` with every new field
 /// `None` (see module docs). Same fail-closed behavior as `load_token`.
 pub fn load_token_set(path: &Path) -> Result<TokenSet, AuthError> {
-    if let Some(parent) = path.parent() {
-        if parent.exists() {
-            check_not_world_writable(parent)?;
-        }
-    }
-
-    if !path.exists() {
+    // `isekai_fs_guard::read_checked` covers the permission-checked
+    // parent-then-file read; unlike `isekai-trust`'s TOML stores, a missing
+    // token file here is a hard error (no meaningful "empty token" state),
+    // so `None` maps to `TokenFileNotFound` rather than a default.
+    let Some(mut content) = isekai_fs_guard::read_checked(path)? else {
         return Err(AuthError::TokenFileNotFound { path: path.to_path_buf() });
-    }
-    check_not_world_writable(path)?;
-
-    let mut content =
-        fs::read_to_string(path).map_err(|e| AuthError::Read { path: path.to_path_buf(), source: e })?;
+    };
     let parsed: Result<TokenFileSchema, _> = serde_json::from_str(&content);
     // Zeroized as soon as `serde_json::from_str` is done with it, win or
     // lose — `content` holds the raw secret in plaintext (the whole file,
@@ -313,60 +301,26 @@ pub fn save_token_set(path: &Path, token_set: &TokenSet) -> Result<(), AuthError
     write_atomically(path, serialized)
 }
 
-/// Shared atomic-write body for `save_token`/`save_token_set`: write to a
-/// fresh temp file in `path`'s parent directory (creating it, `0700`, if
-/// needed), set `0600` permissions on the temp file, then rename it over
-/// `path`. Takes `serialized` by value (not `&str`) specifically so it can
-/// be zeroized here once the write attempt is done with it — the JSON text
-/// this function's two callers hand it is plaintext containing the actual
-/// secret (`access_token`/`refresh_token`, or the legacy `relay_jwt`), a
-/// third copy alongside the two `load_token_set` already zeroizes on the
-/// read side (adversarial review, 2026-08: this write-side copy was found
-/// still un-zeroized after that fix).
+/// Shared atomic-write body for `save_token`/`save_token_set`. The temp-file
+/// + `0600`/`0700` permission handling + rename sequence itself is
+/// `isekai_fs_guard::write_private_atomically`, shared with `isekai-trust`'s
+/// TOML stores (WU-M3). Takes `serialized` by value (not `&str`)
+/// specifically so it can be zeroized here once the write attempt is done
+/// with it — the JSON text this function's two callers hand it is plaintext
+/// containing the actual secret (`access_token`/`refresh_token`, or the
+/// legacy `relay_jwt`), a third copy alongside the two `load_token_set`
+/// already zeroizes on the read side (adversarial review, 2026-08: this
+/// write-side copy was found still un-zeroized after that fix). Zeroizing
+/// right after the call returns (rather than between the write and the
+/// rename, as a previous version of this function did before its atomic
+/// write body moved into `isekai_fs_guard`) is a deliberately accepted,
+/// negligible widening of the exposure window — `write_private_atomically`'s
+/// own rename step never reads `serialized` again after the write, so
+/// nothing observes the extra few instructions' delay.
 fn write_atomically(path: &Path, mut serialized: String) -> Result<(), AuthError> {
-    let parent = path.parent().ok_or_else(|| AuthError::NoParentDir { path: path.to_path_buf() })?;
-    ensure_private_dir(parent)?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
-    set_private_file_permissions(tmp.path())?;
-    let write_result = tmp.write_all(serialized.as_bytes()).and_then(|_| tmp.flush());
+    let result = isekai_fs_guard::write_private_atomically(path, serialized.as_bytes());
     serialized.zeroize();
-    write_result.map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })?;
-
-    tmp.persist(path).map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e.error })?;
-    Ok(())
-}
-
-/// Translates a `FsGuardError` (path-less by design, see its docs) into this
-/// crate's own `AuthError`, attaching `path` back.
-fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> AuthError {
-    use isekai_fs_guard::FsGuardError;
-    match err {
-        FsGuardError::CreateDir(source) => AuthError::CreateDir { path: path.to_path_buf(), source },
-        FsGuardError::Stat(source) => AuthError::Stat { path: path.to_path_buf(), source },
-        FsGuardError::SetPermissions(source) => AuthError::Write { path: path.to_path_buf(), source },
-        FsGuardError::WorldWritable { mode } => AuthError::WorldWritable { path: path.to_path_buf(), mode },
-        FsGuardError::InsecureAcl { principal, rights } => {
-            AuthError::InsecureAcl { path: path.to_path_buf(), principal, rights }
-        }
-    }
-}
-
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
-fn ensure_private_dir(dir: &Path) -> Result<(), AuthError> {
-    isekai_fs_guard::ensure_private_dir(dir).map_err(|e| map_fs_guard_err(dir, e))
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), AuthError> {
-    isekai_fs_guard::set_private_file_permissions(path).map_err(|e| map_fs_guard_err(path, e))
-}
-
-/// Fails closed if `path` is writable by users other than its owner
-/// (mode bit `0o002`). Unix-only; a no-op elsewhere.
-fn check_not_world_writable(path: &Path) -> Result<(), AuthError> {
-    isekai_fs_guard::check_not_world_writable(path).map_err(|e| map_fs_guard_err(path, e))
+    result.map_err(AuthError::from)
 }
 
 /// Reads the relay JWT from `~/.config/isekai-ssh/token.json` (or a custom
@@ -600,7 +554,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
 
         let err = load_token(&path).unwrap_err();
-        assert!(matches!(err, AuthError::WorldWritable { .. }));
+        assert!(matches!(err, AuthError::FsGuard(isekai_fs_guard::FsGuardErrorAt::WorldWritable { .. })));
     }
 
     #[cfg(unix)]
@@ -616,14 +570,12 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let err = load_token(&path).unwrap_err();
-        assert!(matches!(err, AuthError::WorldWritable { .. }));
+        assert!(matches!(err, AuthError::FsGuard(isekai_fs_guard::FsGuardErrorAt::WorldWritable { .. })));
     }
 
-    #[test]
-    fn config_dir_is_joined_under_home() {
-        let home = Path::new("/home/example-user");
-        assert_eq!(config_dir_from_home(home), home.join(".config").join("isekai-ssh"));
-    }
+    // `config_dir_from_home`'s own join logic is now
+    // `isekai_fs_guard::config_dir_from_home` — see that crate's
+    // `config_dir_is_joined_under_home` test instead.
 
     // --- TokenSet / phase S-5 schema tests ---
 

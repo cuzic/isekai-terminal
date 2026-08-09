@@ -7,17 +7,12 @@ use std::path::PathBuf;
 /// ファイル形式").
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
-    #[error("failed to read trust store at {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to write trust store at {path}: {source}")]
-    Write { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to create config directory {path}: {source}")]
-    CreateDir { path: PathBuf, #[source] source: std::io::Error },
-
-    #[error("failed to inspect permissions of {path}: {source}")]
-    Stat { path: PathBuf, #[source] source: std::io::Error },
+    /// Every read/write/permission/config-directory failure this crate can
+    /// hit — `isekai_fs_guard::FsGuardErrorAt` is the single shared,
+    /// path-attached type both this crate and `isekai-auth` build on (WU-M3;
+    /// this used to be eight separate variants declared independently here).
+    #[error(transparent)]
+    FsGuard(#[from] isekai_fs_guard::FsGuardErrorAt),
 
     /// Covers both malformed TOML and an unrecognized `update_policy` value:
     /// the latter is rejected by `UpdatePolicy`'s `Deserialize` impl, which
@@ -29,18 +24,6 @@ pub enum TrustError {
 
     #[error("failed to serialize trust store to TOML: {0}")]
     Serialize(#[from] toml::ser::Error),
-
-    #[error("{path} is world-writable (mode {mode:o}); refusing to use it")]
-    WorldWritable { path: PathBuf, mode: u32 },
-
-    #[error("{path} grants write access to {principal} (rights {rights}); refusing to use it")]
-    InsecureAcl { path: PathBuf, principal: String, rights: String },
-
-    #[error("could not determine the home directory (HOME is not set)")]
-    NoHomeDir,
-
-    #[error("path {path} has no parent directory")]
-    NoParentDir { path: PathBuf },
 
     #[error("empty host spec")]
     EmptyHost,

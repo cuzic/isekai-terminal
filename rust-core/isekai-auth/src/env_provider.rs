@@ -15,8 +15,8 @@ pub const RELAY_JWT_ENV_VAR: &str = "ISEKAI_RELAY_JWT";
 /// every other concurrently-running test in the process — each test can use
 /// its own uniquely-named variable instead, avoiding the
 /// `std::env::set_var` race condition that a shared name would create
-/// (`isekai-trust::store::config_dir_from_home` splits `HOME` handling the
-/// same way for the same reason).
+/// (`isekai_fs_guard::resolve_home_dir_from` splits `HOME`/`USERPROFILE`
+/// handling the same way for the same reason).
 pub struct EnvTokenProvider {
     var_name: String,
 }
