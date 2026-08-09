@@ -1589,6 +1589,41 @@ impl Terminal {
         new_cells
     }
 
+    /// 現在のカーソル状態(位置・SGR属性・文字セット状態)を[SavedCursor]として
+    /// 切り出す。DECSC(`save_cursor_decsc`)とalt画面切替(`switch_to_alt`)は
+    /// **同じフィールド集合**を保存する(`?1049h`が仕様上「DECSCとして保存」を
+    /// 兼ねるため——[Terminal]の`saved_cursor_main`フィールドdocコメント参照)。
+    /// どちらのスロットへ入れるかは呼び出し元が決める。
+    fn capture_cursor(&self) -> SavedCursor {
+        SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            attrs: self.cur_attrs,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            gl_is_g1: self.gl_is_g1,
+        }
+    }
+
+    /// [capture_cursor]で保存した状態を現在のカーソルへ適用する([capture_cursor]の
+    /// 逆操作)。
+    ///
+    /// 画面サイズへのクランプはここでは**行わない**——DECRC
+    /// ([restore_cursor_decrc])だけが適用後に別途クランプする、という既存の
+    /// 非対称性をそのまま維持するため(`switch_to_main`側は
+    /// `resize_preserving_state`が`saved_cursor_*`自体をリサイズに追従させて
+    /// いるためクランプしていない)。スロットを`take`するかどうかも同じ理由で
+    /// 呼び出し元の責務にしてある(alt→mainの復帰は使い切りで消すが、DECRCは
+    /// 何度でも同じ位置へ戻れるよう残す)。
+    fn apply_saved_cursor(&mut self, saved: SavedCursor) {
+        self.cursor_row = saved.row;
+        self.cursor_col = saved.col;
+        self.cur_attrs = saved.attrs;
+        self.g0_charset = saved.g0;
+        self.g1_charset = saved.g1;
+        self.gl_is_g1 = saved.gl_is_g1;
+    }
+
     fn switch_to_alt(&mut self, save_cursor: bool) {
         // 既にalt画面ならno-op(クラッシュ観点レビュー、2026-07-31、対になる
         // `switch_to_main`の`if !self.alt_active { return; }`と対称のガード)。
@@ -1603,14 +1638,7 @@ impl Terminal {
         // alt画面への切替は画面内容を丸ごと差し替える——全画面dirty(#93)。
         self.full_damage_pending = true;
         if save_cursor {
-            self.saved_cursor_main = Some(SavedCursor {
-                row: self.cursor_row,
-                col: self.cursor_col,
-                attrs: self.cur_attrs,
-                g0: self.g0_charset,
-                g1: self.g1_charset,
-                gl_is_g1: self.gl_is_g1,
-            });
+            self.saved_cursor_main = Some(self.capture_cursor());
         }
         let theme = self.theme;
         self.main_cells = self.cells().clone();
@@ -1645,13 +1673,10 @@ impl Terminal {
         self.full_damage_pending = true;
         self.alt_active = false;
         if restore_cursor {
+            // `take`する(alt→main復帰は使い切り)——DECRCと違い同じスロットへ
+            // 戻り続ける必要がないため、既存挙動をそのまま維持する。
             if let Some(saved) = self.saved_cursor_main.take() {
-                self.cursor_row = saved.row;
-                self.cursor_col = saved.col;
-                self.cur_attrs = saved.attrs;
-                self.g0_charset = saved.g0;
-                self.g1_charset = saved.g1;
-                self.gl_is_g1 = saved.gl_is_g1;
+                self.apply_saved_cursor(saved);
             }
         }
         self.active_link_id = None;
@@ -1665,14 +1690,7 @@ impl Terminal {
     /// スロットを共有する設計の理由は[Terminal]の`saved_cursor_main`フィールド
     /// docコメント参照。
     fn save_cursor_decsc(&mut self) {
-        let saved = Some(SavedCursor {
-            row: self.cursor_row,
-            col: self.cursor_col,
-            attrs: self.cur_attrs,
-            g0: self.g0_charset,
-            g1: self.g1_charset,
-            gl_is_g1: self.gl_is_g1,
-        });
+        let saved = Some(self.capture_cursor());
         if self.alt_active {
             self.saved_cursor_alt = saved;
         } else {
@@ -1686,17 +1704,15 @@ impl Terminal {
     fn restore_cursor_decrc(&mut self) {
         let saved = if self.alt_active { self.saved_cursor_alt } else { self.saved_cursor_main };
         if let Some(saved) = saved {
+            self.apply_saved_cursor(saved);
             // 保存後にresizeで画面が縮んでいる可能性を考慮し、現在のcols/rowsへ
-            // クランプする。`resize_preserving_state`は`saved_cursor_*`自体を
+            // クランプする(この後段クランプがDECRC固有の差分——`apply_saved_cursor`
+            // のdocコメント参照)。`resize_preserving_state`は`saved_cursor_*`自体を
             // resize時に追従更新するが(念のため多重に安全側でもクランプする)、
             // colはprintの遅延折り返し状態(`== cols`)を許容する必要があるため
             // `cols`ちょうどまでは許容し、それを超える場合のみ切り詰める。
-            self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
-            self.cursor_col = saved.col.min(self.cols);
-            self.cur_attrs = saved.attrs;
-            self.g0_charset = saved.g0;
-            self.g1_charset = saved.g1;
-            self.gl_is_g1 = saved.gl_is_g1;
+            self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
+            self.cursor_col = self.cursor_col.min(self.cols);
         }
     }
 
@@ -6809,6 +6825,96 @@ mod tests {
         feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(?1049hが上書き保存した位置に復元)
         assert_eq!(t.cursor_row(), 1);
         assert_eq!(t.cursor_col(), 2);
+    }
+
+    // ── SavedCursorのcapture/apply共通化(Phase 2)の等価性 ─────────────
+    //
+    // DECSC/DECRC・`?1047`/`?1049`の4箇所に開き書きされていたカーソル保存/復元を
+    // `capture_cursor`/`apply_saved_cursor`へ統合した。「保存対象のフィールド集合が
+    // 4箇所で同一であること」と「意図的に残した3つの差分」をここで固定する。
+
+    #[test]
+    fn test_decsc_decrc_roundtrips_every_saved_cursor_field() {
+        // `SavedCursor`の6フィールド(row/col/attrs/g0/g1/gl_is_g1)が1回の
+        // DECSC→DECRCで**まとめて**往復することを固定する(1つでも
+        // `capture_cursor`/`apply_saved_cursor`から漏れれば落ちる)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H"); // row=2, col=4
+        feed(&mut t, b"\x1b[1;4;41m"); // bold + underline + 赤背景
+        feed(&mut t, b"\x1b(0"); // G0 = DEC Special Graphics
+        feed(&mut t, b"\x1b)0\x0e"); // G1 = DEC Special Graphics, SO で GL=G1
+        feed(&mut t, b"\x1b7"); // DECSC
+
+        // 保存後に全部を別の値へ動かす。
+        feed(&mut t, b"\x1b[1;1H\x1b[0m\x1b(B\x1b)B\x0f");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(!t.cur_attrs.bold && !t.gl_is_g1);
+
+        feed(&mut t, b"\x1b8"); // DECRC
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4), "位置が戻る");
+        assert!(t.cur_attrs.bold, "boldが戻る");
+        assert!(t.cur_attrs.underline, "underlineが戻る");
+        assert_eq!(t.cur_attrs.bg, Theme::default().ansi16[1], "背景色が戻る");
+        assert!(t.g0_charset == Charset::DecSpecialGraphics, "G0が戻る");
+        assert!(t.g1_charset == Charset::DecSpecialGraphics, "G1が戻る");
+        assert!(t.gl_is_g1, "GL(SI/SO)の選択状態が戻る");
+    }
+
+    #[test]
+    fn test_alt_screen_switch_saves_and_restores_the_same_field_set_as_decsc() {
+        // `?1049h`/`?1049l`の暗黙保存/復元も、DECSC/DECRCと**同じフィールド集合**を
+        // 対象にする(`capture_cursor`/`apply_saved_cursor`を共有している)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H");
+        feed(&mut t, b"\x1b[1;4;41m");
+        feed(&mut t, b"\x1b(0\x1b)0\x0e");
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(暗黙DECSC)
+        // alt画面側はフレッシュな既定から始まる。
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(!t.cur_attrs.bold);
+        assert!(t.g0_charset == Charset::Ascii && t.g1_charset == Charset::Ascii && !t.gl_is_g1);
+
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(暗黙DECRC)
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4));
+        assert!(t.cur_attrs.bold);
+        assert!(t.cur_attrs.underline);
+        assert_eq!(t.cur_attrs.bg, Theme::default().ansi16[1]);
+        assert!(t.g0_charset == Charset::DecSpecialGraphics);
+        assert!(t.g1_charset == Charset::DecSpecialGraphics);
+        assert!(t.gl_is_g1);
+    }
+
+    #[test]
+    fn test_decrc_does_not_consume_the_saved_slot() {
+        // 意図的な差分1: DECRCはスロットを`take`しない(何度でも同じ位置へ戻れる)。
+        // alt→main復帰(`switch_to_main`)側が`take`する既存挙動との非対称性は
+        // `test_naked_decrc_after_1049_exit_without_new_decsc_is_noop`が固定している。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b7"); // (2,4)を保存
+        feed(&mut t, b"\x1b[1;1H\x1b8");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4));
+        feed(&mut t, b"\x1b[1;1H\x1b8"); // 2回目のDECRCも同じ位置へ戻れる
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 4), "DECRCのスロットは使い切りではない");
+    }
+
+    #[test]
+    fn test_decrc_clamps_restored_position_to_current_screen_size() {
+        // 意図的な差分2: DECRCだけが復元後に現在のcols/rowsへクランプする
+        // (`apply_saved_cursor`自体はクランプしない)。通常は
+        // `resize_preserving_state`が`saved_cursor_*`を追従更新するので到達
+        // しないが、多重の安全策としてこのクランプは残してある。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        t.saved_cursor_main = Some(SavedCursor {
+            row: 99,
+            col: 99,
+            attrs: t.cur_attrs,
+            g0: Charset::Ascii,
+            g1: Charset::Ascii,
+            gl_is_g1: false,
+        });
+        feed(&mut t, b"\x1b8"); // DECRC
+        assert_eq!(t.cursor_row(), 4, "行は rows-1 へクランプ");
+        assert_eq!(t.cursor_col(), 20, "列は cols ちょうど(遅延折り返し位置)まで許容");
     }
 
     #[test]
