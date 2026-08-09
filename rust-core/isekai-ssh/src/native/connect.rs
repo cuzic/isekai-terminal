@@ -42,8 +42,8 @@ use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionInt
 use russh::client;
 use russh_stream_session::{
     authenticate_keyboard_interactive, authenticate_openssh_cert_with_passphrase, authenticate_publickey_with_passphrase,
-    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, Credential,
-    ForwardRoutes, KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
+    authenticate_session, establish_over_stream, open_channel, verifying_handler, Credential, ForwardRoutes,
+    KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -898,7 +898,7 @@ where
     // `rejection` so a host-key rejection's reason (a plain `bool` alone
     // can't carry — see `RejectionReason`'s docs) survives past this
     // function's `?` into the caller's error context.
-    let handler = verifying_handler_with_routes_and_reason(verifier, forward_routes, &rejection);
+    let handler = verifying_handler(verifier).with_forward_routes(forward_routes).with_rejection_reason(&rejection);
     let mut handle = establish_over_stream(config, stream, handler).await.map_err(|e| {
         let base = anyhow::Error::from(e);
         match rejection.take() {

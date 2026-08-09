@@ -87,11 +87,12 @@ pub trait HostKeyVerifier: Send + Sync {
 ///
 /// Follows the same `Arc`-backed, `Clone`-shares-state shape as
 /// [`ForwardRoutes`]: construct one, pass `&reason` into
-/// [`verifying_handler_with_reason`]/[`verifying_handler_with_routes_and_reason`],
-/// and keep your own clone to call [`take`](Self::take) on once the
-/// handshake has failed — the clone installed inside the (otherwise
-/// unreachable, once handed to `new_handler`) handler and the clone the
-/// caller kept refer to the same slot.
+/// [`VerifyingHandler::with_rejection_reason`] (e.g. via
+/// [`verifying_handler`]`(v).with_rejection_reason(&reason)`), and keep your
+/// own clone to call [`take`](Self::take) on once the handshake has failed —
+/// the clone installed inside the (otherwise unreachable, once handed to
+/// `new_handler`) handler and the clone the caller kept refer to the same
+/// slot.
 #[derive(Clone, Default)]
 pub struct RejectionReason(Arc<Mutex<Option<String>>>);
 
@@ -444,27 +445,6 @@ pub fn verifying_handler_with_routes<V: HostKeyVerifier + 'static>(
     routes: &ForwardRoutes,
 ) -> VerifyingHandler<V> {
     VerifyingHandler::new(verifier).with_forward_routes(routes)
-}
-
-/// Like [`verifying_handler`], but also installs `reason` — see
-/// [`VerifyingHandler::with_rejection_reason`].
-pub fn verifying_handler_with_reason<V: HostKeyVerifier + 'static>(
-    verifier: &Arc<V>,
-    reason: &RejectionReason,
-) -> VerifyingHandler<V> {
-    VerifyingHandler::new(verifier).with_rejection_reason(reason)
-}
-
-/// Combines [`verifying_handler_with_routes`] and
-/// [`verifying_handler_with_reason`] for callers that need both (e.g. the
-/// day-to-day native connect path, which routes ctl-socket forwards *and*
-/// wants a host-key-rejection reason for its top-level error).
-pub fn verifying_handler_with_routes_and_reason<V: HostKeyVerifier + 'static>(
-    verifier: &Arc<V>,
-    routes: &ForwardRoutes,
-    reason: &RejectionReason,
-) -> VerifyingHandler<V> {
-    VerifyingHandler::new(verifier).with_forward_routes(routes).with_rejection_reason(reason)
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`
