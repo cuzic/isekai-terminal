@@ -97,11 +97,6 @@ impl Drop for HelperTrust {
 pub struct TrustStore {
     #[serde(default)]
     pub helpers: BTreeMap<String, HelperTrust>,
-    /// Reserved for release signing keys once `update_policy` gains a
-    /// `signed-compatible`-style variant; unused (and always empty on
-    /// disk) while `UpdatePolicy` only has `ExactDigestOnly`.
-    #[serde(default)]
-    pub release_keys: BTreeMap<String, String>,
 }
 
 impl TrustStore {
@@ -181,7 +176,6 @@ mod tests {
     fn serializes_and_parses_back_via_toml() {
         let mut store = TrustStore::default();
         store.insert("myhost:22".to_string(), sample_entry());
-        store.release_keys.insert("stable".to_string(), "release-key-material".to_string());
 
         let serialized = toml::to_string_pretty(&store).unwrap();
         let parsed: TrustStore = toml::from_str(&serialized).unwrap();
@@ -207,6 +201,12 @@ cached_session_secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 [release_keys]
 stable = "release-key-material"
 "#;
+        // The `[release_keys]` table above is deliberately still present in
+        // this fixture even though `TrustStore::release_keys` was removed
+        // (ISEKAI_PIPE_DESIGN.md §8 Epic D records signature verification as
+        // permanently removed, not a future placeholder): this pins that an
+        // old on-disk `known_helpers.toml` written before that removal still
+        // loads fine — serde silently ignores unknown table keys.
         let store: TrustStore = toml::from_str(toml_str).unwrap();
         let entry = store.get("myhost:22").unwrap();
         assert_eq!(entry.update_policy, UpdatePolicy::ExactDigestOnly);
@@ -217,7 +217,6 @@ stable = "release-key-material"
         // (no `cached_stun_observed_addr` key at all) must still load, with
         // this simply defaulting to `None`.
         assert_eq!(entry.cached_stun_observed_addr, None);
-        assert_eq!(store.release_keys.get("stable").unwrap(), "release-key-material");
     }
 
     #[test]
