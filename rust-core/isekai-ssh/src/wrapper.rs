@@ -484,9 +484,18 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
         && !RESERVED_SUBCOMMANDS.contains(&first)
 }
 
-pub async fn run(args: Vec<String>) -> Result<u8> {
-    let plan = parse_wrapper(args)?;
-    if let Some(log_file) = &plan.isekai.log_file {
+/// Opens `--isekai-log-file` (or, absent that, the default always-on verbose
+/// log) for this invocation — shared by the Unix entrypoint ([`run`]) and
+/// the Windows-native entrypoint (`native::connect::prepare_with_tofu`),
+/// which used to each hand-roll an identical if/else-if pair. That
+/// duplication had already caused one real regression: the native copy was
+/// missing entirely for a while (a real Windows CI failure, see
+/// `native::connect::prepare_with_tofu`'s own doc comment for the
+/// no-visible-symptom-until-a-test-depended-on-it story) — extracting this
+/// structurally prevents that class of regression from recurring, since
+/// there is now only one copy to keep in sync.
+pub(crate) fn init_logging(plan: &WrapperPlan) -> Result<()> {
+    if let Some(log_file) = plan.log_file() {
         crate::log_file::init(log_file)
             .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
     } else if let Ok(verbose_log_file) = default_log_file() {
@@ -495,6 +504,55 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         // permissions/read-only-filesystem error opening its own log file.
         let _ = crate::log_file::init_verbose(&verbose_log_file);
     }
+    Ok(())
+}
+
+/// Resolves `resolution` into a [`ConnectionIntent`], auto-bootstrapping a
+/// brand-new (never-registered) destination inline when [`should_bootstrap`]
+/// allows it — `tofu` decides whether *that* bootstrap's own trust
+/// confirmation is interactive ([`TofuConfirmation::AlwaysPrompt`], both
+/// entrypoints' first-contact case) or silent
+/// ([`TofuConfirmation::Silent`], only used by the native path's detached
+/// mux-holder entrypoint, which has no console to confirm on — see
+/// `native::connect::prepare_with_tofu`'s doc comment).
+///
+/// Shared by the Unix entrypoint ([`run`]) and the Windows-native entrypoint
+/// (`native::connect::prepare_with_tofu`), which used to hand-roll nearly
+/// identical copies of this match — the *only* platform-specific piece
+/// (which [`isekai_bootstrap::BootstrapBackend`] actually performs the
+/// deploy) is already internal to [`bootstrap_and_register`], so nothing
+/// here needs to branch on platform. Unifies the two copies' previously
+/// divergent "auto-bootstrap is disabled" message onto the native path's
+/// more actionable wording (pointing at the exact `isekai-ssh init` command
+/// to run) for both — a small, deliberate UX improvement riding along with
+/// this dedup, not a functional change (this arm is reached only when the
+/// user has explicitly opted out of auto-bootstrap).
+pub(crate) async fn build_intent_or_bootstrap(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    tofu: TofuConfirmation,
+) -> Result<ConnectionIntent> {
+    match build_connection_intent(resolution) {
+        Ok(intent) => Ok(intent),
+        Err(err) if should_bootstrap(plan, resolution) => {
+            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, tofu).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
+            }
+            build_connection_intent(resolution).context("isekai-ssh: still not trusted after auto-bootstrap")
+        }
+        Err(err) => Err(err.context(format!(
+            "isekai-ssh: {:?} is not set up yet — run `isekai-ssh init {}` first \
+             (auto-bootstrap is disabled: --isekai-no-bootstrap / #@isekai bootstrap-policy never)",
+            plan.destination(),
+            plan.destination()
+        ))),
+    }
+}
+
+pub async fn run(args: Vec<String>) -> Result<u8> {
+    let plan = parse_wrapper(args)?;
+    init_logging(&plan)?;
     if plan.isekai.direct {
         return run_openssh_direct(&plan).await;
     }
@@ -520,18 +578,7 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
             return Ok(0);
         }
     }
-    let intent = match build_connection_intent(&resolution) {
-        Ok(intent) => intent,
-        Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
-                print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
-            }
-            build_connection_intent(&resolution)
-                .context("isekai-ssh: still not trusted after auto-bootstrap")?
-        }
-        Err(err) => return Err(err),
-    };
+    let intent = build_intent_or_bootstrap(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await?;
     run_ssh_with_connect_failure_recovery(&plan, &resolution, intent).await
 }
 

@@ -181,30 +181,15 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
 /// the holder never comes up.
 pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation) -> Result<Prepared> {
     let plan = crate::wrapper::parse_wrapper(args)?;
-    // `--isekai-log-file` must be honored on the native path too — the Unix
-    // path opens it at the top of `wrapper::run`; without this the flag was
-    // silently ignored on Windows (Codex review finding). Opened before any
-    // connection attempt so every diagnostic line below is captured.
-    //
-    // The `else` arm mirrors `wrapper::run`'s own default-verbose-log
-    // initialization, which this native path was missing entirely (real
-    // Windows CI regression found while investigating a post-merge e2e
-    // failure): `log_line_verbose!` (`bootstrap_and_register`'s "Registered
-    // ... in ..." line among others) silently drops every line whenever
-    // `log_file::init_verbose` was never called — `append_verbose_line`'s
-    // own doc comment confirms this is a deliberate best-effort no-op, not a
-    // panic, so the gap produced no visible symptom on its own. It only
-    // surfaced once a test started depending on that line appearing in the
-    // default verbose log instead of stderr.
-    if let Some(log_file) = plan.log_file() {
-        crate::log_file::init(log_file)
-            .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
-    } else if let Ok(verbose_log_file) = isekai_pipe_core::default_log_file() {
-        // Best-effort, same as `wrapper::run`: verbose bootstrap/diagnostic
-        // detail is a nicety, never worth failing the connection over a
-        // permissions/read-only-filesystem error opening its own log file.
-        let _ = crate::log_file::init_verbose(&verbose_log_file);
-    }
+    // `--isekai-log-file`/the default verbose log must be honored on the
+    // native path too — a real Windows CI regression (this call used to be a
+    // hand-rolled, independently-drifting copy of `wrapper::run`'s own
+    // if/else-if, and was found silently *missing* entirely at one point —
+    // `log_line_verbose!` failing open with no visible symptom until a test
+    // started depending on a line reaching the default verbose log) is
+    // exactly the class of bug sharing one `init_logging` now structurally
+    // prevents.
+    crate::wrapper::init_logging(&plan)?;
     let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan)?;
     if !resolution.isekai_enabled() {
         return Err(anyhow!(
@@ -213,37 +198,19 @@ pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation)
             plan.destination_host()
         ));
     }
-    let intent = match build_connection_intent(&resolution) {
-        Ok(intent) => intent,
-        // A brand-new (never-registered) destination: auto-bootstrap inline
-        // with a TOFU confirmation prompt, exactly mirroring
-        // `wrapper::run`'s own `Err(err) if should_bootstrap(...)` arm on
-        // Unix — the only difference is which `BootstrapBackend` performs the
-        // actual deploy (`RusshBackend` here via
-        // `native::bootstrap_backend::resolve_backend`, vs. `OpenSshBackend`
-        // on Unix; `bootstrap_and_register` itself already dispatches on
-        // platform). `always-connects.md`'s stated TOFU exception exempts the
-        // *interactive confirmation itself* being un-automatable, not a
-        // requirement that the user run a separate `isekai-ssh init` command
-        // first — this native path used to require exactly that, an
-        // ultrareview-confirmed, real-Windows-CI-reproduced divergence from
-        // the Unix path's behavior.
-        Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, tofu).await {
-                print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
-            }
-            build_connection_intent(&resolution).context("isekai-ssh: still not trusted after auto-bootstrap")?
-        }
-        Err(err) => {
-            return Err(err.context(format!(
-                "isekai-ssh: {:?} is not set up yet — run `isekai-ssh init {}` first \
-                 (auto-bootstrap is disabled: --isekai-no-bootstrap / #@isekai bootstrap-policy never)",
-                plan.destination(),
-                plan.destination()
-            )))
-        }
-    };
+    // A brand-new (never-registered) destination auto-bootstraps inline with
+    // a TOFU confirmation prompt (`tofu`) — shared with `wrapper::run`'s own
+    // Unix entrypoint via `build_intent_or_bootstrap`; the only difference
+    // is which `BootstrapBackend` performs the actual deploy (`RusshBackend`
+    // here via `native::bootstrap_backend::resolve_backend`, vs.
+    // `OpenSshBackend` on Unix — `bootstrap_and_register` itself already
+    // dispatches on platform, so nothing native-specific belongs here).
+    // `always-connects.md`'s stated TOFU exception exempts the *interactive
+    // confirmation itself* being un-automatable, not a requirement that the
+    // user run a separate `isekai-ssh init` command first — this native path
+    // used to require exactly that, an ultrareview-confirmed,
+    // real-Windows-CI-reproduced divergence from the Unix path's behavior.
+    let intent = crate::wrapper::build_intent_or_bootstrap(&plan, &resolution, tofu).await?;
     let runtime_dir = default_runtime_dir()?;
     Ok(Prepared { plan, resolution, host_config, intent, runtime_dir })
 }
