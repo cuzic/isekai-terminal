@@ -490,10 +490,44 @@ impl OrchestratorAdapter {
     }
 }
 
+/// `OrchestratorAdapter`の`SessionCallback`実装のうち、「古い世代からの遅延
+/// コールバックなら何もしない、そうでなければ同名の`OrchestratorCallback`へ
+/// そのまま委譲する」だけの単純委譲メソッドをまとめて生成する。
+///
+/// `ActiveSession`の`dispatch_all!`と同じ方針で、**staleガード以外の分岐
+/// ロジックを持たない委譲にのみ**使う —— `on_host_key`/`on_connected`/
+/// `on_disconnected`/trzsz系/`on_notify`/`on_file_preview_exec_result`のように
+/// 固有の処理を持つものは手書きのまま下に残す(そちらこそが読む価値のある
+/// 部分なので、マクロの一覧に埋もれさせない)。
+///
+/// staleだった場合の戻り値は`Default::default()`——このマクロが対象にする
+/// コールバックの戻り値は`()`/`bool`/`Option<T>`だけで、いずれも既定値
+/// (何もしない・拒否・値なし)が手書き実装当時と同じ意味になる。
+macro_rules! forward_if_current {
+    ($( fn $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) $( -> $ret:ty )? ; )*) => {
+        $(
+            fn $name(&self, $( $arg : $ty ),*) $( -> $ret )? {
+                if !self.is_current() { return Default::default(); }
+                self.shared.callback.$name($( $arg ),*)
+            }
+        )*
+    };
+}
+
 impl SessionCallback for OrchestratorAdapter {
-    fn on_data(&self, data: Vec<u8>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_data(data);
+    forward_if_current! {
+        fn on_data(data: Vec<u8>);
+        fn on_screen_update(update: ScreenUpdate);
+        fn on_no_viable_path();
+        fn on_forward_state_changed(id: String, state: ForwardState);
+        fn on_agent_sign_request(key_fingerprint: String) -> bool;
+        fn on_clipboard_write(payload: ClipboardPayload);
+        fn on_clipboard_pull_request() -> Option<ClipboardPayload>;
+        fn on_request_wifi_fd() -> Option<crate::PlatformFd>;
+        fn on_request_cellular_fd() -> Option<crate::PlatformFd>;
+        fn on_rebind_state_changed(state: crate::rebind_manager::RebindPublicState);
+        fn on_prompt_jump(target: Option<crate::PromptJumpTarget>);
+        fn on_prompt_output_copy_ready(text: Option<String>);
     }
 
     fn on_host_key(&self, fingerprint: String) -> bool {
@@ -526,11 +560,6 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_disconnected(&self, reason: Option<String>) {
         if !self.is_current() { return; }
         handle_unexpected_disconnect(&self.shared, reason);
-    }
-
-    fn on_screen_update(&self, update: ScreenUpdate) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_screen_update(update);
     }
 
     fn on_trzsz_request(
@@ -624,46 +653,6 @@ impl SessionCallback for OrchestratorAdapter {
         );
     }
 
-    fn on_no_viable_path(&self) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_no_viable_path();
-    }
-
-    fn on_forward_state_changed(&self, id: String, state: ForwardState) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_forward_state_changed(id, state);
-    }
-
-    fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
-        if !self.is_current() { return false; }
-        self.shared.callback.on_agent_sign_request(key_fingerprint)
-    }
-
-    fn on_clipboard_write(&self, payload: ClipboardPayload) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_clipboard_write(payload);
-    }
-
-    fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_clipboard_pull_request()
-    }
-
-    fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_request_wifi_fd()
-    }
-
-    fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_request_cellular_fd()
-    }
-
-    fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_rebind_state_changed(state);
-    }
-
     /// タスク#57: tmux hookの発火を、(a)`(tmux_tag, seq)`重複排除、(b)フォアグラウンド
     /// +このタブ表示中の抑制、の2段階を経てから`OrchestratorCallback::on_notify`へ
     /// 渡す。
@@ -704,16 +693,6 @@ impl SessionCallback for OrchestratorAdapter {
         if should_deliver {
             self.shared.callback.on_notify(kind);
         }
-    }
-
-    fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_prompt_jump(target);
-    }
-
-    fn on_prompt_output_copy_ready(&self, text: Option<String>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_prompt_output_copy_ready(text);
     }
 
     /// タスク#17: `pending_file_previews`から`request_id`に対応する要求種別を取り出し、
@@ -1858,6 +1837,13 @@ mod tests {
         cellular_fd_requests: StdMutex<u32>,
         rebind_states: StdMutex<Vec<crate::rebind_manager::RebindPublicState>>,
         prompt_jumps: StdMutex<Vec<Option<crate::PromptJumpTarget>>>,
+        // 以下は`forward_if_current!`が生成する単純委譲コールバックの検証用
+        // (`assert_forwards_only_while_current`参照)。`ForwardState`は
+        // `PartialEq`を持たないのでidだけを記録する。
+        data: StdMutex<Vec<Vec<u8>>>,
+        no_viable_paths: StdMutex<u32>,
+        forward_state_ids: StdMutex<Vec<String>>,
+        prompt_output_copies: StdMutex<Vec<Option<String>>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1869,15 +1855,21 @@ mod tests {
             self.host_keys.lock().unwrap().push((host, port, fingerprint));
             true
         }
-        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_data(&self, data: Vec<u8>) {
+            self.data.lock().unwrap().push(data);
+        }
         fn on_trzsz_state_changed(&self, state: TrzszPublicState) {
             self.trzsz_states.lock().unwrap().push(state);
         }
         fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>) {
             self.downloads.lock().unwrap().push((file_name, data));
         }
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_no_viable_path(&self) {
+            *self.no_viable_paths.lock().unwrap() += 1;
+        }
+        fn on_forward_state_changed(&self, id: String, _state: ForwardState) {
+            self.forward_state_ids.lock().unwrap().push(id);
+        }
         fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
             self.agent_sign_requests.lock().unwrap().push(key_fingerprint);
             true
@@ -1903,7 +1895,9 @@ mod tests {
         fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
             self.prompt_jumps.lock().unwrap().push(target);
         }
-        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_prompt_output_copy_ready(&self, text: Option<String>) {
+            self.prompt_output_copies.lock().unwrap().push(text);
+        }
         fn on_file_preview_result(&self, _request_id: String, outcome: FilePreviewOutcome) {
             self.file_preview_outcomes.lock().unwrap().push(outcome);
         }
@@ -2606,113 +2600,179 @@ mod tests {
 
     // ── OrchestratorAdapter (SessionCallback) の単純委譲群 ──────
     //
-    // 以下はいずれも「is_current()なら`shared.callback`へそのまま委譲、staleなら
-    // 何もしない/既定値を返す」という同型のパターン。1テストで両方(委譲される値の
-    // 正しさ・staleになった後は委譲が止まること)を確認する。
+    // 以下はいずれも`forward_if_current!`が生成する「is_current()なら
+    // `shared.callback`へそのまま委譲、staleなら何もしない/既定値を返す」という
+    // 同型のパターン。共通の検証手順は`assert_forwards_only_while_current`に
+    // まとめつつ、テストはコールバックごとに独立させてある —— マクロ展開が
+    // 名前や引数を取り違えていれば(例: `on_prompt_jump`が別のコールバックへ
+    // 委譲していれば)そのコールバック固有の記録内容の比較で落ちる。
+
+    /// `forward_if_current!`が生成する単純委譲コールバック1つ分の検証。
+    ///
+    /// - `invoke`: 対象コールバックの呼び出し(戻り値も検証したいので返す)。
+    /// - `expected_when_current` / `expected_when_stale`: 現行/stale時の戻り値
+    ///   (staleは`Default::default()`相当 —— `()`/`false`/`None`)。
+    /// - `recorded`: `RecordingCallback`が記録した「何が届いたか」。型が
+    ///   コールバックごとに違うのでクロージャで取り出す。
+    ///
+    /// 現行adapterでの呼び出し後に`recorded`が`expected_recorded`と一致すること、
+    /// および新しいadapter生成でstaleにした後の2回目の呼び出しでも`recorded`が
+    /// **増えも変わりもしない**ことを見る(件数だけでなく内容まで比較するので、
+    /// 「委譲された値が正しいか」と「staleでは委譲されないか」の両方を1本で
+    /// カバーできる)。
+    fn assert_forwards_only_while_current<T, R>(
+        invoke: impl Fn(&OrchestratorAdapter) -> T,
+        expected_when_current: T,
+        expected_when_stale: T,
+        recorded: impl Fn(&RecordingCallback) -> R,
+        expected_recorded: R,
+    ) where
+        T: std::fmt::Debug + PartialEq,
+        R: std::fmt::Debug + PartialEq,
+    {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+
+        assert_eq!(invoke(&current), expected_when_current, "currentなadapterは委譲するはず");
+        assert_eq!(recorded(&cb), expected_recorded, "委譲された内容がそのまま届くはず");
+
+        // 新しいセッションが生成された(session_generationが進む)状況を模す。
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(invoke(&current), expected_when_stale, "staleなadapterは既定値を返すはず");
+        assert_eq!(recorded(&cb), expected_recorded, "staleなadapterからは委譲されないはず");
+    }
 
     #[test]
     fn on_agent_sign_request_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_agent_sign_request("aa:bb".to_string()));
-        assert_eq!(cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()]);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(!current.on_agent_sign_request("cc:dd".to_string()), "staleなadapterはfalseを返すべき");
-        assert_eq!(
-            cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()],
-            "staleなadapterからのforwardは発生しないはず"
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_agent_sign_request("aa:bb".to_string()),
+            true,
+            false,
+            |cb| cb.agent_sign_requests.lock().unwrap().clone(),
+            vec!["aa:bb".to_string()],
         );
     }
 
     #[test]
     fn on_clipboard_write_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
         let payload = ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"hello".to_vec() };
-        current.on_clipboard_write(payload.clone());
-        assert_eq!(cb.clipboard_writes.lock().unwrap().as_slice(), &[payload]);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_clipboard_write(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"stale".to_vec() });
-        assert_eq!(
-            cb.clipboard_writes.lock().unwrap().len(), 1,
-            "staleなadapterからのon_clipboard_writeは転送されないはず"
+        let expected = vec![payload.clone()];
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_clipboard_write(payload.clone()),
+            (),
+            (),
+            |cb| cb.clipboard_writes.lock().unwrap().clone(),
+            expected,
         );
     }
 
     #[test]
     fn on_clipboard_pull_request_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        assert_eq!(
-            current.on_clipboard_pull_request(),
-            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_clipboard_pull_request(),
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() }),
+            None,
+            |cb| *cb.clipboard_pull_requests.lock().unwrap(),
+            1,
         );
-        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert_eq!(current.on_clipboard_pull_request(), None, "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
     }
 
     #[test]
     fn on_request_wifi_fd_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        let fd = current.on_request_wifi_fd().expect("current adapter should forward");
-        assert_eq!((fd.fd, fd.local_ip.as_str()), (42, "10.0.0.1"));
-        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_request_wifi_fd().is_none(), "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+        // `PlatformFd`は`PartialEq`を持たない(uniffi::Record)ので、比較可能な
+        // タプルへ落としてから検証する。
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_request_wifi_fd().map(|fd| (fd.fd, fd.local_ip)),
+            Some((42, "10.0.0.1".to_string())),
+            None,
+            |cb| *cb.wifi_fd_requests.lock().unwrap(),
+            1,
+        );
     }
 
     #[test]
     fn on_request_cellular_fd_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        let fd = current.on_request_cellular_fd().expect("current adapter should forward");
-        assert_eq!((fd.fd, fd.local_ip.as_str()), (43, "10.0.0.2"));
-        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_request_cellular_fd().is_none(), "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_request_cellular_fd().map(|fd| (fd.fd, fd.local_ip)),
+            Some((43, "10.0.0.2".to_string())),
+            None,
+            |cb| *cb.cellular_fd_requests.lock().unwrap(),
+            1,
+        );
     }
 
     #[test]
     fn on_rebind_state_changed_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular);
-        assert_eq!(
-            cb.rebind_states.lock().unwrap().as_slice(),
-            &[crate::rebind_manager::RebindPublicState::FailedOverToCellular]
-        );
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::OnWifi);
-        assert_eq!(
-            cb.rebind_states.lock().unwrap().len(), 1,
-            "staleなadapterからのon_rebind_state_changedは転送されないはず"
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular),
+            (),
+            (),
+            |cb| cb.rebind_states.lock().unwrap().clone(),
+            vec![crate::rebind_manager::RebindPublicState::FailedOverToCellular],
         );
     }
 
     #[test]
     fn on_prompt_jump_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
         let target = Some(crate::PromptJumpTarget { scroll_offset: 5, is_live: false });
-        current.on_prompt_jump(target);
-        assert_eq!(cb.prompt_jumps.lock().unwrap().as_slice(), &[target]);
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_prompt_jump(target),
+            (),
+            (),
+            |cb| cb.prompt_jumps.lock().unwrap().clone(),
+            vec![target],
+        );
+    }
 
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_prompt_jump(None);
-        assert_eq!(
-            cb.prompt_jumps.lock().unwrap().len(), 1,
-            "staleなadapterからのon_prompt_jumpは転送されないはず"
+    // 以下4つは、マクロ化するまで単純委譲であること自体が無検証だった残りの
+    // コールバック。`RecordingCallback`側に記録を足して同じヘルパーで確認する
+    // (`on_screen_update`だけは、`ScreenUpdate`が`PartialEq`を持たない大きな
+    // Record型で値の合成コストに見合わないため対象外にしてある —— 委譲先の
+    // 名前・引数はマクロが同じ`$name`から生成するのでコンパイラが保証しており、
+    // 残る検証価値はstaleガードだけで、それは他の11メソッドで確認済み)。
+
+    #[test]
+    fn on_data_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_data(b"hello".to_vec()),
+            (),
+            (),
+            |cb| cb.data.lock().unwrap().clone(),
+            vec![b"hello".to_vec()],
+        );
+    }
+
+    #[test]
+    fn on_no_viable_path_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_no_viable_path(),
+            (),
+            (),
+            |cb| *cb.no_viable_paths.lock().unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn on_forward_state_changed_forwards_and_is_suppressed_for_stale_generation() {
+        // `ForwardState`は`PartialEq`を持たないため、記録側でidだけを取っている。
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_forward_state_changed("fwd-1".to_string(), ForwardState::Listening),
+            (),
+            (),
+            |cb| cb.forward_state_ids.lock().unwrap().clone(),
+            vec!["fwd-1".to_string()],
+        );
+    }
+
+    #[test]
+    fn on_prompt_output_copy_ready_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_prompt_output_copy_ready(Some("output".to_string())),
+            (),
+            (),
+            |cb| cb.prompt_output_copies.lock().unwrap().clone(),
+            vec![Some("output".to_string())],
         );
     }
 
