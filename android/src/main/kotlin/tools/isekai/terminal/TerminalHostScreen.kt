@@ -43,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.AuthType
+import tools.isekai.terminal.data.needsPasswordPrompt
 import uniffi.isekai_terminal_core.ProgressState
 
 /**
@@ -186,11 +187,12 @@ private fun TabLabel(
     val tmuxWindowLabel by tab.tmuxWindowLabel.collectAsStateWithLifecycle()
     var showThemeDialog by remember { mutableStateOf(false) }
     var showSplitDialog by remember { mutableStateOf(false) }
-    // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
-    // SplitPaneDialogを閉じてこちらのpending方向を使ってPasswordDialogを表示する。
-    var pendingSplitNewDirection by remember { mutableStateOf<SplitDirection?>(null) }
-    // 「+」(同一プロファイルへの新規タブ追加)がパスワード認証プロファイルの場合のPasswordDialog表示。
-    var showNewSessionPasswordDialog by remember { mutableStateOf(false) }
+    // 「+」(同一プロファイルへの新規タブ追加)・splitPaneの「新規接続（同じプロファイル）」の
+    // どちらも、対象プロファイルがパスワード認証ならPasswordDialogを挟んでから実行する必要が
+    // ある。両者は「確定時に何を実行するか」が違うだけなので、確定アクションそのものを
+    // 保持する1つのnullable stateへ統合する(non-nullの間、下のPasswordDialogブロックが
+    // tab.profile向けのダイアログを表示する)。
+    var pendingPasswordAction by remember { mutableStateOf<((password: String, jumpPassword: String?) -> Unit)?>(null) }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -293,10 +295,8 @@ private fun TabLabel(
         if (profile != null) {
             IconButton(
                 onClick = {
-                    val needsPasswordPrompt = profile.authTypeEnum == AuthType.PASSWORD ||
-                        (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD)
-                    if (needsPasswordPrompt) {
-                        showNewSessionPasswordDialog = true
+                    if (profile.needsPasswordPrompt) {
+                        pendingPasswordAction = { password, jumpPassword -> tabsVm.openTab(profile, password, jumpPassword) }
                     } else {
                         tabsVm.openTab(profile)
                     }
@@ -308,24 +308,6 @@ private fun TabLabel(
         }
         IconButton(onClick = onClose, modifier = Modifier.size(20.dp).testTag("closeTabButton")) {
             Text("×", color = Color(0xFFAAAAAA), fontSize = 16.sp)
-        }
-    }
-
-    if (showNewSessionPasswordDialog) {
-        val profile = tab.profile
-        if (profile == null) {
-            showNewSessionPasswordDialog = false
-        } else {
-            PasswordDialog(
-                label = profile.label,
-                showMainField = profile.authTypeEnum == AuthType.PASSWORD,
-                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
-                onDismiss = { showNewSessionPasswordDialog = false },
-                onConfirm = { password, jumpPassword ->
-                    tabsVm.openTab(profile, password, jumpPassword)
-                    showNewSessionPasswordDialog = false
-                },
-            )
         }
     }
 
@@ -343,10 +325,10 @@ private fun TabLabel(
             onSplitNew = { direction ->
                 showSplitDialog = false
                 val profile = tab.profile
-                val needsPasswordPrompt = profile != null &&
-                    (profile.authTypeEnum == AuthType.PASSWORD || (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD))
-                if (needsPasswordPrompt) {
-                    pendingSplitNewDirection = direction
+                if (profile?.needsPasswordPrompt == true) {
+                    pendingPasswordAction = { password, jumpPassword ->
+                        tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
+                    }
                 } else {
                     tabsVm.splitPane(tab.tabId, direction)
                 }
@@ -359,19 +341,19 @@ private fun TabLabel(
         )
     }
 
-    pendingSplitNewDirection?.let { direction ->
+    pendingPasswordAction?.let { action ->
         val profile = tab.profile
         if (profile == null) {
-            pendingSplitNewDirection = null
+            pendingPasswordAction = null
         } else {
             PasswordDialog(
                 label = profile.label,
                 showMainField = profile.authTypeEnum == AuthType.PASSWORD,
                 jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
-                onDismiss = { pendingSplitNewDirection = null },
+                onDismiss = { pendingPasswordAction = null },
                 onConfirm = { password, jumpPassword ->
-                    tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
-                    pendingSplitNewDirection = null
+                    action(password, jumpPassword)
+                    pendingPasswordAction = null
                 },
             )
         }

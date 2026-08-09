@@ -55,6 +55,7 @@ import kotlinx.coroutines.withContext
 import tools.isekai.terminal.data.AuthType
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
+import tools.isekai.terminal.data.needsPasswordPrompt
 import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.ListItemCard
@@ -279,9 +280,7 @@ fun ProfileListScreen(
                         ProfileCard(
                             profile = profile,
                             onTap = {
-                                val needsPasswordPrompt = profile.authTypeEnum == AuthType.PASSWORD ||
-                                    (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD)
-                                if (needsPasswordPrompt) {
+                                if (profile.needsPasswordPrompt) {
                                     RemoteLogger.i("IsekaiTerminalProfile", "tap → password dialog: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
                                     vm.requestPasswordConnect(profile)
                                 } else {
