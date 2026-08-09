@@ -1288,31 +1288,13 @@ async fn handle_attach_stream(
     let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
     control_task.abort();
 
-    match outcome {
-        RelayOutcome::TcpDied => {
-            lease.release().await;
-            sessions.remove(&session_id_bytes).await;
-            if let Some(guard) = table_guard {
-                guard.disarm();
-            }
-        }
-        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
-            // まだ`Established`のまま(=fencing slotを保持したまま)にする —
-            // 一致する`RESUME`がこのsession_idの元へ戻ってこられるように。
-            lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            drop(session);
-            // park済み(=parked_sinceがSome)になったので、既存の
-            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
-            // 回収可能な状態になった — `table_guard`のDropフォールバックは
-            // もう不要。
-            if let Some(guard) = table_guard {
-                guard.disarm();
-            }
-        }
-    }
+    // `handle_resume_stream`の末尾と全く同じ後始末 — 以前はここに同じ
+    // `TcpDied`/`DataStreamDied`分岐を独立に書き下していたが、
+    // 「後始末を2箇所がそれぞれ覚えていなければならない」形そのものが
+    // `.claude/rules/always-connects.md`が記録している過去2件の
+    // fencing slotリーク(`sweep_expired_parked`/`insert_existing`)の
+    // 原因なので、共通のヘルパーへ一本化した。
+    finish_or_park_session(&sessions, lease, table_guard, session_id_bytes, handle, outcome).await;
     Ok(())
 }
 
@@ -1467,7 +1449,7 @@ async fn handle_resume_stream(
     )
     .await;
     control_task.abort();
-    finish_or_park_session(&sessions, lease, table_guard, Some(session_id), handle, outcome).await;
+    finish_or_park_session(&sessions, lease, Some(table_guard), session_id, handle, outcome).await;
     Ok(())
 }
 
@@ -1573,22 +1555,31 @@ async fn accept_control_stream(
 /// `Session::parked_tcp` に戻して resume を待てるようにし(`AttachArbiter`は
 /// `Established`のまま、`lease`もfencing slotを占有し続ける)、TCP 自体が
 /// 死んでいるなら`AttachRuntime::relay_ended`でslotを解放しテーブルから
-/// 破棄する。`id`が`None`なのは起こり得ない(#18-4以降、session_idは常に
-/// `ATTACH_HELLO`の時点で存在する)が、呼び出し側の型を単純に保つため
-/// `Option`のまま残す。
+/// 破棄する。
+///
+/// `handle_attach_stream`(新規ATTACH)と`handle_resume_stream`(RESUME)の
+/// **唯一**の後始末経路。「どちらの呼び出し元も同じ後始末を独立に覚えている」
+/// 形は`.claude/rules/always-connects.md`が禁じている(過去2件の
+/// fencing slotリークが実際にその形で起きた)。
+///
+/// `id`は以前`Option<SessionId>`だったが、`None`分岐は#18-4以降(session_idは
+/// 常に`ATTACH_HELLO`の時点で存在する)到達不能な死んだ分岐であり、しかも
+/// その分岐は`lease.keep()`だけしてpark情報を書かない
+/// =slotを`Established`のまま孤児化させる、まさにこのルールが禁じる
+/// 挙動だったため、`Option`ごと取り除いた(現在の呼び出し元2箇所はどちらも
+/// 具体的な`session_id`を持っている)。
+///
+/// `table_guard`が`None`になるのは`insert_existing`が`InsertOutcome::Rejected`
+/// を返した場合だけ(このsessionは`SessionTable`に載っていない=守るエントリが
+/// 無い)。その場合の`sessions.remove`は空振りするだけで害はない。
 async fn finish_or_park_session(
     sessions: &SessionTable,
     lease: EstablishedLease,
-    table_guard: SessionTableEntryGuard,
-    id: Option<resume::SessionId>,
+    table_guard: Option<SessionTableEntryGuard>,
+    id: resume::SessionId,
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
-    let Some(id) = id else {
-        lease.keep();
-        table_guard.disarm();
-        return;
-    };
     match outcome {
         RelayOutcome::TcpDied => {
             log::info!(
@@ -1597,7 +1588,9 @@ async fn finish_or_park_session(
             );
             lease.release().await;
             sessions.remove(&id).await;
-            table_guard.disarm();
+            if let Some(table_guard) = table_guard {
+                table_guard.disarm();
+            }
         }
         RelayOutcome::DataStreamDied {
             tcp_read,
@@ -1612,9 +1605,13 @@ async fn finish_or_park_session(
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
             drop(session);
-            // park済みになったので、既存のsweep_expired_parked/insert_existing
-            // のLRU立ち退きで正しく回収可能な状態になった。
-            table_guard.disarm();
+            // park済み(=parked_sinceがSome)になったので、既存の
+            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
+            // 回収可能な状態になった — `table_guard`のDropフォールバックは
+            // もう不要。
+            if let Some(table_guard) = table_guard {
+                table_guard.disarm();
+            }
             // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
             // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
         }
