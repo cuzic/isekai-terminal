@@ -202,6 +202,55 @@ pub(crate) fn spawn_resize_watcher() -> Option<tokio::sync::mpsc::UnboundedRecei
     Some(rx)
 }
 
+/// `recv` on the optional resize channel [`spawn_resize_watcher`] returns, or
+/// a future that never resolves when there is no watcher (so the `select!`
+/// branch consuming this is inert) — shared by the non-mux native `ssh`
+/// channel loop (`connect.rs`) and the mux client loop (`mux/client.rs`),
+/// which previously each carried an identical copy of this function (plus
+/// its own `recv_resize_tests` module) next to their own `select!` loop
+/// rather than next to the watcher that actually produces the receiver they
+/// consume.
+pub(crate) async fn recv_resize(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+) -> Option<(u32, u32)> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod recv_resize_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn recv_resize_with_none_never_resolves() {
+        // When the channel is None, recv_resize should return pending forever.
+        let mut rx: Option<mpsc::UnboundedReceiver<(u32, u32)>> = None;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), recv_resize(&mut rx)).await;
+        assert!(result.is_err(), "recv_resize with None should never resolve (timeout expected)");
+    }
+
+    #[tokio::test]
+    async fn recv_resize_with_some_receives_value() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = Some(rx);
+        tx.send((120, 40)).unwrap();
+        let result = recv_resize(&mut rx).await;
+        assert_eq!(result, Some((120, 40)));
+    }
+
+    #[tokio::test]
+    async fn recv_resize_with_some_returns_none_when_sender_dropped() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = Some(rx);
+        drop(tx);
+        let result = recv_resize(&mut rx).await;
+        assert_eq!(result, None);
+    }
+}
+
 // Builds the terminal mode list for `request_pty` from the local terminal
 /// settings. On Unix this reads the actual `termios` via `tcgetattr`; on
 /// other platforms it returns a minimal default set matching a normal

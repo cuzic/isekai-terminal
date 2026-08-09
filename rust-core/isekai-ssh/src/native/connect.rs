@@ -1220,7 +1220,7 @@ where
                     _ => {}
                 }
             }
-            resize = recv_resize(&mut resize_rx) => {
+            resize = console::recv_resize(&mut resize_rx) => {
                 if let Some((cols, rows)) = resize {
                     let _ = channel.window_change(cols, rows, 0, 0).await;
                 }
@@ -1229,49 +1229,6 @@ where
     }
 
     Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED))
-}
-
-/// `recv` on the optional resize channel, or a future that never resolves
-/// when there is no watcher (so the `select!` branch is inert).
-async fn recv_resize(
-    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
-) -> Option<(u32, u32)> {
-    match rx.as_mut() {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-#[cfg(test)]
-mod recv_resize_tests {
-    use super::*;
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn recv_resize_with_none_never_resolves() {
-        // When the channel is None, recv_resize should return pending forever.
-        let mut rx: Option<mpsc::UnboundedReceiver<(u32, u32)>> = None;
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), recv_resize(&mut rx)).await;
-        assert!(result.is_err(), "recv_resize with None should never resolve (timeout expected)");
-    }
-
-    #[tokio::test]
-    async fn recv_resize_with_some_receives_value() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut rx = Some(rx);
-        tx.send((120, 40)).unwrap();
-        let result = recv_resize(&mut rx).await;
-        assert_eq!(result, Some((120, 40)));
-    }
-
-    #[tokio::test]
-    async fn recv_resize_with_some_returns_none_when_sender_dropped() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut rx = Some(rx);
-        drop(tx);
-        let result = recv_resize(&mut rx).await;
-        assert_eq!(result, None);
-    }
 }
 
 #[cfg(test)]
