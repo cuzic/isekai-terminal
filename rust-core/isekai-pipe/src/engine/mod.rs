@@ -976,7 +976,7 @@ async fn handle_cancel_attach(
 ) -> Result<()> {
     let cancel = decode_cancel_attach(&cancel_bytes).context("failed to decode CancelAttach")?;
     let transcript = cancel_attach_proof_transcript(&cancel.session_id, cancel.generation, &cancel.attempt_id);
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
+    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"", &transcript).await?;
     if !cancel.proof.ct_eq(&AttachProof::new(expected)) {
         return Err(anyhow!("CancelAttach proof mismatch, ignoring"));
     }
@@ -1166,7 +1166,7 @@ async fn handle_attach_stream(
         &hello.attempt_id,
         hello.requested_resume_grace_secs,
     );
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
+    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"", &transcript).await?;
     if !hello.proof.ct_eq(&AttachProof::new(expected)) {
         reject_attach(&mut send, AttachRejectReason::Auth).await;
         return Err(anyhow!("ATTACH_HELLO proof mismatch, rejecting"));
@@ -1334,10 +1334,11 @@ async fn handle_resume_stream(
     })?;
     // quicmuxはauth_blobの中身を一切解釈しない — このHMAC検証はisekai-pipe
     // 独自のポリシーとしてここで行う(`quicmux::resume`モジュールdocs参照)。
-    let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    mac.update(&session_id);
-    let expected = mac.finalize().into_bytes();
+    // 計算式は上のコメントどおり HMAC(secret, exporter || session_id) で不変。
+    // ATTACH側と同じ`proof_from_exporter`を通す(`extra`=session_id)。
+    // `exporter`は`decode_resume_request`にも渡す必要があるため、
+    // `compute_proof`ではなくこちらを使って再exportを避ける。
+    let expected = proof_from_exporter(&session_secret, &exporter, &session_id);
     if request.auth_blob.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::Auth).await;
         return Err(anyhow!("resume proof mismatch, rejecting"));
@@ -1482,8 +1483,24 @@ fn effective_resume_grace(requested_resume_grace_secs: u32, max_resume_grace_sec
     }
 }
 
-/// `session_secret` と QUIC connection の exporter から proof を計算する
-/// （data stream HELLO と control stream CONTROL_HELLO で共通のロジック）。
+/// `proof = HMAC-SHA256(session_secret, exporter || extra)` — この
+/// バイナリが計算する proof は **すべて** この1関数を通る
+/// (`isekai_transport::proof::compute_proof`の`extra`パラメータと対称)。
+///
+/// 以前はここに3つの実装が並んでいた: `extra`なしの`compute_proof`
+/// (CONTROL_HELLO用)、`extra`=transcriptの`compute_attach_proof`
+/// (ATTACH_HELLO/CancelAttach用)、そして`handle_resume_stream`が
+/// `extra`=session_idで手書きしていたもの。3つとも同じ鍵・同じexporter・
+/// 同じ順序でHMACへ食わせていたので、`extra`の1パラメータだけが違う。
+///
+/// **ワイヤ互換性**: 既に配布済みのヘルパー/クライアントと相互運用する
+/// ため、HMACへ食わせるバイト列とその順序は絶対に変えてはならない
+/// (変えると既存セッションのresumeが一斉に壊れる —
+/// `.claude/rules/always-connects.md`)。`extra`が空の場合に
+/// `mac.update(&[])`を呼ぶのは、呼ばないのと完全に同一(HMACは長さ0の
+/// 入力を吸収しても内部状態が変わらない)なので、旧`compute_proof`とも
+/// バイト単位で一致する。
+///
 /// `quicmux::AnyMuxConnection::export_keying_material`が非同期(qmuxバックエンドは
 /// 一度captureした値を返すだけだが、noqバックエンドは呼び出し毎に計算するため
 /// 将来的な非同期化に備えて両方ともasync)になったため、この関数もasyncにした。
@@ -1492,29 +1509,28 @@ async fn compute_proof(
     session_secret: &[u8; 32],
     label: &[u8],
     context: &[u8],
+    extra: &[u8],
 ) -> Result<[u8; 32]> {
     let exporter = conn
         .export_keying_material(label, context)
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(proof_from_exporter(session_secret, &exporter, extra))
 }
 
-/// `ATTACH_HELLO`/`CancelAttach`のproof計算(`#18`): 通常の`compute_proof`と
-/// 同じexporterを使うが、`isekai_transport::proof::compute_proof`の`extra`
-/// パラメータと対称になるよう、`transcript`(`attach_hello_proof_transcript`
-/// 等が返すbyte列)をHMACに追加で混ぜ込む。
-async fn compute_attach_proof(conn: &AnyMuxConnection, session_secret: &[u8; 32], transcript: &[u8]) -> Result<[u8; 32]> {
-    let exporter = conn
-        .export_keying_material(EXPORTER_LABEL, b"")
-        .await
-        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+/// [`compute_proof`]のHMAC部分だけ。`handle_resume_stream`専用に切り出して
+/// ある——あちらはexporterを`quicmux::decode_resume_request`の
+/// `conn_exporter`引数にも渡す必要があるため、既に手元にあるexporterを
+/// そのまま使う(`compute_proof`を呼ぶと`export_keying_material`が2回
+/// 走ることになる。TLS exporterは決定的なので結果は同じだが、
+/// 元の実装は1回しか呼んでおらず、そこを変える理由が無い)。
+/// MACの計算自体はこの1箇所にしか無いので、`extra`の混ぜ方が
+/// 経路ごとにずれることはない。
+fn proof_from_exporter(session_secret: &[u8; 32], exporter: &[u8], extra: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    mac.update(transcript);
-    Ok(mac.finalize().into_bytes().into())
+    mac.update(exporter);
+    mac.update(extra);
+    mac.finalize().into_bytes().into()
 }
 
 /// control stream を accept し、`CONTROL_HELLO` を検証して`CONTROL_ACK`を返す。
@@ -1536,7 +1552,8 @@ async fn accept_control_stream(
     if hello[0] != resume::CONTROL_HELLO {
         return Err(anyhow!("unexpected control frame type: {:#x}", hello[0]));
     }
-    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"").await?;
+    // CONTROL_HELLOのproofは`extra`なし = HMAC(secret, exporter)。
+    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"", b"").await?;
     if hello[1..33].ct_eq(&expected).unwrap_u8() != 1 {
         return Err(anyhow!("CONTROL_HELLO proof mismatch"));
     }
