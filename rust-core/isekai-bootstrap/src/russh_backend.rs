@@ -418,7 +418,7 @@ async fn resolve_hop(
     let username = explicit_user
         .map(str::to_string)
         .or_else(|| host_config.user.clone())
-        .or_else(local_username)
+        .or_else(openssh_config::local_username)
         .ok_or_else(|| BootstrapError::NoUsername { host: host.to_string() })?;
 
     let identity_paths = match identity_file_override {
@@ -430,10 +430,6 @@ async fn resolve_hop(
     };
 
     Ok(ResolvedHop { hostname, port, username, identity_paths })
-}
-
-fn local_username() -> Option<String> {
-    std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
 /// Reads one candidate identity file into a [`Credential::PublicKey`], or
