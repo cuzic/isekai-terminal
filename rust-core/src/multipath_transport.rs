@@ -31,7 +31,7 @@ use log::{info, warn};
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, UdpSender};
 
-use crate::isekai_pipe_quic_transport::{self, ALPN, EXPORTER_LABEL};
+use crate::isekai_pipe_quic_transport::{self, EXPORTER_LABEL};
 use isekai_protocol::attach::{
     attach_hello_proof_transcript, encode_attach_activate, encode_attach_hello, AttachActivate, AttachHello,
     AttachProof, AttachResponse, ConnectionGeneration,
@@ -1095,6 +1095,7 @@ mod tests {
     //! ではなく `establish_multipath_connection` を直接呼ぶ）ので、実機・実
     //! ネットワーク不要でCIから常時実行できる。
     use super::*;
+    use crate::isekai_pipe_quic_transport::ALPN;
     use isekai_protocol::attach::{
         decode_attach_activate, decode_attach_hello, encode_attach_response, AttachRejectReason, AttachToken,
         ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,

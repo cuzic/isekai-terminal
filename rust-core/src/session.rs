@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
 use crate::{
-    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback,
+    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScrollbackSearchMatch, SessionCallback,
     RUNTIME,
 };
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
@@ -1573,7 +1573,7 @@ mod decode_clipboard_push_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LineDamage;
+    use crate::{LineDamage, ScreenUpdate};
 
     fn cell(label: char) -> TermCell {
         TermCell {
