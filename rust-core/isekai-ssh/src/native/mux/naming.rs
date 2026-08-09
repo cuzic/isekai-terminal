@@ -64,7 +64,7 @@ pub fn channel_name(host_config: &HostConfig, resolution: &WrapperResolution, de
     // config, bootstrap policy, …). See `WrapperResolution::mux_identity_material`.
     hash_field(&mut hasher, resolution.mux_identity_material().as_bytes());
 
-    format!(r"\\.\pipe\isekai-ssh-mux-{}", to_hex(&hasher.finalize()))
+    format!(r"\\.\pipe\isekai-ssh-mux-{}", isekai_trust::hex(&hasher.finalize()))
 }
 
 /// The auth-token file name for a given channel: the pipe's leaf name plus a
@@ -114,15 +114,6 @@ fn forward_agent_tag(fa: Option<&ForwardAgent>) -> u8 {
         Some(ForwardAgent::Yes) => 2,
         Some(ForwardAgent::Socket(_)) => 3,
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 #[cfg(test)]
