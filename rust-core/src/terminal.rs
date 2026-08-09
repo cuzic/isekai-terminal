@@ -1638,7 +1638,8 @@ impl Terminal {
         // alt画面への切替は画面内容を丸ごと差し替える——全画面dirty(#93)。
         self.full_damage_pending = true;
         if save_cursor {
-            self.saved_cursor_main = Some(self.capture_cursor());
+            let captured = self.capture_cursor();
+            self.saved_cursor_main = Some(captured);
         }
         let theme = self.theme;
         self.main_cells = self.cells().clone();
