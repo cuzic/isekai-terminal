@@ -20,6 +20,8 @@ use isekai_protocol::{decode_ctl_message, CtlMessage};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
+use tokio::net::unix::OwnedReadHalf;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::connect::next_arg;
@@ -62,6 +64,26 @@ enum CtlLaunch {
     /// connection open for the whole build (streamed `BuildOutputChunk`s
     /// before the terminating `BuildFinished`), not a single round trip.
     Build { sock: Option<String>, profile: String },
+}
+
+impl CtlLaunch {
+    /// `--sock`/`$ISEKAI_CTL_SOCK` override common to every variant —
+    /// factored out so `ctl_command`'s unix and non-unix variants (which
+    /// both need it before their platform-specific paths diverge) don't
+    /// each carry their own copy of this 9-arm match.
+    fn sock(&self) -> Option<String> {
+        match self {
+            CtlLaunch::Title { sock, .. }
+            | CtlLaunch::TabColor { sock, .. }
+            | CtlLaunch::Progress { sock, .. }
+            | CtlLaunch::ClipPush { sock, .. }
+            | CtlLaunch::ClipPull { sock }
+            | CtlLaunch::Notify { sock, .. }
+            | CtlLaunch::SetVar { sock, .. }
+            | CtlLaunch::GetVar { sock, .. }
+            | CtlLaunch::Build { sock, .. } => sock.clone(),
+        }
+    }
 }
 
 fn print_ctl_help() {
@@ -679,20 +701,7 @@ async fn ctl_command_with_sweep_dir(mut args: impl Iterator<Item = String>, swee
     // the remote host, so do it unconditionally before touching our own
     // socket rather than only on error/retry paths.
     sweep_stale_ctl_sockets_in(sweep_dir);
-    let sock = match &launch {
-        CtlLaunch::Title { sock, .. }
-        | CtlLaunch::TabColor { sock, .. }
-        | CtlLaunch::Progress { sock, .. }
-        | CtlLaunch::ClipPush { sock, .. }
-        | CtlLaunch::ClipPull { sock }
-        | CtlLaunch::Notify { sock, .. }
-        | CtlLaunch::SetVar { sock, .. }
-        | CtlLaunch::GetVar { sock, .. }
-        | CtlLaunch::Build { sock, .. } => {
-            sock.clone()
-        }
-    };
-    let sock_path = match resolve_ctl_socket_path(sock) {
+    let sock_path = match resolve_ctl_socket_path(launch.sock()) {
         Ok(path) => path,
         Err(code) => return code,
     };
@@ -733,20 +742,7 @@ pub(crate) async fn ctl_command(mut args: impl Iterator<Item = String>) -> ExitC
     // Still resolve `--sock`/`$ISEKAI_CTL_SOCK` so a misconfigured caller
     // sees the same usage error on every platform — only the final "connect
     // to it" step is unix-only.
-    let sock = match &launch {
-        CtlLaunch::Title { sock, .. }
-        | CtlLaunch::TabColor { sock, .. }
-        | CtlLaunch::Progress { sock, .. }
-        | CtlLaunch::ClipPush { sock, .. }
-        | CtlLaunch::ClipPull { sock }
-        | CtlLaunch::Notify { sock, .. }
-        | CtlLaunch::SetVar { sock, .. }
-        | CtlLaunch::GetVar { sock, .. }
-        | CtlLaunch::Build { sock, .. } => {
-            sock.clone()
-        }
-    };
-    if let Err(code) = resolve_ctl_socket_path(sock) {
+    if let Err(code) = resolve_ctl_socket_path(launch.sock()) {
         return code;
     }
     eprintln!("isekai-pipe ctl: not supported on this platform (requires UNIX domain sockets)");
@@ -843,20 +839,7 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<u8> {
 async fn stream_build(sock_path: &Path, profile: String) -> Result<u8> {
     use isekai_protocol::BuildOutputStream;
 
-    let stream = UnixStream::connect(sock_path)
-        .await
-        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half
-        .write_all(&secret_preamble(sock_path))
-        .await
-        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line =
-        serde_json::to_vec(&CtlMessage::BuildRequest { profile }).context("isekai-pipe ctl: failed to encode ctl message")?;
-    line.push(b'\n');
-    write_half.write_all(&line).await.context("isekai-pipe ctl: failed to write ctl message")?;
-    write_half.shutdown().await.ok();
-
+    let read_half = open_ctl_conn(sock_path, &CtlMessage::BuildRequest { profile }).await?;
     let mut reader = BufReader::new(read_half);
     loop {
         let mut response_line = String::new();
@@ -916,30 +899,16 @@ fn secret_preamble(sock_path: &Path) -> Vec<u8> {
     line
 }
 
+/// Connects to `sock_path`, writes the shared-secret preamble followed by
+/// `msg` as a single JSON line, then half-closes the write side (a ctl
+/// connection is always exactly "connect, send one message, read zero or
+/// more response lines" — never kept open across multiple messages, §8
+/// Epic M "ワイヤーフォーマット"). Returns the read half so callers that
+/// expect a response (or a stream of them, e.g. `stream_build`) can keep
+/// reading from it; callers that don't care about a response (`send_ctl_message`)
+/// simply drop it.
 #[cfg(unix)]
-pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
-    let mut stream = UnixStream::connect(sock_path)
-        .await
-        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
-    stream
-        .write_all(&secret_preamble(sock_path))
-        .await
-        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
-    line.push(b'\n');
-    stream
-        .write_all(&line)
-        .await
-        .context("isekai-pipe ctl: failed to write ctl message")?;
-    // Half-close the write side so a listener reading line-by-line sees a
-    // clean EOF after this one message; we never keep a ctl connection open
-    // across multiple messages (§8 Epic M "ワイヤーフォーマット").
-    stream.shutdown().await.ok();
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
+async fn open_ctl_conn(sock_path: &Path, msg: &CtlMessage) -> Result<OwnedReadHalf> {
     let stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
@@ -948,14 +917,25 @@ async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -
         .write_all(&secret_preamble(sock_path))
         .await
         .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
+    let mut line = serde_json::to_vec(msg).context("isekai-pipe ctl: failed to encode ctl message")?;
     line.push(b'\n');
     write_half
         .write_all(&line)
         .await
         .context("isekai-pipe ctl: failed to write ctl message")?;
     write_half.shutdown().await.ok();
+    Ok(read_half)
+}
 
+#[cfg(unix)]
+pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
+    open_ctl_conn(sock_path, &msg).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
+    let read_half = open_ctl_conn(sock_path, &msg).await?;
     let mut reader = BufReader::new(read_half);
     let mut response_line = String::new();
     reader
