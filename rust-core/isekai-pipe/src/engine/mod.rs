@@ -1304,12 +1304,13 @@ async fn handle_attach_stream(
 /// `token`=session_id・`auth_blob`=resume proof はquicmuxにとって完全に
 /// opaqueなbytesなので、その意味付け(HMAC検証・SessionTable/AttachRuntime
 /// との突き合わせ)はすべてこの関数(呼び出し側)の責務になる —
-/// `quicmux::resume`モジュールdocsの「ResumeAcceptorが担う一点」そのもの
-/// (ただしここでは`dyn ResumeAcceptor`を経由せず、`decode_resume_request`/
-/// `respond_resume_*`を直接呼んでいる。理由: `handle_connection`は既に
-/// ATTACH_HELLO/CancelAttachと同じ一本のstreamの先頭1byteで種別分岐して
-/// いるため、`accept_resume`のように新規`accept_bi()`を自前で行う版は
-/// 使えない)。
+/// `quicmux::resume`モジュールdocsが「呼び出し側が持つ」と定めている責務
+/// そのもの。`handle_connection`は既にATTACH_HELLO/CancelAttachと同じ一本の
+/// streamの先頭1byteで種別分岐しており、frame typeバイトもstream自体も
+/// 消費済みなので、自前で`accept_bi()`を行うラッパーは構造的に使えない —
+/// これがquicmux側に`accept_resume`/`ResumeAcceptor`(かつてこの経路と並行して
+/// 存在し、production呼び出し元が1つも無かった)を置かず、
+/// `decode_resume_request`/`respond_resume_*`を直接公開している理由でもある。
 async fn handle_resume_stream(
     conn: AnyMuxConnection,
     mut send: AnyByteStreamWriteHalf,

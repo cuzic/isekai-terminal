@@ -48,11 +48,12 @@
 //!   [`WarmStandbyError::AlreadyPromoting`] immediately rather than racing
 //!   its own resume attempt — the caller should treat that as "someone else
 //!   is already handling this," not retry. This is a client-side efficiency/
-//!   clarity guard, not the sole correctness backstop: the server's own
-//!   `ResumeAcceptor::try_resume` contract (quicmux-server-resume Stage B)
-//!   already makes a second *concurrent* resume attempt for the same
-//!   session fail closed (`UnknownToken`) even if this guard somehow didn't
-//!   exist, since a session can only be "claimed" once server-side.
+//!   clarity guard, not the sole correctness backstop: the server
+//!   (`isekai-pipe serve`'s `handle_resume_stream`) already makes a second
+//!   *concurrent* resume attempt for the same session fail closed
+//!   (`UnknownToken`) even if this guard somehow didn't exist, because it
+//!   claims the session by `parked_tcp.take()` under the session lock — so
+//!   only one attempt can ever find a parked connection to resume onto.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

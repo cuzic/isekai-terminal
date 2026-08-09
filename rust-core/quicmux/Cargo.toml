@@ -6,7 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Backend-agnostic QUIC-ish multiplexed-stream abstraction over noq (quinn's multipath fork) and qmux (draft-ietf-quic-qmux, QUIC-over-TLS-over-TCP)."
 
 [dependencies]
-async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sha2 = "0.10"
