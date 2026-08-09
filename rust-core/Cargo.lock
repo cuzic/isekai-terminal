@@ -1877,7 +1877,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "bytes",
  "env_logger",
  "hmac",
  "isekai-fs-guard",
