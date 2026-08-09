@@ -1,6 +1,5 @@
 mod ctl;
 mod ctl_file;
-mod datagram_relay;
 mod engine;
 mod connect;
 mod inspect;
