@@ -1722,13 +1722,88 @@ impl Terminal {
         }
     }
 
+    /// 行範囲`[top, bot]`(両端含む)の`n`行を空行(現在のSGR属性を引き継ぐ
+    /// [Self::blank])で埋める。[shift_rows_up]/[shift_rows_down]の「空いた側を
+    /// 埋める」部分の実体。
+    ///
+    /// 呼び出し元は`start + n <= rows`を保証すること(いずれの呼び出し元も
+    /// `n`をregion幅へクランプ済みなので満たされる)。
+    fn blank_rows(&mut self, start: usize, n: usize) {
+        if n == 0 { return; }
+        let cols = self.cols;
+        let blank = self.blank();
+        let from = start * cols;
+        let to = (start + n) * cols;
+        self.cells_mut()[from..to].fill(blank);
+    }
+
+    /// scroll region的な行範囲`[top, bot]`(両端含む)の内容を`n`行分**上**へ
+    /// シフトし、空いた下端`n`行を空行で埋める(SU/DL/LF/インデックス操作の共通実体)。
+    ///
+    /// - `n`は領域幅(`bot - top + 1`)へクランプする。`n == 領域幅`のときはシフト
+    ///   対象が0行になるため、シフトループ自体をスキップする — `bot - n`を
+    ///   `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
+    ///   (タスク#69: `Ps`がフルスクロール領域幅以上のときに実際に踏んでいた既存
+    ///   バグの修正)。空行埋めの開始行も`bot - n + 1`ではなく
+    ///   `top + (region_size - n)`(＝同じ値)の順序で計算し、同じ理由の
+    ///   アンダーフローを避ける。
+    /// - **行を丸ごと**移動するので、全角(wide)文字の本体セルとその
+    ///   `is_wide_placeholder`は常に同じ行に留まり、対応関係は崩れない
+    ///   ([sanitize_wide_row]が必要になるのはICH/DCHのような行内シフトだけ)。
+    /// - scrollbackへのpush・`full_damage_pending`・[Self::clear_images]は
+    ///   **呼び出し元の責務**——SU(`scroll_up_region`)だけがscrollbackへ積み、
+    ///   DL(`delete_lines`)は積んではいけない、という差がここに埋もれないようにする。
+    fn shift_rows_up(&mut self, top: usize, bot: usize, n: usize) {
+        // 防御的ガード(クラッシュ観点): 呼び出し元は全て`top <= bot < rows`を
+        // 満たすが、`Terminal`自身の不変量を呼び出し元の実装に依存させない。
+        if top > bot || bot >= self.rows { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let cols = self.cols;
+        if n < region_size {
+            // 上へ詰めるので、行番号の小さい方から順にコピーする(書き込み先
+            // `row`はこの時点で既に読み終わっている)。
+            for row in top..=(bot - n) {
+                let dst = row * cols;
+                let src = (row + n) * cols;
+                let cells = self.cells_mut();
+                // `dst + cols <= src`(n >= 1)なのでsplit_at_mutで重なりなく
+                // 行単位でコピーできる。per-cellのcloneと同じ結果。
+                let (head, tail) = cells.split_at_mut(src);
+                head[dst..dst + cols].clone_from_slice(&tail[..cols]);
+            }
+        }
+        self.blank_rows(top + (region_size - n), n);
+    }
+
+    /// [shift_rows_up]の逆向き(SD/IL/RI共通)。行範囲`[top, bot]`の内容を`n`行分
+    /// **下**へシフトし、空いた上端`n`行(`top..top+n`)を空行で埋める。
+    /// クランプ・アンダーフロー回避・wide文字の扱い・呼び出し元責務は
+    /// [shift_rows_up]と同じ。
+    fn shift_rows_down(&mut self, top: usize, bot: usize, n: usize) {
+        if top > bot || bot >= self.rows { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let cols = self.cols;
+        if n < region_size {
+            // 下へ押し出すので、行番号の大きい方から順にコピーする(書き込み先
+            // `row + n`がまだ読んでいない元データを上書きしないようにする)。
+            for row in (top..=(bot - n)).rev() {
+                let src = row * cols;
+                let dst = (row + n) * cols;
+                let cells = self.cells_mut();
+                let (head, tail) = cells.split_at_mut(dst);
+                tail[..cols].clone_from_slice(&head[src..src + cols]);
+            }
+        }
+        self.blank_rows(top, n);
+    }
+
     /// SU(`CSI Ps S`)。scroll region内を`n`行分上方向へシフトし、下端を空行で
-    /// 埋める。[scroll_down_region](SD)と同じ理由で、シフト対象が0行になる
-    /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
-    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
-    /// (タスク#69: `Ps`がフルスクロール領域幅以上のときに実際に踏んでいた既存
-    /// バグの修正。空行埋めの範囲も`bot - n + 1`ではなく`bot + 1 - n`の順序で
-    /// 計算し同じ理由のアンダーフローを避ける)。
+    /// 埋める([shift_rows_up]が実体)。`top == 0`かつmain画面の場合に限り、
+    /// 押し出された行をscrollbackへ積む——この点だけが[delete_lines](DL)との差。
     fn scroll_up_region(&mut self, n: usize) {
         // スクロールは行座標をずらすので行差分では追随できない——全画面dirty(#93)。
         self.full_damage_pending = true;
@@ -1762,20 +1837,7 @@ impl Terminal {
             self.trim_pending_scrollback();
         }
 
-        if n < region_size {
-            for row in top..=(bot - n) {
-                for col in 0..cols {
-                    let src = self.cells_mut()[(row + n) * cols + col].clone();
-                    self.cells_mut()[row * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in (bot + 1 - n)..=bot {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_up(top, bot, n);
     }
 
     /// SD(`CSI Ps T`)。scroll region([scroll_top, scroll_bottom])の内容を`n`行分
@@ -1788,30 +1850,14 @@ impl Terminal {
     ///
     /// [insert_lines]/[delete_lines]と同じ理由で、シフト対象が0行になる
     /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
-    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため。
+    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
+    /// ([shift_rows_down]が実体)。
     fn scroll_down_region(&mut self, n: usize) {
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-
-        if n < region_size {
-            for row in (top..=(bot - n)).rev() {
-                for col in 0..cols {
-                    let src = self.cells_mut()[row * cols + col].clone();
-                    self.cells_mut()[(row + n) * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in top..(top + n) {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_down(top, bot, n);
     }
 
     /// IL(`CSI Ps L`)。カーソル行に`n`個の空行を挿入し、カーソル行〜scroll_bottomの
@@ -1834,25 +1880,9 @@ impl Terminal {
         if top < self.scroll_top || top > bot { return; }
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-        if n < region_size {
-            // 下から上へ(行番号の大きい方から)コピーすることで、書き込み先
-            // (row + n)がまだ読んでいない元データを上書きしないようにする。
-            for row in (top..=(bot - n)).rev() {
-                for col in 0..cols {
-                    let src = self.cells_mut()[row * cols + col].clone();
-                    self.cells_mut()[(row + n) * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        for row in top..(top + n) {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        // `scroll_down_region`(SD)と実体は同一で、`top`が`scroll_top`ではなく
+        // カーソル行になる点だけが違う([shift_rows_down])。
+        self.shift_rows_down(top, bot, n);
     }
 
     /// DL(`CSI Ps M`)。カーソル行から`n`行を削除し、それより下(〜scroll_bottom)の
@@ -1863,31 +1893,17 @@ impl Terminal {
     /// アンダーフロー回避のため、空行で埋める開始行を`bot - n + 1`ではなく
     /// `top + (region_size - n)`として計算する(`n == region_size`の時
     /// `bot - n + 1`は`usize`の直接減算だと桁あふれし得るが、こちらは
-    /// `region_size - n >= 0`が`n`のクランプにより保証されているため安全)。
+    /// `region_size - n >= 0`が`n`のクランプにより保証されているため安全)——
+    /// この計算も含めて実体は[shift_rows_up]と共有する。`scroll_up_region`(SU)
+    /// との唯一の差は、SUが行うscrollbackへのpushをここでは**行わない**こと
+    /// (上記の理由)。
     fn delete_lines(&mut self, n: usize) {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
         self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
-        let region_size = bot - top + 1;
-        let n = n.min(region_size);
-        let cols = self.cols;
-        if n < region_size {
-            for row in top..=(bot - n) {
-                for col in 0..cols {
-                    let src = self.cells_mut()[(row + n) * cols + col].clone();
-                    self.cells_mut()[row * cols + col] = src;
-                }
-            }
-        }
-        let blank = self.blank();
-        let blank_start = top + (region_size - n);
-        for row in blank_start..=bot {
-            for col in 0..cols {
-                self.cells_mut()[row * cols + col] = blank.clone();
-            }
-        }
+        self.shift_rows_up(top, bot, n);
     }
 
     /// [insert_chars]/[delete_chars] が行内で全角(wide)文字の片割れを分断してしまった
@@ -3346,17 +3362,11 @@ impl Perform for Terminal {
                     self.full_damage_pending = true;
                     let top = self.scroll_top;
                     let bot = self.scroll_bottom;
-                    let cols = self.cols;
-                    for row in (top + 1..=bot).rev() {
-                        for col in 0..cols {
-                            let src = self.cells_mut()[(row - 1) * cols + col].clone();
-                            self.cells_mut()[row * cols + col] = src;
-                        }
-                    }
-                    let blank = self.blank();
-                    for col in 0..cols {
-                        self.cells_mut()[top * cols + col] = blank.clone();
-                    }
+                    // SD(`scroll_down_region`)/IL(`insert_lines`)と同じ1行分の
+                    // 下方向シフト([shift_rows_down])。`clear_images`は歴史的に
+                    // ここだけ呼んでいないため、挙動を変えないよう呼び出さない
+                    // (sibling関数との差異はPhase 2レビューで別途扱う)。
+                    self.shift_rows_down(top, bot, 1);
                 } else if self.cursor_row > 0 {
                     self.cursor_row -= 1;
                 }
@@ -5786,6 +5796,251 @@ mod tests {
         assert_eq!(cell(&t, 3, 3), "4", "旧row4がカーソル行(3)へ詰められる");
         assert_eq!(cell(&t, 4, 0), " ", "region下端(scroll_bottom=4)が空行で埋まる");
         assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はDLの影響を受けない");
+    }
+
+    // ── 行シフト共通ヘルパー(shift_rows_up/shift_rows_down)の等価性 ────────
+    //
+    // Phase 2のクリーンアップで、SU(`CSI S`)/SD(`CSI T`)/IL(`CSI L`)/
+    // DL(`CSI M`)/RI(`ESC M`)の5箇所にコピペされていた「行をN行ずらして
+    // 空いた側を空行で埋める」ループを`shift_rows_up`/`shift_rows_down`
+    // (+`blank_rows`)へ統合した。統合の前後で**どのセルがどこへ移るか**が
+    // 1文字も変わっていないことを、セル単体ではなく行全体の文字列で固定する
+    // (レンダリング結果に直結するため、「panicしない」では不十分)。
+
+    /// 行`row`の全列を1つの文字列として取り出す。行全体を突き合わせることで、
+    /// シフト範囲の1行/1列ズレを見逃さない。
+    fn row_text(t: &Terminal, row: usize) -> String {
+        let cols = t.cols();
+        t.screen_cells()[row * cols..(row + 1) * cols]
+            .iter()
+            .map(|c| c.ch.as_str())
+            .collect()
+    }
+
+    /// 6列×5行に`L0abcd`〜`L4abcd`を1行ずつ書き込んだ端末(全列が埋まっている
+    /// ので、行の一部だけがずれた場合も`row_text`の比較で必ず落ちる)。
+    fn filled_6x5() -> Terminal {
+        let mut t = Terminal::new(6, 5, Theme::default());
+        feed(&mut t, b"L0abcd\r\nL1abcd\r\nL2abcd\r\nL3abcd\r\nL4abcd");
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "前提: 初期内容");
+        }
+        t
+    }
+
+    #[test]
+    fn test_su_shifts_exact_rows_and_pushes_scrollback() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2S");
+        assert_eq!(row_text(&t, 0), "L2abcd");
+        assert_eq!(row_text(&t, 1), "L3abcd");
+        assert_eq!(row_text(&t, 2), "L4abcd");
+        assert_eq!(row_text(&t, 3), "      ", "下端2行は空行");
+        assert_eq!(row_text(&t, 4), "      ");
+        // SUだけが持つscrollbackへのpush(DLとの唯一の差)。
+        let pending = t.take_scrollback();
+        assert_eq!(pending.len(), 2);
+        let pushed: Vec<String> = pending
+            .iter()
+            .map(|r| r.iter().map(|c| c.ch.as_str()).collect())
+            .collect();
+        assert_eq!(pushed, vec!["L0abcd".to_string(), "L1abcd".to_string()]);
+        assert_eq!(t.total_scrolled_lines, 2);
+    }
+
+    #[test]
+    fn test_sd_shifts_exact_rows_and_never_touches_scrollback() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2T");
+        assert_eq!(row_text(&t, 0), "      ");
+        assert_eq!(row_text(&t, 1), "      ");
+        assert_eq!(row_text(&t, 2), "L0abcd");
+        assert_eq!(row_text(&t, 3), "L1abcd");
+        assert_eq!(row_text(&t, 4), "L2abcd");
+        assert!(t.take_scrollback().is_empty(), "SDはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_il_shifts_exact_rows_from_cursor_row() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;1H\x1b[2L"); // カーソル行1に2行挿入
+        assert_eq!(row_text(&t, 0), "L0abcd", "カーソル行より上は不変");
+        assert_eq!(row_text(&t, 1), "      ");
+        assert_eq!(row_text(&t, 2), "      ");
+        assert_eq!(row_text(&t, 3), "L1abcd");
+        assert_eq!(row_text(&t, 4), "L2abcd");
+        assert!(t.take_scrollback().is_empty(), "ILはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_dl_shifts_exact_rows_from_cursor_row() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;1H\x1b[2M"); // カーソル行1から2行削除
+        assert_eq!(row_text(&t, 0), "L0abcd", "カーソル行より上は不変");
+        assert_eq!(row_text(&t, 1), "L3abcd");
+        assert_eq!(row_text(&t, 2), "L4abcd");
+        assert_eq!(row_text(&t, 3), "      ");
+        assert_eq!(row_text(&t, 4), "      ");
+        assert!(t.take_scrollback().is_empty(), "DLはscrollbackへ積まない");
+        assert_eq!(t.total_scrolled_lines, 0);
+    }
+
+    #[test]
+    fn test_ri_at_scroll_top_shifts_exact_rows_down_by_one() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[1;1H"); // カーソルを scroll_top(行0)へ
+        feed(&mut t, b"\x1bM"); // RI
+        assert_eq!(row_text(&t, 0), "      ", "空いた上端1行だけが空行になる");
+        assert_eq!(row_text(&t, 1), "L0abcd");
+        assert_eq!(row_text(&t, 2), "L1abcd");
+        assert_eq!(row_text(&t, 3), "L2abcd");
+        assert_eq!(row_text(&t, 4), "L3abcd");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0), "RIのスクロール時はカーソル不動");
+        assert!(t.take_scrollback().is_empty(), "RIはscrollbackへ積まない");
+    }
+
+    #[test]
+    fn test_ri_inside_non_full_scroll_region_touches_only_that_region() {
+        // RIのシフトも`[scroll_top, scroll_bottom]`に閉じている(region外の行は不変)。
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3(0-indexed)
+        feed(&mut t, b"\x1b[2;1H"); // カーソルを scroll_top(行1)へ
+        feed(&mut t, b"\x1bM"); // RI
+        assert_eq!(row_text(&t, 0), "L0abcd", "region上端より上は不変");
+        assert_eq!(row_text(&t, 1), "      ", "region上端が空行になる");
+        assert_eq!(row_text(&t, 2), "L1abcd");
+        assert_eq!(row_text(&t, 3), "L2abcd");
+        assert_eq!(row_text(&t, 4), "L4abcd", "region下端より下は不変(旧row3は破棄)");
+    }
+
+    #[test]
+    fn test_su_sd_inside_non_full_scroll_region_touch_only_that_region() {
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3
+        feed(&mut t, b"\x1b[1S"); // SU 1行
+        assert_eq!(row_text(&t, 0), "L0abcd", "region外(上)は不変");
+        assert_eq!(row_text(&t, 1), "L2abcd");
+        assert_eq!(row_text(&t, 2), "L3abcd");
+        assert_eq!(row_text(&t, 3), "      ", "region下端が空行");
+        assert_eq!(row_text(&t, 4), "L4abcd", "region外(下)は不変");
+        assert!(
+            t.take_scrollback().is_empty(),
+            "scroll_top != 0 のSUはscrollbackへ積まない(既存仕様)"
+        );
+
+        let mut t2 = filled_6x5();
+        feed(&mut t2, b"\x1b[2;4r");
+        feed(&mut t2, b"\x1b[1T"); // SD 1行
+        assert_eq!(row_text(&t2, 0), "L0abcd");
+        assert_eq!(row_text(&t2, 1), "      ", "region上端が空行");
+        assert_eq!(row_text(&t2, 2), "L1abcd");
+        assert_eq!(row_text(&t2, 3), "L2abcd");
+        assert_eq!(row_text(&t2, 4), "L4abcd");
+    }
+
+    #[test]
+    fn test_row_shift_preserves_wide_char_body_placeholder_pairing() {
+        // 行シフトは**行を丸ごと**動かすので、全角文字の本体セルと右隣の
+        // `is_wide_placeholder`は必ず同じ行に留まる(ICH/DCHのような行内シフトと
+        // 違い`sanitize_wide_row`が要らない理由。bulkコピー化で崩れていないことを固定)。
+        let mut t = Terminal::new(6, 4, Theme::default());
+        feed(&mut t, "あい\r\n".as_bytes());
+        feed(&mut t, b"plain2");
+        let wide_row_is_intact = |t: &Terminal, row: usize| {
+            let cols = t.cols();
+            let r = &t.screen_cells()[row * cols..(row + 1) * cols];
+            assert_eq!(r[0].ch.as_str(), "あ");
+            assert!(!r[0].is_wide_placeholder);
+            assert!(r[1].is_wide_placeholder, "全角1文字目の右隣はプレースホルダ");
+            assert_eq!(r[2].ch.as_str(), "い");
+            assert!(!r[2].is_wide_placeholder);
+            assert!(r[3].is_wide_placeholder, "全角2文字目の右隣はプレースホルダ");
+        };
+        wide_row_is_intact(&t, 0);
+
+        // 下方向シフト(SD)の後も対応関係が保たれる。
+        feed(&mut t, b"\x1b[1T");
+        wide_row_is_intact(&t, 1);
+        // 上方向シフト(SU)で元の位置へ戻しても同じ。
+        feed(&mut t, b"\x1b[1S");
+        wide_row_is_intact(&t, 0);
+    }
+
+    #[test]
+    fn test_su_sd_ri_blank_fill_uses_current_sgr_bg() {
+        // IL/DLについては`test_il_dl_blank_uses_current_sgr_bg`が固定済み。
+        // 共通化した`blank_rows`が同じく現在のSGR属性を引き継ぐことを、
+        // SU/SD/RIの3経路でも固定する。
+        let red_bg = Theme::default().ansi16[1];
+
+        let mut t = filled_6x5();
+        feed(&mut t, b"\x1b[41m\x1b[1S"); // 赤背景 + SU → 下端(行4)が空行
+        assert_eq!(t.screen_cells()[4 * 6].bg, red_bg, "SUの空行は現在のSGR背景色");
+
+        let mut t2 = filled_6x5();
+        feed(&mut t2, b"\x1b[41m\x1b[1T"); // SD → 上端(行0)が空行
+        assert_eq!(t2.screen_cells()[0].bg, red_bg, "SDの空行は現在のSGR背景色");
+
+        let mut t3 = filled_6x5();
+        feed(&mut t3, b"\x1b[1;1H\x1b[41m\x1bM"); // RI at scroll_top
+        assert_eq!(t3.screen_cells()[0].bg, red_bg, "RIの空行は現在のSGR背景色");
+    }
+
+    #[test]
+    fn test_shift_rows_helpers_direct_edge_cases() {
+        // ヘルパー自体の境界条件(エスケープシーケンス経由では作れないものを含む)。
+        // - `n == 0`は完全なno-op
+        // - `n >= 領域幅`は領域全体を空行にする(アンダーフローしない)
+        // - 1行だけの領域(DECSTBMは`top < bot`しか受け付けないので直接呼ぶ)
+        let mut t = filled_6x5();
+        t.shift_rows_up(1, 3, 0);
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "n==0のshift_rows_upはno-op");
+        }
+        t.shift_rows_down(1, 3, 0);
+        for row in 0..5 {
+            assert_eq!(row_text(&t, row), format!("L{row}abcd"), "n==0のshift_rows_downはno-op");
+        }
+
+        let mut t2 = filled_6x5();
+        t2.shift_rows_up(1, 3, 99);
+        assert_eq!(row_text(&t2, 0), "L0abcd");
+        assert_eq!(row_text(&t2, 1), "      ");
+        assert_eq!(row_text(&t2, 2), "      ");
+        assert_eq!(row_text(&t2, 3), "      ");
+        assert_eq!(row_text(&t2, 4), "L4abcd");
+
+        let mut t3 = filled_6x5();
+        t3.shift_rows_down(1, 3, 99);
+        assert_eq!(row_text(&t3, 0), "L0abcd");
+        assert_eq!(row_text(&t3, 1), "      ");
+        assert_eq!(row_text(&t3, 2), "      ");
+        assert_eq!(row_text(&t3, 3), "      ");
+        assert_eq!(row_text(&t3, 4), "L4abcd");
+
+        // 1行だけの領域: シフト対象は0行、その1行が空行になるだけ。
+        let mut t4 = filled_6x5();
+        t4.shift_rows_down(2, 2, 1);
+        assert_eq!(row_text(&t4, 1), "L1abcd");
+        assert_eq!(row_text(&t4, 2), "      ");
+        assert_eq!(row_text(&t4, 3), "L3abcd");
+        let mut t5 = filled_6x5();
+        t5.shift_rows_up(2, 2, 1);
+        assert_eq!(row_text(&t5, 1), "L1abcd");
+        assert_eq!(row_text(&t5, 2), "      ");
+        assert_eq!(row_text(&t5, 3), "L3abcd");
+
+        // 不正な範囲(top > bot / bot が画面外)は防御的にno-op(panicしない)。
+        let mut t6 = filled_6x5();
+        t6.shift_rows_up(3, 1, 1);
+        t6.shift_rows_down(3, 1, 1);
+        t6.shift_rows_up(0, 99, 1);
+        t6.shift_rows_down(0, 99, 1);
+        for row in 0..5 {
+            assert_eq!(row_text(&t6, row), format!("L{row}abcd"), "不正範囲はno-op");
+        }
     }
 
     #[test]
