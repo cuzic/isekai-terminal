@@ -2269,6 +2269,7 @@ mod tests {
 #[cfg(test)]
 mod dispatch_transport_event_tests {
     use super::*;
+    use crate::ScreenUpdate;
 
     struct NoopSessionCallback;
     impl SessionCallback for NoopSessionCallback {
@@ -2367,6 +2368,7 @@ mod dispatch_transport_event_tests {
 #[cfg(test)]
 mod session_event_loop_tests {
     use super::*;
+    use crate::ScreenUpdate;
 
     struct RecordingSessionCallback {
         updates: Mutex<Vec<ScreenUpdate>>,

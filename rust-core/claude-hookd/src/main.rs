@@ -248,6 +248,7 @@ enum ClientEvent {
     StopAmbiguousTeammate,
 }
 
+#[cfg(unix)]
 impl ClientEvent {
     /// This crate's own minimal daemon wire format (`main.rs::send_event`'s
     /// client side, `daemon.rs::read_one_event_line`'s server side) —

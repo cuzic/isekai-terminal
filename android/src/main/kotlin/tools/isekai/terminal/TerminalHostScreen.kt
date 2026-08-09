@@ -438,7 +438,9 @@ private fun TerminalTabScreen(
     }
 
     SplitPanes(
-        direction = splitDirection,
+        // splitPane/splitDirectionは常にセットで更新される(TabState.openSplit/closeSplitPane参照)ため、
+        // split(splitPane)が非nullならsplitDirectionも必ず非null。
+        direction = splitDirection ?: SplitDirection.HORIZONTAL,
         first = {
             TerminalPaneScreen(
                 tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
