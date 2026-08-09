@@ -18,7 +18,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -73,7 +73,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: UInt32(cells.count), rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -111,7 +111,7 @@ final class TerminalScreenViewTests: XCTestCase {
             let update = ScreenUpdate(
                 updateSeq: 0, cols: 1, rows: 1, cells: [cell],
                 cursorRow: 0, cursorCol: 0,
-                title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false,
+                title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false,
                 bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
@@ -168,7 +168,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -198,7 +198,7 @@ final class TerminalScreenViewTests: XCTestCase {
             let update = ScreenUpdate(
                 updateSeq: 0, cols: 1, rows: 1, cells: cells,
                 cursorRow: 0, cursorCol: 0,
-                title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+                title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: true, bellGeneration: 0,
                 notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -224,7 +224,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: 1, rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -257,7 +257,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -294,7 +294,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -329,7 +329,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -365,7 +365,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -400,7 +400,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -674,7 +674,7 @@ final class TerminalScreenViewTests: XCTestCase {
             ScreenUpdate(
                 updateSeq: 0, cols: 1, rows: 1, cells: [cell(blink: blink)],
                 cursorRow: 0, cursorCol: 0,
-                title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+                title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
                 notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -1116,7 +1116,7 @@ final class TerminalScreenViewTests: XCTestCase {
         return ScreenUpdate(
             updateSeq: updateSeq, cols: cols, rows: rows, cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: 0,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",

@@ -36,6 +36,24 @@ const MAX_LIVE_IMAGES: usize = 32;
 /// (64MiB)を選ぶ。`place_sixel_image`は新しい画像を追加した後、この合計または
 /// `MAX_LIVE_IMAGES`を超えている間、最も古い画像から順に捨てる。
 const MAX_TOTAL_IMAGE_RGBA_BYTES: usize = 64 * 1024 * 1024;
+/// vteがOSCペイロードを溜める生バイトバッファ(`vte::Parser<OSC_RAW_BUF_SIZE>`の
+/// 定数ジェネリクス、`no_std`フィーチャ時は固定長`ArrayVec`)のサイズ。vte 0.13の
+/// 既定値は1024バイトで、埋まると以降のバイトは(`;`区切り自体を含めて)静かに
+/// 捨てられる——OSC 52クリップボード書き込みではこれが致命的で、切り詰められた
+/// base64はdecodeに失敗し**何も起きない**(エラーにすらならない)。
+///
+/// そこで、OSC 52で運べるテキスト量が ctl-socket 経路
+/// (`isekai_protocol::MAX_CLIPBOARD_TEXT_DECODED_LEN` = 64KiB、
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic M)と一致するようサイズを決める。両経路で
+/// 「クリップボードは64KiBまで」と言い切れるようにするのが狙いなので、64KiBそのもの
+/// ではなく**64KiBをbase64化した長さ**に`52;c;`プレフィックス分を足した値にする
+/// (バッファはデコード後ではなくワイヤ上のペイロードを溜めるため)。
+const OSC_CLIPBOARD_PREFIX_LEN: usize = "52;c;".len();
+const OSC_RAW_BUF_SIZE: usize =
+    OSC_CLIPBOARD_PREFIX_LEN + (isekai_protocol::MAX_CLIPBOARD_TEXT_DECODED_LEN + 2) / 3 * 4;
+/// このcrateが使うvteパーサーの型エイリアス。`vte::Parser::new()`は既定サイズ
+/// (1024)専用なので、生成側は`OscParser::new_with_size()`を使うこと。
+pub(crate) type OscParser = vte::Parser<OSC_RAW_BUF_SIZE>;
 /// OSC 8(タスク#40)のURL intern表(`Terminal::link_table`)に登録できるURLの
 /// 上限件数。`link_table`は(scrollback中の過去セルの`link_id`がindexとして
 /// 指し続けるため)RISでもクリアせず単調増加する設計(`link_table`フィールドの
@@ -2182,11 +2200,13 @@ impl Terminal {
     /// `print()`が書き込む全セルへこのidが付与される。
     ///
     /// vteの既定ビルド(`no_std`フィーチャ、`Cargo.toml`の`vte = "0.13"`はデフォルト
-    /// フィーチャ込み)はOSCペイロードのraw byteバッファが`MAX_OSC_RAW`(1024バイト)の
-    /// 固定長`ArrayVec`で、バッファが埋まると以降のバイト(`;`区切り自体を含む)は
-    /// 静かに捨てられる。1024バイトを超える長いURLは`osc_dispatch`に丸ごとは届かず
-    /// 途中で切り詰められたバイト列になる(`test_osc8_extremely_long_url_is_truncated_by_vte_osc_buffer`
-    /// で明示)。
+    /// フィーチャ込み)はOSCペイロードのraw byteバッファを固定長`ArrayVec`で持ち、
+    /// バッファが埋まると以降のバイト(`;`区切り自体を含む)は静かに捨てられる。
+    /// このcrateはそのサイズをvte既定の1024バイトではなく`OSC_RAW_BUF_SIZE`
+    /// (約85KiB、OSC 52で64KiBのクリップボードテキストを運べる大きさ。定数の
+    /// docコメント参照)に広げているが、上限が無くなったわけではない——それを
+    /// 超える長いURLは`osc_dispatch`に丸ごとは届かず途中で切り詰められたバイト列に
+    /// なる(`test_osc8_extremely_long_url_is_truncated_by_vte_osc_buffer`で明示)。
     fn handle_osc8_hyperlink(&mut self, params: &[&[u8]]) {
         let uri: Option<String> = if params.len() >= 3 {
             let mut buf = Vec::new();
@@ -3387,11 +3407,14 @@ impl Perform for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vte::Parser;
     use proptest::prelude::*;
 
+    /// 本番(`session_state.rs`)と同じ`OscParser`を使う——既定サイズの
+    /// `vte::Parser::new()`だとOSCバッファ長が食い違い、テストが実際の挙動を
+    /// 検証しなくなる。`SessionState`と同じ理由(インラインの固定長バッファが
+    /// 大きい)でBoxに載せる。
     fn feed(t: &mut Terminal, bytes: &[u8]) {
-        let mut p = Parser::new();
+        let mut p = Box::new(OscParser::new_with_size());
         for &b in bytes { p.advance(t, b); }
     }
 
@@ -4080,6 +4103,43 @@ mod tests {
         assert_eq!(t.take_pending_clipboard_write(), None);
     }
 
+    /// `OSC_RAW_BUF_SIZE`を広げた目的そのもの: OSC 52で ctl-socket 経路と同じ
+    /// `MAX_CLIPBOARD_TEXT_DECODED_LEN`(64KiB)ちょうどのテキストが運べること。
+    /// vte既定の1024バイトバッファ時代はここが静かに切り詰められ、decodeに失敗して
+    /// **何も起きない**(エラーにもならない)のが最大の落とし穴だった。
+    #[test]
+    fn test_clipboard_write_osc_52_carries_a_full_max_clipboard_text() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let text = "a".repeat(isekai_protocol::MAX_CLIPBOARD_TEXT_DECODED_LEN);
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1b]52;c;");
+        seq.extend_from_slice(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes()).as_bytes(),
+        );
+        seq.push(0x07);
+        assert!(seq.len() - 3 <= OSC_RAW_BUF_SIZE, "OSCペイロードはバッファに収まる想定");
+        feed(&mut t, &seq);
+        assert_eq!(t.take_pending_clipboard_write(), Some(text));
+    }
+
+    /// 上限の外側もピン留めしておく: バッファを超えるOSC 52はbase64が切り詰められて
+    /// decodeに失敗し、クリップボードは更新されない(パニックもしない)。
+    /// 「無反応」に見えるこの挙動があるからこそ、送る側は上限内へ切り詰める責任がある
+    /// (`SnippetTemplates.CLAUDE_COPY_LAST_REPLY`がまさにそれをしている)。
+    #[test]
+    fn test_clipboard_write_osc_52_beyond_the_buffer_is_dropped() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let text = "a".repeat(OSC_RAW_BUF_SIZE * 2);
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1b]52;c;");
+        seq.extend_from_slice(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes()).as_bytes(),
+        );
+        seq.push(0x07);
+        feed(&mut t, &seq);
+        assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
     #[test]
     fn test_clipboard_query_is_not_treated_as_a_write() {
         let mut t = Terminal::new(80, 24, Theme::default());
@@ -4228,16 +4288,21 @@ mod tests {
     #[test]
     fn test_osc8_extremely_long_url_is_truncated_by_vte_osc_buffer() {
         // vteの既定ビルド(`no_std`フィーチャ有効、`vte = "0.13"`はデフォルト
-        // フィーチャ込みでこれを含む)はOSC生バイトバッファが`MAX_OSC_RAW`
-        // (1024バイト)固定長の`ArrayVec`で、溢れた分は静かに捨てられる。
-        // 1024バイトを大幅に超えるURLは`osc_dispatch`に丸ごとは届かず、
-        // 途中で切り詰められたバイト列として渡ってくる——ここではその挙動を
-        // 明示する(切り詰められても`osc_dispatch`自体は呼ばれ、パニックしない
-        // ことも合わせて確認する)。
+        // フィーチャ込みでこれを含む)はOSC生バイトバッファが固定長の`ArrayVec`で、
+        // 溢れた分は静かに捨てられる。このcrateはそのサイズを`OSC_RAW_BUF_SIZE`
+        // (vte既定の1024ではなく約85KiB)へ広げているが上限自体は残るので、
+        // それを大幅に超えるURLは`osc_dispatch`に丸ごとは届かず、途中で切り詰め
+        // られたバイト列として渡ってくる——ここではその挙動を明示する
+        // (切り詰められても`osc_dispatch`自体は呼ばれ、パニックしないことも
+        // 合わせて確認する)。バッファを広げてもこの性質が変わらないことを
+        // 保証したいので、長さは定数から導出して`OSC_RAW_BUF_SIZE`追従にする。
         let mut t = Terminal::new(80, 24, Theme::default());
-        let long_suffix = "x".repeat(2000);
+        let long_suffix = "x".repeat(OSC_RAW_BUF_SIZE * 2);
         let long_url = format!("https://example.com/{long_suffix}");
-        assert!(long_url.len() > 1024, "テストの前提として2000バイト超のURLを使う");
+        assert!(
+            long_url.len() > OSC_RAW_BUF_SIZE,
+            "テストの前提としてOSCバッファを大幅に超える長さのURLを使う",
+        );
         let mut seq = Vec::new();
         seq.extend_from_slice(b"\x1b]8;;");
         seq.extend_from_slice(long_url.as_bytes());
@@ -4246,7 +4311,7 @@ mod tests {
         // パニックせず、かつ実際にintern表へ入ったURL(もしあれば)は元のURLより
         // 短く切り詰められている。
         if let Some(interned) = t.link_table().first() {
-            assert!(interned.len() < long_url.len(), "1024バイトのOSCバッファで切り詰められているはず");
+            assert!(interned.len() < long_url.len(), "OSCバッファ長で切り詰められているはず");
             assert!(long_url.starts_with(interned.as_str()), "切り詰め後も先頭は元のURLのprefixのまま");
         }
     }

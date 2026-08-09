@@ -3706,6 +3706,12 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var tabColor: TabColor?
     /**
+     * ctlソケット経由の`CtlMessage::SetProgress`(`isekai-ssh`ではOSC 9;4)で設定された
+     * タブ進捗。`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+     * セッション限りの状態(永続化しない)。詳細は[TabProgress]参照。
+     */
+    public var tabProgress: TabProgress?
+    /**
      * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
      * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
      * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
@@ -3893,6 +3899,11 @@ public struct ScreenUpdate: Equatable, Hashable {
          * セッション限りの状態(永続化しない)。詳細は[TabColor]参照。
          */tabColor: TabColor?, 
         /**
+         * ctlソケット経由の`CtlMessage::SetProgress`(`isekai-ssh`ではOSC 9;4)で設定された
+         * タブ進捗。`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
+         * セッション限りの状態(永続化しない)。詳細は[TabProgress]参照。
+         */tabProgress: TabProgress?, 
+        /**
          * xterm/iTerm2互換のOSC 12(またはOSC 112でのリセット)で設定されたカーソル色。
          * `title`/`tab_color`と同じくRIS/新規セッションで`None`にリセットされる、
          * セッション限りの状態(永続化しない)。詳細は[CursorColor]参照。
@@ -4045,6 +4056,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.cursorCol = cursorCol
         self.title = title
         self.tabColor = tabColor
+        self.tabProgress = tabProgress
         self.cursorColor = cursorColor
         self.applicationCursorMode = applicationCursorMode
         self.applicationKeypadMode = applicationKeypadMode
@@ -4096,6 +4108,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
                 tabColor: FfiConverterOptionTypeTabColor.read(from: &buf), 
+                tabProgress: FfiConverterOptionTypeTabProgress.read(from: &buf), 
                 cursorColor: FfiConverterOptionTypeCursorColor.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 applicationKeypadMode: FfiConverterBool.read(from: &buf), 
@@ -4133,6 +4146,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cursorCol, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
         FfiConverterOptionTypeTabColor.write(value.tabColor, into: &buf)
+        FfiConverterOptionTypeTabProgress.write(value.tabProgress, into: &buf)
         FfiConverterOptionTypeCursorColor.write(value.cursorColor, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
         FfiConverterBool.write(value.applicationKeypadMode, into: &buf)
@@ -4442,6 +4456,67 @@ public func FfiConverterTypeTabColor_lift(_ buf: RustBuffer) throws -> TabColor 
 #endif
 public func FfiConverterTypeTabColor_lower(_ value: TabColor) -> RustBuffer {
     return FfiConverterTypeTabColor.lower(value)
+}
+
+
+/**
+ * ctl-socket経由の`CtlMessage::SetProgress`(`isekai-pipe ctl progress`/`ctl build`、
+ * `isekai-ssh`ではOSC 9;4へ変換される)で設定されたタブ進捗。`state ==
+ * ProgressState::Normal`の時のみ`progress`(0-100)が意味を持つ。
+ * `ScreenUpdate::tab_progress`が`None`のときは未設定(タブUIは進捗インジケータを
+ * 表示しない)。
+ */
+public struct TabProgress: Equatable, Hashable {
+    public var state: ProgressState
+    public var progress: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: ProgressState, progress: UInt8) {
+        self.state = state
+        self.progress = progress
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TabProgress: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTabProgress: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TabProgress {
+        return
+            try TabProgress(
+                state: FfiConverterTypeProgressState.read(from: &buf), 
+                progress: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TabProgress, into buf: inout [UInt8]) {
+        FfiConverterTypeProgressState.write(value.state, into: &buf)
+        FfiConverterUInt8.write(value.progress, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTabProgress_lift(_ buf: RustBuffer) throws -> TabProgress {
+    return try FfiConverterTypeTabProgress.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTabProgress_lower(_ value: TabProgress) -> RustBuffer {
+    return FfiConverterTypeTabProgress.lower(value)
 }
 
 
@@ -5983,6 +6058,100 @@ public func FfiConverterTypePanelKind_lift(_ buf: RustBuffer) throws -> PanelKin
 #endif
 public func FfiConverterTypePanelKind_lower(_ value: PanelKind) -> RustBuffer {
     return FfiConverterTypePanelKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * `isekai_protocol::ctl::ProgressState`(uniffiに依存しないpure crate側の型)を
+ * UniFFI境界越しに公開するための同型(`ClipboardMimeKind`/`NotifyKind`と同じ理由で
+ * ミラーが必要)。ConEmu/Windows Terminal互換のOSC 9;4(タブアイコンの進捗リング+
+ * タスクバー統合)が表現する進捗状態。
+ */
+
+public enum ProgressState: Equatable, Hashable {
+    
+    case none
+    case normal
+    case error
+    case indeterminate
+    case warning
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ProgressState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProgressState: FfiConverterRustBuffer {
+    typealias SwiftType = ProgressState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProgressState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .normal
+        
+        case 3: return .error
+        
+        case 4: return .indeterminate
+        
+        case 5: return .warning
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ProgressState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .normal:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .error:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .indeterminate:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .warning:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgressState_lift(_ buf: RustBuffer) throws -> ProgressState {
+    return try FfiConverterTypeProgressState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgressState_lower(_ value: ProgressState) -> RustBuffer {
+    return FfiConverterTypeProgressState.lower(value)
 }
 
 
@@ -8177,6 +8346,30 @@ fileprivate struct FfiConverterOptionTypeTabColor: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeTabColor.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTabProgress: FfiConverterRustBuffer {
+    typealias SwiftType = TabProgress?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTabProgress.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTabProgress.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

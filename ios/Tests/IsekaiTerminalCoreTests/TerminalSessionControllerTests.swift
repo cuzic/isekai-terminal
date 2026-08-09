@@ -649,7 +649,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         ScreenUpdate(
             updateSeq: 0, cols: 1, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: bellGeneration,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
@@ -692,7 +692,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         controller.onScreenUpdate(update: ScreenUpdate(
             updateSeq: 0, cols: 2, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, tabColor: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            title: nil, tabColor: nil, tabProgress: nil, cursorColor: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 3,
             notifyGeneration: 0, notifyKind: .info, notifyTitle: "", notifyBody: "",
