@@ -315,9 +315,12 @@ fn kill_if_recorded(home: &Path, fingerprint: &str) {
 
 /// `RusshBackend` counterpart to `openssh_e2e.rs`'s
 /// `install_and_start_redeploys_when_the_alive_helpers_binary_is_stale` — the
-/// two backends generate byte-identical reuse-check shell logic
-/// (`openssh.rs`/`russh_backend.rs`), but nothing enforced that outside of
-/// manual inspection; this closes that gap for the `RusshBackend` side too.
+/// two backends now run the *same* reuse-check shell logic by construction
+/// (`isekai_bootstrap::install_script::build_install_script`, shared since
+/// the two hand-maintained copies were unified), but "same script text" and
+/// "same observable behavior over this backend's transport" are still
+/// different claims; this test asserts the latter for the `RusshBackend`
+/// side too.
 ///
 /// Unlike `openssh_e2e.rs`'s ELF-plus-a-trailing-byte trick, the two script
 /// variants here differ by an actual extra line (a `# v2` comment) — a shell
