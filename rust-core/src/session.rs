@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
 use crate::{
-    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback,
+    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScrollbackSearchMatch, SessionCallback,
     RUNTIME,
 };
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
@@ -16,10 +16,8 @@ use crate::theme::Theme;
 use crate::transport::{ExecError, ExecOutput, SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
-/// ローカルscrollbackの保持上限(行数)。タスク#58のtmux capture-paneベースの
-/// scrollback backfillも、独自の上限を新設せずこの値を再利用する
-/// (`tmux_scrollback::fetch_tmux_scrollback_history`の呼び出し元
-/// `orchestrator.rs::spawn_tmux_scrollback_backfill`参照)。
+/// ローカルscrollbackの保持上限(行数)。[`SessionCore::inject_scrollback_history`]の
+/// バッチ注入も、独自の上限を新設せずこの値を再利用する。
 pub(crate) const SCROLLBACK_LIMIT: usize = 1000;
 
 /// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
@@ -585,32 +583,33 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::FocusChanged(focused));
     }
 
-    /// タスク#58: フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、
-    /// ライブのPTY出力(`TransportEvent::Stdout`)がまだ1バイトも届いていない
-    /// うちに、tmux自身のscrollback履歴(`tmux_scrollback::fetch_tmux_scrollback_history`
-    /// がcapture-pane経由で取得したプレーンテキスト行)をこのタブのローカル
-    /// scrollbackへバッチ注入する。
+    /// フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、ライブのPTY
+    /// 出力(`TransportEvent::Stdout`)がまだ1バイトも届いていないうちに、
+    /// プレーンテキスト行のバッチをこのタブのローカルscrollbackへ注入する。
     ///
-    /// `lines`はtmux capture-paneの出力そのまま(古い→新しい、画面に一番近い行が
-    /// 最後)の順序で渡すこと —— `dispatch_result`が`Terminal::take_scrollback`の
-    /// 結果(同じく古い→新しい順)を`push_front`していく既存の規約とまったく同じ
-    /// 順序規約で積む(=`lines`の各行を出現順に`push_front`していく)ため、
-    /// 呼び出し順を変えてはいけない。
+    /// 2026-08-09時点でtmux capture-paneベースの呼び出し元(旧`tmux_scrollback.rs`/
+    /// `orchestrator.rs::spawn_tmux_scrollback_backfill`)は、`tmux_session::
+    /// ensure_tab_window`が常に`TmuxTargetKind::Window`のロケータしか作らないため
+    /// 到達不能なdead codeと判明し削除された(WU-R7、2026-08-09ユーザー判断)。
+    /// このメソッド自体は`SessionCore`の一般的なAPI(WU-R1の
+    /// `impl_session_core_delegation!`が全6トランスポートへ委譲する対象)として残す。
+    ///
+    /// `lines`は古い→新しい、画面に一番近い行が最後の順序で渡すこと ——
+    /// `dispatch_result`が`Terminal::take_scrollback`の結果(同じく古い→新しい順)を
+    /// `push_front`していく既存の規約とまったく同じ順序規約で積む(=`lines`の各行を
+    /// 出現順に`push_front`していく)ため、呼び出し順を変えてはいけない。
     ///
     /// この関数は「まだ何も積まれていない空のscrollback」(フル再接続直後、
     /// まだライブ出力が1バイトも届いていない新規`SessionCore`)への初回バッチ
     /// 注入だけを想定している。既存のscrollbackが空でない状態で呼ぶと、
     /// `lines`はどれだけ古い履歴であっても既存の行より*前*(=ライブ画面に
-    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元
-    /// (`orchestrator.rs::spawn_tmux_scrollback_backfill`)は必ず`connect_via`
-    /// 直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。既存状態自体を
-    /// 破棄することはない(クリアはしない)という意味でのみ「加算的」。
+    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元は
+    /// 必ず`connect_via`直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。
+    /// 既存状態自体を破棄することはない(クリアはしない)という意味でのみ「加算的」。
     ///
-    /// ANSI装飾(色・太字等)は再現しない —— tmuxの`capture-pane -e`は行ごとの
-    /// SGRシーケンスを再現できるが、行をまたいだ色の持ち越し状態の復元が
-    /// 煩雑な割に得られる価値が小さいと判断し、`-e`なし(プレーンテキスト)の
-    /// 出力を前提にしている(呼び出し元`orchestrator.rs`のコメント参照)。
-    /// 各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
+    /// ANSI装飾(色・太字等)は再現しない ——行をまたいだ色の持ち越し状態の復元が
+    /// 煩雑な割に得られる価値が小さいと判断し、プレーンテキストの入力を前提にして
+    /// いる。各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
     /// 現在のテーマの既定前景/背景で塗る。
     pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
         if lines.is_empty() {
@@ -677,6 +676,126 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::CopyLastCommandOutput);
     }
 }
+
+/// WU-R1(rust-core cleanupパス): `core: SessionCore`フィールドを持つ6つのtransport
+/// 構造体(`SshSession`/`QuicSession`/`IsekaiPipeQuicSession`/
+/// `MultipathIsekaiPipeQuicSession`/`IsekaiStunP2pSession`/`IsekaiLinkRelaySession`)は
+/// いずれも`SessionCore`への同一シグネチャの一行委譲メソッド群を手書きで複製していた。
+/// `orchestrator.rs`の`dispatch_all!`と同じ前提(6構造体がメソッドシグネチャで揃っている
+/// こと)に乗っかり、ここに1回だけ定義して各transportモジュールから
+/// `crate::impl_session_core_delegation!(StructName);`として呼び出す。
+///
+/// マクロ本体の型は全て`crate::`絶対パスで書く: `macro_rules!`のhygieneでは、呼び出し側
+/// ではなく定義側(このモジュール)のスコープで名前解決されるため、相対名だと呼び出し元の
+/// importに依存してしまう。
+///
+/// `add_local_forward`/`remove_forward`(SSH/tsshd-QUICのみ対応)のようにtransportごとに
+/// 挙動が違うメソッドはこのマクロの対象外とし、各implブロックに手書きのまま残す。
+macro_rules! impl_session_core_delegation {
+    ($ty:ty) => {
+        impl $ty {
+            pub(crate) fn scrollback_len(&self) -> u32 {
+                self.core.scrollback_len()
+            }
+
+            pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<crate::CellData> {
+                self.core.scrollback_cells(offset, rows)
+            }
+
+            /// タスク#58: フル再接続直後のtmux scrollback backfill。
+            /// `SessionCore::inject_scrollback_history`参照。
+            pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+                self.core.inject_scrollback_history(lines)
+            }
+
+            pub(crate) fn search_scrollback(
+                &self,
+                query: String,
+                case_sensitive: bool,
+            ) -> Vec<crate::ScrollbackSearchMatch> {
+                self.core.search_scrollback(&query, case_sensitive)
+            }
+
+            pub(crate) fn send(&self, data: Vec<u8>) {
+                self.core.send(data);
+            }
+
+            /// タスク#17: `SessionCore::file_preview_exec`参照。
+            pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+                self.core.file_preview_exec(request_id, command_line)
+            }
+
+            pub(crate) fn resize(&self, cols: u32, rows: u32) {
+                self.core.resize(cols, rows);
+            }
+
+            /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
+            pub(crate) fn notify_focus_change(&self, focused: bool) {
+                self.core.notify_focus_change(focused);
+            }
+
+            /// タスク#13(OSC 133)。
+            pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+                self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+            }
+            pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+                self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+            }
+            pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+                self.core.click_to_prompt_cursor(row, col);
+            }
+            pub(crate) fn copy_last_command_output(&self) {
+                self.core.copy_last_command_output();
+            }
+
+            pub(crate) fn disconnect(&self) {
+                self.core.disconnect();
+            }
+
+            pub(crate) fn trzsz_accept_upload(
+                &self,
+                transfer_id: String,
+                file_name: String,
+                file_size: u64,
+                mode: u32,
+            ) {
+                self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
+            }
+
+            pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+                self.core.trzsz_send_chunk(transfer_id, data, is_last);
+            }
+
+            pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
+                self.core.trzsz_accept_download(transfer_id);
+            }
+
+            pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
+                self.core.trzsz_cancel(transfer_id);
+            }
+
+            /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+            /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+            pub(crate) async fn run_exec(
+                &self,
+                command: String,
+            ) -> Result<crate::transport::ExecOutput, crate::transport::ExecError> {
+                self.core.run_exec(command).await
+            }
+
+            /// Phase 12: per-session theme。
+            pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+                self.core.set_theme(theme);
+            }
+
+            /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート。
+            pub(crate) fn set_panel_enabled(&self, enabled: bool) {
+                self.core.set_panel_enabled(enabled);
+            }
+        }
+    };
+}
+pub(crate) use impl_session_core_delegation;
 
 /// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。
 /// `session_event_loop`の`select!`アームから切り出したもの
@@ -1453,7 +1572,7 @@ mod decode_clipboard_push_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LineDamage;
+    use crate::{LineDamage, ScreenUpdate};
 
     fn cell(label: char) -> TermCell {
         TermCell {

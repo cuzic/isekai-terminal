@@ -22,20 +22,13 @@ use base64::Engine as _;
 use log::{info, warn};
 use russh::client;
 
-use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
-use crate::isekai_pipe_quic_transport::{
-    self, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION,
-};
-use crate::resume_client::{self, ClientResumeState};
-use crate::transport::{
-    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
-    ExecError, ExecOutput, TransportCommand, TransportEvent,
-};
-use crate::{init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::helper_bootstrap::{IsekaiPipeHandshake, IsekaiPipeP2pMode};
+use crate::isekai_pipe_quic_transport;
+use crate::resume_client;
+use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
+use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
-const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// relayへのブートストラップ + QUIC接続確立全体のタイムアウト。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -113,78 +106,8 @@ impl IsekaiLinkRelaySession {
         });
         Ok(())
     }
-
-    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
-
-    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
-        self.core.scrollback_cells(offset, rows)
-    }
-    /// タスク#58: フル再接続直後のtmux scrollback backfill。
-    /// `SessionCore::inject_scrollback_history`参照。
-    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
-        self.core.inject_scrollback_history(lines)
-    }
-
-    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
-        self.core.search_scrollback(&query, case_sensitive)
-    }
-
-    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
-    /// タスク#17: `SessionCore::file_preview_exec`参照。
-    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
-        self.core.file_preview_exec(request_id, command_line)
-    }
-
-    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
-
-    /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
-    pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
-
-    /// タスク#13(OSC 133)。
-    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
-        self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
-    }
-    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
-        self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
-    }
-    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) { self.core.click_to_prompt_cursor(row, col); }
-    pub(crate) fn copy_last_command_output(&self) { self.core.copy_last_command_output(); }
-
-    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
-
-    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
-                               file_size: u64, mode: u32) {
-        self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
-    }
-
-    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
-        self.core.trzsz_send_chunk(transfer_id, data, is_last);
-    }
-
-    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
-        self.core.trzsz_accept_download(transfer_id);
-    }
-
-    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
-        self.core.trzsz_cancel(transfer_id);
-    }
-
-    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
-    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
-    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
-        self.core.run_exec(command).await
-    }
-
-    /// Phase 12: per-session theme。
-    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
-        self.core.set_theme(theme);
-    }
-
-    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート。
-    pub(crate) fn set_panel_enabled(&self, enabled: bool) {
-        self.core.set_panel_enabled(enabled);
-    }
 }
+crate::session::impl_session_core_delegation!(IsekaiLinkRelaySession);
 
 // ── ブートストラップ ─────────────────────────────────────
 
@@ -215,49 +138,26 @@ async fn try_connect_isekai_link_relay(
 }
 
 /// ProxyJump対応のSSH接続を張り、`--relay`/`--relay-sni`/`--relay-jwt`付きでisekai-helperを
-/// ブートストラップ起動する。`isekai_stun_p2p_transport.rs::bootstrap_via_ssh_with_punch`と
-/// 同じ理由でコード共有はせず複製している。ホスト鍵検証ループ
-/// (`spawn_bootstrap_host_key_forwarder`)自体は共有する。
+/// ブートストラップ起動する。WU-R1(rust-core cleanup)以前は
+/// `isekai_pipe_quic_transport::bootstrap_helper_via_ssh`をそのまま複製していたが、
+/// `isekai_stun_p2p_transport.rs::bootstrap_via_ssh_with_punch`と同様、同関数に
+/// `stun_servers`引数を足したことで薄いラッパーに縮小した(relay経路にはSTUNサーバー設定が
+/// 無いため常に`&[]`を渡す)。ホスト鍵検証ループ(`spawn_bootstrap_host_key_forwarder`)自体は
+/// 元々共有していた。
 async fn bootstrap_via_ssh_with_relay(
     config: &IsekaiLinkRelayConfig,
     relay_addr: SocketAddr,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<IsekaiPipeHandshake, String> {
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
-    spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
-
-    let russh_config = Arc::new(client::Config::default());
-    let mut established = connect_via_jump_or_direct(
-        &config.jump, russh_config, &config.ssh_host, config.ssh_port, event_tx,
-    )
-    .await
-    .map_err(|e| format!("bootstrap SSH connect failed: {e}"))?;
-
-    let (authenticated, _) =
-        authenticate_session(&mut established.handle, &config.username, &config.auth).await;
-    if !authenticated {
-        return Err("bootstrap SSH authentication failed".to_string());
-    }
-
-    let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
     let p2p_mode = IsekaiPipeP2pMode::Relay {
         relay_addr,
         relay_sni: config.relay_sni.clone(),
         relay_jwt: config.relay_jwt.clone(),
     };
-    // relay経路にはSTUNサーバー設定が無いため常に空スライス
-    // (isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。
-    helper_bootstrap::ensure_helper_running(
-        &mut established.handle,
-        &binaries,
-        ISEKAI_PIPE_VERSION,
-        "127.0.0.1:22",
-        None,
-        &p2p_mode,
-        &[],
-    )
-    .await
-    .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
+    isekai_pipe_quic_transport::bootstrap_helper_via_ssh(
+        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
+        None, &p2p_mode, &[], host_key_callback,
+    ).await
 }
 
 // ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────
@@ -287,77 +187,11 @@ async fn connect_relay_stream(
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
         .await
         .map_err(|e| e.to_string())?;
-    info!("isekai_link_relay: ATTACH ok — handing off to SSH");
-
-    let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
-        DEFAULT_RESUME_BUFFER_SIZE,
-    )));
-
-    {
-        let resume_state = resume_state.clone();
-        RUNTIME.spawn(async move {
-            match tokio::time::timeout(
-                CONTROL_STREAM_TIMEOUT,
-                isekai_transport::resume::open_control_stream(&conn, &proof),
-            )
-            .await
-            {
-                Ok(Ok(control)) => {
-                    let session_id = *control.session_id.as_bytes();
-                    info!(
-                        "isekai_link_relay: control stream established (resume support enabled), session_id={}",
-                        session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                    );
-                    resume_state.lock().unwrap().session_id = Some(session_id);
-                    let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
-                    isekai_pipe_quic_transport::spawn_app_ack_bridge(resume_state, counters);
-                }
-                Ok(Err(e)) => {
-                    info!("isekai_link_relay: control stream handshake failed ({e}), continuing without resume support");
-                }
-                Err(_) => {
-                    info!("isekai_link_relay: control stream not accepted within timeout, continuing without resume support");
-                }
-            }
-        });
-    }
-
     // reattach(RESUME)はrelay公開アドレスへ新規エフェメラルソケットから繋ぎ直すだけ。
     // relayは常時経路に残る(常にトンネルを維持している)ため、STUN版のような
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
-        let resume_state = resume_state.clone();
-        move |session_id, client_sent_offset, client_delivered_offset| {
-            let factory = crate::android_quic_endpoint::factory();
-            let target = target.clone();
-            let resume_state = resume_state.clone();
-            Box::pin(async move {
-                let outcome = isekai_transport::resume::reconnect_and_resume(
-                    &factory,
-                    &target,
-                    isekai_transport::SessionId::from_bytes(session_id),
-                    isekai_transport::C2hSentOffset::new(client_sent_offset),
-                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-                isekai_pipe_quic_transport::spawn_control_stream_reestablishment_after_resume(
-                    "isekai_link_relay",
-                    outcome.connection.clone(),
-                    target.session_secret.clone(),
-                    resume_state,
-                );
-                let (read, write) = outcome.data_stream.split();
-                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-            })
-        }
-    });
-
-    let (data_read, data_write) = data_stream.split();
-    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
+    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_link_relay", conn, data_stream, proof, target).await)
 }
 
 async fn run_over_stream(
