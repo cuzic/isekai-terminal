@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
+pub use isekai_pipe_protocol::ServiceName;
 
 // The pure Candidate model used to live in this crate's own `candidate`
 // module; moved to `isekai-transport` (`#31`) so that crate doesn't have to
@@ -26,7 +26,7 @@ pub use isekai_transport::candidate::{
 
 mod profile;
 pub use profile::{
-    default_log_file, default_profiles_dir, load_persistent_profile, migrate_trust_store, update_persistent_profile,
+    default_log_file, default_profiles_dir, load_persistent_profile, update_persistent_profile,
     write_persistent_profile, LegacyRelayTransport, PathHint, PersistentProfile, PERSISTENT_PROFILE_SCHEMA_VERSION,
 };
 
@@ -67,14 +67,6 @@ pub const DEFAULT_RELAY_DELAY_MS: u64 = 750;
 /// only the backstop that eventually reclaims a session nobody ever comes
 /// back for.
 pub const DEFAULT_RESUME_GRACE_SECS: u64 = 864_000;
-
-/// STUN hole-punch retry counter, distinct from `CandidateGeneration`
-/// (candidate-collection round) and any future connection-attach generation
-/// (`#18`) — newtyped specifically to prevent those three counters from
-/// being confused with one another (`candidate.rs`'s module docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PunchGeneration(pub u64);
 
 /// A remote service exposed by `isekai-pipe serve`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,15 +126,6 @@ impl std::fmt::Display for ServiceSpecError {
 
 impl std::error::Error for ServiceSpecError {}
 
-/// High-level role of an `isekai-pipe` process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipeRole {
-    /// Local side: stdio/TCP listen to logical session.
-    Connect,
-    /// Remote side: logical session to service target.
-    Serve,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionIntent {
     pub schema_version: u32,
@@ -190,7 +173,6 @@ pub struct ConnectionIntent {
     /// counterpart of `isekai-helper --bind-port-range` on the remote side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_bind_port_range: Option<(u16, u16)>,
-    pub punch_generation: PunchGeneration,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub bootstrap_provenance: BootstrapProvenance,
@@ -225,7 +207,6 @@ impl ConnectionIntent {
             relay_delay_ms: DEFAULT_RELAY_DELAY_MS,
             resume_grace_secs: DEFAULT_RESUME_GRACE_SECS,
             local_bind_port_range: None,
-            punch_generation: PunchGeneration(0),
             created_at_unix_ms: now,
             expires_at_unix_ms: expires,
             bootstrap_provenance,
@@ -470,11 +451,6 @@ fn libc_getuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn roles_are_distinct() {
-        assert_ne!(PipeRole::Connect, PipeRole::Serve);
-    }
 
     #[test]
     fn parses_named_service_spec() {

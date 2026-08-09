@@ -2,10 +2,10 @@
 //! on-disk store `isekai-ssh`/`isekai-pipe` read and write
 //! (`ISEKAI_PIPE_DESIGN.md` §8 Epic B). The legacy `known_helpers.toml`
 //! trust store (`isekai_trust::schema::{TrustStore, HelperTrust}`) is no
-//! longer read by any live code path -- `migrate_legacy_helper_trust`/
-//! `migrate_trust_store` below remain only as one-off conversion helpers for
-//! a caller that still has an old `known_helpers.toml` lying around and
-//! wants to hand-convert it.
+//! longer read by any live code path -- `migrate_legacy_helper_trust`
+//! below remains only as a one-off conversion helper for a caller that
+//! still has an old `known_helpers.toml` lying around and wants to
+//! hand-convert it.
 //!
 //! `known_helpers.toml` was keyed by `host:port` and stored a single cached
 //! relay address/session secret per entry, plus release-trust metadata
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use isekai_trust::schema::{HelperTrust, TrustStore, UpdatePolicy};
+use isekai_trust::schema::{HelperTrust, UpdatePolicy};
 
 use crate::{IntentTransport, RelayPolicy, ServerIdentity};
 
@@ -174,19 +174,6 @@ impl PersistentProfile {
                 session_secret_b64: legacy.session_secret_b64.clone(),
             })
     }
-}
-
-/// Migrates every entry in a loaded `known_helpers.toml` document. Pure
-/// (no I/O): callers load the `TrustStore` with `isekai_trust::load_trust_store`
-/// as they already do, and separately decide whether/where to persist the
-/// result (`write_persistent_profile` below, or nothing at all for a
-/// dry-run/inspection use).
-pub fn migrate_trust_store(store: &TrustStore) -> Vec<PersistentProfile> {
-    store
-        .helpers
-        .iter()
-        .map(|(key, trust)| PersistentProfile::migrate_legacy_helper_trust(key, trust))
-        .collect()
 }
 
 /// `chatgpt.md` §33's `state/profiles/` layout, rooted the same way
@@ -579,20 +566,6 @@ mod tests {
             cached_stun_observed_addr: None,
         };
         assert_eq!(profile.to_legacy_relay_transport(), None);
-    }
-
-    #[test]
-    fn migrates_every_entry_in_a_trust_store() {
-        let mut store = TrustStore::default();
-        store.insert("host-a:22".to_string(), sample_trust());
-        store.insert("host-b:22".to_string(), sample_trust());
-
-        let mut profiles = migrate_trust_store(&store);
-        profiles.sort_by(|a, b| a.profile.cmp(&b.profile));
-
-        assert_eq!(profiles.len(), 2);
-        assert_eq!(profiles[0].profile, "host-a:22");
-        assert_eq!(profiles[1].profile, "host-b:22");
     }
 
     #[test]
