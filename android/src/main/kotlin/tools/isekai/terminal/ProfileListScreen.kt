@@ -5,7 +5,6 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,7 +29,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -60,6 +58,7 @@ import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.ListItemCard
+import tools.isekai.terminal.ui.RadioChoiceDialog
 import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
@@ -170,6 +169,24 @@ fun ProfileListScreen(
         mutableStateOf(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
     }
 
+    // メニュー内のON/OFFトグル項目(画面の保護・クリップボード書込/送信・tmux迂回control-plane)は
+    // 「現在値からラベルを組み立て、タップで反転してprefsへ即座に永続化する」という骨格が
+    // 4箇所とも同一だったため、この局所ヘルパーへ切り出した。反転後の値をprefsへの永続化以外にも
+    // 反映したい場合(画面保護のFLAG_SECURE適用、tmux迂回control-planeのRust側グローバル状態反映)は
+    // [onToggled] で行う。
+    @Composable
+    fun toggleMenuItem(label: String, value: Boolean, key: String, onToggled: (Boolean) -> Unit) {
+        DropdownMenuItem(
+            text = { Text(if (value) "$label: ON" else "$label: OFF") },
+            onClick = {
+                showMenu = false
+                val newValue = !value
+                prefs.edit().putBoolean(key, newValue).apply()
+                onToggled(newValue)
+            },
+        )
+    }
+
     Scaffold(
         topBar = {
             Row(
@@ -208,46 +225,24 @@ fun ProfileListScreen(
                             text = { Text("鍵管理") },
                             onClick = { showMenu = false; onManageKeys() },
                         )
-                        DropdownMenuItem(
-                            text = { Text(if (screenProtectionEnabled) "画面の保護: ON" else "画面の保護: OFF") },
-                            onClick = {
-                                showMenu = false
-                                screenProtectionEnabled = !screenProtectionEnabled
-                                prefs.edit().putBoolean(PREF_KEY_SCREEN_PROTECTION, screenProtectionEnabled).apply()
-                                (context as? Activity)?.let { applyScreenProtection(it, screenProtectionEnabled) }
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (remoteClipboardWriteEnabled) "リモートからのクリップボード書込: ON" else "リモートからのクリップボード書込: OFF") },
-                            onClick = {
-                                showMenu = false
-                                remoteClipboardWriteEnabled = !remoteClipboardWriteEnabled
-                                prefs.edit()
-                                    .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, remoteClipboardWriteEnabled)
-                                    .apply()
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (remoteClipboardPullEnabled) "リモートへのクリップボード送信: ON" else "リモートへのクリップボード送信: OFF") },
-                            onClick = {
-                                showMenu = false
-                                remoteClipboardPullEnabled = !remoteClipboardPullEnabled
-                                prefs.edit()
-                                    .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, remoteClipboardPullEnabled)
-                                    .apply()
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (ctlSocketForwardEnabled) "tmux迂回control-plane: ON" else "tmux迂回control-plane: OFF") },
-                            onClick = {
-                                showMenu = false
-                                ctlSocketForwardEnabled = !ctlSocketForwardEnabled
-                                prefs.edit()
-                                    .putBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, ctlSocketForwardEnabled)
-                                    .apply()
-                                applyCtlSocketForwardEnabled(ctlSocketForwardEnabled)
-                            },
-                        )
+                        toggleMenuItem("画面の保護", screenProtectionEnabled, PREF_KEY_SCREEN_PROTECTION) { newValue ->
+                            screenProtectionEnabled = newValue
+                            (context as? Activity)?.let { applyScreenProtection(it, newValue) }
+                        }
+                        toggleMenuItem(
+                            "リモートからのクリップボード書込",
+                            remoteClipboardWriteEnabled,
+                            PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE,
+                        ) { newValue -> remoteClipboardWriteEnabled = newValue }
+                        toggleMenuItem(
+                            "リモートへのクリップボード送信",
+                            remoteClipboardPullEnabled,
+                            PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL,
+                        ) { newValue -> remoteClipboardPullEnabled = newValue }
+                        toggleMenuItem("tmux迂回control-plane", ctlSocketForwardEnabled, PREF_KEY_ENABLE_CTL_SOCKET_FORWARD) { newValue ->
+                            ctlSocketForwardEnabled = newValue
+                            applyCtlSocketForwardEnabled(newValue)
+                        }
                         DropdownMenuItem(
                             text = { Text("セキュリティ") },
                             onClick = { showMenu = false; showSecurityDialog = true },
@@ -484,32 +479,13 @@ internal fun TerminalThemeDialog(
     onSelect: (TerminalTheme) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("配色テーマ") },
-        text = {
-            Column {
-                TerminalThemes.ALL.forEach { theme ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelect(theme); onDismiss() }
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        RadioButton(
-                            selected = theme.name == current,
-                            onClick = { onSelect(theme); onDismiss() },
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(theme.name)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("閉じる") }
-        },
+    RadioChoiceDialog(
+        title = "配色テーマ",
+        items = TerminalThemes.ALL,
+        label = { it.name },
+        isSelected = { it.name == current },
+        onSelect = onSelect,
+        onDismiss = onDismiss,
     )
 }
 
@@ -524,39 +500,15 @@ internal fun KeyboardLayoutDialog(
     onSelect: (KeyboardLayoutMode) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("キーボード配列") },
-        text = {
-            Column {
-                Text(
-                    "接続中の外部キーボードが¥キー/ろキーを備えているかで自動判定します。" +
-                        "うまく検出されない場合はここで固定してください。",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.width(4.dp))
-                KeyboardLayoutMode.entries.forEach { mode ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelect(mode); onDismiss() }
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        RadioButton(
-                            selected = mode == current,
-                            onClick = { onSelect(mode); onDismiss() },
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(mode.label())
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("閉じる") }
-        },
+    RadioChoiceDialog(
+        title = "キーボード配列",
+        items = KeyboardLayoutMode.entries,
+        label = { it.label() },
+        isSelected = { it == current },
+        onSelect = onSelect,
+        onDismiss = onDismiss,
+        description = "接続中の外部キーボードが¥キー/ろキーを備えているかで自動判定します。" +
+            "うまく検出されない場合はここで固定してください。",
     )
 }
 

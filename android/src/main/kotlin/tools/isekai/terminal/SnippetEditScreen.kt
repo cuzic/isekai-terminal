@@ -13,11 +13,6 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -38,9 +33,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.SnippetTemplate
+import tools.isekai.terminal.ui.ProfileScopeDropdown
 import tools.isekai.terminal.util.RemoteLogger
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SnippetEditScreen(
     snippet: Snippet? = null,
@@ -56,9 +51,7 @@ fun SnippetEditScreen(
     var command by remember { mutableStateOf(snippet?.command ?: template?.command ?: "") }
     var appendNewline by remember { mutableStateOf(snippet?.appendNewline ?: template?.appendNewline ?: true) }
     var profileId by remember { mutableStateOf(snippet?.profileId) }
-    var profileMenuExpanded by remember { mutableStateOf(false) }
 
-    val selectedProfileLabel = profiles.firstOrNull { it.id == profileId }?.label ?: "全プロファイル共通"
     val canSave = label.isNotBlank() && command.isNotBlank()
 
     Column(
@@ -114,38 +107,11 @@ fun SnippetEditScreen(
         }
 
         Text("適用範囲")
-        ExposedDropdownMenuBox(
-            expanded = profileMenuExpanded,
-            onExpandedChange = { profileMenuExpanded = it },
-        ) {
-            OutlinedTextField(
-                value = selectedProfileLabel,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text("プロファイル") },
-                trailingIcon = {
-                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = profileMenuExpanded)
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .menuAnchor(MenuAnchorType.PrimaryNotEditable),
-            )
-            ExposedDropdownMenu(
-                expanded = profileMenuExpanded,
-                onDismissRequest = { profileMenuExpanded = false },
-            ) {
-                DropdownMenuItem(
-                    text = { Text("全プロファイル共通") },
-                    onClick = { profileId = null; profileMenuExpanded = false },
-                )
-                profiles.forEach { p ->
-                    DropdownMenuItem(
-                        text = { Text(p.label) },
-                        onClick = { profileId = p.id; profileMenuExpanded = false },
-                    )
-                }
-            }
-        }
+        ProfileScopeDropdown(
+            profiles = profiles,
+            selectedId = profileId,
+            onSelect = { profileId = it },
+        )
 
         Spacer(Modifier.height(8.dp))
 

@@ -14,25 +14,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.testTag
-import tools.isekai.terminal.data.KeyEntry
+import tools.isekai.terminal.data.ConnectionProfile
 
 /**
- * 登録済み鍵([KeyEntry])を選択する `ExposedDropdownMenuBox`。[ProfileEditScreen]で
- * 接続先本体/踏み台の2箇所にほぼ同一の実装があったものを統合した。
+ * 定型コマンド/打鍵列の「適用範囲」(全プロファイル共通 or 特定プロファイル専用)を選ぶ
+ * `ExposedDropdownMenuBox`。[SnippetEditScreen]/[KeySequenceEditScreen]で
+ * ほぼ同一の実装があったものを統合した。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun KeyPickerDropdown(
-    label: String,
-    keys: List<KeyEntry>,
+fun ProfileScopeDropdown(
+    profiles: List<ConnectionProfile>,
     selectedId: Long?,
-    onSelect: (Long) -> Unit,
+    onSelect: (Long?) -> Unit,
     modifier: Modifier = Modifier,
-    testTag: String? = null,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val selectedLabel = keys.firstOrNull { it.id == selectedId }?.label ?: "鍵を選択"
+    val selectedLabel = profiles.firstOrNull { it.id == selectedId }?.label ?: "全プロファイル共通"
 
     ExposedDropdownMenuBox(
         expanded = expanded,
@@ -43,34 +41,27 @@ fun KeyPickerDropdown(
             value = selectedLabel,
             onValueChange = {},
             readOnly = true,
-            label = { Text(label) },
+            label = { Text("プロファイル") },
             trailingIcon = {
                 ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .menuAnchor(MenuAnchorType.PrimaryNotEditable)
-                .let { m -> testTag?.let { m.testTag(it) } ?: m },
+                .menuAnchor(MenuAnchorType.PrimaryNotEditable),
         )
         ExposedDropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
         ) {
-            if (keys.isEmpty()) {
+            DropdownMenuItem(
+                text = { Text("全プロファイル共通") },
+                onClick = { onSelect(null); expanded = false },
+            )
+            profiles.forEach { p ->
                 DropdownMenuItem(
-                    text = { Text("登録された鍵がありません") },
-                    onClick = { expanded = false },
+                    text = { Text(p.label) },
+                    onClick = { onSelect(p.id); expanded = false },
                 )
-            } else {
-                keys.forEach { key ->
-                    DropdownMenuItem(
-                        text = { Text(key.label) },
-                        onClick = {
-                            onSelect(key.id)
-                            expanded = false
-                        },
-                    )
-                }
             }
         }
     }

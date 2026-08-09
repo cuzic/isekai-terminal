@@ -455,45 +455,50 @@ private fun TerminalTabScreen(
         return
     }
 
-    when (splitDirection) {
-        SplitDirection.VERTICAL ->
-            Column(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-                Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(Color(0xFF444444)))
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
-                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-            }
-        else ->
-            Row(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-                Box(modifier = Modifier.width(2.dp).fillMaxHeight().background(Color(0xFF444444)))
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
-                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-            }
+    SplitPanes(
+        direction = splitDirection,
+        first = {
+            TerminalPaneScreen(
+                tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
+                hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
+                chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+            )
+        },
+        second = {
+            TerminalPaneScreen(
+                tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
+                hasFocus = focusedPaneId == split.paneId, onBack = onBack,
+                onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
+                chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+            )
+        },
+    )
+}
+
+/**
+ * 画面分割時の2ペインレイアウト。[SplitDirection.VERTICAL]ならColumnで縦に、それ以外(横分割)
+ * ならRowで横に並べ、間に2dpの区切り線を挟む。両分岐で軸(fillMaxWidth/fillMaxHeight・
+ * height/width)が入れ替わるだけで構造は同一だったため統合した。
+ */
+@Composable
+private fun SplitPanes(
+    direction: SplitDirection,
+    first: @Composable () -> Unit,
+    second: @Composable () -> Unit,
+) {
+    val dividerColor = Color(0xFF444444)
+    if (direction == SplitDirection.VERTICAL) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) { first() }
+            Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(dividerColor))
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) { second() }
+        }
+    } else {
+        Row(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) { first() }
+            Box(modifier = Modifier.width(2.dp).fillMaxHeight().background(dividerColor))
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) { second() }
+        }
     }
 }
 

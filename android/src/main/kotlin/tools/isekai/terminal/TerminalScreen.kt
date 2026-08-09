@@ -1637,24 +1637,11 @@ private fun SnippetPickerSheet(
                         .verticalScroll(rememberScrollState()),
                 ) {
                     snippets.forEach { snippet ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onPick(snippet) }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(snippet.label, color = Color.White, fontSize = 15.sp)
-                                Text(
-                                    snippet.command.lineSequence().firstOrNull() ?: "",
-                                    color = Color(0xFF888888),
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 1,
-                                )
-                            }
-                        }
+                        PickerRow(
+                            label = snippet.label,
+                            preview = snippet.command.lineSequence().firstOrNull() ?: "",
+                            onClick = { onPick(snippet) },
+                        )
                     }
                 }
             }
@@ -1690,7 +1677,7 @@ private fun KeySequencePickerSheet(
                 )
             } else {
                 keySequences.forEach { keySequence ->
-                    KeySequencePickerRow(
+                    PickerRow(
                         label = keySequence.label,
                         preview = keySequence.steps.previewText(),
                         onClick = { onSendSteps(keySequence.steps) },
@@ -1705,7 +1692,7 @@ private fun KeySequencePickerSheet(
                     )
                     val resolved = tools.isekai.terminal.pack.KeySequencePackResolver.resolve(pack, installation.paramValues)
                     resolved.forEach { seq ->
-                        KeySequencePickerRow(
+                        PickerRow(
                             label = seq.label,
                             preview = seq.steps.previewText(),
                             onClick = { onSendSteps(seq.steps) },
@@ -1718,7 +1705,7 @@ private fun KeySequencePickerSheet(
 }
 
 @Composable
-private fun KeySequencePickerRow(label: String, preview: String, onClick: () -> Unit) {
+private fun PickerRow(label: String, preview: String, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
