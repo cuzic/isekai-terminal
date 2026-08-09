@@ -19,7 +19,7 @@ use log::info;
 use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, RemoteSpec};
 use rand::RngCore;
 
-use crate::attempt::{ConnectAttemptError, ConnectAttemptStage, RejectReason};
+use crate::attempt::{ConnectAttemptError, ConnectAttemptStage};
 use crate::error::TransportError;
 use crate::proof::compute_proof;
 use crate::telemetry::{log_candidate_attempt, CandidateAttempt, CandidateIdentity, CandidateOutcome};
@@ -320,10 +320,7 @@ pub(crate) async fn attach_handshake(
         }
         AttachResponse::Reject(reason) => {
             cancelled(format!("rejected:{reason:?}"));
-            Err(ConnectAttemptError {
-                stage: ConnectAttemptStage::Rejected(RejectReason::from_attach_reject(reason)),
-                source: TransportError::Rejected(reason),
-            })
+            Err(ConnectAttemptError { stage: ConnectAttemptStage::Rejected(reason), source: TransportError::Rejected(reason) })
         }
     }
 }

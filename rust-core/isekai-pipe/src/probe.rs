@@ -11,7 +11,7 @@ use isekai_pipe_core::{default_profiles_dir, load_persistent_profile};
 use isekai_transport::{
     connect_stun_p2p_with_fallback, connect_via_relay_resumable_with_fallback, system_quic_factory, AttemptFailure,
     RelayTarget, SequentialConnectError, SequentialFailure, SequentialRelayCandidate, SequentialStunCandidate,
-    SequentialStunConnectError, StunP2pTarget,
+    StunP2pTarget,
 };
 use std::process::ExitCode;
 
@@ -125,14 +125,16 @@ fn stage_from_attempt_failure(failure: &AttemptFailure) -> (ProbeStageStatus, Pr
     }
 }
 
-/// `SequentialConnectError` (the relay-resumable path's error type) has
-/// three variants `SequentialStunConnectError` doesn't: resumable-session
-/// setup can fail *after* a successful attach (`AttachedButControlStreamFailed`),
-/// after a forced resume (`MustResumeButResumeFailed`), or exhaust its
-/// generation-retry budget entirely (`GaveUpAfterGenerationRetries`) — none
-/// of which STUN P2P has, since it has no resume/control-stream concept at
-/// all (`stun_p2p.rs`'s module docs).
-fn stage_from_relay_connect_error(error: &SequentialConnectError) -> (ProbeStageStatus, ProbeStageStatus) {
+/// Shared by both the relay-resumable and STUN P2P probe paths —
+/// `connect_via_relay_resumable_with_fallback` and
+/// `connect_stun_p2p_with_fallback` both return `SequentialConnectError`
+/// (`isekai_transport::stun_p2p`'s docs: `SequentialStunConnectError` is now
+/// just an alias for it), though the STUN path never actually constructs
+/// `AttachedButControlStreamFailed`/`MustResumeButResumeFailed`/
+/// `GaveUpAfterGenerationRetries` — it has no resume/control-stream concept
+/// at all (`stun_p2p.rs`'s module docs) — those three arms only ever fire
+/// for the relay path in practice.
+fn stage_from_sequential_connect_error(error: &SequentialConnectError) -> (ProbeStageStatus, ProbeStageStatus) {
     match error {
         SequentialConnectError::NoCandidates => unreachable!("probe always passes exactly one candidate"),
         SequentialConnectError::AllCandidatesFailed { failures } => stage_from_sequential_failures(failures),
@@ -375,9 +377,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
         let stale_trust_suspected = stun_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
         let (handshake, target_reachability) = match stun_result {
             Ok(_established) => (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None }),
-            Err(SequentialStunConnectError::NoCandidates) => unreachable!("probe always passes exactly one candidate"),
-            Err(SequentialStunConnectError::StoppedEarly { failure, .. }) => stage_from_attempt_failure(&failure),
-            Err(SequentialStunConnectError::AllCandidatesFailed { failures }) => stage_from_sequential_failures(&failures),
+            Err(e) => stage_from_sequential_connect_error(&e),
         };
 
         return Ok(ProbeReport {
@@ -433,7 +433,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             drop(session);
             (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None })
         }
-        Err(e) => stage_from_relay_connect_error(&e),
+        Err(e) => stage_from_sequential_connect_error(&e),
     };
 
     Ok(ProbeReport {
@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_from_relay_connect_error_attached_but_control_stream_failed_still_confirms_target_reachable() {
+    fn stage_from_sequential_connect_error_attached_but_control_stream_failed_still_confirms_target_reachable() {
         // The subtle case: the data-stream attach genuinely succeeded (which
         // already implies the remote reached its target) before the
         // *separate* resumable control-stream open failed — `handshake`
@@ -518,7 +518,7 @@ mod tests {
             candidate_id: "probe".to_string(),
             source: sample_transport_error(),
         };
-        let (handshake, target_reachability) = stage_from_relay_connect_error(&error);
+        let (handshake, target_reachability) = stage_from_sequential_connect_error(&error);
         assert!(matches!(handshake, ProbeStageStatus::Failed { .. }), "{handshake:?}");
         assert!(target_reachability.is_ok(), "{target_reachability:?}");
     }

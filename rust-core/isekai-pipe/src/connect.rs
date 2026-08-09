@@ -20,7 +20,7 @@ use isekai_pipe_core::{
 use isekai_transport::{
     connect_stun_p2p, qmux_relay_factory, system_quic_factory, AnyMuxFactory, CandidatePool, CandidateProvider,
     ConfigRelayProvider, ConfigStunProvider, GatherContext, RelayTarget, SequentialConnectError,
-    SequentialRelayCandidate, SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget,
+    SequentialRelayCandidate, SequentialStunCandidate, StunP2pTarget,
 };
 use std::process::ExitCode;
 
@@ -550,14 +550,11 @@ impl StaleTrustSignalSource for isekai_transport::TransportError {
         isekai_transport::TransportError::is_stale_trust_signal(self)
     }
 }
+// `SequentialStunConnectError` is a type alias for `SequentialConnectError`
+// (`isekai_transport::stun_p2p`'s docs), so a single impl covers both names.
 impl StaleTrustSignalSource for SequentialConnectError {
     fn is_stale_trust_signal(&self) -> bool {
         SequentialConnectError::is_stale_trust_signal(self)
-    }
-}
-impl StaleTrustSignalSource for SequentialStunConnectError {
-    fn is_stale_trust_signal(&self) -> bool {
-        SequentialStunConnectError::is_stale_trust_signal(self)
     }
 }
 
