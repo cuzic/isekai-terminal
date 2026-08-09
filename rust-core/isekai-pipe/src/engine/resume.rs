@@ -152,9 +152,14 @@ impl Session {
     }
 }
 
-/// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。
+/// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。以前は
+/// `engine::hex_lower`(`mod.rs`、`&[u8]` 版)と全く同じ1行を自前で再実装
+/// していたが、`&SessionId`(`[u8; 16]`)は呼び出し箇所で `&[u8]` に自動で
+/// coerceされるため、単にそちらへ委譲するだけにした。呼び出し側
+/// (`insert_existing`/`claim_oldest_parked`/`sweep_expired_parked`、いずれも
+/// 本 work unit の予約範囲)はシグネチャ・呼び出し方とも一切変えていない。
 fn hex_lower(id: &SessionId) -> String {
-    id.iter().map(|b| format!("{b:02x}")).collect()
+    super::hex_lower(id)
 }
 
 /// Scans an already-locked table for the session with the oldest
