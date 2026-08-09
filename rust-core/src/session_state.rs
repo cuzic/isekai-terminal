@@ -1,4 +1,4 @@
-use vte::Parser;
+use crate::terminal::OscParser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
 use crate::kitty_graphics::{ApcInterceptor, ApcStep};
 use crate::{CellData, CursorColor, CursorShape, LineDamage, ScreenUpdate, TabColor, TabProgress};
@@ -79,7 +79,12 @@ fn force_cursor_row_dirty(damages: &mut Vec<LineDamage>, row: usize, col: usize,
 /// チャネル・コールバック・Tokio に一切依存せず、単体テストから直接呼べる。
 pub(crate) struct SessionState {
     terminal: Terminal,
-    parser: Parser,
+    /// `OscParser`はOSCバッファを固定長`ArrayVec`として構造体に**インライン**で持つ
+    /// (`terminal::OSC_RAW_BUF_SIZE`は約85KiB)。`SessionState`は値で生成して
+    /// 返す(`SessionState::new`)ため、インラインのままだと生成のたびに同サイズの
+    /// スタック一時領域が要る——Androidのワーカースレッドのスタックを無駄に
+    /// 圧迫しないようBoxでヒープへ逃がす。`advance`は自動derefでそのまま呼べる。
+    parser: Box<OscParser>,
     /// Kitty graphics(#53)のAPC文字列を、vteへ渡す前にバイトストリームから切り出す
     /// 前段。vteはAPCを配送しないため必要(`kitty_graphics.rs`モジュールdoc参照)。
     apc: ApcInterceptor,
@@ -124,7 +129,7 @@ impl SessionState {
     pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
         SessionState {
             terminal: Terminal::new(cols, rows, theme),
-            parser: Parser::new(),
+            parser: Box::new(OscParser::new_with_size()),
             apc: ApcInterceptor::new(),
             fsm: TrzszTransferFsm::new(),
             last_emitted_cells: None,
