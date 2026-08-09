@@ -622,19 +622,12 @@ async fn run_ssh_with_connect_failure_recovery(
         ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
         ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
             let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
-                 (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
-                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
-            );
+            log_auto_bootstrap_disabled(&outcome.class, &resolution.isekai.profile, &outcome.detail);
             Ok(exit_code)
         }
         ConnectFailureRecoveryAction::RebootstrapAndRetry => {
             let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
-                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
-            );
+            log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
             if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
@@ -657,6 +650,33 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
     }
+}
+
+/// Logs `ConnectFailureRecoveryAction::AutoBootstrapDisabled`'s explanation
+/// — identical wording on both the Unix (`run_ssh_with_connect_failure_recovery`)
+/// and Windows-native (`native::connect::drive_connect_recovery`) paths, so
+/// this one function is the whole of the dedup for that arm (unlike
+/// `RebootstrapAndRetry`'s — see [`log_rebootstrap_and_retry_decision`] —
+/// whose trailing clause differs per platform).
+pub(crate) fn log_auto_bootstrap_disabled(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str) {
+    log_line!(
+        "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
+         (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
+        outcome_summary(class), profile, detail
+    );
+}
+
+/// Logs `ConnectFailureRecoveryAction::RebootstrapAndRetry`'s explanation,
+/// shared by the same two paths as [`log_auto_bootstrap_disabled`]. Unlike
+/// that arm, the trailing clause genuinely differs per platform (Unix:
+/// "refreshing automatically..."; native: a longer note that a
+/// still-untrusted SSH host key needs a separate confirmation prompt, since
+/// its re-deploy dials `RusshBackend` directly rather than through
+/// `ssh(1)`) — `retry_note` stays a caller-supplied parameter rather than
+/// unified wording, the same "shared classification, caller-owned wording"
+/// split [`outcome_summary`] itself already establishes.
+pub(crate) fn log_rebootstrap_and_retry_decision(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str, retry_note: &str) {
+    log_line!("isekai-ssh: {} for {:?} ({}); {retry_note}", outcome_summary(class), profile, detail);
 }
 
 /// The three ways a failed first `ssh` attempt in

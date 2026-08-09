@@ -52,7 +52,7 @@ use super::mux::handoff::HandoffCredentials;
 
 use crate::log_file::log_line;
 use crate::wrapper::{
-    bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery, outcome_summary,
+    bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery,
     print_bootstrap_failure_guidance, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation, WrapperPlan,
     WrapperResolution,
 };
@@ -338,23 +338,16 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
         ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
             let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
-                 (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
-                outcome_summary(&outcome.class),
-                outcome.profile,
-                outcome.detail
-            );
+            crate::wrapper::log_auto_bootstrap_disabled(&outcome.class, &outcome.profile, &outcome.detail);
             Err(first_error)
         }
         ConnectFailureRecoveryAction::RebootstrapAndRetry => {
             let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}); re-deploying the helper automatically \
-                 (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
-                outcome_summary(&outcome.class),
-                outcome.profile,
-                outcome.detail
+            crate::wrapper::log_rebootstrap_and_retry_decision(
+                &outcome.class,
+                &outcome.profile,
+                &outcome.detail,
+                "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
             );
             let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
             ops.attempt(&intent2, true).await
