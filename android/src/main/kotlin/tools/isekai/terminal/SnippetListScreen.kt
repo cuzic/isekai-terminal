@@ -5,18 +5,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -29,7 +26,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,6 +35,7 @@ import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.SnippetTemplate
 import tools.isekai.terminal.data.SnippetTemplates
 import tools.isekai.terminal.ui.DeleteConfirmDialog
+import tools.isekai.terminal.ui.ListItemCard
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
@@ -158,39 +155,12 @@ private fun SnippetCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onEdit),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = snippet.label,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                )
-                Spacer(Modifier.width(2.dp))
-                Text(
-                    text = snippet.command.lineSequence().firstOrNull() ?: "",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                )
-                Text(
-                    text = if (snippet.profileId == null) "全プロファイル共通" else "特定プロファイル専用",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            TextButton(onClick = onEdit) { Text("編集") }
-            TextButton(onClick = onDelete) { Text("削除") }
-        }
-    }
+    ListItemCard(
+        title = snippet.label,
+        subtitle = snippet.command.lineSequence().firstOrNull() ?: "",
+        caption = if (snippet.profileId == null) "全プロファイル共通" else "特定プロファイル専用",
+        onTap = onEdit,
+        onEdit = onEdit,
+        onDelete = onDelete,
+    )
 }

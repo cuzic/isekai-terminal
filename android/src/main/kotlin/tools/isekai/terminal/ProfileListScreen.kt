@@ -22,7 +22,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
@@ -46,8 +45,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,6 +59,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.ui.DeleteConfirmDialog
+import tools.isekai.terminal.ui.ListItemCard
 import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
@@ -569,40 +567,16 @@ private fun ProfileCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onTap),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = profile.label,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                )
-                Spacer(Modifier.width(2.dp))
-                Text(
-                    text = "${profile.username}@${profile.host}:${profile.port}",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    text = if (profile.authTypeEnum == AuthType.KEY) "鍵認証" else "パスワード",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            TextButton(onClick = onEdit, modifier = Modifier.testTag("profileEditButton")) { Text("編集") }
-            TextButton(onClick = onDelete, modifier = Modifier.testTag("profileDeleteButton")) { Text("削除") }
-        }
-    }
+    ListItemCard(
+        title = profile.label,
+        subtitle = "${profile.username}@${profile.host}:${profile.port}",
+        caption = if (profile.authTypeEnum == AuthType.KEY) "鍵認証" else "パスワード",
+        onTap = onTap,
+        onEdit = onEdit,
+        onDelete = onDelete,
+        editTestTag = "profileEditButton",
+        deleteTestTag = "profileDeleteButton",
+    )
 }
 
 /**
