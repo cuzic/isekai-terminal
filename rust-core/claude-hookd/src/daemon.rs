@@ -35,9 +35,9 @@ const ATTENTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// reachable before self-exit.
 const MAX_DEFERRAL: Duration = Duration::from_secs(30 * 60);
 
-/// How long a `WireEvent::TeammateDispatched` (a successful, top-level
+/// How long a `ClientEvent::TeammateDispatched` (a successful, top-level
 /// `Agent`/`SendMessage` `PostToolUse`) stays "recent enough" for a later
-/// `WireEvent::StopAmbiguousTeammate` on the same session to treat a
+/// `ClientEvent::StopAmbiguousTeammate` on the same session to treat a
 /// `type: "teammate"` `background_tasks` entry as plausibly still working
 /// (`HookEvent::StopDeferred`) rather than a long-idle teammate
 /// (`HookEvent::Notify`, the safe default). Deliberately independent of
@@ -127,23 +127,23 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
             "--attention-color" => attention_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
             "--waiting-color" => waiting_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
             "--attention-timeout-ms" => {
-                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
-                    attention_timeout = Duration::from_millis(ms);
+                if let Some(d) = take_ms(&mut args) {
+                    attention_timeout = d;
                 }
             }
             "--max-deferral-ms" => {
-                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
-                    max_deferral = Duration::from_millis(ms);
+                if let Some(d) = take_ms(&mut args) {
+                    max_deferral = d;
                 }
             }
             "--idle-exit-ms" => {
-                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
-                    idle_exit = Duration::from_millis(ms);
+                if let Some(d) = take_ms(&mut args) {
+                    idle_exit = d;
                 }
             }
             "--teammate-dispatch-ttl-ms" => {
-                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
-                    teammate_dispatch_ttl = Duration::from_millis(ms);
+                if let Some(d) = take_ms(&mut args) {
+                    teammate_dispatch_ttl = d;
                 }
             }
             _ => {}
@@ -166,6 +166,15 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
     })
     .await;
     ExitCode::SUCCESS
+}
+
+/// Parses the next arg as a millisecond count and converts it to a
+/// [`Duration`] — shared by every `--*-ms` flag in [`serve_command`]'s
+/// parse loop, all of which reduce to exactly this (consume one more arg,
+/// parse it as `u64`, wrap in `Duration::from_millis`), silently leaving the
+/// existing default in place on a missing/unparseable value.
+fn take_ms(args: &mut impl Iterator<Item = String>) -> Option<Duration> {
+    args.next().and_then(|v| v.parse().ok()).map(Duration::from_millis)
 }
 
 async fn run(config: DaemonConfig) {
@@ -244,7 +253,7 @@ async fn run(config: DaemonConfig) {
     // purpose (see `state.rs`'s module docs) — this map answers "did this
     // session recently dispatch work to a teammate?", not "is this session
     // pending attention?", and only ever exists to resolve
-    // `WireEvent::StopAmbiguousTeammate` below. Values are the *expiry*
+    // `ClientEvent::StopAmbiguousTeammate` below. Values are the *expiry*
     // instant (`now + config.teammate_dispatch_ttl` at insertion), not the
     // dispatch instant — checking `now < expiry` on lookup then also does
     // this map's only pruning, so no separate sweep task is needed for it
@@ -262,14 +271,14 @@ async fn run(config: DaemonConfig) {
                 idle_exit_deadline = Instant::now() + config.idle_exit;
                 let now = Instant::now();
                 let event = match wire_event {
-                    WireEvent::Notify => HookEvent::Notify,
-                    WireEvent::StopDeferred => HookEvent::StopDeferred,
-                    WireEvent::Resolve => HookEvent::Resolve,
-                    WireEvent::TeammateDispatched => {
+                    super::ClientEvent::Notify => HookEvent::Notify,
+                    super::ClientEvent::StopDeferred => HookEvent::StopDeferred,
+                    super::ClientEvent::Resolve => HookEvent::Resolve,
+                    super::ClientEvent::TeammateDispatched => {
                         teammate_dispatch.insert(session_id.clone(), now + config.teammate_dispatch_ttl);
                         HookEvent::Resolve
                     }
-                    WireEvent::StopAmbiguousTeammate => {
+                    super::ClientEvent::StopAmbiguousTeammate => {
                         match teammate_dispatch.get(&session_id) {
                             Some(&expiry) if now < expiry => HookEvent::StopDeferred,
                             _ => HookEvent::Notify,
@@ -333,34 +342,18 @@ async fn attention_sleep(state: &TabState) {
     }
 }
 
-/// The daemon's own wire-level event vocabulary — a strict superset of
-/// `state::HookEvent`, mirroring `main.rs`'s `ClientEvent` (the two are kept
-/// as distinct types rather than shared, same as the rest of this wire
-/// format's deliberate decoupling from Claude Code's own hook JSON schema).
-/// `TeammateDispatched`/`StopAmbiguousTeammate` are not themselves valid
-/// inputs to `state::apply_event` — [`run`]'s main loop translates them into
-/// a real `HookEvent` first, using its own `teammate_dispatch` TTL map,
-/// before ever touching `TabState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WireEvent {
-    Notify,
-    StopDeferred,
-    Resolve,
-    TeammateDispatched,
-    StopAmbiguousTeammate,
-}
-
 /// Reads exactly one
 /// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"|
-/// "teammate_dispatched"|"stop_ambiguous_teammate"}` line — the daemon's own
-/// minimal wire format, deliberately decoupled from Claude Code's own hook
-/// JSON schema (only `super::parse_hook_event`, the client side, needs to
-/// know that shape).
-async fn read_one_event(stream: tokio::net::UnixStream) -> Option<(String, WireEvent)> {
+/// "teammate_dispatched"|"stop_ambiguous_teammate"}` line — this crate's own
+/// minimal daemon wire format (`super::ClientEvent::as_wire_str`/
+/// `from_wire_str`), deliberately decoupled from Claude Code's own hook JSON
+/// schema (only `super::parse_hook_event`, the client side, needs to know
+/// that shape).
+async fn read_one_event(stream: tokio::net::UnixStream) -> Option<(String, super::ClientEvent)> {
     tokio::time::timeout(EVENT_READ_TIMEOUT, read_one_event_line(stream)).await.ok()?
 }
 
-async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, WireEvent)> {
+async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, super::ClientEvent)> {
     // Symmetric with `main.rs::send_event`'s own peer-credential check on
     // the client side (adversarial review, 2026-08: this accept-side check
     // was missing entirely) — under the `/tmp` fallback (no
@@ -381,14 +374,7 @@ async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, 
     reader.read_line(&mut line).await.ok()?;
     let value: serde_json::Value = serde_json::from_str(line.trim_end()).ok()?;
     let session_id = value.get("session_id")?.as_str()?.to_string();
-    let event = match value.get("event")?.as_str()? {
-        "notify" => WireEvent::Notify,
-        "stop_deferred" => WireEvent::StopDeferred,
-        "resolve" => WireEvent::Resolve,
-        "teammate_dispatched" => WireEvent::TeammateDispatched,
-        "stop_ambiguous_teammate" => WireEvent::StopAmbiguousTeammate,
-        _ => return None,
-    };
+    let event = super::ClientEvent::from_wire_str(value.get("event")?.as_str()?)?;
     Some((session_id, event))
 }
 
