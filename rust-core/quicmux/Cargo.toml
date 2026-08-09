@@ -37,6 +37,12 @@ web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = 
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 
 [features]
+# デフォルトを`noq`にしておかないと、feature無し(`cargo check -p quicmux`単体等)で
+# ビルドした際にmux.rsのAnyMux*系enumが空になり、その`match`がすべて
+# non-exhaustive("E0004: type &AnyMux* is non-empty")として壊れる
+# (実際のworkspace consumerは全員`features = ["noq"]`を明示しているため
+# 気づかれずにいた既存の技術的負債、Phase 2レビューで発見)。
+default = ["noq"]
 noq = ["dep:noq"]
 qmux = ["dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
 
