@@ -28,7 +28,7 @@
 //!    one pane tmux is actually rendering to the attached client, and stays
 //!    correct even if the pane that happened to spawn the daemon is later
 //!    closed. Wrapped in tmux's passthrough DCS
-//!    (`osc_color::wrap_for_tmux_passthrough`) so a tmux server with
+//!    ([`wrap_for_tmux_passthrough`]) so a tmux server with
 //!    `allow-passthrough on` forwards it to the real outer terminal.
 //!    Requires no isekai-terminal infrastructure at all — just a bare `ssh`
 //!    + `tmux` session and `allow-passthrough` enabled.
@@ -116,7 +116,7 @@ impl Delivery {
     /// need to re-resolve `$TMUX_PANE`/etc itself (it may not even inherit
     /// the same environment — spawn args are passed explicitly, matching
     /// this crate's general "resolve once, thread the value through"
-    /// convention, same as `osc_color::TerminalKind`).
+    /// convention, same as `hooks_dir` — see `main.rs::hooks_dir`).
     pub(crate) fn to_spec(&self) -> String {
         match self {
             Delivery::IsekaiPipeCtl { ctl_sock } => format!("ctl:{}", ctl_sock.display()),
@@ -164,24 +164,41 @@ fn query_current_pane_tty(session_id: &str) -> Option<PathBuf> {
 
 /// Best-effort: a failed send here must never crash or wedge the caller,
 /// just drop that one color/popup update (same trust model the pre-split
-/// `isekai-pipe ctl`-based version already used).
-pub(crate) async fn send_tab_color(delivery: &Delivery, rgb: (u8, u8, u8)) {
-    send_tab_color_with(delivery, rgb, query_current_pane_tty).await
+/// `isekai-pipe ctl`-based version already used). `hooks_dir` is only
+/// consulted for `TmuxSession`/`DirectTty` (see [`super::tab_color::resolve`])
+/// — `IsekaiPipeCtl` sends the raw RGB value over the ctl-socket and lets the
+/// receiving end (`isekai-ssh`) decide how to render it, so it has no use
+/// for a local tab-color script at all.
+pub(crate) async fn send_tab_color(delivery: &Delivery, rgb: (u8, u8, u8), hooks_dir: Option<&Path>) {
+    send_tab_color_with(delivery, rgb, hooks_dir, query_current_pane_tty).await
 }
 
-async fn send_tab_color_with(delivery: &Delivery, (r, g, b): (u8, u8, u8), resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>) {
+async fn send_tab_color_with(
+    delivery: &Delivery,
+    (r, g, b): (u8, u8, u8),
+    hooks_dir: Option<&Path>,
+    resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>,
+) {
     match delivery {
         Delivery::IsekaiPipeCtl { ctl_sock } => {
             let _ = send_ctl_message(ctl_sock, isekai_protocol::CtlMessage::SetTabColor { r, g, b }).await;
         }
         Delivery::TmuxSession { session_id } => {
             let Some(path) = resolve_active_pane_tty(session_id) else { return };
-            let seq = osc_color::tab_color_sequence(osc_color::TerminalKind::resolve(), r, g, b);
-            write_tty(&path, &osc_color::wrap_for_tmux_passthrough(&seq));
+            let seq = super::tab_color::resolve(hooks_dir, r, g, b).await;
+            // Empty is a deliberate downgrade (either this crate's own
+            // embedded default script failed to run, or a user's override
+            // script decided this terminal shouldn't get anything) — not a
+            // reason to write an empty passthrough wrapper to the tty.
+            if !seq.is_empty() {
+                write_tty(&path, &wrap_for_tmux_passthrough(&seq));
+            }
         }
         Delivery::DirectTty { path } => {
-            let seq = osc_color::tab_color_sequence(osc_color::TerminalKind::resolve(), r, g, b);
-            write_tty(path, &seq);
+            let seq = super::tab_color::resolve(hooks_dir, r, g, b).await;
+            if !seq.is_empty() {
+                write_tty(path, &seq);
+            }
         }
     }
 }
@@ -212,10 +229,23 @@ async fn send_notify_popup_with(delivery: &Delivery, resolve_active_pane_tty: im
         }
         Delivery::TmuxSession { session_id } => {
             let Some(path) = resolve_active_pane_tty(session_id) else { return };
-            write_tty(&path, &osc_color::wrap_for_tmux_passthrough(seq));
+            write_tty(&path, &wrap_for_tmux_passthrough(seq));
         }
         Delivery::DirectTty { path } => write_tty(path, seq),
     }
+}
+
+/// Wraps an arbitrary escape sequence in tmux's passthrough DCS
+/// (`\ePtmux;<payload with every ESC doubled>\e\\`) so a tmux server with
+/// `allow-passthrough on` forwards it to the real outer terminal instead of
+/// swallowing it. Every real `ESC` (`0x1b`) byte inside `inner` must be
+/// doubled per tmux's own escaping rule for this wrapper. Inlined from the
+/// former `osc-color` crate dependency (removed 2026-08) — this part is
+/// generic (no terminal-kind knowledge needed), so unlike
+/// [`super::tab_color`]'s job it had no reason to move to a shell script.
+fn wrap_for_tmux_passthrough(inner: &str) -> String {
+    let escaped = inner.replace('\x1b', "\x1b\x1b");
+    format!("\x1bPtmux;{escaped}\x1b\\")
 }
 
 fn write_tty(path: &Path, bytes: &str) {
@@ -363,21 +393,43 @@ mod tests {
         assert_eq!(pane_a.unwrap().identity(), pane_b.unwrap().identity());
     }
 
+    /// Writes a deterministic `hooks_dir/tab-color` script and returns its
+    /// containing dir — used instead of the embedded default (which depends
+    /// on ambient `$TERM_PROGRAM`) so these tests only exercise *this
+    /// module's* wrapping/dispatch logic, not `tab_color`'s terminal-kind
+    /// detection (already covered by that module's own tests). An
+    /// adversarial review (2026-08-09) caught that the original versions of
+    /// these tests asserted the Windows-Terminal-specific OSC format via the
+    /// real embedded default, which only passed because this sandbox
+    /// happens to run under tmux (`$TERM_PROGRAM=tmux`, not `iTerm.app`) —
+    /// on a real macOS iTerm2 machine they would have failed every time.
+    fn custom_tab_color_hooks_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("tab-color");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf 'OSCTEST:%s' \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn send_tab_color_over_tmux_session_resolves_the_active_pane_at_write_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-tty");
+        let tty_dir = tempfile::tempdir().unwrap();
+        let path = tty_dir.path().join("fake-tty");
         std::fs::write(&path, b"").unwrap();
+        let hooks_dir = custom_tab_color_hooks_dir();
         let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
         let resolved_path = path.clone();
-        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), move |session_id| {
+        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), Some(hooks_dir.path()), move |session_id| {
             assert_eq!(session_id, "$3");
             Some(resolved_path.clone())
         })
         .await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.starts_with("\x1bPtmux;"), "must be wrapped for tmux passthrough: {written:?}");
-        assert!(written.contains("4;264;rgb:ff/00/00"), "must contain the WT-compatible tab-color OSC: {written:?}");
+        assert!(written.contains("OSCTEST:ff0000"), "must contain the tab-color script's output: {written:?}");
     }
 
     #[tokio::test]
@@ -385,18 +437,19 @@ mod tests {
         // e.g. every pane in the session has since been closed — must not
         // panic or write anywhere.
         let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
-        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), |_| None).await;
+        send_tab_color_with(&delivery, (0xff, 0x00, 0x00), None, |_| None).await;
     }
 
     #[tokio::test]
     async fn send_tab_color_over_direct_tty_is_not_wrapped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake-tty");
+        let tty_dir = tempfile::tempdir().unwrap();
+        let path = tty_dir.path().join("fake-tty");
         std::fs::write(&path, b"").unwrap();
+        let hooks_dir = custom_tab_color_hooks_dir();
         let delivery = Delivery::DirectTty { path: path.clone() };
-        send_tab_color(&delivery, (0x00, 0xff, 0x00)).await;
+        send_tab_color(&delivery, (0x00, 0xff, 0x00), Some(hooks_dir.path())).await;
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.starts_with("\x1bPtmux;"), "direct delivery must not wrap: {written:?}");
-        assert!(written.contains("4;264;rgb:00/ff/00"));
+        assert!(written.contains("OSCTEST:00ff00"));
     }
 }

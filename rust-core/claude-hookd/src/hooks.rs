@@ -29,7 +29,7 @@ fn hook_path(hooks_dir: &Path, aggregate_name: &str) -> PathBuf {
 /// "executable by this process' uid specifically": a hook file with the
 /// wrong owner bits set is just treated as "no hook configured," the same
 /// silent no-op as a missing file, not a distinguished error.
-async fn is_executable(path: &Path) -> bool {
+pub(crate) async fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     match tokio::fs::metadata(path).await {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,

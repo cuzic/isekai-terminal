@@ -10,7 +10,6 @@ name = "claude-hookd"
 path = "src/main.rs"
 
 [dependencies]
-osc-color = { path = "../osc-color" }
 isekai-protocol = { path = "../isekai-protocol" }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

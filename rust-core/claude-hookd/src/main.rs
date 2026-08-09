@@ -36,8 +36,12 @@ mod daemon;
 #[cfg(unix)]
 mod delivery;
 #[cfg(unix)]
+mod hexcolor;
+#[cfg(unix)]
 mod hooks;
 mod state;
+#[cfg(unix)]
+mod tab_color;
 
 #[cfg(unix)]
 use delivery::Delivery;
@@ -133,7 +137,7 @@ async fn event_command() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let idle_color = std::env::var("ISEKAI_TAB_IDLE_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
+    let idle_color = std::env::var("ISEKAI_TAB_IDLE_COLOR").ok().and_then(|v| hexcolor::parse_hex_color(&v).ok());
 
     // Only `Notify`/`StopDeferred` lazily spawn a daemon: if none is running
     // there is by definition no pending state for a *daemon-tracked*
@@ -168,13 +172,13 @@ async fn event_command() -> ExitCode {
         // `Resolve`.
         if is_session_end {
             let (r, g, b) = idle_color.unwrap_or(DEFAULT_IDLE_COLOR);
-            delivery::send_tab_color(&delivery, (r, g, b)).await;
+            delivery::send_tab_color(&delivery, (r, g, b), hooks_dir().as_deref()).await;
         }
         return ExitCode::SUCCESS;
     }
 
-    let attention_color = std::env::var("ISEKAI_TAB_ATTENTION_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
-    let waiting_color = std::env::var("ISEKAI_TAB_WAITING_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
+    let attention_color = std::env::var("ISEKAI_TAB_ATTENTION_COLOR").ok().and_then(|v| hexcolor::parse_hex_color(&v).ok());
+    let waiting_color = std::env::var("ISEKAI_TAB_WAITING_COLOR").ok().and_then(|v| hexcolor::parse_hex_color(&v).ok());
     spawn_detached_daemon(&daemon_sock_path, &delivery, idle_color, attention_color, waiting_color, hooks_dir().as_deref());
 
     for delay_ms in SPAWN_RETRY_DELAYS_MS {
@@ -587,13 +591,13 @@ fn spawn_detached_daemon(
         .arg("--delivery-spec")
         .arg(delivery.to_spec());
     if let Some(color) = idle_color {
-        cmd.arg("--idle-color").arg(osc_color::format_hex_color(color));
+        cmd.arg("--idle-color").arg(hexcolor::format_hex_color(color));
     }
     if let Some(color) = attention_color {
-        cmd.arg("--attention-color").arg(osc_color::format_hex_color(color));
+        cmd.arg("--attention-color").arg(hexcolor::format_hex_color(color));
     }
     if let Some(color) = waiting_color {
-        cmd.arg("--waiting-color").arg(osc_color::format_hex_color(color));
+        cmd.arg("--waiting-color").arg(hexcolor::format_hex_color(color));
     }
     if let Some(dir) = hooks_dir {
         cmd.arg("--hooks-dir").arg(dir);

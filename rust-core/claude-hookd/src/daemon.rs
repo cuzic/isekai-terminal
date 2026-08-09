@@ -123,9 +123,9 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
             "--sock" => sock_path = args.next().map(PathBuf::from),
             "--delivery-spec" => delivery_spec = args.next(),
             "--hooks-dir" => hooks_dir = args.next().map(PathBuf::from),
-            "--idle-color" => idle_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
-            "--attention-color" => attention_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
-            "--waiting-color" => waiting_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
+            "--idle-color" => idle_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
+            "--attention-color" => attention_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
+            "--waiting-color" => waiting_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
             "--attention-timeout-ms" => {
                 if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
                     attention_timeout = Duration::from_millis(ms);
@@ -201,7 +201,7 @@ async fn run(config: DaemonConfig) {
     // self-exit-then-respawn — looks identical to a real transition to a
     // hook script, which is more likely to surprise a hook author than help
     // one).
-    delivery::send_tab_color(&config.delivery, config.idle_color).await;
+    delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
 
     // Accepting and reading each connection happens on its own spawned
     // task, separate from the main loop below: a connection that opens and
@@ -396,16 +396,16 @@ async fn execute_actions(config: &DaemonConfig, actions: &[Action], state: &TabS
     for action in actions {
         match action {
             Action::SetAttentionColorAndPopup => {
-                delivery::send_tab_color(&config.delivery, config.attention_color).await;
+                delivery::send_tab_color(&config.delivery, config.attention_color, config.hooks_dir.as_deref()).await;
                 delivery::send_notify_popup(&config.delivery).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "attention", state, now).await;
             }
             Action::SetWaitingColor => {
-                delivery::send_tab_color(&config.delivery, config.waiting_color).await;
+                delivery::send_tab_color(&config.delivery, config.waiting_color, config.hooks_dir.as_deref()).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "waiting", state, now).await;
             }
             Action::SetIdleColor => {
-                delivery::send_tab_color(&config.delivery, config.idle_color).await;
+                delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "idle", state, now).await;
             }
         }
