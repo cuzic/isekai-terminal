@@ -1298,66 +1298,69 @@ impl Terminal {
     }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
+    /// RIS(`ESC c`、Reset to Initial State)。
+    ///
+    /// **実装方針(重要)**: 個々のフィールドへ初期値を代入していくのではなく、
+    /// 一度`Terminal::new`で作り直した「まっさらな状態」で丸ごと置き換えてから、
+    /// RISを跨いで生き残るべき状態だけを旧stateから移し戻す。
+    ///
+    /// 以前は約40個の初期値代入を`Terminal::new`と二重管理しており、
+    /// 新しいフィールドを追加したときに片方への追記を忘れると、RIS後だけ
+    /// 古い値が残る(あるいは初期化されない)というサイレントな挙動差が
+    /// 生まれる構造になっていた。この形なら**新しいフィールドの既定は
+    /// 「RISでリセットされる」側**になり、生き残らせたい場合だけ下の
+    /// 明示的なリストへ足すことになる(RISの意味からしてこちらが安全側)。
+    ///
+    /// 生き残るのは次の3種類だけ:
+    /// 1. 端末そのものの属性(`theme`/`cols`/`rows`)——RISはリサイズでも
+    ///    テーマ変更でもない。
+    /// 2. 「過去」を指す履歴・単調増加id(`pending_scrollback`/`link_table`/
+    ///    `link_ids`/`next_image_id`/`total_scrolled_lines`/`prompt_marks`/
+    ///    `last_command_output`)——リセットするとscrollbackに既に流れた
+    ///    セルの`link_id`や過去のプロンプトマークの絶対行番号が別の意味に
+    ///    化けてしまう(各フィールドのdocコメント参照)。
+    /// 3. 端末エミュレーション外部との受け渡し状態——`bell_generation`/
+    ///    `notify_*`/`panel_*`(conflatedチャネルの世代カウンタと直近内容。
+    ///    リモートのRISでUI通知を取りこぼさない)、`panel_enabled`
+    ///    (`set_panel_enabled`でホスト側が設定するopt-inフラグであり、
+    ///    リモートが送るRISで勝手にON/OFFされてはいけない)、
+    ///    `last_panel_update_at`(レート制限状態。RISでリセットできると
+    ///    制限を回避できてしまう)、`kitty`/`sixel_decoder`(チャンク転送・
+    ///    DCSデコードの途中組み立て状態。RIS前後で挙動を変えない)。
     fn reset_all(&mut self) {
-        let theme = self.theme;
-        let blank = blank_cell_for_theme(&theme);
-        let cells = vec![blank; self.cols * self.rows];
-        self.main_cells = cells.clone();
-        self.alt_cells = cells;
-        self.alt_active = false;
-        self.saved_cursor_main = None;
-        self.saved_cursor_alt = None;
-        self.cursor_row = 0; self.cursor_col = 0;
-        self.cur_attrs = TermAttrs::default_for(&theme);
-        self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
-        self.title = None;
-        self.tab_color = None;
-        self.tab_progress = None;
-        self.cursor_color = None;
-        self.pending_clipboard_write = None;
-        self.pending_clipboard_pull_request = false;
-        self.pending_terminal_responses.clear();
-        self.application_cursor_mode = false;
-        self.application_keypad_mode = false;
-        self.bracketed_paste_mode = false;
-        self.synchronized_output_active = false;
-        // RISは画面全体を初期化する——行差分では追随できないので全画面dirty(#93)。
+        let (cols, rows, theme) = (self.cols, self.rows, self.theme);
+        let old = std::mem::replace(self, Terminal::new(cols, rows, theme));
+
+        // ── ここから下がRISを跨いで生き残る状態(上記docコメント参照) ──
+        // 2. 「過去」を指す履歴・単調増加id
+        self.pending_scrollback = old.pending_scrollback;
+        self.link_table = old.link_table;
+        self.link_ids = old.link_ids;
+        self.next_image_id = old.next_image_id;
+        self.total_scrolled_lines = old.total_scrolled_lines;
+        self.prompt_marks = old.prompt_marks;
+        self.last_command_output = old.last_command_output;
+        // 3. 端末エミュレーション外部との受け渡し状態
+        self.bell_generation = old.bell_generation;
+        self.notify_generation = old.notify_generation;
+        self.notify_kind = old.notify_kind;
+        self.notify_title = old.notify_title;
+        self.notify_body = old.notify_body;
+        self.panel_generation = old.panel_generation;
+        self.panel_kind = old.panel_kind;
+        self.panel_title = old.panel_title;
+        self.panel_markdown = old.panel_markdown;
+        self.panel_fields = old.panel_fields;
+        self.panel_enabled = old.panel_enabled;
+        self.last_panel_update_at = old.last_panel_update_at;
+        self.kitty = old.kitty;
+        self.sixel_decoder = old.sixel_decoder;
+
+        // `Terminal::new`との唯一の意図的な差分: RISは画面全体を初期化する
+        // ——行差分では追随できないので全画面dirty(#93)。新規`Terminal`は
+        // まだ一度も描画していないので`false`だが、RIS後は既存の描画内容を
+        // 全て捨てさせる必要がある。
         self.full_damage_pending = true;
-        self.focus_reporting_mode = false;
-        self.cursor_visible = true;
-        self.cursor_shape = CursorShape::Block;
-        self.cursor_blink = true;
-        self.autowrap_mode = true;
-        self.origin_mode = false;
-        self.last_graphic_cell = None;
-        self.g0_charset = Charset::Ascii;
-        self.g1_charset = Charset::Ascii;
-        self.gl_is_g1 = false;
-        self.mouse_reporting_mode = MouseReportingMode::Off;
-        self.sgr_mouse_mode = false;
-        self.alternate_scroll = false;
-        self.urxvt_mouse_mode = false;
-        // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
-        // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
-        self.active_link_id = None;
-        // RIS(`ESC c`)はタブストップも既定(8列おき)へ戻す(実端末の挙動、タスク#61)。
-        self.tab_stops = default_tab_stops(self.cols);
-        // Sixel(タスク#42): RISは画面内容自体を全消去するため、画像配置も道連れに
-        // 消す(`next_image_id`自体はリセットしない、[Terminal]のdocコメント参照)。
-        self.clear_images();
-        // Kitty keyboard protocol(タスク#54): RISはmain/alt両方のflagsスタックを
-        // 空(legacy mode)へ戻す。他のDECモード([mouse_reporting_mode]等)と同じく
-        // RISはセッション全体の状態を初期化する操作なので、main/alt独立という
-        // 仕様上の制約とは矛盾しない(両方を初期化するだけ)。
-        self.main_kitty_flags_stack.clear();
-        self.alt_kitty_flags_stack.clear();
-        // OSC 133(タスク#13): `total_scrolled_lines`/`prompt_marks`/`last_command_output`
-        // は`link_table`と同じ理由でRISでもクリアしない(過去マークの絶対行番号の
-        // 意味が変わってしまうため)。「今」の一時的な状態のみリセットする。
-        self.input_line_active = false;
-        self.capturing_command_output = false;
-        self.current_output_line.clear();
-        self.current_output_lines.clear();
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -5530,6 +5533,202 @@ mod tests {
         assert_eq!(t.bell_generation(), 2, "RISでbell_generationはリセットされない");
         feed(&mut t, b"\x07");
         assert_eq!(t.bell_generation(), 3, "RIS後もカウントは継続する");
+    }
+
+    // ── RIS(`ESC c`)で「生き残る状態」/「リセットされる状態」の全数固定 ─────
+    //
+    // `reset_all`は`Terminal::new`で丸ごと作り直してから生き残るべき状態だけを
+    // 移し戻す実装になっている(`reset_all`のdocコメント参照)。この2つのテストは
+    // その「生き残るリスト」を全数で固定する——リストから漏れた/余計に入った
+    // フィールドは、scrollback履歴の消失やUI通知の取りこぼしとして実際に
+    // ユーザーへ見える回帰になるため。
+
+    #[test]
+    fn test_ris_preserves_exactly_the_documented_survivor_fields() {
+        let theme = Theme::default();
+        let mut t = Terminal::new(10, 4, theme);
+
+        // 1. 端末そのものの属性(cols/rows/theme)。
+        //    別テーマを渡して「RISがテーマを既定へ戻さない」ことも見る。
+        let custom_theme = Theme { default_fg: 0xFF00FF00, ..Theme::default() };
+        t.set_theme(custom_theme);
+
+        // 2. 「過去」を指す履歴・単調増加id。
+        feed(&mut t, b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let scrolled_out = t.pending_scrollback.len();
+        assert!(scrolled_out > 0, "前提: 何行かはscrollbackへ押し出されている");
+        let total_scrolled = t.total_scrolled_lines;
+        assert!(total_scrolled > 0, "前提: total_scrolled_linesも進んでいる");
+        feed(&mut t, b"\x1b]8;;https://example.com/a\x1b\\X\x1b]8;;\x1b\\");
+        assert_eq!(t.link_table().len(), 1, "前提: link_tableへ1件intern済み");
+        let image_id = t.push_image(1, 1, vec![0u8, 0, 0, 255]);
+        t.prompt_marks.push_back(PromptMark { kind: PromptMarkKind::PromptStart, row: 3 });
+        t.last_command_output = Some(vec!["out".to_string()]);
+
+        // 3. 端末エミュレーション外部との受け渡し状態。
+        feed(&mut t, b"\x07"); // bell_generation を進める
+        let bell = t.bell_generation();
+        t.notify_generation = 7;
+        t.notify_kind = NotifyKind::JobDone;
+        t.notify_title = "title".to_string();
+        t.notify_body = "body".to_string();
+        t.panel_generation = 9;
+        t.panel_kind = PanelKind::Document;
+        t.panel_title = "ptitle".to_string();
+        t.panel_markdown = "# md".to_string();
+        t.panel_fields = vec![PanelField {
+            id: "f".to_string(),
+            label: "l".to_string(),
+            kind: crate::PanelFieldKind::Text,
+            options: Vec::new(),
+        }];
+        t.panel_enabled = true;
+        let panel_at = std::time::Instant::now();
+        t.last_panel_update_at = Some(panel_at);
+
+        feed(&mut t, b"\x1bc"); // RIS
+
+        assert_eq!(t.cols(), 10, "RISはリサイズではない");
+        assert_eq!(t.rows(), 4, "RISはリサイズではない");
+        assert_eq!(t.theme().default_fg, 0xFF00FF00, "RISはテーマ変更ではない");
+
+        assert_eq!(
+            t.pending_scrollback.len(),
+            scrolled_out,
+            "scrollback履歴はRISで失われてはいけない"
+        );
+        assert_eq!(
+            t.pending_scrollback[0].iter().map(|c| c.ch.as_str()).collect::<String>(),
+            "line0     ",
+            "scrollbackの中身もそのまま"
+        );
+        assert_eq!(t.total_scrolled_lines, total_scrolled, "絶対行番号の基準はRISで巻き戻さない");
+        assert_eq!(t.link_table().len(), 1, "link_tableはRISでクリアしない(過去セルのidが指す先)");
+        assert_eq!(t.link_table()[0], "https://example.com/a");
+        assert_eq!(
+            t.push_image(1, 1, vec![0u8, 0, 0, 255]),
+            image_id + 1,
+            "next_image_idはRISでも単調増加を維持する"
+        );
+        assert_eq!(t.prompt_marks.len(), 1, "prompt_marksはRISでクリアしない");
+        assert_eq!(t.last_command_output, Some(vec!["out".to_string()]));
+
+        assert_eq!(t.bell_generation(), bell, "bell_generationはRISでリセットしない");
+        assert_eq!(t.notify_generation, 7);
+        assert_eq!(t.notify_kind, NotifyKind::JobDone);
+        assert_eq!(t.notify_title, "title");
+        assert_eq!(t.notify_body, "body");
+        assert_eq!(t.panel_generation, 9);
+        assert_eq!(t.panel_kind, PanelKind::Document);
+        assert_eq!(t.panel_title, "ptitle");
+        assert_eq!(t.panel_markdown, "# md");
+        assert_eq!(t.panel_fields.len(), 1);
+        assert!(t.panel_enabled, "AIパネルのopt-inフラグをリモートのRISで落としてはいけない");
+        assert_eq!(
+            t.last_panel_update_at,
+            Some(panel_at),
+            "パネルのレート制限状態をRISで巻き戻せてはいけない(制限回避になる)"
+        );
+    }
+
+    #[test]
+    fn test_ris_resets_every_non_survivor_field() {
+        let mut t = Terminal::new(10, 4, Theme::default());
+        // 画面・カーソル・保存カーソル・SGR・各種モードを一通り既定から動かす。
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(saved_cursor_mainも埋まる)
+        feed(&mut t, b"ABC");
+        feed(&mut t, b"\x1b7"); // DECSC(alt側スロット)
+        feed(&mut t, b"\x1b[41;1m"); // 赤背景+bold
+        feed(&mut t, b"\x1b[2;3r"); // scroll region
+        feed(&mut t, b"\x1b]0;title\x07"); // title
+        feed(&mut t, b"\x1b]4;264;rgb:11/22/33\x1b\\"); // tab color
+        feed(&mut t, b"\x1b]12;rgb:44/55/66\x1b\\"); // cursor color
+        feed(&mut t, b"\x1b]52;c;aGk=\x07"); // pending clipboard write
+        feed(&mut t, b"\x1b]52;c;?\x07"); // pending clipboard pull
+        feed(&mut t, b"\x1b[c"); // DA → pending_terminal_responses
+        feed(&mut t, b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?2026h"); // DECCKM/keypad/bracketed/sync
+        feed(&mut t, b"\x1b[?1004h\x1b[?25l"); // focus reporting / cursor hidden
+        feed(&mut t, b"\x1b[4 q"); // DECSCUSR: steady underline
+        feed(&mut t, b"\x1b[?7l\x1b[?6h"); // DECAWM off / DECOM on
+        feed(&mut t, b"\x1b)0\x0e"); // G1=DEC special graphics, SO(GL=G1)
+        feed(&mut t, b"\x1b[?1003h\x1b[?1006h\x1b[?1007h\x1b[?1015h"); // mouse modes
+        feed(&mut t, b"\x1b]8;;https://example.com/b\x1b\\"); // active link open
+        feed(&mut t, b"\x1b[3g\x1bH"); // TBC(全消去)+HTS(現在列にタブストップ)
+        feed(&mut t, b"\x1b[>1u"); // kitty keyboard flags push
+        feed(&mut t, b"\x1b]133;C\x1b\\"); // OSC 133;C: コマンド出力キャプチャ開始
+        feed(&mut t, b"captured\n");
+        t.set_tab_progress(ProgressState::Normal, 50);
+        t.push_image(1, 1, vec![0u8, 0, 0, 255]);
+        // `input_line_active`はOSC 133;Bでのみ立ち、;Cで落ちる(両立しない)ので
+        // 直接立てておく——RIS後にfalseへ戻ることを空振りでなく確認するため。
+        t.input_line_active = true;
+
+        // 前提: RIS前に「リセットされるべき状態」が実際に既定から動いている。
+        assert!(t.alt_active && t.saved_cursor_main.is_some() && t.saved_cursor_alt.is_some());
+        assert!(t.title().is_some() && t.tab_color().is_some() && t.cursor_color().is_some());
+        assert!(t.capturing_command_output && !t.current_output_lines.is_empty());
+        assert!(t.cursor_shape() != CursorShape::Block && !t.cursor_visible());
+        assert!(t.gl_is_g1 && t.g1_charset == Charset::DecSpecialGraphics);
+        assert!(t.active_link_id.is_some() && t.kitty_keyboard_flags() != 0);
+        assert!(t.tab_stops != default_tab_stops(10) && !t.images().is_empty());
+        assert!(t.tab_progress().is_some() && t.origin_mode && !t.autowrap_mode);
+
+        feed(&mut t, b"\x1bc"); // RIS
+
+        // 画面(main/alt両方)・カーソル・保存カーソル。
+        assert!(!t.alt_active, "RISはmain画面へ戻す");
+        for row in 0..4 {
+            assert_eq!(row_text(&t, row), "          ", "row {row} は空行");
+        }
+        assert!(t.alt_cells.iter().all(|c| c.ch.as_str() == " "), "alt画面も消去される");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+        assert!(t.saved_cursor_main.is_none() && t.saved_cursor_alt.is_none());
+        // SGR属性・scroll region(`TermAttrs`はPartialEq/Debugを持たないので個別に見る)。
+        let default_attrs = TermAttrs::default_for(&Theme::default());
+        assert_eq!(t.cur_attrs.fg, default_attrs.fg);
+        assert_eq!(t.cur_attrs.bg, default_attrs.bg, "赤背景SGRはRISで既定へ戻る");
+        assert!(!t.cur_attrs.bold && !t.cur_attrs.reverse && !t.cur_attrs.underline);
+        assert_eq!((t.scroll_top, t.scroll_bottom), (0, 3));
+        // OSC由来のセッション状態。
+        assert_eq!(t.title(), None);
+        assert_eq!(t.tab_color(), None);
+        assert_eq!(t.tab_progress(), None);
+        assert_eq!(t.cursor_color(), None);
+        assert_eq!(t.take_pending_clipboard_write(), None);
+        assert!(!t.take_pending_clipboard_pull_request());
+        assert!(t.take_pending_terminal_responses().is_empty());
+        // DECモード群。
+        assert!(!t.application_cursor_mode());
+        assert!(!t.application_keypad_mode());
+        assert!(!t.bracketed_paste_mode());
+        assert!(!t.synchronized_output_active());
+        assert!(!t.focus_reporting_mode());
+        assert!(t.cursor_visible());
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+        assert!(t.cursor_blink());
+        assert!(t.autowrap_mode);
+        assert!(!t.origin_mode);
+        assert!(t.last_graphic_cell.is_none());
+        // `Charset`はDebugを持たないので`assert!`で比較する。
+        assert!(t.g0_charset == Charset::Ascii);
+        assert!(t.g1_charset == Charset::Ascii, "G1のDEC Special GraphicsもRISで戻る");
+        assert!(!t.gl_is_g1, "SOによるGL=G1もRISで戻る");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+        assert!(!t.sgr_mouse_mode);
+        assert!(!t.alternate_scroll);
+        assert!(!t.urxvt_mouse_mode);
+        // ハイパーリンク(アクティブ状態のみ)・タブストップ・画像・kitty flags。
+        assert!(t.active_link_id.is_none(), "アクティブなリンクはRISで閉じる");
+        assert_eq!(t.tab_stops, default_tab_stops(10), "タブストップは既定(8列おき)へ戻る");
+        assert!(t.images().is_empty(), "画像配置はRISで消える");
+        assert_eq!(t.kitty_keyboard_flags(), 0, "kitty keyboard flagsはlegacyへ戻る");
+        // OSC 133の「今」の状態。
+        assert!(!t.input_line_active);
+        assert!(!t.capturing_command_output);
+        assert!(t.current_output_line.is_empty());
+        assert!(t.current_output_lines.is_empty());
+        // `Terminal::new`との唯一の意図的な差分。
+        assert!(t.take_full_damage_pending(), "RISは全画面dirtyを立てる");
     }
 
     #[test]
