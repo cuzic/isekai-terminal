@@ -35,6 +35,8 @@ use std::time::Duration;
 mod daemon;
 #[cfg(unix)]
 mod delivery;
+#[cfg(unix)]
+mod hooks;
 mod state;
 
 #[cfg(unix)]
@@ -173,7 +175,7 @@ async fn event_command() -> ExitCode {
 
     let attention_color = std::env::var("ISEKAI_TAB_ATTENTION_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
     let waiting_color = std::env::var("ISEKAI_TAB_WAITING_COLOR").ok().and_then(|v| osc_color::parse_hex_color(&v).ok());
-    spawn_detached_daemon(&daemon_sock_path, &delivery, idle_color, attention_color, waiting_color);
+    spawn_detached_daemon(&daemon_sock_path, &delivery, idle_color, attention_color, waiting_color, hooks_dir().as_deref());
 
     for delay_ms in SPAWN_RETRY_DELAYS_MS {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -375,6 +377,18 @@ fn daemon_sock_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// `~/.config/claude-hookd/hooks` — where `hooks::run_hook` looks for
+/// `on-idle`/`on-waiting`/`on-attention` executables (`ISEKAI_PIPE_DESIGN.md`
+/// §8 Epic Q). `None` when `$HOME` isn't set, which `hooks::run_hook` treats
+/// as "no hooks configured," the same silent no-op as every other
+/// misconfiguration this crate tolerates — resolved once here (not read
+/// inside the long-running daemon) to match this crate's existing
+/// config-is-passed-in convention (see [`daemon_sock_dir`]).
+#[cfg(unix)]
+fn hooks_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/claude-hookd/hooks"))
+}
+
 /// Derives this delivery target's daemon socket path deterministically from
 /// [`Delivery::identity`] (a stable string: the ctl-socket path, the tmux
 /// session id, or the direct tty device path) via a non-cryptographic hash —
@@ -509,6 +523,7 @@ fn spawn_detached_daemon(
     idle_color: Option<(u8, u8, u8)>,
     attention_color: Option<(u8, u8, u8)>,
     waiting_color: Option<(u8, u8, u8)>,
+    hooks_dir: Option<&Path>,
 ) {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
@@ -528,6 +543,9 @@ fn spawn_detached_daemon(
     }
     if let Some(color) = waiting_color {
         cmd.arg("--waiting-color").arg(osc_color::format_hex_color(color));
+    }
+    if let Some(dir) = hooks_dir {
+        cmd.arg("--hooks-dir").arg(dir);
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // Safety: the closure only calls `setsid(2)`, an async-signal-safe libc

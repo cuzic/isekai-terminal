@@ -165,6 +165,32 @@ impl TabState {
     fn deferred_session_count(&self) -> usize {
         self.sessions.values().filter(|p| matches!(p, Pending::Deferred(_))).count()
     }
+
+    /// This tab's state as JSON, for external consumers (`hooks.rs`'s
+    /// command hooks) that have no access to this crate's Rust types.
+    /// Deliberately a bespoke conversion rather than `#[derive(Serialize)]`
+    /// on `TabState`/`Pending` directly: `Instant` has no portable
+    /// wall-clock meaning, so each deadline is expressed as milliseconds
+    /// remaining from `now` instead of serialized as-is. `aggregate_name` is
+    /// threaded in by the caller (`daemon.rs::execute_actions` already knows
+    /// it from the `Action` variant being handled) rather than recomputed
+    /// here via `aggregate()`, so this can never disagree with the
+    /// transition that triggered the call.
+    pub(crate) fn to_hook_json(&self, aggregate_name: &str, now: Instant) -> serde_json::Value {
+        let sessions: serde_json::Map<String, serde_json::Value> = self
+            .sessions
+            .iter()
+            .map(|(session_id, pending)| {
+                let (kind, deadline) = match pending {
+                    Pending::Attention(d) => ("attention", d),
+                    Pending::Deferred(d) => ("deferred", d),
+                };
+                let remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+                (session_id.clone(), serde_json::json!({ "kind": kind, "deadline_ms_remaining": remaining_ms }))
+            })
+            .collect();
+        serde_json::json!({ "aggregate": aggregate_name, "sessions": sessions })
+    }
 }
 
 /// Applies one hook event for `session_id` and returns the new state plus
@@ -503,5 +529,37 @@ mod tests {
         let (state, actions) = notify(&state, "s1", now + Duration::from_secs(1));
         assert_eq!(actions, vec![Action::SetAttentionColorAndPopup]);
         assert!(state.is_attention());
+    }
+
+    #[test]
+    fn to_hook_json_of_an_idle_tab_has_no_sessions() {
+        let now = Instant::now();
+        let json = TabState::new().to_hook_json("idle", now);
+        assert_eq!(json, serde_json::json!({ "aggregate": "idle", "sessions": {} }));
+    }
+
+    #[test]
+    fn to_hook_json_reports_kind_and_remaining_ms_per_session() {
+        let now = Instant::now();
+        let (state, _) = notify(&TabState::new(), "s1", now);
+        let json = state.to_hook_json("attention", now);
+        assert_eq!(json["aggregate"], "attention");
+        assert_eq!(json["sessions"]["s1"]["kind"], "attention");
+        assert_eq!(json["sessions"]["s1"]["deadline_ms_remaining"], ATTENTION_TIMEOUT.as_millis() as u64);
+    }
+
+    #[test]
+    fn to_hook_json_distinguishes_deferred_from_attention_and_uses_aggregate_names_verbatim() {
+        let now = Instant::now();
+        let (state, _) = stop_deferred(&TabState::new(), "pane-a", now);
+        // `aggregate_name` is caller-supplied (see this method's docs on why),
+        // so this pins that the string is passed through unmodified rather
+        // than recomputed from `self.aggregate()` — the two happen to agree
+        // here (a lone `Deferred` session aggregates to `Waiting`), but the
+        // point of the parameter is that this method never has to know that.
+        let json = state.to_hook_json("waiting", now);
+        assert_eq!(json["aggregate"], "waiting");
+        assert_eq!(json["sessions"]["pane-a"]["kind"], "deferred");
+        assert_eq!(json["sessions"]["pane-a"]["deadline_ms_remaining"], MAX_DEFERRAL.as_millis() as u64);
     }
 }
