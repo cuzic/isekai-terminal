@@ -245,19 +245,70 @@ enum ClientEvent {
 /// session; **not** documented in the public hooks reference, which is
 /// incomplete for this payload — see `claude-hookd-background-tasks-design`
 /// in the user's memory system for the full trail) contains an entry whose
-/// `type` is `"shell"` or `"subagent"` — the two mechanisms this crate
-/// actually means to detect unconditionally (`Bash` with `run_in_background`,
-/// and a backgrounded `Agent`/subagent). Deliberately narrower than "array
-/// non-empty": the array can also contain `"teammate"`/`"dream"`/
-/// `"auto-mode scan"`/`"monitor"`/etc. entries that can sit `running`
-/// indefinitely (e.g. an idle teammate under `CLAUDE_CODE_TEAMMATE_MODE`),
-/// which an earlier, reverted attempt at this same fix (2026-08-03, believed
-/// at the time to be checking a nonexistent field — it wasn't) learned the
-/// hard way not to trust wholesale. A `"teammate"`-only array no longer
-/// falls straight through to `Notify` either, as of 2026-08 — see
-/// `ClientEvent::StopAmbiguousTeammate`'s docs; every *other* unrecognized/
-/// future `type` still fails to the safe (`Notify`) side, by construction
-/// (`matches!` against an explicit allowlist, not a denylist).
+/// `type` is `"shell"`, `"subagent"`, or `"workflow"` — the mechanisms this
+/// crate actually means to detect unconditionally (`Bash` with
+/// `run_in_background`, a backgrounded `Agent`/subagent, and the `Workflow`
+/// tool's own background orchestration). `"workflow"` added 2026-08-09 after
+/// a live false-positive report was traced to a real `Stop` payload
+/// (`background_tasks: [{"type":"workflow","status":"running",...}]`,
+/// captured live via a temporary hook while the session was genuinely
+/// waiting on a dispatched `Workflow` run) — before this, `"workflow"` fell
+/// through to the unfiltered `"Stop" => Notify` branch below exactly like
+/// any other unrecognized type, painting Attention while the session was
+/// legitimately just waiting on background work that would auto-resume it.
+/// Deliberately narrower than "array non-empty": the array can also contain
+/// `"teammate"`/`"dream"`/`"auto-mode scan"`/`"monitor"`/etc. entries that
+/// can sit `running` indefinitely (e.g. an idle teammate under
+/// `CLAUDE_CODE_TEAMMATE_MODE`), which an earlier, reverted attempt at this
+/// same fix (2026-08-03, believed at the time to be checking a nonexistent
+/// field — it wasn't) learned the hard way not to trust wholesale. A
+/// `"teammate"`-only array no longer falls straight through to `Notify`
+/// either, as of 2026-08 — see `ClientEvent::StopAmbiguousTeammate`'s docs;
+/// every *other* unrecognized/future `type` still fails to the safe
+/// (`Notify`) side, by construction (`matches!` against an explicit
+/// allowlist, not a denylist) — `"workflow"` itself fell there prior to
+/// 2026-08-09. The same `MAX_DEFERRAL` self-correction that backstops
+/// `"shell"`/`"subagent"` against a wrongly-`StopDeferred` guess backstops
+/// `"workflow"` too, so adding it here needed no new tracking machinery the
+/// way `"teammate"` did — though a `Workflow` run in *this* repository
+/// commonly runs well past `MAX_DEFERRAL` (30 min; design → implement →
+/// document → verify), so a long one can still eventually reach `Attention`
+/// if the dispatching session has no other activity in the meantime. That's
+/// a real, known limitation of the one-size-fits-all `MAX_DEFERRAL`, not a
+/// defect in this allowlist addition — a per-`type` deferral bound is a
+/// plausible future improvement, not attempted here.
+///
+/// `"workflow"` + `"teammate"` in the same array (realistic in this
+/// repository, since `Workflow` runs themselves dispatch teammates to
+/// Fable/Opus) now unconditionally takes the `has_relevant_background_work`
+/// branch below (`StopDeferred`, no TTL check) rather than
+/// `ClientEvent::StopAmbiguousTeammate`'s dispatch-TTL-gated path — a
+/// deliberate choice (deferring is the safe side either way), not an
+/// oversight; see `stop_defers_unconditionally_when_workflow_and_teammate_
+/// are_both_present` below for the pinned behavior.
+///
+/// The full list of `background_tasks[].type` values this CLI version can
+/// produce is not otherwise documented anywhere and was reverse-engineered
+/// from the installed binary, not guessed: `strings ~/.local/share/claude/
+/// versions/<version>` (or an equivalent byte-level scan) for the object
+/// literal assigned to a variable resembling `lsi` in the minified bundle —
+/// as of CLI 2.1.226 it maps internal task kinds to exactly the 9 wire
+/// values this crate's tests enumerate (`local_agent`→`"subagent"`,
+/// `local_workflow`→`"workflow"`, `local_bash`→`"shell"`,
+/// `monitor_mcp`/`monitor_ws`→`"monitor"`, `mcp_task`→`"MCP task"`,
+/// `in_process_teammate`→`"teammate"`, `dream`→`"dream"`,
+/// `auto_mode_scan`→`"auto-mode scan"`, `remote_agent`→`"cloud session"`) —
+/// confirming the existing "non-relevant" type list below was already
+/// exhaustive, not merely "etc."-hedged guesswork. One candidate this
+/// enumeration surfaces for future investigation, *not* acted on here for
+/// lack of live evidence: `"cloud session"` (a remote/cloud-hosted agent)
+/// is plausibly the same "background work that will auto-resume me" shape
+/// as `"workflow"`/`"subagent"`, but nothing here has actually observed a
+/// false positive traced to it — re-run this same live-capture method
+/// against a real cloud-session dispatch before adding it, per this
+/// project's established "verify before implementing" discipline (see the
+/// reverted 2026-08-03 attempt referenced above for what skipping that step
+/// costs).
 ///
 /// The same `StopDeferred` treatment also applies when `session_crons`
 /// (present on the same `Stop` payload, alongside `background_tasks` —
@@ -331,7 +382,7 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, ClientEvent, bool)> {
         .flatten()
         .filter_map(|t| t.get("type").and_then(|v| v.as_str()))
         .collect();
-    let has_relevant_background_work = background_task_types.iter().any(|t| matches!(*t, "shell" | "subagent"));
+    let has_relevant_background_work = background_task_types.iter().any(|t| matches!(*t, "shell" | "subagent" | "workflow"));
     let has_teammate_background_work = background_task_types.contains(&"teammate");
     let has_pending_session_cron =
         value.get("session_crons").and_then(|v| v.as_array()).is_some_and(|crons| !crons.is_empty());
@@ -718,8 +769,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_with_a_shell_or_subagent_background_task_is_deferred() {
-        for kind in ["shell", "subagent"] {
+    fn stop_with_a_shell_subagent_or_workflow_background_task_is_deferred() {
+        for kind in ["shell", "subagent", "workflow"] {
             let payload = format!(
                 r#"{{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{{"id":"t1","type":"{kind}","status":"running"}}]}}"#
             );
@@ -731,6 +782,20 @@ mod tests {
         }
     }
 
+    /// Pins the fix for a real live false-Attention report (2026-08-09, see
+    /// `parse_hook_event`'s doc comment): a `"workflow"`-only
+    /// `background_tasks` array used to paint Attention while the session
+    /// was genuinely just waiting on a dispatched `Workflow` run — before
+    /// the fix, this exact payload shape was asserted as *correctly*
+    /// `Notify` by `stop_with_only_non_relevant_background_task_types_is_notify`
+    /// below (`"workflow"` was in that test's "non-relevant" list), i.e. the
+    /// false positive itself was pinned as intended behavior.
+    #[test]
+    fn stop_with_only_a_workflow_background_task_is_deferred_not_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"workflow","status":"running","name":"svg-primitives-extend-all"}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
+    }
+
     /// The type filter is deliberately an allowlist, not "array non-empty"
     /// — a long-lived `dream`/`monitor`/etc. entry must not suppress
     /// attention (see `parse_hook_event`'s doc comment on why the original,
@@ -739,10 +804,13 @@ mod tests {
     /// gets its own dedicated classification
     /// (`ClientEvent::StopAmbiguousTeammate`), see
     /// `stop_with_only_a_teammate_background_task_is_stop_ambiguous_teammate`
-    /// below.
+    /// below. `"workflow"` is deliberately *not* in this list (as of
+    /// 2026-08-09) — it moved to the allowlist above after a live false
+    /// positive; kept here as a comment, not a case, so a future reader
+    /// doesn't wonder why it's missing.
     #[test]
     fn stop_with_only_non_relevant_background_task_types_is_notify() {
-        for kind in ["dream", "auto-mode scan", "monitor", "MCP task", "cloud session", "workflow", "some-future-type"] {
+        for kind in ["dream", "auto-mode scan", "monitor", "MCP task", "cloud session", "some-future-type"] {
             let payload = format!(
                 r#"{{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{{"id":"t1","type":"{kind}","status":"running"}}]}}"#
             );
@@ -764,6 +832,18 @@ mod tests {
     fn stop_with_only_a_teammate_background_task_is_stop_ambiguous_teammate() {
         let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"teammate","status":"running"}]}"#;
         assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopAmbiguousTeammate, false)));
+    }
+
+    /// Pins the deliberate branch-order choice `parse_hook_event`'s doc
+    /// comment calls out: `"workflow"` (or any `has_relevant_background_work`
+    /// type) alongside `"teammate"` takes the unconditional `StopDeferred`
+    /// path, *not* `StopAmbiguousTeammate`'s dispatch-TTL-gated one — a
+    /// realistic combination in this repository, since a `Workflow` run
+    /// itself dispatches teammates to Fable/Opus.
+    #[test]
+    fn stop_defers_unconditionally_when_workflow_and_teammate_are_both_present() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"t1","type":"workflow","status":"running"},{"id":"t2","type":"teammate","status":"running"}]}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::StopDeferred, false)));
     }
 
     #[test]
