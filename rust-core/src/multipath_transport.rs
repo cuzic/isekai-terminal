@@ -36,10 +36,8 @@ use isekai_protocol::attach::{
     attach_hello_proof_transcript, encode_attach_activate, encode_attach_hello, AttachActivate, AttachHello,
     AttachProof, AttachResponse, ConnectionGeneration,
 };
-use crate::transport::{run_ssh_channel_loop, ExecError, ExecOutput, TransportCommand, TransportEvent};
-use crate::{
-    init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME,
-};
+use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
+use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 use base64::Engine as _;
 use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
@@ -250,77 +248,8 @@ impl MultipathIsekaiPipeQuicSession {
             None => warn!("multipath_quic: notify_upstream_health_degraded called before RebindManager Driver started"),
         }
     }
-
-    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
-
-    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
-        self.core.scrollback_cells(offset, rows)
-    }
-    /// タスク#58: フル再接続直後のtmux scrollback backfill。
-    /// `SessionCore::inject_scrollback_history`参照。
-    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
-        self.core.inject_scrollback_history(lines)
-    }
-
-    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
-        self.core.search_scrollback(&query, case_sensitive)
-    }
-
-    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
-    /// タスク#17: `SessionCore::file_preview_exec`参照。
-    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
-        self.core.file_preview_exec(request_id, command_line)
-    }
-
-    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
-
-    /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
-    pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
-
-    /// タスク#13(OSC 133)。
-    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
-        self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
-    }
-    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
-        self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
-    }
-    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) { self.core.click_to_prompt_cursor(row, col); }
-    pub(crate) fn copy_last_command_output(&self) { self.core.copy_last_command_output(); }
-
-    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
-
-    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
-        self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
-    }
-
-    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
-        self.core.trzsz_send_chunk(transfer_id, data, is_last);
-    }
-
-    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
-        self.core.trzsz_accept_download(transfer_id);
-    }
-
-    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
-        self.core.trzsz_cancel(transfer_id);
-    }
-
-    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
-    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
-    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
-        self.core.run_exec(command).await
-    }
-
-    /// Phase 12: per-session theme。
-    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
-        self.core.set_theme(theme);
-    }
-
-    /// `AI_INTEGRATION_DESIGN.md` §3のAIパネル機能opt-inゲート。
-    pub(crate) fn set_panel_enabled(&self, enabled: bool) {
-        self.core.set_panel_enabled(enabled);
-    }
 }
+crate::session::impl_session_core_delegation!(MultipathIsekaiPipeQuicSession);
 
 // ── path health（`isekai_transport::path_health`、旧`PathBroker`）─────────
 //
