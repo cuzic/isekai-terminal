@@ -32,7 +32,7 @@ import uniffi.isekai_terminal_core.ScrollbackSearchMatch
  * のために追加したキャッシュのinvalidation条件(セル寸法・テーマ背景色・typefaceの
  * いずれかが変わったら再計算/再描画する)を検証する。実際の描画結果ではなく
  * 「再計算/再描画が必要と判断されるかどうか」だけをピュアに検証できるよう、
- * `needsRefit`/`needsRerender` はComposeの`Canvas{}`スコープの外から直接呼べる。
+ * `needsRefit`/`planRender` はComposeの`Canvas{}`スコープの外から直接呼べる。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
@@ -223,11 +223,13 @@ class SshTerminalCanvasTest {
     }
 
     // ── GridRenderCache: update参照/セル寸法/テーマ背景/typefaceが変わったときだけ再描画 ──
+    // (GridRenderCache.needsRerenderは`planRender(...) != GridRenderPlan.Reuse`の薄いラッパーで
+    // 本番コードから一切呼ばれていなかったため撤去した。ここでは同値の判定式で直接検証する。)
 
     @Test
     fun `GridRenderCache requires rerender on first use`() {
         val cache = GridRenderCache()
-        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
+        assertTrue(cache.planRender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false) != GridRenderPlan.Reuse)
     }
 
     @Test
@@ -235,7 +237,7 @@ class SshTerminalCanvasTest {
         val cache = GridRenderCache()
         val update = screenUpdate()
         cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
-        assertFalse(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
+        assertFalse(cache.planRender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false) != GridRenderPlan.Reuse)
     }
 
     @Test
@@ -245,7 +247,7 @@ class SshTerminalCanvasTest {
         cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
         assertTrue(
             "フォント変更後も同じScreenUpdate/サイズなら古いフォントで描いたBitmapが再利用されてしまう",
-            cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.SERIF, false),
+            cache.planRender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.SERIF, false) != GridRenderPlan.Reuse,
         )
     }
 
@@ -253,7 +255,7 @@ class SshTerminalCanvasTest {
     fun `GridRenderCache requires rerender when a new ScreenUpdate instance arrives`() {
         val cache = GridRenderCache()
         cache.markRendered(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
-        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
+        assertTrue(cache.planRender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false) != GridRenderPlan.Reuse)
     }
 
     @Test
@@ -262,7 +264,7 @@ class SshTerminalCanvasTest {
         val update = screenUpdate()
         cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
         cache.invalidate()
-        assertTrue(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
+        assertTrue(cache.planRender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false) != GridRenderPlan.Reuse)
     }
 
     @Test
@@ -275,7 +277,7 @@ class SshTerminalCanvasTest {
         cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, blinkPhase = false)
         assertTrue(
             "blink位相の反転だけでは他のキーが変わらないため、blinkPhaseをキーに含めないと再描画がスキップされてしまう",
-            cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, blinkPhase = true),
+            cache.planRender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, blinkPhase = true) != GridRenderPlan.Reuse,
         )
     }
 

@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::UnixListener;
 
 use super::delivery::{self, Delivery};
+use super::hooks;
 use super::state::{apply_event, apply_timeout, Action, HookEvent, TabState};
 
 /// How long an `Attention` session stays that way without a debounce
@@ -90,6 +91,14 @@ struct DaemonConfig {
     max_deferral: Duration,
     idle_exit: Duration,
     teammate_dispatch_ttl: Duration,
+    /// `~/.config/claude-hookd/hooks` (`main.rs::hooks_dir`), resolved by the
+    /// short-lived `claude-hookd event` process and passed down as
+    /// `--hooks-dir` — never read from `$HOME` inside this long-running
+    /// daemon, matching every other piece of this config. `None` (unset
+    /// `$HOME`, or the flag simply not passed by an older/test caller) makes
+    /// `hooks::run_hook` a silent no-op, same as a hooks dir that exists but
+    /// has no matching `on-*` file in it.
+    hooks_dir: Option<PathBuf>,
 }
 
 /// Parses `__serve`'s spawn arguments and runs the daemon loop until it
@@ -108,13 +117,15 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
     let mut max_deferral = MAX_DEFERRAL;
     let mut idle_exit = IDLE_EXIT;
     let mut teammate_dispatch_ttl = TEAMMATE_DISPATCH_TTL;
+    let mut hooks_dir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => sock_path = args.next().map(PathBuf::from),
             "--delivery-spec" => delivery_spec = args.next(),
-            "--idle-color" => idle_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
-            "--attention-color" => attention_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
-            "--waiting-color" => waiting_color = args.next().and_then(|v| osc_color::parse_hex_color(&v).ok()),
+            "--hooks-dir" => hooks_dir = args.next().map(PathBuf::from),
+            "--idle-color" => idle_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
+            "--attention-color" => attention_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
+            "--waiting-color" => waiting_color = args.next().and_then(|v| super::hexcolor::parse_hex_color(&v).ok()),
             "--attention-timeout-ms" => {
                 if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
                     attention_timeout = Duration::from_millis(ms);
@@ -151,6 +162,7 @@ pub(crate) async fn serve_command(mut args: impl Iterator<Item = String>) -> Exi
         max_deferral,
         idle_exit,
         teammate_dispatch_ttl,
+        hooks_dir,
     })
     .await;
     ExitCode::SUCCESS
@@ -177,8 +189,19 @@ async fn run(config: DaemonConfig) {
     // looking write to a terminal already showing its default color) and,
     // more importantly, a restart after a crash or the 1h self-exit that
     // left a *previous* daemon's tab stuck in the attention color with
-    // nothing left to revert it.
-    delivery::send_tab_color(&config.delivery, config.idle_color).await;
+    // nothing left to revert it. Deliberately calls `delivery` directly
+    // rather than going through `execute_actions`/`hooks::run_hook`: this
+    // write isn't a response to an `Action` from a real state transition
+    // (`state` is freshly `TabState::new()` at this point), so an
+    // `on-idle` hook never fires purely from daemon startup/restart — only
+    // from a real `Attention`/`Waiting` → `Idle` transition later in `run`'s
+    // loop (adversarial review, 2026-08, flagged this asymmetry as worth
+    // documenting explicitly rather than fixing: firing `on-idle` here too
+    // would mean every daemon restart — including the routine 1h
+    // self-exit-then-respawn — looks identical to a real transition to a
+    // hook script, which is more likely to surprise a hook author than help
+    // one).
+    delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
 
     // Accepting and reading each connection happens on its own spawned
     // task, separate from the main loop below: a connection that opens and
@@ -255,12 +278,13 @@ async fn run(config: DaemonConfig) {
                 };
                 let (next_state, actions) = apply_event(&state, &session_id, event, now, config.attention_timeout, config.max_deferral);
                 state = next_state;
-                execute_actions(&config, &actions).await;
+                execute_actions(&config, &actions, &state, now).await;
             }
             () = attention_sleep(&state) => {
-                let (next_state, actions) = apply_timeout(&state, Instant::now(), config.attention_timeout);
+                let now = Instant::now();
+                let (next_state, actions) = apply_timeout(&state, now, config.attention_timeout);
                 state = next_state;
-                execute_actions(&config, &actions).await;
+                execute_actions(&config, &actions, &state, now).await;
             }
             () = idle_exit_sleep => {
                 break;
@@ -368,18 +392,21 @@ async fn read_one_event_line(stream: tokio::net::UnixStream) -> Option<(String, 
     Some((session_id, event))
 }
 
-async fn execute_actions(config: &DaemonConfig, actions: &[Action]) {
+async fn execute_actions(config: &DaemonConfig, actions: &[Action], state: &TabState, now: Instant) {
     for action in actions {
         match action {
             Action::SetAttentionColorAndPopup => {
-                delivery::send_tab_color(&config.delivery, config.attention_color).await;
+                delivery::send_tab_color(&config.delivery, config.attention_color, config.hooks_dir.as_deref()).await;
                 delivery::send_notify_popup(&config.delivery).await;
+                hooks::run_hook(config.hooks_dir.as_deref(), "attention", state, now).await;
             }
             Action::SetWaitingColor => {
-                delivery::send_tab_color(&config.delivery, config.waiting_color).await;
+                delivery::send_tab_color(&config.delivery, config.waiting_color, config.hooks_dir.as_deref()).await;
+                hooks::run_hook(config.hooks_dir.as_deref(), "waiting", state, now).await;
             }
             Action::SetIdleColor => {
-                delivery::send_tab_color(&config.delivery, config.idle_color).await;
+                delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
+                hooks::run_hook(config.hooks_dir.as_deref(), "idle", state, now).await;
             }
         }
     }
@@ -391,6 +418,35 @@ mod tests {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::UnixStream;
 
+    /// Every end-to-end test in this module that asserts on the literal
+    /// `4;264;rgb:...` OSC bytes goes through `hooks_dir: None`, which falls
+    /// through to `tab_color`'s embedded default script — and that script
+    /// resolves the Windows-Terminal-vs-iTerm2 convention from this real
+    /// process's own ambient `$TERM_PROGRAM`. On a real macOS iTerm2 machine
+    /// (outside tmux) that env var is `iTerm.app`, which would flip every
+    /// one of those assertions to the OSC 6 sequence instead (adversarial
+    /// review, 2026-08-09, caught this — `tab_color.rs`'s and `delivery.rs`'s
+    /// own tests already isolate this the same way `tab_color.rs`'s
+    /// `resolve_with_isolated_env` does; this crate can't reach that
+    /// test-only helper from here since `serve_command`/`run` exercise the
+    /// *real* `tab_color::resolve`, not an injectable variant). Pins the
+    /// child's `$ISEKAI_TERMINAL_KIND` once, process-wide, before any test
+    /// spawns a `tab-color` subprocess that would read it — safe against the
+    /// parallel-test races that ruled out `std::env::set_var` in
+    /// `tab_color.rs`'s own tests, because every caller here passes the same
+    /// fixed value and nothing in this module ever needs it to be anything
+    /// else.
+    fn ensure_deterministic_terminal_kind() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // SAFETY: `call_once` guarantees this runs exactly once, and no
+            // test in this module ever sets a *different* value — see the
+            // doc comment above for why that makes this safe despite
+            // `cargo test`'s default parallel execution.
+            unsafe { std::env::set_var("ISEKAI_TERMINAL_KIND", "windows-terminal") };
+        });
+    }
+
     /// Drives a real daemon (`run`, not the pure `state.rs` function) through
     /// startup self-heal, a Notify→Attention transition (color + popup),
     /// an attention timeout back to Idle, and self-exit — using millisecond
@@ -401,6 +457,7 @@ mod tests {
     /// right times).
     #[tokio::test]
     async fn daemon_loop_end_to_end() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let tty_path = dir.path().join("fake-tty");
         std::fs::write(&tty_path, b"").unwrap();
@@ -419,6 +476,14 @@ mod tests {
             max_deferral: Duration::from_millis(150),
             idle_exit: Duration::from_millis(300),
             teammate_dispatch_ttl: Duration::from_millis(150),
+            // The realistic default for most users, not `None`: `main.rs`'s
+            // `hooks_dir()` resolves to `Some(...)` unconditionally whenever
+            // `$HOME` is set, whether or not the directory (or any `on-*`
+            // file in it) actually exists (adversarial review, 2026-08: this
+            // flagship regression test — "behavior is unchanged with no
+            // hooks configured" — previously only exercised the `None`
+            // case, which in practice almost never happens).
+            hooks_dir: Some(dir.path().join("hooks")),
         }));
 
         // Poll (not a fixed sleep — this project has repeatedly hit CI
@@ -451,6 +516,76 @@ mod tests {
         assert!(hookd_sock_path.exists(), "graceful self-exit must not unlink its own socket file");
     }
 
+    /// End to end through the real daemon loop (not `hooks.rs`'s own unit
+    /// tests, which call `hooks::run_hook` directly): a `notify` wire event
+    /// must both paint the attention color (already covered above) *and*
+    /// fire the configured `on-attention` command hook with the right
+    /// `argv[1]`/stdin, without the hook's own runtime delaying the OSC
+    /// write it races against.
+    #[tokio::test]
+    async fn notify_fires_the_configured_command_hook_alongside_the_osc_write() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let out_path = dir.path().join("hook-out");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let script_path = hooks_dir.join("on-attention");
+            std::fs::write(&script_path, format!("#!/bin/sh\necho \"$1\" > {out_path:?}.arg\ncat > {out_path:?}.stdin\n")).unwrap();
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_secs(5),
+            max_deferral: Duration::from_secs(5),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_secs(5),
+            hooks_dir: Some(hooks_dir),
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify\"}\n").await.unwrap();
+        drop(client);
+
+        // Both effects of the same `Action::SetAttentionColorAndPopup` must
+        // land — the OSC write is not blocked on the hook, nor vice versa.
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "notify must still paint attention color").await;
+        // Polls on parseable JSON, not mere existence — see `hooks.rs`'s
+        // matching test for why an existence-only check flaked under load.
+        poll_until(Duration::from_secs(2), || {
+            out_path.with_extension("arg").exists()
+                && std::fs::read_to_string(out_path.with_extension("stdin"))
+                    .ok()
+                    .is_some_and(|s| serde_json::from_str::<serde_json::Value>(&s).is_ok())
+        })
+        .await
+        .expect("the on-attention hook must run");
+
+        assert_eq!(std::fs::read_to_string(out_path.with_extension("arg")).unwrap().trim(), "attention");
+        let stdin_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out_path.with_extension("stdin")).unwrap()).unwrap();
+        assert_eq!(stdin_json["aggregate"], "attention");
+        assert_eq!(stdin_json["sessions"]["s1"]["kind"], "attention");
+
+        daemon.abort();
+    }
+
     /// Drives the new `stop_deferred` wire event through a real daemon: a
     /// `Deferred` session paints the waiting color with **no** popup, and
     /// once `max_deferral` elapses with no further event, the daemon
@@ -458,6 +593,7 @@ mod tests {
     /// popup a wrongly-suppressed real notification eventually still gets.
     #[tokio::test]
     async fn stop_deferred_paints_waiting_then_self_corrects_to_attention() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let tty_path = dir.path().join("fake-tty");
         std::fs::write(&tty_path, b"").unwrap();
@@ -476,6 +612,7 @@ mod tests {
             max_deferral: Duration::from_millis(80),
             idle_exit: Duration::from_secs(5),
             teammate_dispatch_ttl: Duration::from_millis(80),
+            hooks_dir: None,
         }));
 
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
@@ -506,6 +643,7 @@ mod tests {
     /// would, as long as the dispatch is still within `teammate_dispatch_ttl`.
     #[tokio::test]
     async fn teammate_dispatch_then_ambiguous_stop_defers_within_ttl() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let tty_path = dir.path().join("fake-tty");
         std::fs::write(&tty_path, b"").unwrap();
@@ -524,6 +662,7 @@ mod tests {
             max_deferral: Duration::from_millis(200),
             idle_exit: Duration::from_secs(5),
             teammate_dispatch_ttl: Duration::from_secs(5),
+            hooks_dir: None,
         }));
 
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
@@ -552,6 +691,7 @@ mod tests {
     /// `status` looks identical to a working one.
     #[tokio::test]
     async fn ambiguous_stop_without_a_recent_dispatch_notifies() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let tty_path = dir.path().join("fake-tty");
         std::fs::write(&tty_path, b"").unwrap();
@@ -570,6 +710,7 @@ mod tests {
             max_deferral: Duration::from_millis(200),
             idle_exit: Duration::from_secs(5),
             teammate_dispatch_ttl: Duration::from_secs(5),
+            hooks_dir: None,
         }));
 
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
@@ -590,6 +731,7 @@ mod tests {
     /// independent of ever wiring up a `TeammateIdle` hook.
     #[tokio::test]
     async fn a_stale_teammate_dispatch_past_its_ttl_no_longer_defers() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let tty_path = dir.path().join("fake-tty");
         std::fs::write(&tty_path, b"").unwrap();
@@ -608,6 +750,7 @@ mod tests {
             max_deferral: Duration::from_millis(200),
             idle_exit: Duration::from_secs(5),
             teammate_dispatch_ttl: Duration::from_millis(50),
+            hooks_dir: None,
         }));
 
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
@@ -671,6 +814,7 @@ mod tests {
                 max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
                 teammate_dispatch_ttl: Duration::from_millis(50),
+                hooks_dir: None,
             }),
         )
         .await;
@@ -752,6 +896,7 @@ mod tests {
     /// sweep to reclaim, not `remove_file` it itself.
     #[tokio::test]
     async fn a_self_exiting_daemon_leaves_its_socket_for_the_sweep_instead_of_unlinking_it() {
+        ensure_deterministic_terminal_kind();
         let dir = tempfile::tempdir().unwrap();
         let hookd_sock_path = dir.path().join("claude-hookd-t.sock");
 
@@ -767,6 +912,7 @@ mod tests {
                 max_deferral: Duration::from_millis(50),
                 idle_exit: Duration::from_millis(50),
                 teammate_dispatch_ttl: Duration::from_millis(50),
+                hooks_dir: None,
             }),
         )
         .await
@@ -784,5 +930,62 @@ mod tests {
         let removed = super::super::ctl_gc::sweep_stale_sockets(dir.path(), "claude-hookd-", Duration::from_secs(24 * 60 * 60))
             .expect("sweep must not fail on a plain tempdir");
         assert_eq!(removed, vec![hookd_sock_path], "the sweep must be the one to reclaim it");
+    }
+
+    /// Drives `serve_command` — the actual `--sock`/`--hooks-dir`/etc CLI
+    /// arg parser `main.rs::spawn_detached_daemon` invokes `__serve` with —
+    /// rather than constructing `DaemonConfig` directly like every other
+    /// test in this file. Pins the round-trip from CLI string to running
+    /// behavior for `--hooks-dir` specifically (adversarial review,
+    /// 2026-08-09: `main.rs` writes this flag, `serve_command` reads it, and
+    /// as of this PR it's the one thing both the command-hook feature and
+    /// the tab-color script feature depend on — nothing previously exercised
+    /// that round-trip at all, so a typo'd flag name or a dropped
+    /// `args.next()` would have silently disabled both features while every
+    /// other test, which all bypass `serve_command`, stayed green).
+    #[tokio::test]
+    async fn serve_command_wires_hooks_dir_from_cli_args_through_to_a_running_hook() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let out_path = dir.path().join("hook-out");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let script_path = hooks_dir.join("on-attention");
+            std::fs::write(&script_path, format!("#!/bin/sh\necho ran > {out_path:?}\n")).unwrap();
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let args = vec![
+            "--sock".to_string(),
+            hookd_sock_path.to_string_lossy().into_owned(),
+            "--delivery-spec".to_string(),
+            format!("tty:{}", tty_path.display()),
+            "--hooks-dir".to_string(),
+            hooks_dir.to_string_lossy().into_owned(),
+            "--attention-timeout-ms".to_string(),
+            "5000".to_string(),
+            "--idle-exit-ms".to_string(),
+            "300".to_string(),
+        ];
+        let daemon = tokio::spawn(serve_command(args.into_iter()));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify\"}\n").await.unwrap();
+        drop(client);
+
+        poll_until(Duration::from_secs(2), || out_path.exists())
+            .await
+            .expect("--hooks-dir passed on the CLI must reach a running on-attention hook");
+
+        daemon.abort();
     }
 }

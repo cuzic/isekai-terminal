@@ -216,6 +216,14 @@ data class ConnectionProfile(
 }
 
 /**
+ * UI が接続前にパスワード入力ダイアログを挟むべきか(本体または踏み台のどちらかが
+ * パスワード認証)。[ProfileListScreen]/[TerminalHostScreen]の複数箇所で同じ判定が
+ * 重複していたため抽出した。
+ */
+val ConnectionProfile.needsPasswordPrompt: Boolean
+    get() = authTypeEnum == AuthType.PASSWORD || (usesJumpHost && jumpAuthTypeEnum == AuthType.PASSWORD)
+
+/**
  * [PortForward] のリストを Room の TEXT 列に保存するための TypeConverter。
  * 外部の JSON ライブラリを追加せず、Android 標準の `org.json` だけで完結させている
  * (MVP のポートフォワード機能のためだけに kotlinx.serialization 等を新規導入しない判断)。

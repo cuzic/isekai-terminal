@@ -39,6 +39,7 @@ import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.SPECIAL_KEY_CHOICES
 import tools.isekai.terminal.input.shortLabel
+import tools.isekai.terminal.ui.ProfileScopeDropdown
 import tools.isekai.terminal.util.RemoteLogger
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -55,14 +56,12 @@ fun KeySequenceEditScreen(
     var label by remember { mutableStateOf(keySequence?.label ?: "") }
     val steps = remember { mutableStateListOf<KeyStep>().apply { addAll(keySequence?.steps ?: emptyList()) } }
     var profileId by remember { mutableStateOf(keySequence?.profileId) }
-    var profileMenuExpanded by remember { mutableStateOf(false) }
 
     var ctrlCharInput by remember { mutableStateOf("") }
     var textStepInput by remember { mutableStateOf("") }
     var specialKeyMenuExpanded by remember { mutableStateOf(false) }
     var selectedSpecialKeyLabel by remember { mutableStateOf(SPECIAL_KEY_CHOICES.first().first) }
 
-    val selectedProfileLabel = profiles.firstOrNull { it.id == profileId }?.label ?: "全プロファイル共通"
     // steps.isNotEmpty() だけでは、Ctrl+1 のような変換不能な文字だけのstepでも保存できてしまい
     // 送信時に無音no-opになる(codexレビュー指摘)。実際にバイト列が出力されることまで確認する。
     val canSave = label.isNotBlank() && KeySequenceCommands.toBytes(steps).isNotEmpty()
@@ -196,38 +195,11 @@ fun KeySequenceEditScreen(
         }
 
         Text("適用範囲")
-        ExposedDropdownMenuBox(
-            expanded = profileMenuExpanded,
-            onExpandedChange = { profileMenuExpanded = it },
-        ) {
-            OutlinedTextField(
-                value = selectedProfileLabel,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text("プロファイル") },
-                trailingIcon = {
-                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = profileMenuExpanded)
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .menuAnchor(MenuAnchorType.PrimaryNotEditable),
-            )
-            ExposedDropdownMenu(
-                expanded = profileMenuExpanded,
-                onDismissRequest = { profileMenuExpanded = false },
-            ) {
-                DropdownMenuItem(
-                    text = { Text("全プロファイル共通") },
-                    onClick = { profileId = null; profileMenuExpanded = false },
-                )
-                profiles.forEach { p ->
-                    DropdownMenuItem(
-                        text = { Text(p.label) },
-                        onClick = { profileId = p.id; profileMenuExpanded = false },
-                    )
-                }
-            }
-        }
+        ProfileScopeDropdown(
+            profiles = profiles,
+            selectedId = profileId,
+            onSelect = { profileId = it },
+        )
 
         Spacer(Modifier.height(8.dp))
 

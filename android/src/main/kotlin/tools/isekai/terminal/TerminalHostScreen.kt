@@ -43,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.AuthType
+import tools.isekai.terminal.data.needsPasswordPrompt
 import uniffi.isekai_terminal_core.ProgressState
 
 /**
@@ -186,11 +187,12 @@ private fun TabLabel(
     val tmuxWindowLabel by tab.tmuxWindowLabel.collectAsStateWithLifecycle()
     var showThemeDialog by remember { mutableStateOf(false) }
     var showSplitDialog by remember { mutableStateOf(false) }
-    // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
-    // SplitPaneDialogを閉じてこちらのpending方向を使ってPasswordDialogを表示する。
-    var pendingSplitNewDirection by remember { mutableStateOf<SplitDirection?>(null) }
-    // 「+」(同一プロファイルへの新規タブ追加)がパスワード認証プロファイルの場合のPasswordDialog表示。
-    var showNewSessionPasswordDialog by remember { mutableStateOf(false) }
+    // 「+」(同一プロファイルへの新規タブ追加)・splitPaneの「新規接続（同じプロファイル）」の
+    // どちらも、対象プロファイルがパスワード認証ならPasswordDialogを挟んでから実行する必要が
+    // ある。両者は「確定時に何を実行するか」が違うだけなので、確定アクションそのものを
+    // 保持する1つのnullable stateへ統合する(non-nullの間、下のPasswordDialogブロックが
+    // tab.profile向けのダイアログを表示する)。
+    var pendingPasswordAction by remember { mutableStateOf<((password: String, jumpPassword: String?) -> Unit)?>(null) }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -293,10 +295,8 @@ private fun TabLabel(
         if (profile != null) {
             IconButton(
                 onClick = {
-                    val needsPasswordPrompt = profile.authTypeEnum == AuthType.PASSWORD ||
-                        (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD)
-                    if (needsPasswordPrompt) {
-                        showNewSessionPasswordDialog = true
+                    if (profile.needsPasswordPrompt) {
+                        pendingPasswordAction = { password, jumpPassword -> tabsVm.openTab(profile, password, jumpPassword) }
                     } else {
                         tabsVm.openTab(profile)
                     }
@@ -308,24 +308,6 @@ private fun TabLabel(
         }
         IconButton(onClick = onClose, modifier = Modifier.size(20.dp).testTag("closeTabButton")) {
             Text("×", color = Color(0xFFAAAAAA), fontSize = 16.sp)
-        }
-    }
-
-    if (showNewSessionPasswordDialog) {
-        val profile = tab.profile
-        if (profile == null) {
-            showNewSessionPasswordDialog = false
-        } else {
-            PasswordDialog(
-                label = profile.label,
-                showMainField = profile.authTypeEnum == AuthType.PASSWORD,
-                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
-                onDismiss = { showNewSessionPasswordDialog = false },
-                onConfirm = { password, jumpPassword ->
-                    tabsVm.openTab(profile, password, jumpPassword)
-                    showNewSessionPasswordDialog = false
-                },
-            )
         }
     }
 
@@ -343,10 +325,10 @@ private fun TabLabel(
             onSplitNew = { direction ->
                 showSplitDialog = false
                 val profile = tab.profile
-                val needsPasswordPrompt = profile != null &&
-                    (profile.authTypeEnum == AuthType.PASSWORD || (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD))
-                if (needsPasswordPrompt) {
-                    pendingSplitNewDirection = direction
+                if (profile?.needsPasswordPrompt == true) {
+                    pendingPasswordAction = { password, jumpPassword ->
+                        tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
+                    }
                 } else {
                     tabsVm.splitPane(tab.tabId, direction)
                 }
@@ -359,19 +341,19 @@ private fun TabLabel(
         )
     }
 
-    pendingSplitNewDirection?.let { direction ->
+    pendingPasswordAction?.let { action ->
         val profile = tab.profile
         if (profile == null) {
-            pendingSplitNewDirection = null
+            pendingPasswordAction = null
         } else {
             PasswordDialog(
                 label = profile.label,
                 showMainField = profile.authTypeEnum == AuthType.PASSWORD,
                 jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
-                onDismiss = { pendingSplitNewDirection = null },
+                onDismiss = { pendingPasswordAction = null },
                 onConfirm = { password, jumpPassword ->
-                    tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
-                    pendingSplitNewDirection = null
+                    action(password, jumpPassword)
+                    pendingPasswordAction = null
                 },
             )
         }
@@ -455,45 +437,50 @@ private fun TerminalTabScreen(
         return
     }
 
-    when (splitDirection) {
-        SplitDirection.VERTICAL ->
-            Column(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-                Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(Color(0xFF444444)))
-                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
-                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-            }
-        else ->
-            Row(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-                Box(modifier = Modifier.width(2.dp).fillMaxHeight().background(Color(0xFF444444)))
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    TerminalPaneScreen(
-                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
-                        hasFocus = focusedPaneId == split.paneId, onBack = onBack,
-                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
-                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
-                    )
-                }
-            }
+    SplitPanes(
+        direction = splitDirection,
+        first = {
+            TerminalPaneScreen(
+                tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
+                hasFocus = focusedPaneId == tab.primaryPane.paneId, onBack = onBack,
+                chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+            )
+        },
+        second = {
+            TerminalPaneScreen(
+                tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
+                hasFocus = focusedPaneId == split.paneId, onBack = onBack,
+                onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
+                chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+            )
+        },
+    )
+}
+
+/**
+ * 画面分割時の2ペインレイアウト。[SplitDirection.VERTICAL]ならColumnで縦に、それ以外(横分割)
+ * ならRowで横に並べ、間に2dpの区切り線を挟む。両分岐で軸(fillMaxWidth/fillMaxHeight・
+ * height/width)が入れ替わるだけで構造は同一だったため統合した。
+ */
+@Composable
+private fun SplitPanes(
+    direction: SplitDirection,
+    first: @Composable () -> Unit,
+    second: @Composable () -> Unit,
+) {
+    val dividerColor = Color(0xFF444444)
+    if (direction == SplitDirection.VERTICAL) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) { first() }
+            Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(dividerColor))
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) { second() }
+        }
+    } else {
+        Row(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) { first() }
+            Box(modifier = Modifier.width(2.dp).fillMaxHeight().background(dividerColor))
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) { second() }
+        }
     }
 }
 
@@ -540,33 +527,33 @@ private fun TerminalPaneScreen(
                 onUserActivity = onUserActivity,
                 actions = TerminalScreenActions(
                     onConnect = { tabsVm.reconnectPane(address) },
-                    onDisconnect = { tabsVm.disconnectPane(address) },
-                    onCancelReconnect = { tabsVm.cancelReconnectPane(address) },
+                    onDisconnect = { pane.session.disconnect() },
+                    onCancelReconnect = { pane.session.cancelReconnect() },
                     onBack = onBack,
-                    onSend = { bytes -> tabsVm.sendToPane(address, bytes) },
-                    onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
-                    onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
+                    onSend = { bytes -> pane.session.send(bytes) },
+                    onResize = { cols, rows -> pane.session.resize(cols, rows) },
+                    onScrollbackCells = { offset, rows -> pane.session.scrollbackCells(offset, rows) },
                     onSearchScrollback = { query, caseSensitive -> tabsVm.searchScrollbackForPane(address, query, caseSensitive) },
                     onJumpToPreviousPrompt = { fromScrollOffset, fromShowingScrollback ->
-                        tabsVm.jumpToPreviousPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                        pane.session.jumpToPreviousPrompt(fromScrollOffset, fromShowingScrollback)
                     },
                     onJumpToNextPrompt = { fromScrollOffset, fromShowingScrollback ->
-                        tabsVm.jumpToNextPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                        pane.session.jumpToNextPrompt(fromScrollOffset, fromShowingScrollback)
                     },
-                    onClickToPromptCursor = { row, col -> tabsVm.clickToPromptCursorForPane(address, row, col) },
-                    onCopyLastCommandOutput = { tabsVm.copyLastCommandOutputForPane(address) },
-                    onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
-                    onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
-                    onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
-                    onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPromptForPane(address) },
+                    onClickToPromptCursor = { row, col -> pane.session.clickToPromptCursor(row, col) },
+                    onCopyLastCommandOutput = { pane.session.copyLastCommandOutput() },
+                    onTrustUpdatedHostKey = { pane.session.trustUpdatedHostKey() },
+                    onDismissHostKeyWarning = { pane.session.dismissHostKeyWarning() },
+                    onTrustNewHostKey = { pane.session.trustNewHostKey() },
+                    onDismissNewHostKeyPrompt = { pane.session.dismissNewHostKeyPrompt() },
                     onTrzszStartUpload = { uri -> tabsVm.trzszStartUploadForPane(address, uri) },
                     onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(address) },
-                    onTrzszCancel = { tabsVm.trzszCancelForPane(address) },
-                    onTrzszDismiss = { tabsVm.trzszDismissForPane(address) },
-                    onGetSessionLog = { tabsVm.getSessionLogForPane(address) },
+                    onTrzszCancel = { pane.session.trzszCancel() },
+                    onTrzszDismiss = { pane.session.trzszDismiss() },
+                    onGetSessionLog = { pane.session.log.value },
                     onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(address, snippet) },
                     onSendKeySequence = { steps -> tabsVm.sendKeySequenceToPane(address, steps) },
-                    onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(address, approved) },
+                    onRespondAgentSignRequest = { approved -> pane.session.respondAgentSignRequest(approved) },
                     onRequestFocus = { tabsVm.setFocusedPane(address) },
                     // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
                     // 画面分割中でもタブ切替はタブ単位の操作なので、どちらのペインからでも同じ

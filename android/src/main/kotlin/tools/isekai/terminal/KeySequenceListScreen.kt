@@ -1,11 +1,9 @@
 package tools.isekai.terminal
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -29,7 +27,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,9 +36,9 @@ import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.KeySequencePackInstallation
 import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.previewText
-import tools.isekai.terminal.input.shortLabel
 import tools.isekai.terminal.pack.KeySequencePack
 import tools.isekai.terminal.ui.DeleteConfirmDialog
+import tools.isekai.terminal.ui.ListItemCard
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
@@ -154,41 +151,14 @@ private fun KeySequenceCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onEdit),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = keySequence.label,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                )
-                Spacer(Modifier.width(2.dp))
-                Text(
-                    text = keySequence.steps.previewText(),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                )
-                Text(
-                    text = if (keySequence.profileId == null) "全プロファイル共通" else "特定プロファイル専用",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            TextButton(onClick = onEdit) { Text("編集") }
-            TextButton(onClick = onDelete) { Text("削除") }
-        }
-    }
+    ListItemCard(
+        title = keySequence.label,
+        subtitle = keySequence.steps.previewText(),
+        caption = if (keySequence.profileId == null) "全プロファイル共通" else "特定プロファイル専用",
+        onTap = onEdit,
+        onEdit = onEdit,
+        onDelete = onDelete,
+    )
 }
 
 /**

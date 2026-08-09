@@ -1,7 +1,6 @@
 package tools.isekai.terminal
 
 import android.app.Application
-import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.KeyEntry
@@ -13,12 +12,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-class ProfileEditViewModel(app: Application) : AndroidViewModel(app) {
+class ProfileEditViewModel(app: Application) : SavingEditViewModel<ConnectionProfile>(app) {
     private val _keys = MutableStateFlow<List<KeyEntry>>(emptyList())
     val keys: StateFlow<List<KeyEntry>> = _keys.asStateFlow()
-
-    private val _isSaving = MutableStateFlow(false)
-    val isSaving: StateFlow<Boolean> = _isSaving.asStateFlow()
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -26,14 +22,11 @@ class ProfileEditViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun save(profile: ConnectionProfile, onSaved: () -> Unit) {
-        if (_isSaving.value) return
-        _isSaving.value = true
-        viewModelScope.launch {
-            RemoteLogger.i("IsekaiTerminalProfile", "saving profile: label='${profile.label}' host=${profile.host}:${profile.port} user=${profile.username} authType=${profile.authType} keyId=${profile.keyId} id=${if (profile.id == 0L) "new" else "${profile.id}"}")
-            Repositories.profiles.save(profile) // Room の suspend fun が内部で IO ディスパッチする
-            _isSaving.value = false
-            onSaved()
-        }
+    override fun onSaving(entity: ConnectionProfile) {
+        RemoteLogger.i("IsekaiTerminalProfile", "saving profile: label='${entity.label}' host=${entity.host}:${entity.port} user=${entity.username} authType=${entity.authType} keyId=${entity.keyId} id=${if (entity.id == 0L) "new" else "${entity.id}"}")
+    }
+
+    override suspend fun persist(entity: ConnectionProfile) {
+        Repositories.profiles.save(entity) // Room の suspend fun が内部で IO ディスパッチする
     }
 }
