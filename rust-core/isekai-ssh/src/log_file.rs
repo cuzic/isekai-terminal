@@ -33,14 +33,103 @@
 //! human-facing reconnect status lines into a log file by default too,
 //! defeating the point (found during design review before implementing —
 //! see the plan for this change).
+//!
+//! The two process-wide targets ([`LOG_FILE`]/[`VERBOSE_LOG_FILE`]) are both
+//! [`Sink`] instances: a single `OnceLock<Mutex<File>>`-backed open/append
+//! implementation, since `init`/`append_line` and `init_verbose`/
+//! `append_verbose_line` used to be two independent, near-identical copies
+//! of that exact logic. One real drift this unification fixes: `init`
+//! (`--isekai-log-file`) never created its target's parent directory or
+//! restricted its permissions to `0o600` on Unix, while `init_verbose` (the
+//! always-on default sink) already did both — folding both into
+//! [`Sink::open`] makes `--isekai-log-file` do the same now, a small,
+//! deliberate hardening riding along with the dedup rather than a
+//! functional change anyone depends on the old gap for.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
-static VERBOSE_LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+/// A single process-wide log target: `open()` installs the backing file (at
+/// most once — a second `open()` call is a caller bug, per [`init`]'s doc
+/// comment, so its handle is simply dropped), `append_line`/`append_bytes`
+/// write to it, and both silently no-op before `open()` succeeds or once
+/// installed but subsequently unwritable (disk full, file removed out from
+/// under the process, a poisoned lock from an earlier panic while holding
+/// it) — logging must never be able to fail the actual command.
+struct Sink(OnceLock<Mutex<File>>);
+
+impl Sink {
+    const fn new() -> Self {
+        Sink(OnceLock::new())
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// Opens (creating parent dirs as needed) `path` and installs it as this
+    /// sink's target, always appending (never truncating the *file itself*
+    /// — repeated invocations during one debugging session accumulate a
+    /// single history rather than each overwriting the last) with `0o600`
+    /// permissions on Unix. `truncate_over`, when given, first removes a
+    /// pre-existing file already larger than that many bytes — the default
+    /// verbose sink's bounded-growth safety net (see
+    /// [`VERBOSE_LOG_MAX_BYTES`]); the explicit `--isekai-log-file` sink
+    /// passes `None` and append-forevers by design.
+    fn open(&self, path: &Path, truncate_over: Option<u64>) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(max_bytes) = truncate_over {
+            if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > max_bytes {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        // `OnceLock::set` failing (already initialized) would mean the
+        // caller opened this sink twice — a caller bug, not a runtime
+        // condition to handle gracefully — so the second file handle is
+        // simply dropped.
+        let _ = self.0.set(Mutex::new(file));
+        Ok(())
+    }
+
+    /// Appends raw `bytes` verbatim (no line-ending massaging — callers that
+    /// have whole lines already terminated should just include the `\n`).
+    fn append_bytes(&self, bytes: &[u8]) {
+        let Some(file) = self.0.get() else { return };
+        let Ok(mut file) = file.lock() else { return };
+        let _ = file.write_all(bytes);
+        let _ = file.flush();
+    }
+
+    /// Appends one already-formatted line (a trailing `\n` is always added,
+    /// whether or not `line` has one). Checks [`is_enabled`](Self::is_enabled)
+    /// itself first so a disabled sink skips building the `String` buffer
+    /// entirely, rather than relying solely on [`append_bytes`](Self::append_bytes)'s
+    /// own (otherwise-sufficient) no-op check.
+    fn append_line(&self, line: &str) {
+        if !self.is_enabled() {
+            return;
+        }
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        self.append_bytes(buf.as_bytes());
+    }
+}
+
+static LOG_FILE: Sink = Sink::new();
+static VERBOSE_LOG_FILE: Sink = Sink::new();
 
 /// Truncated if larger than this when (re-)opened — a lightweight safety
 /// net against unbounded growth now that this file is written by default
@@ -50,88 +139,55 @@ static VERBOSE_LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 /// session from growing this file without bound.
 const VERBOSE_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Opens (creating parent dirs + the file as needed) the default verbose
-/// log at `path` and installs it as the process-wide verbose-log target.
-/// Called at most once, from `run()`, only when `--isekai-log-file` was
-/// *not* given (that flag's own `init` above takes priority in
-/// `log_line_verbose!`). Truncates first if the existing file already
-/// exceeds [`VERBOSE_LOG_MAX_BYTES`]. Failure here (permissions, read-only
-/// filesystem, ...) is not fatal — `run()` simply proceeds without verbose
-/// logging enabled, same "never block the connection over a diagnostics
-/// nicety" philosophy as `append_bytes`.
+/// Opens the default verbose log at `path` and installs it as the
+/// process-wide verbose-log target. Called at most once, from `run()`, only
+/// when `--isekai-log-file` was *not* given (that flag's own [`init`] above
+/// takes priority in [`log_line_verbose!`]). Failure here (permissions,
+/// read-only filesystem, ...) is not fatal — `run()` simply proceeds
+/// without verbose logging enabled, same "never block the connection over a
+/// diagnostics nicety" philosophy as every other write in this module.
 pub fn init_verbose(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > VERBOSE_LOG_MAX_BYTES {
-        let _ = std::fs::remove_file(path);
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    let _ = VERBOSE_LOG_FILE.set(Mutex::new(file));
-    Ok(())
+    VERBOSE_LOG_FILE.open(path, Some(VERBOSE_LOG_MAX_BYTES))
 }
 
 /// Appends one already-formatted line to the default verbose log, silently
-/// doing nothing if `init_verbose` was never called or failed (same
-/// fail-open policy as [`append_line`]/[`append_bytes`]).
+/// doing nothing if [`init_verbose`] was never called or failed (same
+/// fail-open policy as [`append_line`]).
 pub fn append_verbose_line(line: &str) {
-    let Some(file) = VERBOSE_LOG_FILE.get() else { return };
-    let Ok(mut file) = file.lock() else { return };
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
-    let _ = file.write_all(buf.as_bytes());
-    let _ = file.flush();
+    VERBOSE_LOG_FILE.append_line(line);
 }
 
-/// Opens (creating if needed, always appending — repeated invocations
-/// during one debugging session accumulate a single history rather than
-/// each overwriting the last) `path` and installs it as the process-wide
-/// log file. Must be called at most once; `run()` only calls this when
-/// `--isekai-log-file` was actually given.
+/// Opens (creating if needed, always appending) `path` and installs it as
+/// the process-wide log file. Must be called at most once; `run()` only
+/// calls this when `--isekai-log-file` was actually given.
 pub fn init(path: &Path) -> std::io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    // `OnceLock::set` failing (already initialized) would mean `run()`
-    // called this twice — a caller bug, not a runtime condition to handle
-    // gracefully — so the second file handle is simply dropped.
-    let _ = LOG_FILE.set(Mutex::new(file));
-    Ok(())
+    LOG_FILE.open(path, None)
 }
 
 pub fn is_enabled() -> bool {
-    LOG_FILE.get().is_some()
+    LOG_FILE.is_enabled()
 }
 
-/// Appends raw `bytes` verbatim (no line-ending massaging — callers that
-/// have whole lines already terminated should just include the `\n`).
-/// Silently drops the write on I/O failure (e.g. disk full, file removed
-/// out from under us) — logging must never be able to fail the actual
-/// command. A poisoned lock (a prior panic while holding it) is likewise
-/// treated as "logging unavailable" rather than propagating the panic.
-fn append_bytes(bytes: &[u8]) {
-    let Some(file) = LOG_FILE.get() else { return };
-    let Ok(mut file) = file.lock() else { return };
-    let _ = file.write_all(bytes);
-    let _ = file.flush();
-}
-
-/// Appends one already-formatted line (a trailing `\n` is always added,
-/// whether or not `line` has one) — used by [`log_line!`].
+/// Appends one already-formatted line — used by [`log_line!`].
 pub fn append_line(line: &str) {
-    if !is_enabled() {
-        return;
+    LOG_FILE.append_line(line);
+}
+
+/// Writes `line` to [`LOG_FILE`] if `--isekai-log-file` is active, otherwise
+/// to `fallback` — the branching [`log_line!`]/[`log_line_verbose!`] used to
+/// each re-implement per macro arm (four near-identical copies total: two
+/// macros × the empty-args/format-args arms each needs). `fallback` is what
+/// keeps the two macros meaningfully different — `log_line!`'s prints to
+/// this process's own stderr, `log_line_verbose!`'s writes to the always-on
+/// default verbose sink — not just "which file," so they remain two
+/// macros, each now a thin wrapper around this one function instead of
+/// hand-rolling the `is_enabled` branch itself.
+pub(crate) fn dispatch(line: &str, fallback: impl FnOnce(&str)) {
+    if is_enabled() {
+        append_line(line);
+    } else {
+        fallback(line);
     }
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
-    append_bytes(buf.as_bytes());
 }
 
 /// Drop-in replacement for `eprintln!` used throughout `wrapper.rs`: when no
@@ -141,18 +197,10 @@ pub fn append_line(line: &str) {
 /// reaches the terminal while a log file is configured.
 macro_rules! log_line {
     () => {{
-        if $crate::log_file::is_enabled() {
-            $crate::log_file::append_line("");
-        } else {
-            eprintln!();
-        }
+        $crate::log_file::dispatch("", |_line| eprintln!());
     }};
     ($($arg:tt)*) => {{
-        if $crate::log_file::is_enabled() {
-            $crate::log_file::append_line(&format!($($arg)*));
-        } else {
-            eprintln!($($arg)*);
-        }
+        $crate::log_file::dispatch(&format!($($arg)*), |line| eprintln!("{line}"));
     }};
 }
 pub(crate) use log_line;
@@ -167,18 +215,10 @@ pub(crate) use log_line;
 /// case.
 macro_rules! log_line_verbose {
     () => {{
-        if $crate::log_file::is_enabled() {
-            $crate::log_file::append_line("");
-        } else {
-            $crate::log_file::append_verbose_line("");
-        }
+        $crate::log_file::dispatch("", |line| $crate::log_file::append_verbose_line(line));
     }};
     ($($arg:tt)*) => {{
-        if $crate::log_file::is_enabled() {
-            $crate::log_file::append_line(&format!($($arg)*));
-        } else {
-            $crate::log_file::append_verbose_line(&format!($($arg)*));
-        }
+        $crate::log_file::dispatch(&format!($($arg)*), |line| $crate::log_file::append_verbose_line(line));
     }};
 }
 pub(crate) use log_line_verbose;
@@ -197,6 +237,6 @@ pub async fn redirect_child_stderr(mut child_stderr: tokio::process::ChildStderr
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        append_bytes(&buf[..n]);
+        LOG_FILE.append_bytes(&buf[..n]);
     }
 }

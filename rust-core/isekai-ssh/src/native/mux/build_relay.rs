@@ -27,7 +27,7 @@
 //! type that forcing one shared function would obscure more than it'd share
 //! (see `build_exec.rs`'s module docs).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use russh::client;
 use tokio::sync::{mpsc, oneshot};
 
@@ -69,119 +69,53 @@ pub(crate) const BUILD_ABORTED_SENTINEL: i32 = i32::MIN;
 /// failed write, as the simpler Unix single-process path does) means a
 /// build that goes briefly quiet doesn't delay detecting a disconnect that
 /// already happened.
+///
+/// A ~20-line [`crate::build_exec::BuildRelay`] adapter over the shared
+/// runner (`crate::build_exec::run_build`, Epic P × 2026-08 unification) —
+/// see that function's module docs for the 3 dispatch paths this used to
+/// duplicate and the behavior drift unifying them deliberately closes.
+/// `send`/`watch` reborrow the *same* `&mut channel` at different points of
+/// one `select!` loop inside `run_build`, which is exactly why `BuildRelay`
+/// is one trait (implemented once here on a single `ChannelRelay`) rather
+/// than two independent generic parameters: `run_build`'s `select!` only
+/// ever holds one of `relay.send(..)`/`relay.watch()`'s implicit `&mut self`
+/// reborrows alive at a time (the loser of each `select!` iteration is
+/// dropped before the winner's handler runs), the same reason the original,
+/// pre-unification version of this function could freely alternate
+/// `channel.data(..)`/`channel.wait()` calls on the same `&mut channel`.
 pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::Msg>, host: &str, profile_name: &str) -> Result<()> {
-    let profile = crate::build_profile::default_build_profiles_path()
-        .and_then(|path| crate::build_profile::load_build_profiles(&path))
-        .ok()
-        .and_then(|store| crate::build_profile::find_profile(&store, host, profile_name).cloned());
-
-    let Some(profile) = profile else {
-        let chunk = crate::build_exec::encode_build_output_chunk(
-            isekai_protocol::BuildOutputStream::Stderr,
-            format!("isekai-ssh: no build profile registered for {host:?}/{profile_name:?}\n").into_bytes(),
-        )?;
-        let _ = channel.data(&chunk[..]).await;
-        let finished = crate::build_exec::encode_build_finished(127, Vec::new())?;
-        let _ = channel.data(&finished[..]).await;
-        let _ = channel.close().await;
-        return Ok(());
-    };
-
-    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        // Mirrors the unknown-profile arm above (and `run_client_build`'s
-        // matching arm): a profile that exists but can't actually be
-        // spawned (e.g. `dir` no longer exists) must still answer with a
-        // `BuildFinished`, not just propagate `Err` and leave the remote's
-        // `isekai-pipe ctl build` hanging forever with no reply and no
-        // channel close (`russh::Channel` has no `Drop` impl, so simply
-        // returning here without an explicit `close()` would never send
-        // `CHANNEL_CLOSE` either). `126` (distinct from `127` above) matches
-        // the POSIX convention for "found but not executable".
-        Err(e) => {
-            let chunk = crate::build_exec::encode_build_output_chunk(
-                isekai_protocol::BuildOutputStream::Stderr,
-                format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}\n").into_bytes(),
-            )?;
-            let _ = channel.data(&chunk[..]).await;
-            let finished = crate::build_exec::encode_build_finished(126, Vec::new())?;
-            let _ = channel.data(&finished[..]).await;
-            let _ = channel.close().await;
-            return Ok(());
+    struct ChannelRelay<'a>(&'a mut russh::Channel<client::Msg>);
+    impl crate::build_exec::BuildRelay for ChannelRelay<'_> {
+        async fn send(&mut self, bytes: Vec<u8>) -> bool {
+            self.0.data(&bytes[..]).await.is_ok()
         }
-    };
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
-    let stdout_task = tokio::spawn(crate::build_exec::pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
-    let stderr_task = tokio::spawn(crate::build_exec::pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
-    drop(tx);
-
-    let mut disconnected = false;
-    loop {
-        tokio::select! {
-            recv = rx.recv() => {
-                match recv {
-                    Some((stream, bytes)) => {
-                        let chunk = crate::build_exec::encode_build_output_chunk(stream, bytes)?;
-                        if channel.data(&chunk[..]).await.is_err() {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                    None => break,
+        async fn watch(&mut self) {
+            loop {
+                match self.0.wait().await {
+                    None | Some(russh::ChannelMsg::Close) => return,
+                    _ => continue,
                 }
             }
-            msg = channel.wait() => {
-                if matches!(msg, None | Some(russh::ChannelMsg::Close)) {
-                    disconnected = true;
-                    break;
-                }
-            }
+        }
+        async fn close(&mut self) {
+            // `russh::Channel` has no `Drop` impl, so nothing sends
+            // `CHANNEL_CLOSE` unless we do — without this the remote
+            // `isekai-pipe ctl build` would see its reply arrive but the
+            // channel itself never properly close.
+            let _ = self.0.close().await;
         }
     }
-    // See `crate::ctl_forward::run_build`'s identical comment: dropping `rx`
-    // unblocks any pump task still waiting on a full channel so awaiting
-    // them below can't deadlock.
-    drop(rx);
 
-    if disconnected {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+    let outcome = crate::build_exec::run_build(
+        &mut ChannelRelay(channel),
+        host,
+        profile_name,
+        crate::ctl_forward::TerminalKind::WindowsTerminal,
+    )
+    .await?;
+    if matches!(outcome, crate::build_exec::BuildOutcome::Disconnected) {
         bail!("isekai-ssh: ctl channel closed before the build finished; killed the child process");
     }
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    let status = child.wait().await.context("isekai-ssh: failed to wait for the build child process")?;
-    let exit_code = status.code().unwrap_or(-1);
-
-    let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
-        (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if let Some(dest_dir) = &profile.dest_dir {
-        crate::build_exec::spawn_result_push(host.to_string(), dest_dir.clone(), result_paths.clone());
-    }
-    let finished = crate::build_exec::encode_build_finished(exit_code, result_paths)?;
-    let _ = channel.data(&finished[..]).await;
-    // `russh::Channel` has no `Drop` impl, so nothing sends `CHANNEL_CLOSE`
-    // unless we do — without this the remote `isekai-pipe ctl build` would
-    // see its reply arrive but the channel itself never properly close.
-    let _ = channel.close().await;
     Ok(())
 }
 
@@ -248,123 +182,37 @@ pub(crate) fn spawn_client_build(host: String, profile_name: String, build_out_t
     ActiveBuild { abort_tx: Some(abort_tx), task }
 }
 
-async fn run_client_build(host: String, profile_name: String, build_out_tx: mpsc::UnboundedSender<Vec<u8>>, mut abort_rx: oneshot::Receiver<()>) {
-    let profile = crate::build_profile::default_build_profiles_path()
-        .and_then(|path| crate::build_profile::load_build_profiles(&path))
-        .ok()
-        .and_then(|store| crate::build_profile::find_profile(&store, &host, &profile_name).cloned());
-
-    let Some(profile) = profile else {
-        if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
-            isekai_protocol::BuildOutputStream::Stderr,
-            format!("isekai-ssh: no build profile registered for {host:?}/{profile_name:?}\n").into_bytes(),
-        ) {
-            let _ = build_out_tx.send(chunk);
+/// A ~15-line [`crate::build_exec::BuildRelay`] adapter over the shared
+/// runner (`crate::build_exec::run_build`, Epic P × 2026-08 unification).
+/// `watch` resolving on *either* an explicit abort or `abort_tx` simply being
+/// dropped (both surface identically as `abort_rx` resolving, one `Ok` one
+/// `Err`) mirrors this function's pre-unification behavior exactly — both
+/// were always treated the same way here.
+async fn run_client_build(host: String, profile_name: String, build_out_tx: mpsc::UnboundedSender<Vec<u8>>, abort_rx: oneshot::Receiver<()>) {
+    struct ClientRelay {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+        abort_rx: oneshot::Receiver<()>,
+    }
+    impl crate::build_exec::BuildRelay for ClientRelay {
+        async fn send(&mut self, bytes: Vec<u8>) -> bool {
+            // A send failure means `run_inner`'s own select loop already
+            // ended (the owner connection was lost) — there is nowhere left
+            // for this output to go.
+            self.tx.send(bytes).is_ok()
         }
-        if let Ok(finished) = crate::build_exec::encode_build_finished(127, Vec::new()) {
-            let _ = build_out_tx.send(finished);
-        }
-        return;
-    };
-
-    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        // Mirrors the unknown-profile arm above and `run_build_over_channel`'s
-        // matching arm (review finding: this side was missed in an earlier
-        // pass — a spawn failure here used to just log and return with
-        // nothing sent into `build_out_tx`, leaving `active_build` `Some`
-        // forever — every later `BuildRequest` on this tab silently ignored
-        // by `client.rs`'s `active_build.is_some()` guard, and the owner's
-        // `active_build_reply_tx` never cleared either, rejecting every
-        // subsequent remote build with 125 while this one hung with no
-        // reply at all).
-        Err(e) => {
-            log_line!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}");
-            if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
-                isekai_protocol::BuildOutputStream::Stderr,
-                format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}\n").into_bytes(),
-            ) {
-                let _ = build_out_tx.send(chunk);
-            }
-            if let Ok(finished) = crate::build_exec::encode_build_finished(126, Vec::new()) {
-                let _ = build_out_tx.send(finished);
-            }
-            return;
-        }
-    };
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    let (tx, mut rx) = mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
-    let stdout_task = tokio::spawn(crate::build_exec::pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
-    let stderr_task = tokio::spawn(crate::build_exec::pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
-    drop(tx);
-
-    let mut aborted = false;
-    loop {
-        tokio::select! {
-            recv = rx.recv() => {
-                match recv {
-                    Some((stream, bytes)) => {
-                        let Ok(chunk) = crate::build_exec::encode_build_output_chunk(stream, bytes) else {
-                            continue;
-                        };
-                        // A send failure means `run_inner`'s own select loop
-                        // already ended (the owner connection was lost) —
-                        // there is nowhere left for this output to go.
-                        if build_out_tx.send(chunk).is_err() {
-                            aborted = true;
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            _ = &mut abort_rx => {
-                aborted = true;
-                break;
-            }
+        async fn watch(&mut self) {
+            let _ = (&mut self.abort_rx).await;
         }
     }
-    // See `run_build_over_channel`'s identical comment: dropping `rx`
-    // unblocks any pump task still waiting on a full channel so awaiting
-    // them below can't deadlock.
-    drop(rx);
 
-    if aborted {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-        return;
-    }
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    let Ok(status) = child.wait().await else {
-        return;
-    };
-    let exit_code = status.code().unwrap_or(-1);
-
-    let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
-        (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if let Some(dest_dir) = &profile.dest_dir {
-        crate::build_exec::spawn_result_push(host, dest_dir.clone(), result_paths.clone());
-    }
-    if let Ok(finished) = crate::build_exec::encode_build_finished(exit_code, result_paths) {
-        let _ = build_out_tx.send(finished);
+    let mut relay = ClientRelay { tx: build_out_tx, abort_rx };
+    // Mirrors this function's pre-unification behavior: any error here
+    // (in practice, only an unreachable `serde_json` encode failure — see
+    // `build_exec.rs`'s module docs) is logged and otherwise swallowed
+    // rather than propagated, since this function has always returned `()`
+    // and `client.rs::run_inner` has no `Result`-shaped slot to route it to.
+    if let Err(e) = crate::build_exec::run_build(&mut relay, &host, &profile_name, crate::ctl_forward::TerminalKind::WindowsTerminal).await {
+        log_line!("isekai-ssh: build profile {host:?}/{profile_name:?} failed: {e:#}");
     }
 }
 
