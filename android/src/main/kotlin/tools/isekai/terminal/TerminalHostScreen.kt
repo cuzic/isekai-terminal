@@ -545,33 +545,33 @@ private fun TerminalPaneScreen(
                 onUserActivity = onUserActivity,
                 actions = TerminalScreenActions(
                     onConnect = { tabsVm.reconnectPane(address) },
-                    onDisconnect = { tabsVm.disconnectPane(address) },
-                    onCancelReconnect = { tabsVm.cancelReconnectPane(address) },
+                    onDisconnect = { pane.session.disconnect() },
+                    onCancelReconnect = { pane.session.cancelReconnect() },
                     onBack = onBack,
-                    onSend = { bytes -> tabsVm.sendToPane(address, bytes) },
-                    onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
-                    onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
+                    onSend = { bytes -> pane.session.send(bytes) },
+                    onResize = { cols, rows -> pane.session.resize(cols, rows) },
+                    onScrollbackCells = { offset, rows -> pane.session.scrollbackCells(offset, rows) },
                     onSearchScrollback = { query, caseSensitive -> tabsVm.searchScrollbackForPane(address, query, caseSensitive) },
                     onJumpToPreviousPrompt = { fromScrollOffset, fromShowingScrollback ->
-                        tabsVm.jumpToPreviousPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                        pane.session.jumpToPreviousPrompt(fromScrollOffset, fromShowingScrollback)
                     },
                     onJumpToNextPrompt = { fromScrollOffset, fromShowingScrollback ->
-                        tabsVm.jumpToNextPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                        pane.session.jumpToNextPrompt(fromScrollOffset, fromShowingScrollback)
                     },
-                    onClickToPromptCursor = { row, col -> tabsVm.clickToPromptCursorForPane(address, row, col) },
-                    onCopyLastCommandOutput = { tabsVm.copyLastCommandOutputForPane(address) },
-                    onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
-                    onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
-                    onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
-                    onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPromptForPane(address) },
+                    onClickToPromptCursor = { row, col -> pane.session.clickToPromptCursor(row, col) },
+                    onCopyLastCommandOutput = { pane.session.copyLastCommandOutput() },
+                    onTrustUpdatedHostKey = { pane.session.trustUpdatedHostKey() },
+                    onDismissHostKeyWarning = { pane.session.dismissHostKeyWarning() },
+                    onTrustNewHostKey = { pane.session.trustNewHostKey() },
+                    onDismissNewHostKeyPrompt = { pane.session.dismissNewHostKeyPrompt() },
                     onTrzszStartUpload = { uri -> tabsVm.trzszStartUploadForPane(address, uri) },
                     onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(address) },
-                    onTrzszCancel = { tabsVm.trzszCancelForPane(address) },
-                    onTrzszDismiss = { tabsVm.trzszDismissForPane(address) },
-                    onGetSessionLog = { tabsVm.getSessionLogForPane(address) },
+                    onTrzszCancel = { pane.session.trzszCancel() },
+                    onTrzszDismiss = { pane.session.trzszDismiss() },
+                    onGetSessionLog = { pane.session.log.value },
                     onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(address, snippet) },
                     onSendKeySequence = { steps -> tabsVm.sendKeySequenceToPane(address, steps) },
-                    onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(address, approved) },
+                    onRespondAgentSignRequest = { approved -> pane.session.respondAgentSignRequest(approved) },
                     onRequestFocus = { tabsVm.setFocusedPane(address) },
                     // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
                     // 画面分割中でもタブ切替はタブ単位の操作なので、どちらのペインからでも同じ

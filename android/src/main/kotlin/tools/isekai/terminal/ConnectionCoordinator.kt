@@ -16,13 +16,7 @@ import tools.isekai.terminal.session.AuthValidator
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
-import uniffi.isekai_terminal_core.IsekaiPipeQuicConfig
-import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
-import uniffi.isekai_terminal_core.MultipathIsekaiPipeQuicConfig
-import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.SshAuth
-import uniffi.isekai_terminal_core.SshConfig
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
@@ -81,11 +75,18 @@ internal class ConnectionCoordinator(
             } else {
                 null
             }
+            // 実際の`connect_*`種別によらず、呼び出し先はいずれも接続前に
+            // isekai-pipe serveのAndroidサービスが起動していることを要求するため、
+            // dispatch前に一度だけ呼んでおく(旧実装は`connectX`という薄いラッパーを
+            // 7つ経由してそれぞれの中でensureServiceRunning()を呼んでいた)。
+            executor.ensureServiceRunning()
             when (profile.transportPreference) {
-                TransportPreference.PLAIN_SSH -> connect(pane, profile.toSshConfig(auth, jumpAuth))
-                TransportPreference.TSSHD_QUIC -> connectQuic(pane, profile.toQuicConfig(auth))
-                TransportPreference.ISEKAI_PIPE_QUIC -> connectIsekaiPipeQuic(pane, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
-                TransportPreference.AUTO -> connectIsekaiPipeQuicAuto(pane, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.PLAIN_SSH -> pane.session.connect(profile.toSshConfig(auth, jumpAuth))
+                TransportPreference.TSSHD_QUIC -> pane.session.connectQuic(profile.toQuicConfig(auth))
+                TransportPreference.ISEKAI_PIPE_QUIC ->
+                    pane.session.connectIsekaiPipeQuic(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.AUTO ->
+                    pane.session.connectIsekaiPipeQuicAuto(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
                 TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH -> {
                     // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
                     // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
@@ -98,16 +99,18 @@ internal class ConnectionCoordinator(
                         PhysicalMultipathFds()
                     }
                     pane.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
-                    connectMultipathIsekaiPipeQuic(pane, profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth))
+                    pane.session.connectMultipathIsekaiPipeQuic(
+                        profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth),
+                    )
                 }
                 TransportPreference.ISEKAI_STUN_P2P_QUIC ->
-                    connectIsekaiStunP2p(pane, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
+                    pane.session.connectIsekaiStunP2p(profile.toIsekaiStunP2pConfig(auth, jumpAuth))
                 TransportPreference.ISEKAI_LINK_RELAY_QUIC -> {
                     // relayJwt は Room に RelayCredentialVault で暗号化して保存してあるため、
                     // 実際の接続直前に復号する(toIsekaiLinkRelayConfig 自体は暗号化を意識しない
                     // 純粋なマッピング関数のまま保つ)。
                     val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
-                    connectIsekaiLinkRelay(pane, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
+                    pane.session.connectIsekaiLinkRelay(decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
                 }
             }
             // タスク#65: 復号済み秘密鍵PEMのベストエフォートなメモリ消去。
@@ -140,41 +143,6 @@ internal class ConnectionCoordinator(
         val commands = profile.postConnectCommands?.takeIf { it.isNotBlank() }
         pane.pendingPostConnectBytes = commands?.let { SnippetCommands.toBytes(it, appendNewline = true) }
         pane.postConnectSent.set(pane.pendingPostConnectBytes == null)
-    }
-
-    private fun connect(pane: PaneState, config: SshConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connect(config)
-    }
-
-    private fun connectQuic(pane: PaneState, config: QuicConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectQuic(config)
-    }
-
-    private fun connectIsekaiPipeQuic(pane: PaneState, config: IsekaiPipeQuicConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectIsekaiPipeQuic(config)
-    }
-
-    private fun connectIsekaiPipeQuicAuto(pane: PaneState, config: IsekaiPipeQuicConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectIsekaiPipeQuicAuto(config)
-    }
-
-    private fun connectMultipathIsekaiPipeQuic(pane: PaneState, config: MultipathIsekaiPipeQuicConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectMultipathIsekaiPipeQuic(config)
-    }
-
-    private fun connectIsekaiStunP2p(pane: PaneState, config: IsekaiStunP2pConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectIsekaiStunP2p(config)
-    }
-
-    private fun connectIsekaiLinkRelay(pane: PaneState, config: IsekaiLinkRelayConfig) {
-        executor.ensureServiceRunning()
-        pane.session.connectIsekaiLinkRelay(config)
     }
 
     private suspend fun resolveAuth(pane: PaneState, profile: ConnectionProfile, password: String?): SshAuth? =
