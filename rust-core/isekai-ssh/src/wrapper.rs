@@ -1208,18 +1208,72 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     }
 
+    let (key, path) = register_helper_trust(
+        &resolution.isekai.profile,
+        &candidate.via,
+        handshake,
+        helper_sha256,
+        "unknown".to_string(),
+        None,
+        cached_relay_addr,
+    )
+    .map_err(|e| e.context(BootstrapFailure::PersistenceFailed(format!("failed to register {:?}", resolution.isekai.profile))))?;
+    log_line_verbose!("Registered {key:?} in {}", path.display());
+    Ok(())
+}
+
+/// Writes a `HelperTrust`-backed `PersistentProfile` for `profile` (the
+/// register-flow tail shared by `isekai-ssh init`'s `init::run` and this
+/// module's own auto-bootstrap path above) — the same 13-field `HelperTrust`
+/// literal, `PersistentProfile::migrate_legacy_helper_trust` +
+/// `write_persistent_profile` sequence both used to hand-roll almost
+/// verbatim. Returns the normalized trust-store key and the path
+/// `write_persistent_profile` wrote to; the caller decides how to report
+/// both (`init::run` prints to stdout unconditionally since it's always
+/// interactive, this module logs via `log_line_verbose!` since it's the
+/// opportunistic auto-bootstrap path — different enough UX that unifying it
+/// too would fight the whole point of each caller's own output convention).
+///
+/// `cached_relay_addr` is a caller-computed parameter rather than derived
+/// here: `init::run` always deploys via a relay (so it's always
+/// `handshake.relay_public_addr().unwrap_or(<its own --relay-addr>)`), while
+/// `bootstrap_and_register` above also handles a *direct* (non-relay)
+/// launch (falling back to `handshake.direct_by_bootstrap_host_port()`
+/// instead) — genuinely different logic per caller, not further
+/// duplication worth unifying.
+///
+/// Deliberately returns a plain `anyhow::Result`, not the
+/// `BootstrapFailure`-classified one `bootstrap_and_register` used to wrap
+/// only around the final `write_persistent_profile` step: `init::run` has no
+/// use for that classification (it never auto-retries — see
+/// `.claude/rules/always-connects.md`), and folding the two harmless,
+/// already-validated-earlier `default_profiles_dir`/`normalize_host_port`
+/// steps into the same `BootstrapFailure::PersistenceFailed` classification
+/// at the call site below is behavior-neutral either way (neither
+/// `should_redirect_to_login`/`should_redirect_to_init`/`may_retry` treats
+/// `PersistenceFailed` differently from an unclassified error — see
+/// `isekai-bootstrap-plan::BootstrapFailure`'s own doc comments).
+pub(crate) fn register_helper_trust(
+    profile: &str,
+    candidate_via: &[String],
+    handshake: &isekai_protocol::HandshakeJson,
+    helper_sha256: String,
+    version: String,
+    channel: Option<String>,
+    cached_relay_addr: String,
+) -> Result<(String, std::path::PathBuf)> {
     let profiles_dir =
         default_profiles_dir().context("could not determine the profiles directory (is $HOME set?)")?;
-    let key = isekai_trust::normalize_host_port(&resolution.isekai.profile)
-        .with_context(|| format!("invalid profile {:?}", resolution.isekai.profile))?;
+    let key = isekai_trust::normalize_host_port(profile).with_context(|| format!("invalid profile {profile:?}"))?;
     let now = now_rfc3339();
+    let identity = handshake.cert_sha256().to_string();
     let trust = HelperTrust {
         identity_pubkey: identity.clone(),
         trusted_helper_sha256: helper_sha256,
-        trusted_helper_version: "unknown".to_string(),
+        trusted_helper_version: version,
         update_policy: UpdatePolicy::ExactDigestOnly,
-        release_channel: None,
-        last_via: (!candidate.via.is_empty()).then(|| candidate.via.join(",")),
+        release_channel: channel,
+        last_via: (!candidate_via.is_empty()).then(|| candidate_via.join(",")),
         trusted_at: now.clone(),
         last_seen_at: now,
         cached_relay_addr,
@@ -1227,14 +1281,10 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         cached_session_secret: handshake.session_secret.clone(),
         cached_stun_observed_addr: handshake.stun_observed_addr().map(str::to_string),
     };
-    let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
-    let path = write_persistent_profile(&profiles_dir, &profile)
-        .map_err(|e| {
-            anyhow::Error::new(e)
-                .context(BootstrapFailure::PersistenceFailed(format!("failed to write profile to {}", profiles_dir.display())))
-        })?;
-    log_line_verbose!("Registered {key:?} in {}", path.display());
-    Ok(())
+    let stored = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
+    let path = write_persistent_profile(&profiles_dir, &stored)
+        .with_context(|| format!("failed to write profile to {}", profiles_dir.display()))?;
+    Ok((key, path))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -2083,6 +2133,19 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// `init.rs` used to carry an identical `format_rfc3339_utc`/test pair
+    /// (deleted when `register_helper_trust` was extracted here and became
+    /// this function's sole remaining caller) — moved here rather than
+    /// dropped, so this crate keeps direct coverage of the civil-calendar
+    /// conversion `HelperTrust.trusted_at`/`last_seen_at` depend on.
+    #[test]
+    fn rfc3339_formats_a_known_timestamp() {
+        // 2026-07-04T00:00:00Z, matching the fixtures used across
+        // isekai-trust's own tests.
+        let unix_secs = 1_783_123_200u64;
+        assert_eq!(format_rfc3339_utc(unix_secs), "2026-07-04T00:00:00Z");
     }
 
     #[test]
