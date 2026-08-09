@@ -354,6 +354,33 @@ pub async fn respond_resume_rejected(send: &mut AnyByteStreamWriteHalf, reason: 
 /// moved here verbatim in spirit, with explicit overflow handling on the
 /// offset arithmetic added (flagged in review as the class of bug this
 /// project has hit before in adjacent offset-tracking code).
+///
+/// This is the **single** replay-buffer implementation in the workspace.
+/// `isekai-pipe` previously carried two near-identical copies of it
+/// (`engine::resume::OutputBuffer` on the server side, `resume_loop::
+/// C2hReplayBuffer` on the client side) which had silently drifted apart on
+/// [`Self::advance_start`]'s out-of-range behavior — see that method's docs
+/// for which behavior is correct and why the other one would corrupt
+/// offsets. Both now use this type.
+///
+/// # Overflow policy: reject, never evict
+///
+/// [`Self::append`] refuses to write anything that would exceed `capacity`
+/// and reports that as `false`; it never evicts the oldest bytes to make
+/// room. That is the only policy that makes sense for a *replay* buffer:
+/// the oldest bytes are precisely the ones a resuming peer is most likely
+/// to still need, so dropping them to accept newer ones converts a
+/// recoverable "slow down" into an unrecoverable
+/// [`ResumeRejectReason::OffsetGone`]. Callers are expected to apply real
+/// backpressure by never reading more than [`Self::remaining_capacity`]
+/// bytes from their source in the first place, which makes a `false` return
+/// a should-never-happen defensive signal rather than routine flow control.
+///
+/// (`isekai-pipe`'s `tty::ring_buffer` deliberately does the opposite —
+/// evicting oldest-first — because it is a scrollback buffer, where losing
+/// the oldest lines is the *intended* behavior and there is no peer whose
+/// offsets could desync. It is not a member of this family and must not be
+/// folded into it.)
 pub struct ReplayBuffer {
     data: VecDeque<u8>,
     start_offset: u64,
@@ -401,8 +428,9 @@ impl ReplayBuffer {
     /// Appends `bytes`. Returns `false` (writing nothing) if `bytes` would
     /// exceed `remaining_capacity()` — the caller is expected to only ever
     /// read up to `remaining_capacity()` bytes from its own source before
-    /// calling this (matching every existing caller of `OutputBuffer`), so
-    /// this is a defensive check, not the primary backpressure mechanism.
+    /// calling this, so this is a defensive check, not the primary
+    /// backpressure mechanism. See the type's docs for why the answer to
+    /// overflow is "refuse" and never "evict the oldest bytes".
     pub fn append(&mut self, bytes: &[u8]) -> bool {
         if bytes.len() > self.remaining_capacity() {
             return false;
@@ -412,10 +440,42 @@ impl ReplayBuffer {
     }
 
     /// Discards bytes the peer has confirmed receiving up to
-    /// `confirmed_offset`. A `confirmed_offset` at or before the current
-    /// `start_offset` is a no-op (already discarded, or a stale/duplicate
-    /// ack) rather than an error — acks can legitimately arrive
-    /// out of order or be resent.
+    /// `confirmed_offset`.
+    ///
+    /// A `confirmed_offset` at or before the current `start_offset` is a
+    /// no-op (already discarded, or a stale/duplicate ack) rather than an
+    /// error — acks can legitimately arrive out of order or be resent.
+    ///
+    /// A `confirmed_offset` beyond `end_offset()` **clamps**: the buffer is
+    /// drained and `start_offset` stops at the old `end_offset()`. It
+    /// deliberately does *not* jump `start_offset` ahead to
+    /// `confirmed_offset`, even though that would look like the tidier
+    /// postcondition, because that is unsound in the presence of the
+    /// send-then-append ordering every caller here uses:
+    ///
+    /// 1. The caller writes `n` bytes to the peer.
+    /// 2. The caller appends those same `n` bytes to this buffer.
+    ///
+    /// Between (1) and (2) the peer can legitimately receive, process, and
+    /// ack those bytes, so an ack naming an offset past the current
+    /// `end_offset()` is a *normal race*, not a protocol violation —
+    /// `isekai-pipe serve` hits exactly this window, since its ack reader
+    /// runs in a task spawned separately from its relay loop and the two
+    /// contend for the same session lock. Jumping `start_offset` to
+    /// `confirmed_offset` there would mislabel the bytes that step (2) is
+    /// about to append: they belong at the *old* `end_offset()`, so the
+    /// buffer would then hand a resuming peer already-delivered bytes under
+    /// a higher offset, silently duplicating data and desyncing both sides'
+    /// offset accounting. Clamping keeps step (2)'s bytes correctly
+    /// labelled.
+    ///
+    /// (`isekai-pipe`'s client-side copy of this buffer used to jump ahead
+    /// instead. It was safe only by accident of its own structure — there,
+    /// append and `advance_start` run sequentially in one task with append
+    /// first, so the window never opens — and it was never reachable anyway,
+    /// because `replay_and_advance` rejects an out-of-range offset via
+    /// `replay_from` before calling this. Consolidating on the clamping
+    /// behavior loses nothing and removes the trap.)
     pub fn advance_start(&mut self, confirmed_offset: u64) {
         while self.start_offset < confirmed_offset && !self.data.is_empty() {
             self.data.pop_front();
@@ -503,6 +563,40 @@ mod tests {
         assert!(buf.append(b"klmnop"));
         assert_eq!(buf.end_offset(), 16);
         assert_eq!(buf.replay_from(6).unwrap(), b"ghijklmnop");
+    }
+
+    /// Regression guard for the send-then-append race described in
+    /// `advance_start`'s docs: an ack that names bytes already written to
+    /// the peer but not yet appended here must clamp, so that the append
+    /// which follows still lands at the offset those bytes actually have.
+    /// The "jump `start_offset` to `confirmed_offset`" variant this
+    /// consolidation removed would leave `start_offset == 110` here and then
+    /// mislabel `"0123456789"` as offsets 110..120.
+    #[test]
+    fn advance_start_past_end_clamps_so_a_racing_append_stays_correctly_labelled() {
+        let mut buf = ReplayBuffer::new(64);
+        assert!(buf.append(b"0123456789"));
+        buf.advance_start(10);
+        assert_eq!(buf.start_offset(), 10);
+        assert!(buf.is_empty());
+
+        // The caller has just written offsets 10..20 to the peer but has not
+        // reached its own `append` yet; the peer acks all 20 bytes first.
+        buf.advance_start(20);
+        assert_eq!(buf.start_offset(), 10, "must clamp at end_offset, not jump to 20");
+        assert_eq!(buf.end_offset(), 10);
+
+        // Now the append lands. Those bytes are offsets 10..20 and must be
+        // replayable as such.
+        assert!(buf.append(b"abcdefghij"));
+        assert_eq!(buf.start_offset(), 10);
+        assert_eq!(buf.end_offset(), 20);
+        assert_eq!(buf.replay_from(10).unwrap(), b"abcdefghij");
+        assert_eq!(buf.replay_from(20).unwrap(), b"");
+        // The ack is re-delivered (the peer resends it); still consistent.
+        buf.advance_start(20);
+        assert_eq!(buf.start_offset(), 20);
+        assert!(buf.is_empty());
     }
 
     #[test]
