@@ -3381,10 +3381,16 @@ impl Perform for Terminal {
                     self.full_damage_pending = true;
                     let top = self.scroll_top;
                     let bot = self.scroll_bottom;
+                    // Sixel/Kitty(タスク#42): 領域内シフトは画像が乗っていた
+                    // グリッド位置の内容を別の内容へ置き換える——sibling
+                    // (`scroll_up_region`/`scroll_down_region`/`insert_lines`/
+                    // `delete_lines`)は全て`clear_images`を呼んでいたのに、
+                    // ここだけ漏れていた(`full_damage_pending`が同じ形で漏れて
+                    // いたのと同じ見落とし)。画像だけが古い行位置に取り残される
+                    // ので、`clear_images`docコメントの方針どおり消す。
+                    self.clear_images();
                     // SD(`scroll_down_region`)/IL(`insert_lines`)と同じ1行分の
-                    // 下方向シフト([shift_rows_down])。`clear_images`は歴史的に
-                    // ここだけ呼んでいないため、挙動を変えないよう呼び出さない
-                    // (sibling関数との差異はPhase 2レビューで別途扱う)。
+                    // 下方向シフト([shift_rows_down])。
                     self.shift_rows_down(top, bot, 1);
                 } else if self.cursor_row > 0 {
                     self.cursor_row -= 1;
@@ -7982,6 +7988,23 @@ mod tests {
             feed(&mut t, b"\r\n");
         }
         assert!(t.images().is_empty(), "スクロールで既存の画像配置は消去される");
+    }
+
+    #[test]
+    fn test_ri_scroll_clears_sixel_images_like_its_siblings() {
+        // RI(`ESC M`)がscroll_top上でスクロールする経路も、SU/SD/IL/DLと同じく
+        // 画像配置を消す(Phase 2で判明した抜け)。カーソル移動だけで済む
+        // 通常のRIは画面内容を動かさないので消さない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1b[5;1H"); // scroll_top(行0)ではない位置へ
+        feed(&mut t, b"\x1bM"); // RI: カーソルが上へ動くだけ
+        assert_eq!(t.cursor_row(), 3);
+        assert_eq!(t.images().len(), 1, "スクロールしないRIでは画像を消さない");
+        feed(&mut t, b"\x1b[1;1H"); // scroll_top へ
+        feed(&mut t, b"\x1bM"); // RI: 領域内シフトが起きる
+        assert!(t.images().is_empty(), "RIによるスクロールでも画像配置は消去される");
     }
 
     #[test]
