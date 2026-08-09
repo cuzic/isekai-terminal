@@ -19,10 +19,6 @@ pub(crate) mod net_health_policy;
 // Epic M ctl-socketパスの対応表(データモデル本体。実際の配線は#60の
 // `tmux_session.rs`/`orchestrator.rs::ensure_tmux_tab_window`)。
 pub(crate) mod tmux_locator;
-// #58: フル再接続(resume失敗)直後にtmux自身のscrollback履歴をcapture-pane
-// 経由で取り込むためのコマンド組み立て/出力パース。実際の配線は
-// `orchestrator.rs`側。
-pub(crate) mod tmux_scrollback;
 // #60: tmux session group のensure/attach + タブ用ウィンドウのcreate-or-select。
 // #61(run_exec)・#62(tmux_locator)を実際に繋ぎ合わせる本体。
 pub(crate) mod tmux_session;

@@ -16,10 +16,8 @@ use crate::theme::Theme;
 use crate::transport::{ExecError, ExecOutput, SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
-/// ローカルscrollbackの保持上限(行数)。タスク#58のtmux capture-paneベースの
-/// scrollback backfillも、独自の上限を新設せずこの値を再利用する
-/// (`tmux_scrollback::fetch_tmux_scrollback_history`の呼び出し元
-/// `orchestrator.rs::spawn_tmux_scrollback_backfill`参照)。
+/// ローカルscrollbackの保持上限(行数)。[`SessionCore::inject_scrollback_history`]の
+/// バッチ注入も、独自の上限を新設せずこの値を再利用する。
 pub(crate) const SCROLLBACK_LIMIT: usize = 1000;
 
 /// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
@@ -585,32 +583,33 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::FocusChanged(focused));
     }
 
-    /// タスク#58: フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、
-    /// ライブのPTY出力(`TransportEvent::Stdout`)がまだ1バイトも届いていない
-    /// うちに、tmux自身のscrollback履歴(`tmux_scrollback::fetch_tmux_scrollback_history`
-    /// がcapture-pane経由で取得したプレーンテキスト行)をこのタブのローカル
-    /// scrollbackへバッチ注入する。
+    /// フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、ライブのPTY
+    /// 出力(`TransportEvent::Stdout`)がまだ1バイトも届いていないうちに、
+    /// プレーンテキスト行のバッチをこのタブのローカルscrollbackへ注入する。
     ///
-    /// `lines`はtmux capture-paneの出力そのまま(古い→新しい、画面に一番近い行が
-    /// 最後)の順序で渡すこと —— `dispatch_result`が`Terminal::take_scrollback`の
-    /// 結果(同じく古い→新しい順)を`push_front`していく既存の規約とまったく同じ
-    /// 順序規約で積む(=`lines`の各行を出現順に`push_front`していく)ため、
-    /// 呼び出し順を変えてはいけない。
+    /// 2026-08-09時点でtmux capture-paneベースの呼び出し元(旧`tmux_scrollback.rs`/
+    /// `orchestrator.rs::spawn_tmux_scrollback_backfill`)は、`tmux_session::
+    /// ensure_tab_window`が常に`TmuxTargetKind::Window`のロケータしか作らないため
+    /// 到達不能なdead codeと判明し削除された(WU-R7、2026-08-09ユーザー判断)。
+    /// このメソッド自体は`SessionCore`の一般的なAPI(WU-R1の
+    /// `impl_session_core_delegation!`が全6トランスポートへ委譲する対象)として残す。
+    ///
+    /// `lines`は古い→新しい、画面に一番近い行が最後の順序で渡すこと ——
+    /// `dispatch_result`が`Terminal::take_scrollback`の結果(同じく古い→新しい順)を
+    /// `push_front`していく既存の規約とまったく同じ順序規約で積む(=`lines`の各行を
+    /// 出現順に`push_front`していく)ため、呼び出し順を変えてはいけない。
     ///
     /// この関数は「まだ何も積まれていない空のscrollback」(フル再接続直後、
     /// まだライブ出力が1バイトも届いていない新規`SessionCore`)への初回バッチ
     /// 注入だけを想定している。既存のscrollbackが空でない状態で呼ぶと、
     /// `lines`はどれだけ古い履歴であっても既存の行より*前*(=ライブ画面に
-    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元
-    /// (`orchestrator.rs::spawn_tmux_scrollback_backfill`)は必ず`connect_via`
-    /// 直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。既存状態自体を
-    /// 破棄することはない(クリアはしない)という意味でのみ「加算的」。
+    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元は
+    /// 必ず`connect_via`直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。
+    /// 既存状態自体を破棄することはない(クリアはしない)という意味でのみ「加算的」。
     ///
-    /// ANSI装飾(色・太字等)は再現しない —— tmuxの`capture-pane -e`は行ごとの
-    /// SGRシーケンスを再現できるが、行をまたいだ色の持ち越し状態の復元が
-    /// 煩雑な割に得られる価値が小さいと判断し、`-e`なし(プレーンテキスト)の
-    /// 出力を前提にしている(呼び出し元`orchestrator.rs`のコメント参照)。
-    /// 各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
+    /// ANSI装飾(色・太字等)は再現しない ——行をまたいだ色の持ち越し状態の復元が
+    /// 煩雑な割に得られる価値が小さいと判断し、プレーンテキストの入力を前提にして
+    /// いる。各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
     /// 現在のテーマの既定前景/背景で塗る。
     pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
         if lines.is_empty() {
