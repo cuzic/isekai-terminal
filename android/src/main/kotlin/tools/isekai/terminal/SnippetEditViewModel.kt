@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class SnippetEditViewModel(app: Application) : AndroidViewModel(app) {
     private val _profiles = MutableStateFlow<List<ConnectionProfile>>(emptyList())
@@ -29,9 +30,15 @@ class SnippetEditViewModel(app: Application) : AndroidViewModel(app) {
     fun save(snippet: Snippet, onSaved: () -> Unit) {
         if (_isSaving.value) return
         _isSaving.value = true
-        viewModelScope.launch(Dispatchers.IO) {
+        // onSaved は呼び出し元(MainActivity)でnavController.popBackStack()に直結しており
+        // Main threadでの呼び出しを想定するため、DB書き込みだけをIOへ逃がし、onSaved自体は
+        // viewModelScopeの既定ディスパッチャ(Main.immediate)へ戻ってから呼ぶ(実バグ修正:
+        // 以前はviewModelScope.launch(Dispatchers.IO)の中でonSavedまで呼んでおり、IOスレッド
+        // からnavController.popBackStack()を呼ぶことになっていた。KeySequenceEditViewModel/
+        // ProfileEditViewModelは元からこの形になっていた)。
+        viewModelScope.launch {
             RemoteLogger.i("IsekaiTerminalSnippet", "saving snippet: label='${snippet.label}' profileId=${snippet.profileId} id=${if (snippet.id == 0L) "new" else "${snippet.id}"}")
-            Repositories.snippets.save(snippet)
+            withContext(Dispatchers.IO) { Repositories.snippets.save(snippet) }
             _isSaving.value = false
             onSaved()
         }
