@@ -246,8 +246,13 @@ private fun TabLabel(
                     strokeWidth = 1.5.dp,
                 )
             } else {
+                // ERROR/WARNINGはOSC 9;4の慣習上progress値が意味を持たない
+                // (Rust側`ProgressState`のdocコメント参照)ため、0%表示で弧が消えて
+                // トラック色だけが見える事故を避けるよう常に満円(1f)で塗る。
+                // NORMALのみ実際の`progress`値(0-100)を反映する。
+                val fraction = if (tabProgress.state == ProgressState.NORMAL) tabProgress.progress.toInt() / 100f else 1f
                 CircularProgressIndicator(
-                    progress = { tabProgress.progress.toInt() / 100f },
+                    progress = { fraction },
                     modifier = indicatorModifier,
                     color = indicatorColor,
                     strokeWidth = 1.5.dp,
