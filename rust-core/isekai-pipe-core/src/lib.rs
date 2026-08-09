@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub use isekai_pipe_protocol::ServiceName;
@@ -355,39 +356,75 @@ pub fn write_connection_intent(
     runtime_dir: &Path,
     intent: &ConnectionIntent,
 ) -> Result<PathBuf, IntentError> {
-    validate_intent_id(&intent.intent_id)?;
-    let intents = runtime_dir.join("intents");
-    create_private_dir(runtime_dir)?;
-    create_private_dir(&intents)?;
-    let path = intents.join(format!("{}.json", intent.intent_id));
-    let tmp = intents.join(format!("{}.{}.tmp", intent.intent_id, std::process::id()));
-    let bytes = serde_json::to_vec_pretty(intent)?;
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
-    Ok(path)
+    write_json_atomically(runtime_dir, "intents", &intent.intent_id, intent)
 }
 
 pub fn claim_connection_intent(
     runtime_dir: &Path,
     intent_id: &str,
 ) -> Result<ConnectionIntent, IntentError> {
-    validate_intent_id(intent_id)?;
-    let src = runtime_dir
-        .join("intents")
-        .join(format!("{intent_id}.json"));
-    let claimed_dir = runtime_dir.join("claimed");
+    let intent: ConnectionIntent =
+        claim_json(runtime_dir, "intents", "claimed", intent_id)?.ok_or(IntentError::Missing)?;
+    intent.validate_for_use(SystemTime::now())?;
+    Ok(intent)
+}
+
+/// Atomically writes `value` as pretty JSON to `<runtime_dir>/<dir_name>/
+/// <id>.json` (write to a sibling `<id>.<pid>.tmp` then rename, so a reader
+/// never observes a partially-written file), after ensuring both
+/// `runtime_dir` and `<runtime_dir>/<dir_name>` exist with owner-only
+/// (`0700`) permissions. Shared by [`write_connection_intent`]
+/// (`dir_name = "intents"`) and `isekai_pipe_core::outcome::write_connect_outcome`
+/// (`dir_name = "connect-outcomes"`) — same atomic tmp-file + rename write,
+/// differing only in which subdirectory and value type they persist.
+pub(crate) fn write_json_atomically<T: Serialize>(
+    runtime_dir: &Path,
+    dir_name: &str,
+    id: &str,
+    value: &T,
+) -> Result<PathBuf, IntentError> {
+    validate_intent_id(id)?;
+    let dir = runtime_dir.join(dir_name);
+    create_private_dir(runtime_dir)?;
+    create_private_dir(&dir)?;
+    let path = dir.join(format!("{id}.json"));
+    let tmp = dir.join(format!("{id}.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Claims (consumes, by rename into `<runtime_dir>/<claimed_dir_name>/
+/// <id>.<pid>.json`) the JSON file at `<runtime_dir>/<dir_name>/<id>.json`,
+/// if any. Returns `Ok(None)` — not an error — if it was never written or
+/// already claimed by another process; [`claim_connection_intent`] turns
+/// that into `Err(IntentError::Missing)` (a missing intent is always an
+/// error there), while `isekai_pipe_core::outcome::claim_connect_outcome`
+/// leaves it as `Ok(None)` (a missing outcome file is its normal case —
+/// see that function's docs). Shared file-claiming mechanics only; each
+/// caller layers its own "missing" semantics and any extra validation
+/// (e.g. `ConnectionIntent::validate_for_use`) on top of the returned value.
+pub(crate) fn claim_json<T: DeserializeOwned>(
+    runtime_dir: &Path,
+    dir_name: &str,
+    claimed_dir_name: &str,
+    id: &str,
+) -> Result<Option<T>, IntentError> {
+    validate_intent_id(id)?;
+    let src = runtime_dir.join(dir_name).join(format!("{id}.json"));
+    let claimed_dir = runtime_dir.join(claimed_dir_name);
     create_private_dir(runtime_dir)?;
     create_private_dir(&claimed_dir)?;
-    let dst = claimed_dir.join(format!("{intent_id}.{}.json", std::process::id()));
+    let dst = claimed_dir.join(format!("{id}.{}.json", std::process::id()));
     match fs::rename(&src, &dst) {
         Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(IntentError::Missing),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(IntentError::Io(e)),
     }
     let bytes = fs::read(&dst)?;
-    let intent: ConnectionIntent = serde_json::from_slice(&bytes)?;
-    intent.validate_for_use(SystemTime::now())?;
-    Ok(intent)
+    let value: T = serde_json::from_slice(&bytes)?;
+    Ok(Some(value))
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
