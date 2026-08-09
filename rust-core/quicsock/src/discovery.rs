@@ -18,9 +18,3 @@ pub fn list_interfaces() -> Vec<(InterfaceIndex, netdev::Interface)> {
         .map(|iface| (InterfaceIndex(iface.index), iface))
         .collect()
 }
-
-/// The OS's notion of the "default" interface (the one its default route
-/// currently points at), if it has one right now.
-pub fn default_interface() -> Result<(InterfaceIndex, netdev::Interface), String> {
-    netdev::get_default_interface().map(|iface| (InterfaceIndex(iface.index), iface))
-}

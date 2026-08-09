@@ -5,8 +5,7 @@ fn basic() -> Result<(), std::io::Error> {
     let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
     let udp = quicsock::bind_udp(interface, local_addr)?;
-    let tcp = quicsock::bind_tcp(interface, local_addr)?;
-    let _ = (udp, tcp);
+    let _ = udp;
     Ok(())
 }
 
