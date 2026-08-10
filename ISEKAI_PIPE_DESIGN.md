@@ -1097,9 +1097,35 @@ control・multiplex protocol・broker upgrade・stale session cleanupが必要)�
   `isekai-pipe ctl build`(Epic P)から自動発火する連携を実装済み——ビルド開始時に
   `Indeterminate`(スピナー)、終了時に成功なら`None`(非表示)・失敗なら`Error`を
   `run_build`が直接`osc_sequence_for`/`emit_osc`を呼んで送出する(ctlソケット越しの
-  往復は経由しない、`isekai-ssh`自身のプロセス内で完結するため)。Android本体アプリ
-  側は`SetProgress`受信時は現状無視する(`session.rs`)——タブ進捗UIは別タスクとして
-  未着手のまま。
+  往復は経由しない、`isekai-ssh`自身のプロセス内で完結するため)。
+  ✅(2026-08-10訂正)Android本体アプリ側の`SetProgress`受信は、当初「現状無視する」
+  としていたが実際には2026-08-09のcommit `538cc161`で既に配線済みだった(この節の
+  記述が実装後に訂正されていなかった、honest gap)——`SetTabColor`の実装パターン
+  (`Terminal::tab_color`→`ScreenUpdate.tab_color`→タブ行のアクセントドット)を
+  そのまま踏襲し、`Terminal::tab_progress`・`ScreenUpdate.tab_progress`・タブ行の
+  進捗リング(`TerminalHostScreen.kt`の`CircularProgressIndicator`、`Indeterminate`
+  で回転)まで配線されている。
+  **Windows Terminalのタスクバー進捗・Androidの`tab_progress`は1タブにつき1スロット**
+  であり、`isekai-pipe ctl build`/`isekai-pipe ctl progress`と(下記の`claude-hookd`
+  自身による`Waiting`状態表示も含め)同じスロットを共有する。複数の書き手が
+  同じタブへ同時に書きうる状況では、明示的な調停は行わず**最後に書いたほうが勝つ
+  (last-writer-wins)**仕様として受け入れている(1スロット設計の帰結であり、
+  特定の呼び出し元を優先させる仕組みは意図的に持たない)。
+- ✅(2026-08-10)`claude-hookd`が`Waiting`集約状態でもプログレスリングを送出する
+  ようになった: `Action::SetWaitingColor`(`state.rs`)発火時に、既存のタブ色変更
+  (`waiting_color`)に加えて`CtlMessage::SetProgress{state: Indeterminate, progress:
+  0}`を送出する(`daemon.rs::execute_actions`)。`Idle`/`Attention`への遷移時は
+  対称的に`ProgressState::None`を送ってクリアする(`SetIdleColor`/
+  `SetAttentionColorAndPopup`双方——`Attention`側は「まだ自動で続きそうな作業待ち」
+  ではなく「人間の入力が要る」状態のため、リング表示を続ける理由が無い)。
+  daemon起動時のセルフヒール・`SessionEnd`到達不能時のフォールバック書き込み
+  (`main.rs::session_end_self_heal_with`)双方でも同様にクリアし、色のセルフヒールと
+  同じく「クラッシュ時にリングが点いたまま取り残される」ことを防ぐ。
+  配信経路は既存の`send_tab_color`と対称な`delivery.rs::send_progress`(新設
+  `tab_progress.rs`、`tab_color.rs`と同じ3段フェイルセーフ構造)。下流の配線
+  (isekai-terminal・isekai-ssh経由Windows Terminal双方)はどちらも本節冒頭で述べた
+  通り元々完成していたため、`claude-hookd`自身がこの`CtlMessage`を送出するように
+  なった変更のみで両方に反映される。
 
 **動機**: リモートの対話シェルが出す OSC 0/2(タイトル変更)・OSC 52(クリップボード)は、
 tmux配下だと既定でtmuxに横取りされ、外側のターミナル(Windows Terminalの`ssh`+`isekai-ssh`
@@ -2181,3 +2207,170 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
 - `rust-core/src/orchestrator.rs`: `SessionOrchestrator`/`ConnPhase`(状態機械の設計
   テンプレート、`.claude/rules/rust-ssot.md`参照)
 - `AI_INTEGRATION_DESIGN.md` §6.1・§9 Epic AI-2/AI-3(本Epicが回答する既知のギャップ)
+
+### Epic Q-2: delivery層のプラグイン化と外部消費API — 設計・一部実装(2026-08-08〜09、他プロジェクト調査を踏まえた比較検討、§3は未マージのブランチで実装済み)
+
+**現状**: `claude-hookd`の検知ロジック(`state.rs`)はI/O無し純粋関数として既に
+分離済みで、これ自体は他プロジェクトと比べても遜色ない完成度にある。一方
+`delivery.rs`は`Action`の実行先(OSC送信)を`IsekaiPipeCtl`/`TmuxSession`/
+`DirectTty`の3方式に**内部でハードコードして特権的に処理しており**、
+`daemon.rs`の`execute_actions`が直接`delivery::send_tab_color`/
+`send_notify_popup`を呼ぶ。第三者が別の配信先(例: bunterm・isekai-terminal
+本体アプリ以外のダッシュボード・スマホ通知)を追加するには`claude-hookd`
+自体を改造する必要があり、拡張点になっていない。
+
+**動機**: 類似プロダクトの調査(`opensessions`、`cmux`、`herdr`)で、この
+「検知と配信の同梱」自体が繰り返し現れるアンチパターンであることを確認した。
+
+- `opensessions`(Ataraxy Labs、tmuxサイドバー): 状態推論とUIが同一プロセスに
+  同梱されており、外部が推論結果を**読み取る**公開APIを持たない(公開APIは
+  外部から書き込む方向の`POST /set-status`系のみ)。
+- `cmux`(manaflow-ai、★25000超、macOSネイティブ): 同種の課題意識("Claude
+  Code's notification body is always just 'Claude is waiting for your
+  input' with no context")から作られたツールで、OSC 9/99/777 +
+  `cmux notify` CLIをhooksへ配線する方式を採る。通知パネルに**未読管理**
+  (最新未読へジャンプ)を持つ点が`claude-hookd`に無い。
+- `herdr`(herdrdev、★26000超、常駐サーバ型ランタイム): `working`/
+  `blocked`/`idle`という`claude-hookd`の`Aggregate`とほぼ同型の3状態を持ち、
+  ソケットAPIに`session.snapshot`(pull、現在状態の一括取得)と
+  `events.subscribe`(push、`pane.agent_status_changed`等の長期購読)の
+  両方を最初から備えている。
+
+**方針**: `claude-hookd`の価値を検知ロジック(`state.rs`)に絞り、配信先は
+すべて対等な「購読者」として扱う。既存の3方式(`IsekaiPipeCtl`/
+`TmuxSession`/`DirectTty`)を特権コードのまま残すのではなく、それ自体を
+下記の購読APIを使う**参照実装の1つ**として書き直す(bunterm側の設計
+ドキュメントで採用した「自分自身を特別扱いしない」方針と同じ)。
+
+**設計**:
+
+1. **購読プロトコルの追加**(既存の per-tab Unixソケットを拡張、新しいソケット・
+   新しい常駐プロセスは増やさない):
+   - `{"cmd":"snapshot"}` — 現在の`TabState`を1行のJSONで返して接続を閉じる
+     (pull)。
+   - `{"cmd":"subscribe"}` — 接続を開いたまま、まず現在のsnapshotを1行返し、
+     以降`Action`が発生するたびに1行ずつ追記していく(push)。
+   - 実装は`daemon.rs`のmain loopが`state`を更新するたびに
+     `tokio::sync::watch`チャネルへ書き込み、各接続の受付タスクは
+     そのReceiverを購読するだけにする(既存の「状態変更はmain loopに
+     一元化、接続タスクはI/Oだけ」という設計原則を崩さない)。
+   - **snapshotに単調増加する`version`(u64)を付け、pushは常に「ヒント」・
+     pullが「権威」とする**(`cmux`のiOSクライアント[実際にTestFlightへ
+     出荷済み、`docs/agent-session-tracking-spec.md`のSlice A「バージョニング
+     + pull snapshot」はDONE]が採用する
+     push=hint/pull=authoritativeモデルの移植、2026-08-09調査で追加)。
+     `subscribe`が流す各行にも同じ`version`を載せる——消費側は「自分が最後に
+     見た`version`と届いた`version`が連続しているか」だけで取りこぼしを機械的に
+     判定でき、連続していなければ`snapshot`を撃ち直せばよい(差分の再送機構は
+     不要)。isekai-terminalにとってこれは一般論の意匠ではなく、既存の欠落を
+     埋める:「常に接続できる」原則の下でQUIC resume・ローミング・完全切断からの
+     復帰が日常的に起きる以上、pushの取りこぼしは例外でなく通常動作であり、
+     Epic M(`isekai-pipe ctl title`/`clip push`)は現状バージョン無しの
+     fire-and-forgetで、再接続後にタブタイトルが陳腐化しうる同種の穴を
+     既に抱えている。「Rustが権威、Kotlinはミラーを持たない」という
+     `rust-ssot.md`の原則の通信版でもある。
+2. **`delivery.rs`を参照プラグインへ格下げ**: 3方式のOSC送信を、
+   `daemon.rs`が直接呼ぶ特権コードから、上記subscribeを使う(同一プロセス
+   内で完結する)実装へ書き直す。外部から見れば`delivery.rs`は「たまたま
+   同じバイナリに同梱されている、数あるプラグインの1つ」になる。
+3. **外部コマンドhook(git hooks方式)を第2の参照プラグインとして追加**:
+   `~/.config/claude-hookd/hooks/on-attention`/`on-waiting`/`on-idle`
+   (実行可能ファイルがあれば`spawn`、無ければ無視——「環境がおかしくても
+   Claude Codeのhookを失敗させない」という既存方針を踏襲)。stdinに
+   snapshot JSON、argv[1]に新しい集約状態名を渡す。timeoutスイープ由来の
+   `Action`は単一`session_id`に紐付かない(複数セッションが同時に期限切れ
+   しうる)ため、単一session_idを無理に付けずTabState全体を渡す。
+   **実装済み(2026-08-09、Opusレビュー2回反映、未マージ)**:
+   `feat/claude-hookd-external-command-hook`ブランチ(`worktree-claude-hookd-hook`)。
+   併せて`delivery.rs`のタブ色OSC生成も、`~/.config/claude-hookd/hooks/tab-color`
+   (実行可能ファイルがあれば優先、無ければ`include_str!`で埋め込んだデフォルト
+   スクリプトへフォールバック)へシェルスクリプト化し、コンパイル時の
+   `osc-color`クレート依存(`isekai-ssh`は引き続き使用、`claude-hookd`のみ廃止)
+   を除去した——§2「参照プラグインへ格下げ」の考え方をタブ色配信自体にも
+   一段適用した形。埋め込みデフォルト自体が実行できない(`sh`が無い等)場合は
+   コンパイル済みのWindows Terminal互換シーケンスへ更にフォールバックする
+   (格下げの格下げ、という多段フェイルセーフ)。
+   **実装済み(2026-08-10)**: `Waiting`状態のプログレスリング送出(Epic Q本体、
+   本節冒頭参照)の追加にあわせて、`~/.config/claude-hookd/hooks/tab-progress`を
+   `tab-color`と対になる第2の拡張点として同じ形で追加した(`tab_progress.rs`、
+   `default-tab-progress.sh`)。terminal-kind検出ロジック・既定方針(iTerm2検出時
+   のみ空、それ以外はWindows Terminal形式で出力)は`default-tab-color.sh`と共通の
+   考え方を踏襲するが、iTerm2向けの代替シーケンスは存在しない(iTerm2にOSC 9;4
+   相当の進捗表示規約が無いため、tab-colorのOSC 6のような「iTerm2ネイティブな
+   出力」ではなく単に空を返す)。
+4. **複数リモートホストの集約**(isekai-terminal固有の論点): `claude-hookd`
+   はhooksが実際に発火するリモートホスト側で動く設計であり(main.rsのdoc
+   comment参照)、これは変更しない——検知ロジックをどこか1箇所に集約すると、
+   hookの発火元と検知の実行場所が別ホストになり、新しいネットワーク経路が
+   要る。代わりに、**検知は各ホスト・各タブでローカルに動かしたまま、
+   手元のクライアント側に1個だけ集約プロセスを置く**。この集約プロセスは
+   `IsekaiPipeCtl`配信経路が既に持っているctl-forward(`$ISEKAI_CTL_SOCK`
+   経由でリモートからクライアントへメッセージを送り返す既存の仕組み)を
+   再利用して各ホストの`claude-hookd`から状態変化を受け取る——新しい
+   SSH/QUICチャネルは増やさない、というEpic Q本体の制約をそのまま踏襲する。
+   bunterm側もこの集約プロセスの一実装になりうる。
+   **設計テンプレートとして記録(2026-08-09、`cmux`調査から)**: `cmux`は実
+   tmuxセッションへcontrol-modeクライアントとして接続し、レイアウトツリーを
+   「スナップショット→diff→commit」の1パス収束モデルでネイティブUI側へ
+   ミラーする("reconciliation"と呼んでいる)。この集約プロセスを実装する際、
+   差分を逐次適用するのではなく**毎回まっさらな状態から収束させる**という
+   考え方自体は、§1のversion番号(取りこぼしたらsnapshotを撃ち直す)と同じ
+   「取りこぼし耐性」思想であり流用できる。ただし`cmux`のcontrol-mode接続
+   そのもの(実tmuxのレイアウトをVT100描画経路ごとネイティブUIへミラーする
+   実装)は持ち込まない——`rust-core/src/tmux_session.rs`は split pane の
+   tmuxミラーリングを明示的にMVP対象外にしており(primary paneのみを
+   tmuxウィンドウへ写す設計)、control-mode採用はVT100描画・resume/ローミング
+   契約の作り直しを要し投資対効果が悪いため。
+5. **`session_id`を使ったレジューム連携**(`cmux`から着想): `claude-hookd`は
+   既にhookのJSONペイロードから`session_id`を取得している。直近の
+   `session_id`をタブごとに記録しておき、isekai-terminalの再接続フロー
+   (「常に接続できる」原則、QUIC roaming/resume)が「同じtmuxペインに
+   再アタッチする」だけでなく「同じClaude Code会話を`--resume
+   <session_id>`で明示的に再開する」という選択肢も持てるようにする。
+   tmuxペイン自体が何らかの理由で失われた場合のフォールバック経路になる。
+6. **未読管理は§1のversion番号で実装する**(`cmux`の通知パネル+未読管理から
+   着想、2026-08-09にversion番号方式へ寄せて再設計): 当初案だった「直近N件の
+   `Action`遷移を独立したリングバッファに保持する」設計は不要——消費側
+   (スマホ通知・bunterm Portal等)は自分が最後に処理した`version`を「既読
+   カーソル」として1個保持するだけでよく、`snapshot`で返る現在の`version`と
+   比較すれば「未読があるか」は判定できる。`cmux`側の通知ポリシーhookチェーン
+   (`cmux.json`で状態遷移ごとに複数effectを個別設定)そのものは移植しない
+   ——`claude-hookd`は既に§3の外部コマンドhookで任意のeffectを表現でき、
+   「遷移×effect」の設定用マトリクスを別途増やしても表現力は増えず設定面が
+   増えるだけと判断した(2026-08-09、Opusレビュー)。取り込む価値があったのは
+   「未読を機械的に判定できる」という一点で、それはversion番号だけで足りる。
+
+**明示的にスコープ外**:
+- 複数コーディングエージェント(Codex/OpenCode/Aider/Goose等)への対応拡張。
+  `cmux`の`cmux hooks setup`(複数エージェント一括hooksインストーラ)や
+  `herdr`の「agent-native」API(エージェント同士が互いを待つ)は調査上
+  参考にしたが、`claude-hookd`はClaude Code専用のまま据え置く方針。
+- `herdr`の「always running」永続化(サーバ再起動を跨いでプロセスが
+  生き続ける)。`claude-hookd`の1タブ1daemon・遅延起動・1時間自壊という
+  軽量設計と根本的に相性が悪いため持ち込まない。
+- `cmux`のサイドバーメタ情報(gitブランチ・PR状態・作業ディレクトリ・
+  listening ports)。将来snapshotへ任意フィールドとして追加できる余地は
+  残すが、v1では実装しない。
+- **`cmux`のAgent Hibernation**(アイドルなエージェントプロセスを自動
+  kill/resumeしメモリを回収する仕組み、2026-08-09調査で不採用と判断)。
+  `cmux`はエージェントプロセスのライフサイクルを自分自身が所有しているが、
+  isekai-terminal/`claude-hookd`は所有していない——Claude Codeはユーザーの
+  リモートホスト上のtmux内で動いており、`claude-hookd`はisekai-terminal本体
+  アプリに同梱すらされない独立ツールである。他人(リモートホスト側)の
+  プロセスを勝手にkillすることは「常に接続できる」原則(状態を失わせない)
+  と正面衝突し、`herdr`の常駐ランタイム型永続化を上記の理由で既に
+  スコープ外にしたのと同じ理由で退ける。隣接する有用な部分(会話の再開)は
+  §5の`--resume <session_id>`連携で既にカバーしている。
+
+**未決事項**:
+- 集約プロセス(§4)を新規に1個作るか、bunterm daemon自身に集約ロジックを
+  持たせるか。
+- `delivery.rs`のOSC送信を同一バイナリ内蔵のまま(§2)にするか、独立した
+  コンパニオンバイナリ(例: `claude-hookd-osc-relay`)として完全に切り出し、
+  他のプラグインと全く同じ扱いにするか。
+- §1の`version`番号の具体的な採番方式(2026-08-09追加): daemonプロセス起動
+  ごとにリセットする単純な単調増加カウンタで足りるか、それとも
+  daemon再起動(1時間自壊からの再起動含む)を跨いでも連続性を保証したいか。
+  後者を選ぶ場合、`session_id`のような永続的な識別子と組み合わせる必要が
+  あり設計が増える——1タブ1daemon・遅延起動という軽量設計とどこまで
+  相性よく両立できるかが論点。
