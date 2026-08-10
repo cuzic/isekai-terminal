@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/cargo-check-on-edit.sh",
+            "command": "python3 .claude/hooks/cargo_check_on_edit.py",
             "async": true,
             "asyncRewake": true,
             "rewakeMessage": "cargo build reported warnings/errors after your last edit to a rust-core file:\n",

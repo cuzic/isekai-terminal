@@ -33,3 +33,7 @@ Thumbs.db
 /.claude/worktrees/
 /.claude/scheduled_tasks.lock
 .env
+
+# Python (cargo_check_on_edit.py hook)
+__pycache__/
+*.pyc
