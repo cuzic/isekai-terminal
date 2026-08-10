@@ -123,12 +123,11 @@ pub(crate) async fn fetch_tmux_scrollback_history<R: RemoteTmuxCommandRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // tmux_locator.rs/tmux_notify.rsと同一定義だった`standalone`をtest_supportへ
+    // 共通化した。
+    use crate::tmux_locator::test_support::standalone;
     use std::future::Future;
     use std::sync::Mutex;
-
-    fn standalone(name: &str) -> TmuxSessionScope {
-        TmuxSessionScope::Standalone { session_name: name.to_string() }
-    }
 
     fn pane_locator(session: &str, tag: &str) -> TmuxLocator {
         TmuxLocator { scope: standalone(session), kind: TmuxTargetKind::Pane, tag: TmuxTag(tag.to_string()) }
