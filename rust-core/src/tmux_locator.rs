@@ -628,15 +628,61 @@ pub(crate) async fn push_ctl_socket_to_tmux<R: RemoteTmuxCommandRunner>(
 
 // ── テスト ────────────────────────────────────────────────
 
+/// `tmux_locator.rs`・`tmux_notify.rs`・`tmux_scrollback.rs`がそれぞれ独自に
+/// 持っていた`RemoteTmuxCommandRunner`テストフィクスチャのうち、バイト単位で
+/// 同一だった部分(`standalone`/`pane`コンストラクタヘルパーと、値で消費される
+/// runnerでも呼び出し後に外から発行済みコマンドを見られる`RecordingRunner`)を
+/// ここに集約する。`RemoteTmuxCommandRunner`自体がこのファイルで定義されて
+/// いるため、他ファイルからは`crate::tmux_locator::test_support::...`で参照する。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Mutex;
+
+    pub(crate) fn standalone(name: &str) -> TmuxSessionScope {
+        TmuxSessionScope::Standalone { session_name: name.to_string() }
+    }
+
+    pub(crate) fn pane(tab: &str, pane: &str) -> AppPaneId {
+        AppPaneId { tab_id: tab.to_string(), pane_id: pane.to_string() }
+    }
+
+    /// runnerを値で消費する呼び出し元(`push_ctl_socket_to_tmux`等)でも、呼び出し後に
+    /// 外から発行済みコマンドを見られるように`Arc<Mutex<Vec<String>>>`にログを溜める
+    /// フェイク。単一の固定応答を返す(応答をキューで使い分けたい場合は各ファイル
+    /// 固有の`FakeRunner`を使う)。
+    pub(crate) struct RecordingRunner {
+        response: Result<String, TmuxRunError>,
+        calls: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingRunner {
+        pub(crate) fn new(output: &str, calls: std::sync::Arc<Mutex<Vec<String>>>) -> Self {
+            Self { response: Ok(output.to_string()), calls }
+        }
+    }
+
+    impl RemoteTmuxCommandRunner for RecordingRunner {
+        fn run(&self, cmd: &str) -> impl Future<Output = Result<String, TmuxRunError>> + Send {
+            self.calls.lock().unwrap().push(cmd.to_string());
+            let response = self.response.clone();
+            async move { response }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support::{pane, standalone, RecordingRunner};
     use std::sync::Mutex;
 
     // ── フェイクの RemoteTmuxCommandRunner ──────────────
     // このリポジトリの慣習(重量なモックフレームワークより実/フェイク実装を
     // 好む)に沿って、呼ばれたコマンドを記録しつつ固定の応答を返すだけの
-    // 最小限のフェイクにする。
+    // 最小限のフェイクにする。`standalone`/`pane`/`RecordingRunner`は
+    // tmux_notify.rs/tmux_scrollback.rsと共有するため`test_support`へ切り出した
+    // (このファイル固有の`FakeRunner`は単一固定応答を返すだけなので共有対象外)。
 
     struct FakeRunner {
         response: Result<String, TmuxRunError>,
@@ -661,10 +707,6 @@ mod tests {
             let response = self.response.clone();
             async move { response }
         }
-    }
-
-    fn standalone(name: &str) -> TmuxSessionScope {
-        TmuxSessionScope::Standalone { session_name: name.to_string() }
     }
 
     fn group(group_name: &str, session_name: &str) -> TmuxSessionScope {
@@ -880,27 +922,8 @@ mod tests {
     // 完結できる(テスト間の共有可変状態を避ける)。
     //
     // `push_ctl_socket_to_tmux`はrunnerを値で消費するため、`FakeRunner`とは別に
-    // 呼び出し後も外から発行済みコマンドを見られる`RecordingRunner`
+    // 呼び出し後も外から発行済みコマンドを見られる`test_support::RecordingRunner`
     // (`Arc<std::sync::Mutex<Vec<String>>>`にログを溜める)を使う。
-
-    struct RecordingRunner {
-        response: Result<String, TmuxRunError>,
-        calls: std::sync::Arc<Mutex<Vec<String>>>,
-    }
-
-    impl RecordingRunner {
-        fn new(output: &str, calls: std::sync::Arc<Mutex<Vec<String>>>) -> Self {
-            Self { response: Ok(output.to_string()), calls }
-        }
-    }
-
-    impl RemoteTmuxCommandRunner for RecordingRunner {
-        fn run(&self, cmd: &str) -> impl Future<Output = Result<String, TmuxRunError>> + Send {
-            self.calls.lock().unwrap().push(cmd.to_string());
-            let response = self.response.clone();
-            async move { response }
-        }
-    }
 
     #[tokio::test]
     async fn push_ctl_socket_to_tmux_is_a_noop_when_locator_unknown() {
@@ -1016,10 +1039,6 @@ mod tests {
     }
 
     // ── TmuxLocatorRegistry (マッピングテーブル) ─────────
-
-    fn pane(tab: &str, pane: &str) -> AppPaneId {
-        AppPaneId { tab_id: tab.to_string(), pane_id: pane.to_string() }
-    }
 
     fn locator(tag: &str) -> TmuxLocator {
         TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag(tag.to_string()) }

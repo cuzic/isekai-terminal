@@ -1273,41 +1273,14 @@ mod pooling_e2e_tests {
     use std::time::Duration;
     use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-    #[allow(dead_code)]
-    enum TestEvent {
-        Connection(ConnectionPublicState),
-        Data(Vec<u8>),
-    }
-
-    struct TestCallback {
-        tx: UnboundedSender<TestEvent>,
-    }
-
-    impl OrchestratorCallback for TestCallback {
-        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
-            let _ = self.tx.send(TestEvent::Connection(state));
-        }
-        fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
-        fn on_data(&self, data: Vec<u8>) {
-            let _ = self.tx.send(TestEvent::Data(data));
-        }
-        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
-        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-        fn on_notify(&self, _kind: crate::NotifyKind) {}
-        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
-        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
-    }
+    // transport/forward.rs・orchestrator.rsのテストと同型(かつ大半が同一実装)だった
+    // OrchestratorCallbackのno-op寄りテストダブルをtest_callbacks.rsへ共通化した。
+    // 転送するイベント種別は3ファイル分の合併集合だが、このファイルのポーリング
+    // ループは全て`_ => continue`のワイルドカード節を持つため無関係のイベントが
+    // 増えても安全(test_callbacks.rsのdocコメント参照)。
+    use crate::test_callbacks::{
+        ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
+    };
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
     /// バイト列をそのままechoし返す最小SSHサーバ。プーリングが効いていれば

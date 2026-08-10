@@ -230,10 +230,7 @@ pub(super) async fn run_dynamic_forward(
 #[cfg(test)]
 mod local_forward_e2e_tests {
     use super::*;
-    use crate::{
-        create_session_orchestrator, ConnectionPublicState, ForwardType, OrchestratorCallback,
-        PortForward, ScreenUpdate, SshAuth, SshConfig, TrzszPublicState,
-    };
+    use crate::{create_session_orchestrator, ForwardType, OrchestratorCallback, PortForward, SshAuth, SshConfig};
     use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
     use russh::Channel as RusshChannel;
     use russh_keys::ssh_key::private::Ed25519Keypair;
@@ -242,42 +239,15 @@ mod local_forward_e2e_tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-
-    #[allow(dead_code)]
-    enum TestEvent {
-        Connection(ConnectionPublicState),
-        Forward(String, ForwardState),
-    }
-
-    struct TestCallback {
-        tx: UnboundedSender<TestEvent>,
-    }
-
-    impl OrchestratorCallback for TestCallback {
-        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
-            let _ = self.tx.send(TestEvent::Connection(state));
-        }
-        fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
-        fn on_data(&self, _data: Vec<u8>) {}
-        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
-        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, id: String, state: ForwardState) {
-            let _ = self.tx.send(TestEvent::Forward(id, state));
-        }
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-        fn on_notify(&self, _kind: crate::NotifyKind) {}
-        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
-        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
-    }
+    use tokio::sync::mpsc::unbounded_channel;
+    // transport/ssh_handler.rs・orchestrator.rsのテストと同型(かつ大半が同一実装)
+    // だったOrchestratorCallbackのno-op寄りテストダブルをtest_callbacks.rsへ
+    // 共通化した。転送するイベント種別は3ファイル分の合併集合だが、このファイルの
+    // ポーリングループは全て`_ => continue`のワイルドカード節を持つため無関係の
+    // イベントが増えても安全(test_callbacks.rsのdocコメント参照)。
+    use crate::test_callbacks::{
+        ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
+    };
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
     async fn spawn_echo_server() -> SocketAddr {

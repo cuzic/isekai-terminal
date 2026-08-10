@@ -1568,6 +1568,29 @@ mod decode_clipboard_push_tests {
 // `SessionCore::scrollback_cells`(オフセット/行数からscrollbackを切り出す表示ロジック)
 // と`dispatch_result`のscrollback上限トリミングは、実SSH/QUIC接続もTokioランタイムも
 // 不要な純粋なデータ変換だが、`session.rs`にはテストが1つも無かった。
+/// `SessionCallback`の全メソッドが no-op の共有テストダブル。`mod tests`と
+/// `mod dispatch_transport_event_tests`の両方が同一の定義を持っていたため
+/// ファイルスコープへ集約した。
+#[cfg(test)]
+struct NoopSessionCallback;
+#[cfg(test)]
+impl SessionCallback for NoopSessionCallback {
+    fn on_data(&self, _data: Vec<u8>) {}
+    fn on_host_key(&self, _fingerprint: String) -> bool { true }
+    fn on_connected(&self) {}
+    fn on_disconnected(&self, _reason: Option<String>) {}
+    fn on_screen_update(&self, _update: ScreenUpdate) {}
+    fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+    fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+    fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+    fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+    fn on_no_viable_path(&self) {}
+    fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+    fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+    fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+    fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2213,24 +2236,6 @@ mod tests {
 
     // ── dispatch_result: scrollback上限トリミング ────────────
 
-    struct NoopSessionCallback;
-    impl SessionCallback for NoopSessionCallback {
-        fn on_data(&self, _data: Vec<u8>) {}
-        fn on_host_key(&self, _fingerprint: String) -> bool { true }
-        fn on_connected(&self) {}
-        fn on_disconnected(&self, _reason: Option<String>) {}
-        fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
-        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
-        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
-        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-    }
-
     #[test]
     fn dispatch_result_trims_scrollback_to_limit_by_dropping_the_oldest() {
         // SCROLLBACK_LIMIT - 1 件を予め積んでおき、末尾(=最古)に目印の行を置く。
@@ -2269,24 +2274,6 @@ mod tests {
 mod dispatch_transport_event_tests {
     use super::*;
     use crate::ScreenUpdate;
-
-    struct NoopSessionCallback;
-    impl SessionCallback for NoopSessionCallback {
-        fn on_data(&self, _data: Vec<u8>) {}
-        fn on_host_key(&self, _fingerprint: String) -> bool { true }
-        fn on_connected(&self) {}
-        fn on_disconnected(&self, _reason: Option<String>) {}
-        fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
-        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
-        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
-        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-    }
 
     fn fresh_state() -> SessionState {
         SessionState::new(80, 24, Theme::default())
