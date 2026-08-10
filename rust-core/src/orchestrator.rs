@@ -36,8 +36,8 @@ enum ActiveSession {
 /// `ActiveSession`の全バリアントに同じメソッド呼び出しを委譲するだけのmatchを
 /// 展開する。6トランスポートすべてが同じ`SessionCore`委譲メソッドを持つため
 /// （各transportモジュール参照）、ここは常に「アームごとの分岐ロジックが無い」
-/// 純粋な委譲にのみ使う。`add_local_forward`/`remove_forward`のように一部の
-/// トランスポートで挙動が違うメソッドは対象外とし、手書きのmatchのままにする。
+/// 純粋な委譲にのみ使う。トランスポートごとに挙動が違うメソッドは対象外とし、
+/// 手書きのmatchのままにする。
 macro_rules! dispatch_all {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
@@ -59,8 +59,7 @@ impl ActiveSession {
         dispatch_all!(self, resize, cols, rows)
     }
     /// タスク#60: OSのフォーカス変化を全トランスポート共通で`SessionCore`まで委譲する
-    /// (`Terminal`/`SessionCore`はトランスポート非依存のため`add_local_forward`と違い
-    /// 対象外の分岐は無い)。
+    /// (`Terminal`/`SessionCore`はトランスポート非依存のため対象外の分岐は無い)。
     fn notify_focus_change(&self, focused: bool) {
         dispatch_all!(self, notify_focus_change, focused)
     }
@@ -127,33 +126,13 @@ impl ActiveSession {
         dispatch_all!(self, copy_last_command_output)
     }
     /// タスク#17: `run_ssh_channel_loop`は6トランスポート共通の実体なので
-    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、`add_local_forward`と違い
-    /// トランスポート別の対応可否分岐は無い——全バリアントで同じ委譲でよい。
+    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、トランスポート別の
+    /// 対応可否分岐は無い——全バリアントで同じ委譲でよい。
     fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
         dispatch_all!(self, file_preview_exec, request_id, command_line)
     }
-    fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
-        match self {
-            Self::Ssh(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
-            Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
-            // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
-            // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
-            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
-                log::warn!("add_local_forward: not supported over helper-QUIC transports");
-            }
-        }
-    }
-    fn remove_forward(&self, id: String) {
-        match self {
-            Self::Ssh(s) => s.remove_forward(id),
-            Self::Quic(s) => s.remove_forward(id),
-            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
-                log::warn!("remove_forward: not supported over helper-QUIC transports");
-            }
-        }
-    }
     /// Phase 12: per-session theme。全トランスポート共通(`Terminal`/`SessionCore`は
-    /// トランスポート非依存)なので、`add_local_forward`と違い対象外の分岐は無い。
+    /// トランスポート非依存)なので対象外の分岐は無い。
     fn set_theme(&self, theme: crate::theme::Theme) {
         dispatch_all!(self, set_theme, theme)
     }
@@ -164,7 +143,7 @@ impl ActiveSession {
     }
     /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
     /// 接続上で短命なexecコマンドを実行する。全トランスポート共通
-    /// (`SessionCore::run_exec`)なので`add_local_forward`と違い対象外の分岐は無いが、
+    /// (`SessionCore::run_exec`)なので対象外の分岐は無いが、
     /// asyncメソッドは`dispatch_all!`(各アームを`.await`しないため型が揃わない)
     /// では書けないので手書きのmatchにする。
     async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
@@ -1536,21 +1515,6 @@ impl SessionOrchestrator {
                     }
                 }
             }
-        }
-    }
-
-    /// 接続中にローカルポートフォワード(-L)を動的に追加する。
-    /// MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-    /// 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-    pub fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port);
-        }
-    }
-
-    pub fn remove_forward(&self, id: String) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.remove_forward(id);
         }
     }
 
@@ -3720,25 +3684,6 @@ mod tests {
             panic!("did not observe a FilePreviewOutcome for id={} within timeout", expected_id);
         }
 
-        async fn wait_forward_state(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str, expect_listening: bool) {
-            for _ in 0..50 {
-                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                    Ok(Some(TestEvent::Forward(id, state))) if id == expected_id => {
-                        match (&state, expect_listening) {
-                            (ForwardState::Listening, true) => return,
-                            (ForwardState::Stopped, false) => return,
-                            _ => continue,
-                        }
-                    }
-                    _ => continue,
-                }
-            }
-            panic!(
-                "did not observe expected ForwardState for id={} (listening={}) within timeout",
-                expected_id, expect_listening
-            );
-        }
-
         async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
             let (addr, window_changes, channel_closed) = spawn_recording_server().await;
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
@@ -4055,35 +4000,6 @@ mod tests {
 
                 orch.trzsz_cancel();
                 wait_received_contains(&received, &[0x03]).await;
-            });
-        }
-
-        // ── add_local_forward / remove_forward ──
-
-        #[test]
-        fn add_local_forward_then_remove_forward_drive_the_real_transport() {
-            crate::init_logger();
-            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
-            rt.block_on(async {
-                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
-
-                // bind_port=0でOSにポートを選ばせる(このテストは実際に転送先へ
-                // 接続するのではなく、実transportまでコマンドが届いて本当に
-                // リスナーが立ち上がった/畳まれたことをForwardStateコールバックで
-                // 確認するだけなので、具体的なポート番号は不要)。
-                orch.add_local_forward(
-                    "fwd-1".to_string(), "127.0.0.1".to_string(), 0,
-                    "example.invalid".to_string(), 80,
-                );
-                // ActiveSession::add_local_forwardがno-opに変異していれば
-                // TransportCommandが送られず、リスナーも立ち上がらないため
-                // ForwardState::Listeningは永遠に届かずタイムアウトする。
-                wait_forward_state(&mut rx, "fwd-1", true).await;
-
-                orch.remove_forward("fwd-1".to_string());
-                // 同様にActiveSession::remove_forwardがno-opに変異していれば
-                // リスナーは立ったままでForwardState::Stoppedは届かない。
-                wait_forward_state(&mut rx, "fwd-1", false).await;
             });
         }
 
