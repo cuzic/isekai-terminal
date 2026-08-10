@@ -211,6 +211,10 @@ async fn run(config: DaemonConfig) {
     // hook script, which is more likely to surprise a hook author than help
     // one).
     delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
+    // Same self-heal reasoning, for the progress ring: a daemon that
+    // crashed/self-exited mid-`Waiting` would otherwise leave the
+    // indeterminate ring spinning forever with nothing left to clear it.
+    delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
 
     // Accepting and reading each connection happens on its own spawned
     // task, separate from the main loop below: a connection that opens and
@@ -383,15 +387,25 @@ async fn execute_actions(config: &DaemonConfig, actions: &[Action], state: &TabS
         match action {
             Action::SetAttentionColorAndPopup => {
                 delivery::send_tab_color(&config.delivery, config.attention_color, config.hooks_dir.as_deref()).await;
+                // Attention isn't Waiting's "still working, hang tight"
+                // signal — clear any indeterminate ring left over from a
+                // Waiting->Attention transition. A no-op write when there
+                // was never a ring showing (e.g. a fresh Idle->Attention
+                // Notify), same idempotent-clear posture as `SetIdleColor`
+                // below.
+                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
                 delivery::send_notify_popup(&config.delivery).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "attention", state, now).await;
             }
             Action::SetWaitingColor => {
                 delivery::send_tab_color(&config.delivery, config.waiting_color, config.hooks_dir.as_deref()).await;
+                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::Indeterminate, 0, config.hooks_dir.as_deref())
+                    .await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "waiting", state, now).await;
             }
             Action::SetIdleColor => {
                 delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
+                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "idle", state, now).await;
             }
         }
@@ -477,13 +491,14 @@ mod tests {
         // self-heal has painted idle. This also transitively waits for the
         // listener to be bound, since `run` binds before self-healing.
         poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+        poll_tty_contains(&tty_path, "9;4;0;0", "startup self-heal must also clear the progress ring").await;
 
         let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
         client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify\"}\n").await.unwrap();
         drop(client);
 
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "notify must paint attention color").await;
-        poll_tty_contains(&tty_path, "]9;", "notify must also emit the OSC 9 popup").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "notify must also emit the OSC 9 popup").await;
 
         // No `resolve` ever arrives — the 100ms attention timeout fires and
         // reverts the color on its own. Poll for the *last* write ending in
@@ -608,15 +623,17 @@ mod tests {
         drop(client);
 
         poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "stop_deferred must paint the waiting color").await;
+        poll_tty_contains(&tty_path, "9;4;3;0", "stop_deferred must also start the indeterminate progress ring").await;
         assert!(
-            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;"),
+            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;Claude"),
             "stop_deferred must never emit the attention popup"
         );
 
         // No further events — max_deferral (80ms) elapses and the daemon
         // promotes the still-Deferred session to Attention on its own.
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must self-correct to the attention color").await;
-        poll_tty_contains(&tty_path, "]9;", "the self-correction must fire the popup, same as a real Notify would").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "the self-correction must fire the popup, same as a real Notify would").await;
+        poll_tty_contains(&tty_path, "9;4;0;0", "the self-correction must also clear the progress ring").await;
 
         daemon.abort();
     }
@@ -663,7 +680,7 @@ mod tests {
 
         poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "a recent teammate dispatch must make an ambiguous Stop defer").await;
         assert!(
-            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;"),
+            !std::fs::read_to_string(&tty_path).unwrap().contains("]9;Claude"),
             "a deferred ambiguous Stop must never emit the attention popup"
         );
 
@@ -706,7 +723,7 @@ mod tests {
         drop(client);
 
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "no recent dispatch must fall back to the attention color").await;
-        poll_tty_contains(&tty_path, "]9;", "the safe fallback must fire the popup, same as a real Notify would").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "the safe fallback must fire the popup, same as a real Notify would").await;
 
         daemon.abort();
     }
@@ -752,7 +769,7 @@ mod tests {
         drop(client);
 
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "a dispatch past its TTL must not defer an ambiguous Stop").await;
-        poll_tty_contains(&tty_path, "]9;", "an expired dispatch must fall back to the real Notify popup").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "an expired dispatch must fall back to the real Notify popup").await;
 
         daemon.abort();
     }
