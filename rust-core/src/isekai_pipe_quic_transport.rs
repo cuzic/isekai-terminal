@@ -869,33 +869,6 @@ mod tests {
         assert!(!reply_rx.await.unwrap(), "missing callback must fail closed (reject), not fail open");
     }
 
-    struct TestCallback {
-        buf: Arc<StdMutex<Vec<u8>>>,
-        notify: Arc<Notify>,
-    }
-
-    impl SessionCallback for TestCallback {
-        fn on_data(&self, data: Vec<u8>) {
-            self.buf.lock().unwrap().extend_from_slice(&data);
-            self.notify.notify_one();
-        }
-        fn on_host_key(&self, _fingerprint: String) -> bool { true }
-        fn on_connected(&self) {}
-        fn on_disconnected(&self, reason: Option<String>) {
-            eprintln!("test: disconnected: {reason:?}");
-        }
-        fn on_screen_update(&self, _update: crate::ScreenUpdate) {}
-        fn on_trzsz_request(&self, _t: String, _m: String, _n: Option<String>, _s: Option<u64>) {}
-        fn on_trzsz_download_chunk(&self, _t: String, _d: Vec<u8>, _l: bool) {}
-        fn on_trzsz_progress(&self, _t: String, _tr: u64, _to: Option<u64>) {}
-        fn on_trzsz_finished(&self, _t: String, _s: bool, _m: Option<String>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-    }
-
     #[tokio::test]
     async fn full_stack_bootstrap_quic_and_shell_command() {
         let Ok(key_path) = std::env::var("ISEKAI_PIPE_BOOTSTRAP_TEST_KEY") else {
@@ -918,7 +891,7 @@ mod tests {
         let session = create_isekai_pipe_quic_session(config);
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
-        let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
+        let callback = crate::test_callbacks::BufferingSessionCallback { buf: buf.clone(), notify: notify.clone() };
         session
             .connect(Box::new(callback), crate::tmux_locator::AppPaneId::generate_process_local())
             .expect("connect() call failed");
@@ -980,7 +953,7 @@ mod tests {
         let session = create_isekai_pipe_quic_session(config);
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
-        let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
+        let callback = crate::test_callbacks::BufferingSessionCallback { buf: buf.clone(), notify: notify.clone() };
         session
             .connect(Box::new(callback), crate::tmux_locator::AppPaneId::generate_process_local())
             .expect("connect() call failed");

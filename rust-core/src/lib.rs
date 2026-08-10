@@ -41,6 +41,8 @@ pub mod isekai_stun_p2p_transport;
 pub mod isekai_link_relay_transport;
 #[cfg(test)]
 pub(crate) mod faulty_stream;
+#[cfg(test)]
+pub(crate) mod test_callbacks;
 pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
 pub(crate) mod resume_client;
