@@ -71,3 +71,7 @@ tokio = { version = "1", features = ["test-util"] }
 # client `isekai-helper`'s own e2e tests used (Phase 9-1's noq/quinn
 # backward-compat guarantee).
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+# `resume_loop.rs`のcfg(test)コードがquicmux::test_support::
+# self_signed_server_configを使うため有効化する(`[dependencies]`のquicmuxは
+# `noq`featureのみ)。
+quicmux = { path = "../quicmux", features = ["test-support"] }
