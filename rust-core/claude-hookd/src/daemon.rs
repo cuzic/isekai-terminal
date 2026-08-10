@@ -276,6 +276,7 @@ async fn run(config: DaemonConfig) {
                 let now = Instant::now();
                 let event = match wire_event {
                     super::ClientEvent::Notify => HookEvent::Notify,
+                    super::ClientEvent::NotifyUnlessDeferred => HookEvent::NotifyUnlessDeferred,
                     super::ClientEvent::StopDeferred => HookEvent::StopDeferred,
                     super::ClientEvent::Resolve => HookEvent::Resolve,
                     super::ClientEvent::TeammateDispatched => {
@@ -347,8 +348,9 @@ async fn attention_sleep(state: &TabState) {
 }
 
 /// Reads exactly one
-/// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"|
-/// "teammate_dispatched"|"stop_ambiguous_teammate"}` line — this crate's own
+/// `{"session_id": "...", "event": "notify"|"notify_unless_deferred"|
+/// "stop_deferred"|"resolve"|"teammate_dispatched"|"stop_ambiguous_teammate"}`
+/// line — this crate's own
 /// minimal daemon wire format (`super::ClientEvent::as_wire_str`/
 /// `from_wire_str`), deliberately decoupled from Claude Code's own hook JSON
 /// schema (only `super::parse_hook_event`, the client side, needs to know
@@ -656,6 +658,125 @@ mod tests {
                 std::fs::read_to_string(&tty_path).unwrap()
             )
         });
+
+        daemon.abort();
+    }
+
+    /// The 2026-08-10 fix, end to end (see `state::HookEvent::NotifyUnlessDeferred`'s
+    /// docs for the live report this pins): a `stop_deferred` (one or more
+    /// background subagents still running) must stay the waiting color when a
+    /// `notify_unless_deferred` wire event arrives next (one of those
+    /// subagents finishing) — not jump to the attention color the way a plain
+    /// `notify` would. The deferred session still self-corrects to attention
+    /// once `max_deferral` elapses with no further real `Stop`, exactly as an
+    /// unresolved `stop_deferred` alone would.
+    #[tokio::test]
+    async fn notify_unless_deferred_does_not_escalate_a_waiting_tab_but_still_self_corrects() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(100),
+            // Deliberately generous relative to the fixed 40ms settle-sleep
+            // below (adversarial review, 2026-08-10: 150ms here left too
+            // little margin under this sandbox's known concurrent-agent CPU
+            // load — a slow scheduler tick could let max_deferral elapse
+            // before the negative assertion even runs, turning a real "did
+            // not escalate" pass into an accidental "already self-corrected,
+            // assertion happens to still see the old color" pass, or an
+            // outright flaky failure).
+            max_deferral: Duration::from_millis(800),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_millis(150),
+            hooks_dir: None,
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_deferred\"}\n").await.unwrap();
+        drop(client);
+        poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "stop_deferred must paint the waiting color").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify_unless_deferred\"}\n").await.unwrap();
+        drop(client);
+
+        // Give the event a moment to be processed, then assert the attention
+        // color/popup never landed — this is the actual regression: an
+        // `agent_completed` notification for one of several still-running
+        // background jobs used to escalate straight to attention here. (A
+        // no-op transition writes nothing at all, so the tty's last bytes are
+        // still whatever `SetWaitingColor` wrote — the progress ring, not the
+        // color escape — hence checking "never appeared" rather than
+        // "currently ends with the waiting color".)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let tty_contents = std::fs::read_to_string(&tty_path).unwrap();
+        assert!(
+            !tty_contents.contains("4;264;rgb:ff/88/00") && !tty_contents.contains("]9;Claude"),
+            "notify_unless_deferred must not escalate an already-Deferred session to attention: {tty_contents:?}"
+        );
+
+        // No further events — max_deferral (800ms) elapses and the daemon
+        // still self-corrects to attention on its own, same as an unresolved
+        // plain stop_deferred would.
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must still self-correct to the attention color").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "the self-correction must fire the popup").await;
+
+        daemon.abort();
+    }
+
+    /// Companion to the test above, closing the gap an adversarial review
+    /// (2026-08-10) flagged in it: that test only asserts *negatively*
+    /// ("attention never appeared"), which would also pass if the
+    /// `"notify_unless_deferred"` wire word were silently mis-typed and
+    /// [`super::super::ClientEvent::from_wire_str`] just dropped the event
+    /// entirely (`read_one_event_line` returns `None` for an unparseable
+    /// line, no error surfaced anywhere). Proves the round trip actually
+    /// works by exercising the *other* branch of `NotifyUnlessDeferred`
+    /// end to end: on a session with no locally-known `Deferred` state at
+    /// all, the wire event must positively paint the attention color and
+    /// fire the popup, exactly like a real `notify` would.
+    #[tokio::test]
+    async fn notify_unless_deferred_wire_event_on_a_fresh_session_paints_attention() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color: (0x20, 0x20, 0x20),
+            attention_color: (0xff, 0x88, 0x00),
+            waiting_color: (0x00, 0x60, 0xa0),
+            attention_timeout: Duration::from_secs(5),
+            max_deferral: Duration::from_secs(5),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_secs(5),
+            hooks_dir: None,
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify_unless_deferred\"}\n").await.unwrap();
+        drop(client);
+
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "a fresh session must still be paintable to attention").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "and must still fire the popup, exactly like a real notify").await;
 
         daemon.abort();
     }
