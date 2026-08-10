@@ -3422,9 +3422,16 @@ mod tests {
         t.screen_cells()[row * t.cols() + col].ch.as_str()
     }
 
+    /// `Terminal::new(80, 24, Theme::default())`はこのファイルのテストの
+    /// 大半(229箇所)が使う既定サイズ・既定テーマの組み合わせ。テスト側で
+    /// 異なる寸法/テーマが必要な場合は`Terminal::new`を直接呼ぶ。
+    fn default_term() -> Terminal {
+        Terminal::new(80, 24, Theme::default())
+    }
+
     #[test]
     fn test_print_ascii() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"hello");
         assert_eq!(cell(&t, 0, 0), "h");
         assert_eq!(cell(&t, 0, 4), "o");
@@ -3434,7 +3441,7 @@ mod tests {
 
     #[test]
     fn test_cr_lf() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"hello\r\nworld");
         assert_eq!(cell(&t, 0, 0), "h");
         assert_eq!(cell(&t, 1, 0), "w");
@@ -3482,7 +3489,7 @@ mod tests {
 
     #[test]
     fn test_cursor_address_csi_h() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[6;11H");  // row=6, col=11（1-indexed）
         assert_eq!(t.cursor_row(), 5);
         assert_eq!(t.cursor_col(), 10);
@@ -3490,7 +3497,7 @@ mod tests {
 
     #[test]
     fn test_erase_display_j2() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"hello\x1b[2J");
         assert_eq!(cell(&t, 0, 0), " ");
         assert_eq!(t.cursor_row(), 0);
@@ -3499,7 +3506,7 @@ mod tests {
 
     #[test]
     fn test_sgr_ansi_color() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31mA");  // red fg
         let c = &t.screen_cells()[0];
         assert_eq!(c.ch.as_str(), "A");
@@ -3508,14 +3515,14 @@ mod tests {
 
     #[test]
     fn test_sgr_reset() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31m\x1b[0mB");
         assert_eq!(t.screen_cells()[0].fg, Theme::default().default_fg);
     }
 
     #[test]
     fn test_sgr_underline_italic_strikethrough_blink_dim_invisible() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[4;3;9;5;2;8mA");
         let c = &t.screen_cells()[0];
         assert!(c.underline, "SGR 4 should set underline");
@@ -3528,7 +3535,7 @@ mod tests {
 
     #[test]
     fn test_sgr_individual_attribute_resets() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // 全部立てた上で、それぞれの reset コードだけを送り個別に消せることを確認する。
         feed(&mut t, b"\x1b[4;3;9;5;2;8m\x1b[24;23;29;25;22;28mA");
         let c = &t.screen_cells()[0];
@@ -3544,7 +3551,7 @@ mod tests {
     fn test_sgr_22_resets_both_bold_and_dim() {
         // SGR 22 は「bold/dim いずれかを解除する」共通のリセットコードであり、
         // bold(1)/dim(2) どちらが立っていても両方消す(SGR仕様通り、個別コードは無い)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[1;2m\x1b[22mA");
         let c = &t.screen_cells()[0];
         assert!(!c.bold, "SGR 22 should reset bold");
@@ -3553,7 +3560,7 @@ mod tests {
 
     #[test]
     fn test_sgr_reverse_swaps_effective_colors_at_write_time() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31;44;7mA"); // fg=red, bg=blue, reverse
         let c = &t.screen_cells()[0];
         // 実効色は書込み時に fg/bg が入れ替わって解決されている
@@ -3564,7 +3571,7 @@ mod tests {
 
     #[test]
     fn test_sgr_27_reverse_reset_restores_original_colors() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // reverse を解除(SGR 27)した後に書いた文字は元の論理色(fg=red,bg=blue)のまま。
         feed(&mut t, b"\x1b[31;44;7m\x1b[27mA");
         let c = &t.screen_cells()[0];
@@ -3574,7 +3581,7 @@ mod tests {
 
     #[test]
     fn test_sgr_0_and_empty_ps_clear_all_new_attributes() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[1;2;3;4;5;7;8;9m\x1b[0mA");
         let c = &t.screen_cells()[0];
         assert!(!c.bold && !c.dim && !c.italic && !c.underline && !c.blink && !c.invisible && !c.strikethrough);
@@ -3582,7 +3589,7 @@ mod tests {
         assert_eq!(c.bg, Theme::default().default_bg);
 
         // 空パラメータ(`ESC[m`)も SGR 0 と同義であるべき(Fableレビュー指摘)。
-        let mut t2 = Terminal::new(80, 24, Theme::default());
+        let mut t2 = default_term();
         feed(&mut t2, b"\x1b[1;2;3;4;5;7;8;9m\x1b[mB");
         let c2 = &t2.screen_cells()[0];
         assert!(!c2.bold && !c2.dim && !c2.italic && !c2.underline && !c2.blink && !c2.invisible && !c2.strikethrough);
@@ -3592,7 +3599,7 @@ mod tests {
 
     #[test]
     fn test_blank_and_wide_char_placeholder_inherit_current_attributes() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // wide文字(全角)の2セル目(placeholder)も現在のSGR属性を引き継ぐこと。
         feed(&mut t, b"\x1b[1;4m\xE3\x81\x82"); // bold+underline, "あ"(全角、UTF-8: E3 81 82)
         assert_eq!(t.screen_cells()[1].ch.as_str(), " ");
@@ -3611,7 +3618,7 @@ mod tests {
         // 幅0の結合文字(U+0301 COMBINING ACUTE ACCENT)は、独立したセルとして
         // カーソル位置に置かれるのではなく、直前のセルへグラフェムとして付加され、
         // カーソルは進まない(Fableレビュー: タスク#39)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, "e\u{0301}".as_bytes());
         assert_eq!(cell(&t, 0, 0), "e\u{0301}");
         assert_eq!(t.cursor_col(), 1, "combining char must not advance the cursor");
@@ -3625,7 +3632,7 @@ mod tests {
     fn test_combining_char_after_wide_char_attaches_to_wide_char_main_cell() {
         // 全角文字の直後に結合文字が来た場合、2セル目のプレースホルダではなく
         // 全角文字自身の本体セル(1セル目)へ付加するのが正解(Fableレビュー: タスク#39)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, "\u{3042}\u{0301}".as_bytes()); // "あ" + COMBINING ACUTE ACCENT
         assert_eq!(cell(&t, 0, 0), "\u{3042}\u{0301}", "combining char should attach to the wide char's main cell");
         assert_eq!(cell(&t, 0, 1), " ", "wide char placeholder cell must stay untouched");
@@ -3676,7 +3683,7 @@ mod tests {
     fn test_combining_char_at_start_of_line_with_no_prior_char_is_ignored() {
         // 行頭で付加対象の文字が存在しない場合(RIS直後・クリア直後等)は無視する。
         // グラフェムクラスタリング(ZWJ絵文字等)は対象外(Fableレビューでスコープ外と明記)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, "\u{0301}".as_bytes());
         assert_eq!(cell(&t, 0, 0), " ", "no base char to attach to: cell must remain blank");
         assert_eq!(t.cursor_col(), 0, "no cell was written, cursor must not move");
@@ -3686,7 +3693,7 @@ mod tests {
     fn test_combining_char_bytes_are_capped_per_cell() {
         // `a` + U+0301(2バイト)を大量に送っても、1セルの`ch`は
         // `MAX_COMBINING_BYTES_PER_CELL`を超えて際限なく成長しない(タスク#78)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"a");
         // 十分大きいN(1000個)を送り、上限超過分が黙って捨てられることを確認する。
         for _ in 0..1000 {
@@ -3710,7 +3717,7 @@ mod tests {
 
     #[test]
     fn test_rep_repeats_last_printed_char_with_explicit_count() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"A\x1b[3b"); // "A" の後にREPで3回追加繰り返し
         assert_eq!(cell(&t, 0, 0), "A");
         assert_eq!(cell(&t, 0, 1), "A");
@@ -3723,7 +3730,7 @@ mod tests {
     #[test]
     fn test_rep_default_count_is_one_when_param_omitted() {
         // `CSI b`(パラメータ省略)は`CSI 1b`と同義(他のCSIパラメータの既定値と同じ扱い)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"A\x1b[b");
         assert_eq!(cell(&t, 0, 0), "A");
         assert_eq!(cell(&t, 0, 1), "A");
@@ -3735,7 +3742,7 @@ mod tests {
     fn test_rep_is_noop_when_no_prior_graphic_char() {
         // 画面先頭など「直前に一度もgraphic文字が書かれていない」状態でのREPはno-op
         // (タスク#48の要求事項: 「直前文字が無い」状態の扱いを決めてテストする)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[5b");
         assert_eq!(cell(&t, 0, 0), " ");
         assert_eq!(t.cursor_col(), 0, "REP with no prior char must not move the cursor or write anything");
@@ -3745,7 +3752,7 @@ mod tests {
     fn test_rep_is_noop_immediately_after_ris_even_if_something_was_printed_before() {
         // RIS(`ESC c`)は「直前のgraphic文字」の記憶自体もリセットする(画面全体を
         // 消去する以上、繰り返す対象も存在しないと扱うのが自然、タスク#48)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"A\x1bc\x1b[3b");
         assert_eq!(cell(&t, 0, 0), " ", "RIS must clear the screen and REP must stay a no-op afterward");
     }
@@ -3754,7 +3761,7 @@ mod tests {
     fn test_rep_survives_intervening_newline_and_writes_at_new_cursor_position() {
         // 改行等の制御機能を挟んでも「直前のgraphic文字」の記憶はクリアしない
         // (xterm/VTE系実装の一般的挙動に合わせる、タスク#48)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"A\r\n\x1b[2b");
         assert_eq!(cell(&t, 0, 0), "A");
         assert_eq!(cell(&t, 1, 0), "A", "REP after a newline should still repeat the last printed char");
@@ -3768,7 +3775,7 @@ mod tests {
         // REPは「直前に描画した文字・属性」を繰り返す(タスク#48要件)——文字を最初に
         // 書いた時点のSGR属性を凍結して使い、その後SGRが変わっていても(REPを実行する
         // 時点で偶然有効な)現在の属性には影響されない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31mA\x1b[0m\x1b[2b"); // 赤字で"A"、その後SGRリセットしてからREP
         let theme = Theme::default();
         assert_eq!(t.screen_cells()[0].fg, theme.ansi16[1], "the originally-printed 'A' keeps its red color");
@@ -3789,7 +3796,7 @@ mod tests {
         // 幅0の結合文字は`last_graphic_cell`を更新しない(`print()`の幅0分岐は別経路)。
         // "e" + COMBINING ACUTE ACCENT の後のREPは、結合済みの「é」ではなく
         // 素の"e"を繰り返す(タスク#48)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, "e\u{0301}".as_bytes());
         feed(&mut t, b"\x1b[b");
         assert_eq!(cell(&t, 0, 0), "e\u{0301}", "original combined cell is untouched");
@@ -3801,7 +3808,7 @@ mod tests {
         // 全角文字のREPは、通常の`print_mapped()`(タスク#84で`print()`から分離)と
         // 同じ折り返し・プレースホルダロジックを再利用するため、1回の繰り返しごとに
         // 2セルずつ消費する(タスク#48)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角) が col0-1 を占める
         feed(&mut t, b"\x1b[2b"); // さらに2回繰り返す -> col2-3, col4-5
         assert_eq!(cell(&t, 0, 0), "\u{3042}");
@@ -3836,7 +3843,7 @@ mod tests {
         // (この文字集合では'q'は罫線文字'─'へ写像される) → REP。
         // 正しい挙動は、charset切り替え前に実際に画面へ書かれた'q'を繰り返すこと
         // であり、切り替え後のcharsetで'q'を再写像した'─'ではない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"q\x1b(0\x1b[b");
         assert_eq!(cell(&t, 0, 0), "q", "original 'q' printed under ASCII charset is untouched");
         assert_eq!(
@@ -3858,7 +3865,7 @@ mod tests {
         // REPでも高々24〜25行しかスクロールアウトしないため、この比較では
         // クランプが無くても(修正前の65535文字→約819行スクロールでも)
         // 819 <= 1920でテストが偽陽性に通ってしまいpinとして機能しなかった)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"x\x1b[65535b");
         let scrolled = t.take_scrollback().len();
         assert!(
@@ -3876,7 +3883,7 @@ mod tests {
     /// この随時トリミング自体が独立して効いていることを確認できる。
     #[test]
     fn test_pending_scrollback_is_capped_within_a_single_batch() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"x");
         for _ in 0..100 {
             feed(&mut t, b"\x1b[65535b");
@@ -3893,7 +3900,7 @@ mod tests {
         // vim起動→終了のような alt screen 往復で、SGR属性(新規属性含む)が
         // main側のカーソル状態として保存/復元されることを確認する
         // (Fableレビュー: saved_cursor タプルへの属性追加漏れの回帰防止)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[1;4;3;9;5;7mmain"); // bold+underline+italic+strike+blink+reverse
         feed(&mut t, b"\x1b[?1049h"); // alt へ(カーソル保存、alt側は属性リセットされる)
         assert!(!t.screen_cells()[0].bold, "alt screen should start with reset attributes");
@@ -3935,7 +3942,7 @@ mod tests {
     fn test_set_theme_affects_only_future_sgr_resolution() {
         // Phase 12: per-session theme。set_theme()は「以降にパースされるSGR」にのみ
         // 反映され、既に解決済みのセルは遡って再着色されない(既存の仕様を維持)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31mA");
         let original_red = t.screen_cells()[0].fg;
 
@@ -3951,7 +3958,7 @@ mod tests {
 
     #[test]
     fn test_alt_screen_switch() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"main");
         feed(&mut t, b"\x1b[?1049h");   // alt に切り替え（カーソル保存）
         assert_eq!(cell(&t, 0, 0), " "); // alt は空白
@@ -3974,7 +3981,7 @@ mod tests {
     /// `main_cells`を壊さないこと」だけを検証する。
     #[test]
     fn test_switch_to_alt_is_a_noop_when_already_in_alt_screen() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"shell-screen"); // main画面(最終的に復元されるべき内容)
         feed(&mut t, b"\x1b[?1049h"); // vim自身のalt進入(main_cellsを正しく保存)
         feed(&mut t, b"vim-screen"); // alt側(vimの画面)を書き換える
@@ -3985,21 +3992,21 @@ mod tests {
 
     #[test]
     fn test_title_osc() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
     }
 
     #[test]
     fn test_tab_color_osc_4_264_windows_terminal_convention() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
         assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
     }
 
     #[test]
     fn test_tab_color_osc_ignores_other_palette_indices() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // OSC 4 (regular palette color setting) is otherwise unimplemented —
         // only index 264 (Windows Terminal's tab-color convention) should
         // ever populate tab_color.
@@ -4009,7 +4016,7 @@ mod tests {
 
     #[test]
     fn test_tab_color_osc_cleared_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]4;264;rgb:aa/bb/cc\x1b\\");
         assert_eq!(t.tab_color(), Some((0xaa, 0xbb, 0xcc)));
         feed(&mut t, b"\x1bc"); // RIS
@@ -4024,7 +4031,7 @@ mod tests {
     /// into one final `tab_color`.
     #[test]
     fn test_tab_color_osc_6_1_bg_iterm2_convention() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]6;1;bg;red;brightness;170\x07");
         feed(&mut t, b"\x1b]6;1;bg;green;brightness;187\x07");
         feed(&mut t, b"\x1b]6;1;bg;blue;brightness;204\x07");
@@ -4036,7 +4043,7 @@ mod tests {
     /// three eventually do, not just the fully-combined end state above.
     #[test]
     fn test_tab_color_osc_6_1_bg_iterm2_applies_one_channel_at_a_time() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]6;1;bg;red;brightness;170\x07");
         assert_eq!(t.tab_color(), Some((0xaa, 0x00, 0x00)), "an as-yet-incomplete update should still be visible, not held back until all 3 channels arrive");
         feed(&mut t, b"\x1b]6;1;bg;blue;brightness;204\x07");
@@ -4045,7 +4052,7 @@ mod tests {
 
     #[test]
     fn test_tab_color_osc_6_1_bg_ignores_malformed_or_unrecognized_input() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         for malformed in [
             &b"\x1b]6;1;bg;red;brightness;not-a-number\x07"[..],
             &b"\x1b]6;1;bg;purple;brightness;170\x07"[..], // unrecognized channel name
@@ -4060,14 +4067,14 @@ mod tests {
 
     #[test]
     fn test_set_tab_color_direct_setter_mirrors_set_title() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_tab_color(0x11, 0x22, 0x33);
         assert_eq!(t.tab_color(), Some((0x11, 0x22, 0x33)));
     }
 
     #[test]
     fn test_set_tab_progress_direct_setter_mirrors_set_tab_color() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert_eq!(t.tab_progress(), None);
         t.set_tab_progress(ProgressState::Normal, 42);
         assert_eq!(t.tab_progress(), Some((ProgressState::Normal, 42)));
@@ -4075,7 +4082,7 @@ mod tests {
 
     #[test]
     fn test_set_tab_progress_none_state_clears_regardless_of_progress_value() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_tab_progress(ProgressState::Indeterminate, 0);
         assert!(t.tab_progress().is_some());
         // OSC 9;4;0の慣習(進捗をクリアする)を踏襲: stateがNoneなら`progress`の
@@ -4086,7 +4093,7 @@ mod tests {
 
     #[test]
     fn test_set_tab_progress_cleared_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_tab_progress(ProgressState::Error, 0);
         assert!(t.tab_progress().is_some());
         feed(&mut t, b"\x1bc"); // RIS
@@ -4095,7 +4102,7 @@ mod tests {
 
     #[test]
     fn test_clipboard_write_osc_52() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // "hello" base64-encoded, selection "c" (clipboard).
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(t.take_pending_clipboard_write(), Some("hello".to_string()));
@@ -4109,7 +4116,7 @@ mod tests {
     /// **何も起きない**(エラーにもならない)のが最大の落とし穴だった。
     #[test]
     fn test_clipboard_write_osc_52_carries_a_full_max_clipboard_text() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let text = "a".repeat(isekai_protocol::MAX_CLIPBOARD_TEXT_DECODED_LEN);
         let mut seq = Vec::new();
         seq.extend_from_slice(b"\x1b]52;c;");
@@ -4128,7 +4135,7 @@ mod tests {
     /// (`SnippetTemplates.CLAUDE_COPY_LAST_REPLY`がまさにそれをしている)。
     #[test]
     fn test_clipboard_write_osc_52_beyond_the_buffer_is_dropped() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let text = "a".repeat(OSC_RAW_BUF_SIZE * 2);
         let mut seq = Vec::new();
         seq.extend_from_slice(b"\x1b]52;c;");
@@ -4142,14 +4149,14 @@ mod tests {
 
     #[test]
     fn test_clipboard_query_is_not_treated_as_a_write() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;?\x07");
         assert_eq!(t.take_pending_clipboard_write(), None);
     }
 
     #[test]
     fn test_clipboard_query_sets_pending_pull_request() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;?\x07");
         assert!(t.take_pending_clipboard_pull_request());
         // Consumed once — a second take returns false until the next query.
@@ -4158,7 +4165,7 @@ mod tests {
 
     #[test]
     fn test_clipboard_write_does_not_set_pending_pull_request() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
         assert!(!t.take_pending_clipboard_pull_request());
     }
@@ -4167,7 +4174,7 @@ mod tests {
 
     #[test]
     fn test_osc8_open_link_attaches_link_id_to_printed_cells() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07hi");
         assert_eq!(t.screen_cells()[0].link_id, Some(0));
         assert_eq!(t.screen_cells()[1].link_id, Some(0));
@@ -4176,7 +4183,7 @@ mod tests {
 
     #[test]
     fn test_osc8_text_before_link_and_after_close_has_no_link_id() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"a");
         feed(&mut t, b"\x1b]8;;https://example.com\x07b");
         feed(&mut t, b"\x1b]8;;\x07c"); // 空URIで閉じる
@@ -4187,7 +4194,7 @@ mod tests {
 
     #[test]
     fn test_osc8_same_url_is_interned_to_the_same_id() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
         feed(&mut t, b"\x1b]8;;https://example.com\x07b\x1b]8;;\x07");
         assert_eq!(t.screen_cells()[0].link_id, t.screen_cells()[1].link_id);
@@ -4196,7 +4203,7 @@ mod tests {
 
     #[test]
     fn test_osc8_different_urls_get_different_ids() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://a.example\x07a\x1b]8;;\x07");
         feed(&mut t, b"\x1b]8;;https://b.example\x07b\x1b]8;;\x07");
         assert_ne!(t.screen_cells()[0].link_id, t.screen_cells()[1].link_id);
@@ -4208,7 +4215,7 @@ mod tests {
         // vteはOSCペイロードを`;`ごとにparamsへ分割して渡す——URIはparams[2]単独では
         // なくparams[2..]を`;`で再結合しなければならない(Fableレビュー2次指摘)。
         // このテストではURI自体に`;`を含むケースを再現する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com/?a=1;b=2\x07x");
         assert_eq!(t.link_table(), &["https://example.com/?a=1;b=2".to_string()]);
     }
@@ -4218,14 +4225,14 @@ mod tests {
         // `id=`パラメータ(params[1])は行折り返しをまたぐ同一リンク同定用だが、この
         // 実装ではURL自体のみをintern対象にする——id=部分がURLへ混入しないことを
         // 確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;id=42;https://example.com\x07x");
         assert_eq!(t.link_table(), &["https://example.com".to_string()]);
     }
 
     #[test]
     fn test_osc8_malformed_sequence_without_params_is_a_noop() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8\x07x"); // "8"だけでid/URIパートが無い
         assert_eq!(t.screen_cells()[0].link_id, None);
         assert!(t.link_table().is_empty());
@@ -4233,7 +4240,7 @@ mod tests {
 
     #[test]
     fn test_osc8_active_link_cleared_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07");
         feed(&mut t, b"\x1bc"); // RIS(`ESC c`、フルリセット)
         feed(&mut t, b"x");
@@ -4245,7 +4252,7 @@ mod tests {
         // RISはアクティブリンク状態だけをクリアし、intern表自体はクリアしない
         // ——既にscrollbackへ流れた過去セルのlink_idがこの表のindexを指し続けて
         // いるため、RIS後にindexを再利用すると過去セルが別URLを指す破損になる。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07x\x1b]8;;\x07");
         assert_eq!(t.link_table(), &["https://example.com".to_string()]);
         feed(&mut t, b"\x1bc"); // RIS
@@ -4254,7 +4261,7 @@ mod tests {
 
     #[test]
     fn test_osc8_active_link_cleared_on_switch_to_alt_screen() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07");
         feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
         feed(&mut t, b"x");
@@ -4263,7 +4270,7 @@ mod tests {
 
     #[test]
     fn test_osc8_active_link_cleared_on_switch_back_to_main_screen() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
         feed(&mut t, b"\x1b]8;;https://example.com\x07");
         feed(&mut t, b"\x1b[?1049l"); // mainへ復帰
@@ -4277,7 +4284,7 @@ mod tests {
         // 繰り返す設計(SGR属性と同じ扱い)。ここではその時点でアクティブだった
         // リンクを再現し、REP実行時点(既にリンクを閉じた後)のリンク状態には
         // 化けないことを確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
         feed(&mut t, b"\x1b[3b"); // REP: 直前文字'a'を3回繰り返す
         for i in 0..4 {
@@ -4296,7 +4303,7 @@ mod tests {
         // (切り詰められても`osc_dispatch`自体は呼ばれ、パニックしないことも
         // 合わせて確認する)。バッファを広げてもこの性質が変わらないことを
         // 保証したいので、長さは定数から導出して`OSC_RAW_BUF_SIZE`追従にする。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let long_suffix = "x".repeat(OSC_RAW_BUF_SIZE * 2);
         let long_url = format!("https://example.com/{long_suffix}");
         assert!(
@@ -4321,7 +4328,7 @@ mod tests {
         // タスク#70: リモートが相異なるOSC8 URLを大量に流しても`link_table`は
         // 無制限には増えない。上限到達後の新規URLはインターンされず、
         // アクティブリンクは「リンク無し」にフォールバックする。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // 上限ちょうどまでは各URLが順番にインターンされる。
         for i in 0..MAX_LINK_TABLE {
             feed(&mut t, format!("\x1b]8;;https://example.com/{i}\x07").as_bytes());
@@ -4362,7 +4369,7 @@ mod tests {
         // OSC8確認ダイアログに表示される文字列を偽装できてしまう(RTLO spoofing、
         // 例: 拡張子を先頭にひっくり返して見せる)ため、intern表に登録せずリンク
         // 無しへフォールバックしなければならない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let malicious = "https://evil.example/\u{202e}gpj.exe";
         feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
         assert_eq!(
@@ -4379,7 +4386,7 @@ mod tests {
     fn test_osc8_url_with_bidi_isolate_is_rejected() {
         // タスク#77: LRE/RLE/PDF/LRO/RLOだけでなく、bidi isolate(U+2066..=U+2069)
         // も同じ理由で拒否対象。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let malicious = "https://evil.example/\u{2066}x\u{2069}";
         feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
         assert_eq!(t.screen_cells()[0].link_id, None);
@@ -4391,7 +4398,7 @@ mod tests {
         // タスク#77: C1制御文字(例: U+0085 NEL)はUTF-8では2バイトのマルチバイト
         // シーケンスとしてvteのOSC文字列パーサをそのまま通過する(C0と違い静かに
         // 捨てられない)ため、Rust側でのフィルタが必要な実際の到達経路になる。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let malicious = "https://example.com/\u{0085}evil";
         feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
         assert_eq!(t.screen_cells()[0].link_id, None);
@@ -4403,7 +4410,7 @@ mod tests {
         // タスク#77: DEL(0x7F)はvteのOSC文字列パーサが無視するC0範囲
         // (0x00-0x06/0x08-0x17/0x19/0x1C-0x1F)に含まれず素通りするため、
         // 実際に`osc_dispatch`まで到達しうる制御文字。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com/\x7fevil\x07x");
         assert_eq!(t.screen_cells()[0].link_id, None);
         assert!(t.link_table().is_empty());
@@ -4412,7 +4419,7 @@ mod tests {
     #[test]
     fn test_osc8_url_without_disallowed_chars_is_unaffected_by_task77_filter() {
         // タスク#77のフィルタが正当なURLまで巻き込んでいないことの回帰確認。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]8;;https://example.com/normal-path?x=1\x07x");
         assert_eq!(t.screen_cells()[0].link_id, Some(0));
         assert_eq!(t.link_table(), &["https://example.com/normal-path?x=1".to_string()]);
@@ -4420,7 +4427,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_pending_clipboard_pull_request() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;?\x07");
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(!t.take_pending_clipboard_pull_request());
@@ -4428,14 +4435,14 @@ mod tests {
 
     #[test]
     fn test_clipboard_write_ignores_invalid_base64() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;not-valid-base64!!\x07");
         assert_eq!(t.take_pending_clipboard_write(), None);
     }
 
     #[test]
     fn test_reset_clears_pending_clipboard_write() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert_eq!(t.take_pending_clipboard_write(), None);
@@ -4445,7 +4452,7 @@ mod tests {
 
     #[test]
     fn test_primary_da_queues_response() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[c"); // Primary DA
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2;4c".to_vec()]);
         // Consumed once.
@@ -4454,14 +4461,14 @@ mod tests {
 
     #[test]
     fn test_primary_da_with_explicit_zero_param_queues_response() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[0c"); // Primary DA、明示的に Ps=0
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2;4c".to_vec()]);
     }
 
     #[test]
     fn test_secondary_da_queues_response_distinct_from_primary() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>c"); // Secondary DA(vteは`>`をintermediatesに入れる)
         let resp = t.take_pending_terminal_responses();
         assert_eq!(resp, vec![b"\x1b[>0;100;0c".to_vec()]);
@@ -4470,14 +4477,14 @@ mod tests {
 
     #[test]
     fn test_dsr_5n_queues_ok_response() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[5n"); // DSR: device status report
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[0n".to_vec()]);
     }
 
     #[test]
     fn test_dsr_6n_cpr_reports_current_cursor_position_1indexed() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[6;11H"); // カーソルを row=6, col=11 (1-indexed) へ移動
         feed(&mut t, b"\x1b[6n"); // DSR: cursor position report (CPR)
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[6;11R".to_vec()]);
@@ -4485,7 +4492,7 @@ mod tests {
 
     #[test]
     fn test_dsr_unhandled_ps_queues_nothing() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[9n"); // 未対応のDSR種別
         assert!(t.take_pending_terminal_responses().is_empty());
     }
@@ -4507,21 +4514,21 @@ mod tests {
         // Primary DA(識別要求)は`Ps`が省略時解釈込みで0の場合のみ有効(vte自身のANSI
         // ハンドラも`next_param_or(0) == 0`を条件にしている、Codexレビュー指摘)。
         // `CSI 1c`のような非0の`Ps`には応答しない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[1c");
         assert!(t.take_pending_terminal_responses().is_empty());
     }
 
     #[test]
     fn test_secondary_da_with_nonzero_ps_is_ignored() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>1c");
         assert!(t.take_pending_terminal_responses().is_empty());
     }
 
     #[test]
     fn test_reset_clears_pending_terminal_responses() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[6n"); // CPR要求をpendingにする
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(t.take_pending_terminal_responses().is_empty());
@@ -4531,7 +4538,7 @@ mod tests {
 
     #[test]
     fn test_kitty_query_default_flags_is_zero_legacy_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert_eq!(t.kitty_keyboard_flags(), 0);
         feed(&mut t, b"\x1b[?u"); // CSI ? u: query
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?0u".to_vec()]);
@@ -4539,7 +4546,7 @@ mod tests {
 
     #[test]
     fn test_kitty_push_sets_flags_and_query_reports_them() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>5u"); // push flags=5 (disambiguate + report alternate keys)
         assert_eq!(t.kitty_keyboard_flags(), 5);
         feed(&mut t, b"\x1b[?u");
@@ -4548,7 +4555,7 @@ mod tests {
 
     #[test]
     fn test_kitty_push_without_param_defaults_to_zero() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>1u");
         feed(&mut t, b"\x1b[>u"); // 省略時0をpush
         assert_eq!(t.kitty_keyboard_flags(), 0);
@@ -4556,7 +4563,7 @@ mod tests {
 
     #[test]
     fn test_kitty_pop_default_pops_one_entry_restoring_previous() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>1u");
         feed(&mut t, b"\x1b[>31u");
         assert_eq!(t.kitty_keyboard_flags(), 31);
@@ -4566,7 +4573,7 @@ mod tests {
 
     #[test]
     fn test_kitty_pop_explicit_count_pops_multiple() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>1u");
         feed(&mut t, b"\x1b[>2u");
         feed(&mut t, b"\x1b[>3u");
@@ -4576,7 +4583,7 @@ mod tests {
 
     #[test]
     fn test_kitty_pop_more_than_stack_depth_empties_without_panic() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>5u");
         feed(&mut t, b"\x1b[<100u"); // スタックの深さ(1)を大きく超えるpop要求
         assert_eq!(t.kitty_keyboard_flags(), 0, "空になった後は0(legacy mode)に戻る");
@@ -4587,7 +4594,7 @@ mod tests {
 
     #[test]
     fn test_kitty_set_mode1_default_replaces_flags() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>31u");
         feed(&mut t, b"\x1b[=1u"); // mode省略(既定1) → 丸ごと1へ置換
         assert_eq!(t.kitty_keyboard_flags(), 1);
@@ -4595,7 +4602,7 @@ mod tests {
 
     #[test]
     fn test_kitty_set_mode2_ors_bits_into_current_flags() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>1u"); // flags=1
         feed(&mut t, b"\x1b[=4;2u"); // mode2: 4をOR
         assert_eq!(t.kitty_keyboard_flags(), 5);
@@ -4603,7 +4610,7 @@ mod tests {
 
     #[test]
     fn test_kitty_set_mode3_clears_bits_from_current_flags() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>31u"); // flags=31(全ビット)
         feed(&mut t, b"\x1b[=5;3u"); // mode3: bit0とbit2をクリア
         assert_eq!(t.kitty_keyboard_flags(), 26); // 31 & !5 == 26
@@ -4611,7 +4618,7 @@ mod tests {
 
     #[test]
     fn test_kitty_set_on_empty_stack_creates_entry() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert_eq!(t.kitty_keyboard_flags(), 0);
         feed(&mut t, b"\x1b[=3u"); // pushせずいきなりset
         assert_eq!(t.kitty_keyboard_flags(), 3);
@@ -4619,7 +4626,7 @@ mod tests {
 
     #[test]
     fn test_kitty_push_beyond_stack_limit_evicts_oldest_entry() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // KITTY_KEYBOARD_STACK_MAX(8)を超えてpushする。
         for i in 1..=9u16 {
             feed(&mut t, format!("\x1b[>{i}u").as_bytes());
@@ -4637,7 +4644,7 @@ mod tests {
     fn test_kitty_flags_stack_independent_between_main_and_alt_screen() {
         // 仕様: "The main and alternate screens...must maintain their own,
         // independent, keyboard mode stacks"。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>5u"); // main画面でpush
         assert_eq!(t.kitty_keyboard_flags(), 5);
         feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
@@ -4653,7 +4660,7 @@ mod tests {
         // 既存のCSI u(ANSI.SYS方言、タスク#57)はintermediates無しの`u`のみを
         // 対象とする。Kitty分岐(`>`/`<`/`=`/`?`付き)を追加してもこの既存挙動を
         // 壊してはいけない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[10;5H"); // カーソルを移動
         feed(&mut t, b"\x1b[s"); // CSI s: save cursor
         feed(&mut t, b"\x1b[1;1H"); // 別の位置へ移動
@@ -4667,7 +4674,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_kitty_keyboard_flags_stack_on_both_screens() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[>5u");
         feed(&mut t, b"\x1b[?1049h"); // alt画面へ
         feed(&mut t, b"\x1b[>9u");
@@ -4683,14 +4690,14 @@ mod tests {
 
     #[test]
     fn test_osc10_query_reports_default_fg_bell_terminated() {
-        let mut t = Terminal::new(80, 24, Theme::default()); // default_fg = 0xFFCCCCCC
+        let mut t = default_term(); // default_fg = 0xFFCCCCCC
         feed(&mut t, b"\x1b]10;?\x07"); // BEL終端でquery
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:cccc/cccc/cccc\x07".to_vec()]);
     }
 
     #[test]
     fn test_osc11_query_reports_default_bg_st_terminated() {
-        let mut t = Terminal::new(80, 24, Theme::default()); // default_bg = 0xFF000000
+        let mut t = default_term(); // default_bg = 0xFF000000
         feed(&mut t, b"\x1b]11;?\x1b\\"); // ST(ESC \\)終端でquery — 応答も同じ終端子を使うべき
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec()]);
     }
@@ -4706,7 +4713,7 @@ mod tests {
 
     #[test]
     fn test_osc10_set_rgb_form_updates_theme_for_subsequent_query() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // fgを赤に設定(2桁hex成分)
         feed(&mut t, b"\x1b]10;?\x07");
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:ffff/0000/0000\x07".to_vec()]);
@@ -4714,7 +4721,7 @@ mod tests {
 
     #[test]
     fn test_osc11_set_hash_form_updates_theme_for_subsequent_query() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]11;#112233\x07"); // `#RRGGBB`形式
         feed(&mut t, b"\x1b]11;?\x07");
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]11;rgb:1111/2222/3333\x07".to_vec()]);
@@ -4722,7 +4729,7 @@ mod tests {
 
     #[test]
     fn test_osc10_set_invalid_spec_is_ignored() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]10;not-a-color\x07");
         feed(&mut t, b"\x1b]10;?\x07");
         // 既定値のまま変わっていないこと
@@ -4732,7 +4739,7 @@ mod tests {
     #[test]
     fn test_osc10_set_does_not_queue_a_response() {
         // set(query以外)は何も送り返さない——実端末もsetそのものには応答しない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07");
         assert!(t.take_pending_terminal_responses().is_empty());
     }
@@ -4743,7 +4750,7 @@ mod tests {
         // OSC 10 set直後にSGRリセットを挟まず印字すると、`self.theme`だけ更新しても
         // 旧既定色のまま描かれてしまう。setがまだ明示色指定を受けていないcur_attrsを
         // 新しい既定色へ追従させることを確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // fgを赤に設定
         feed(&mut t, b"x"); // SGRリセットを挟まず印字
         assert_eq!(t.screen_cells()[0].fg, 0xFFFF0000);
@@ -4753,7 +4760,7 @@ mod tests {
     fn test_osc10_set_does_not_override_explicitly_colored_sgr() {
         // 既にSGRで明示的に色指定済みのcur_attrsは、OSC 10 setで既定色が変わっても
         // 追従してはいけない(まだ"default"を指していない)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[32m"); // fgを緑(SGR 32)に明示指定
         feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // 既定fgを赤に変更
         feed(&mut t, b"x");
@@ -4764,14 +4771,14 @@ mod tests {
 
     #[test]
     fn test_osc12_query_falls_back_to_default_fg_when_unset() {
-        let mut t = Terminal::new(80, 24, Theme::default()); // default_fg = 0xFFCCCCCC
+        let mut t = default_term(); // default_fg = 0xFFCCCCCC
         feed(&mut t, b"\x1b]12;?\x07");
         assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]12;rgb:cccc/cccc/cccc\x07".to_vec()]);
     }
 
     #[test]
     fn test_osc12_set_rgb_form_updates_cursor_color_for_subsequent_query() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
         assert_eq!(t.cursor_color(), Some((0xff, 0x00, 0x00)));
         feed(&mut t, b"\x1b]12;?\x1b\\");
@@ -4780,14 +4787,14 @@ mod tests {
 
     #[test]
     fn test_osc12_set_invalid_spec_is_ignored() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]12;not-a-color\x07");
         assert_eq!(t.cursor_color(), None);
     }
 
     #[test]
     fn test_osc112_resets_cursor_color_to_unset() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
         assert_eq!(t.cursor_color(), Some((0xff, 0x00, 0x00)));
         feed(&mut t, b"\x1b]112\x07");
@@ -4796,7 +4803,7 @@ mod tests {
 
     #[test]
     fn test_osc12_cursor_color_cleared_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]12;rgb:ff/00/00\x07");
         feed(&mut t, b"\x1bc"); // RIS
         assert_eq!(t.cursor_color(), None);
@@ -4804,7 +4811,7 @@ mod tests {
 
     #[test]
     fn test_backspace() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"ab\x08c");  // a b BS c → "ac" at col 0,1
         assert_eq!(cell(&t, 0, 0), "a");
         assert_eq!(cell(&t, 0, 1), "c");
@@ -4813,7 +4820,7 @@ mod tests {
 
     #[test]
     fn test_cursor_up_down_csi() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[5B");  // cursor down 5
         assert_eq!(t.cursor_row(), 5);
         feed(&mut t, b"\x1b[2A");  // cursor up 2
@@ -4834,13 +4841,13 @@ mod tests {
 
     #[test]
     fn test_decawm_default_is_on() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert!(t.autowrap_mode(), "DECAWM should default to on (xterm既定)");
     }
 
     #[test]
     fn test_decawm_7l_disables_autowrap_and_7h_reenables() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?7l");
         assert!(!t.autowrap_mode());
         feed(&mut t, b"\x1b[?7h");
@@ -4871,7 +4878,7 @@ mod tests {
 
     #[test]
     fn test_decawm_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?7l");
         assert!(!t.autowrap_mode());
         feed(&mut t, b"\x1bc"); // RIS
@@ -5002,7 +5009,7 @@ mod tests {
 
     #[test]
     fn test_decom_default_is_off() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert!(!t.origin_mode(), "DECOM should default to off (xterm既定)");
     }
 
@@ -5160,7 +5167,7 @@ mod tests {
 
     #[test]
     fn test_decom_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?6h");
         assert!(t.origin_mode());
         feed(&mut t, b"\x1bc"); // RIS
@@ -5171,7 +5178,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_updates_dimensions() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.resize_preserving_state(40, 12);
         assert_eq!(t.cols(), 40);
         assert_eq!(t.rows(), 12);
@@ -5180,7 +5187,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_keeps_existing_content() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"hello");
         t.resize_preserving_state(40, 12);
         assert_eq!(cell(&t, 0, 0), "h");
@@ -5297,7 +5304,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_preserves_sgr_and_cursor_within_bounds() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[31mA"); // 赤, cursor_col=1
         t.resize_preserving_state(40, 12);
         feed(&mut t, b"B");
@@ -5307,7 +5314,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_clips_cursor_when_shrinking() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[20;70H"); // row=20,col=70(0-indexed 19,69)
         t.resize_preserving_state(40, 10);
         assert!(t.cursor_row() < 10);
@@ -5316,7 +5323,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_preserves_title_and_modes() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]0;My Title\x07");
         feed(&mut t, b"\x1b[?1h");    // application cursor mode on
         feed(&mut t, b"\x1b[?2004h"); // bracketed paste on
@@ -5328,7 +5335,7 @@ mod tests {
 
     #[test]
     fn test_dectcem_hides_and_shows_cursor() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert!(t.cursor_visible(), "既定はカーソル表示");
         feed(&mut t, b"\x1b[?25l"); // DECTCEM: カーソル非表示
         assert!(!t.cursor_visible());
@@ -5339,7 +5346,7 @@ mod tests {
     #[test]
     fn test_deckpam_deckpnm_toggle_application_keypad_mode() {
         // タスク#43: DECKPAM(`ESC =`)/DECKPNM(`ESC >`)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert!(!t.application_keypad_mode(), "既定はnumeric keypad mode");
         feed(&mut t, b"\x1b="); // DECKPAM
         assert!(t.application_keypad_mode());
@@ -5349,7 +5356,7 @@ mod tests {
 
     #[test]
     fn test_ris_resets_application_keypad_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b=");
         assert!(t.application_keypad_mode());
         feed(&mut t, b"\x1bc"); // RIS
@@ -5358,7 +5365,7 @@ mod tests {
 
     #[test]
     fn test_synchronized_output_mode_2026_toggle() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert!(!t.synchronized_output_active(), "既定はoff");
         feed(&mut t, b"\x1b[?2026h");
         assert!(t.synchronized_output_active());
@@ -5368,7 +5375,7 @@ mod tests {
 
     #[test]
     fn test_ris_resets_synchronized_output_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?2026h");
         assert!(t.synchronized_output_active());
         feed(&mut t, b"\x1bc"); // RIS
@@ -5377,7 +5384,7 @@ mod tests {
 
     #[test]
     fn test_force_end_synchronized_output_clears_active_flag() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?2026h");
         assert!(t.synchronized_output_active());
         t.force_end_synchronized_output();
@@ -5386,7 +5393,7 @@ mod tests {
 
     #[test]
     fn test_dectcem_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?25l");
         assert!(!t.cursor_visible());
         feed(&mut t, b"\x1bc"); // RIS (full reset)
@@ -5395,7 +5402,7 @@ mod tests {
 
     #[test]
     fn test_decscusr_default_shape() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert_eq!(t.cursor_shape(), CursorShape::Block, "既定はblock");
         assert!(t.cursor_blink(), "既定は点滅");
     }
@@ -5412,7 +5419,7 @@ mod tests {
             (6, CursorShape::Bar, false),
         ];
         for &(ps, shape, blink) in cases {
-            let mut t = Terminal::new(80, 24, Theme::default());
+            let mut t = default_term();
             feed(&mut t, format!("\x1b[{} q", ps).as_bytes());
             assert_eq!(t.cursor_shape(), shape, "Ps={ps}");
             assert_eq!(t.cursor_blink(), blink, "Ps={ps}");
@@ -5421,7 +5428,7 @@ mod tests {
 
     #[test]
     fn test_decscusr_unknown_param_ignored() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[5 q"); // bar, blinking
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
         feed(&mut t, b"\x1b[99 q"); // 未知のパラメータ: 直前の状態を維持
@@ -5434,7 +5441,7 @@ mod tests {
     /// intermediates == [b' '] の場合のみ DECSCUSR として扱うことを保証する。
     #[test]
     fn test_csi_q_without_intermediate_is_not_decscusr() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[5 q"); // まず bar/blinking にしておく
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
         feed(&mut t, b"\x1b[2q"); // 中間バイト無し = DECLL(未実装、no-op)であるべき
@@ -5444,7 +5451,7 @@ mod tests {
 
     #[test]
     fn test_decscusr_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[4 q"); // steady underline
         assert_eq!(t.cursor_shape(), CursorShape::Underline);
         assert!(!t.cursor_blink());
@@ -5455,7 +5462,7 @@ mod tests {
 
     #[test]
     fn test_decset_12_toggles_cursor_blink_independent_of_shape() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert!(t.cursor_blink(), "既定は点滅");
         feed(&mut t, b"\x1b[?12l"); // 点滅off
         assert!(!t.cursor_blink());
@@ -5475,7 +5482,7 @@ mod tests {
 
     #[test]
     fn test_decset_12_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?12l");
         assert!(!t.cursor_blink());
         feed(&mut t, b"\x1bc"); // RIS
@@ -5484,7 +5491,7 @@ mod tests {
 
     #[test]
     fn test_bell_increments_generation() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert_eq!(t.bell_generation(), 0, "既定は0");
         feed(&mut t, b"\x07");
         assert_eq!(t.bell_generation(), 1);
@@ -5492,7 +5499,7 @@ mod tests {
 
     #[test]
     fn test_bell_multiple_increments_each_time() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x07\x07\x07");
         assert_eq!(t.bell_generation(), 3, "BELを受信するたびに単調増加する");
     }
@@ -5502,7 +5509,7 @@ mod tests {
         // vte は OSC のターミネータとして使われた BEL(`ESC]0;title BEL`)を
         // ターミネータとして消費し、`execute()`には渡さない仕様。よって
         // タイトル設定に伴う BEL では鳴ってはいけない(Fableレビュー: タスク#24)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
         assert_eq!(t.bell_generation(), 0, "OSC終端のBELではbell_generationは進まない");
@@ -5513,7 +5520,7 @@ mod tests {
         // reset_all(RIS)はpending clipboard等を律儀にリセットするが、
         // bell_generationは単調増加を維持する必要があるため意図的にリセットしない
         // (Fableレビュー: タスク#24)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x07\x07");
         assert_eq!(t.bell_generation(), 2);
         feed(&mut t, b"\x1bc"); // RIS (full reset)
@@ -5524,7 +5531,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_preserves_cursor_visibility() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?25l"); // カーソル非表示にしてからリサイズ
         t.resize_preserving_state(40, 12);
         assert!(!t.cursor_visible(), "リサイズでカーソル非表示状態が消えてはいけない");
@@ -5532,7 +5539,7 @@ mod tests {
 
     #[test]
     fn test_resize_preserving_state_noop_when_size_unchanged() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"hello");
         t.resize_preserving_state(80, 24);
         assert_eq!(cell(&t, 0, 0), "h");
@@ -5547,7 +5554,7 @@ mod tests {
         // scroll regionが全画面(0..new_rows-1)を覆っていなければならない。
         // 単純にmin(max_row)するだけだと、増えた下端がscroll regionの外に
         // 取り残され、newlineでのスクロールが画面の上半分だけで起きてしまう。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.resize_preserving_state(80, 40);
         // 24行目(0-indexed)より下までnewlineでスクロールできることを確認する:
         // scroll regionが0..23のまま壊れていれば、この時点でcursor_rowは23で
@@ -5564,7 +5571,7 @@ mod tests {
         // 全画面でない明示的なscroll region(DECSTBM)が設定されていた場合は、
         // (全画面だった場合と違って)新サイズにclampするだけで、勝手に全画面へは
         // リセットしない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[3;10r"); // scroll region = rows 3..10 (1-indexed) = 2..9 (0-indexed)
         t.resize_preserving_state(80, 12);
         // scroll_top/bottomの直接getterは無いため、scroll region下端(0-indexed 9)を
@@ -5581,7 +5588,7 @@ mod tests {
         // 通常のカーソル位置(旧cols内の途中の列)が、単純に`min(new_cols)`されると
         // 「ちょうど新しいnew_colsで折り返し待ち」に化けてしまい、次に出力した文字が
         // 同じ行の右端ではなく次行の先頭に出てしまうバグがあった。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[1;70H"); // row=1,col=70(1-indexed) → cursor_col=69(0-indexed)
         t.resize_preserving_state(40, 24); // cols: 80→40, 69 は新しい幅を超える
         feed(&mut t, b"Z");
@@ -5606,7 +5613,7 @@ mod tests {
     fn test_resize_preserving_state_clamps_zero_size_to_minimum() {
         // Terminal自身の不変量(cursor_row < rows等)を、呼び出し元がどんな値を渡しても
         // 保つため、0を渡されても最低1x1にclampする(Codexレビュー(#18)指摘のP2)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.resize_preserving_state(0, 0);
         assert_eq!(t.cols(), 1);
         assert_eq!(t.rows(), 1);
@@ -6603,14 +6610,14 @@ mod tests {
 
     #[test]
     fn test_mouse_mode_default_off() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
         assert!(!t.sgr_mouse_mode());
     }
 
     #[test]
     fn test_mouse_mode_decset_1000_1002_1003() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h");
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Normal);
         feed(&mut t, b"\x1b[?1002h");
@@ -6623,7 +6630,7 @@ mod tests {
     fn test_mouse_mode_decrst_any_number_turns_off() {
         // xterm互換: `?1000`/`?1002`/`?1003`は同一の内部モードを共有するため、
         // どの番号でreset(`l`)しても番号に関わらずOffに戻る。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1003h");
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::AnyEvent);
         feed(&mut t, b"\x1b[?1000l");
@@ -6632,7 +6639,7 @@ mod tests {
 
     #[test]
     fn test_mouse_mode_sgr_1006_independent_toggle() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1006h");
         assert!(t.sgr_mouse_mode());
         // SGRを先にonにしても、マウストラッキング自体は別モードのまま(Off)。
@@ -6643,7 +6650,7 @@ mod tests {
 
     #[test]
     fn test_mouse_mode_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1003h\x1b[?1006h");
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::AnyEvent);
         assert!(t.sgr_mouse_mode());
@@ -6654,7 +6661,7 @@ mod tests {
 
     #[test]
     fn test_mouse_mode_preserved_across_resize() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
         t.resize_preserving_state(40, 12);
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::ButtonEvent);
@@ -6667,7 +6674,7 @@ mod tests {
         // 1シーケンスにまとめて送ることが珍しくない(codexレビュー指摘: 先頭
         // パラメータしか見ないと後続の1006が無視され、SGRを要求したのにlegacy
         // X10形式のまま返してしまうバグになる)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000;1006h");
         assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Normal);
         assert!(t.sgr_mouse_mode());
@@ -6678,7 +6685,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_off_mode_reports_nothing() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         let event = PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::Left), modifiers: no_mods(),
@@ -6688,7 +6695,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_sgr_press_and_release() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let press = t.encode_pointer_event(PointerEvent {
             row: 4, col: 9, kind: MouseEventKind::Press,
@@ -6706,7 +6713,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_sgr_with_modifiers() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let mods = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
         let press = t.encode_pointer_event(PointerEvent {
@@ -6719,7 +6726,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_sgr_wheel() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let up = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6735,7 +6742,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_legacy_x10_press_and_release() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h"); // 1006無し(レガシー)
         let press = t.encode_pointer_event(PointerEvent {
             row: 4, col: 9, kind: MouseEventKind::Press,
@@ -6769,7 +6776,7 @@ mod tests {
         // この端末の実サイズへクランプしてから送る(codexレビュー指摘: SGRが
         // 無クランプだと、80列の端末でも列1001のような存在しない座標を報告できて
         // しまっていた)。80x24の端末なので有効な最終セルは(23, 79)(0-based)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let sgr = t.encode_pointer_event(PointerEvent {
             row: 1000, col: 1000, kind: MouseEventKind::Press,
@@ -6788,7 +6795,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_motion_suppressed_in_normal_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h"); // Normal: press/releaseのみ
         let motion = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Motion,
@@ -6799,7 +6806,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_drag_reported_in_button_event_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1002h\x1b[?1006h"); // ButtonEvent
         let drag = t.encode_pointer_event(PointerEvent {
             row: 1, col: 1, kind: MouseEventKind::Motion,
@@ -6817,7 +6824,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_hover_reported_in_any_event_mode() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1003h\x1b[?1006h"); // AnyEvent
         let hover = t.encode_pointer_event(PointerEvent {
             row: 2, col: 2, kind: MouseEventKind::Motion,
@@ -6830,7 +6837,7 @@ mod tests {
     #[test]
     fn test_encode_pointer_event_wheel_reported_even_in_normal_mode() {
         // ホイールは移動ではなくPress扱いなので、Normal(?1000)でも報告される。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let up = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6842,7 +6849,7 @@ mod tests {
     #[test]
     fn test_encode_pointer_event_urxvt_press_and_release() {
         // URXVT (?1015) uses `CSI Cb ; Cx ; Cy M` (no `<` prefix, unlike SGR).
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
         let press = t.encode_pointer_event(PointerEvent {
             row: 4, col: 9, kind: MouseEventKind::Press,
@@ -6858,7 +6865,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_urxvt_with_modifiers() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
         let mods = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
         let press = t.encode_pointer_event(PointerEvent {
@@ -6871,7 +6878,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_urxvt_wheel() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
         let up = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6887,7 +6894,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_urxvt_drag_motion() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1002h\x1b[?1015h");
         let drag = t.encode_pointer_event(PointerEvent {
             row: 1, col: 1, kind: MouseEventKind::Motion,
@@ -6900,7 +6907,7 @@ mod tests {
     #[test]
     fn test_encode_pointer_event_sgr_takes_precedence_over_urxvt() {
         // When both ?1006 (SGR) and ?1015 (URXVT) are enabled, SGR wins.
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h\x1b[?1015h");
         let press = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6911,7 +6918,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_horizontal_wheel_sgr() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let left = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6927,7 +6934,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_horizontal_wheel_legacy() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h"); // legacy X10
         let left = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6945,7 +6952,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_middle_button_sgr() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
         let press = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6956,7 +6963,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_right_button_legacy() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h");
         let press = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6968,7 +6975,7 @@ mod tests {
 
     #[test]
     fn test_encode_pointer_event_urxvt_horizontal_wheel() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
         let left = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
@@ -6986,7 +6993,7 @@ mod tests {
 
     #[test]
     fn test_cursor_forward_cuf() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // Place cursor at col 5, then move forward 3
         t.cursor_col = 5;
         feed(&mut t, b"\x1b[3C");
@@ -6996,7 +7003,7 @@ mod tests {
 
     #[test]
     fn test_cursor_forward_cuf_clamps_at_last_column() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_col = 78;
         feed(&mut t, b"\x1b[5C");
         assert_eq!(t.cursor_col, 79); // cols-1
@@ -7004,7 +7011,7 @@ mod tests {
 
     #[test]
     fn test_cursor_backward_cub() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_col = 10;
         feed(&mut t, b"\x1b[4D");
         assert_eq!(t.cursor_col, 6);
@@ -7012,7 +7019,7 @@ mod tests {
 
     #[test]
     fn test_cursor_backward_cub_clamps_at_zero() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_col = 2;
         feed(&mut t, b"\x1b[10D");
         assert_eq!(t.cursor_col, 0);
@@ -7020,7 +7027,7 @@ mod tests {
 
     #[test]
     fn test_cursor_next_line_cnl() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_row = 3;
         t.cursor_col = 10;
         feed(&mut t, b"\x1b[2E");
@@ -7030,7 +7037,7 @@ mod tests {
 
     #[test]
     fn test_cursor_previous_line_cpl() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_row = 5;
         t.cursor_col = 10;
         feed(&mut t, b"\x1b[2F");
@@ -7040,7 +7047,7 @@ mod tests {
 
     #[test]
     fn test_cursor_key_mode_decckm() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert!(!t.application_cursor_mode());
         feed(&mut t, b"\x1b[?1h");
         assert!(t.application_cursor_mode());
@@ -7050,7 +7057,7 @@ mod tests {
 
     #[test]
     fn test_su_with_scroll_region() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         // Fill rows 0-5 with identifiable content
         for row in 0..6 {
             let ch = (b'A' + row as u8) as char;
@@ -7073,7 +7080,7 @@ mod tests {
 
     #[test]
     fn test_reverse_index_ri() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.cursor_row = 5;
         feed(&mut t, b"\x1bM"); // Reverse Index
         assert_eq!(t.cursor_row, 4);
@@ -7081,7 +7088,7 @@ mod tests {
 
     #[test]
     fn test_reverse_index_ri_at_top_scrolls_down() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.print('X');
         t.cursor_row = 0;
         t.cursor_col = 0;
@@ -7096,13 +7103,13 @@ mod tests {
 
     #[test]
     fn test_focus_reporting_mode_default_off() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert!(!t.focus_reporting_mode());
     }
 
     #[test]
     fn test_focus_reporting_mode_decset_decrst_1004() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1004h");
         assert!(t.focus_reporting_mode());
         feed(&mut t, b"\x1b[?1004l");
@@ -7111,7 +7118,7 @@ mod tests {
 
     #[test]
     fn test_focus_reporting_mode_reset_by_ris() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1004h");
         assert!(t.focus_reporting_mode());
         feed(&mut t, b"\x1bc"); // RIS
@@ -7120,7 +7127,7 @@ mod tests {
 
     #[test]
     fn test_focus_reporting_mode_preserved_across_resize() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1004h");
         t.resize_preserving_state(40, 12);
         assert!(t.focus_reporting_mode());
@@ -7128,14 +7135,14 @@ mod tests {
 
     #[test]
     fn test_encode_focus_event_off_mode_reports_nothing() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert_eq!(t.encode_focus_event(true), None);
         assert_eq!(t.encode_focus_event(false), None);
     }
 
     #[test]
     fn test_encode_focus_event_gained_and_lost() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1004h");
         assert_eq!(t.encode_focus_event(true), Some(b"\x1b[I".to_vec()));
         assert_eq!(t.encode_focus_event(false), Some(b"\x1b[O".to_vec()));
@@ -7145,7 +7152,7 @@ mod tests {
 
     #[test]
     fn test_sixel_places_image_at_cursor_and_advances_cursor_below_it() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[3;5H"); // カーソルを(row=2,col=4)へ(1-indexed入力)
         // 色0を赤で定義し、1ピクセルだけ描くsixel(1x1画像)。
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
@@ -7172,7 +7179,7 @@ mod tests {
     /// のトリミングもすり抜ける)に至っていた。
     #[test]
     fn test_sixel_sparse_bounding_box_does_not_bypass_area_cap() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let mut seq = b"\x1bPq#0;2;100;0;0!4095@".to_vec();
         seq.extend(std::iter::repeat(b'-').take(682));
         seq.extend_from_slice(b"G\x1b\\");
@@ -7182,7 +7189,7 @@ mod tests {
 
     #[test]
     fn test_sixel_image_gets_monotonically_increasing_ids() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         let ids: Vec<u64> = t.images().iter().map(|i| i.id).collect();
@@ -7212,7 +7219,7 @@ mod tests {
 
     #[test]
     fn dispatch_apc_present_document_updates_panel_fields_and_generation() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_panel_enabled(true);
         assert_eq!(t.panel_generation(), 0, "既定は0");
         assert_eq!(t.panel_kind(), PanelKind::None);
@@ -7228,7 +7235,7 @@ mod tests {
 
     #[test]
     fn dispatch_apc_present_form_populates_fields() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_panel_enabled(true);
         t.dispatch_apc(
             br#"{"type":"presentForm","title":"confirm","fields":[{"id":"a","label":"A","kind":"text"},{"id":"b","label":"B","kind":"choice","options":["x","y"]}]}"#,
@@ -7243,7 +7250,7 @@ mod tests {
         // `PANEL_MIN_UPDATE_INTERVAL`のレート制限に引っかからないよう、各呼び出しの
         // 現在時刻を`dispatch_apc_at`で明示的に間隔を空けて注入する(`dispatch_apc`
         // 自体の実時間待ちはしない)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_panel_enabled(true);
         let t0 = std::time::Instant::now();
         t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
@@ -7269,7 +7276,7 @@ mod tests {
         // graphicsへフォールバックすること(名前空間分岐が既存機能を壊していないこと
         // の回帰テスト)。
         use base64::Engine;
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let payload = format!(
             "Gf=32,s=1,v=1,a=T;{}",
             base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4])
@@ -7284,7 +7291,7 @@ mod tests {
         // コードレビュー2026-07-25で指摘された回帰の再発防止テスト:
         // `set_panel_enabled(true)`を呼ぶまでは、有効なAIパネルエンベロープが
         // 来ても黙って無視される(`AI_INTEGRATION_DESIGN.md` §3の既定OFF)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         assert_eq!(t.panel_generation(), 0);
         t.dispatch_apc(br#"{"type":"presentDocument","title":"t","markdown":"m"}"#);
         assert_eq!(t.panel_generation(), 0, "opt-inするまでパネル世代は進まない");
@@ -7295,7 +7302,7 @@ mod tests {
     fn dispatch_apc_rate_limits_panel_updates_within_min_interval() {
         // `AI_INTEGRATION_DESIGN.md` §6.2の表示レート制限: 直近許可した更新から
         // `PANEL_MIN_UPDATE_INTERVAL`未満の間隔で来た新しいパネルは黙って破棄される。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_panel_enabled(true);
         let t0 = std::time::Instant::now();
         t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
@@ -7323,7 +7330,7 @@ mod tests {
         // 拒否された呼び出しは`last_panel_update_at`を更新しない——直近「許可した」
         // 時刻からの間隔でのみ判定されることを確認する(拒否のたびに時計がリセット
         // されるとレート制限が実質無効化されてしまう)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         t.set_panel_enabled(true);
         let t0 = std::time::Instant::now();
         t.dispatch_apc_at(br#"{"type":"presentDocument","title":"first","markdown":""}"#, t0);
@@ -7356,7 +7363,7 @@ mod tests {
         // Opusレビュー指摘: `i=`(client image id)を送らない画像(chafa等が実際に
         // そうする)が`d=a`(全削除)で消せなかった不具合の回帰テスト。
         use base64::Engine;
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let payload = format!(
             "Gf=32,s=1,v=1,a=T;{}",
             base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4])
@@ -7370,7 +7377,7 @@ mod tests {
     #[test]
     fn test_kitty_delete_all_does_not_remove_sixel_images() {
         use base64::Engine;
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\"); // sixel画像を1枚配置
         let payload = format!(
             "Gf=32,s=1,v=1,a=T;{}",
@@ -7385,7 +7392,7 @@ mod tests {
     #[test]
     fn test_kitty_delete_by_id_removes_only_matching_placement() {
         use base64::Engine;
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let img_a = format!(
             "Gf=32,s=1,v=1,a=T,i=1;{}",
             base64::engine::general_purpose::STANDARD.encode([1u8, 1, 1, 1])
@@ -7405,7 +7412,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_sixel_images() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         feed(&mut t, b"\x1bc"); // RIS
@@ -7414,7 +7421,7 @@ mod tests {
 
     #[test]
     fn test_scroll_clears_sixel_images() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         // 画面全体を埋めて自然にスクロールさせる(24行分の改行)。
@@ -7426,7 +7433,7 @@ mod tests {
 
     #[test]
     fn test_alt_screen_switch_clears_sixel_images() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         feed(&mut t, b"\x1b[?1049h"); // alt screenへ
@@ -7435,7 +7442,7 @@ mod tests {
 
     #[test]
     fn test_resize_clears_sixel_images() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         t.resize_preserving_state(40, 12);
@@ -7446,7 +7453,7 @@ mod tests {
     fn test_full_screen_erase_clears_sixel_images() {
         // codexレビュー指摘: `CSI 2J`/`CSI 3J`(全画面消去、`clear(1)`が送る)は
         // テキストと一緒に画像配置も消えるべき。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         feed(&mut t, b"\x1b[2J");
@@ -7457,7 +7464,7 @@ mod tests {
     fn test_partial_erase_does_not_clear_sixel_images() {
         // ED0/ED1・EL等の部分消去はスコープ外(`ImagePlacement`のdocコメント参照)
         // であることを明示的に固定する回帰テスト。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
         assert_eq!(t.images().len(), 1);
         feed(&mut t, b"\x1b[0J"); // ED0
@@ -7469,14 +7476,14 @@ mod tests {
     fn test_non_sixel_dcs_is_ignored() {
         // 最終バイトが`q`以外のDCS(未対応のサブプロトコル)は無視され、画像は
         // 作られない(黙って破棄する従来通りの挙動)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1bP1$tsomething\x1b\\");
         assert!(t.images().is_empty());
     }
 
     #[test]
     fn test_primary_da_advertises_sixel_support() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[c");
         let resp = t.take_pending_terminal_responses();
         assert_eq!(resp, vec![b"\x1b[?1;2;4c".to_vec()], "DA1応答に';4'(Sixel対応)が含まれること");
@@ -7490,7 +7497,7 @@ mod tests {
         // 呼び(実際のsixelバイト列エンコードは不要——寿命管理ロジックの検証が
         // 目的)、合計バイト数が`MAX_TOTAL_IMAGE_RGBA_BYTES`(64MiB)を上回らない
         // ことを確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let width = 2000usize;
         let height = 2000usize;
         assert_eq!(width * height, 4_000_000, "テストの前提: 2000x2000pxはsixel::MAX_SIXEL_AREA(4_000_000)と一致する");
@@ -7514,7 +7521,7 @@ mod tests {
         // 総バイト数キャップに達したら最も古い画像から捨てる(`MAX_LIVE_IMAGES`
         // 超過時の1枚捨てと同じ「古いものを優先して捨てる」ポリシー)ことを、
         // idの単調増加で確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         let width = 2000usize;
         let height = 2000usize;
         for _ in 0..8 {
@@ -7533,7 +7540,7 @@ mod tests {
         // 小さい画像であれば総バイト数キャップに達しないため、
         // `MAX_LIVE_IMAGES`(個数キャップ)の挙動がそのまま保たれることを確認する
         // (総バイト数キャップの追加が既存の個数キャップの挙動を壊していないこと)。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         for _ in 0..40 {
             t.place_sixel_image(SixelImage { width: 1, height: 1, rgba: vec![0, 0, 0, 255] });
         }
@@ -7545,7 +7552,7 @@ mod tests {
     #[test]
     fn test_osc133_abcd_sequence_does_not_affect_screen_content() {
         // OSC 133自体は不可視のマーカーであり、画面内容(セル)には一切影響しない。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n");
         feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
         feed(&mut t, b"\x1b]133;D;0\x07");
@@ -7651,7 +7658,7 @@ mod tests {
 
     #[test]
     fn test_osc133_click_moves_cursor_forward_on_active_input_line() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;B\x07ab");
         // カーソルは(0,2)。同じ行の列5をタップ -> 3回分right矢印。
         let bytes = t.cursor_move_bytes_for_click(0, 5).expect("入力行上のタップは有効なはず");
@@ -7660,7 +7667,7 @@ mod tests {
 
     #[test]
     fn test_osc133_click_moves_cursor_backward_on_active_input_line() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;B\x07abcde");
         // カーソルは(0,5)。列1をタップ -> 4回分left矢印。
         let bytes = t.cursor_move_bytes_for_click(0, 1).expect("入力行上のタップは有効なはず");
@@ -7669,7 +7676,7 @@ mod tests {
 
     #[test]
     fn test_osc133_click_uses_ss3_form_when_application_cursor_mode_active() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b[?1h"); // DECCKM on
         feed(&mut t, b"\x1b]133;B\x07ab");
         let bytes = t.cursor_move_bytes_for_click(0, 3).expect("入力行上のタップは有効なはず");
@@ -7679,7 +7686,7 @@ mod tests {
     #[test]
     fn test_osc133_click_is_noop_before_command_start() {
         // OSC 133;Bがまだ来ていない(=入力行がアクティブでない)状態のタップは無視する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"ab");
         assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
     }
@@ -7687,28 +7694,28 @@ mod tests {
     #[test]
     fn test_osc133_click_is_noop_after_command_executed() {
         // ;Cが来た後(出力フェーズ)はもう入力行ではないので無視する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;B\x07ab\x1b]133;C\x07");
         assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
     }
 
     #[test]
     fn test_osc133_click_is_noop_on_a_different_row() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;B\x07ab");
         assert!(t.cursor_move_bytes_for_click(1, 0).is_none(), "カーソル行以外のタップは無視するはず");
     }
 
     #[test]
     fn test_osc133_click_is_noop_when_tapped_column_equals_cursor_column() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;B\x07ab");
         assert!(t.cursor_move_bytes_for_click(0, 2).is_none(), "移動量ゼロは送信しない");
     }
 
     #[test]
     fn test_osc133_copy_last_command_output_single_line() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
         feed(&mut t, b"\x1b]133;D;0\x07");
         assert_eq!(t.last_command_output_text(), Some("file.txt".to_string()));
@@ -7716,7 +7723,7 @@ mod tests {
 
     #[test]
     fn test_osc133_copy_last_command_output_multi_line_joins_with_newline() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;C\x07line1\r\nline2\r\n");
         feed(&mut t, b"\x1b]133;D\x07");
         assert_eq!(t.last_command_output_text(), Some("line1\nline2".to_string()));
@@ -7724,13 +7731,13 @@ mod tests {
 
     #[test]
     fn test_osc133_copy_last_command_output_none_before_any_command_finished() {
-        let t = Terminal::new(80, 24, Theme::default());
+        let t = default_term();
         assert_eq!(t.last_command_output_text(), None);
     }
 
     #[test]
     fn test_osc133_copy_last_command_output_is_overwritten_by_newer_command() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;C\x07old\r\n");
         feed(&mut t, b"\x1b]133;D\x07");
         feed(&mut t, b"\x1b]133;C\x07new\r\n");
@@ -7740,7 +7747,7 @@ mod tests {
 
     #[test]
     fn test_osc133_copy_last_command_output_ignores_bytes_outside_c_to_d_window() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;A\x07prompt-not-output\r\n");
         feed(&mut t, b"\x1b]133;C\x07actual-output\r\n");
         feed(&mut t, b"\x1b]133;D\x07next-prompt-not-output\r\n");
@@ -7751,7 +7758,7 @@ mod tests {
     fn test_osc133_d_exit_code_parses_when_present_and_numeric() {
         // exit codeそのものは`last_command_output_text`からは見えないが、パース失敗
         // (数値以外)でもpanicしない/後続の処理を壊さないことを確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;C\x07out\r\n");
         feed(&mut t, b"\x1b]133;D;127\x07");
         assert_eq!(t.last_command_output_text(), Some("out".to_string()));
@@ -7759,7 +7766,7 @@ mod tests {
 
     #[test]
     fn test_osc133_d_with_non_numeric_extra_param_does_not_panic() {
-        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut t = default_term();
         feed(&mut t, b"\x1b]133;C\x07out\r\n");
         feed(&mut t, b"\x1b]133;D;aid=1\x07");
         assert_eq!(t.last_command_output_text(), Some("out".to_string()));
@@ -7787,14 +7794,14 @@ mod tests {
         /// 任意バイト列でパニックしない
         #[test]
         fn prop_no_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let mut t = Terminal::new(80, 24, Theme::default());
+            let mut t = default_term();
             feed(&mut t, &bytes);
         }
 
         /// カーソルは常に画面内に収まる
         #[test]
         fn prop_cursor_in_bounds(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let mut t = Terminal::new(80, 24, Theme::default());
+            let mut t = default_term();
             feed(&mut t, &bytes);
             prop_assert!(t.cursor_row() < t.rows(),
                 "cursor_row={} >= rows={}", t.cursor_row(), t.rows());
@@ -7836,7 +7843,7 @@ mod tests {
             new_rows in 4usize..40,
             after in proptest::collection::vec(any::<u8>(), 0..256),
         ) {
-            let mut t = Terminal::new(80, 24, Theme::default());
+            let mut t = default_term();
             feed(&mut t, &before);
             t.resize_preserving_state(new_cols, new_rows);
             prop_assert_eq!(t.cols(), new_cols);
