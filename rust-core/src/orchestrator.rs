@@ -1457,10 +1457,6 @@ impl SessionOrchestrator {
         self.shared.callback.on_trzsz_state_changed(TrzszPublicState::Idle);
     }
 
-    pub fn is_quic(&self) -> bool {
-        self.shared.state.lock().is_quic()
-    }
-
     /// OS からネットワーク断（Wi-Fi/セルラー消失等）を通知された時の対応を決める。
     /// QUIC 接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中や
     /// OS からのネットワークpath変化(`ConnectivityManager`/`NWPathMonitor`)をそのまま
@@ -1542,12 +1538,6 @@ impl SessionOrchestrator {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.set_panel_enabled(enabled);
         }
-    }
-
-    pub fn notify_error(&self, message: String) {
-        self.shared.callback.on_connection_state_changed(
-            ConnectionPublicState::Error { message }
-        );
     }
 
     /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
