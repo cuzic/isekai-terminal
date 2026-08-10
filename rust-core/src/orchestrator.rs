@@ -3620,49 +3620,14 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
         use tokio::net::TcpListener as TokioTcpListener;
-        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
         use crate::SshAuth;
-
-        #[allow(dead_code)]
-        enum TestEvent {
-            Connection(ConnectionPublicState),
-            Data(Vec<u8>),
-            Forward(String, ForwardState),
-            FilePreview(String, FilePreviewOutcome),
-        }
-
-        struct TestCallback {
-            tx: UnboundedSender<TestEvent>,
-        }
-
-        impl OrchestratorCallback for TestCallback {
-            fn on_connection_state_changed(&self, state: ConnectionPublicState) {
-                let _ = self.tx.send(TestEvent::Connection(state));
-            }
-            fn on_screen_update(&self, _update: ScreenUpdate) {}
-            fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
-            fn on_data(&self, data: Vec<u8>) {
-                let _ = self.tx.send(TestEvent::Data(data));
-            }
-            fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
-            fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
-            fn on_no_viable_path(&self) {}
-            fn on_forward_state_changed(&self, id: String, state: ForwardState) {
-                let _ = self.tx.send(TestEvent::Forward(id, state));
-            }
-            fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-            fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
-            fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
-            fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-            fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-            fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-            fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
-            fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-            fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
-                let _ = self.tx.send(TestEvent::FilePreview(request_id, outcome));
-            }
-            fn on_notify(&self, _kind: crate::NotifyKind) {}
-        }
+        // transport/ssh_handler.rs・transport/forward.rsのテストと同型(このファイルは
+        // その2つの合併集合そのもの)だったOrchestratorCallbackのno-op寄りテストダブルを
+        // test_callbacks.rsへ共通化した。
+        use crate::test_callbacks::{
+            ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
+        };
 
         /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
         /// 記録しつつ、受信データをそのままechoし返す最小SSHサーバ。
