@@ -506,9 +506,15 @@ mod tests {
         // reverts the color on its own. Poll for the *last* write ending in
         // the idle sequence (not just "contains", which the startup
         // self-heal above already satisfies) so this doesn't pass
-        // spuriously before the timeout actually fires.
+        // spuriously before the timeout actually fires. `SetIdleColor` now
+        // sends the color write immediately followed by its own progress-
+        // ring clear (both in the same `execute_actions` arm), so the
+        // trailing bytes to match against are the color+clear pair, not
+        // just the bare color sequence — matching only the color half would
+        // never again match "the end of the buffer" once the clear is
+        // appended right after it.
         poll_until(Duration::from_secs(2), || {
-            std::fs::read_to_string(&tty_path).unwrap().trim_end().ends_with("\x1b]4;264;rgb:20/20/20\x1b\\")
+            std::fs::read_to_string(&tty_path).unwrap().trim_end().ends_with("\x1b]4;264;rgb:20/20/20\x1b\\\x1b]9;4;0;0\x07")
         })
         .await
         .unwrap_or_else(|_| panic!("attention timeout must revert to idle: {:?}", std::fs::read_to_string(&tty_path).unwrap()));
