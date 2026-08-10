@@ -174,19 +174,7 @@ async fn event_command() -> ExitCode {
         // `Resolve`.
         if is_session_end {
             let (r, g, b) = idle_color.unwrap_or(DEFAULT_IDLE_COLOR);
-            // Note for anyone reading `tab_color`'s/`hooks`'s module docs
-            // alongside this call: their "runs with the daemon process's
-            // environment" claim doesn't apply here specifically — this one
-            // direct write happens in this short-lived `claude-hookd event`
-            // process itself (no daemon involved at all), so a `tab-color`
-            // script invoked from *this* call site sees the actual Claude
-            // Code session's own environment, not some other session's that
-            // happened to win an earlier spawn race. Harmless in practice
-            // (if anything, more accurate), but worth knowing if you're
-            // debugging why `$TERM_PROGRAM` looks different here. This path
-            // also never fires `on-idle` (see `daemon.rs::run`'s startup
-            // self-heal comment for the same non-firing behavior and why).
-            delivery::send_tab_color(&delivery, (r, g, b), hooks_dir().as_deref()).await;
+            session_end_self_heal_with(&delivery, (r, g, b), hooks_dir().as_deref()).await;
         }
         return ExitCode::SUCCESS;
     }
@@ -202,6 +190,36 @@ async fn event_command() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The `SessionEnd`-without-a-reachable-daemon self-heal: one direct,
+/// best-effort, idempotent idle-color + progress-clear write, bypassing the
+/// daemon/state machine entirely (see `event_command`'s call site for why
+/// this exists at all — the short version: a dead daemon right as the last
+/// event for a tab arrives must not strand that tab in the attention color/
+/// progress ring forever). Extracted into its own function, taking
+/// `delivery`/`hooks_dir` as parameters instead of resolving them from `$HOME`/
+/// `Delivery::resolve()` itself, so this path is directly test-injectable —
+/// this crate's other delivery-adjacent functions (`send_tab_color`/
+/// `send_progress`) already follow the same "resolve once, thread the value
+/// through" shape; this call site just hadn't needed it until a progress
+/// write was added alongside the color write here too.
+///
+/// Note for anyone reading `tab_color`'s/`tab_progress`'s/`hooks`'s module
+/// docs alongside this call: their "runs with the daemon process's
+/// environment" claim doesn't apply here specifically — this one direct
+/// write happens in this short-lived `claude-hookd event` process itself (no
+/// daemon involved at all), so a `tab-color`/`tab-progress` script invoked
+/// from *this* call site sees the actual Claude Code session's own
+/// environment, not some other session's that happened to win an earlier
+/// spawn race. Harmless in practice (if anything, more accurate), but worth
+/// knowing if you're debugging why `$TERM_PROGRAM` looks different here.
+/// This path also never fires `on-idle` (see `daemon.rs::run`'s startup
+/// self-heal comment for the same non-firing behavior and why).
+#[cfg(unix)]
+async fn session_end_self_heal_with(delivery: &Delivery, idle_color: (u8, u8, u8), hooks_dir: Option<&Path>) {
+    delivery::send_tab_color(delivery, idle_color, hooks_dir).await;
+    delivery::send_progress(delivery, isekai_protocol::ProgressState::None, 0, hooks_dir).await;
 }
 
 /// A hook event as classified purely from Claude Code's own hook JSON — the
@@ -1093,5 +1111,46 @@ mod tests {
             send_event(&sock_path, "s1", ClientEvent::Notify).await,
             "a real listener owned by this same process's own uid must be treated as reachable"
         );
+    }
+
+    /// This test is the first in this module to drive a real
+    /// `delivery::send_tab_color`/`send_progress` write against
+    /// `Delivery::DirectTty` with no `hooks_dir` override — which falls
+    /// through to the embedded default scripts' real `$TERM_PROGRAM`-based
+    /// terminal-kind detection. Same fix as `daemon.rs`'s
+    /// `ensure_deterministic_terminal_kind`: pin `$ISEKAI_TERMINAL_KIND`
+    /// once, process-wide, so this doesn't flip to the iTerm2 OSC sequences
+    /// on a real macOS iTerm2 CI runner (adversarial review precedent this
+    /// crate has already hit once, see that function's doc comment).
+    fn ensure_deterministic_terminal_kind() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // SAFETY: `call_once` guarantees this runs exactly once, and no
+            // test in this module ever sets a *different* value.
+            unsafe { std::env::set_var("ISEKAI_TERMINAL_KIND", "windows-terminal") };
+        });
+    }
+
+    /// `session_end_self_heal_with` (the `SessionEnd`-without-a-reachable-
+    /// daemon fallback) must write both the idle color *and* clear the
+    /// progress ring — before this function was extracted, `event_command`'s
+    /// inline version of this path was only reachable via real `$HOME`/
+    /// `Delivery::resolve()` env resolution and had no direct test at all
+    /// (the only `SessionEnd`-related test in this module,
+    /// `session_end_is_resolve_and_flagged_for_the_self_heal_fallback`, is a
+    /// pure `parse_hook_event` test that never exercises this write).
+    #[tokio::test]
+    async fn session_end_self_heal_writes_idle_color_and_clears_progress() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let delivery = Delivery::DirectTty { path: tty_path.clone() };
+
+        session_end_self_heal_with(&delivery, (0x20, 0x20, 0x20), None).await;
+
+        let written = std::fs::read_to_string(&tty_path).unwrap();
+        assert!(written.contains("4;264;rgb:20/20/20"), "must paint the idle color: {written:?}");
+        assert!(written.contains("9;4;0;0"), "must also clear the progress ring: {written:?}");
     }
 }
