@@ -45,6 +45,8 @@ pub mod qmux_backend;
 mod mux;
 mod race;
 mod resume;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod types;
 
 pub use cert::{CertMismatchSlot, PinnedCertVerifier};

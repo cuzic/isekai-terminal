@@ -582,27 +582,9 @@ mod listener_tests {
     }
 
     fn test_server_config() -> (MuxServerConfig, String) {
-        let cert = rcgen::generate_simple_self_signed(vec!["quicmux-test.local".to_string()]).unwrap();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
-        let cert_sha256_hex = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(cert_der.as_ref());
-            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
-        };
-        let config = MuxServerConfig {
-            alpn: test_client_config().alpn,
-            exporter_label: test_client_config().exporter_label,
-            max_idle_timeout: std::time::Duration::from_secs(15),
-            keep_alive_interval: std::time::Duration::from_secs(5),
-            max_concurrent_bidi_streams: 2,
-            max_concurrent_uni_streams: 0,
-            multipath: false,
-            datagram_send_buffer_size: None,
-            cert_chain: vec![cert_der],
-            private_key: key_der,
-        };
+        let (mut config, cert_sha256_hex) = crate::test_support::self_signed_server_config("quicmux-test.local");
+        config.alpn = test_client_config().alpn;
+        config.exporter_label = test_client_config().exporter_label;
         (config, cert_sha256_hex)
     }
 
