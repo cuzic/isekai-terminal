@@ -751,32 +751,6 @@ mod tests {
         owner.abort();
     }
 
-    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
-    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
-    /// `build_relay.rs`'s own tests use.
-    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
-        let home = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let mut store = crate::build_profile::BuildProfileStore::default();
-        for profile in profiles {
-            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
-        }
-        let path = crate::build_profile::default_build_profiles_path().unwrap();
-        crate::build_profile::save_build_profiles(&path, &store).unwrap();
-        (home, HomeRestoreGuard(old_home))
-    }
-
-    struct HomeRestoreGuard(Option<std::ffi::OsString>);
-    impl Drop for HomeRestoreGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(old) => std::env::set_var("HOME", old),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
     /// End-to-end for Epic P Phase 2's mux-client path: the owner relays a
     /// `BuildRequest` as `Frame::Ctl`; `run_inner` must run the matching
     /// profile and relay its `BuildOutputChunk`/`BuildFinished` back as
@@ -787,7 +761,7 @@ mod tests {
     async fn client_runs_a_build_profile_and_streams_output_to_the_owner() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -860,7 +834,7 @@ mod tests {
     async fn client_can_run_a_second_build_after_the_first_finishes() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -926,7 +900,7 @@ mod tests {
     async fn client_kills_the_build_when_the_owner_relays_the_abort_sentinel() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
