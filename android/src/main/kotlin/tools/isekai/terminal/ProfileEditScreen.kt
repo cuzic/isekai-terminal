@@ -25,16 +25,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -55,6 +50,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.ui.KeyPickerDropdown
+import tools.isekai.terminal.ui.SettingSwitchRow
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.ForwardType
@@ -185,7 +182,6 @@ fun ProfileEditScreen(
     var username by remember { mutableStateOf(profile?.username ?: "") }
     var authType by remember { mutableStateOf(profile?.authType ?: "password") }
     var keyId by remember { mutableStateOf(profile?.keyId) }
-    var keyMenuExpanded by remember { mutableStateOf(false) }
     var transportPreference by remember { mutableStateOf(profile?.transportPreference ?: TransportPreference.AUTO) }
     val transportUiSpec = remember(transportPreference) { TransportUiSpec.forPreference(transportPreference) }
     // 「Smart SSH」以外(=詳細設定側)を既に使っているプロファイルを編集する場合は、
@@ -232,15 +228,12 @@ fun ProfileEditScreen(
     var jumpUsername by remember { mutableStateOf(profile?.jumpUsername ?: "") }
     var jumpAuthType by remember { mutableStateOf(profile?.jumpAuthType ?: "password") }
     var jumpKeyId by remember { mutableStateOf(profile?.jumpKeyId) }
-    var jumpKeyMenuExpanded by remember { mutableStateOf(false) }
     val forwardDrafts = remember {
         mutableStateListOf<ForwardDraft>().apply {
             profile?.forwards?.forEach { add(it.toDraft()) }
         }
     }
 
-    val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
-    val selectedJumpKeyLabel = keys.firstOrNull { it.id == jumpKeyId }?.label ?: "鍵を選択"
     // 1024未満は多くの環境でサーバー側の管理者権限(CAP_NET_BIND_SERVICE)が必要になるため、
     // ユーザーが誤って指定しないよう非特権ポート範囲のみ許可する(空欄はこれまで通りOK)。
     val helperBindPortValid = helperBindPort.isBlank() || (helperBindPort.toIntOrNull()?.let { it in 1024..65535 } ?: false)
@@ -316,45 +309,13 @@ fun ProfileEditScreen(
         }
 
         if (authType == "key") {
-            ExposedDropdownMenuBox(
-                expanded = keyMenuExpanded,
-                onExpandedChange = { keyMenuExpanded = it },
-            ) {
-                OutlinedTextField(
-                    value = selectedKeyLabel,
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("鍵") },
-                    trailingIcon = {
-                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = keyMenuExpanded)
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .menuAnchor(MenuAnchorType.PrimaryNotEditable)
-                        .testTag("profileKeyDropdownField"),
-                )
-                ExposedDropdownMenu(
-                    expanded = keyMenuExpanded,
-                    onDismissRequest = { keyMenuExpanded = false },
-                ) {
-                    if (keys.isEmpty()) {
-                        DropdownMenuItem(
-                            text = { Text("登録された鍵がありません") },
-                            onClick = { keyMenuExpanded = false },
-                        )
-                    } else {
-                        keys.forEach { key ->
-                            DropdownMenuItem(
-                                text = { Text(key.label) },
-                                onClick = {
-                                    keyId = key.id
-                                    keyMenuExpanded = false
-                                },
-                            )
-                        }
-                    }
-                }
-            }
+            KeyPickerDropdown(
+                label = "鍵",
+                keys = keys,
+                selectedId = keyId,
+                onSelect = { keyId = it },
+                testTag = "profileKeyDropdownField",
+            )
         }
 
         Spacer(Modifier.height(4.dp))
@@ -413,44 +374,12 @@ fun ProfileEditScreen(
             }
 
             if (jumpAuthType == "key") {
-                ExposedDropdownMenuBox(
-                    expanded = jumpKeyMenuExpanded,
-                    onExpandedChange = { jumpKeyMenuExpanded = it },
-                ) {
-                    OutlinedTextField(
-                        value = selectedJumpKeyLabel,
-                        onValueChange = {},
-                        readOnly = true,
-                        label = { Text("踏み台の鍵") },
-                        trailingIcon = {
-                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = jumpKeyMenuExpanded)
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
-                    )
-                    ExposedDropdownMenu(
-                        expanded = jumpKeyMenuExpanded,
-                        onDismissRequest = { jumpKeyMenuExpanded = false },
-                    ) {
-                        if (keys.isEmpty()) {
-                            DropdownMenuItem(
-                                text = { Text("登録された鍵がありません") },
-                                onClick = { jumpKeyMenuExpanded = false },
-                            )
-                        } else {
-                            keys.forEach { key ->
-                                DropdownMenuItem(
-                                    text = { Text(key.label) },
-                                    onClick = {
-                                        jumpKeyId = key.id
-                                        jumpKeyMenuExpanded = false
-                                    },
-                                )
-                            }
-                        }
-                    }
-                }
+                KeyPickerDropdown(
+                    label = "踏み台の鍵",
+                    keys = keys,
+                    selectedId = jumpKeyId,
+                    onSelect = { jumpKeyId = it },
+                )
             }
         }
 
@@ -902,78 +831,40 @@ fun ProfileEditScreen(
 
         Spacer(Modifier.height(4.dp))
 
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("SSH agent forwarding", modifier = Modifier.align(Alignment.CenterVertically))
-                Switch(
-                    checked = enableAgentForward,
-                    onCheckedChange = { enableAgentForward = it },
-                    modifier = Modifier.testTag("agentForwardSwitch"),
-                )
-            }
-            if (enableAgentForward) {
-                Text(
-                    "有効にすると接続先サーバーの管理者や同居プロセスがあなたの秘密鍵での署名を要求できます。" +
-                        "信頼できるホストのみで有効にしてください。署名要求ごとに確認ダイアログが表示されます。",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
+        SettingSwitchRow(
+            title = "SSH agent forwarding",
+            checked = enableAgentForward,
+            onCheckedChange = { enableAgentForward = it },
+            explanation = "有効にすると接続先サーバーの管理者や同居プロセスがあなたの秘密鍵での署名を要求できます。" +
+                "信頼できるホストのみで有効にしてください。署名要求ごとに確認ダイアログが表示されます。",
+            explanationColor = MaterialTheme.colorScheme.error,
+            testTag = "agentForwardSwitch",
+        )
 
         Spacer(Modifier.height(4.dp))
 
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("tmux通知(bell/activity/silence/コマンド終了)", modifier = Modifier.align(Alignment.CenterVertically))
-                Switch(
-                    checked = enableTabNotifications,
-                    onCheckedChange = { checked ->
-                        enableTabNotifications = checked
-                        if (checked) requestNotificationPermissionIfNeeded()
-                    },
-                    modifier = Modifier.testTag("tabNotificationsSwitch"),
-                )
-            }
-            if (enableTabNotifications) {
-                Text(
-                    "tmuxセッション内でベル・アクティビティ・無音・コマンド終了(pane-died)が発生した際、" +
-                        "アプリがバックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします。",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        SettingSwitchRow(
+            title = "tmux通知(bell/activity/silence/コマンド終了)",
+            checked = enableTabNotifications,
+            onCheckedChange = { checked ->
+                enableTabNotifications = checked
+                if (checked) requestNotificationPermissionIfNeeded()
+            },
+            explanation = "tmuxセッション内でベル・アクティビティ・無音・コマンド終了(pane-died)が発生した際、" +
+                "アプリがバックグラウンドまたは別タブ表示中ならAndroid通知でお知らせします。",
+            testTag = "tabNotificationsSwitch",
+        )
 
         Spacer(Modifier.height(4.dp))
 
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("AIパネル(構造化ドキュメント/フォーム)", modifier = Modifier.align(Alignment.CenterVertically))
-                Switch(
-                    checked = enableAiPanel,
-                    onCheckedChange = { enableAiPanel = it },
-                    modifier = Modifier.testTag("aiPanelSwitch"),
-                )
-            }
-            if (enableAiPanel) {
-                Text(
-                    "リモート側(Claude Code等)が送ってくるドキュメント・フォームをアプリ内に表示できるように" +
-                        "します。信頼できるホストのみで有効にしてください。",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        SettingSwitchRow(
+            title = "AIパネル(構造化ドキュメント/フォーム)",
+            checked = enableAiPanel,
+            onCheckedChange = { enableAiPanel = it },
+            explanation = "リモート側(Claude Code等)が送ってくるドキュメント・フォームをアプリ内に表示できるように" +
+                "します。信頼できるホストのみで有効にしてください。",
+            testTag = "aiPanelSwitch",
+        )
 
         Spacer(Modifier.height(8.dp))
 

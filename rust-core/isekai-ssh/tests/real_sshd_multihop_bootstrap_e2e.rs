@@ -7,7 +7,7 @@
 //! different ports — a bastion and the final target — connected through
 //! `ssh(1)`'s own `-J bastion,target`-shape jump chain
 //! (`OpenSshBackend::install_and_start`'s `via: &[JumpSpec]`,
-//! `isekai-bootstrap-plan::BootstrapPlan::validate_jump_chain`). Per this
+//! `isekai-bootstrap-plan::validate_jump_chain`). Per this
 //! crate's self-contained-test-file convention (each `*_e2e.rs` duplicates
 //! its own mock/real-server helpers rather than sharing a `tests/common/`),
 //! this file duplicates rather than imports `real_sshd_bootstrap_e2e.rs`'s

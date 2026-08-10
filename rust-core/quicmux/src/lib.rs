@@ -45,6 +45,8 @@ pub mod qmux_backend;
 mod mux;
 mod race;
 mod resume;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod types;
 
 pub use cert::{CertMismatchSlot, PinnedCertVerifier};
@@ -56,9 +58,8 @@ pub use mux::{
 };
 pub use race::{race_with_stagger, Winner};
 pub use resume::{
-    accept_resume, decode_resume_request, request_resume, respond_resume_accepted, respond_resume_rejected, ReplayBuffer, ResumeAcceptor,
-    ResumeAckOutcome, ResumeDecision, ResumeRejectReason, ResumeRequest, ResumeRequestError, FRAME_RESUME, FRAME_RESUME_ACK,
-    FRAME_RESUME_REJECT,
+    decode_resume_request, request_resume, respond_resume_accepted, respond_resume_rejected, ReplayBuffer, ResumeAckOutcome,
+    ResumeRejectReason, ResumeRequest, ResumeRequestError, FRAME_RESUME, FRAME_RESUME_ACK, FRAME_RESUME_REJECT,
 };
 pub use types::{BindSpec, RemoteSpec};
 

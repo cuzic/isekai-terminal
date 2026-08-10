@@ -30,30 +30,7 @@ pub(super) fn resolve_isekai_config(
             .unwrap_or(plan.destination_host()),
         openssh.port.unwrap_or(22)
     );
-    let mut builder = IsekaiConfigBuilder {
-        enabled: None,
-        bootstrap_policy: None,
-        profile: None,
-        remote_path: None,
-        services: Vec::new(),
-        bootstrap_candidates: Vec::new(),
-        link_endpoints: Vec::new(),
-        rendezvous: Vec::new(),
-        stun_servers: Vec::new(),
-        relay_endpoints: Vec::new(),
-        resume_grace_secs: None,
-        candidate_race_delay_ms: None,
-        relay_delay_ms: None,
-        install_mode: None,
-        bootstrap_relay: None,
-        ctl_socket_enabled: None,
-        remote_log_level: None,
-        remote_bind_port_range: None,
-        local_bind_port_range: None,
-        tab_idle_color: None,
-        tab_attention_color: None,
-        tty: None,
-    };
+    let mut builder = IsekaiConfigBuilder::default();
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
     }
@@ -119,7 +96,7 @@ pub(super) fn resolve_isekai_config(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct IsekaiConfigBuilder {
     enabled: Option<bool>,
     bootstrap_policy: Option<BootstrapPolicy>,
@@ -147,35 +124,34 @@ struct IsekaiConfigBuilder {
 
 fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDirective) -> Result<()> {
     match directive.name.as_str() {
-        "enabled" => set_once(
-            &mut builder.enabled,
-            parse_yes_no(one_arg(&directive)?)?,
-            "enabled",
-        ),
-        "bootstrap-policy" => set_once(
-            &mut builder.bootstrap_policy,
-            match one_arg(&directive)? {
-                "auto" => BootstrapPolicy::Auto,
-                "always" => BootstrapPolicy::Always,
-                "never" => BootstrapPolicy::Never,
-                other => {
-                    return Err(anyhow!(
-                        "isekai-ssh: invalid #@isekai bootstrap-policy {other:?}"
-                    ))
-                }
-            },
-            "bootstrap-policy",
-        ),
-        "profile" => set_once(
-            &mut builder.profile,
-            one_arg(&directive)?.to_string(),
-            "profile",
-        ),
-        "remote-path" => set_once(
-            &mut builder.remote_path,
-            one_arg(&directive)?.to_string(),
-            "remote-path",
-        ),
+        "enabled" => {
+            set_once(&mut builder.enabled, parse_yes_no(one_arg(&directive)?)?);
+            Ok(())
+        }
+        "bootstrap-policy" => {
+            set_once(
+                &mut builder.bootstrap_policy,
+                match one_arg(&directive)? {
+                    "auto" => BootstrapPolicy::Auto,
+                    "always" => BootstrapPolicy::Always,
+                    "never" => BootstrapPolicy::Never,
+                    other => {
+                        return Err(anyhow!(
+                            "isekai-ssh: invalid #@isekai bootstrap-policy {other:?}"
+                        ))
+                    }
+                },
+            );
+            Ok(())
+        }
+        "profile" => {
+            set_once(&mut builder.profile, one_arg(&directive)?.to_string());
+            Ok(())
+        }
+        "remote-path" => {
+            set_once(&mut builder.remote_path, one_arg(&directive)?.to_string());
+            Ok(())
+        }
         "service" => {
             for arg in &directive.args {
                 builder.services.push(
@@ -196,66 +172,72 @@ fn apply_isekai_directive(builder: &mut IsekaiConfigBuilder, directive: IsekaiDi
         "rendezvous" => append_args(&mut builder.rendezvous, &directive),
         "stun" => append_args(&mut builder.stun_servers, &directive),
         "relay" => append_args(&mut builder.relay_endpoints, &directive),
-        "resume-grace" => set_once(
-            &mut builder.resume_grace_secs,
-            parse_duration_ms(one_arg(&directive)?, "resume-grace")?.div_ceil(1000),
-            "resume-grace",
-        ),
-        "candidate-race-delay" => set_once(
-            &mut builder.candidate_race_delay_ms,
-            parse_duration_ms(one_arg(&directive)?, "candidate-race-delay")?,
-            "candidate-race-delay",
-        ),
-        "relay-delay" => set_once(
-            &mut builder.relay_delay_ms,
-            parse_duration_ms(one_arg(&directive)?, "relay-delay")?,
-            "relay-delay",
-        ),
-        "bootstrap-relay" => set_once(
-            &mut builder.bootstrap_relay,
-            parse_bootstrap_relay(&directive.args)?,
-            "bootstrap-relay",
-        ),
-        "install-mode" => set_once(
-            &mut builder.install_mode,
-            match one_arg(&directive)? {
-                "user" => InstallMode::User,
-                "system" => InstallMode::System,
-                other => {
-                    return Err(anyhow!(
-                        "isekai-ssh: invalid #@isekai install-mode {other:?}"
-                    ))
-                }
-            },
-            "install-mode",
-        ),
-        "ctl-socket" => set_once(
-            &mut builder.ctl_socket_enabled,
-            parse_yes_no(one_arg(&directive)?)?,
-            "ctl-socket",
-        ),
-        "remote-log-level" => set_once(
-            &mut builder.remote_log_level,
-            match one_arg(&directive)? {
-                level @ ("error" | "warn" | "info" | "debug" | "trace") => level.to_string(),
-                other => {
-                    return Err(anyhow!(
-                        "isekai-ssh: invalid #@isekai remote-log-level {other:?} (expected one of error|warn|info|debug|trace)"
-                    ))
-                }
-            },
-            "remote-log-level",
-        ),
-        "remote-bind-port-range" => set_once(
-            &mut builder.remote_bind_port_range,
-            parse_bind_port_range(one_arg(&directive)?)?,
-            "remote-bind-port-range",
-        ),
-        "local-bind-port-range" => set_once(
-            &mut builder.local_bind_port_range,
-            parse_bind_port_range(one_arg(&directive)?)?,
-            "local-bind-port-range",
-        ),
+        "resume-grace" => {
+            set_once(
+                &mut builder.resume_grace_secs,
+                parse_duration_ms(one_arg(&directive)?, "resume-grace")?.div_ceil(1000),
+            );
+            Ok(())
+        }
+        "candidate-race-delay" => {
+            set_once(
+                &mut builder.candidate_race_delay_ms,
+                parse_duration_ms(one_arg(&directive)?, "candidate-race-delay")?,
+            );
+            Ok(())
+        }
+        "relay-delay" => {
+            set_once(
+                &mut builder.relay_delay_ms,
+                parse_duration_ms(one_arg(&directive)?, "relay-delay")?,
+            );
+            Ok(())
+        }
+        "bootstrap-relay" => {
+            set_once(&mut builder.bootstrap_relay, parse_bootstrap_relay(&directive.args)?);
+            Ok(())
+        }
+        "install-mode" => {
+            set_once(
+                &mut builder.install_mode,
+                match one_arg(&directive)? {
+                    "user" => InstallMode::User,
+                    "system" => InstallMode::System,
+                    other => {
+                        return Err(anyhow!(
+                            "isekai-ssh: invalid #@isekai install-mode {other:?}"
+                        ))
+                    }
+                },
+            );
+            Ok(())
+        }
+        "ctl-socket" => {
+            set_once(&mut builder.ctl_socket_enabled, parse_yes_no(one_arg(&directive)?)?);
+            Ok(())
+        }
+        "remote-log-level" => {
+            set_once(
+                &mut builder.remote_log_level,
+                match one_arg(&directive)? {
+                    level @ ("error" | "warn" | "info" | "debug" | "trace") => level.to_string(),
+                    other => {
+                        return Err(anyhow!(
+                            "isekai-ssh: invalid #@isekai remote-log-level {other:?} (expected one of error|warn|info|debug|trace)"
+                        ))
+                    }
+                },
+            );
+            Ok(())
+        }
+        "remote-bind-port-range" => {
+            set_once(&mut builder.remote_bind_port_range, parse_bind_port_range(one_arg(&directive)?, "remote-bind-port-range")?);
+            Ok(())
+        }
+        "local-bind-port-range" => {
+            set_once(&mut builder.local_bind_port_range, parse_bind_port_range(one_arg(&directive)?, "local-bind-port-range")?);
+            Ok(())
+        }
         "tab-idle-color" => {
             apply_optional_tab_color(&mut builder.tab_idle_color, "tab-idle-color", &directive);
             Ok(())
@@ -283,12 +265,17 @@ fn append_args(target: &mut Vec<String>, directive: &IsekaiDirective) -> Result<
     Ok(())
 }
 
-fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+/// First-match-wins assignment (`ssh(1)`'s own `Host`/config semantics,
+/// matching every directive in this file): a no-op once `slot` is already
+/// set. Used to take a `name: &str` purely for a later error message that
+/// never actually got produced (the body ended in an unconditional `Ok(())`
+/// regardless) — dropped along with the `Result` return type it never used
+/// either, since every real caller already had its own `?`-propagated error
+/// from parsing the value *before* calling this.
+fn set_once<T>(slot: &mut Option<T>, value: T) {
     if slot.is_none() {
         *slot = Some(value);
     }
-    let _ = name;
-    Ok(())
 }
 
 fn one_arg(directive: &IsekaiDirective) -> Result<&str> {
@@ -352,53 +339,70 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
 /// deliberately accepted trade-off next to not needing a separate keyword
 /// syntax.
 fn apply_optional_tty(slot: &mut Option<TtyDirective>, directive: &IsekaiDirective) {
-    if slot.is_some() {
-        // `set_once` semantics: first match wins, matching every other
-        // directive in this file.
-        return;
-    }
-    let value = match one_arg(directive) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("isekai-ssh: ignoring #@isekai tty: {e} — connecting with a plain login shell instead");
-            return;
+    apply_lenient(slot, "connecting with a plain login shell instead", directive, |directive| {
+        let value = one_arg(directive).map_err(|e| format!("tty: {e}"))?;
+        match value {
+            "auto" => Ok(TtyDirective::Auto),
+            "off" => Ok(TtyDirective::Off),
+            name if crate::tty_attach::is_valid_tty_name(name) => Ok(TtyDirective::Named(name.to_string())),
+            name => Err(format!(
+                "tty {name:?}: not a valid isekai-pipe tty session name \
+                 (must not be empty/\".\"/\"..\", must not contain '/' or NUL, must be <= 200 bytes)"
+            )),
         }
-    };
-    *slot = match value {
-        "auto" => Some(TtyDirective::Auto),
-        "off" => Some(TtyDirective::Off),
-        name if crate::tty_attach::is_valid_tty_name(name) => Some(TtyDirective::Named(name.to_string())),
-        name => {
-            eprintln!(
-                "isekai-ssh: ignoring #@isekai tty {name:?}: not a valid isekai-pipe tty session name \
-                 (must not be empty/\".\"/\"..\", must not contain '/' or NUL, must be <= 200 bytes) — \
-                 connecting with a plain login shell instead"
-            );
-            None
-        }
-    };
+    });
 }
 
-/// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
-/// `(start, end)` pair, passed straight through to `isekai-helper
-/// --bind-port-range` (`engine::parse_bind_port_range` in `isekai-pipe`
-/// applies the identical `start <= end` validation server-side; this
-/// duplicate client-side check exists only to fail closed at config
-/// resolution time instead of after an SSH round-trip).
-fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
-    let (start, end) = value.split_once('-').ok_or_else(|| {
-        anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range {value:?} (expected <START>-<END>)")
-    })?;
-    let start: u16 = start
-        .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range start {start:?}"))?;
-    let end: u16 = end
-        .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range end {end:?}"))?;
+/// Shared "leniently apply a directive" skeleton
+/// (`.claude/rules/always-connects.md`): a no-op once `slot` is already set
+/// (`set_once`'s first-match-wins semantics, matching every directive in
+/// this file), and a `parse` failure prints `isekai-ssh: ignoring #@isekai
+/// {tail} — {fallback}` to stderr and leaves `slot` unset rather than
+/// aborting config resolution — [`apply_optional_tab_color`] and
+/// [`apply_optional_tty`] each hand-rolled this exact shape independently.
+/// `parse`'s `Err` is the message *tail* (after "ignoring #@isekai ",
+/// before the em dash) rather than a bare `anyhow::Error`, so each caller
+/// keeps full control of exactly how the directive name/bad value are
+/// worded in it — `apply_optional_tty` alone has two differently-worded
+/// failure modes, and `apply_optional_tab_color`'s own wording differs from
+/// both.
+fn apply_lenient<T>(
+    slot: &mut Option<T>,
+    fallback: &str,
+    directive: &IsekaiDirective,
+    parse: impl FnOnce(&IsekaiDirective) -> std::result::Result<T, String>,
+) {
+    if slot.is_some() {
+        return;
+    }
+    match parse(directive) {
+        Ok(value) => *slot = Some(value),
+        Err(tail) => eprintln!("isekai-ssh: ignoring #@isekai {tail} — {fallback}"),
+    }
+}
+
+/// Parses `#@isekai remote-bind-port-range`/`local-bind-port-range
+/// <START>-<END>` into an inclusive `(start, end)` pair. The
+/// `remote-bind-port-range` value is passed straight through to
+/// `isekai-helper --bind-port-range` (`engine::parse_bind_port_range` in
+/// `isekai-pipe` applies the identical `start <= end` validation
+/// server-side; this duplicate client-side check exists only to fail closed
+/// at config resolution time instead of after an SSH round-trip);
+/// `local-bind-port-range` is client-side only and has no such server-side
+/// counterpart. `field` (matching the `parse_duration_ms`/`parse_tab_color`
+/// pattern above) names the actual directive in every error message — this
+/// function used to hardcode `"remote-bind-port-range"` in all four even
+/// when called for `local-bind-port-range`, copy-paste residue from when
+/// there was only the one caller, which produced a misleading error message
+/// pointing at the wrong directive.
+fn parse_bind_port_range(value: &str, field: &str) -> Result<(u16, u16)> {
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| anyhow!("isekai-ssh: invalid #@isekai {field} {value:?} (expected <START>-<END>)"))?;
+    let start: u16 = start.parse().map_err(|_| anyhow!("isekai-ssh: invalid #@isekai {field} start {start:?}"))?;
+    let end: u16 = end.parse().map_err(|_| anyhow!("isekai-ssh: invalid #@isekai {field} end {end:?}"))?;
     if start > end {
-        return Err(anyhow!(
-            "isekai-ssh: invalid #@isekai remote-bind-port-range {value:?}: start must be <= end"
-        ));
+        return Err(anyhow!("isekai-ssh: invalid #@isekai {field} {value:?}: start must be <= end"));
     }
     Ok((start, end))
 }
@@ -422,10 +426,6 @@ fn parse_tab_color(value: &str, field: &str) -> Result<(u8, u8, u8)> {
     isekai_pipe_core::parse_hex_color(value).map_err(|e| anyhow!("isekai-ssh: invalid #@isekai {field}: {e}"))
 }
 
-fn parse_tab_color_directive(directive: &IsekaiDirective, field: &str) -> Result<(u8, u8, u8)> {
-    parse_tab_color(one_arg(directive)?, field)
-}
-
 /// Applies a `tab-idle-color`/`tab-attention-color` directive leniently:
 /// unlike every other directive in this file (which fail closed via `?`,
 /// aborting config resolution on a syntax error), a malformed value here
@@ -442,15 +442,11 @@ fn parse_tab_color_directive(directive: &IsekaiDirective, field: &str) -> Result
 /// (Found by Codex code review, 2026-07-25: the original `?`-propagating
 /// version did exactly that.)
 fn apply_optional_tab_color(slot: &mut Option<(u8, u8, u8)>, field: &str, directive: &IsekaiDirective) {
-    if slot.is_some() {
-        // `set_once` semantics: first match wins, matching every other
-        // directive in this file.
-        return;
-    }
-    match parse_tab_color_directive(directive, field) {
-        Ok(color) => *slot = Some(color),
-        Err(e) => eprintln!("isekai-ssh: ignoring #@isekai {field}: {e} — claude-hookd will use its built-in default color instead"),
-    }
+    apply_lenient(slot, "claude-hookd will use its built-in default color instead", directive, |directive| {
+        one_arg(directive)
+            .and_then(|value| parse_tab_color(value, field))
+            .map_err(|e| format!("{field}: {e}"))
+    });
 }
 
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
@@ -709,29 +705,6 @@ mod tests {
     }
 
     fn empty_builder() -> IsekaiConfigBuilder {
-        IsekaiConfigBuilder {
-            enabled: None,
-            bootstrap_policy: None,
-            profile: None,
-            remote_path: None,
-            services: Vec::new(),
-            bootstrap_candidates: Vec::new(),
-            link_endpoints: Vec::new(),
-            rendezvous: Vec::new(),
-            stun_servers: Vec::new(),
-            relay_endpoints: Vec::new(),
-            resume_grace_secs: None,
-            candidate_race_delay_ms: None,
-            relay_delay_ms: None,
-            install_mode: None,
-            bootstrap_relay: None,
-            ctl_socket_enabled: None,
-            remote_log_level: None,
-            remote_bind_port_range: None,
-            local_bind_port_range: None,
-            tab_idle_color: None,
-            tab_attention_color: None,
-            tty: None,
-        }
+        IsekaiConfigBuilder::default()
     }
 }

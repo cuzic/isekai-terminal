@@ -24,9 +24,6 @@ windows = { version = "0.58", features = [
     "Win32_Networking_WinSock",
 ] }
 
-[target.'cfg(target_os = "android")'.dependencies]
-ndk-sys = "0.6"
-
 [features]
 discovery = ["dep:netdev"]
 

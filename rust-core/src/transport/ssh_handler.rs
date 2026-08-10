@@ -744,11 +744,10 @@ async fn run_exec_on_handle_inner(
 // ── タスク#59: tmuxロケータの`RemoteTmuxCommandRunner`シームへのアダプタ ──
 
 /// [`crate::tmux_locator::RemoteTmuxCommandRunner`](#62のシーム)を、上の
-/// `run_exec_on_handle`(タスク#61)へ薄く実装する本番アダプタ。tmux管理コマンド
-/// (`tmux list-windows`/`set-option`等)は必ず標準出力・終了コード0を期待する
-/// 短命コマンドなので、非ゼロ終了は`stderr`の内容が読めない(`run_exec_on_handle`は
-/// stdoutのみ返す設計、タスク#61のスコープ)なりに終了コードだけを含めた
-/// `TmuxRunError`にする。
+/// `run_exec_on_handle`(タスク#61)へ薄く実装する本番アダプタ。`ExecOutput`→
+/// `Result<String, TmuxRunError>`の変換自体は
+/// `tmux_locator::exec_output_to_tmux_result`(`OrchestratorTmuxRunner`と共有)に
+/// 委ねる。
 struct SshHandleTmuxRunner {
     handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
 }
@@ -762,15 +761,7 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
         let cmd = cmd.to_string();
         async move {
             match run_exec_on_handle(&handle, &cmd).await {
-                Ok(ExecOutput { stdout, exit_status }) => {
-                    if !crate::tmux_locator::tmux_exit_status_is_success(exit_status) {
-                        return Err(crate::tmux_locator::TmuxRunError(format!(
-                            "command {cmd:?} exited with status {:?}",
-                            exit_status
-                        )));
-                    }
-                    Ok(String::from_utf8_lossy(&stdout).into_owned())
-                }
+                Ok(output) => crate::tmux_locator::exec_output_to_tmux_result(&cmd, output),
                 Err(e) => Err(crate::tmux_locator::TmuxRunError(e.to_string())),
             }
         }
@@ -1282,41 +1273,14 @@ mod pooling_e2e_tests {
     use std::time::Duration;
     use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-    #[allow(dead_code)]
-    enum TestEvent {
-        Connection(ConnectionPublicState),
-        Data(Vec<u8>),
-    }
-
-    struct TestCallback {
-        tx: UnboundedSender<TestEvent>,
-    }
-
-    impl OrchestratorCallback for TestCallback {
-        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
-            let _ = self.tx.send(TestEvent::Connection(state));
-        }
-        fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
-        fn on_data(&self, data: Vec<u8>) {
-            let _ = self.tx.send(TestEvent::Data(data));
-        }
-        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
-        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
-        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-        fn on_notify(&self, _kind: crate::NotifyKind) {}
-        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
-        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
-    }
+    // transport/forward.rs・orchestrator.rsのテストと同型(かつ大半が同一実装)だった
+    // OrchestratorCallbackのno-op寄りテストダブルをtest_callbacks.rsへ共通化した。
+    // 転送するイベント種別は3ファイル分の合併集合だが、このファイルのポーリング
+    // ループは全て`_ => continue`のワイルドカード節を持つため無関係のイベントが
+    // 増えても安全(test_callbacks.rsのdocコメント参照)。
+    use crate::test_callbacks::{
+        ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
+    };
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
     /// バイト列をそのままechoし返す最小SSHサーバ。プーリングが効いていれば

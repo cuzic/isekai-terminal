@@ -103,14 +103,9 @@ pub(crate) struct CtlForward {
 /// encoding) so a squatting attacker cannot feasibly pre-guess the path.
 pub(crate) fn new_ctl_token() -> String {
     use rand::RngCore as _;
-    use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    isekai_trust::hex(&bytes)
 }
 
 /// Pure decision of whether to attempt a ctl-socket forward for this
@@ -330,163 +325,76 @@ async fn handle_ctl_connection(
 /// — the same "every session must have a guaranteed cleanup path" principle
 /// `.claude/rules/always-connects.md` documents for the fencing-slot lesson,
 /// applied here to a local child process instead of a remote session slot.
+///
+/// This is a ~15-line [`crate::build_exec::BuildRelay`] adapter over the
+/// shared runner (`crate::build_exec::run_build`, Epic P × 2026-08
+/// unification) — see that function's module docs for why the Unix
+/// ctl-socket, Windows-native owner-foreground, and Windows-native
+/// mux-client dispatch paths used to each hand-roll this same 9-step
+/// sequence, and for the behavior this unification deliberately changed
+/// (OSC 9;4 progress reporting and the spawn-failure `BuildFinished(126)`
+/// reply now apply uniformly to all 3, not just this one).
 #[cfg(unix)]
 async fn run_build(
     write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
     host: &str,
     profile_name: &str,
 ) -> Result<()> {
-    let profile = crate::build_profile::default_build_profiles_path()
-        .and_then(|path| crate::build_profile::load_build_profiles(&path))
-        .ok()
-        .and_then(|store| crate::build_profile::find_profile(&store, host, profile_name).cloned());
-
-    let Some(profile) = profile else {
-        send_build_output(
-            write_half,
-            isekai_protocol::BuildOutputStream::Stderr,
-            format!("isekai-ssh: no build profile registered for {host:?}/{profile_name:?}\n").into_bytes(),
-        )
-        .await?;
-        send_build_finished(write_half, 127, Vec::new()).await?;
-        // No `emit_build_progress_result` here: `Indeterminate` is only sent
-        // below, once a profile is confirmed to exist — nothing was ever
-        // shown yet for this build attempt, so there is nothing to clear
-        // (calling it anyway used to paint a spurious `Error` state that
-        // then never got cleared, since the `None`-on-success clear only
-        // ever fires past the point a real build actually ran).
-        return Ok(());
-    };
-
-    // Epic P × 2026-08のOSC 9;4連携: ビルドの成否は事前に分からないので
-    // `Indeterminate`(スピナー)で開始を知らせる。`emit_build_progress_result`と
-    // 対で、doc commentはそちらを参照。
-    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }, TerminalKind::resolve()) {
-        let _ = emit_osc(&seq);
-    }
-
-    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            // `Indeterminate` was already sent above — every exit past that
-            // point must clear it, this one included, or the spinner is
-            // left stuck on the user's tab/taskbar forever.
-            emit_build_progress_result(false);
-            return Err(e).with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"));
+    struct WriteHalfRelay<'a, W>(&'a mut W);
+    impl<'a, W: tokio::io::AsyncWrite + Unpin> crate::build_exec::BuildRelay for WriteHalfRelay<'a, W> {
+        async fn send(&mut self, bytes: Vec<u8>) -> bool {
+            use tokio::io::AsyncWriteExt as _;
+            self.0.write_all(&bytes).await.is_ok()
         }
-    };
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
-    let stdout_task = tokio::spawn(crate::build_exec::pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
-    let stderr_task = tokio::spawn(crate::build_exec::pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
-    drop(tx);
-
-    let mut write_failed = false;
-    while let Some((stream, bytes)) = rx.recv().await {
-        if send_build_output(write_half, stream, bytes).await.is_err() {
-            write_failed = true;
-            break;
+        // The Unix ctl-socket connection has no independent disconnect
+        // signal besides a failed `send` above — unlike the Windows-native
+        // owner-foreground path, which also watches its `russh::Channel`.
+        async fn watch(&mut self) {
+            std::future::pending::<()>().await
+        }
+        async fn close(&mut self) {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = self.0.shutdown().await;
         }
     }
-    // Dropping `rx` (implicit at scope end below doesn't happen yet — done
-    // explicitly here) unblocks any pump task still waiting on a full
-    // channel: their next `tx.send(...)` sees the receiver gone and returns
-    // immediately instead of hanging, so awaiting them below can't deadlock.
-    drop(rx);
 
-    if write_failed {
-        // The remote is gone; there is nothing left to report to. Kill the
-        // child rather than let it keep running unattended.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-        emit_build_progress_result(false);
+    let outcome =
+        crate::build_exec::run_build(&mut WriteHalfRelay(write_half), host, profile_name, TerminalKind::resolve()).await?;
+    if matches!(outcome, crate::build_exec::BuildOutcome::Disconnected) {
         bail!("isekai-ssh: ctl connection closed before the build finished; killed the child process");
     }
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    let status = match child.wait().await {
-        Ok(status) => status,
-        Err(e) => {
-            // Same reasoning as the spawn-failure arm above: `Indeterminate`
-            // is already showing and must be cleared on every exit path.
-            emit_build_progress_result(false);
-            return Err(e).context("isekai-ssh: failed to wait for the build child process");
-        }
-    };
-    // `status.code()` is `None` only if the process was killed by a signal
-    // (not the `write_failed` kill path above, which already returned) —
-    // `-1` is not a valid process exit code on any platform, so it can't be
-    // confused with a real one.
-    let exit_code = status.code().unwrap_or(-1);
-    emit_build_progress_result(exit_code == 0);
-
-    let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
-        (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if let Some(dest_dir) = &profile.dest_dir {
-        crate::build_exec::spawn_result_push(host.to_string(), dest_dir.clone(), result_paths.clone());
-    }
-    send_build_finished(write_half, exit_code, result_paths).await?;
     Ok(())
 }
 
-/// Clears the OSC 9;4 progress indicator `run_build` set to `Indeterminate`
-/// at the start, replacing it with `Error` on failure (no profile found /
-/// remote disconnected mid-build / non-zero exit) or `None` (hide) on
-/// success. Same best-effort/no-op-on-failure posture as the start signal —
-/// see the call site in `run_build`.
-#[cfg(unix)]
-fn emit_build_progress_result(success: bool) {
-    let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
-    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }, TerminalKind::resolve()) {
+/// Signals the *start* of a build via the OSC 9;4 progress indicator
+/// (`Indeterminate`/spinner, since success/failure isn't known yet) — paired
+/// with [`emit_build_progress_result`], which clears it. `terminal` is
+/// resolved once by the caller (`TerminalKind::resolve()` on the Unix path,
+/// always `TerminalKind::WindowsTerminal` on the Windows-native paths, same
+/// "resolve once, thread the value through" convention `osc_sequence_for`
+/// itself documents). Best-effort: a `None` mapping (no OSC sequence for
+/// this terminal) or a failed write is silently ignored, matching every
+/// other OSC-emitting call in this module.
+pub(crate) fn emit_build_progress_start(terminal: TerminalKind) {
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 }, terminal) {
         let _ = emit_osc(&seq);
     }
 }
 
-/// Thin wrappers around `build_exec`'s shared encoders that just add the
-/// actual write — kept here (rather than inlining `build_exec::encode_*` at
-/// each call site in `run_build`) so `run_build` itself reads the same as
-/// before this encoding logic moved out to be shared with the Windows-native
-/// dispatch paths (`ISEKAI_PIPE_DESIGN.md` §8 Epic P Phase 2).
-#[cfg(unix)]
-async fn send_build_output(
-    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
-    stream: isekai_protocol::BuildOutputStream,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let out = crate::build_exec::encode_build_output_chunk(stream, bytes)?;
-    write_half.write_all(&out).await.context("isekai-ssh: failed to write build output chunk")?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn send_build_finished(
-    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
-    exit_code: i32,
-    result_paths: Vec<String>,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-    let out = crate::build_exec::encode_build_finished(exit_code, result_paths)?;
-    write_half.write_all(&out).await.context("isekai-ssh: failed to write build finished message")?;
-    write_half.shutdown().await.ok();
-    Ok(())
+/// Clears the OSC 9;4 progress indicator [`emit_build_progress_start`] set to
+/// `Indeterminate`, replacing it with `Error` on failure (no profile found /
+/// remote disconnected mid-build / non-zero exit) or `None` (hide) on
+/// success. Same best-effort/no-op-on-failure posture as the start signal —
+/// see the call site in `crate::build_exec::run_build`.
+///
+/// Shared by all 3 build-runner dispatch paths since the Epic P × 2026-08
+/// unification (previously Unix-only — see `run_build`'s doc comment on why
+/// that drift existed and was deliberately closed).
+pub(crate) fn emit_build_progress_result(success: bool, terminal: TerminalKind) {
+    let state = if success { isekai_protocol::ProgressState::None } else { isekai_protocol::ProgressState::Error };
+    if let Some(seq) = osc_sequence_for(&CtlMessage::SetProgress { state, progress: 0 }, terminal) {
+        let _ = emit_osc(&seq);
+    }
 }
 
 /// Which real terminal emulator this `isekai-ssh` process is running inside,
@@ -955,39 +863,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("preamble"));
     }
 
-    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
-    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
-    /// `init.rs`'s own `$HOME`-dependent tests use, since `cargo test` runs
-    /// tests on multiple threads and `std::env::set_var` is process-global.
-    /// Returns the tempdir (kept alive for the caller's whole test) and a
-    /// guard that restores the previous `$HOME` on drop.
-    #[cfg(unix)]
-    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
-        let home = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let mut store = crate::build_profile::BuildProfileStore::default();
-        for profile in profiles {
-            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
-        }
-        let path = crate::build_profile::default_build_profiles_path().unwrap();
-        crate::build_profile::save_build_profiles(&path, &store).unwrap();
-        (home, HomeRestoreGuard(old_home))
-    }
-
-    #[cfg(unix)]
-    struct HomeRestoreGuard(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl Drop for HomeRestoreGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(old) => std::env::set_var("HOME", old),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
     /// Reads `CtlMessage` lines off `client` until `BuildFinished`, decoding
     /// every `BuildOutputChunk` along the way and appending its bytes to the
     /// matching stream's buffer. Mirrors what `isekai-pipe ctl build` itself
@@ -1026,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn run_build_reports_an_unknown_profile() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_home, _restore) = with_build_profiles(vec![]);
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![]);
 
         let (mut client, server_stream) = tokio::io::duplex(4096);
         let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
@@ -1049,7 +924,7 @@ mod tests {
     async fn run_build_streams_output_and_reports_exit_code_and_results() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -1089,7 +964,7 @@ mod tests {
     async fn run_build_kills_the_child_when_the_connection_breaks_mid_build() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -1156,7 +1031,7 @@ mod tests {
     async fn a_running_ctl_listener_picks_up_build_profile_changes_without_restarting() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![]);
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![]);
 
         let mut forward = prepare_ctl_forward(workdir.path()).unwrap();
         spawn_ctl_listener(&mut forward, "mybox".to_string()).await;

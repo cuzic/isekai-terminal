@@ -123,7 +123,6 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszAcceptUpload(fileName: String, fileSize: ULong, mode: UInt) { trzszAcceptUploadCount++ }
     override fun trzszSendChunk(data: ByteArray, isLast: Boolean) {}
     override fun trzszCancel() { trzszCancelCount++ }
-    override fun notifyError(message: String) {}
     override fun forceReturnToWifi() { forceReturnToWifiCallCount++ }
     // クラッシュ観点レビュー(2026-07-31)で追加: `TerminalTabsViewModel`の
     // `forwardToRust`(OSコールバックスレッド→UniFFI境界の防御的catch)が
@@ -136,8 +135,6 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         notifyUpstreamHealthDegradedCallCount++
         notifyUpstreamHealthDegradedError?.let { throw it }
     }
-
-    override fun isQuic(): Boolean = quic
 
     // 実 Rust 側 (SessionOrchestrator::notify_network_path_changed) の判断を再現する:
     // ハンドシェイク中/プレーン TCP 接続中は切断、QUIC 接続中は無視。実装側はプレーン TCP
@@ -165,15 +162,6 @@ class FakeOrchestrator : SessionOrchestratorInterface {
             else -> {}
         }
     }
-
-    val addedForwards = mutableListOf<PortForward>()
-    var removedForwardId: String? = null
-
-    override fun addLocalForward(id: String, bindAddress: String, bindPort: UShort, remoteHost: String, remotePort: UShort) {
-        addedForwards.add(PortForward(ForwardType.LOCAL, bindAddress, bindPort, remoteHost, remotePort))
-    }
-
-    override fun removeForward(id: String) { removedForwardId = id }
 
     val setSessionThemeCalls = mutableListOf<Triple<List<UInt>, UInt, UInt>>()
     override fun setSessionTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) {

@@ -28,6 +28,22 @@ use super::protocol::{spawn_frame_reader, write_frame, Frame, MUX_PROTOCOL_VERSI
 /// gets a chance to die cleanly at all.
 const BUILD_ABORT_WAIT: Duration = Duration::from_secs(2);
 
+/// Aborts and awaits `active_build`'s in-flight build (if any), clearing the
+/// slot. Every terminal arm of `run_inner`'s `select!` loop must run this
+/// before returning/breaking, or an in-flight build's real child process is
+/// orphaned — this used to be `if let Some(build) = active_build.take() {
+/// build.abort_and_wait(BUILD_ABORT_WAIT).await; }`, copy-pasted at 7
+/// separate exit points, and one of the 7 was found missing this exact
+/// cleanup during a prior review (see the comment on the `Exit` arm in
+/// `run_inner`) — precisely the risk of spreading one obligation across that
+/// many call sites by hand. Extracted so every exit now goes through the
+/// same function instead.
+async fn abort_active(active_build: &mut Option<super::build_relay::ActiveBuild>) {
+    if let Some(build) = active_build.take() {
+        build.abort_and_wait(BUILD_ABORT_WAIT).await;
+    }
+}
+
 /// How long [`run_inner`] waits for the owner's `HelloAck`/`Rejected` after
 /// sending `Hello`, before giving up on this owner connection entirely
 /// (crash-focused review, 2026-07-31; the symmetric counterpart to the
@@ -277,9 +293,7 @@ where
                     }
                     Ok(n) => {
                         if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
-                            if let Some(build) = active_build.take() {
-                                build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                            }
+                            abort_active(&mut active_build).await;
                             return Ok(ClientOutcome::OwnerLost);
                         }
                     }
@@ -303,9 +317,7 @@ where
                         Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
                     );
                     if write_frame(conn_write, &Frame::Ctl(bytes)).await.is_err() {
-                        if let Some(build) = active_build.take() {
-                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                        }
+                        abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::OwnerLost);
                     }
                     if is_finished {
@@ -350,9 +362,7 @@ where
                             Ok(isekai_protocol::CtlMessage::BuildFinished { exit_code, .. })
                                 if exit_code == super::build_relay::BUILD_ABORTED_SENTINEL =>
                             {
-                                if let Some(build) = active_build.take() {
-                                    build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                                }
+                                abort_active(&mut active_build).await;
                             }
                             Ok(msg) => {
                                 // iTerm2はmacOS専用でWindowsには存在しないため、この
@@ -373,50 +383,31 @@ where
                     // in-flight build, this one didn't, orphaning the real
                     // child process since nothing else will ever kill it).
                     Some(Ok(Some(Frame::Exit(code)))) => {
-                        if let Some(build) = active_build.take() {
-                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                        }
+                        abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::Exited(code));
                     }
                     Some(Ok(Some(other))) => {
-                        if let Some(build) = active_build.take() {
-                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                        }
+                        abort_active(&mut active_build).await;
                         return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}"));
                     }
                     // A clean close without an Exit, any read error (a reset
                     // pipe), or the reader task ending all mean the owner died
                     // mid-session.
                     Some(Ok(None)) | Some(Err(_)) | None => {
-                        if let Some(build) = active_build.take() {
-                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                        }
+                        abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::OwnerLost);
                     }
                 }
             }
-            resize = recv_resize(&mut resize_rx) => {
+            resize = super::super::console::recv_resize(&mut resize_rx) => {
                 if let Some((cols, rows)) = resize {
                     if write_frame(conn_write, &Frame::Resize { cols: cols as u16, rows: rows as u16 }).await.is_err() {
-                        if let Some(build) = active_build.take() {
-                            build.abort_and_wait(BUILD_ABORT_WAIT).await;
-                        }
+                        abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::OwnerLost);
                     }
                 }
             }
         }
-    }
-}
-
-/// `recv` on the optional resize channel, or a future that never resolves
-/// when there is no watcher (so the `select!` branch is inert).
-async fn recv_resize(
-    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
-) -> Option<(u32, u32)> {
-    match rx.as_mut() {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
     }
 }
 
@@ -751,32 +742,6 @@ mod tests {
         owner.abort();
     }
 
-    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
-    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
-    /// `build_relay.rs`'s own tests use.
-    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
-        let home = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let mut store = crate::build_profile::BuildProfileStore::default();
-        for profile in profiles {
-            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
-        }
-        let path = crate::build_profile::default_build_profiles_path().unwrap();
-        crate::build_profile::save_build_profiles(&path, &store).unwrap();
-        (home, HomeRestoreGuard(old_home))
-    }
-
-    struct HomeRestoreGuard(Option<std::ffi::OsString>);
-    impl Drop for HomeRestoreGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(old) => std::env::set_var("HOME", old),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
     /// End-to-end for Epic P Phase 2's mux-client path: the owner relays a
     /// `BuildRequest` as `Frame::Ctl`; `run_inner` must run the matching
     /// profile and relay its `BuildOutputChunk`/`BuildFinished` back as
@@ -787,7 +752,7 @@ mod tests {
     async fn client_runs_a_build_profile_and_streams_output_to_the_owner() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -860,7 +825,7 @@ mod tests {
     async fn client_can_run_a_second_build_after_the_first_finishes() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -926,7 +891,7 @@ mod tests {
     async fn client_kills_the_build_when_the_owner_relays_the_abort_sentinel() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),

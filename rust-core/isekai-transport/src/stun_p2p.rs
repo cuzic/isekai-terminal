@@ -173,56 +173,21 @@ pub struct SequentialStunCandidate {
     pub candidate_id: String,
 }
 
-#[derive(Debug)]
-pub enum SequentialStunConnectError {
-    /// [`connect_stun_p2p_with_fallback`] was called with an empty candidate
-    /// list — a caller bug, not a connectivity failure.
-    NoCandidates,
-    /// Every candidate failed with a pre-attach reason
-    /// (`AttemptFailure::may_retry_pre_fencing() == true`); every one was
-    /// tried.
-    AllCandidatesFailed { failures: Vec<crate::resume::SequentialFailure> },
-    /// A candidate's failure was not safely pre-attach-retryable — stopped
-    /// immediately rather than trying the next candidate, exactly like the
-    /// original (pre-`#25`) relay fallback's `StoppedEarly` behavior. STUN
-    /// P2P has no resume/control-stream concept to converge an ambiguous
-    /// failure through (unlike relay's `#25`), so this stays intentionally
-    /// simple until real-world STUN failure-mode telemetry (`#13b`) shows a
-    /// generation-retry-aware version is actually needed.
-    StoppedEarly { candidate_id: String, failure: crate::attempt::AttemptFailure },
-}
-
-impl SequentialStunConnectError {
-    /// Same any-of semantics as `SequentialConnectError::is_stale_trust_signal`
-    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
-    pub fn is_stale_trust_signal(&self) -> bool {
-        match self {
-            Self::NoCandidates => false,
-            Self::AllCandidatesFailed { failures } => failures.iter().any(|f| f.failure.is_stale_trust_signal()),
-            Self::StoppedEarly { failure, .. } => failure.is_stale_trust_signal(),
-        }
-    }
-}
-
-impl std::fmt::Display for SequentialStunConnectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoCandidates => write!(f, "no candidates were provided to try"),
-            Self::AllCandidatesFailed { failures } => {
-                write!(f, "all {} candidate(s) failed:", failures.len())?;
-                for failure in failures {
-                    write!(f, " [{}: {}]", failure.candidate_id, failure.failure)?;
-                }
-                Ok(())
-            }
-            Self::StoppedEarly { candidate_id, failure } => {
-                write!(f, "stopped after candidate {candidate_id:?} failed ambiguously or terminally: {failure}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SequentialStunConnectError {}
+/// Kept as an alias (rather than removed outright) purely so existing
+/// callers/tests that name this STUN-specific alias keep compiling —
+/// [`connect_stun_p2p_with_fallback`]'s actual error type is
+/// [`crate::resume::SequentialConnectError`] itself, reused as-is rather
+/// than duplicated under a STUN-specific enum: `NoCandidates`/
+/// `AllCandidatesFailed`/`StoppedEarly` are the only variants this STUN path
+/// ever constructs (it has no resume/control-stream concept to produce
+/// `AttachedButControlStreamFailed`/`MustResumeButResumeFailed`/
+/// `GaveUpAfterGenerationRetries` from — see that type's own docs), so a
+/// verbatim-duplicated 3-variant subset (formerly its own
+/// `SequentialStunConnectError` enum here, complete with copy-pasted
+/// `Display`/`is_stale_trust_signal` impls) bought nothing over reusing the
+/// relay path's type directly. New code should just name
+/// [`crate::resume::SequentialConnectError`] directly instead of this alias.
+pub type SequentialStunConnectError = crate::resume::SequentialConnectError;
 
 /// Like [`connect_stun_p2p`], but tries each of `candidates` (each a
 /// different STUN server, same `target`) in order and falls back to the next
@@ -242,9 +207,9 @@ pub async fn connect_stun_p2p_with_fallback(
     factory: &AnyMuxFactory,
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
-) -> Result<(StunP2pConnection, SocketAddr), SequentialStunConnectError> {
+) -> Result<(StunP2pConnection, SocketAddr), crate::resume::SequentialConnectError> {
     if candidates.is_empty() {
-        return Err(SequentialStunConnectError::NoCandidates);
+        return Err(crate::resume::SequentialConnectError::NoCandidates);
     }
 
     let session_id = random_session_id();
@@ -268,12 +233,12 @@ pub async fn connect_stun_p2p_with_fallback(
                     failures.push(crate::resume::SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
                     continue;
                 }
-                return Err(SequentialStunConnectError::StoppedEarly { candidate_id: candidate.candidate_id.clone(), failure });
+                return Err(crate::resume::SequentialConnectError::StoppedEarly { candidate_id: candidate.candidate_id.clone(), failure });
             }
         }
     }
 
-    Err(SequentialStunConnectError::AllCandidatesFailed { failures })
+    Err(crate::resume::SequentialConnectError::AllCandidatesFailed { failures })
 }
 
 pub(crate) async fn connect_stun_p2p_with_round(
@@ -331,41 +296,8 @@ pub(crate) async fn connect_stun_p2p_with_round(
     Ok(StunP2pConnection { our_observed_addr, stream })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resume::SequentialFailure;
-
-    fn stale_failure() -> SequentialFailure {
-        SequentialFailure {
-            candidate_id: "c1".to_string(),
-            failure: AttemptFailure::Terminal {
-                source: TransportError::Rejected(isekai_protocol::attach::AttachRejectReason::Auth),
-            },
-        }
-    }
-
-    fn not_stale_failure() -> SequentialFailure {
-        SequentialFailure { candidate_id: "c2".to_string(), failure: AttemptFailure::RetryablePreAttach { source: TransportError::UnexpectedEof } }
-    }
-
-    #[test]
-    fn no_candidates_is_never_a_stale_trust_signal() {
-        assert!(!SequentialStunConnectError::NoCandidates.is_stale_trust_signal());
-    }
-
-    #[test]
-    fn all_candidates_failed_is_stale_if_any_failure_is() {
-        assert!(SequentialStunConnectError::AllCandidatesFailed { failures: vec![not_stale_failure(), stale_failure()] }
-            .is_stale_trust_signal());
-        assert!(!SequentialStunConnectError::AllCandidatesFailed { failures: vec![not_stale_failure()] }.is_stale_trust_signal());
-    }
-
-    #[test]
-    fn stopped_early_delegates_to_its_failure() {
-        assert!(SequentialStunConnectError::StoppedEarly { candidate_id: "c1".to_string(), failure: stale_failure().failure }
-            .is_stale_trust_signal());
-        assert!(!SequentialStunConnectError::StoppedEarly { candidate_id: "c2".to_string(), failure: not_stale_failure().failure }
-            .is_stale_trust_signal());
-    }
-}
+// `is_stale_trust_signal`/`Display` coverage for the `NoCandidates`/
+// `AllCandidatesFailed`/`StoppedEarly` variants this module's own
+// `connect_stun_p2p_with_fallback` constructs now lives entirely in
+// `resume.rs`'s own test module (`SequentialConnectError` is the same type,
+// no longer a separately-tested `SequentialStunConnectError` duplicate).

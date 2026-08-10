@@ -25,6 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use russh_stream_session::{HostKeyVerifier, VerifyOutcome};
 
+use crate::time::now_rfc3339;
 use crate::SshHostKeyTrust;
 
 /// Verifies a server host key against [`SshHostKeyTrustStore`] with `ssh(1)`
@@ -188,40 +189,6 @@ impl FileBackedHostKeyVerifier {
     }
 }
 
-fn now_rfc3339() -> String {
-    // The same tiny RFC3339 formatter `isekai-ssh`'s `wrapper.rs`/`init.rs`
-    // each carry their own copy of — `wrapper.rs:895-897`'s doc comment
-    // states the project's deliberate call to keep that ~15-line helper
-    // duplicated per module rather than shared. This copy lives here because
-    // the host-key verifier that uses it now lives here; it is not an
-    // attempt to consolidate the others.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = secs / 86_400;
-    let time_of_day = secs % 86_400;
-    let (h, m, s) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
-    let (y, mo, d) = civil_from_days(days as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days` algorithm (public domain,
-/// <http://howardhinnant.github.io/date_algorithms.html>) — converts a day
-/// count since the Unix epoch into a proleptic-Gregorian (year, month, day).
-/// No `chrono`/`time` dependency needed for a value this codebase only ever
-/// displays, never parses back arithmetically.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,14 +340,5 @@ mod tests {
             "SHA256:original",
             "a rejected mismatch must not overwrite the previously-trusted fingerprint"
         );
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        // 1970-01-01 is day 0 by definition.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2026-07-17, cross-checked against Python's
-        // `(date(2026,7,17) - date(1970,1,1)).days` = 20651.
-        assert_eq!(civil_from_days(20_651), (2026, 7, 17));
     }
 }

@@ -1091,13 +1091,6 @@ public func FfiConverterTypeDiagnosticHandle_lower(_ value: DiagnosticHandle) ->
 public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     /**
-     * 接続中にローカルポートフォワード(-L)を動的に追加する。
-     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-     */
-    func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, remoteHost: String, remotePort: UInt16) 
-    
-    /**
      * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
      * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
      * 「中止」操作を出す想定)。
@@ -1202,8 +1195,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func forceReturnToWifi() 
     
-    func isQuic()  -> Bool
-    
     /**
      * [jump_to_previous_prompt]の「次」版。
      */
@@ -1236,8 +1227,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     func notifyDidEnterBackground(budgetMs: UInt32) 
-    
-    func notifyError(message: String) 
     
     /**
      * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
@@ -1296,8 +1285,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * 何もしない。
      */
     func notifyWillEnterForeground() 
-    
-    func removeForward(id: String) 
     
     func resize(cols: UInt32, rows: UInt32) 
     
@@ -1397,23 +1384,6 @@ open class SessionOrchestrator: SessionOrchestratorProtocol, @unchecked Sendable
 
     
 
-    
-    /**
-     * 接続中にローカルポートフォワード(-L)を動的に追加する。
-     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-     */
-open func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, remoteHost: String, remotePort: UInt16)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),
-        FfiConverterString.lower(bindAddress),
-        FfiConverterUInt16.lower(bindPort),
-        FfiConverterString.lower(remoteHost),
-        FfiConverterUInt16.lower(remotePort),$0
-    )
-}
-}
     
     /**
      * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
@@ -1611,14 +1581,6 @@ open func forceReturnToWifi()  {try! rustCall() {
 }
 }
     
-open func isQuic() -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
     /**
      * [jump_to_previous_prompt]の「次」版。
      */
@@ -1673,14 +1635,6 @@ open func notifyDidEnterBackground(budgetMs: UInt32)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(budgetMs),$0
-    )
-}
-}
-    
-open func notifyError(message: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(message),$0
     )
 }
 }
@@ -1766,14 +1720,6 @@ open func notifyUpstreamHealthDegraded()  {try! rustCall() {
 open func notifyWillEnterForeground()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
             self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-open func removeForward(id: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(id),$0
     )
 }
 }
@@ -9217,9 +9163,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_diagnostichandle_fire_callback() != 38453) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9262,9 +9205,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9275,9 +9215,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
@@ -9293,9 +9230,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize() != 11770) {

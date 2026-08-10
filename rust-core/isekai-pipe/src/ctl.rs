@@ -20,9 +20,11 @@ use isekai_protocol::{decode_ctl_message, CtlMessage};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
+use tokio::net::unix::OwnedReadHalf;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::connect::next_arg;
+use crate::connect::{next_arg, usage_err};
 use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
@@ -62,6 +64,26 @@ enum CtlLaunch {
     /// connection open for the whole build (streamed `BuildOutputChunk`s
     /// before the terminating `BuildFinished`), not a single round trip.
     Build { sock: Option<String>, profile: String },
+}
+
+impl CtlLaunch {
+    /// `--sock`/`$ISEKAI_CTL_SOCK` override common to every variant —
+    /// factored out so `ctl_command`'s unix and non-unix variants (which
+    /// both need it before their platform-specific paths diverge) don't
+    /// each carry their own copy of this 9-arm match.
+    fn sock(&self) -> Option<String> {
+        match self {
+            CtlLaunch::Title { sock, .. }
+            | CtlLaunch::TabColor { sock, .. }
+            | CtlLaunch::Progress { sock, .. }
+            | CtlLaunch::ClipPush { sock, .. }
+            | CtlLaunch::ClipPull { sock }
+            | CtlLaunch::Notify { sock, .. }
+            | CtlLaunch::SetVar { sock, .. }
+            | CtlLaunch::GetVar { sock, .. }
+            | CtlLaunch::Build { sock, .. } => sock.clone(),
+        }
+    }
 }
 
 fn print_ctl_help() {
@@ -196,10 +218,7 @@ fn parse_ctl_title(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl title", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl title", &mut args, "--sock").map_err(usage_err)?);
             }
             other if value.is_none() => value = Some(other.to_string()),
             other => {
@@ -225,16 +244,10 @@ fn parse_ctl_tab_color(mut args: impl Iterator<Item = String>) -> Result<Option<
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl tab-color", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl tab-color", &mut args, "--sock").map_err(usage_err)?);
             }
             other if color.is_none() => {
-                color = Some(parse_hex_color(other).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                color = Some(parse_hex_color(other).map_err(usage_err)?);
             }
             other => {
                 eprintln!("isekai-pipe ctl tab-color: unexpected extra argument {other:?}");
@@ -259,16 +272,10 @@ fn parse_ctl_progress(mut args: impl Iterator<Item = String>) -> Result<Option<C
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl progress", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl progress", &mut args, "--sock").map_err(usage_err)?);
             }
             other if state.is_none() => {
-                state = Some(parse_progress_state(other).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                state = Some(parse_progress_state(other).map_err(usage_err)?);
             }
             other => match other.parse::<u16>() {
                 Ok(n) if n <= 100 => progress = n as u8,
@@ -297,20 +304,11 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--sock" => {
-                        sock = Some(next_arg("ctl clip push", &mut args, "--sock").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        sock = Some(next_arg("ctl clip push", &mut args, "--sock").map_err(usage_err)?);
                     }
                     "--mime" => {
-                        let value = next_arg("ctl clip push", &mut args, "--mime").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?;
-                        mime = Some(parse_mime(&value).map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        let value = next_arg("ctl clip push", &mut args, "--mime").map_err(usage_err)?;
+                        mime = Some(parse_mime(&value).map_err(usage_err)?);
                     }
                     other => {
                         eprintln!("isekai-pipe ctl clip push: unknown argument {other:?}");
@@ -329,10 +327,7 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--sock" => {
-                        sock = Some(next_arg("ctl clip pull", &mut args, "--sock").map_err(|e| {
-                            eprintln!("{e}");
-                            ExitCode::from(EX_USAGE)
-                        })?);
+                        sock = Some(next_arg("ctl clip pull", &mut args, "--sock").map_err(usage_err)?);
                     }
                     other => {
                         eprintln!("isekai-pipe ctl clip pull: unknown argument {other:?}");
@@ -418,20 +413,11 @@ fn parse_ctl_setvar(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl setvar", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl setvar", &mut args, "--sock").map_err(usage_err)?);
             }
             "--scope" => {
-                let raw = next_arg("ctl setvar", &mut args, "--scope").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                scope = Some(parse_var_scope(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl setvar", &mut args, "--scope").map_err(usage_err)?;
+                scope = Some(parse_var_scope(&raw).map_err(usage_err)?);
             }
             other if key.is_none() => key = Some(other.to_string()),
             other if value.is_none() => value = Some(other.to_string()),
@@ -459,20 +445,11 @@ fn parse_ctl_getvar(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl getvar", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl getvar", &mut args, "--sock").map_err(usage_err)?);
             }
             "--scope" => {
-                let raw = next_arg("ctl getvar", &mut args, "--scope").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                scope = Some(parse_var_scope(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl getvar", &mut args, "--scope").map_err(usage_err)?;
+                scope = Some(parse_var_scope(&raw).map_err(usage_err)?);
             }
             other if key.is_none() => key = Some(other.to_string()),
             other => {
@@ -503,32 +480,17 @@ fn parse_ctl_notify(mut args: impl Iterator<Item = String>) -> Result<Option<Ctl
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl notify", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl notify", &mut args, "--sock").map_err(usage_err)?);
             }
             "--kind" => {
-                let raw = next_arg("ctl notify", &mut args, "--kind").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
-                kind = Some(parse_notify_kind(&raw).map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                let raw = next_arg("ctl notify", &mut args, "--kind").map_err(usage_err)?;
+                kind = Some(parse_notify_kind(&raw).map_err(usage_err)?);
             }
             "--tag" => {
-                tmux_tag = Some(next_arg("ctl notify", &mut args, "--tag").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                tmux_tag = Some(next_arg("ctl notify", &mut args, "--tag").map_err(usage_err)?);
             }
             "--seq" => {
-                let value = next_arg("ctl notify", &mut args, "--seq").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?;
+                let value = next_arg("ctl notify", &mut args, "--seq").map_err(usage_err)?;
                 seq = Some(value.parse::<u64>().map_err(|_| {
                     eprintln!("isekai-pipe ctl notify: --seq must be a non-negative integer, got {value:?}");
                     ExitCode::from(EX_USAGE)
@@ -578,10 +540,7 @@ fn parse_ctl_build(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sock" => {
-                sock = Some(next_arg("ctl build", &mut args, "--sock").map_err(|e| {
-                    eprintln!("{e}");
-                    ExitCode::from(EX_USAGE)
-                })?);
+                sock = Some(next_arg("ctl build", &mut args, "--sock").map_err(usage_err)?);
             }
             other if profile.is_none() => profile = Some(other.to_string()),
             other => {
@@ -679,20 +638,7 @@ async fn ctl_command_with_sweep_dir(mut args: impl Iterator<Item = String>, swee
     // the remote host, so do it unconditionally before touching our own
     // socket rather than only on error/retry paths.
     sweep_stale_ctl_sockets_in(sweep_dir);
-    let sock = match &launch {
-        CtlLaunch::Title { sock, .. }
-        | CtlLaunch::TabColor { sock, .. }
-        | CtlLaunch::Progress { sock, .. }
-        | CtlLaunch::ClipPush { sock, .. }
-        | CtlLaunch::ClipPull { sock }
-        | CtlLaunch::Notify { sock, .. }
-        | CtlLaunch::SetVar { sock, .. }
-        | CtlLaunch::GetVar { sock, .. }
-        | CtlLaunch::Build { sock, .. } => {
-            sock.clone()
-        }
-    };
-    let sock_path = match resolve_ctl_socket_path(sock) {
+    let sock_path = match resolve_ctl_socket_path(launch.sock()) {
         Ok(path) => path,
         Err(code) => return code,
     };
@@ -733,20 +679,7 @@ pub(crate) async fn ctl_command(mut args: impl Iterator<Item = String>) -> ExitC
     // Still resolve `--sock`/`$ISEKAI_CTL_SOCK` so a misconfigured caller
     // sees the same usage error on every platform — only the final "connect
     // to it" step is unix-only.
-    let sock = match &launch {
-        CtlLaunch::Title { sock, .. }
-        | CtlLaunch::TabColor { sock, .. }
-        | CtlLaunch::Progress { sock, .. }
-        | CtlLaunch::ClipPush { sock, .. }
-        | CtlLaunch::ClipPull { sock }
-        | CtlLaunch::Notify { sock, .. }
-        | CtlLaunch::SetVar { sock, .. }
-        | CtlLaunch::GetVar { sock, .. }
-        | CtlLaunch::Build { sock, .. } => {
-            sock.clone()
-        }
-    };
-    if let Err(code) = resolve_ctl_socket_path(sock) {
+    if let Err(code) = resolve_ctl_socket_path(launch.sock()) {
         return code;
     }
     eprintln!("isekai-pipe ctl: not supported on this platform (requires UNIX domain sockets)");
@@ -843,20 +776,7 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<u8> {
 async fn stream_build(sock_path: &Path, profile: String) -> Result<u8> {
     use isekai_protocol::BuildOutputStream;
 
-    let stream = UnixStream::connect(sock_path)
-        .await
-        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half
-        .write_all(&secret_preamble(sock_path))
-        .await
-        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line =
-        serde_json::to_vec(&CtlMessage::BuildRequest { profile }).context("isekai-pipe ctl: failed to encode ctl message")?;
-    line.push(b'\n');
-    write_half.write_all(&line).await.context("isekai-pipe ctl: failed to write ctl message")?;
-    write_half.shutdown().await.ok();
-
+    let read_half = open_ctl_conn(sock_path, &CtlMessage::BuildRequest { profile }).await?;
     let mut reader = BufReader::new(read_half);
     loop {
         let mut response_line = String::new();
@@ -916,30 +836,16 @@ fn secret_preamble(sock_path: &Path) -> Vec<u8> {
     line
 }
 
+/// Connects to `sock_path`, writes the shared-secret preamble followed by
+/// `msg` as a single JSON line, then half-closes the write side (a ctl
+/// connection is always exactly "connect, send one message, read zero or
+/// more response lines" — never kept open across multiple messages, §8
+/// Epic M "ワイヤーフォーマット"). Returns the read half so callers that
+/// expect a response (or a stream of them, e.g. `stream_build`) can keep
+/// reading from it; callers that don't care about a response (`send_ctl_message`)
+/// simply drop it.
 #[cfg(unix)]
-pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
-    let mut stream = UnixStream::connect(sock_path)
-        .await
-        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
-    stream
-        .write_all(&secret_preamble(sock_path))
-        .await
-        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
-    line.push(b'\n');
-    stream
-        .write_all(&line)
-        .await
-        .context("isekai-pipe ctl: failed to write ctl message")?;
-    // Half-close the write side so a listener reading line-by-line sees a
-    // clean EOF after this one message; we never keep a ctl connection open
-    // across multiple messages (§8 Epic M "ワイヤーフォーマット").
-    stream.shutdown().await.ok();
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
+async fn open_ctl_conn(sock_path: &Path, msg: &CtlMessage) -> Result<OwnedReadHalf> {
     let stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
@@ -948,14 +854,25 @@ async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -
         .write_all(&secret_preamble(sock_path))
         .await
         .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
-    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
+    let mut line = serde_json::to_vec(msg).context("isekai-pipe ctl: failed to encode ctl message")?;
     line.push(b'\n');
     write_half
         .write_all(&line)
         .await
         .context("isekai-pipe ctl: failed to write ctl message")?;
     write_half.shutdown().await.ok();
+    Ok(read_half)
+}
 
+#[cfg(unix)]
+pub(crate) async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
+    open_ctl_conn(sock_path, &msg).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
+    let read_half = open_ctl_conn(sock_path, &msg).await?;
     let mut reader = BufReader::new(read_half);
     let mut response_line = String::new();
     reader

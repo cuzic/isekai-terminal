@@ -1,8 +1,5 @@
 package tools.isekai.terminal
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -24,6 +21,7 @@ import tools.isekai.terminal.data.KeyEntry
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.util.RemoteLogger
+import tools.isekai.terminal.util.copyToClipboard
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -127,8 +125,7 @@ fun KeyListScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cm.setPrimaryClip(ClipData.newPlainText("public key", pubKey))
+                        context.copyToClipboard("public key", pubKey)
                         vm.dismissGeneratedPubKey()
                     },
                     modifier = Modifier.testTag("copyGeneratedKeyButton"),
@@ -204,8 +201,7 @@ fun KeyListScreen(
                             createdAtText = dateFmt.format(Date(key.createdAt)),
                             onCopy = {
                                 RemoteLogger.i("IsekaiTerminalKey", "copied public key: '${key.label}' id=${key.id}")
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("public key", key.publicKey))
+                                context.copyToClipboard("public key", key.publicKey)
                             },
                             onDelete = { vm.requestDelete(key) },
                         )

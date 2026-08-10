@@ -16,12 +16,17 @@
 //! - `BootstrapBackend` (`backend.rs`): the CLI/Android-agnostic trait.
 //! - `OpenSshBackend` (`openssh.rs`): the CLI-default implementation, backed
 //!   by a real `ssh(1)` subprocess with strict stdout-purity enforcement.
+//! - `install_script.rs` (crate-private): the remote install/launch shell
+//!   script, its stdin framing, and the handshake parsing — shared by
+//!   *both* backends, which differ only in how they establish an SSH
+//!   session and push the bytes.
 //! - `HostSpec`/`JumpSpec`/`RelayLaunchSpec`/`BootstrapReport` (`types.rs`).
 //! - `BootstrapError` (`error.rs`).
 
 pub mod backend;
 pub mod client_candidates;
 pub mod error;
+mod install_script;
 pub mod openssh;
 mod reuse;
 pub mod russh_backend;

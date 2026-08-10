@@ -222,13 +222,11 @@ pub(crate) async fn install_notify_hooks<R: RemoteTmuxCommandRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux_locator::{TmuxLocator, TmuxRunError, TmuxSessionScope, TmuxTag, TmuxTargetKind};
-    use std::future::Future;
+    use crate::tmux_locator::{TmuxLocator, TmuxTag, TmuxTargetKind};
+    // tmux_locator.rs/tmux_scrollback.rsと同一定義だった`standalone`/`pane`/
+    // `RecordingRunner`をtest_supportへ共通化した。
+    use crate::tmux_locator::test_support::{pane, standalone, RecordingRunner};
     use std::sync::{Arc, Mutex as StdMutex};
-
-    fn standalone(name: &str) -> TmuxSessionScope {
-        TmuxSessionScope::Standalone { session_name: name.to_string() }
-    }
 
     // ── コマンド組み立て(実tmux 3.3aで検証済みの文字列を固定でpin) ──────
 
@@ -290,29 +288,6 @@ mod tests {
     }
 
     // ── install_notify_hooks (フェイクrunner越し、tmux_locator.rsと同じ慣習) ──
-
-    struct RecordingRunner {
-        response: Result<String, TmuxRunError>,
-        calls: Arc<StdMutex<Vec<String>>>,
-    }
-
-    impl RecordingRunner {
-        fn new(output: &str, calls: Arc<StdMutex<Vec<String>>>) -> Self {
-            Self { response: Ok(output.to_string()), calls }
-        }
-    }
-
-    impl RemoteTmuxCommandRunner for RecordingRunner {
-        fn run(&self, cmd: &str) -> impl Future<Output = Result<String, TmuxRunError>> + Send {
-            self.calls.lock().unwrap().push(cmd.to_string());
-            let response = self.response.clone();
-            async move { response }
-        }
-    }
-
-    fn pane(tab: &str, pane: &str) -> AppPaneId {
-        AppPaneId { tab_id: tab.to_string(), pane_id: pane.to_string() }
-    }
 
     #[tokio::test]
     async fn is_a_noop_when_locator_unknown() {

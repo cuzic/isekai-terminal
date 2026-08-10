@@ -343,8 +343,8 @@ class TerminalTabsViewModelTest {
 
         val tabA = vm.tabs.value.first { it.tabId == idA }
         val tabB = vm.tabs.value.first { it.tabId == idB }
-        assertTrue("tab a must remain connected regardless of active-tab switches", tabA.session.state.value.connected)
-        assertFalse("tab b must not have been connected as a side effect", tabB.session.state.value.connected)
+        assertTrue("tab a must remain connected regardless of active-tab switches", tabA.primaryPane.session.state.value.connected)
+        assertFalse("tab b must not have been connected as a side effect", tabB.primaryPane.session.state.value.connected)
         assertEquals(idA, vm.activeTabId.value)
     }
 
@@ -403,7 +403,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateConnected()
         orchestrators[1].simulateConnected()
 
-        vm.sendToPane(PaneAddress(idA, tab(idA).focusedPane.paneId), byteArrayOf(0x41))
+        tab(idA).focusedPane.session.send(byteArrayOf(0x41))
 
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x41)) })
         assertTrue("tab b's orchestrator must not receive tab a's bytes", orchestrators[1].sentBytes.isEmpty())
@@ -486,16 +486,16 @@ class TerminalTabsViewModelTest {
         val idA = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
         withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
         orchestrators[0].simulateConnected("host-a")
-        withTimeout(3000) { while (!tab(idA).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(idA).primaryPane.session.state.value.connected) delay(10) }
 
         val idB = vm.openTab(multipathProfile("b", enableUpstreamFailover = true), "pass")
         withTimeout(3000) { while (!orchestrators[1].connectMultipathIsekaiPipeQuicCalled) delay(10) }
         orchestrators[1].simulateConnected("host-b")
-        withTimeout(3000) { while (!tab(idB).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(idB).primaryPane.session.state.value.connected) delay(10) }
         withTimeout(3000) { while (executor.upstreamFailoverHandles.size < 2) delay(10) }
 
         orchestrators[0].simulateDisconnected("bye")
-        withTimeout(3000) { while (tab(idA).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (tab(idA).primaryPane.session.state.value.connected) delay(10) }
 
         assertTrue("切断したタブのupstream監視handleだけ閉じるべき", executor.upstreamFailoverHandles[0].closed)
         assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
@@ -512,7 +512,7 @@ class TerminalTabsViewModelTest {
         val idA = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
         withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
         orchestrators[0].simulateConnected("host-a")
-        withTimeout(3000) { while (!tab(idA).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(idA).primaryPane.session.state.value.connected) delay(10) }
         withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
         orchestrators[0].notifyUpstreamHealthDegradedError = InternalException("boom")
 
@@ -560,7 +560,7 @@ class TerminalTabsViewModelTest {
         // 一度もConnectedにならないまま(isConnecting/isReconnecting共にfalseへ)エラー遷移させ、
         // 再接続を試みる。
         orchestrators[0].simulateError("boom")
-        withTimeout(3000) { while (tab(id).session.state.value.isConnecting) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.isConnecting) delay(10) }
 
         vm.reconnectPane(PaneAddress(id, tab(id).focusedPane.paneId), "pass")
         withTimeout(3000) { while (executor.physicalMultipathHandles.size < 2) delay(10) }
@@ -606,11 +606,11 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(multipathProfile("a"), "pass")
         withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
         orchestrators[0].simulateConnected("host-a")
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         assertEquals(1, executor.physicalMultipathHandles.size)
 
         orchestrators[0].simulateDisconnected("bye")
-        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         assertTrue(executor.physicalMultipathHandles[0].closed)
     }
@@ -622,7 +622,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         vm.sendSnippetToPane(PaneAddress(id, tab(id).focusedPane.paneId), Snippet(label = "list", command = "ls -la", appendNewline = true))
 
@@ -634,7 +634,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         vm.sendSnippetToPane(PaneAddress(id, tab(id).focusedPane.paneId), Snippet(label = "partial", command = "echo hi", appendNewline = false))
 
@@ -654,7 +654,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         // tmux 「新規ウィンドウ」相当: Ctrl+B に続けて 'c'。
         vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")))
@@ -667,9 +667,9 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false))
-        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.screenUpdate == null) delay(10) }
 
         vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
 
@@ -683,9 +683,9 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = true))
-        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.screenUpdate == null) delay(10) }
 
         vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
 
@@ -699,9 +699,9 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false, kittyKeyboardFlags = 0b1u))
-        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.screenUpdate == null) delay(10) }
 
         vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.Special(TerminalKeyEncoder.KC_ESCAPE)))
 
@@ -713,7 +713,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         vm.sendKeySequenceToPane(PaneAddress(id, "no-such-pane"), listOf(KeyStep.Text("c")))
 
@@ -728,8 +728,8 @@ class TerminalTabsViewModelTest {
 
         val id = vm.openTab(savedProfile, "pass")
 
-        withTimeout(3000) { while (tab(id).snippets.value.isEmpty()) delay(10) }
-        assertEquals(listOf("web-only"), tab(id).snippets.value.map { it.label })
+        withTimeout(3000) { while (tab(id).primaryPane.snippets.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only"), tab(id).primaryPane.snippets.value.map { it.label })
     }
 
     @Test
@@ -746,8 +746,8 @@ class TerminalTabsViewModelTest {
 
         val id = vm.openTab(savedProfile, "pass")
 
-        withTimeout(3000) { while (tab(id).keySequences.value.isEmpty()) delay(10) }
-        assertEquals(listOf("web-only-seq"), tab(id).keySequences.value.map { it.label })
+        withTimeout(3000) { while (tab(id).primaryPane.keySequences.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only-seq"), tab(id).primaryPane.keySequences.value.map { it.label })
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
@@ -758,7 +758,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
 
         withTimeout(3000) {
@@ -773,7 +773,7 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         delay(700) // 十分にデバウンス時間を超えて待つ
         assertTrue(orchestrators[0].sentBytes.isEmpty())
@@ -788,16 +788,16 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
         withTimeout(3000) {
             while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo once\r" }) delay(20)
         }
 
         orchestrators[0].simulateDisconnected("network blip")
-        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.connected) delay(10) }
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
         delay(700)
 
@@ -813,19 +813,19 @@ class TerminalTabsViewModelTest {
         val id = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
         withTimeout(3000) {
             while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo hi\r" }) delay(20)
         }
 
         val address = PaneAddress(id, tab(id).focusedPane.paneId)
-        vm.disconnectPane(address)
-        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+        tab(id).focusedPane.session.disconnect()
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.connected) delay(10) }
 
         vm.reconnectPane(address, "pass")
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
         delay(700)
 
@@ -971,18 +971,18 @@ class TerminalTabsViewModelTest {
         awaitConnectCalled(orchestrators[0])
         orchestrators[0].ensureTmuxTabWindowThrows = TmuxSessionException.Command("tmux: command not found")
         orchestrators[0].simulateConnected()
-        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
         awaitEnsureTmuxTabWindowCalled(orchestrators[0])
         // ensureTmuxTabWindow自体はviewModelScope.launch内の別コルーチンで動くため、
         // 例外がthrowされてからcatchされるまでの一瞬を待つ必要がある。
         delay(50)
 
-        assertTrue("tab must remain connected despite the tmux failure", tab(id).session.state.value.connected)
+        assertTrue("tab must remain connected despite the tmux failure", tab(id).primaryPane.session.state.value.connected)
         assertNull("no window label should be shown when ensureTmuxTabWindow failed", tab(id).tmuxWindowLabel.value)
         assertNull("no tag should be persisted when ensureTmuxTabWindow failed", Repositories.tmuxTabLocators.findTagForProfile(p.id))
 
         // タブは通常のシェルとして引き続き使える(送信をブロックしない)ことも確認する。
-        vm.sendToPane(PaneAddress(id, tab(id).focusedPane.paneId), byteArrayOf(0x41))
+        tab(id).focusedPane.session.send(byteArrayOf(0x41))
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x41)) })
     }
 
@@ -1024,7 +1024,7 @@ class TerminalTabsViewModelTest {
         val idB = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[1])
         orchestrators[1].simulateConnected("host-a-2")
-        withTimeout(3000) { while (!tab(idB).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (!tab(idB).primaryPane.session.state.value.connected) delay(10) }
         delay(50)
 
         assertTrue(

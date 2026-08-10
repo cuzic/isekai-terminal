@@ -204,16 +204,24 @@ async fn event_command() -> ExitCode {
 
 /// A hook event as classified purely from Claude Code's own hook JSON — the
 /// output of [`parse_hook_event`], before any daemon-side state is
-/// consulted. A strict superset of `state::HookEvent` (the pure decision
-/// core's own input): `TeammateDispatched`/`StopAmbiguousTeammate` cannot be
-/// resolved into a final `state::HookEvent` here, because doing so needs
-/// this tab's *history* (has this session recently dispatched work to a
-/// teammate?), and history is daemon-held state that a one-shot,
-/// short-lived `claude-hookd event` process never has — see `daemon.rs`'s
-/// `WireEvent`/`teammate_dispatch` for where that translation actually
-/// happens. Keeping these two variants out of `state::HookEvent` keeps
-/// `state.rs` exactly what its module docs promise: a pure, I/O-free
-/// function that needs nothing beyond `(state, event, now)`.
+/// consulted. Also this crate's one wire-level event type, sent as-is
+/// (via [`ClientEvent::as_wire_str`]) over the daemon socket and parsed back
+/// (via [`ClientEvent::from_wire_str`]) in `daemon.rs::read_one_event_line`
+/// — both ends of that purely-internal wire format share this one type
+/// rather than each declaring their own copy, since `parse_hook_event`
+/// already provides the decoupling from Claude Code's own hook JSON schema
+/// that would otherwise justify a second type.
+///
+/// A strict superset of `state::HookEvent` (the pure decision core's own
+/// input): `TeammateDispatched`/`StopAmbiguousTeammate` cannot be resolved
+/// into a final `state::HookEvent` here, because doing so needs this tab's
+/// *history* (has this session recently dispatched work to a teammate?),
+/// and history is daemon-held state that a one-shot, short-lived
+/// `claude-hookd event` process never has — see `daemon.rs::run`'s
+/// `teammate_dispatch` for where that translation actually happens. Keeping
+/// these two variants out of `state::HookEvent` keeps `state.rs` exactly
+/// what its module docs promise: a pure, I/O-free function that needs
+/// nothing beyond `(state, event, now)`.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientEvent {
@@ -238,6 +246,37 @@ enum ClientEvent {
     /// dispatch ⇒ probably just a long-idle teammate (`Notify`, the safe
     /// default).
     StopAmbiguousTeammate,
+}
+
+#[cfg(unix)]
+impl ClientEvent {
+    /// This crate's own minimal daemon wire format (`main.rs::send_event`'s
+    /// client side, `daemon.rs::read_one_event_line`'s server side) —
+    /// deliberately decoupled from Claude Code's hook JSON schema, but that
+    /// decoupling is already fully provided by [`parse_hook_event`]; the
+    /// wire string<->variant mapping itself doesn't need a second type on
+    /// the other end, just a shared method both sides of this one binary
+    /// call.
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            ClientEvent::Notify => "notify",
+            ClientEvent::StopDeferred => "stop_deferred",
+            ClientEvent::Resolve => "resolve",
+            ClientEvent::TeammateDispatched => "teammate_dispatched",
+            ClientEvent::StopAmbiguousTeammate => "stop_ambiguous_teammate",
+        }
+    }
+
+    fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "notify" => ClientEvent::Notify,
+            "stop_deferred" => ClientEvent::StopDeferred,
+            "resolve" => ClientEvent::Resolve,
+            "teammate_dispatched" => ClientEvent::TeammateDispatched,
+            "stop_ambiguous_teammate" => ClientEvent::StopAmbiguousTeammate,
+            _ => return None,
+        })
+    }
 }
 
 /// Extracts just the fields `claude-hookd` needs from Claude Code's hook JSON
@@ -559,17 +598,10 @@ async fn send_event(sock_path: &Path, session_id: &str, event: ClientEvent) -> b
     if !peer_is_same_uid(&stream).await {
         return false;
     }
-    let event_name = match event {
-        ClientEvent::Notify => "notify",
-        ClientEvent::StopDeferred => "stop_deferred",
-        ClientEvent::Resolve => "resolve",
-        ClientEvent::TeammateDispatched => "teammate_dispatched",
-        ClientEvent::StopAmbiguousTeammate => "stop_ambiguous_teammate",
-    };
     let Ok(session_id_json) = serde_json::to_string(session_id) else {
         return false;
     };
-    let line = format!("{{\"session_id\":{session_id_json},\"event\":\"{event_name}\"}}\n");
+    let line = format!("{{\"session_id\":{session_id_json},\"event\":\"{}\"}}\n", event.as_wire_str());
     stream.write_all(line.as_bytes()).await.is_ok()
 }
 

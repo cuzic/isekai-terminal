@@ -484,9 +484,18 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
         && !RESERVED_SUBCOMMANDS.contains(&first)
 }
 
-pub async fn run(args: Vec<String>) -> Result<u8> {
-    let plan = parse_wrapper(args)?;
-    if let Some(log_file) = &plan.isekai.log_file {
+/// Opens `--isekai-log-file` (or, absent that, the default always-on verbose
+/// log) for this invocation — shared by the Unix entrypoint ([`run`]) and
+/// the Windows-native entrypoint (`native::connect::prepare_with_tofu`),
+/// which used to each hand-roll an identical if/else-if pair. That
+/// duplication had already caused one real regression: the native copy was
+/// missing entirely for a while (a real Windows CI failure, see
+/// `native::connect::prepare_with_tofu`'s own doc comment for the
+/// no-visible-symptom-until-a-test-depended-on-it story) — extracting this
+/// structurally prevents that class of regression from recurring, since
+/// there is now only one copy to keep in sync.
+pub(crate) fn init_logging(plan: &WrapperPlan) -> Result<()> {
+    if let Some(log_file) = plan.log_file() {
         crate::log_file::init(log_file)
             .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
     } else if let Ok(verbose_log_file) = default_log_file() {
@@ -495,6 +504,55 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         // permissions/read-only-filesystem error opening its own log file.
         let _ = crate::log_file::init_verbose(&verbose_log_file);
     }
+    Ok(())
+}
+
+/// Resolves `resolution` into a [`ConnectionIntent`], auto-bootstrapping a
+/// brand-new (never-registered) destination inline when [`should_bootstrap`]
+/// allows it — `tofu` decides whether *that* bootstrap's own trust
+/// confirmation is interactive ([`TofuConfirmation::AlwaysPrompt`], both
+/// entrypoints' first-contact case) or silent
+/// ([`TofuConfirmation::Silent`], only used by the native path's detached
+/// mux-holder entrypoint, which has no console to confirm on — see
+/// `native::connect::prepare_with_tofu`'s doc comment).
+///
+/// Shared by the Unix entrypoint ([`run`]) and the Windows-native entrypoint
+/// (`native::connect::prepare_with_tofu`), which used to hand-roll nearly
+/// identical copies of this match — the *only* platform-specific piece
+/// (which [`isekai_bootstrap::BootstrapBackend`] actually performs the
+/// deploy) is already internal to [`bootstrap_and_register`], so nothing
+/// here needs to branch on platform. Unifies the two copies' previously
+/// divergent "auto-bootstrap is disabled" message onto the native path's
+/// more actionable wording (pointing at the exact `isekai-ssh init` command
+/// to run) for both — a small, deliberate UX improvement riding along with
+/// this dedup, not a functional change (this arm is reached only when the
+/// user has explicitly opted out of auto-bootstrap).
+pub(crate) async fn build_intent_or_bootstrap(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    tofu: TofuConfirmation,
+) -> Result<ConnectionIntent> {
+    match build_connection_intent(resolution) {
+        Ok(intent) => Ok(intent),
+        Err(err) if should_bootstrap(plan, resolution) => {
+            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, tofu).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
+            }
+            build_connection_intent(resolution).context("isekai-ssh: still not trusted after auto-bootstrap")
+        }
+        Err(err) => Err(err.context(format!(
+            "isekai-ssh: {:?} is not set up yet — run `isekai-ssh init {}` first \
+             (auto-bootstrap is disabled: --isekai-no-bootstrap / #@isekai bootstrap-policy never)",
+            plan.destination(),
+            plan.destination()
+        ))),
+    }
+}
+
+pub async fn run(args: Vec<String>) -> Result<u8> {
+    let plan = parse_wrapper(args)?;
+    init_logging(&plan)?;
     if plan.isekai.direct {
         return run_openssh_direct(&plan).await;
     }
@@ -520,18 +578,7 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
             return Ok(0);
         }
     }
-    let intent = match build_connection_intent(&resolution) {
-        Ok(intent) => intent,
-        Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
-                print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
-            }
-            build_connection_intent(&resolution)
-                .context("isekai-ssh: still not trusted after auto-bootstrap")?
-        }
-        Err(err) => return Err(err),
-    };
+    let intent = build_intent_or_bootstrap(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await?;
     run_ssh_with_connect_failure_recovery(&plan, &resolution, intent).await
 }
 
@@ -575,19 +622,12 @@ async fn run_ssh_with_connect_failure_recovery(
         ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
         ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
             let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
-                 (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
-                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
-            );
+            log_auto_bootstrap_disabled(&outcome.class, &resolution.isekai.profile, &outcome.detail);
             Ok(exit_code)
         }
         ConnectFailureRecoveryAction::RebootstrapAndRetry => {
             let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            log_line!(
-                "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
-                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
-            );
+            log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
             if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
@@ -610,6 +650,33 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
     }
+}
+
+/// Logs `ConnectFailureRecoveryAction::AutoBootstrapDisabled`'s explanation
+/// — identical wording on both the Unix (`run_ssh_with_connect_failure_recovery`)
+/// and Windows-native (`native::connect::drive_connect_recovery`) paths, so
+/// this one function is the whole of the dedup for that arm (unlike
+/// `RebootstrapAndRetry`'s — see [`log_rebootstrap_and_retry_decision`] —
+/// whose trailing clause differs per platform).
+pub(crate) fn log_auto_bootstrap_disabled(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str) {
+    log_line!(
+        "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
+         (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
+        outcome_summary(class), profile, detail
+    );
+}
+
+/// Logs `ConnectFailureRecoveryAction::RebootstrapAndRetry`'s explanation,
+/// shared by the same two paths as [`log_auto_bootstrap_disabled`]. Unlike
+/// that arm, the trailing clause genuinely differs per platform (Unix:
+/// "refreshing automatically..."; native: a longer note that a
+/// still-untrusted SSH host key needs a separate confirmation prompt, since
+/// its re-deploy dials `RusshBackend` directly rather than through
+/// `ssh(1)`) — `retry_note` stays a caller-supplied parameter rather than
+/// unified wording, the same "shared classification, caller-owned wording"
+/// split [`outcome_summary`] itself already establishes.
+pub(crate) fn log_rebootstrap_and_retry_decision(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str, retry_note: &str) {
+    log_line!("isekai-ssh: {} for {:?} ({}); {retry_note}", outcome_summary(class), profile, detail);
 }
 
 /// The three ways a failed first `ssh` attempt in
@@ -966,7 +1033,7 @@ pub(crate) enum TofuConfirmation {
 /// `LaunchSpec::Direct` (`direct-by-bootstrap-host`, no relay, no STUN launch
 /// mode). `candidate.via` may chain through any number of hops
 /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic K) — validated with the same
-/// `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain` cycle/hop-count
+/// `isekai_bootstrap_plan::validate_jump_chain` cycle/hop-count
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
@@ -1053,7 +1120,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             Ok(spec)
         })
         .collect::<Result<_>>()?;
-    isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(&target, &via)
+    isekai_bootstrap_plan::validate_jump_chain(&target, &via)
         .with_context(|| format!("invalid --via chain {:?}", candidate.via))?;
 
     // `plan.openssh_path` (defaults to bare `"ssh"`, PATH-resolved; overridable
@@ -1090,7 +1157,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         };
         e.context(BootstrapFailure::RemoteBinaryMissing)
     })?;
-    let helper_sha256 = hex_sha256(&helper_binary);
+    let helper_sha256 = isekai_trust::hex_sha256(&helper_binary);
 
     let stun_servers = resolve_stun_servers(&resolution.isekai.stun_servers).await;
 
@@ -1208,18 +1275,72 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     }
 
+    let (key, path) = register_helper_trust(
+        &resolution.isekai.profile,
+        &candidate.via,
+        handshake,
+        helper_sha256,
+        "unknown".to_string(),
+        None,
+        cached_relay_addr,
+    )
+    .map_err(|e| e.context(BootstrapFailure::PersistenceFailed(format!("failed to register {:?}", resolution.isekai.profile))))?;
+    log_line_verbose!("Registered {key:?} in {}", path.display());
+    Ok(())
+}
+
+/// Writes a `HelperTrust`-backed `PersistentProfile` for `profile` (the
+/// register-flow tail shared by `isekai-ssh init`'s `init::run` and this
+/// module's own auto-bootstrap path above) — the same 13-field `HelperTrust`
+/// literal, `PersistentProfile::migrate_legacy_helper_trust` +
+/// `write_persistent_profile` sequence both used to hand-roll almost
+/// verbatim. Returns the normalized trust-store key and the path
+/// `write_persistent_profile` wrote to; the caller decides how to report
+/// both (`init::run` prints to stdout unconditionally since it's always
+/// interactive, this module logs via `log_line_verbose!` since it's the
+/// opportunistic auto-bootstrap path — different enough UX that unifying it
+/// too would fight the whole point of each caller's own output convention).
+///
+/// `cached_relay_addr` is a caller-computed parameter rather than derived
+/// here: `init::run` always deploys via a relay (so it's always
+/// `handshake.relay_public_addr().unwrap_or(<its own --relay-addr>)`), while
+/// `bootstrap_and_register` above also handles a *direct* (non-relay)
+/// launch (falling back to `handshake.direct_by_bootstrap_host_port()`
+/// instead) — genuinely different logic per caller, not further
+/// duplication worth unifying.
+///
+/// Deliberately returns a plain `anyhow::Result`, not the
+/// `BootstrapFailure`-classified one `bootstrap_and_register` used to wrap
+/// only around the final `write_persistent_profile` step: `init::run` has no
+/// use for that classification (it never auto-retries — see
+/// `.claude/rules/always-connects.md`), and folding the two harmless,
+/// already-validated-earlier `default_profiles_dir`/`normalize_host_port`
+/// steps into the same `BootstrapFailure::PersistenceFailed` classification
+/// at the call site below is behavior-neutral either way (neither
+/// `should_redirect_to_login`/`should_redirect_to_init`/`may_retry` treats
+/// `PersistenceFailed` differently from an unclassified error — see
+/// `isekai-bootstrap-plan::BootstrapFailure`'s own doc comments).
+pub(crate) fn register_helper_trust(
+    profile: &str,
+    candidate_via: &[String],
+    handshake: &isekai_protocol::HandshakeJson,
+    helper_sha256: String,
+    version: String,
+    channel: Option<String>,
+    cached_relay_addr: String,
+) -> Result<(String, std::path::PathBuf)> {
     let profiles_dir =
         default_profiles_dir().context("could not determine the profiles directory (is $HOME set?)")?;
-    let key = isekai_trust::normalize_host_port(&resolution.isekai.profile)
-        .with_context(|| format!("invalid profile {:?}", resolution.isekai.profile))?;
-    let now = now_rfc3339();
+    let key = isekai_trust::normalize_host_port(profile).with_context(|| format!("invalid profile {profile:?}"))?;
+    let now = isekai_trust::now_rfc3339();
+    let identity = handshake.cert_sha256().to_string();
     let trust = HelperTrust {
         identity_pubkey: identity.clone(),
         trusted_helper_sha256: helper_sha256,
-        trusted_helper_version: "unknown".to_string(),
+        trusted_helper_version: version,
         update_policy: UpdatePolicy::ExactDigestOnly,
-        release_channel: None,
-        last_via: (!candidate.via.is_empty()).then(|| candidate.via.join(",")),
+        release_channel: channel,
+        last_via: (!candidate_via.is_empty()).then(|| candidate_via.join(",")),
         trusted_at: now.clone(),
         last_seen_at: now,
         cached_relay_addr,
@@ -1227,50 +1348,10 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         cached_session_secret: handshake.session_secret.clone(),
         cached_stun_observed_addr: handshake.stun_observed_addr().map(str::to_string),
     };
-    let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
-    let path = write_persistent_profile(&profiles_dir, &profile)
-        .map_err(|e| {
-            anyhow::Error::new(e)
-                .context(BootstrapFailure::PersistenceFailed(format!("failed to write profile to {}", profiles_dir.display())))
-        })?;
-    log_line_verbose!("Registered {key:?} in {}", path.display());
-    Ok(())
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Current UTC time formatted as RFC 3339, matching `init.rs`'s own
-/// `now_rfc3339`/`format_rfc3339_utc` (duplicated rather than shared across
-/// two ~60-line modules for a single timestamp helper).
-fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format_rfc3339_utc(secs)
-}
-
-fn format_rfc3339_utc(unix_secs: u64) -> String {
-    let days = unix_secs / 86_400;
-    let secs_of_day = unix_secs % 86_400;
-    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
-
-    let z = days as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    let stored = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
+    let path = write_persistent_profile(&profiles_dir, &stored)
+        .with_context(|| format!("failed to write profile to {}", profiles_dir.display()))?;
+    Ok((key, path))
 }
 
 fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
@@ -1594,13 +1675,7 @@ fn apply_cli_overrides(host_config: &mut openssh_config::HostConfig, ssh_args: &
 /// `openssh_config::HostConfig`. First occurrence wins per keyword.
 fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
     let mut overrides = CliOverrides::default();
-    let mut i = 0;
-    while i < ssh_args.len() {
-        let arg = ssh_args[i].as_str();
-        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
-            break;
-        }
-        let value = ssh_args.get(i + 1).map(String::as_str);
+    for (arg, value) in ssh_options_before_destination(ssh_args) {
         match (arg, value) {
             ("-p", Some(v)) => {
                 let port = v
@@ -1622,7 +1697,6 @@ fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
             }
             _ => {}
         }
-        i += ssh_option_width(arg);
     }
     Ok(overrides)
 }
@@ -1685,25 +1759,12 @@ fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()
 /// Finds an explicit `-F <path>` in `ssh_args` (the portion before the
 /// destination — mirroring `ssh_args_through_destination`'s scope, since a
 /// `-F` appearing *after* the destination is a remote command argument, not
-/// an option). Walks option widths the same way `find_destination_index`
-/// does so this stays in sync with `ssh_option_width` if that list of
-/// value-taking flags ever changes. Only recognizes the spaced `-F value`
-/// form (matching this function's only two callers/tests) — a concatenated
-/// `-Fvalue` isn't handled by `find_destination_index` either, so this is
-/// consistent with the wrapper's existing `-F` support, not a new gap.
+/// an option). Only recognizes the spaced `-F value` form (matching this
+/// function's only two callers/tests) — a concatenated `-Fvalue` isn't
+/// handled by `find_destination_index` either, so this is consistent with
+/// the wrapper's existing `-F` support, not a new gap.
 fn dash_f_config_path(ssh_args: &[String]) -> Option<PathBuf> {
-    let mut i = 0;
-    while i < ssh_args.len() {
-        let arg = ssh_args[i].as_str();
-        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
-            return None;
-        }
-        if arg == "-F" {
-            return ssh_args.get(i + 1).map(PathBuf::from);
-        }
-        i += ssh_option_width(arg);
-    }
-    None
+    ssh_options_before_destination(ssh_args).find(|(arg, _)| *arg == "-F")?.1.map(PathBuf::from)
 }
 
 async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {
@@ -2033,18 +2094,76 @@ pub(crate) fn shell_quote(value: &str) -> String {
 }
 
 fn find_destination_index(args: &[String]) -> Option<usize> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            return (i + 1 < args.len()).then_some(i + 1);
-        }
-        if !arg.starts_with('-') || arg == "-" {
-            return Some(i);
-        }
-        i += ssh_option_width(arg);
+    let mut walk = ssh_options_before_destination(args);
+    for _ in walk.by_ref() {}
+    let i = walk.stopped_at();
+    match args.get(i) {
+        // `--` explicitly terminates option parsing (`ssh(1)`'s own
+        // convention): the destination is whatever immediately follows it,
+        // if anything.
+        Some(arg) if arg == "--" => (i + 1 < args.len()).then_some(i + 1),
+        // A non-option arg (or a bare `-`, treated as non-option — matches
+        // `ssh_options_before_destination`'s own stopping condition) is the
+        // destination itself.
+        Some(_) => Some(i),
+        // Ran out of args without ever finding `--` or a non-option — every
+        // arg was consumed as an option (or an option's value).
+        None => None,
     }
-    None
+}
+
+/// Walks `args`' leading `ssh(1)` options (skipping each value-taking
+/// flag's value via [`ssh_option_width`]), yielding `(option, value)` for
+/// every option encountered before the destination — mirrors `ssh(1)`'s own
+/// argv shape: `--`, or the first arg that isn't itself an option (or is a
+/// bare `-`), ends option parsing, and everything from there on is the
+/// destination and (optionally) a trailing remote command, never another
+/// option. `value` is `Some` only for a value-taking flag (`ssh_option_width`
+/// returning `2`) that actually has a following arg; a non-value-taking flag
+/// always yields `None` regardless of what follows it.
+///
+/// [`find_destination_index`], [`dash_f_config_path`], and
+/// [`collect_cli_overrides`] each used to hand-roll this exact walk (the
+/// same `arg == "--" || !arg.starts_with('-') || arg == "-"` stopping guard,
+/// the same `i += ssh_option_width(arg)` stepping), differing only in what
+/// they did with each option — or, for `find_destination_index`, in wanting
+/// the stopping index rather than the pairs themselves, which
+/// [`SshOptionsBeforeDestination::stopped_at`] exposes for exactly that
+/// caller.
+fn ssh_options_before_destination(args: &[String]) -> SshOptionsBeforeDestination<'_> {
+    SshOptionsBeforeDestination { args, i: 0 }
+}
+
+struct SshOptionsBeforeDestination<'a> {
+    args: &'a [String],
+    i: usize,
+}
+
+impl<'a> Iterator for SshOptionsBeforeDestination<'a> {
+    type Item = (&'a str, Option<&'a str>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let arg = self.args.get(self.i)?.as_str();
+        if arg == "--" || !arg.starts_with('-') || arg == "-" {
+            return None;
+        }
+        let width = ssh_option_width(arg);
+        let value = if width == 2 { self.args.get(self.i + 1).map(String::as_str) } else { None };
+        self.i += width;
+        Some((arg, value))
+    }
+}
+
+impl SshOptionsBeforeDestination<'_> {
+    /// The index in `args` where iteration stopped — either `--`'s index, a
+    /// non-option's (the destination itself), or `args.len()` if every arg
+    /// was consumed as an option/its value. Only meaningful once the
+    /// iterator is exhausted; [`find_destination_index`] is the only caller
+    /// that needs it (the other two consumers only care about the `(option,
+    /// value)` pairs themselves).
+    fn stopped_at(&self) -> usize {
+        self.i
+    }
 }
 
 fn ssh_option_width(arg: &str) -> usize {
@@ -2254,7 +2373,7 @@ mod tests {
         // A looping chain (repeats the destination, same host *and* port —
         // cycle detection is port-sensitive, matching `plan.rs`'s own
         // `distinct_ports_on_the_same_host_are_not_a_cycle`) is still
-        // rejected, now via `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain`
+        // rejected, now via `isekai_bootstrap_plan::validate_jump_chain`
         // rather than the old single-hop-only guard.
         let looping = resolution_with_via(vec!["bastion-a".to_string(), "production:22".to_string()]);
         let err = bootstrap_and_register(&plan, &looping, TofuConfirmation::AlwaysPrompt).await.unwrap_err();
@@ -2524,11 +2643,7 @@ mod tests {
     #[test]
     fn builds_connection_intent_from_persistent_profile() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home =
-            std::env::temp_dir().join(format!("isekai-ssh-wrapper-intent-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         let sample_trust = || HelperTrust {
             identity_pubkey: "pk".to_string(),
@@ -2679,13 +2794,6 @@ mod tests {
             intent.local_bind_port_range, distinctive_intent.local_bind_port_range,
             "local-bind-port-range directive"
         );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     fn sample_trust_with_stun_observed(stun_observed: Option<&str>) -> HelperTrust {
@@ -2779,10 +2887,7 @@ mod tests {
     #[test]
     fn build_connection_intent_selects_stun_p2p_when_profile_has_observed_address() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("isekai-ssh-wrapper-stun-intent-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
         let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
@@ -2835,13 +2940,6 @@ mod tests {
             }),
             "the connection intent should carry the relay transport as a cross-family fallback"
         );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

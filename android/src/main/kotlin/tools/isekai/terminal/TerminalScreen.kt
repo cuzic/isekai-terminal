@@ -1,7 +1,6 @@
 package tools.isekai.terminal
 
 import android.content.ActivityNotFoundException
-import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -86,11 +85,12 @@ import tools.isekai.terminal.ui.wheelButtonForHorizontalDelta
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.ui.synthesizeDisplayUpdate
 import tools.isekai.terminal.util.RemoteLogger
+import tools.isekai.terminal.util.copyToClipboard
 import uniffi.isekai_terminal_core.*
 
 /**
- * [TerminalScreenBody] が呼び出し元 (単一セッションの [TerminalScreen] か、複数タブの
- * `TerminalTabScreen` か) の違いを気にせず済むようにするための操作の束。
+ * [TerminalScreenBody] の呼び出し元(`TerminalHostScreen.kt`の`TerminalPaneScreen`、
+ * ペイン単位の操作を1つにまとめて渡す)が個々の操作の配線を気にせず済むようにするための束。
  *
  * すべての操作は最終的に [tools.isekai.terminal.session.TerminalSession] への薄い委譲。
  */
@@ -305,8 +305,7 @@ fun TerminalScreenBody(
         if (uiState.promptOutputCopyResult.seq == 0L) return@LaunchedEffect
         val text = uiState.promptOutputCopyResult.text ?: return@LaunchedEffect
         if (text.isNotEmpty()) {
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal command output", text))
+            context.copyToClipboard("isekai-terminal command output", text)
         }
     }
 
@@ -473,8 +472,7 @@ fun TerminalScreenBody(
                         TextButton(
                             onClick = {
                                 val log = actions.onGetSessionLog()
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal log", log))
+                                context.copyToClipboard("isekai-terminal log", log)
                             },
                             contentPadding = PaddingValues(0.dp),
                         ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
@@ -1067,8 +1065,7 @@ fun TerminalScreenBody(
                         val sel = selection ?: return@copy
                         val text = reconstructSelectionText(displayUpdate, sel)
                         if (text.isNotEmpty()) {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal selection", text))
+                            context.copyToClipboard("isekai-terminal selection", text)
                         }
                         selection = null
                     }
@@ -1637,24 +1634,11 @@ private fun SnippetPickerSheet(
                         .verticalScroll(rememberScrollState()),
                 ) {
                     snippets.forEach { snippet ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onPick(snippet) }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(snippet.label, color = Color.White, fontSize = 15.sp)
-                                Text(
-                                    snippet.command.lineSequence().firstOrNull() ?: "",
-                                    color = Color(0xFF888888),
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 1,
-                                )
-                            }
-                        }
+                        PickerRow(
+                            label = snippet.label,
+                            preview = snippet.command.lineSequence().firstOrNull() ?: "",
+                            onClick = { onPick(snippet) },
+                        )
                     }
                 }
             }
@@ -1690,7 +1674,7 @@ private fun KeySequencePickerSheet(
                 )
             } else {
                 keySequences.forEach { keySequence ->
-                    KeySequencePickerRow(
+                    PickerRow(
                         label = keySequence.label,
                         preview = keySequence.steps.previewText(),
                         onClick = { onSendSteps(keySequence.steps) },
@@ -1705,7 +1689,7 @@ private fun KeySequencePickerSheet(
                     )
                     val resolved = tools.isekai.terminal.pack.KeySequencePackResolver.resolve(pack, installation.paramValues)
                     resolved.forEach { seq ->
-                        KeySequencePickerRow(
+                        PickerRow(
                             label = seq.label,
                             preview = seq.steps.previewText(),
                             onClick = { onSendSteps(seq.steps) },
@@ -1718,7 +1702,7 @@ private fun KeySequencePickerSheet(
 }
 
 @Composable
-private fun KeySequencePickerRow(label: String, preview: String, onClick: () -> Unit) {
+private fun PickerRow(label: String, preview: String, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()

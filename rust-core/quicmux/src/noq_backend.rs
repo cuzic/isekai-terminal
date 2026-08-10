@@ -14,12 +14,17 @@ use crate::config::{MuxClientConfig, MuxServerConfig};
 use crate::error::MuxError;
 use crate::types::{BindSpec, RemoteSpec};
 
-/// The sequence of local ports [`bind_udp_socket_async`]/[`bind_udp_socket_sync`]
-/// should try binding to: `bind.local_addr`'s own port when no range is
-/// set, otherwise every port in `bind.port_range` (inclusive), starting
-/// from a random offset so many endpoints created in the same instant
-/// don't all race for the low end of the range.
-fn candidate_ports(bind: &BindSpec) -> Vec<u16> {
+/// The sequence of local ports [`bind_with_port_range`] should try binding
+/// to: `bind.local_addr`'s own port when no range is set, otherwise every
+/// port in `bind.port_range` (inclusive), starting from a random offset so
+/// many endpoints created in the same instant don't all race for the low end
+/// of the range. `pub` (not just crate-internal) so
+/// `isekai-transport::physical_interface`'s own interface-restricted bind —
+/// which needs the exact same port-selection policy but binds through
+/// `quicsock` rather than a plain socket, so it can't reuse
+/// [`bind_with_port_range`] itself — can still reuse this instead of
+/// maintaining its own copy.
+pub fn candidate_ports(bind: &BindSpec) -> Vec<u16> {
     match bind.port_range {
         None => vec![bind.local_addr.port()],
         Some((start, end)) => {
@@ -31,10 +36,26 @@ fn candidate_ports(bind: &BindSpec) -> Vec<u16> {
     }
 }
 
-async fn bind_udp_socket_async(bind: &BindSpec) -> Result<tokio::net::UdpSocket, MuxError> {
+/// Tries [`candidate_ports`] in turn via `try_bind`, returning the first
+/// success or, once every candidate port has failed, [`MuxError::Bind`]
+/// wrapping the last attempt's `io::Error`. `try_bind` is a plain
+/// synchronous closure — a UDP `bind()` syscall itself is not a blocking
+/// operation worth an `.await` for, so [`bind_udp_socket_async`] below binds
+/// a `std::net::UdpSocket` through this same helper and only converts it to
+/// `tokio::net::UdpSocket` afterward (a synchronous step,
+/// `UdpSocket::from_std`) rather than needing its own async retry loop —
+/// exactly like `isekai-transport::physical_interface::connect_via_interface`'s
+/// own interface-bound branch already does for the same reason.
+/// [`bind_udp_socket_sync`] and `physical_interface`'s own
+/// `bind_physical_interface_with_port_range` share this same retry skeleton
+/// too — this used to be hand-duplicated three times.
+pub fn bind_with_port_range(
+    bind: &BindSpec,
+    mut try_bind: impl FnMut(SocketAddr) -> std::io::Result<std::net::UdpSocket>,
+) -> Result<std::net::UdpSocket, MuxError> {
     let mut last_err = None;
     for port in candidate_ports(bind) {
-        match tokio::net::UdpSocket::bind(SocketAddr::new(bind.local_addr.ip(), port)).await {
+        match try_bind(SocketAddr::new(bind.local_addr.ip(), port)) {
             Ok(socket) => return Ok(socket),
             Err(e) => last_err = Some(e),
         }
@@ -46,19 +67,14 @@ async fn bind_udp_socket_async(bind: &BindSpec) -> Result<tokio::net::UdpSocket,
     })
 }
 
+async fn bind_udp_socket_async(bind: &BindSpec) -> Result<tokio::net::UdpSocket, MuxError> {
+    let std_socket = bind_with_port_range(bind, std::net::UdpSocket::bind)?;
+    std_socket.set_nonblocking(true).map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+    tokio::net::UdpSocket::from_std(std_socket).map_err(|e| MuxError::SocketSetup(e.to_string()))
+}
+
 fn bind_udp_socket_sync(bind: &BindSpec) -> Result<std::net::UdpSocket, MuxError> {
-    let mut last_err = None;
-    for port in candidate_ports(bind) {
-        match std::net::UdpSocket::bind(SocketAddr::new(bind.local_addr.ip(), port)) {
-            Ok(socket) => return Ok(socket),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(MuxError::Bind {
-        addr: bind.local_addr,
-        source: last_err
-            .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty port range")),
-    })
+    bind_with_port_range(bind, std::net::UdpSocket::bind)
 }
 
 /// Adapts an already-bound `std::net::UdpSocket` into whatever concrete
@@ -891,28 +907,10 @@ mod tests {
     /// from it, and the cert's SHA-256 fingerprint for the client side to
     /// pin against — everything [`NoqListener`]-based tests need.
     fn test_server_config() -> (MuxServerConfig, String) {
-        let cert = rcgen::generate_simple_self_signed(vec!["quicmux-test.local".to_string()]).unwrap();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
-        let cert_sha256_hex = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(cert_der.as_ref());
-            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
-        };
-
-        let config = MuxServerConfig {
-            alpn: test_config().alpn,
-            exporter_label: test_config().exporter_label,
-            max_idle_timeout: std::time::Duration::from_secs(15),
-            keep_alive_interval: std::time::Duration::from_secs(5),
-            max_concurrent_bidi_streams: 2,
-            max_concurrent_uni_streams: 0,
-            multipath: false,
-            datagram_send_buffer_size: None,
-            cert_chain: vec![cert_der],
-            private_key: key_der,
-        };
+        let (mut config, cert_sha256_hex) = crate::test_support::self_signed_server_config("quicmux-test.local");
+        config.alpn = test_config().alpn;
+        config.exporter_label = test_config().exporter_label;
+        config.max_concurrent_bidi_streams = 2;
         (config, cert_sha256_hex)
     }
 

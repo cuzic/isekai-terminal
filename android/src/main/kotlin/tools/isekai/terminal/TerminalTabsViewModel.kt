@@ -41,7 +41,6 @@ import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.ClientIdentity
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.PlatformFd
@@ -304,10 +303,13 @@ class TerminalTabsViewModel(
      * Rust 側）であり、ここで保持するのはペイン構成(画面分割)・フォーカス・配色テーマなど
      * Kotlin ローカルの補助状態のみ。
      *
-     * 画面分割(split pane)導入前は「1タブ=1セッション」だったため、[session] 等の
-     * 旧APIプロパティは引き続き [primaryPane] への薄い委譲として残してある
-     * (未分割のタブでは [primaryPane] が唯一のペインであり、[focusedPane] も常にそれを指す
-     * ため、既存の呼び出し元・テストの挙動は変わらない)。
+     * 画面分割(split pane)導入前は「1タブ=1セッション」だった名残の後方互換プロパティ
+     * (`session`/`preConnectError`/`uploadInProgress`/`snippets`/`keySequences`/
+     * `installedPacks`/`pendingPostConnectBytes`/`postConnectSent`/
+     * `upstreamFailoverEnabledForCurrentSession`)は、本番コードの呼び出し元が全て既に
+     * [PaneState]を直接参照するよう置き換わっていたため削除した(セッション操作は
+     * `pane: PaneState`を直接扱う設計に統一、`rust-ssot.md`と同じ「状態を複製しない」
+     * 原則の一部)。
      */
     class TabState internal constructor(
         val tabId: String,
@@ -317,21 +319,6 @@ class TerminalTabsViewModel(
         initialTheme: TerminalTheme,
         initialThemeIsOverridden: Boolean,
     ) {
-        // ── 後方互換プロパティ(1タブ=1セッション時代のAPI表面。primaryPaneへの委譲)──
-        val session: TerminalSession get() = primaryPane.session
-        internal val preConnectError get() = primaryPane.preConnectError
-        internal val uploadInProgress get() = primaryPane.uploadInProgress
-        internal val snippets get() = primaryPane.snippets
-        internal val keySequences get() = primaryPane.keySequences
-        internal val installedPacks get() = primaryPane.installedPacks
-        internal var pendingPostConnectBytes: ByteArray?
-            get() = primaryPane.pendingPostConnectBytes
-            set(value) { primaryPane.pendingPostConnectBytes = value }
-        internal val postConnectSent get() = primaryPane.postConnectSent
-        internal var upstreamFailoverEnabledForCurrentSession: Boolean
-            get() = primaryPane.upstreamFailoverEnabledForCurrentSession
-            set(value) { primaryPane.upstreamFailoverEnabledForCurrentSession = value }
-
         /** UI が購読する合成済み状態(主ペインのもの)。 */
         val uiState: Flow<TerminalUiState> get() = primaryPane.uiState
 
@@ -422,11 +409,7 @@ class TerminalTabsViewModel(
         scope = viewModelScope,
         ioDispatcher = ioDispatcher,
         pushTheme = ::pushThemeToSession,
-        loadPaneContent = { pane, profileId ->
-            loadSnippetsForPane(pane, profileId)
-            loadKeySequencesForPane(pane, profileId)
-            loadInstalledPacksForPane(pane, profileId)
-        },
+        loadPaneContent = ::loadPaneContent,
     )
 
     init {
@@ -523,11 +506,17 @@ class TerminalTabsViewModel(
 
     // ── ネットワーク（全タブへファンアウト）───────────────────────────
 
+    /** 全タブ・全ペイン(画面分割side含む)を横断して[block]を実行する。プラットフォーム
+     *  からの生イベント(ネットワーク経路変化・前景/背景遷移等)をRustへそのまま転送する
+     *  ファンアウト処理が複数箇所で同じ`_tabs.value.flatMap { it.panes }.forEach`の
+     *  形をしていたため、この局所ヘルパーへ切り出した。 */
+    private inline fun forEachPane(block: (PaneState) -> Unit) {
+        _tabs.value.flatMap { it.panes }.forEach(block)
+    }
+
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onNetworkPathChanged(isSatisfied: Boolean) {
-        _tabs.value.flatMap { it.panes }.forEach { pane ->
-            forwardToRust("notifyNetworkPathChanged") { pane.session.notifyNetworkPathChanged(isSatisfied) }
-        }
+        forEachPane { pane -> forwardToRust("notifyNetworkPathChanged") { pane.session.notifyNetworkPathChanged(isSatisfied) } }
     }
 
     // ── アプリ全体のフォアグラウンド/バックグラウンド（全タブへファンアウト）──────
@@ -540,17 +529,13 @@ class TerminalTabsViewModel(
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onAppBackgrounded() {
         appInForeground = false
-        _tabs.value.flatMap { it.panes }.forEach { pane ->
-            forwardToRust("notifyDidEnterBackground") { pane.session.notifyDidEnterBackground() }
-        }
+        forEachPane { pane -> forwardToRust("notifyDidEnterBackground") { pane.session.notifyDidEnterBackground() } }
     }
 
     /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onAppForegrounded() {
         appInForeground = true
-        _tabs.value.flatMap { it.panes }.forEach { pane ->
-            forwardToRust("notifyWillEnterForeground") { pane.session.notifyWillEnterForeground() }
-        }
+        forEachPane { pane -> forwardToRust("notifyWillEnterForeground") { pane.session.notifyWillEnterForeground() } }
     }
 
     // ── タブのライフサイクル ────────────────────────────────────────
@@ -893,25 +878,18 @@ class TerminalTabsViewModel(
         }
     }
 
-    // ── 定型コマンド（スニペット）─────────────────────────────────
+    // ── 定型コマンド/打鍵列/打鍵列セット(パック)の読み込み ──────────────────
+    // 3つとも「対象リポジトリから読んで対応するPaneStateのStateFlowへ詰める」骨格が
+    // 同一だったため1つにまとめた。[ConnectionCoordinator.connectPane]から接続開始時に
+    // 呼ばれる。
 
-    private fun loadSnippetsForPane(pane: PaneState, profileId: Long?) {
+    private fun loadPaneContent(pane: PaneState, profileId: Long?) {
         viewModelScope.launch(ioDispatcher) {
             pane.snippets.value = Repositories.snippets.getForProfile(profileId)
         }
-    }
-
-    // ── 打鍵列（KeySequence）─────────────────────────────────────
-
-    private fun loadKeySequencesForPane(pane: PaneState, profileId: Long?) {
         viewModelScope.launch(ioDispatcher) {
             pane.keySequences.value = Repositories.keySequences.getForProfile(profileId)
         }
-    }
-
-    // ── 打鍵列セット(パック) ──────────────────────────────
-
-    private fun loadInstalledPacksForPane(pane: PaneState, profileId: Long?) {
         viewModelScope.launch(ioDispatcher) {
             pane.installedPacks.value = tools.isekai.terminal.pack.KeySequencePacks.ALL.mapNotNull { pack ->
                 Repositories.keySequencePackInstallations.resolveInstallation(pack.id, profileId)?.let { pack to it }
@@ -921,7 +899,7 @@ class TerminalTabsViewModel(
 
     fun sendSnippetToPane(address: PaneAddress, snippet: Snippet) {
         RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=${address.tabId} pane=${address.paneId}")
-        sendToPane(address, SnippetCommands.toBytes(snippet))
+        paneOrNull(address)?.session?.send(SnippetCommands.toBytes(snippet))
     }
 
     // ── 打鍵列(KeySequence) ────────────────────────────────────
@@ -1036,51 +1014,19 @@ class TerminalTabsViewModel(
     // 画面分割時、両ペインは同時に見えるため「タブ指定」だけでは片方のペインの操作を
     // 表現できない(ステータスバーの再接続/切断/ログボタン・リサイズ・scrollback・キャンバスの
     // タップは常にそのペイン自身に向く)。UI([TerminalHostScreen])は常にペイン指定APIを使う。
-
-    fun sendToPane(address: PaneAddress, bytes: ByteArray) = withPane(address) { it.session.send(bytes) }
-
-    fun disconnectPane(address: PaneAddress) = withPane(address) { it.session.disconnect() }
-
-    /** 自動再接続ループ(isReconnecting中)を中止する。 */
-    fun cancelReconnectPane(address: PaneAddress) = withPane(address) { it.session.cancelReconnect() }
-
-    fun resizePane(address: PaneAddress, cols: UInt, rows: UInt) = withPane(address) { it.session.resize(cols, rows) }
-
-    fun scrollbackCellsForPane(address: PaneAddress, offset: Int, rows: Int): List<CellData>? =
-        withPane(address) { it.session.scrollbackCells(offset, rows) }
+    //
+    // 純粋な `withPane(address) { it.session.X(...) }` 転送のみのメソッド(send/disconnect/
+    // resize/scrollbackCells/jump*Prompt/clickToPromptCursor/copyLastCommandOutput/
+    // trust*HostKey/dismiss*HostKey*/respondAgentSignRequest/getSessionLog等)はここには置かず、
+    // TerminalHostScreen側で`pane`(既にPaneAddressから解決済み)から直接`pane.session.X(...)`を
+    // 呼ぶ(TerminalHostScreen.kt:576-585が元々5個の操作でこの直接呼び出しパターンを使っていた)。
+    // 追加のロジック(nullフォールバック以上の何か)を持つメソッドだけをここに残す。
 
     /** タスク#66: スクロールバック検索。対象ペインが無ければ(withPaneがnullを返す
      *  場合)空リストを返す——[TerminalSession.searchScrollback]自体の「未接続時は空
      *  リスト」という契約と揃える。 */
     fun searchScrollbackForPane(address: PaneAddress, query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
         withPane(address) { it.session.searchScrollback(query, caseSensitive) } ?: emptyList()
-
-    /** タスク#13(OSC 133)「前のプロンプトへジャンプ」。既存のスクロールバック検索
-     *  ([searchScrollbackForPane])とは独立した機能。 */
-    fun jumpToPreviousPromptForPane(address: PaneAddress, fromScrollOffset: Int, fromShowingScrollback: Boolean) =
-        withPane(address) { it.session.jumpToPreviousPrompt(fromScrollOffset, fromShowingScrollback) }
-
-    fun jumpToNextPromptForPane(address: PaneAddress, fromScrollOffset: Int, fromShowingScrollback: Boolean) =
-        withPane(address) { it.session.jumpToNextPrompt(fromScrollOffset, fromShowingScrollback) }
-
-    fun clickToPromptCursorForPane(address: PaneAddress, row: Int, col: Int) =
-        withPane(address) { it.session.clickToPromptCursor(row, col) }
-
-    fun copyLastCommandOutputForPane(address: PaneAddress) =
-        withPane(address) { it.session.copyLastCommandOutput() }
-
-    fun trustUpdatedHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustUpdatedHostKey() }
-
-    fun dismissHostKeyWarningForPane(address: PaneAddress) = withPane(address) { it.session.dismissHostKeyWarning() }
-
-    fun trustNewHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustNewHostKey() }
-
-    fun dismissNewHostKeyPromptForPane(address: PaneAddress) = withPane(address) { it.session.dismissNewHostKeyPrompt() }
-
-    fun respondAgentSignRequestForPane(address: PaneAddress, approved: Boolean) =
-        withPane(address) { it.session.respondAgentSignRequest(approved) }
-
-    fun getSessionLogForPane(address: PaneAddress): String = withPane(address) { it.session.log.value } ?: ""
 
     // ── trzsz（Android ファイル I/O は executor 経由。ペインごとに二重起動防止）───
 
@@ -1118,10 +1064,6 @@ class TerminalTabsViewModel(
         if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
         pane.session.trzszAcceptDownload()
     }
-
-    fun trzszCancelForPane(address: PaneAddress) = withPane(address) { it.session.trzszCancel() }
-
-    fun trzszDismissForPane(address: PaneAddress) = withPane(address) { it.session.trzszDismiss() }
 
     // ── ライフサイクル ──────────────────────────────────────────────
 

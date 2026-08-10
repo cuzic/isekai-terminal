@@ -3,17 +3,30 @@
 //! `ssh(1)` binary — for platforms where `ssh(1)` isn't available (Windows
 //! without Win32-OpenSSH, `fancy-humming-pnueli.md` M3).
 //!
-//! **Deliberately duplicates, rather than shares, most of `openssh.rs`'s
-//! logic** (the embedded remote shell script, the `SshOutput` shape, the
-//! host-key/credential plumbing): `OpenSshBackend` is already
-//! security-reviewed production code (review markers #57/#58/#68 throughout
-//! `openssh.rs`) backing every real deployment's SSH bootstrap today.
-//! Extracting a shared abstraction out of it risks introducing a subtle
-//! divergence or regression in that already-hardened path for the sake of
-//! this new, Windows-only backend — not a trade worth making. This mirrors
-//! the project's existing `tests/*_e2e.rs` self-containment convention, just
-//! applied to production code instead of test code (a deliberate, explicit
-//! decision confirmed with the user before starting this module).
+//! **Deliberately duplicates, rather than shares, `openssh.rs`'s
+//! host-key/credential plumbing**: `OpenSshBackend` delegates all of that to
+//! the real `ssh(1)`/`~/.ssh/config`/`ssh-agent`, so there is no common
+//! abstraction to factor out there — only a fake one that would have to
+//! pretend two genuinely different mechanisms are the same. That module is
+//! also already security-reviewed production code (review markers
+//! #57/#58/#68) backing every real deployment's SSH bootstrap today, and
+//! reshaping its credential path for the sake of this newer backend is not a
+//! trade worth making. This mirrors the project's existing `tests/*_e2e.rs`
+//! self-containment convention, just applied to production code instead of
+//! test code (a deliberate, explicit decision confirmed with the user before
+//! starting this module).
+//!
+//! **The remote install/launch script is *not* in that category and is
+//! shared**: it lives in `crate::install_script`, along with its stdin
+//! framing and handshake parsing, and both backends run the identical bytes.
+//! It is a pure string builder and a pure parser — no credentials, no
+//! host-key policy, nothing platform-specific — so the reasoning above never
+//! applied to it, while the cost of duplicating it was real: the macOS
+//! `/proc`-guard fix had to be re-applied by hand when this module was first
+//! written, and any *next* fix to that script would have had the same trap
+//! waiting. Under `always-connects.md`, one backend silently missing a fix
+//! to the silent-re-deploy script means that platform's users stop
+//! self-healing.
 //!
 //! **Scope of this first cut**:
 //! - 0-hop (direct) and single-hop `via` chains only —
@@ -42,29 +55,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine as _;
-use isekai_protocol::bootstrap::{
-    remote_parent_dir, shell_single_quote, validate_log_level, validate_relay_jwt, validate_relay_sni,
-    validate_remote_path, HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
-    ISEKAI_PIPE_INSTALL_DIR,
-};
+use isekai_protocol::bootstrap::{validate_remote_path, ISEKAI_PIPE_BIN_NAME, ISEKAI_PIPE_INSTALL_DIR};
 use isekai_trust::FileBackedHostKeyVerifier;
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler_with_reason, ConnectionLeg,
+    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, ConnectionLeg,
     Credential, JumpHost, RejectionReason, Session, SessionKind, VerifyingHandler,
 };
 
 use crate::backend::BootstrapBackend;
 use crate::error::BootstrapError;
-use crate::reuse::{launch_fingerprint, lock_file_path, pid_file_path, state_file_path};
+use crate::install_script::{build_install_script, parse_install_output, parse_uname_output, SshOutput};
 use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
-
-/// Emitted by the install script in place of a handshake line when the
-/// upload chain (`base64 -d && chmod && mv`) itself fails — same contract
-/// as `openssh.rs`'s identically-named constant (duplicated, not shared;
-/// see this module's docs).
-const UPLOAD_FAILED_MARKER: &str = "ISEKAI_UPLOAD_FAILED";
 
 /// `SSH_EXTENDED_DATA_STDERR`, per RFC 4254 §5.2 — the only `ext` value
 /// `ChannelMsg::ExtendedData` carries in practice for an `exec` channel.
@@ -208,14 +210,7 @@ impl RusshBackend {
     pub async fn detect_remote_arch(&self, target: &HostSpec, via: &[JumpSpec]) -> Result<String, BootstrapError> {
         let session = self.connect_and_authenticate(target, via).await?;
         let out = run_russh_command(&session.handle, "uname -m", &[]).await?;
-        if out.status != Some(0) {
-            return Err(BootstrapError::RemoteCommandFailed {
-                command: "uname -m".to_string(),
-                status: out.status,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
-        }
-        normalize_uname_arch(&String::from_utf8_lossy(&out.stdout))
+        parse_uname_output(&out)
     }
 
     /// Connects to `target`, through `via` if given (single hop only — see
@@ -308,7 +303,7 @@ impl RusshBackend {
                     .expect("connect_via_jump_or_direct only builds a Jump leg when a JumpHost was passed"),
                 ConnectionLeg::Target => target_verifier_for_closure.clone(),
             };
-            verifying_handler_with_reason(&verifier, &rejection_for_closure)
+            verifying_handler(&verifier).with_rejection_reason(&rejection_for_closure)
         };
 
         let jump_host = jump.as_ref().map(|(jh, _)| jh);
@@ -418,7 +413,7 @@ async fn resolve_hop(
     let username = explicit_user
         .map(str::to_string)
         .or_else(|| host_config.user.clone())
-        .or_else(local_username)
+        .or_else(openssh_config::local_username)
         .ok_or_else(|| BootstrapError::NoUsername { host: host.to_string() })?;
 
     let identity_paths = match identity_file_override {
@@ -430,10 +425,6 @@ async fn resolve_hop(
     };
 
     Ok(ResolvedHop { hostname, port, username, identity_paths })
-}
-
-fn local_username() -> Option<String> {
-    std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
 /// Reads one candidate identity file into a [`Credential::PublicKey`], or
@@ -497,12 +488,6 @@ fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
 }
 
 // ── exec-channel command runner ────────────────────────────────────────
-
-struct SshOutput {
-    status: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
 
 /// Maximum time `run_russh_command` will wait with **no forward progress at
 /// all** — neither a stdin byte accepted by the remote's flow-control window
@@ -681,22 +666,13 @@ async fn run_russh_command_inner<H: client::Handler>(
     Ok(SshOutput { status, stdout, stderr })
 }
 
-fn hex_sha256(binary: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(binary);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn normalize_uname_arch(uname_m: &str) -> Result<String, BootstrapError> {
-    match uname_m.trim() {
-        "x86_64" => Ok("x86_64".to_string()),
-        "aarch64" | "arm64" => Ok("aarch64".to_string()),
-        other => Err(BootstrapError::UnsupportedArch(other.to_string())),
-    }
-}
-
-// ── install/launch script (duplicated verbatim from `openssh.rs`, see ──
-// ── this module's own docs for why) ──────────────────────────────────
+// ── install/launch script ───────────────────────────────────────────
+//
+// The script text, its stdin framing, and the response parsing are shared
+// with `openssh.rs` via `crate::install_script` (see this module's docs for
+// why *this* is shared while the credential/host-key plumbing above is not).
+// What stays here is the genuinely `russh`-specific part: establishing the
+// authenticated session, and pushing the bytes over an exec channel.
 
 impl RusshBackend {
     async fn install_and_launch(
@@ -708,185 +684,18 @@ impl RusshBackend {
         stun_servers: &[std::net::SocketAddr],
         binary: &[u8],
     ) -> Result<isekai_protocol::HandshakeJson, BootstrapError> {
+        // Keep the whole `Session` alive (not just `.handle`) for the
+        // duration of the exec below — dropping it would tear down a
+        // single-hop `via` chain's `direct-tcpip` tunnel out from under the
+        // command (see `connect_and_authenticate`'s docs).
         let session = self.connect_and_authenticate(target, via).await?;
 
-        let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
-
-        let bootstrap_request = crate::client_candidates::fresh_bootstrap_request_v2(stun_servers).await;
-        let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
-        let request_len = request_bytes.len();
-
-        let stun_server_arg = match stun_servers.first() {
-            Some(addr) => format!(" --stun-server {addr}"),
-            None => String::new(),
-        };
-
-        let (launch_args, jwt_bytes): (String, Vec<u8>) = match launch {
-            LaunchSpec::Relay(relay) => {
-                validate_relay_sni(&relay.relay_sni)
-                    .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
-                validate_relay_jwt(&relay.relay_jwt)
-                    .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
-                let remote_log_level = validate_log_level(&relay.remote_log_level)
-                    .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
-
-                let relay_addr = relay.relay_addr;
-                let quoted_sni = shell_single_quote(&relay.relay_sni);
-                let idle_lifetime_secs = relay.idle_lifetime_secs;
-                let resume_window_secs = relay.resume_window_secs;
-                let relay_transport_arg = match relay.relay_transport {
-                    crate::types::RelayTransportKind::Udp => String::new(),
-                    crate::types::RelayTransportKind::Qmux => " --relay-transport qmux".to_string(),
-                };
-                let args = format!(
-                    "--target 127.0.0.1:22 --relay {relay_addr} --relay-sni {quoted_sni} \
-                     --relay-jwt-file $tmpdir/relay_jwt --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} \
-                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
-                );
-                (args, relay.relay_jwt.clone().into_bytes())
-            }
-            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range, resume_window_secs } => {
-                let remote_log_level = validate_log_level(remote_log_level)
-                    .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
-                let bind_port_range_arg = match remote_bind_port_range {
-                    Some((start, end)) => format!(" --bind-port-range {start}-{end}"),
-                    None => String::new(),
-                };
-                let args = format!(
-                    "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} \
-                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
-                );
-                (args, Vec::new())
-            }
-        };
-
-        let jwt_len = jwt_bytes.len();
-        let read_jwt_step = if jwt_len > 0 {
-            format!(
-                "dd bs=1 count={jwt_len} > $tmpdir/relay_jwt 2>/dev/null && [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && "
-            )
-        } else {
-            String::new()
-        };
-
-        let remote_dir = remote_parent_dir(remote_binary_path);
-        let fingerprint = launch_fingerprint(launch);
-        let lock_path = lock_file_path(remote_binary_path);
-        let state_path = state_file_path(remote_binary_path, &fingerprint);
-        let pid_path = pid_file_path(remote_binary_path, &fingerprint);
-        let expected_sha256 = hex_sha256(binary);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
-        let encoded_len = encoded.len();
-        let upload_failed_marker = UPLOAD_FAILED_MARKER;
-
-        let cmd = format!(
-            r#"umask 077
-mkdir -p {remote_dir} 2>/dev/null
-exec 9>>{lock_path} 2>/dev/null
-if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
-sha256_of() {{
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
-  fi
-}}
-tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
-if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
-  reuse_envelope=""
-  if [ -f {state_path} ]; then
-    existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
-    existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
-    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      if [ -d /proc ]; then
-        existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
-        expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
-      else
-        existing_exe=ok
-        expected_exe=ok
-      fi
-      # pid/exe-path/fingerprint matching only proves the same binary path
-      # is still running, not that its contents are what this `isekai-ssh`
-      # build expects — a still-alive helper can predate a bugfix to
-      # `isekai-pipe serve` itself. Never killed here if stale (some other
-      # client may be mid-session on it, same as `openssh.rs`'s
-      # fingerprint-mismatch case) — just not reused, falling through to
-      # the normal upload+launch path below.
-      if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
-        existing_sha=$(sha256_of {remote_binary_path})
-        if [ "$existing_sha" = "{expected_sha256}" ]; then
-          reuse_envelope=$(sed -n '2p' {state_path})
-        fi
-      fi
-    fi
-  fi
-  if [ -n "$reuse_envelope" ]; then
-    head -c {encoded_len} > /dev/null
-    printf '%s\n' "$reuse_envelope"
-  else
-    need_upload=1
-    if [ -x {remote_binary_path} ]; then
-      current_sha=$(sha256_of {remote_binary_path})
-      [ -n "$current_sha" ] && [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
-    fi
-    upload_ok=1
-    if [ "$need_upload" -eq 1 ]; then
-      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp && chmod 0700 {remote_binary_path}.tmp && mv {remote_binary_path}.tmp {remote_binary_path} || upload_ok=0
-    else
-      head -c {encoded_len} > /dev/null
-    fi
-    if [ "$upload_ok" -eq 0 ]; then
-      echo {upload_failed_marker}
-    else
-      if command -v setsid >/dev/null 2>&1; then
-        ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
-      else
-        ( ( trap '' HUP; exec {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- ) & echo $! > {pid_path} )
-      fi
-      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do
-        [ -s $tmpdir/handshake ] && break
-        sleep {sleep_secs}
-      done
-      if [ -s $tmpdir/handshake ]; then
-        envelope=$(cat $tmpdir/handshake)
-        new_pid=$(cat {pid_path} 2>/dev/null)
-        ( printf '%s %s\n' "$new_pid" "{fingerprint}"; printf '%s\n' "$envelope" ) > {state_path}.tmp.$$ && mv {state_path}.tmp.$$ {state_path}
-        printf '%s\n' "$envelope"
-      fi
-    fi
-  fi
-  for gc_state in {remote_binary_path}.*.state; do
-    [ -e "$gc_state" ] || continue
-    [ "$gc_state" = {state_path} ] && continue
-    gc_pid=$(sed -n '1p' "$gc_state" | cut -d' ' -f1)
-    if [ -z "$gc_pid" ] || ! kill -0 "$gc_pid" 2>/dev/null; then
-      rm -f "$gc_state" "${{gc_state%.state}}.pid"
-    fi
-  done
-fi
-"#
-        );
-
-        let stdin_chunks: [&[u8]; 3] = [request_bytes.as_slice(), jwt_bytes.as_slice(), encoded.as_bytes()];
-        let out = run_russh_command(&session.handle, &cmd, &stdin_chunks).await?;
-
-        let non_empty_lines: Vec<&[u8]> =
-            out.stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty()).collect();
-
-        match non_empty_lines.as_slice() {
-            [] => Err(BootstrapError::HandshakeMissing {
-                status: out.status,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            }),
-            [marker] if *marker == UPLOAD_FAILED_MARKER.as_bytes() => Err(BootstrapError::UploadFailed {
-                status: out.status,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            }),
-            [single] => Ok(isekai_protocol::bootstrap_request::decode_bootstrap_report_v2(single)?.handshake),
-            _ => Err(BootstrapError::UnexpectedStdout { extra_lines: non_empty_lines.len() - 1 }),
-        }
+        let script = build_install_script(launch, remote_binary_path, stun_servers, binary).await?;
+        // Sent as three separate `channel.data()` writes rather than one
+        // concatenated buffer — see `InstallScript`'s docs.
+        let stdin_chunks = script.stdin_chunk_refs();
+        let out = run_russh_command(&session.handle, &script.command, &stdin_chunks).await?;
+        parse_install_output(&out)
     }
 }
 
@@ -983,18 +792,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_uname_arch_accepts_known_architectures() {
-        assert_eq!(normalize_uname_arch("x86_64\n").unwrap(), "x86_64");
-        assert_eq!(normalize_uname_arch("aarch64\n").unwrap(), "aarch64");
-        assert_eq!(normalize_uname_arch("arm64\n").unwrap(), "aarch64");
-    }
-
-    #[test]
-    fn normalize_uname_arch_rejects_unknown_architectures() {
-        let err = normalize_uname_arch("riscv64\n").unwrap_err();
-        assert!(matches!(err, BootstrapError::UnsupportedArch(ref a) if a == "riscv64"));
-    }
+    // `normalize_uname_arch`/`parse_uname_output`'s own tests live with the
+    // (now shared) implementation in `crate::install_script`.
 
     // ── Finding 1 regression: `Eof` before `exit-status` ────────────────
 

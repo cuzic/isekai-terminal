@@ -15,8 +15,6 @@ use crate::multipath_transport::{MultipathIsekaiPipeQuicConfig, MultipathIsekaiP
 use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
 use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelaySession};
 use crate::transport::{ExecError, ExecOutput};
-use crate::tmux_locator::{RemoteTmuxCommandRunner, TmuxLocator, TmuxRunError};
-use crate::tmux_scrollback::fetch_tmux_scrollback_history;
 
 // ── Active session ────────────────────────────────────────
 
@@ -38,8 +36,8 @@ enum ActiveSession {
 /// `ActiveSession`の全バリアントに同じメソッド呼び出しを委譲するだけのmatchを
 /// 展開する。6トランスポートすべてが同じ`SessionCore`委譲メソッドを持つため
 /// （各transportモジュール参照）、ここは常に「アームごとの分岐ロジックが無い」
-/// 純粋な委譲にのみ使う。`add_local_forward`/`remove_forward`のように一部の
-/// トランスポートで挙動が違うメソッドは対象外とし、手書きのmatchのままにする。
+/// 純粋な委譲にのみ使う。トランスポートごとに挙動が違うメソッドは対象外とし、
+/// 手書きのmatchのままにする。
 macro_rules! dispatch_all {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
@@ -61,8 +59,7 @@ impl ActiveSession {
         dispatch_all!(self, resize, cols, rows)
     }
     /// タスク#60: OSのフォーカス変化を全トランスポート共通で`SessionCore`まで委譲する
-    /// (`Terminal`/`SessionCore`はトランスポート非依存のため`add_local_forward`と違い
-    /// 対象外の分岐は無い)。
+    /// (`Terminal`/`SessionCore`はトランスポート非依存のため対象外の分岐は無い)。
     fn notify_focus_change(&self, focused: bool) {
         dispatch_all!(self, notify_focus_change, focused)
     }
@@ -129,33 +126,13 @@ impl ActiveSession {
         dispatch_all!(self, copy_last_command_output)
     }
     /// タスク#17: `run_ssh_channel_loop`は6トランスポート共通の実体なので
-    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、`add_local_forward`と違い
-    /// トランスポート別の対応可否分岐は無い——全バリアントで同じ委譲でよい。
+    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、トランスポート別の
+    /// 対応可否分岐は無い——全バリアントで同じ委譲でよい。
     fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
         dispatch_all!(self, file_preview_exec, request_id, command_line)
     }
-    fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
-        match self {
-            Self::Ssh(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
-            Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
-            // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
-            // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
-            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
-                log::warn!("add_local_forward: not supported over helper-QUIC transports");
-            }
-        }
-    }
-    fn remove_forward(&self, id: String) {
-        match self {
-            Self::Ssh(s) => s.remove_forward(id),
-            Self::Quic(s) => s.remove_forward(id),
-            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
-                log::warn!("remove_forward: not supported over helper-QUIC transports");
-            }
-        }
-    }
     /// Phase 12: per-session theme。全トランスポート共通(`Terminal`/`SessionCore`は
-    /// トランスポート非依存)なので、`add_local_forward`と違い対象外の分岐は無い。
+    /// トランスポート非依存)なので対象外の分岐は無い。
     fn set_theme(&self, theme: crate::theme::Theme) {
         dispatch_all!(self, set_theme, theme)
     }
@@ -166,7 +143,7 @@ impl ActiveSession {
     }
     /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
     /// 接続上で短命なexecコマンドを実行する。全トランスポート共通
-    /// (`SessionCore::run_exec`)なので`add_local_forward`と違い対象外の分岐は無いが、
+    /// (`SessionCore::run_exec`)なので対象外の分岐は無いが、
     /// asyncメソッドは`dispatch_all!`(各アームを`.await`しないため型が揃わない)
     /// では書けないので手書きのmatchにする。
     async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
@@ -319,9 +296,6 @@ impl Default for ReconnectPolicy {
 const MAX_DOWNLOAD_BUF_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 struct OrchestratorState {
-    current_host: Option<String>,
-    current_port: u16,
-    is_quic: bool,
     phase: ConnPhase,
     /// Active transfer ID set by on_trzsz_request; used to route trzsz commands without exposing ID to Kotlin
     current_transfer_id: Option<String>,
@@ -371,6 +345,15 @@ struct OrchestratorState {
     user_initiated_disconnect: bool,
     /// 直前に成功した(あるいは試みた)`connect_*`。予期しない切断時にこれを
     /// 使って自動的に再接続を試みる。
+    ///
+    /// 「今どのホスト/ポートへ、QUIC系トランスポートで繋いでいるか」もこの1つの
+    /// フィールドが唯一の出所(SSOT)であり、専用のミラーフィールドは持たない
+    /// ([`OrchestratorState::current_target`]が[`LastConnectAttempt::host_port_is_quic`]
+    /// 経由で導出する)。以前は`current_host`/`current_port`/`is_quic`という3つの
+    /// ミラーフィールドがあったが、書き込みがこのフィールドと別のロック取得に
+    /// 分かれていたため、その隙間で両者が食い違って観測され得た(`rust-ssot.md`が
+    /// Kotlin側について警告している「もう1つの状態のコピー」と同じ問題がRust内部で
+    /// 起きていた)。
     last_connect_attempt: Option<LastConnectAttempt>,
     /// 再接続ループのタイミング。テストでは短い値に差し替える。
     reconnect_policy: ReconnectPolicy,
@@ -402,6 +385,22 @@ struct OrchestratorState {
     /// タグが交互に届いた場合に重複排除が破れる(opusレビュー指摘)ため、
     /// [`RECENT_NOTIFY_SEQ_CAPACITY`]件までは覚えておく。
     recent_notify_seqs: std::collections::VecDeque<(String, u64)>,
+}
+
+impl OrchestratorState {
+    /// 現在(直近に)接続を試みている相手と、その経路がQUIC系かどうか。
+    /// [`OrchestratorState::last_connect_attempt`]からその場で導出するため、
+    /// 「接続先」と「その接続に使ったConfig」が食い違うことは原理的に起こり得ない。
+    /// まだ一度も`connect_*`が呼ばれていなければ`None`。
+    fn current_target(&self) -> Option<(String, u16, bool)> {
+        self.last_connect_attempt.as_ref().map(LastConnectAttempt::host_port_is_quic)
+    }
+
+    /// [`OrchestratorState::current_target`]のQUIC判定だけを取り出したもの。
+    /// 接続試行が無い間は「QUICではない」(=以前の`is_quic`フィールドの初期値と同じ)。
+    fn is_quic(&self) -> bool {
+        self.current_target().is_some_and(|(_, _, is_quic)| is_quic)
+    }
 }
 
 /// [`OrchestratorState::recent_notify_seqs`]が覚えておく直近件数。tmux hookの
@@ -439,25 +438,6 @@ pub(crate) struct OrchestratorShared {
     /// 状態で複数回呼ぶ」場合でも1許可分にしかならないため、フラッピングする
     /// ネットワークで無限にウェイクし続ける心配は無い。
     reconnect_wake: tokio::sync::Notify,
-    /// タスク#58: このオーケストレータが担当するタブ/ペインに対応するtmux
-    /// ロケータ。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
-    /// が対象ペインを特定するために読む。`None`(既定)なら単にbackfillを
-    /// fail-openでスキップする —— `ensure_tmux_tab_window`成功時に
-    /// `set_tmux_backfill_locator`経由で設定される(#60が#62の
-    /// `TmuxLocatorRegistry`へ登録するのと同じタイミング)。
-    tmux_backfill_locator: Mutex<Option<TmuxLocator>>,
-    /// タスク#58: `reconnect_attempt`(`connect_via`)が同期的に成功した直後
-    /// (`spawn_reconnect_loop`の2箇所、および`notify_will_enter_foreground`の
-    /// フォアグラウンド復帰時再接続)に一度だけ呼ばれるフック。実運用の既定は
-    /// `spawn_tmux_scrollback_backfill`(tmux capture-paneベースのbackfillを
-    /// `RUNTIME.spawn`で開始するだけで、この呼び出し自体はブロックしない)。
-    /// `reconnect_attempt`と同じ理由(実ネットワーク/実tmuxに触れず「いつ・何回
-    /// 呼ばれるか」だけを単体テストするため)でテストでは差し替え可能にしてある。
-    /// 手動の`connect_*`(`SessionOrchestrator::connect`等)はこのフックを一切
-    /// 経由しない —— `reconnect_attempt`同様`connect_via`専用の経路であり、
-    /// 「resumeが尽きた/初回接続ではない」ことがこのフィールドが呼ばれる時点で
-    /// 既に保証されている。
-    after_reconnect_success: Box<dyn Fn(&Arc<OrchestratorShared>) + Send + Sync>,
 }
 
 // ── OrchestratorAdapter ───────────────────────────────────
@@ -489,18 +469,54 @@ impl OrchestratorAdapter {
     }
 }
 
+/// `OrchestratorAdapter`の`SessionCallback`実装のうち、「古い世代からの遅延
+/// コールバックなら何もしない、そうでなければ同名の`OrchestratorCallback`へ
+/// そのまま委譲する」だけの単純委譲メソッドをまとめて生成する。
+///
+/// `ActiveSession`の`dispatch_all!`と同じ方針で、**staleガード以外の分岐
+/// ロジックを持たない委譲にのみ**使う —— `on_host_key`/`on_connected`/
+/// `on_disconnected`/trzsz系/`on_notify`/`on_file_preview_exec_result`のように
+/// 固有の処理を持つものは手書きのまま下に残す(そちらこそが読む価値のある
+/// 部分なので、マクロの一覧に埋もれさせない)。
+///
+/// staleだった場合の戻り値は`Default::default()`——このマクロが対象にする
+/// コールバックの戻り値は`()`/`bool`/`Option<T>`だけで、いずれも既定値
+/// (何もしない・拒否・値なし)が手書き実装当時と同じ意味になる。
+macro_rules! forward_if_current {
+    ($( fn $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? ) $( -> $ret:ty )? ; )*) => {
+        $(
+            fn $name(&self, $( $arg : $ty ),*) $( -> $ret )? {
+                if !self.is_current() { return Default::default(); }
+                self.shared.callback.$name($( $arg ),*)
+            }
+        )*
+    };
+}
+
 impl SessionCallback for OrchestratorAdapter {
-    fn on_data(&self, data: Vec<u8>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_data(data);
+    forward_if_current! {
+        fn on_data(data: Vec<u8>);
+        fn on_screen_update(update: ScreenUpdate);
+        fn on_no_viable_path();
+        fn on_forward_state_changed(id: String, state: ForwardState);
+        fn on_agent_sign_request(key_fingerprint: String) -> bool;
+        fn on_clipboard_write(payload: ClipboardPayload);
+        fn on_clipboard_pull_request() -> Option<ClipboardPayload>;
+        fn on_request_wifi_fd() -> Option<crate::PlatformFd>;
+        fn on_request_cellular_fd() -> Option<crate::PlatformFd>;
+        fn on_rebind_state_changed(state: crate::rebind_manager::RebindPublicState);
+        fn on_prompt_jump(target: Option<crate::PromptJumpTarget>);
+        fn on_prompt_output_copy_ready(text: Option<String>);
     }
 
     fn on_host_key(&self, fingerprint: String) -> bool {
         if !self.is_current() { return false; }
-        let (host, port) = {
-            let s = self.shared.state.lock();
-            (s.current_host.clone().unwrap_or_default(), s.current_port)
-        };
+        let (host, port, _is_quic) = self.shared.state.lock().current_target()
+            // 接続試行が記録されていない状態でホスト鍵確認が来ることは実際には
+            // 無い(セッションは必ず`begin_connect`/`connect_via`を通ってから
+            // 生成される)が、万一の場合も以前のミラーフィールドの既定値と
+            // 同じ("", 22)でUIへ渡す。
+            .unwrap_or_else(|| (String::new(), 22, false));
         self.shared.callback.on_host_key(host, port, fingerprint)
     }
 
@@ -513,7 +529,7 @@ impl SessionCallback for OrchestratorAdapter {
             s.reconnect_epoch += 1;
             s.reconnect_loop_active = false;
             s.retry_attempt_in_flight = false;
-            s.current_host.clone().unwrap_or_default()
+            s.current_target().map(|(host, _, _)| host).unwrap_or_default()
         };
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Connected { host }
@@ -523,11 +539,6 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_disconnected(&self, reason: Option<String>) {
         if !self.is_current() { return; }
         handle_unexpected_disconnect(&self.shared, reason);
-    }
-
-    fn on_screen_update(&self, update: ScreenUpdate) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_screen_update(update);
     }
 
     fn on_trzsz_request(
@@ -621,46 +632,6 @@ impl SessionCallback for OrchestratorAdapter {
         );
     }
 
-    fn on_no_viable_path(&self) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_no_viable_path();
-    }
-
-    fn on_forward_state_changed(&self, id: String, state: ForwardState) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_forward_state_changed(id, state);
-    }
-
-    fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
-        if !self.is_current() { return false; }
-        self.shared.callback.on_agent_sign_request(key_fingerprint)
-    }
-
-    fn on_clipboard_write(&self, payload: ClipboardPayload) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_clipboard_write(payload);
-    }
-
-    fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_clipboard_pull_request()
-    }
-
-    fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_request_wifi_fd()
-    }
-
-    fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
-        if !self.is_current() { return None; }
-        self.shared.callback.on_request_cellular_fd()
-    }
-
-    fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_rebind_state_changed(state);
-    }
-
     /// タスク#57: tmux hookの発火を、(a)`(tmux_tag, seq)`重複排除、(b)フォアグラウンド
     /// +このタブ表示中の抑制、の2段階を経てから`OrchestratorCallback::on_notify`へ
     /// 渡す。
@@ -701,16 +672,6 @@ impl SessionCallback for OrchestratorAdapter {
         if should_deliver {
             self.shared.callback.on_notify(kind);
         }
-    }
-
-    fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_prompt_jump(target);
-    }
-
-    fn on_prompt_output_copy_ready(&self, text: Option<String>) {
-        if !self.is_current() { return; }
-        self.shared.callback.on_prompt_output_copy_ready(text);
     }
 
     /// タスク#17: `pending_file_previews`から`request_id`に対応する要求種別を取り出し、
@@ -860,16 +821,40 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
 /// リトライ専用のセッション生成。`begin_connect()`(手動接続の開始、`Connecting`通知・
 /// `reconnect_epoch`無効化を伴う)とは別関数にしてある — リトライのたびに`begin_connect()`
 /// を呼ぶと、リトライループ自身の`reconnect_epoch`を無効化してしまい自己終了してしまう。
+///
+/// `last_connect_attempt`はここでは書き換えない —— この関数は常にその
+/// `last_connect_attempt`自身のcloneを渡されて呼ばれる(`spawn_reconnect_loop`/
+/// `notify_will_enter_foreground`)ので書き戻しても同じ値になるはずだが、
+/// ループがattemptをcloneしてから実際に発火するまでの間に手動接続が
+/// `last_connect_attempt`を更新していた場合、古い値で上書きし返してしまう。
+/// 「接続先のSSOTは`last_connect_attempt`」という原則の下では、その唯一の
+/// 書き手は手動接続(`begin_connect`)だけにしておくのが安全。
 fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) -> Result<(), SshError> {
-    let (host, port, is_quic) = attempt.host_port_is_quic();
-    {
-        let mut s = shared.state.lock();
-        s.current_host = Some(host);
-        s.current_port = port;
-        s.is_quic = is_quic;
-        s.phase = ConnPhase::Connecting;
-    }
+    shared.state.lock().phase = ConnPhase::Connecting;
     let adapter = OrchestratorAdapter::new(shared.clone());
+    build_and_store_session(shared, attempt, adapter)
+}
+
+/// `attempt`が指すトランスポートのセッションを1つ生成・接続し、成功したら
+/// `shared.session`へ格納する。手動接続([`SessionOrchestrator::start_manual_connect`])と
+/// 自動再接続([`connect_via`])の両方がここを通るため、**トランスポート分岐の
+/// matchはこの1箇所だけ**になる —— 以前は`connect_via`と7つの`connect_*`が
+/// 同じ「セッション生成→connect→`ActiveSession`格納」を二重に持っており、
+/// 新しいトランスポートを足すたびに2つのリストを同期させる必要があった。
+///
+/// `adapter`を呼び出し側から受け取るのは、[`OrchestratorAdapter::new`]が
+/// `session_generation`をインクリメントする(=古いセッションからの遅延
+/// コールバックをそこで一斉に無効化する)副作用を持つため —— そのタイミングは
+/// 呼び出し側の手順(手動接続なら`begin_connect`のstate更新+`Connecting`通知の
+/// 直後)に合わせる必要があり、この関数の中へ動かしてよいものではない。
+///
+/// `connect`が`Err`を返した場合は`shared.session`を書き換えないまま伝播する
+/// (直前のセッションを壊さない)。
+fn build_and_store_session(
+    shared: &Arc<OrchestratorShared>,
+    attempt: LastConnectAttempt,
+    adapter: OrchestratorAdapter,
+) -> Result<(), SshError> {
     let session = match attempt {
         LastConnectAttempt::Ssh(config) => {
             let session = crate::create_ssh_session(config);
@@ -913,76 +898,6 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
     };
     *shared.session.lock() = Some(session);
     Ok(())
-}
-
-// ── タスク#58: フル再接続直後のtmux scrollback backfill ──────
-
-/// `ActiveSession::run_exec`(タスク#61のexecチャンネル)を、`tmux_locator`/
-/// `tmux_scrollback`が要求する[`RemoteTmuxCommandRunner`]シームへ薄く適合させる
-/// アダプタ。コマンドの組み立て・出力のパースといった純粋なロジックは全て
-/// `tmux_scrollback`モジュール側の自由関数にあり、ここでは「execを呼んで結果を
-/// `Result<String, TmuxRunError>`へ変換する」ことだけを行う。
-struct ActiveSessionTmuxRunner(ActiveSession);
-
-impl RemoteTmuxCommandRunner for ActiveSessionTmuxRunner {
-    fn run(&self, cmd: &str) -> impl std::future::Future<Output = Result<String, TmuxRunError>> + Send {
-        let session = self.0.clone();
-        let cmd = cmd.to_string();
-        async move {
-            let output = session.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
-            if !crate::tmux_locator::tmux_exit_status_is_success(output.exit_status) {
-                return Err(TmuxRunError(format!(
-                    "tmux command exited with status {:?}",
-                    output.exit_status
-                )));
-            }
-            String::from_utf8(output.stdout)
-                .map_err(|e| TmuxRunError(format!("tmux output was not valid UTF-8: {e}")))
-        }
-    }
-}
-
-/// [`OrchestratorShared::after_reconnect_success`]の実運用の既定実装。
-/// `shared.tmux_backfill_locator`が設定されていて、かつ現在`ActiveSession`が
-/// 存在する(=直前の`connect_via`が本当に成功していた)場合にのみ、
-/// `RUNTIME.spawn`でバックグラウンドタスクを起こし、tmuxのscrollback履歴を
-/// 取得してこのタブのローカルscrollbackへバッチ注入する。
-///
-/// 呼び出し自体は同期・即座に返る(実際のexec/capture-paneは`RUNTIME.spawn`
-/// されたタスク側で行う)—— `connect_via`のごく直後、まだライブのPTY出力が
-/// 届き始めるより十分前のタイミングで呼ばれる想定だが、たとえ多少ライブ出力と
-/// 競合してもscrollbackへの注入は加算的(`push_front`)なので致命的な破壊は
-/// 起きない。ロケータ未設定・exec失敗・tmux未検出・出力が空、いずれの場合も
-/// fail-open(ログを出すだけで接続自体には一切影響しない)。
-fn spawn_tmux_scrollback_backfill(shared: &Arc<OrchestratorShared>) {
-    let Some(locator) = shared.tmux_backfill_locator.lock().clone() else {
-        log::debug!("orchestrator: no tmux locator registered for this pane yet, skipping scrollback backfill");
-        return;
-    };
-    let Some(session) = shared.session.lock().clone() else {
-        log::debug!("orchestrator: no active session to backfill scrollback onto, skipping");
-        return;
-    };
-    RUNTIME.spawn(async move {
-        let runner = ActiveSessionTmuxRunner(session.clone());
-        match fetch_tmux_scrollback_history(&runner, &locator, crate::session::SCROLLBACK_LIMIT).await {
-            Ok(lines) if lines.is_empty() => {
-                log::debug!("orchestrator: tmux scrollback backfill found no history above the visible screen");
-            }
-            Ok(lines) => {
-                log::info!(
-                    "orchestrator: backfilling {} line(s) of tmux scrollback history after full reconnect",
-                    lines.len()
-                );
-                session.inject_scrollback_history(lines);
-            }
-            Err(e) => {
-                log::warn!(
-                    "orchestrator: tmux scrollback backfill failed ({e}), continuing with an empty scrollback for this reconnect"
-                );
-            }
-        }
-    });
 }
 
 /// `spawn_reconnect_loop`の1 tick分の待機。`tick`を素通しで待つのと、
@@ -1067,7 +982,7 @@ fn spawn_reconnect_loop(
                         "orchestrator: network path restored while reconnecting; retrying immediately instead of waiting out the rest of this tick"
                     );
                     match (shared.reconnect_attempt)(&shared, attempt.clone()) {
-                        Ok(()) => (shared.after_reconnect_success)(&shared),
+                        Ok(()) => {}
                         Err(e) => {
                             log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
                             let mut s = shared.state.lock();
@@ -1119,7 +1034,7 @@ fn spawn_reconnect_loop(
             };
             if should_attempt {
                 match (shared.reconnect_attempt)(&shared, attempt.clone()) {
-                    Ok(()) => (shared.after_reconnect_success)(&shared),
+                    Ok(()) => {}
                     Err(e) => {
                         log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
                         let mut s = shared.state.lock();
@@ -1145,9 +1060,6 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
     crate::init_logger();
     let shared = Arc::new(OrchestratorShared {
         state: Mutex::new(OrchestratorState {
-            current_host: None,
-            current_port: 22,
-            is_quic: false,
             phase: ConnPhase::Idle,
             current_transfer_id: None,
             trzsz_mode: None,
@@ -1172,16 +1084,15 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
         reconnect_attempt: Box::new(connect_via),
         reconnect_wake: tokio::sync::Notify::new(),
-        tmux_backfill_locator: Mutex::new(None),
-        after_reconnect_success: Box::new(spawn_tmux_scrollback_backfill),
     });
     Arc::new(SessionOrchestrator { shared })
 }
 
 impl SessionOrchestrator {
     /// 各`connect_*`が共通で行う「state更新→Connecting通知→adapter生成」を
-    /// 一箇所にまとめる。session生成・接続・`ActiveSession`格納は呼び出し側が
-    /// トランスポートごとに行う（`connect`のエラー型/セッション型がそれぞれ違うため）。
+    /// 一箇所にまとめる。実際のsession生成・接続・`ActiveSession`格納は、
+    /// 自動再接続経路と共有する[`build_and_store_session`]が引き受ける
+    /// (呼び出し元は[`SessionOrchestrator::start_manual_connect`])。
     ///
     /// phaseが既に`Connecting`(=前の`connect_*`呼び出しがまだ実行中)の間の新規呼び出しは
     /// 拒否する(真の二重start防止、Task #9)。`Connected`中の呼び出しは意図的に許可する
@@ -1189,15 +1100,17 @@ impl SessionOrchestrator {
     /// 正当な経路であり(下記invalidate呼び出し、および
     /// `notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt`
     /// テスト参照)、`Idle`と同様に受理してよい。
-    fn begin_connect(&self, host: String, port: u16, is_quic: bool) -> Result<OrchestratorAdapter, SshError> {
+    fn begin_connect(&self, attempt: LastConnectAttempt) -> Result<OrchestratorAdapter, SshError> {
         {
             let mut s = self.shared.state.lock();
             if s.phase == ConnPhase::Connecting {
                 return Err(SshError::ConnectionFailed);
             }
-            s.current_host = Some(host);
-            s.current_port = port;
-            s.is_quic = is_quic;
+            // 接続先(host/port/QUIC種別)と再接続用のConfigは同じ1つの
+            // `last_connect_attempt`が担う。以前は呼び出し側が別途
+            // `last_connect_attempt`を書いており、このロックを一度解放した後に
+            // 書かれるまでの間だけ両者が食い違って見え得た(SSOT違反)。
+            s.last_connect_attempt = Some(attempt);
             s.phase = ConnPhase::Connecting;
             // 新しい手動接続が始まった以上、直前のdisconnect()由来のフラグや
             // 実行中だったかもしれない自動再接続ループは無関係になる。
@@ -1218,93 +1131,57 @@ impl SessionOrchestrator {
         Ok(OrchestratorAdapter::new(self.shared.clone()))
     }
 
-    /// タスク#58: このオーケストレータが担当するタブ/ペインのtmuxロケータを
-    /// 設定/更新する。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
-    /// が対象ペインを特定するために読む値そのもの。`TmuxLocator`自体が
-    /// UniFFI境界を越えない内部専用の型のため、この関数もUniFFIへは公開しない
-    /// ——`ensure_tmux_tab_window`が成功のたびに呼ぶ(#62の`TmuxLocatorRegistry`への
-    /// 登録と同じタイミング)。呼ばれなければ`tmux_backfill_locator`は`None`のままで、
-    /// backfillはfail-openで単にスキップされる。
-    pub(crate) fn set_tmux_backfill_locator(&self, locator: Option<TmuxLocator>) {
-        *self.shared.tmux_backfill_locator.lock() = locator;
+    /// すべての手動接続(`connect_*`)の共通実装。`begin_connect`で状態遷移と
+    /// `Connecting`通知を済ませてから、[`build_and_store_session`]で実際の
+    /// セッションを生成する。トランスポートごとに違うのは`LastConnectAttempt`の
+    /// バリアントだけなので、各`connect_*`はこれを1回呼ぶだけの薄いUniFFI入口に
+    /// なる(生成手順そのものは自動再接続経路[`connect_via`]と共有する)。
+    fn start_manual_connect(&self, attempt: LastConnectAttempt) -> Result<(), SshError> {
+        let adapter = self.begin_connect(attempt.clone())?;
+        build_and_store_session(&self.shared, attempt, adapter)
     }
 }
 
 #[uniffi::export]
 impl SessionOrchestrator {
     pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.host.clone(), config.port, false)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Ssh(config.clone()));
-        let session = crate::create_ssh_session(config);
-        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::Ssh(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::Ssh(config))
     }
 
     pub fn connect_quic(&self, config: QuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Quic(config.clone()));
-        let session = crate::quic_transport::create_quic_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::Quic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::Quic(config))
     }
 
     /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
     /// （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
     pub fn connect_isekai_pipe_quic(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuic(config.clone()));
-        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiPipeQuic(config))
     }
 
     /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
     /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
     pub fn connect_isekai_pipe_quic_auto(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuicAuto(config.clone()));
-        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
-        session.connect_auto(Box::new(adapter), self.shared.app_pane_id.clone())?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiPipeQuicAuto(config))
     }
 
     /// Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
     /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
     /// 受動的マルチパスで接続する。
     pub fn connect_multipath_isekai_pipe_quic(&self, config: MultipathIsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::MultipathIsekaiPipeQuic(config.clone()));
-        let session = crate::multipath_transport::create_multipath_isekai_pipe_quic_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::MultipathIsekaiPipeQuic(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::MultipathIsekaiPipeQuic(config))
     }
 
     /// Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
     /// STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
     /// 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
     pub fn connect_isekai_stun_p2p(&self, config: IsekaiStunP2pConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiStunP2p(config.clone()));
-        let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiStunP2p(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiStunP2p(config))
     }
 
     /// Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
     /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
     pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
-        self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiLinkRelay(config.clone()));
-        let session = crate::isekai_link_relay_transport::create_isekai_link_relay_session(config);
-        session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::IsekaiLinkRelay(session));
-        Ok(())
+        self.start_manual_connect(LastConnectAttempt::IsekaiLinkRelay(config))
     }
 
     pub fn disconnect(&self) {
@@ -1413,7 +1290,7 @@ impl SessionOrchestrator {
             // `phase`が`Connecting`のまま固まり、UIが「接続中…」から進まなくなる。
             // ループ経由の再試行に頼らず、この場で`Idle`へ戻し失敗を通知する。
             match (self.shared.reconnect_attempt)(&self.shared, attempt) {
-                Ok(()) => (self.shared.after_reconnect_success)(&self.shared),
+                Ok(()) => {}
                 Err(e) => {
                     log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
                     let mut s = self.shared.state.lock();
@@ -1580,10 +1457,6 @@ impl SessionOrchestrator {
         self.shared.callback.on_trzsz_state_changed(TrzszPublicState::Idle);
     }
 
-    pub fn is_quic(&self) -> bool {
-        self.shared.state.lock().is_quic
-    }
-
     /// OS からネットワーク断（Wi-Fi/セルラー消失等）を通知された時の対応を決める。
     /// QUIC 接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中や
     /// OS からのネットワークpath変化(`ConnectivityManager`/`NWPathMonitor`)をそのまま
@@ -1598,7 +1471,7 @@ impl SessionOrchestrator {
     pub fn notify_network_path_changed(&self, is_satisfied: bool) {
         let (phase, is_quic) = {
             let s = self.shared.state.lock();
-            (s.phase, s.is_quic)
+            (s.phase, s.is_quic())
         };
         match phase {
             ConnPhase::Idle => {
@@ -1641,21 +1514,6 @@ impl SessionOrchestrator {
         }
     }
 
-    /// 接続中にローカルポートフォワード(-L)を動的に追加する。
-    /// MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-    /// 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-    pub fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port);
-        }
-    }
-
-    pub fn remove_forward(&self, id: String) {
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.remove_forward(id);
-        }
-    }
-
     /// Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
     /// アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
     /// 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
@@ -1680,12 +1538,6 @@ impl SessionOrchestrator {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.set_panel_enabled(enabled);
         }
-    }
-
-    pub fn notify_error(&self, message: String) {
-        self.shared.callback.on_connection_state_changed(
-            ConnectionPublicState::Error { message }
-        );
     }
 
     /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
@@ -1747,9 +1599,8 @@ impl SessionOrchestrator {
 
 /// [`crate::tmux_session::ensure_tab_window`]が要求する
 /// [`crate::tmux_locator::RemoteTmuxCommandRunner`]の、`SessionOrchestrator::run_exec`
-/// (#61)への薄いアダプタ。`ExecOutput`(stdout + 終了ステータス)を
-/// `RemoteTmuxCommandRunner`が期待する`Result<String, TmuxRunError>`へ変換する
-/// (非ゼロ終了・非UTF-8出力もここでエラーとして畳み込む)。
+/// (#61)への薄いアダプタ。`ExecOutput`→`Result<String, TmuxRunError>`の変換自体は
+/// `tmux_locator::exec_output_to_tmux_result`(`SshHandleTmuxRunner`と共有)に委ねる。
 struct OrchestratorTmuxRunner<'a> {
     orchestrator: &'a SessionOrchestrator,
 }
@@ -1763,15 +1614,8 @@ impl<'a> crate::tmux_locator::RemoteTmuxCommandRunner for OrchestratorTmuxRunner
         let cmd = cmd.to_string();
         async move {
             use crate::tmux_locator::TmuxRunError;
-            let output = orchestrator.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
-            if !crate::tmux_locator::tmux_exit_status_is_success(output.exit_status) {
-                return Err(TmuxRunError(format!(
-                    "tmux command exited with status {:?} (stdout: {:?})",
-                    output.exit_status,
-                    String::from_utf8_lossy(&output.stdout),
-                )));
-            }
-            String::from_utf8(output.stdout).map_err(|e| TmuxRunError(format!("non-utf8 tmux output: {e}")))
+            let output = orchestrator.run_exec(cmd.clone()).await.map_err(|e| TmuxRunError(e.to_string()))?;
+            crate::tmux_locator::exec_output_to_tmux_result(&cmd, output)
         }
     }
 }
@@ -1847,13 +1691,7 @@ impl SessionOrchestrator {
             recovered_ctl_socket_path.clone(),
         );
         registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
-        // タスク#58: `spawn_tmux_scrollback_backfill`が読む`tmux_backfill_locator`
-        // (`OrchestratorShared`フィールドのdoc参照)も同じタイミングで配線する。
-        // ここを呼ばないと`tmux_backfill_locator`が常に`None`のままとなり、
-        // フル再接続後のscrollback backfillがfail-openで常にスキップされ続ける
-        // (上のTMUX_LOCATOR_REGISTRY登録漏れと同種の、配線し忘れによる無効化)。
-        self.set_tmux_backfill_locator(Some(outcome.locator.clone()));
-        // 上と同じ理由で、tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
+        // tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
         // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
         // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが
         // 分かった今すぐ改めて試す(有効化されていなければ内部で無害にno-opする)。
@@ -1941,6 +1779,11 @@ mod tests {
         downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
         notifications: StdMutex<Vec<crate::NotifyKind>>,
         file_preview_outcomes: StdMutex<Vec<FilePreviewOutcome>>,
+        /// `on_host_key`へ渡された`(host, port, fingerprint)`。`host`/`port`は
+        /// `OrchestratorState::current_target()`(=`last_connect_attempt`)からの
+        /// 導出結果そのものなので、ミラーフィールド廃止後もUIへ正しい接続先が
+        /// 伝わっているかをここで直接検証できるようにしてある。
+        host_keys: StdMutex<Vec<(String, u16, String)>>,
         agent_sign_requests: StdMutex<Vec<String>>,
         clipboard_writes: StdMutex<Vec<ClipboardPayload>>,
         clipboard_pull_requests: StdMutex<u32>,
@@ -1948,6 +1791,13 @@ mod tests {
         cellular_fd_requests: StdMutex<u32>,
         rebind_states: StdMutex<Vec<crate::rebind_manager::RebindPublicState>>,
         prompt_jumps: StdMutex<Vec<Option<crate::PromptJumpTarget>>>,
+        // 以下は`forward_if_current!`が生成する単純委譲コールバックの検証用
+        // (`assert_forwards_only_while_current`参照)。`ForwardState`は
+        // `PartialEq`を持たないのでidだけを記録する。
+        data: StdMutex<Vec<Vec<u8>>>,
+        no_viable_paths: StdMutex<u32>,
+        forward_state_ids: StdMutex<Vec<String>>,
+        prompt_output_copies: StdMutex<Vec<Option<String>>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1955,18 +1805,25 @@ mod tests {
             self.connection_states.lock().unwrap().push(state);
         }
         fn on_screen_update(&self, _update: ScreenUpdate) {}
-        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool {
+        fn on_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
+            self.host_keys.lock().unwrap().push((host, port, fingerprint));
             true
         }
-        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_data(&self, data: Vec<u8>) {
+            self.data.lock().unwrap().push(data);
+        }
         fn on_trzsz_state_changed(&self, state: TrzszPublicState) {
             self.trzsz_states.lock().unwrap().push(state);
         }
         fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>) {
             self.downloads.lock().unwrap().push((file_name, data));
         }
-        fn on_no_viable_path(&self) {}
-        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_no_viable_path(&self) {
+            *self.no_viable_paths.lock().unwrap() += 1;
+        }
+        fn on_forward_state_changed(&self, id: String, _state: ForwardState) {
+            self.forward_state_ids.lock().unwrap().push(id);
+        }
         fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
             self.agent_sign_requests.lock().unwrap().push(key_fingerprint);
             true
@@ -1992,7 +1849,9 @@ mod tests {
         fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
             self.prompt_jumps.lock().unwrap().push(target);
         }
-        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_prompt_output_copy_ready(&self, text: Option<String>) {
+            self.prompt_output_copies.lock().unwrap().push(text);
+        }
         fn on_file_preview_result(&self, _request_id: String, outcome: FilePreviewOutcome) {
             self.file_preview_outcomes.lock().unwrap().push(outcome);
         }
@@ -2001,13 +1860,39 @@ mod tests {
         }
     }
 
+    /// `shared_with_phase`の`is_quic`が表現する「QUIC系トランスポートで接続中」の状態。
+    /// `current_host`/`current_port`/`is_quic`のミラーフィールドを廃止した今、
+    /// 「QUICで繋いでいる」は`last_connect_attempt`がQUIC系バリアントであることでしか
+    /// 表現できない(=両者が食い違う状態を作れない、というのがこの変更の狙い)。
+    /// host/portは旧ミラーフィールドの既定値と同じ`example.com:22`にしてある。
+    fn test_quic_attempt() -> LastConnectAttempt {
+        LastConnectAttempt::IsekaiPipeQuic(IsekaiPipeQuicConfig {
+            ssh_host: "example.com".to_string(),
+            ssh_port: 22,
+            username: "tester".to_string(),
+            auth: crate::SshAuth::Password { password: "unused".to_string() },
+            cols: 80,
+            rows: 24,
+            jump: None,
+            bind_port: None,
+        })
+    }
+
+    /// `begin_connect`へ渡すプレーンSSHのattempt(接続先ホスト名だけ差し替える)。
+    fn ssh_attempt(host: &str) -> LastConnectAttempt {
+        let mut config = test_ssh_config();
+        config.host = host.to_string();
+        LastConnectAttempt::Ssh(config)
+    }
+
+    /// `is_quic == false`側を敢えて`last_connect_attempt: None`のままにしてあるのは、
+    /// 多くのテストが「直前の接続設定が無いので自動再接続ループが始まらない」ことに
+    /// 依存しているため(例: `on_disconnected_sets_phase_idle_and_forwards_reason`)。
+    /// プレーンSSHのattemptが要るテストは各自`ssh_attempt`で設定する。
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
         let callback = Arc::new(RecordingCallback::default());
         let shared = Arc::new(OrchestratorShared {
             state: Mutex::new(OrchestratorState {
-                current_host: Some("example.com".to_string()),
-                current_port: 22,
-                is_quic,
                 phase,
                 current_transfer_id: None,
                 trzsz_mode: None,
@@ -2019,7 +1904,7 @@ mod tests {
                 reconnect_loop_active: false,
                 retry_attempt_in_flight: false,
                 user_initiated_disconnect: false,
-                last_connect_attempt: None,
+                last_connect_attempt: is_quic.then(test_quic_attempt),
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
                 tab_focused: false,
@@ -2032,8 +1917,6 @@ mod tests {
             app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             reconnect_attempt: Box::new(connect_via),
             reconnect_wake: tokio::sync::Notify::new(),
-            tmux_backfill_locator: Mutex::new(None),
-            after_reconnect_success: Box::new(|_shared| {}),
         });
         (shared, callback)
     }
@@ -2062,14 +1945,10 @@ mod tests {
     /// 単体テストでは「正しいcadenceで試行が発火したか」だけを見る。
     /// 自動再接続ループのテスト群が共有する`OrchestratorState`の組み立て
     /// (opusレビューLow指摘: 以前は2つのヘルパー関数がこの約20行をほぼ丸ごと
-    /// 複製していた)。`reconnect_attempt`/`after_reconnect_success`(テストごとに
-    /// 異なるフェイク)はこの関数の範囲外——呼び出し側が`OrchestratorShared`
-    /// 構築時に個別に指定する。
+    /// 複製していた)。`reconnect_attempt`(テストごとに異なるフェイク)は
+    /// この関数の範囲外——呼び出し側が`OrchestratorShared`構築時に個別に指定する。
     fn reconnect_test_state(policy: ReconnectPolicy) -> OrchestratorState {
         OrchestratorState {
-            current_host: Some("example.com".to_string()),
-            current_port: 22,
-            is_quic: false,
             phase: ConnPhase::Connected,
             current_transfer_id: None,
             trzsz_mode: None,
@@ -2107,52 +1986,8 @@ mod tests {
                 Ok(())
             }),
             reconnect_wake: tokio::sync::Notify::new(),
-            tmux_backfill_locator: Mutex::new(None),
-            after_reconnect_success: Box::new(|_shared| {}),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
-    }
-
-    /// タスク#58: `after_reconnect_success`フックが「自動再接続が成功した回数」
-    /// と正確に連動して呼ばれること(失敗した試行では呼ばれないこと)を検証する
-    /// ためだけの専用ヘルパー。`reconnect_attempt`自体は`should_fail`が指す
-    /// 呼び出し回数(1始まり)だけ`Err`を返し、それ以外は`Ok`にする——「毎回
-    /// 成功」だけでなく「一部の試行が失敗する」cadenceも再現できるようにする。
-    fn orchestrator_connected_with_reconnect_policy_and_backfill_counter(
-        policy: ReconnectPolicy,
-        fail_on_attempt_numbers: Vec<usize>,
-    ) -> (
-        SessionOrchestrator,
-        Arc<RecordingCallback>,
-        Arc<std::sync::atomic::AtomicUsize>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        let callback = Arc::new(RecordingCallback::default());
-        let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backfill_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = attempt_count.clone();
-        let backfill_counter_for_hook = backfill_count.clone();
-        let shared = Arc::new(OrchestratorShared {
-            state: Mutex::new(reconnect_test_state(policy)),
-            callback: callback.clone(),
-            session: Mutex::new(None),
-            path_observer: Mutex::new(net_health_policy::PathObserver::default()),
-            reconnect_attempt: Box::new(move |_shared, _attempt| {
-                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                if fail_on_attempt_numbers.contains(&n) {
-                    Err(SshError::ConnectionFailed)
-                } else {
-                    Ok(())
-                }
-            }),
-            reconnect_wake: tokio::sync::Notify::new(),
-            tmux_backfill_locator: Mutex::new(None),
-            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
-            after_reconnect_success: Box::new(move |_shared| {
-                backfill_counter_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }),
-        });
-        (SessionOrchestrator { shared }, callback, attempt_count, backfill_count)
     }
 
     fn test_ssh_config() -> SshConfig {
@@ -2251,7 +2086,7 @@ mod tests {
         // 新しいセッションを誤って切断してはいけない。
         let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
         orch.notify_network_path_changed(false);
-        orch.begin_connect("other.example.com".to_string(), 22, false)
+        orch.begin_connect(ssh_attempt("other.example.com"))
             .expect("Connected中の新規connectは許可されるはず");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2276,16 +2111,21 @@ mod tests {
         // TerminalSession.guardedConnect() の check-then-act は複数スレッドから並行に
         // 呼ばれるとアトミックではないため、最終防衛はRust側のこのロックの中で行う。
         let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
-        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        orch.shared.state.lock().last_connect_attempt = Some(ssh_attempt("example.com"));
+        let result = orch.begin_connect(ssh_attempt("other.example.com"));
         assert!(matches!(result, Err(SshError::ConnectionFailed)));
-        // 拒否された呼び出しは進行中の接続の host/port を書き換えてはいけない。
-        assert_eq!(orch.shared.state.lock().current_host.as_deref(), Some("example.com"));
+        // 拒否された呼び出しは進行中の接続の host/port(=`last_connect_attempt`)を
+        // 書き換えてはいけない。
+        assert_eq!(
+            orch.shared.state.lock().current_target(),
+            Some(("example.com".to_string(), 22, false))
+        );
     }
 
     #[test]
     fn begin_connect_allows_a_new_call_while_idle() {
         let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
-        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        let result = orch.begin_connect(ssh_attempt("other.example.com"));
         assert!(result.is_ok());
         assert!(orch.shared.state.lock().phase == ConnPhase::Connecting);
     }
@@ -2296,9 +2136,12 @@ mod tests {
         // (notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt
         // が検証する正当な経路)。
         let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
-        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        let result = orch.begin_connect(ssh_attempt("other.example.com"));
         assert!(result.is_ok());
-        assert_eq!(orch.shared.state.lock().current_host.as_deref(), Some("other.example.com"));
+        assert_eq!(
+            orch.shared.state.lock().current_target(),
+            Some(("other.example.com".to_string(), 22, false))
+        );
     }
 
     // ── OrchestratorAdapter (SessionCallback実装) ────────────
@@ -2311,6 +2154,8 @@ mod tests {
     #[test]
     fn on_connected_sets_phase_connected_and_reports_current_host() {
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        // 通知されるhostは`last_connect_attempt`からの導出結果(ミラーフィールドは無い)。
+        shared.state.lock().last_connect_attempt = Some(ssh_attempt("example.com"));
         adapter.on_connected();
         assert!(shared.state.lock().phase == ConnPhase::Connected);
         let events = cb.connection_states.lock().unwrap();
@@ -2517,10 +2362,20 @@ mod tests {
 
     #[test]
     fn on_host_key_reports_current_host_and_port_from_state() {
-        let (adapter, _shared, _cb) = adapter_with_phase(ConnPhase::Connecting, false);
-        // RecordingCallback::on_host_key always returns true; verifying it forwards
-        // without panicking exercises the host/port read out of shared state.
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        // ホスト鍵確認ダイアログに出すhost/portは`last_connect_attempt`からの導出結果。
+        // 別ホスト・別ポートのattemptを入れて、本当にそこから読んでいることを確認する。
+        let mut config = test_ssh_config();
+        config.host = "hostkey.example.com".to_string();
+        config.port = 2022;
+        shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Ssh(config));
+
         assert!(adapter.on_host_key("aa:bb:cc".to_string()));
+
+        assert_eq!(
+            cb.host_keys.lock().unwrap().as_slice(),
+            &[("hostkey.example.com".to_string(), 2022, "aa:bb:cc".to_string())]
+        );
     }
 
     #[test]
@@ -2699,113 +2554,179 @@ mod tests {
 
     // ── OrchestratorAdapter (SessionCallback) の単純委譲群 ──────
     //
-    // 以下はいずれも「is_current()なら`shared.callback`へそのまま委譲、staleなら
-    // 何もしない/既定値を返す」という同型のパターン。1テストで両方(委譲される値の
-    // 正しさ・staleになった後は委譲が止まること)を確認する。
+    // 以下はいずれも`forward_if_current!`が生成する「is_current()なら
+    // `shared.callback`へそのまま委譲、staleなら何もしない/既定値を返す」という
+    // 同型のパターン。共通の検証手順は`assert_forwards_only_while_current`に
+    // まとめつつ、テストはコールバックごとに独立させてある —— マクロ展開が
+    // 名前や引数を取り違えていれば(例: `on_prompt_jump`が別のコールバックへ
+    // 委譲していれば)そのコールバック固有の記録内容の比較で落ちる。
+
+    /// `forward_if_current!`が生成する単純委譲コールバック1つ分の検証。
+    ///
+    /// - `invoke`: 対象コールバックの呼び出し(戻り値も検証したいので返す)。
+    /// - `expected_when_current` / `expected_when_stale`: 現行/stale時の戻り値
+    ///   (staleは`Default::default()`相当 —— `()`/`false`/`None`)。
+    /// - `recorded`: `RecordingCallback`が記録した「何が届いたか」。型が
+    ///   コールバックごとに違うのでクロージャで取り出す。
+    ///
+    /// 現行adapterでの呼び出し後に`recorded`が`expected_recorded`と一致すること、
+    /// および新しいadapter生成でstaleにした後の2回目の呼び出しでも`recorded`が
+    /// **増えも変わりもしない**ことを見る(件数だけでなく内容まで比較するので、
+    /// 「委譲された値が正しいか」と「staleでは委譲されないか」の両方を1本で
+    /// カバーできる)。
+    fn assert_forwards_only_while_current<T, R>(
+        invoke: impl Fn(&OrchestratorAdapter) -> T,
+        expected_when_current: T,
+        expected_when_stale: T,
+        recorded: impl Fn(&RecordingCallback) -> R,
+        expected_recorded: R,
+    ) where
+        T: std::fmt::Debug + PartialEq,
+        R: std::fmt::Debug + PartialEq,
+    {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+
+        assert_eq!(invoke(&current), expected_when_current, "currentなadapterは委譲するはず");
+        assert_eq!(recorded(&cb), expected_recorded, "委譲された内容がそのまま届くはず");
+
+        // 新しいセッションが生成された(session_generationが進む)状況を模す。
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(invoke(&current), expected_when_stale, "staleなadapterは既定値を返すはず");
+        assert_eq!(recorded(&cb), expected_recorded, "staleなadapterからは委譲されないはず");
+    }
 
     #[test]
     fn on_agent_sign_request_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_agent_sign_request("aa:bb".to_string()));
-        assert_eq!(cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()]);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(!current.on_agent_sign_request("cc:dd".to_string()), "staleなadapterはfalseを返すべき");
-        assert_eq!(
-            cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()],
-            "staleなadapterからのforwardは発生しないはず"
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_agent_sign_request("aa:bb".to_string()),
+            true,
+            false,
+            |cb| cb.agent_sign_requests.lock().unwrap().clone(),
+            vec!["aa:bb".to_string()],
         );
     }
 
     #[test]
     fn on_clipboard_write_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
         let payload = ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"hello".to_vec() };
-        current.on_clipboard_write(payload.clone());
-        assert_eq!(cb.clipboard_writes.lock().unwrap().as_slice(), &[payload]);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_clipboard_write(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"stale".to_vec() });
-        assert_eq!(
-            cb.clipboard_writes.lock().unwrap().len(), 1,
-            "staleなadapterからのon_clipboard_writeは転送されないはず"
+        let expected = vec![payload.clone()];
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_clipboard_write(payload.clone()),
+            (),
+            (),
+            |cb| cb.clipboard_writes.lock().unwrap().clone(),
+            expected,
         );
     }
 
     #[test]
     fn on_clipboard_pull_request_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        assert_eq!(
-            current.on_clipboard_pull_request(),
-            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_clipboard_pull_request(),
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() }),
+            None,
+            |cb| *cb.clipboard_pull_requests.lock().unwrap(),
+            1,
         );
-        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert_eq!(current.on_clipboard_pull_request(), None, "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
     }
 
     #[test]
     fn on_request_wifi_fd_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        let fd = current.on_request_wifi_fd().expect("current adapter should forward");
-        assert_eq!((fd.fd, fd.local_ip.as_str()), (42, "10.0.0.1"));
-        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_request_wifi_fd().is_none(), "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+        // `PlatformFd`は`PartialEq`を持たない(uniffi::Record)ので、比較可能な
+        // タプルへ落としてから検証する。
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_request_wifi_fd().map(|fd| (fd.fd, fd.local_ip)),
+            Some((42, "10.0.0.1".to_string())),
+            None,
+            |cb| *cb.wifi_fd_requests.lock().unwrap(),
+            1,
+        );
     }
 
     #[test]
     fn on_request_cellular_fd_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        let fd = current.on_request_cellular_fd().expect("current adapter should forward");
-        assert_eq!((fd.fd, fd.local_ip.as_str()), (43, "10.0.0.2"));
-        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1);
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        assert!(current.on_request_cellular_fd().is_none(), "staleなadapterはNoneを返すべき");
-        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_request_cellular_fd().map(|fd| (fd.fd, fd.local_ip)),
+            Some((43, "10.0.0.2".to_string())),
+            None,
+            |cb| *cb.cellular_fd_requests.lock().unwrap(),
+            1,
+        );
     }
 
     #[test]
     fn on_rebind_state_changed_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
-        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular);
-        assert_eq!(
-            cb.rebind_states.lock().unwrap().as_slice(),
-            &[crate::rebind_manager::RebindPublicState::FailedOverToCellular]
-        );
-
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::OnWifi);
-        assert_eq!(
-            cb.rebind_states.lock().unwrap().len(), 1,
-            "staleなadapterからのon_rebind_state_changedは転送されないはず"
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular),
+            (),
+            (),
+            |cb| cb.rebind_states.lock().unwrap().clone(),
+            vec![crate::rebind_manager::RebindPublicState::FailedOverToCellular],
         );
     }
 
     #[test]
     fn on_prompt_jump_forwards_and_is_suppressed_for_stale_generation() {
-        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
-        let current = OrchestratorAdapter::new(shared.clone());
         let target = Some(crate::PromptJumpTarget { scroll_offset: 5, is_live: false });
-        current.on_prompt_jump(target);
-        assert_eq!(cb.prompt_jumps.lock().unwrap().as_slice(), &[target]);
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_prompt_jump(target),
+            (),
+            (),
+            |cb| cb.prompt_jumps.lock().unwrap().clone(),
+            vec![target],
+        );
+    }
 
-        let _fresh = OrchestratorAdapter::new(shared.clone());
-        current.on_prompt_jump(None);
-        assert_eq!(
-            cb.prompt_jumps.lock().unwrap().len(), 1,
-            "staleなadapterからのon_prompt_jumpは転送されないはず"
+    // 以下4つは、マクロ化するまで単純委譲であること自体が無検証だった残りの
+    // コールバック。`RecordingCallback`側に記録を足して同じヘルパーで確認する
+    // (`on_screen_update`だけは、`ScreenUpdate`が`PartialEq`を持たない大きな
+    // Record型で値の合成コストに見合わないため対象外にしてある —— 委譲先の
+    // 名前・引数はマクロが同じ`$name`から生成するのでコンパイラが保証しており、
+    // 残る検証価値はstaleガードだけで、それは他の11メソッドで確認済み)。
+
+    #[test]
+    fn on_data_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_data(b"hello".to_vec()),
+            (),
+            (),
+            |cb| cb.data.lock().unwrap().clone(),
+            vec![b"hello".to_vec()],
+        );
+    }
+
+    #[test]
+    fn on_no_viable_path_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_no_viable_path(),
+            (),
+            (),
+            |cb| *cb.no_viable_paths.lock().unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn on_forward_state_changed_forwards_and_is_suppressed_for_stale_generation() {
+        // `ForwardState`は`PartialEq`を持たないため、記録側でidだけを取っている。
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_forward_state_changed("fwd-1".to_string(), ForwardState::Listening),
+            (),
+            (),
+            |cb| cb.forward_state_ids.lock().unwrap().clone(),
+            vec!["fwd-1".to_string()],
+        );
+    }
+
+    #[test]
+    fn on_prompt_output_copy_ready_forwards_and_is_suppressed_for_stale_generation() {
+        assert_forwards_only_while_current(
+            |adapter| adapter.on_prompt_output_copy_ready(Some("output".to_string())),
+            (),
+            (),
+            |cb| cb.prompt_output_copies.lock().unwrap().clone(),
+            vec![Some("output".to_string())],
         );
     }
 
@@ -2838,78 +2759,6 @@ mod tests {
             attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "retry_interval経過後に再接続が試みられるはず"
         );
-    }
-
-    // ── タスク#58: フル再接続成功後のtmux scrollback backfillフック ──────
-
-    #[test]
-    fn after_reconnect_success_fires_once_per_successful_automatic_reconnect_attempt() {
-        // resumeが尽きて自動再接続ループ(`spawn_reconnect_loop`)が実際に
-        // `connect_via`相当のフェイクを成功させるたびに、`after_reconnect_success`
-        // フックが呼ばれることを確認する——これがオーケストレータ側の
-        // 「resume失敗/フル再接続」シグナルそのもの(このフェイクは常に成功する
-        // ので、成功回数と`attempt_count`は常に一致するはず)。
-        let (orch, _cb, attempt_count, backfill_count) =
-            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
-        let adapter = OrchestratorAdapter::new(orch.shared.clone());
-
-        adapter.on_disconnected(Some("peer closed".to_string()));
-        std::thread::sleep(Duration::from_millis(80));
-
-        let attempts = attempt_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(attempts >= 1, "少なくとも1回は再接続試行が起きるはず");
-        // opusレビューM3: attempt_countとbackfill_countは別々のタイミングでloadする
-        // 2つの独立したアトミックのため、この2回のload()の間にループがもう1回
-        // 試行を開始してattempt_countだけ先に進んでいる(その試行のbackfillはまだ
-        // 記録されていない)ことがある(高負荷環境で特に踏みやすい)。「backfillは
-        // 成功した試行の数」という不変条件は、現在進行中の1試行分の遅延を許容した
-        // 範囲(attempts-1 <= backfill <= attempts)としてなら常に成り立つ。
-        let backfill = backfill_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            backfill == attempts || backfill == attempts - 1,
-            "backfillは成功した試行の回数と一致するか、直近1試行分だけ遅れているはず, \
-             attempts={attempts} backfill={backfill}"
-        );
-    }
-
-    #[test]
-    fn after_reconnect_success_does_not_fire_when_the_reconnect_attempt_fails() {
-        // 再接続の試行自体が(同期的に)失敗した場合は、まだ「フル再接続に成功
-        // した」わけではないので、backfillフックを呼んではいけない
-        // ("NOT on every reconnect" —— 成功した試行にだけ反応する)。
-        let (orch, _cb, attempt_count, backfill_count) = orchestrator_connected_with_reconnect_policy_and_backfill_counter(
-            fast_test_policy(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8], // 観測しうる試行回数を広く先回りして失敗させる
-        );
-        let adapter = OrchestratorAdapter::new(orch.shared.clone());
-
-        adapter.on_disconnected(Some("peer closed".to_string()));
-        std::thread::sleep(Duration::from_millis(80));
-
-        assert!(
-            attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "再接続の試行自体は起きるはず(失敗するだけ)"
-        );
-        assert_eq!(
-            backfill_count.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "1回も成功していないのでbackfillフックは1度も呼ばれないはず"
-        );
-    }
-
-    #[test]
-    fn after_reconnect_success_does_not_fire_when_no_disconnect_ever_happens() {
-        // resumeがtransport層で透過的に成功した場合、`on_disconnected`自体が
-        // 一度も発火しないため自動再接続ループも`connect_via`も一切呼ばれない
-        // ——「resume成功パスを一切妨げない」ことは、この経路がそもそも
-        // `reconnect_attempt`/`after_reconnect_success`に触れないという構造上の
-        // 性質としてすでに保証されている(この回帰を検出するための明示テスト)。
-        let (orch, _cb, attempt_count, backfill_count) =
-            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(backfill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let _ = orch;
     }
 
     #[test]
@@ -3087,7 +2936,7 @@ mod tests {
         assert!(orch.shared.state.lock().reconnect_loop_active);
 
         // 手動で新しい接続を開始(begin_connect相当)。
-        let _new_adapter = orch.begin_connect("other.example.com".to_string(), 22, false)
+        let _new_adapter = orch.begin_connect(ssh_attempt("other.example.com"))
             .expect("Idle中の新規connectは許可されるはず");
         assert!(!orch.shared.state.lock().reconnect_loop_active, "新しい手動接続でループは無効化されるはず");
 
@@ -3230,26 +3079,6 @@ mod tests {
     }
 
     #[test]
-    fn notify_will_enter_foreground_after_budget_expired_also_fires_the_backfill_hook_on_success() {
-        // タスク#58: バックグラウンド猶予切れからのフォアグラウンド復帰再接続
-        // (`notify_will_enter_foreground`が直接`reconnect_attempt`を呼ぶ経路)も
-        // `spawn_reconnect_loop`と同じく「フル再接続に成功した」経路なので、
-        // 同じ`after_reconnect_success`フックを経由するはず。
-        let (orch, _cb, attempt_count, backfill_count) =
-            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
-        orch.notify_did_enter_background(30_000);
-        orch.notify_background_budget_expired();
-
-        orch.notify_will_enter_foreground();
-
-        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            backfill_count.load(std::sync::atomic::Ordering::SeqCst), 1,
-            "フォアグラウンド復帰再接続の成功でもbackfillフックが呼ばれるはず"
-        );
-    }
-
-    #[test]
     fn notify_will_enter_foreground_does_not_double_trigger_when_reconnect_loop_already_active() {
         let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
         orch.notify_did_enter_background(30_000);
@@ -3292,7 +3121,7 @@ mod tests {
     fn begin_connect_resets_background_state_to_foreground() {
         let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
         orch.shared.state.lock().background_state = BackgroundState::Suspended;
-        let _ = orch.begin_connect("example.com".to_string(), 22, false);
+        let _ = orch.begin_connect(ssh_attempt("example.com"));
         assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
     }
 
@@ -3340,28 +3169,7 @@ mod tests {
         let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = attempt_count.clone();
         let shared = Arc::new(OrchestratorShared {
-            state: Mutex::new(OrchestratorState {
-                current_host: Some("example.com".to_string()),
-                current_port: 22,
-                is_quic: false,
-                phase: ConnPhase::Connected,
-                current_transfer_id: None,
-                trzsz_mode: None,
-                download_buf: Vec::new(),
-                size_limit_exceeded_for: None,
-                pending_file_previews: HashMap::new(),
-                session_generation: 0,
-                reconnect_epoch: 0,
-                reconnect_loop_active: false,
-                retry_attempt_in_flight: false,
-                user_initiated_disconnect: false,
-                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
-                reconnect_policy: ReconnectPolicy::default(),
-                background_state: BackgroundState::Foreground,
-                tab_focused: false,
-                app_foreground: true,
-                recent_notify_seqs: std::collections::VecDeque::new(),
-            }),
+            state: Mutex::new(reconnect_test_state(ReconnectPolicy::default())),
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
@@ -3376,8 +3184,6 @@ mod tests {
                 Err(SshError::ConnectionFailed)
             }),
             reconnect_wake: tokio::sync::Notify::new(),
-            tmux_backfill_locator: Mutex::new(None),
-            after_reconnect_success: Box::new(|_shared| {}),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }
@@ -3620,76 +3426,59 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
         use tokio::net::TcpListener as TokioTcpListener;
-        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+        use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
         use crate::SshAuth;
+        // transport/ssh_handler.rs・transport/forward.rsのテストと同型(このファイルは
+        // その2つの合併集合そのもの)だったOrchestratorCallbackのno-op寄りテストダブルを
+        // test_callbacks.rsへ共通化した。
+        use crate::test_callbacks::{
+            ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
+        };
 
-        #[allow(dead_code)]
-        enum TestEvent {
-            Connection(ConnectionPublicState),
-            Data(Vec<u8>),
-            Forward(String, ForwardState),
-            FilePreview(String, FilePreviewOutcome),
+        /// `MockServer::data`の挙動切り替え。`RecordingServer`(受信データをそのまま
+        /// echoし返す)と`ScriptedServer`(echoせず`received`に記録するだけで、代わりに
+        /// `shell_request`時に保存した`server::Handle`からテストコードが任意タイミングで
+        /// バイトを能動的に送り込める)は、以前は別々の`Server`/`Handler`ペアだったが、
+        /// `data()`以外の全メソッド(auth/pty/shell/window_change/channel_close/exec)は
+        /// バイト単位で同一実装だったため1つの`MockServer`に統合し、モードだけで分岐する。
+        #[derive(Clone, Copy, PartialEq)]
+        enum MockServerMode {
+            /// scrollback/focus/resize系のテスト向け(旧`RecordingServer`)。
+            Echo,
+            /// trzsz系のテスト向け(旧`ScriptedServer`)。
+            RecordOnly,
         }
 
-        struct TestCallback {
-            tx: UnboundedSender<TestEvent>,
-        }
-
-        impl OrchestratorCallback for TestCallback {
-            fn on_connection_state_changed(&self, state: ConnectionPublicState) {
-                let _ = self.tx.send(TestEvent::Connection(state));
-            }
-            fn on_screen_update(&self, _update: ScreenUpdate) {}
-            fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
-            fn on_data(&self, data: Vec<u8>) {
-                let _ = self.tx.send(TestEvent::Data(data));
-            }
-            fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
-            fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
-            fn on_no_viable_path(&self) {}
-            fn on_forward_state_changed(&self, id: String, state: ForwardState) {
-                let _ = self.tx.send(TestEvent::Forward(id, state));
-            }
-            fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-            fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
-            fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
-            fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-            fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-            fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-            fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
-            fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
-            fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
-                let _ = self.tx.send(TestEvent::FilePreview(request_id, outcome));
-            }
-            fn on_notify(&self, _kind: crate::NotifyKind) {}
-        }
-
-        /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
-        /// 記録しつつ、受信データをそのままechoし返す最小SSHサーバ。
         #[derive(Clone)]
-        struct RecordingServer {
+        struct MockServer {
+            mode: MockServerMode,
             window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
             channel_closed: Arc<AtomicBool>,
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
         }
 
-        impl server::Server for RecordingServer {
-            type Handler = RecordingHandler;
-            fn new_client(&mut self, _: Option<SocketAddr>) -> RecordingHandler {
-                RecordingHandler {
-                    window_changes: self.window_changes.clone(),
-                    channel_closed: self.channel_closed.clone(),
+        impl MockServer {
+            fn new(mode: MockServerMode) -> Self {
+                Self {
+                    mode,
+                    window_changes: Arc::new(StdMutex::new(Vec::new())),
+                    channel_closed: Arc::new(AtomicBool::new(false)),
+                    channel_handle: Arc::new(StdMutex::new(None)),
+                    received: Arc::new(StdMutex::new(Vec::new())),
                 }
             }
         }
 
-        #[derive(Clone)]
-        struct RecordingHandler {
-            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
-            channel_closed: Arc<AtomicBool>,
+        impl server::Server for MockServer {
+            type Handler = MockServer;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> MockServer {
+                self.clone()
+            }
         }
 
         #[async_trait::async_trait]
-        impl server::Handler for RecordingHandler {
+        impl server::Handler for MockServer {
             type Error = russh::Error;
 
             async fn auth_publickey(
@@ -3716,6 +3505,9 @@ mod tests {
                 &mut self, channel: ChannelId, session: &mut ServerSession,
             ) -> Result<(), Self::Error> {
                 session.channel_success(channel)?;
+                // ScriptedServer相当の用途(trzsz系)でのみ実際に読まれるが、常に保存して
+                // おいても他モードには無害(誰も読まない)。
+                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
                 Ok(())
             }
 
@@ -3730,7 +3522,14 @@ mod tests {
             async fn data(
                 &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
             ) -> Result<(), Self::Error> {
-                session.data(channel, CryptoVec::from(data.to_vec()))?;
+                match self.mode {
+                    MockServerMode::Echo => {
+                        session.data(channel, CryptoVec::from(data.to_vec()))?;
+                    }
+                    MockServerMode::RecordOnly => {
+                        self.received.lock().unwrap().extend_from_slice(data);
+                    }
+                }
                 Ok(())
             }
 
@@ -3758,7 +3557,7 @@ mod tests {
             }
         }
 
-        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+        async fn spawn_mock_server(mode: MockServerMode) -> (SocketAddr, MockServer) {
             let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
             let host_key = russh_keys::PrivateKey::from(keypair);
             let config = Arc::new(server::Config {
@@ -3767,17 +3566,23 @@ mod tests {
             });
             let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let window_changes = Arc::new(StdMutex::new(Vec::new()));
-            let channel_closed = Arc::new(AtomicBool::new(false));
-            let mut sh = RecordingServer {
-                window_changes: window_changes.clone(),
-                channel_closed: channel_closed.clone(),
-            };
+            let handle = MockServer::new(mode);
+            let mut sh = handle.clone();
             tokio::spawn(async move {
                 use server::Server as _;
                 let _ = sh.run_on_socket(config, &listener).await;
             });
-            (addr, window_changes, channel_closed)
+            (addr, handle)
+        }
+
+        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let (addr, sh) = spawn_mock_server(MockServerMode::Echo).await;
+            (addr, sh.window_changes, sh.channel_closed)
+        }
+
+        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
+            let (addr, sh) = spawn_mock_server(MockServerMode::RecordOnly).await;
+            (addr, sh.channel_handle, sh.received)
         }
 
         fn key_auth(seed: u8) -> SshAuth {
@@ -3850,23 +3655,21 @@ mod tests {
             panic!("did not observe a FilePreviewOutcome for id={} within timeout", expected_id);
         }
 
-        async fn wait_forward_state(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str, expect_listening: bool) {
+        /// VTEでの画面反映は`on_screen_update`コールバック駆動の非同期処理なので、
+        /// scrollbackへの反映が追いつくまで短時間ポーリングして`scrollback_len()`が
+        /// 0より大きくなるのを待つ(2つのテストがこの手順を独立に持っていたので共通化)。
+        /// 反映されなければ最後に観測した値(0)を返し、呼び出し側で`assert!(len > 0, ...)`
+        /// させる(パニックメッセージをテストごとに変えたいため、ここではpanicしない)。
+        async fn wait_scrollback_nonzero(orch: &SessionOrchestrator) -> u32 {
+            let mut len = 0u32;
             for _ in 0..50 {
-                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                    Ok(Some(TestEvent::Forward(id, state))) if id == expected_id => {
-                        match (&state, expect_listening) {
-                            (ForwardState::Listening, true) => return,
-                            (ForwardState::Stopped, false) => return,
-                            _ => continue,
-                        }
-                    }
-                    _ => continue,
+                len = orch.scrollback_len();
+                if len > 0 {
+                    break;
                 }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            panic!(
-                "did not observe expected ForwardState for id={} (listening={}) within timeout",
-                expected_id, expect_listening
-            );
+            len
         }
 
         async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
@@ -3934,14 +3737,7 @@ mod tests {
                 wait_echo(&mut rx, b"line-059").await;
                 // VTEでの画面反映は非同期(on_screen_updateコールバック駆動)なので、
                 // scrollbackへの反映が追いつくまで短時間ポーリングする。
-                let mut len = 0u32;
-                for _ in 0..50 {
-                    len = orch.scrollback_len();
-                    if len > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                let len = wait_scrollback_nonzero(&orch).await;
                 assert!(
                     len > 0,
                     "SessionOrchestrator::scrollback_len()が実際のtransport/terminal状態を \
@@ -3959,96 +3755,13 @@ mod tests {
 
         // ── trzsz_accept_download / trzsz_accept_upload / trzsz_cancel ──
         //
-        // 上のRecordingServerはクライアントからのデータを無条件にechoするだけなので、
-        // サーバー側が任意タイミングで能動的にバイトを送れる`ScriptedServer`を別途
-        // 用意する(`session.handle()`を`shell_request`時に保存し、テストコードから
-        // `Handle::data()`で直接送り込む)。これにより実物のtrzszトリガー/CFG/NUM
-        // フレームをワイヤ上に流し、`SessionOrchestrator::trzsz_accept_download`等の
-        // 委譲がno-opに変異した場合に実際に検知できるテストを組む。
-
-        #[derive(Clone)]
-        struct ScriptedServer {
-            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
-            received: Arc<StdMutex<Vec<u8>>>,
-        }
-
-        impl server::Server for ScriptedServer {
-            type Handler = ScriptedHandler;
-            fn new_client(&mut self, _: Option<SocketAddr>) -> ScriptedHandler {
-                ScriptedHandler {
-                    channel_handle: self.channel_handle.clone(),
-                    received: self.received.clone(),
-                }
-            }
-        }
-
-        #[derive(Clone)]
-        struct ScriptedHandler {
-            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
-            received: Arc<StdMutex<Vec<u8>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl server::Handler for ScriptedHandler {
-            type Error = russh::Error;
-
-            async fn auth_publickey(
-                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
-            ) -> Result<Auth, Self::Error> {
-                Ok(Auth::Accept)
-            }
-
-            async fn channel_open_session(
-                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
-            ) -> Result<bool, Self::Error> {
-                Ok(true)
-            }
-
-            async fn pty_request(
-                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
-                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(channel)?;
-                Ok(())
-            }
-
-            async fn shell_request(
-                &mut self, channel: ChannelId, session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(channel)?;
-                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
-                Ok(())
-            }
-
-            async fn data(
-                &mut self, _channel: ChannelId, data: &[u8], _session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                self.received.lock().unwrap().extend_from_slice(data);
-                Ok(())
-            }
-        }
-
-        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
-            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
-            let host_key = russh_keys::PrivateKey::from(keypair);
-            let config = Arc::new(server::Config {
-                keys: vec![host_key],
-                ..Default::default()
-            });
-            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let channel_handle = Arc::new(StdMutex::new(None));
-            let received = Arc::new(StdMutex::new(Vec::new()));
-            let mut sh = ScriptedServer {
-                channel_handle: channel_handle.clone(),
-                received: received.clone(),
-            };
-            tokio::spawn(async move {
-                use server::Server as _;
-                let _ = sh.run_on_socket(config, &listener).await;
-            });
-            (addr, channel_handle, received)
-        }
+        // 上のRecordingServer相当(`MockServerMode::Echo`)はクライアントからのデータを
+        // 無条件にechoするだけなので、サーバー側が任意タイミングで能動的にバイトを送れる
+        // `MockServerMode::RecordOnly`を代わりに使う(`session.handle()`を`shell_request`
+        // 時に保存し、テストコードから`Handle::data()`で直接送り込む)。これにより実物の
+        // trzszトリガー/CFG/NUMフレームをワイヤ上に流し、`SessionOrchestrator::
+        // trzsz_accept_download`等の委譲がno-opに変異した場合に実際に検知できるテストを
+        // 組む(`spawn_scripted_server`は上の`MockServer`定義の直後を参照)。
 
         async fn connect_scripted_orchestrator() -> (
             Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>,
@@ -4062,7 +3775,7 @@ mod tests {
             (orch, rx, channel_handle, received)
         }
 
-        /// `shell_request`が届き`ScriptedHandler`が`Handle`を保存するまで待ってから、
+        /// `shell_request`が届き`MockServer`(`RecordOnly`モード)が`Handle`を保存するまで待ってから、
         /// テストコードから能動的にバイトをクライアントへ送り込む
         /// (実物のtrzszトリガー/CFG/NUMフレームをそのままワイヤに流すために使う)。
         async fn send_from_server(slot: &Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, bytes: Vec<u8>) {
@@ -4188,35 +3901,6 @@ mod tests {
             });
         }
 
-        // ── add_local_forward / remove_forward ──
-
-        #[test]
-        fn add_local_forward_then_remove_forward_drive_the_real_transport() {
-            crate::init_logger();
-            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
-            rt.block_on(async {
-                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
-
-                // bind_port=0でOSにポートを選ばせる(このテストは実際に転送先へ
-                // 接続するのではなく、実transportまでコマンドが届いて本当に
-                // リスナーが立ち上がった/畳まれたことをForwardStateコールバックで
-                // 確認するだけなので、具体的なポート番号は不要)。
-                orch.add_local_forward(
-                    "fwd-1".to_string(), "127.0.0.1".to_string(), 0,
-                    "example.invalid".to_string(), 80,
-                );
-                // ActiveSession::add_local_forwardがno-opに変異していれば
-                // TransportCommandが送られず、リスナーも立ち上がらないため
-                // ForwardState::Listeningは永遠に届かずタイムアウトする。
-                wait_forward_state(&mut rx, "fwd-1", true).await;
-
-                orch.remove_forward("fwd-1".to_string());
-                // 同様にActiveSession::remove_forwardがno-opに変異していれば
-                // リスナーは立ったままでForwardState::Stoppedは届かない。
-                wait_forward_state(&mut rx, "fwd-1", false).await;
-            });
-        }
-
         // ── notify_focus_change ──
 
         #[test]
@@ -4270,7 +3954,7 @@ mod tests {
                 //
                 // SGR属性の実効色は「実行時点」でtheme.default_fg/bgから解決されて
                 // cur_attrsにスナップショットされる(以降テーマが変わっても、明示的な
-                // SGRリセットが無い限り再解決されない)。RecordingServerが素通しで
+                // SGRリセットが無い限り再解決されない)。MockServer(Echoモード)が素通しで
                 // echoする性質を利用し、`\x1b[0m`をecho往復させてからテキストを送ることで
                 // 新テーマでの解決を強制する。
                 orch.send(b"\x1b[0m".to_vec());
@@ -4279,14 +3963,7 @@ mod tests {
                 }
                 wait_echo(&mut rx, b"line-059").await;
 
-                let mut len = 0u32;
-                for _ in 0..50 {
-                    len = orch.scrollback_len();
-                    if len > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                let len = wait_scrollback_nonzero(&orch).await;
                 assert!(len > 0, "scrollbackへの反映を待つ準備ができていない");
 
                 let cells = orch.scrollback_cells(0, 1);
@@ -4317,7 +3994,7 @@ mod tests {
                 // SessionOrchestrator::file_preview_requestがno-op(session.file_preview_execを
                 // 呼ばない)に変異していれば、`queued`は常にfalseとなり即座に
                 // FilePreviewOutcome::Error{"not connected"}が同期的に返る。実transportまで
-                // 委譲されていれば、RecordingServerのexec_requestが返す実物のls JSONが
+                // 委譲されていれば、MockServerのexec_requestが返す実物のls JSONが
                 // 非同期に届くはず。
                 let outcome = wait_file_preview_result(&mut rx, "req-1").await;
                 match outcome {

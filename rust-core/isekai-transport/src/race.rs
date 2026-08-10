@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::session_id::SessionId;
-use quicmux::{AnyByteStream, AnyMuxFactory, RemoteSpec, Winner};
+use quicmux::{AnyByteStream, AnyMuxFactory, Winner};
 
 use crate::attempt::AttemptFailure;
 use crate::relay::{connect_and_handshake, random_session_id};
@@ -151,14 +151,12 @@ async fn relay_attempt(
     identity: CandidateIdentity<'_>,
 ) -> Result<AnyByteStream, AttemptFailure> {
     let endpoint = factory
-        .create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range))
+        .create_endpoint(target.bind_spec())
         .await
         .map_err(|source| AttemptFailure::RetryablePreAttach { source: crate::error::TransportError::Mux(source) })?;
-    let remote =
-        RemoteSpec { addr: target.helper_addr, server_name: target.server_name.clone(), cert_sha256_hex: target.cert_sha256_hex.clone() };
     // No resume support in the race path yet (module docs: minimal scope) —
     // `0` means "no preference".
-    connect_and_handshake(&endpoint, remote, &target.session_secret, session_id, generation, 0, identity)
+    connect_and_handshake(&endpoint, target.remote_spec(), &target.session_secret, session_id, generation, 0, identity)
         .await
         .map(|(_conn, stream, _proof, _grace)| stream)
         .map_err(AttemptFailure::from)

@@ -3415,6 +3415,13 @@ tmuxの「session group」機構(同じウィンドウ/ペイン集合を共有�
   ペイン種別のlocatorのみ対象。`orchestrator.rs::spawn_tmux_scrollback_backfill`から
   `after_reconnect_success`フックとして起動されるが、これは「resumeが失敗しフルreconnect
   した」経路のみで発火し、初回接続やトランスポート層の透過的resumeでは発火しない。
+  **2026-08-09削除**: `fetch_tmux_scrollback_history`は`TmuxTargetKind::Pane`のlocatorしか
+  受け付けないが、唯一の呼び出し元が経由する`tmux_session::ensure_tab_window`は両分岐とも
+  常に`TmuxTargetKind::Window`のlocatorしか作らないため、実装当初から一度も実行されたことが
+  ない到達不能コードだったと判明(rust-core cleanupパスの重複監査で発見)。ユーザー判断により
+  `tmux_scrollback.rs`本体・`ActiveSessionTmuxRunner`・`spawn_tmux_scrollback_backfill`・
+  `OrchestratorShared::tmux_backfill_locator`/`after_reconnect_success`フックごと削除し、
+  再配線はしない方針とした。
 - **`rust-core/src/tmux_notify.rs`(#57、hook→Android通知)**: 実機tmux 3.3aでの検証結果を
   モジュール冒頭に記録: `alert-bell`/`alert-activity`/`alert-silence`は`-w`指定でも
   黙ってsessionスコープに丸められる一方、`pane-died`は逆にwindow/pane スコープのみ有効
@@ -3507,10 +3514,11 @@ tmuxの「session group」機構(同じウィンドウ/ペイン集合を共有�
   同じ`TabAlertNotifier`経路へ配線したため、現在は7バリアントすべてが実際にこの
   オブジェクトを通ってAndroid通知として届く(`AI_INTEGRATION_DESIGN.md` §11.1.4参照)。
 
-**実装**: `rust-core/src/tmux_locator.rs`・`tmux_session.rs`・`tmux_scrollback.rs`・
-`tmux_notify.rs`、`rust-core/src/transport/ssh_handler.rs`(`SshHandleTmuxRunner`・
+**実装**: `rust-core/src/tmux_locator.rs`・`tmux_session.rs`・`tmux_notify.rs`
+(`tmux_scrollback.rs`は2026-08-09に到達不能dead codeとして削除済み、上記参照)、
+`rust-core/src/transport/ssh_handler.rs`(`SshHandleTmuxRunner`・
 `run_exec_on_handle`)、`rust-core/src/orchestrator.rs`(`ensure_tmux_tab_window`・
-`spawn_tmux_scrollback_backfill`・`on_notify`・`OrchestratorTmuxRunner`)、
+`on_notify`・`OrchestratorTmuxRunner`)、
 `rust-core/isekai-pipe/src/ctl.rs`(`resolve_ctl_socket_path`のtmuxフォールバック)、
 Android側`TerminalTabsViewModel.kt`(`maybeEnsureTmuxTabWindow`)・
 `data/TmuxTabLocator.kt`(Room `tmux_tab_locators`テーブル、`profile_id`キー)・

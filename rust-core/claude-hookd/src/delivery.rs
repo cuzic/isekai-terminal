@@ -103,12 +103,13 @@ impl Delivery {
     /// time. Crucially, `TmuxSession`'s identity is the *session*, not any
     /// one pane — see this module's docs on why every pane in a session must
     /// share one daemon.
+    ///
+    /// Identical to [`Self::to_spec`] — deliberately implemented in terms of
+    /// it rather than duplicating the match, so a future change to the spec
+    /// format (which [`Self::from_spec`] parses back) can't silently
+    /// desync the daemon-socket identity from it.
     pub(crate) fn identity(&self) -> String {
-        match self {
-            Delivery::IsekaiPipeCtl { ctl_sock } => format!("ctl:{}", ctl_sock.display()),
-            Delivery::TmuxSession { session_id } => format!("tmux-session:{session_id}"),
-            Delivery::DirectTty { path } => format!("tty:{}", path.display()),
-        }
+        self.to_spec()
     }
 
     /// Round-trips through `--delivery-spec` (see `main.rs`'s
@@ -179,28 +180,17 @@ async fn send_tab_color_with(
     hooks_dir: Option<&Path>,
     resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>,
 ) {
-    match delivery {
-        Delivery::IsekaiPipeCtl { ctl_sock } => {
-            let _ = send_ctl_message(ctl_sock, isekai_protocol::CtlMessage::SetTabColor { r, g, b }).await;
+    // Only resolved for TmuxSession/DirectTty — IsekaiPipeCtl sends the raw
+    // RGB value over the ctl-socket instead and has no use for a local
+    // tab-color script at all, so this must not spawn one just to discard
+    // the result.
+    let raw_osc = match delivery {
+        Delivery::IsekaiPipeCtl { .. } => String::new(),
+        Delivery::TmuxSession { .. } | Delivery::DirectTty { .. } => {
+            super::tab_color::resolve(hooks_dir, r, g, b).await
         }
-        Delivery::TmuxSession { session_id } => {
-            let Some(path) = resolve_active_pane_tty(session_id) else { return };
-            let seq = super::tab_color::resolve(hooks_dir, r, g, b).await;
-            // Empty is a deliberate downgrade (either this crate's own
-            // embedded default script failed to run, or a user's override
-            // script decided this terminal shouldn't get anything) — not a
-            // reason to write an empty passthrough wrapper to the tty.
-            if !seq.is_empty() {
-                write_tty(&path, &wrap_for_tmux_passthrough(&seq));
-            }
-        }
-        Delivery::DirectTty { path } => {
-            let seq = super::tab_color::resolve(hooks_dir, r, g, b).await;
-            if !seq.is_empty() {
-                write_tty(path, &seq);
-            }
-        }
-    }
+    };
+    deliver(delivery, isekai_protocol::CtlMessage::SetTabColor { r, g, b }, &raw_osc, &resolve_active_pane_tty).await
 }
 
 pub(crate) async fn send_notify_popup(delivery: &Delivery) {
@@ -212,26 +202,52 @@ async fn send_notify_popup_with(delivery: &Delivery, resolve_active_pane_tty: im
     // several terminal emulators support (same choice
     // `isekai-ssh::ctl_forward::osc_sequence_for` makes for the same message
     // kind).
-    let seq = "\x1b]9;Claude Code: needs your input\x07";
+    let raw_osc = "\x1b]9;Claude Code: needs your input\x07";
+    let ctl_msg = isekai_protocol::CtlMessage::Notify {
+        kind: isekai_protocol::NotifyKind::Waiting,
+        tmux_tag: String::new(),
+        seq: 0,
+        title: "Claude Code".to_string(),
+        body: "needs your input".to_string(),
+    };
+    deliver(delivery, ctl_msg, raw_osc, &resolve_active_pane_tty).await
+}
+
+/// The shared 3-way dispatch every `send_*` helper in this module reduces
+/// to: `IsekaiPipeCtl` sends `ctl_msg` over the ctl-socket; `TmuxSession`
+/// resolves the currently-active pane and writes `raw_osc` wrapped for tmux
+/// passthrough; `DirectTty` writes `raw_osc` unwrapped. Keeping this in one
+/// place means the two callers can't independently drift on *how* tmux
+/// wrapping is done (only on *what* `ctl_msg`/`raw_osc` are) — the OSC
+/// sequence content itself is still each caller's own concern
+/// ([`super::tab_color::resolve`] for colors, a compiled-in literal for the
+/// notify popup).
+///
+/// `raw_osc` empty is a deliberate downgrade (either a tab-color script
+/// failed/declined to run, or — for a fixed literal like the notify
+/// popup — simply never happens) — not a reason to write an empty
+/// passthrough wrapper to the tty.
+async fn deliver(
+    delivery: &Delivery,
+    ctl_msg: isekai_protocol::CtlMessage,
+    raw_osc: &str,
+    resolve_active_pane_tty: &impl Fn(&str) -> Option<PathBuf>,
+) {
     match delivery {
         Delivery::IsekaiPipeCtl { ctl_sock } => {
-            let _ = send_ctl_message(
-                ctl_sock,
-                isekai_protocol::CtlMessage::Notify {
-                    kind: isekai_protocol::NotifyKind::Waiting,
-                    tmux_tag: String::new(),
-                    seq: 0,
-                    title: "Claude Code".to_string(),
-                    body: "needs your input".to_string(),
-                },
-            )
-            .await;
+            let _ = send_ctl_message(ctl_sock, ctl_msg).await;
         }
         Delivery::TmuxSession { session_id } => {
             let Some(path) = resolve_active_pane_tty(session_id) else { return };
-            write_tty(&path, &wrap_for_tmux_passthrough(seq));
+            if !raw_osc.is_empty() {
+                write_tty(&path, &wrap_for_tmux_passthrough(raw_osc));
+            }
         }
-        Delivery::DirectTty { path } => write_tty(path, seq),
+        Delivery::DirectTty { path } => {
+            if !raw_osc.is_empty() {
+                write_tty(path, raw_osc);
+            }
+        }
     }
 }
 

@@ -16,10 +16,10 @@ use isekai_protocol::attach::{
 use isekai_protocol::hello::Proof;
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use log::info;
-use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, RemoteSpec};
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, BindSpec, RemoteSpec};
 use rand::RngCore;
 
-use crate::attempt::{ConnectAttemptError, ConnectAttemptStage, RejectReason};
+use crate::attempt::{ConnectAttemptError, ConnectAttemptStage};
 use crate::error::TransportError;
 use crate::proof::compute_proof;
 use crate::telemetry::{log_candidate_attempt, CandidateAttempt, CandidateIdentity, CandidateOutcome};
@@ -76,6 +76,29 @@ pub struct RelayTarget {
     pub local_bind_port_range: Option<(u16, u16)>,
 }
 
+impl RelayTarget {
+    /// The `factory.create_endpoint(...)` argument every dial site in this
+    /// crate (`relay.rs`/`resume.rs`/`race.rs`/`warm_standby.rs`) needs to
+    /// bind before dialing `self` — an OS-assigned-ephemeral-port IPv4
+    /// wildcard bind, narrowed to [`Self::local_bind_port_range`] if given.
+    /// Was previously hand-rebuilt at each call site (six of them); one of
+    /// those (`warm_standby.rs`'s own doc comment on its `dial` method)
+    /// records that `local_bind_port_range` was silently dropped there until
+    /// someone noticed — a single shared constructor is exactly what
+    /// prevents that class of bug from recurring at whichever call site
+    /// gets added or edited next.
+    pub fn bind_spec(&self) -> BindSpec {
+        BindSpec::any_ipv4().with_port_range(self.local_bind_port_range)
+    }
+
+    /// The `RemoteSpec` every dial site in this crate needs to name `self`
+    /// as the QUIC dial target — see [`Self::bind_spec`]'s docs for why this
+    /// is factored out the same way.
+    pub fn remote_spec(&self) -> RemoteSpec {
+        RemoteSpec { addr: self.helper_addr, server_name: self.server_name.clone(), cert_sha256_hex: self.cert_sha256_hex.clone() }
+    }
+}
+
 /// Establishes a fresh QUIC connection to `target.helper_addr`, pinned to
 /// `target.cert_sha256_hex`, then performs the HELLO/proof/ACK handshake
 /// (`archive/HELPER_PROTOCOL.md` §4) using `isekai_protocol::hello`. On success,
@@ -86,16 +109,12 @@ pub struct RelayTarget {
 /// handle — `archive/ISEKAI_SSH_DESIGN.md`'s S-0d-1 scope is "HELLO/proof/ACKまでの
 /// 接続確立だけでよい"; resume support lands in S-4a.
 pub async fn connect_via_relay(factory: &AnyMuxFactory, target: &RelayTarget) -> Result<AnyByteStream, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await?;
     // No resume support on this path (module docs), so there is no grace
     // period to request — `0` ("no preference").
     let (_conn, stream, _proof, _effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
-        RemoteSpec {
-            addr: target.helper_addr,
-            server_name: target.server_name.clone(),
-            cert_sha256_hex: target.cert_sha256_hex.clone(),
-        },
+        target.remote_spec(),
         &target.session_secret,
         random_session_id(),
         ConnectionGeneration::INITIAL,
@@ -124,17 +143,13 @@ pub async fn connect_via_relay_with_connection(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
 ) -> Result<(AnyMuxConnection, AnyByteStream, Proof), TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await?;
     // No resume-grace preference from this entry point (module docs on
     // `connect_via_relay`) — the caller decides resume policy for itself via
     // whichever `resume::*` functions it calls afterward.
     let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
-        RemoteSpec {
-            addr: target.helper_addr,
-            server_name: target.server_name.clone(),
-            cert_sha256_hex: target.cert_sha256_hex.clone(),
-        },
+        target.remote_spec(),
         &target.session_secret,
         random_session_id(),
         ConnectionGeneration::INITIAL,
@@ -320,10 +335,7 @@ pub(crate) async fn attach_handshake(
         }
         AttachResponse::Reject(reason) => {
             cancelled(format!("rejected:{reason:?}"));
-            Err(ConnectAttemptError {
-                stage: ConnectAttemptStage::Rejected(RejectReason::from_attach_reject(reason)),
-                source: TransportError::Rejected(reason),
-            })
+            Err(ConnectAttemptError { stage: ConnectAttemptStage::Rejected(reason), source: TransportError::Rejected(reason) })
         }
     }
 }

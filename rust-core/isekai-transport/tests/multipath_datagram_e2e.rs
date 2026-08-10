@@ -9,15 +9,17 @@
 //! hardcode `system::isekai_mux_config(true)`, which explicitly disables
 //! datagrams — `isekai-ssh`/`isekai-pipe`'s SSH tunnel doesn't use them
 //! today). Instead it reproduces just enough of that module's connect +
-//! `open_path` sequence with its own datagram-enabled `MuxClientConfig`,
-//! per this repo's `isekai-ssh-e2e-test-self-containment-convention` (each
-//! `tests/*_e2e.rs` file duplicates its own setup rather than sharing it).
+//! `open_path` sequence with its own datagram-enabled `MuxClientConfig`.
+//! `generate_cert` comes from `tests/common/mod.rs`; `mock_server`'s
+//! multipath+datagram `TransportConfig` is a real per-scenario difference
+//! from that module's plain `mock_noq_server`, so it stays local (mirrors
+//! `multipath_e2e.rs::mock_server`).
 //!
 //! Wraps the resulting `noq::Connection` via the new
 //! `quicmux::AnyMuxConnection::from_noq_connection` constructor (added
-//! alongside this test) so `isekai-pipe`'s `datagram_relay` module (or any
-//! other `AnyMuxConnection`-based caller) could drive its datagram plane the
-//! same way over a multipath connection as over an ordinary single-path one.
+//! alongside this test) so any `AnyMuxConnection`-based caller could drive
+//! its datagram plane the same way over a multipath connection as over an
+//! ordinary single-path one.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -25,20 +27,9 @@ use std::time::Duration;
 
 use isekai_protocol::hello::ALPN;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
 
-const SNI: &str = "isekai-pipe.local";
-
-fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let sha256_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    (cert_der, key_der, sha256_hex)
-}
+mod common;
+use common::{generate_cert, SNI};
 
 /// Bound to the IPv4 wildcard address so it also receives the secondary
 /// path's traffic on `127.0.0.2` — see `multipath_e2e.rs::mock_server`'s

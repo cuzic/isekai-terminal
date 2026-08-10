@@ -13,37 +13,16 @@ fun KeyStep.shortLabel(): String = when (this) {
 
 fun List<KeyStep>.previewText(): String = joinToString(" ") { it.shortLabel() }
 
-private fun specialKeyShortLabel(keyCode: Int): String = when (keyCode) {
-    TerminalKeyEncoder.KC_ENTER -> "Enter"
-    TerminalKeyEncoder.KC_DEL -> "Del"
-    TerminalKeyEncoder.KC_TAB -> "Tab"
-    TerminalKeyEncoder.KC_ESCAPE -> "Esc"
-    TerminalKeyEncoder.KC_DPAD_UP -> "↑"
-    TerminalKeyEncoder.KC_DPAD_DOWN -> "↓"
-    TerminalKeyEncoder.KC_DPAD_LEFT -> "←"
-    TerminalKeyEncoder.KC_DPAD_RIGHT -> "→"
-    TerminalKeyEncoder.KC_PAGE_UP -> "PageUp"
-    TerminalKeyEncoder.KC_PAGE_DOWN -> "PageDown"
-    TerminalKeyEncoder.KC_MOVE_HOME -> "Home"
-    TerminalKeyEncoder.KC_MOVE_END -> "End"
-    TerminalKeyEncoder.KC_F1 -> "F1"
-    TerminalKeyEncoder.KC_F2 -> "F2"
-    TerminalKeyEncoder.KC_F3 -> "F3"
-    TerminalKeyEncoder.KC_F4 -> "F4"
-    TerminalKeyEncoder.KC_F5 -> "F5"
-    TerminalKeyEncoder.KC_F6 -> "F6"
-    TerminalKeyEncoder.KC_F7 -> "F7"
-    TerminalKeyEncoder.KC_F8 -> "F8"
-    TerminalKeyEncoder.KC_F9 -> "F9"
-    TerminalKeyEncoder.KC_F10 -> "F10"
-    TerminalKeyEncoder.KC_F11 -> "F11"
-    TerminalKeyEncoder.KC_F12 -> "F12"
-    else -> "Key($keyCode)"
-}
+/** [SPECIAL_KEY_CHOICES]をkeyCode→labelの逆引きに使う(SSOTはSPECIAL_KEY_CHOICES側、
+ *  ここでは2重管理しない)。選択肢一覧に無いkeyCode(将来追加され得るraw値)は
+ *  "Key(keyCode)"にフォールバックする。 */
+private fun specialKeyShortLabel(keyCode: Int): String =
+    SPECIAL_KEY_CHOICES.firstOrNull { it.second == keyCode }?.first ?: "Key($keyCode)"
 
 /** 打鍵列編集画面のステップ追加UIで選べる特殊キーの一覧(ラベル付き)。 */
 val SPECIAL_KEY_CHOICES: List<Pair<String, Int>> = listOf(
     "Enter" to TerminalKeyEncoder.KC_ENTER,
+    "Del" to TerminalKeyEncoder.KC_DEL,
     "Tab" to TerminalKeyEncoder.KC_TAB,
     "Esc" to TerminalKeyEncoder.KC_ESCAPE,
     "↑" to TerminalKeyEncoder.KC_DPAD_UP,

@@ -63,12 +63,6 @@ impl ReplayBuffer {
         }
     }
 
-    /// 本体コードからは呼ばれず、このファイル末尾のテストからのみ使われる。
-    #[allow(dead_code)]
-    pub(crate) fn start_offset(&self) -> u64 {
-        self.start_offset
-    }
-
     pub(crate) fn end_offset(&self) -> u64 {
         self.start_offset + self.data.len() as u64
     }
@@ -101,74 +95,6 @@ impl ClientResumeState {
             client_delivered_offset: 0,
             session_id: None,
         }
-    }
-}
-
-/// data stream (`S: AsyncRead + AsyncWrite`) を包み、読み書きしたバイト数を
-/// `ClientResumeState` に tee する。control stream が使えない（旧 helper 等）
-/// 場合でもこの wrapper 自体は素通しとして機能するため、呼び出し側は常に
-/// これで包んでよい。
-///
-/// Phase 8-3 で `ReattachableStream` が導入されてからは、本番コードは
-/// こちらではなくそちらを使う（QUIC connection 消失時に russh へエラーを
-/// 見せずに reattach できるのは `ReattachableStream` のみ）。この型は
-/// 「offset を tee するだけ」の最小構成としてテスト・将来の用途に残してある。
-#[cfg(test)]
-pub(crate) struct ResumeAwareStream<S> {
-    inner: S,
-    state: Arc<Mutex<ClientResumeState>>,
-}
-
-#[cfg(test)]
-impl<S> ResumeAwareStream<S> {
-    pub(crate) fn new(inner: S, state: Arc<Mutex<ClientResumeState>>) -> Self {
-        Self { inner, state }
-    }
-}
-
-#[cfg(test)]
-impl<S: AsyncRead + Unpin> AsyncRead for ResumeAwareStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let n = buf.filled().len() - before;
-            if n > 0 {
-                this.state.lock().unwrap().client_delivered_offset += n as u64;
-            }
-        }
-        poll
-    }
-}
-
-#[cfg(test)]
-impl<S: AsyncWrite + Unpin> AsyncWrite for ResumeAwareStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            if *n > 0 {
-                this.state.lock().unwrap().replay_buffer.append(&buf[..*n]);
-            }
-        }
-        poll
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -522,7 +448,6 @@ mod tests {
         let mut buf = ReplayBuffer::new(1024);
         buf.append(b"0123456789");
         buf.advance_start(4);
-        assert_eq!(buf.start_offset(), 4);
         assert!(buf.replay_from(0).is_none());
         assert_eq!(buf.replay_from(4).unwrap(), b"456789");
     }
@@ -531,36 +456,7 @@ mod tests {
     fn capacity_overflow_evicts_oldest_bytes() {
         let mut buf = ReplayBuffer::new(4);
         buf.append(b"abcdefgh");
-        assert_eq!(buf.start_offset(), 4);
         assert_eq!(buf.replay_from(4).unwrap(), b"efgh");
-    }
-
-    #[tokio::test]
-    async fn resume_aware_stream_tracks_offsets_through_duplex() {
-        let (client_side, server_side) = tokio::io::duplex(64);
-        let state = Arc::new(Mutex::new(ClientResumeState::new(1024)));
-        let mut wrapped = ResumeAwareStream::new(client_side, state.clone());
-
-        let mut server_side = server_side;
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 5];
-            server_side.read_exact(&mut buf).await.unwrap();
-            server_side.write_all(b"reply").await.unwrap();
-        });
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        wrapped.write_all(b"hello").await.unwrap();
-        let mut resp = [0u8; 5];
-        wrapped.read_exact(&mut resp).await.unwrap();
-        assert_eq!(&resp, b"reply");
-
-        // std::sync::Mutex 経由で poll_write/poll_read 内から同期的に更新するため、
-        // write_all/read_exact の完了時点で即座に反映されているはず。
-        let s = state.lock().unwrap();
-        assert_eq!(s.replay_buffer.end_offset(), 5, "C->S 5 bytes 送信のはず");
-        assert_eq!(s.client_delivered_offset, 5, "S->C 5 bytes 受信のはず");
-        assert_eq!(s.replay_buffer.replay_from(0).unwrap(), b"hello");
     }
 
     // ── ReattachableStream(mock ByteStream経由) ─────────────────────

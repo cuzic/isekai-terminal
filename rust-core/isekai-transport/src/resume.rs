@@ -185,14 +185,10 @@ pub async fn connect_via_relay_resumable(
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<ResumableRelaySession, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await.map_err(TransportError::Mux)?;
     let (conn, data_stream, proof, effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
-        RemoteSpec {
-            addr: target.helper_addr,
-            server_name: target.server_name.clone(),
-            cert_sha256_hex: target.cert_sha256_hex.clone(),
-        },
+        target.remote_spec(),
         &target.session_secret,
         random_session_id(),
         ConnectionGeneration::INITIAL,
@@ -425,7 +421,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                 id: &candidate.candidate_id,
             };
 
-            let endpoint = match factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(candidate.target.local_bind_port_range)).await {
+            let endpoint = match factory.create_endpoint(candidate.target.bind_spec()).await {
                 Ok(endpoint) => endpoint,
                 Err(source) => {
                     // Binding our own local socket never touches the remote
@@ -440,11 +436,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
 
             let attempt = connect_and_handshake(
                 &endpoint,
-                RemoteSpec {
-                    addr: candidate.target.helper_addr,
-                    server_name: candidate.target.server_name.clone(),
-                    cert_sha256_hex: candidate.target.cert_sha256_hex.clone(),
-                },
+                candidate.target.remote_spec(),
                 &candidate.target.session_secret,
                 round.session_id,
                 round.generation,
@@ -645,10 +637,21 @@ pub struct ResumeAckOutcome {
     pub data_stream: AnyByteStream,
     pub helper_committed_offset: C2hHelperCommittedOffset,
     pub helper_sent_offset: H2cSentOffset,
-    /// See `ResumableRelaySession::network_rebinder` — this reconnect made a
-    /// brand-new endpoint, so this is a fresh handle onto *that* one, not a
-    /// stale reference to whatever endpoint the previous connection used.
+    /// See `ResumableRelaySession::network_rebinder`. [`reconnect_and_resume`]
+    /// made a brand-new endpoint, so this is a fresh handle onto *that* one,
+    /// not a stale reference to whatever endpoint the previous connection
+    /// used. Always `None` for [`crate::WarmStandby::promote`], which resumes
+    /// onto a connection whose endpoint it does not own a rebinder for.
     pub network_rebinder: Option<AnyMuxRebinder>,
+}
+
+impl std::fmt::Debug for ResumeAckOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeAckOutcome")
+            .field("helper_committed_offset", &self.helper_committed_offset)
+            .field("helper_sent_offset", &self.helper_sent_offset)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Maps `quicmux::ResumeRejectReason`(意味論としては解釈しない、ワイヤ上の
@@ -656,9 +659,11 @@ pub struct ResumeAckOutcome {
 /// 使い続けている`isekai_protocol::resume::ResumeRejectReason`(3値とも
 /// 1:1で対応)に変換する。quicmux-server-resume Stage Bでワイヤフォーマット
 /// 自体はquicmux::resumeへ移行したが、呼び出し側(`isekai-ssh`等)から見た
-/// このcrateの公開エラー型は変えない。`pub(crate)`: `warm_standby.rs`も
-/// standby連接の直接resumeで同じ変換が必要なため。
-pub(crate) fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_protocol::resume::ResumeRejectReason {
+/// このcrateの公開エラー型は変えない。以前は`warm_standby.rs`も同じ変換を
+/// 自前で行っていたため`pub(crate)`だったが、その経路が
+/// [`resume_on_connection`]へ統合されて呼び出し元がこのファイル内だけに
+/// なったので privateへ戻した。
+fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_protocol::resume::ResumeRejectReason {
     match reason {
         quicmux::ResumeRejectReason::Auth => isekai_protocol::resume::ResumeRejectReason::Auth,
         quicmux::ResumeRejectReason::UnknownToken => isekai_protocol::resume::ResumeRejectReason::UnknownSession,
@@ -714,6 +719,61 @@ pub async fn reconnect_and_resume(
     // — see `connect_via_relay_resumable`'s identical comment.
     let network_rebinder = endpoint.rebinder();
 
+    let resumed = resume_on_connection(
+        conn,
+        &target.session_secret,
+        session_id,
+        client_sent_offset,
+        client_delivered_offset,
+        network_rebinder,
+        "reconnect_and_resume: request_resume",
+    )
+    .await?;
+
+    info!(
+        "isekai-transport: resume succeeded, session_id={session_id}, helper_committed_offset={}",
+        resumed.helper_committed_offset
+    );
+    Ok(resumed)
+}
+
+/// Issues the `RESUME` request itself on a connection the caller has
+/// **already** established: computes the proof bound to *this* connection,
+/// puts it on the wire via `quicmux::request_resume`, and translates the
+/// response into this crate's own types.
+///
+/// Shared by the two ways a caller can arrive at a connection to resume on
+/// — [`reconnect_and_resume`], which dials a brand-new one, and
+/// [`crate::WarmStandby::promote`], which uses the standby it kept
+/// pre-established and probed. Everything from the proof scheme through the
+/// offset bookkeeping is identical between them; the only genuine
+/// differences are where `conn` came from and whether an [`AnyMuxRebinder`]
+/// for its endpoint exists to hand back (it does not for the warm-standby
+/// path, which is why that field is `Option`).
+///
+/// `timeout_stage` names the call site in [`TransportError::TimedOut`].
+/// **Both** paths are now bounded by [`TRANSPORT_STEP_TIMEOUT`], for the
+/// reason [`reconnect_and_resume`]'s docs spell out (a host suspend/resume
+/// can stall the very monotonic timer meant to notice the peer is gone).
+/// The warm-standby path had no such bound before this was factored out —
+/// a standby that died silently since its last
+/// [`crate::WarmStandby::ensure_warm`] probe could hang the failover
+/// forever, and since promotion only ever runs *after* the primary already
+/// failed, that left the caller with no live path and nothing to time out
+/// on: exactly the "never recovers without manual intervention" state
+/// `.claude/rules/always-connects.md` treats as a bug. Bounding it lets the
+/// caller fall back to a full `reconnect_and_resume`, which is what
+/// `isekai-pipe`'s `promote_warm_standby_once` already does for every other
+/// promote failure.
+pub(crate) async fn resume_on_connection(
+    conn: AnyMuxConnection,
+    session_secret: &[u8],
+    session_id: SessionId,
+    client_sent_offset: C2hSentOffset,
+    client_delivered_offset: H2cClientDeliveredOffset,
+    network_rebinder: Option<AnyMuxRebinder>,
+    timeout_stage: &'static str,
+) -> Result<ResumeAckOutcome, TransportError> {
     // `resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
     // (`archive/HELPER_PROTOCOL.md` §7.3の計算式は不変 — 変わったのは
     // これをquicmux::resumeの`token`/`auth_blob`という完全にopaqueな
@@ -722,7 +782,7 @@ pub async fn reconnect_and_resume(
     // 初回`HELLO`と`RESUME`/`CONTROL_HELLO`の両方で同じexporter labelを
     // 使う(`isekai-pipe/src/engine/mod.rs`のEXPORTER_LABEL)ことに対称に
     // 揃えたもの。
-    let resume_proof_bytes = compute_proof(&conn, &target.session_secret, session_id.as_bytes()).await?;
+    let resume_proof_bytes = compute_proof(&conn, session_secret, session_id.as_bytes()).await?;
 
     let outcome = tokio::time::timeout(
         TRANSPORT_STEP_TIMEOUT,
@@ -735,16 +795,12 @@ pub async fn reconnect_and_resume(
         ),
     )
     .await
-    .map_err(|_| TransportError::TimedOut { stage: "reconnect_and_resume: request_resume" })?
+    .map_err(|_| TransportError::TimedOut { stage: timeout_stage })?
     .map_err(|e| match e {
         quicmux::ResumeRequestError::Mux(mux_err) => TransportError::Mux(mux_err),
         quicmux::ResumeRequestError::Rejected(reason) => TransportError::ResumeRejected(map_reject_reason(reason)),
     })?;
 
-    info!(
-        "isekai-transport: resume succeeded, session_id={session_id}, helper_committed_offset={}",
-        outcome.committed_offset
-    );
     Ok(ResumeAckOutcome {
         connection: conn,
         data_stream: outcome.stream,

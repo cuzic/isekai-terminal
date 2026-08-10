@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{create_private_dir, validate_intent_id, IntentError};
+use crate::{claim_json, write_json_atomically, IntentError};
 
 pub const CONNECT_OUTCOME_SCHEMA_VERSION: u32 = 1;
 
@@ -62,18 +62,10 @@ pub struct ConnectOutcome {
     pub detail: String,
 }
 
-/// Same atomic tmp-file + rename write `write_connection_intent` uses.
+/// Same atomic tmp-file + rename write `write_connection_intent` uses
+/// (`write_json_atomically`, `lib.rs`).
 pub fn write_connect_outcome(runtime_dir: &Path, outcome: &ConnectOutcome) -> Result<PathBuf, IntentError> {
-    validate_intent_id(&outcome.intent_id)?;
-    let outcomes = runtime_dir.join("connect-outcomes");
-    create_private_dir(runtime_dir)?;
-    create_private_dir(&outcomes)?;
-    let path = outcomes.join(format!("{}.json", outcome.intent_id));
-    let tmp = outcomes.join(format!("{}.{}.tmp", outcome.intent_id, std::process::id()));
-    let bytes = serde_json::to_vec_pretty(outcome)?;
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
-    Ok(path)
+    write_json_atomically(runtime_dir, "connect-outcomes", &outcome.intent_id, outcome)
 }
 
 /// Claims (consumes, by rename) the outcome file for `intent_id`, if any.
@@ -82,20 +74,7 @@ pub fn write_connect_outcome(runtime_dir: &Path, outcome: &ConnectOutcome) -> Re
 /// classified as stale trust) — this returns `Ok(None)`, not
 /// `Err(IntentError::Missing)`.
 pub fn claim_connect_outcome(runtime_dir: &Path, intent_id: &str) -> Result<Option<ConnectOutcome>, IntentError> {
-    validate_intent_id(intent_id)?;
-    let src = runtime_dir.join("connect-outcomes").join(format!("{intent_id}.json"));
-    let claimed_dir = runtime_dir.join("connect-outcomes-claimed");
-    create_private_dir(runtime_dir)?;
-    create_private_dir(&claimed_dir)?;
-    let dst = claimed_dir.join(format!("{intent_id}.{}.json", std::process::id()));
-    match fs::rename(&src, &dst) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(IntentError::Io(e)),
-    }
-    let bytes = fs::read(&dst)?;
-    let outcome: ConnectOutcome = serde_json::from_slice(&bytes)?;
-    Ok(Some(outcome))
+    claim_json(runtime_dir, "connect-outcomes", "connect-outcomes-claimed", intent_id)
 }
 
 #[cfg(test)]

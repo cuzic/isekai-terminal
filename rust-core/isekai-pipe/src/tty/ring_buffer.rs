@@ -1,8 +1,11 @@
 //! A bounded, drop-oldest byte ring buffer for the daemon's dtach-style
 //! "replay recent output on attach" behavior.
 //!
-//! Deliberately **not** `isekai-pipe/src/engine/resume.rs`'s existing
-//! `OutputBuffer` (a design review flagged this): that type is built for the
+//! Deliberately **not** `quicmux::ReplayBuffer` (aliased as `OutputBuffer`
+//! in `isekai-pipe/src/engine/resume.rs`, and also used by
+//! `resume_loop.rs`) — a design review flagged this, and the consolidation
+//! that merged every other copy of that buffer into one type deliberately
+//! left this file alone for the same reason: that type is built for the
 //! QUIC resume protocol's ACK-driven trimming — `append` *rejects* new data
 //! once full rather than evicting old data, because trimming there only
 //! happens when the client's `APP_ACK` confirms delivery of a specific

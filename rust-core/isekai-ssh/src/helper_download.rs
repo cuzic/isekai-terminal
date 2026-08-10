@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use isekai_bootstrap::{HostSpec, JumpSpec};
-use sha2::{Digest, Sha256};
+use isekai_trust::hex_sha256;
 
 #[cfg(test)]
 use isekai_bootstrap::OpenSshBackend;
@@ -169,14 +169,6 @@ fn fetch_latest_tag(agent: &ureq::Agent, api_base: &str, repo: &str) -> Result<S
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("isekai-ssh: release metadata from {url} has no tag_name field"))
-}
-
-/// Duplicated from `init.rs`/`wrapper.rs`'s own `hex_sha256` per this
-/// crate's established convention of small private per-module helpers
-/// rather than a shared one.
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Where to look for the release. `repo` is `"owner/repo"`; `tag` pins a

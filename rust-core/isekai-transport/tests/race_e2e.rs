@@ -1,8 +1,11 @@
 //! End-to-end tests for `race_direct_and_relay` (`#19`: direct(STUN
 //! P2P)/relay minimal two-path race) against real local mock STUN/QUIC
-//! servers, mirroring `stun_p2p_e2e.rs`'s and `relay_e2e.rs`'s techniques
-//! (this crate's convention: one self-contained e2e file per scenario,
-//! duplicating mock-server helpers rather than sharing them).
+//! servers, mirroring `stun_p2p_e2e.rs`'s and `relay_e2e.rs`'s techniques.
+//! `generate_cert`/`mock_server`/`spawn_mock_stun_server` come from
+//! `tests/common/mod.rs`, shared with those files; `run_full_mock` stays
+//! local since it has real behavioral differences from the shared ATTACH-v2
+//! responder (fixed `negotiated_resume_grace_secs: 0`, an optional
+//! "contacted" flag, no `client_done` handshake-completion signaling).
 //!
 //! Scenarios: direct wins when it completes within the stagger window
 //! (relay never even starts); relay wins when direct keeps failing (STUN
@@ -12,7 +15,6 @@
 //! tests are scoped to the client-side race *mechanism* (staggered start,
 //! correct winner selection, the loser's future actually getting dropped).
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,80 +24,18 @@ use isekai_protocol::attach::{
     attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
     AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
-use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+use isekai_protocol::hello::EXPORTER_LABEL;
 use isekai_transport::{
     race_direct_and_relay, DirectRelayRaceTargets, RaceWinner, RelayTarget, StunP2pTarget, system_quic_factory,
 };
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+
+mod common;
+use common::{generate_cert, mock_noq_server as mock_server, spawn_mock_stun_server, SNI};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SNI: &str = "isekai-pipe.local";
 const SESSION_SECRET: &[u8] = b"race-e2e-test-session-secret";
-
-async fn spawn_mock_stun_server() -> SocketAddr {
-    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = server.local_addr().unwrap();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 512];
-        loop {
-            let Ok((n, from)) = server.recv_from(&mut buf).await else { break };
-            if n < 20 {
-                continue;
-            }
-            let transaction_id = &buf[8..20];
-            let SocketAddr::V4(from_v4) = from else { continue };
-
-            let magic_cookie: u32 = 0x2112_A442;
-            let xport = from_v4.port() ^ ((magic_cookie >> 16) as u16);
-            let xaddr = u32::from(*from_v4.ip()) ^ magic_cookie;
-
-            let mut resp = Vec::with_capacity(32);
-            resp.extend_from_slice(&0x0101u16.to_be_bytes());
-            resp.extend_from_slice(&12u16.to_be_bytes());
-            resp.extend_from_slice(&magic_cookie.to_be_bytes());
-            resp.extend_from_slice(transaction_id);
-            resp.extend_from_slice(&0x0020u16.to_be_bytes());
-            resp.extend_from_slice(&8u16.to_be_bytes());
-            resp.push(0);
-            resp.push(0x01);
-            resp.extend_from_slice(&xport.to_be_bytes());
-            resp.extend_from_slice(&xaddr.to_be_bytes());
-
-            let _ = server.send_to(&resp, from).await;
-        }
-    });
-    addr
-}
-
-fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
-    // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
-    // `ring`, so rustls can no longer auto-select a single process-wide
-    // crypto provider when this crate is built with that feature on —
-    // every test in this file calls `generate_cert` first, so fixing it
-    // once here covers all of them.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let sha256_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    (cert_der, key_der, sha256_hex)
-}
-
-fn mock_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> noq::Endpoint {
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .unwrap();
-    tls_config.alpn_protocols = vec![ALPN.to_vec()];
-    let quic_crypto = noq::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap();
-    let config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    noq::Endpoint::server(config, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap()
-}
 
 /// Accepts one connection, verifies the ATTACH_HELLO proof, replies
 /// AttachReadyV2, reads AttachActivate, then echoes one message — used for

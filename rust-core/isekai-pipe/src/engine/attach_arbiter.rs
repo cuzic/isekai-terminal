@@ -132,10 +132,7 @@ pub enum AttachEffect {
     /// active relay task) — the effect executor looks up its own
     /// lease-keyed bookkeeping to know which.
     CancelLease { lease: LeaseId },
-    /// `lease` lets the connection that eventually reaches `Established` for
-    /// `key` report `AttachEvent::RelayEnded { lease }` later, without the
-    /// executor needing a separate `key -> lease` lookup.
-    SendReady { key: AttachKey, lease: LeaseId, attach_token: AttachToken },
+    SendReady { key: AttachKey, attach_token: AttachToken },
     SendReject { key: AttachKey, reason: AttachRejectReason },
     /// Arm a pending-activation timer for `lease`; the executor feeds
     /// `AttachEvent::PendingExpired { lease }` back if it fires before
@@ -294,7 +291,7 @@ impl AttachArbiter {
                     // Retransmit of the same attempt that already has a
                     // token: resend AttachReadyV2. No new effect if we're
                     // still just Connecting (nothing to resend yet).
-                    Some(attach_token) => vec![AttachEffect::SendReady { key, lease: cur_lease, attach_token }],
+                    Some(attach_token) => vec![AttachEffect::SendReady { key, attach_token }],
                     None => vec![],
                 }
             } else {
@@ -318,7 +315,7 @@ impl AttachArbiter {
             return vec![];
         };
         self.sessions.insert(session_id, AttachState::PendingActivation { key, lease, attach_token, target });
-        vec![AttachEffect::SendReady { key, lease, attach_token }, AttachEffect::SchedulePendingTimeout { lease }]
+        vec![AttachEffect::SendReady { key, attach_token }, AttachEffect::SchedulePendingTimeout { lease }]
     }
 
     fn on_target_connect_failed(&mut self, lease: LeaseId) -> Vec<AttachEffect> {
@@ -441,7 +438,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                AttachEffect::SendReady { key: k, lease: LeaseId(0), attach_token: tok },
+                AttachEffect::SendReady { key: k, attach_token: tok },
                 AttachEffect::SchedulePendingTimeout { lease: LeaseId(0) }
             ]
         );
@@ -730,6 +727,6 @@ mod tests {
         let tok = token(7);
         a.apply(AttachEvent::TargetConnected { lease: LeaseId(0), target: TargetHandleId(1), attach_token: tok });
         let effects = a.apply(AttachEvent::HelloReceived { key: k });
-        assert_eq!(effects, vec![AttachEffect::SendReady { key: k, lease: LeaseId(0), attach_token: tok }]);
+        assert_eq!(effects, vec![AttachEffect::SendReady { key: k, attach_token: tok }]);
     }
 }

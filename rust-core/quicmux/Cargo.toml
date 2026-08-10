@@ -6,7 +6,6 @@ license = "MIT OR Apache-2.0"
 description = "Backend-agnostic QUIC-ish multiplexed-stream abstraction over noq (quinn's multipath fork) and qmux (draft-ietf-quic-qmux, QUIC-over-TLS-over-TCP)."
 
 [dependencies]
-async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sha2 = "0.10"
@@ -35,11 +34,33 @@ noq = { version = "1.0.1", features = ["rustls", "ring"], optional = true }
 qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+# `test_support::self_signed_server_config`専用(下の`test-support` feature参照)。
+# optionalな通常dependencyにしているのは、外部crate(isekai-transport/isekai-pipe等)
+# のdev-dependencyから`features = ["test-support"]`を有効化して使えるようにするため
+# — dev-dependencyはこのcrate自身のtest-onlyコードにしか見えず、下流の
+# dev-dependency経由では見えない。
+rcgen = { version = "0.13", optional = true }
 
 [features]
+# デフォルトを`noq`にしておかないと、feature無し(`cargo check -p quicmux`単体等)で
+# ビルドした際にmux.rsのAnyMux*系enumが空になり、その`match`がすべて
+# non-exhaustive("E0004: type &AnyMux* is non-empty")として壊れる
+# (実際のworkspace consumerは全員`features = ["noq"]`を明示しているため
+# 気づかれずにいた既存の技術的負債、Phase 2レビューで発見)。
+default = ["noq"]
 noq = ["dep:noq"]
 qmux = ["dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
+# self-signed cert + MuxServerConfig組み立てのtest専用ヘルパー
+# (`test_support::self_signed_server_config`)を公開する。この crate自身の
+# 各backend(noq_backend.rs/qmux_backend.rs/resume.rs)のcfg(test)コードと、
+# isekai-transport/isekai-pipeのcfg(test)コードの双方が同じ実装を使う
+# (以前は各ファイルが同じ~20行を手で複製していた)。既定OFFでrcgenを
+# 通常ビルドに持ち込まない。
+test-support = ["dep:rcgen"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-rcgen = "0.13"
+# quicmux自身のcfg(test)コードがtest_support::self_signed_server_configを使うため、
+# 自分自身をdev-dependencyとして再宣言しtest-support featureを有効化する
+# (Cargoの標準パターン: テスト専用featureを自crateのcfg(test)からも有効にする)。
+quicmux = { path = ".", features = ["test-support"] }

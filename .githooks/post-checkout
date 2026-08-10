@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# `git worktree add` は内部的に checkout を行うため post-checkout hook が発火する。
+# 新規worktreeが作られたタイミングで、rust-core の musl クロスビルド成果物
+# (isekai-pipe embed用、gitignore対象なのでworktreeごとに空)をメインworktreeから
+# シンボリックリンクしておく。詳細は scripts/link-worktree-artifacts.sh 参照。
+#
+# 通常の(worktreeでない)ブランチ切り替え時にも呼ばれるが、その場合は
+# メインworktree自身がリンク先になり script 側で no-op になるので安全。
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+    exit 0
+fi
+
+SCRIPT="$REPO_ROOT/scripts/link-worktree-artifacts.sh"
+if [ -x "$SCRIPT" ]; then
+    "$SCRIPT" "$REPO_ROOT" >&2 || true
+fi

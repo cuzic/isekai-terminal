@@ -1,5 +1,5 @@
-//! [`BootstrapFailure`]: why a [`crate::BootstrapPlan`] attempt failed,
-//! classified so a caller can decide what to do next without string-matching
+//! [`BootstrapFailure`]: why a bootstrap attempt failed, classified so a
+//! caller can decide what to do next without string-matching
 //! an error message. `ISEKAI_PIPE_DESIGN.md` §8 Epic A calls out four
 //! decisions this classification must support without guessing from text:
 //! retry the same route, redirect to `isekai-ssh login`, redirect to
@@ -16,8 +16,8 @@ pub enum BootstrapFailure {
     /// interactively.
     #[error("no usable SSH credential for this host")]
     AuthenticationRequired,
-    /// A relay-scoped token (`CredentialSource::RelayToken`) was supplied
-    /// but the relay rejected it as expired.
+    /// A relay-scoped token was supplied but the relay rejected it as
+    /// expired.
     #[error("relay token expired")]
     TokenExpired,
     /// `ssh(1)` refused to proceed because the remote host key didn't match

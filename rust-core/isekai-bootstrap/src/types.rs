@@ -45,39 +45,58 @@ impl HostSpec {
 
 /// A `-J`/`ProxyJump` hop used only as the "`--via`" fallback path
 /// (`archive/ISEKAI_SSH_DESIGN.md` "`--via` フォールバックの2つの用途").
+///
+/// A newtype over [`HostSpec`] rather than a second struct with the same
+/// three fields: a jump hop *is* an ssh destination (same `[user@]host` +
+/// separate port shape, same precedence rules), and the only thing that
+/// differs is how it is *rendered* on the command line — `-J` wants the
+/// single-token `[user@]host[:port]` form, while a target destination
+/// passes its port separately via `-p`. Keeping it a distinct type (instead
+/// of aliasing `HostSpec`) preserves the API boundary
+/// `isekai-bootstrap-plan` documents for `JumpHost`/`BootstrapTarget`, and
+/// keeps `to_arg` from being callable on a target by accident.
+///
+/// `Deref<Target = HostSpec>` exists purely so the `host`/`port`/`user`
+/// fields stay readable exactly as they were when this was its own struct
+/// (`isekai-bootstrap-plan`'s cycle detection and `russh_backend`'s per-hop
+/// resolution both read them) — it is a plain field-access forwarder, not
+/// an inheritance mechanism: every *behavior* a jump hop has lives in the
+/// inherent impl below.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JumpSpec {
-    pub host: String,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-}
+pub struct JumpSpec(HostSpec);
 
 impl JumpSpec {
     pub fn new(host: impl Into<String>) -> Self {
-        Self { host: host.into(), port: None, user: None }
+        Self(HostSpec::new(host))
     }
 
-    pub fn with_port(mut self, port: u16) -> Self {
-        self.port = Some(port);
-        self
+    pub fn with_port(self, port: u16) -> Self {
+        Self(self.0.with_port(port))
     }
 
-    pub fn with_user(mut self, user: impl Into<String>) -> Self {
-        self.user = Some(user.into());
-        self
+    pub fn with_user(self, user: impl Into<String>) -> Self {
+        Self(self.0.with_user(user))
     }
 
     /// The single-token form ssh(1)'s `-J` flag accepts:
-    /// `[user@]host[:port]`.
+    /// `[user@]host[:port]` — the same `[user@]host` destination
+    /// [`HostSpec::ssh_destination`] builds, with `-J`'s inline `:port`
+    /// suffix appended (a target host passes its port out of band as `-p`
+    /// instead, which is the whole difference between the two renderings).
     pub(crate) fn to_arg(&self) -> String {
-        let dest = match &self.user {
-            Some(user) => format!("{user}@{}", self.host),
-            None => self.host.clone(),
-        };
-        match self.port {
+        let dest = self.0.ssh_destination();
+        match self.0.port {
             Some(port) => format!("{dest}:{port}"),
             None => dest,
         }
+    }
+}
+
+impl std::ops::Deref for JumpSpec {
+    type Target = HostSpec;
+
+    fn deref(&self) -> &HostSpec {
+        &self.0
     }
 }
 

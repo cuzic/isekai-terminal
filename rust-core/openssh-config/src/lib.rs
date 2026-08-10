@@ -480,7 +480,12 @@ fn comma_pattern_list_match(pattern_list: &str, value: &str) -> bool {
 
 /// The real local username (`$USER` on Unix, `%USERNAME%` on Windows) for
 /// `Match localuser` — mirrors [`home_dir`]'s cross-platform env var pair.
-fn local_username() -> Option<String> {
+///
+/// Public because callers resolving a `ssh_config(5)` `User` fall back to
+/// this same real local username when no `User`/explicit override applies
+/// (the same precedence `ssh(1)` itself uses), and used to each carry their
+/// own byte-identical copy of this function rather than reuse this crate's.
+pub fn local_username() -> Option<String> {
     std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 

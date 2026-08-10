@@ -7,132 +7,19 @@
 //! stream, and exchanges the real ATTACH v2 wire bytes
 //! (`isekai_protocol::attach`: ATTACH_HELLO / AttachReadyV2 / AttachActivate)
 //! end-to-end.
+//!
+//! Mock scaffolding (`generate_cert`/`mock_helper_server`/`run_mock_helper`)
+//! lives in `tests/common/mod.rs`, shared with the other e2e files that speak
+//! the same ATTACH v2 protocol over the same plain-loopback `noq::Endpoint`
+//! shape.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
-use isekai_protocol::attach::{
-    attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
-    AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
-};
-use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+use isekai_protocol::attach::AttachRejectReason;
 use isekai_transport::{connect_via_relay, system_quic_factory, MuxError, RelayTarget, TransportError};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
-
-const SNI: &str = "isekai-pipe.local";
-
-/// Generates a self-signed certificate (standing in for isekai-helper's own
-/// ephemeral cert, `archive/HELPER_PROTOCOL.md` §2) and returns it alongside the
-/// lowercase-hex SHA-256 fingerprint a real client would receive out-of-band
-/// over the bootstrap SSH channel.
-fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
-    // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
-    // `ring`, so rustls can no longer auto-select a single process-wide
-    // crypto provider when this crate is built with that feature on —
-    // every test in this file calls `generate_cert` first, so fixing it
-    // once here covers all of them.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let sha256_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    (cert_der, key_der, sha256_hex)
-}
-
-/// A real `noq` server endpoint, configured exactly like isekai-helper's own
-/// QUIC server (`archive/HELPER_PROTOCOL.md` §4 ALPN, self-signed cert).
-fn mock_helper_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> noq::Endpoint {
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .unwrap();
-    tls_config.alpn_protocols = vec![ALPN.to_vec()];
-    let quic_crypto = noq::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap();
-    let config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    noq::Endpoint::server(config, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap()
-}
-
-/// Accepts exactly one connection and one bidirectional stream, reads the
-/// ATTACH_HELLO frame, verifies the proof the same way isekai-helper would
-/// (`isekai_protocol::attach`: `HMAC-SHA256(session_secret, exporter ||
-/// attach_hello_proof_transcript(..))`), and replies AttachReadyV2 /
-/// REJECT_AUTH accordingly. On AttachReadyV2 it then reads the client's
-/// AttachActivate before echoing back one more message, to prove the returned
-/// stream is a real, working, bidirectional pass-through afterward — not just
-/// a handshake stub.
-///
-/// `client_done` must fire only after the client side has finished reading
-/// everything it needs from this connection. Dropping `conn`/`endpoint`
-/// (which happens as soon as this function returns) races the client
-/// actually draining its receive buffer otherwise — the same hand-off
-/// hazard `isekai-link-masque/tests/relay_e2e.rs` documents and works around
-/// the same way.
-async fn run_mock_helper(
-    endpoint: noq::Endpoint,
-    session_secret: Vec<u8>,
-    client_done: tokio::sync::oneshot::Receiver<()>,
-) {
-    let incoming = endpoint.accept().await.unwrap();
-    let conn = incoming.await.unwrap();
-    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-
-    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello_bytes).await.unwrap();
-    let hello = decode_attach_hello(&hello_bytes).unwrap();
-
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
-    let transcript = attach_hello_proof_transcript(
-        &hello.session_id,
-        hello.generation,
-        &hello.attempt_id,
-        hello.requested_resume_grace_secs,
-    );
-    let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
-    mac.update(&exporter);
-    mac.update(&transcript);
-    let expected_bytes: [u8; 32] = mac.finalize().into_bytes().into();
-    let expected = AttachProof::new(expected_bytes);
-
-    if !hello.proof.ct_eq(&expected) {
-        let reject = AttachResponse::Reject(AttachRejectReason::Auth);
-        send.write_all(&encode_attach_response(&reject)).await.unwrap();
-        send.finish().ok();
-        client_done.await.ok();
-        return;
-    }
-
-    let ready = AttachResponse::Ready {
-        session_id: hello.session_id,
-        generation: hello.generation,
-        attempt_id: hello.attempt_id,
-        negotiated_resume_grace_secs: hello.requested_resume_grace_secs,
-        attach_token: AttachToken::new(rand::random()),
-    };
-    send.write_all(&encode_attach_response(&ready)).await.unwrap();
-
-    // The client confirms the attach with AttachActivate on the same stream
-    // before it becomes a raw pass-through.
-    let mut activate_bytes = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
-    recv.read_exact(&mut activate_bytes).await.unwrap();
-    decode_attach_activate(&activate_bytes).unwrap();
-
-    let mut buf = [0u8; 64];
-    if let Ok(Some(n)) = recv.read(&mut buf).await {
-        send.write_all(&buf[..n]).await.unwrap();
-    }
-    send.finish().ok();
-
-    client_done.await.ok();
-}
+mod common;
+use common::{generate_cert, mock_noq_server as mock_helper_server, run_mock_attach_helper as run_mock_helper, SNI};
 
 #[tokio::test]
 async fn connect_via_relay_completes_hello_ack_over_a_real_quic_connection() {

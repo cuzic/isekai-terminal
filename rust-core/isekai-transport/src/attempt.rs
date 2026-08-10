@@ -45,52 +45,12 @@ pub(crate) enum ConnectAttemptStage {
     ActivateWrite,
     /// The server responded with an explicit reject byte (not silence, not
     /// an I/O failure) — the client *does* know the outcome for certain.
-    Rejected(RejectReason),
-}
-
-/// Mirrors `isekai_protocol::attach::AttachRejectReason`, minus the payload
-/// on `StaleGeneration` (kept alongside instead, since [`AttemptFailure`]'s
-/// `StaleAttempt` variant is where callers actually want it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RejectReason {
-    Auth,
-    Target,
-    Unsupported,
-    AlreadyAttached,
-    StaleGeneration { current_generation: ConnectionGeneration },
-    BusyOtherSession,
-    AttachAlreadyEstablished,
-}
-
-impl RejectReason {
-    pub(crate) fn from_attach_reject(reason: AttachRejectReason) -> Self {
-        match reason {
-            AttachRejectReason::Auth => Self::Auth,
-            AttachRejectReason::Target => Self::Target,
-            AttachRejectReason::Unsupported => Self::Unsupported,
-            AttachRejectReason::AlreadyAttached => Self::AlreadyAttached,
-            AttachRejectReason::StaleGeneration { current_generation } => {
-                Self::StaleGeneration { current_generation }
-            }
-            AttachRejectReason::BusyOtherSession => Self::BusyOtherSession,
-            AttachRejectReason::AttachAlreadyEstablished => Self::AttachAlreadyEstablished,
-        }
-    }
-
-    #[cfg(test)]
-    fn as_attach_reject(self) -> AttachRejectReason {
-        match self {
-            Self::Auth => AttachRejectReason::Auth,
-            Self::Target => AttachRejectReason::Target,
-            Self::Unsupported => AttachRejectReason::Unsupported,
-            Self::AlreadyAttached => AttachRejectReason::AlreadyAttached,
-            Self::StaleGeneration { current_generation } => {
-                AttachRejectReason::StaleGeneration { current_generation }
-            }
-            Self::BusyOtherSession => AttachRejectReason::BusyOtherSession,
-            Self::AttachAlreadyEstablished => AttachRejectReason::AttachAlreadyEstablished,
-        }
-    }
+    /// Uses `isekai_protocol::attach::AttachRejectReason` directly (rather
+    /// than a hand-duplicated local mirror of it) — this crate already
+    /// depends on `isekai-protocol` and `TransportError::Rejected` carries
+    /// this exact type, so there was never a real decoupling need for a
+    /// separate copy, payload included.
+    Rejected(AttachRejectReason),
 }
 
 /// `connect_and_handshake`'s internal error type: the underlying
@@ -171,6 +131,20 @@ pub enum AttemptFailure {
 
 impl std::fmt::Display for AttemptFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source_ref())
+    }
+}
+
+impl std::error::Error for AttemptFailure {}
+
+impl AttemptFailure {
+    /// Every variant's `source` field, in one place — `Display` and
+    /// [`Self::is_stale_trust_signal`] both just want a borrowed
+    /// `&TransportError` and are defined in terms of this. [`Self::into_source`]
+    /// can't reuse this (it needs to *move* `source` out, and `TransportError`
+    /// isn't `Clone`), so it keeps its own identically-shaped consuming match
+    /// — the seven-arm match still exists twice, not three times.
+    fn source_ref(&self) -> &TransportError {
         match self {
             Self::RetryablePreAttach { source }
             | Self::DefinitiveRejectNotRetryable { source }
@@ -178,14 +152,10 @@ impl std::fmt::Display for AttemptFailure {
             | Self::LostRace { source }
             | Self::StaleAttempt { source, .. }
             | Self::MustResume { source }
-            | Self::Terminal { source } => write!(f, "{source}"),
+            | Self::Terminal { source } => source,
         }
     }
-}
 
-impl std::error::Error for AttemptFailure {}
-
-impl AttemptFailure {
     /// Whether a sequential fallback connector may safely try a different
     /// candidate after this failure, *without* `#25`'s generation-advancing
     /// machinery. `#25` will need its own, less conservative check for the
@@ -214,15 +184,7 @@ impl AttemptFailure {
     /// classification this type adds is orthogonal to whether the
     /// *underlying* failure looks like stale cached trust material.
     pub fn is_stale_trust_signal(&self) -> bool {
-        match self {
-            Self::RetryablePreAttach { source }
-            | Self::DefinitiveRejectNotRetryable { source }
-            | Self::AmbiguousAfterAttach { source }
-            | Self::LostRace { source }
-            | Self::StaleAttempt { source, .. }
-            | Self::MustResume { source }
-            | Self::Terminal { source } => source.is_stale_trust_signal(),
-        }
+        self.source_ref().is_stale_trust_signal()
     }
 }
 
@@ -239,21 +201,21 @@ impl From<ConnectAttemptError> for AttemptFailure {
             ConnectAttemptStage::HelloWrite | ConnectAttemptStage::AckRead | ConnectAttemptStage::ActivateWrite => {
                 AttemptFailure::AmbiguousAfterAttach { source: e.source }
             }
-            ConnectAttemptStage::Rejected(RejectReason::Target) => {
+            ConnectAttemptStage::Rejected(AttachRejectReason::Target) => {
                 AttemptFailure::DefinitiveRejectNotRetryable { source: e.source }
             }
-            ConnectAttemptStage::Rejected(RejectReason::AlreadyAttached) => {
+            ConnectAttemptStage::Rejected(AttachRejectReason::AlreadyAttached) => {
                 AttemptFailure::LostRace { source: e.source }
             }
-            ConnectAttemptStage::Rejected(RejectReason::StaleGeneration { current_generation }) => {
+            ConnectAttemptStage::Rejected(AttachRejectReason::StaleGeneration { current_generation }) => {
                 AttemptFailure::StaleAttempt { source: e.source, current_generation }
             }
-            ConnectAttemptStage::Rejected(RejectReason::AttachAlreadyEstablished) => {
+            ConnectAttemptStage::Rejected(AttachRejectReason::AttachAlreadyEstablished) => {
                 AttemptFailure::MustResume { source: e.source }
             }
-            ConnectAttemptStage::Rejected(RejectReason::Auth)
-            | ConnectAttemptStage::Rejected(RejectReason::Unsupported)
-            | ConnectAttemptStage::Rejected(RejectReason::BusyOtherSession) => {
+            ConnectAttemptStage::Rejected(AttachRejectReason::Auth)
+            | ConnectAttemptStage::Rejected(AttachRejectReason::Unsupported)
+            | ConnectAttemptStage::Rejected(AttachRejectReason::BusyOtherSession) => {
                 AttemptFailure::Terminal { source: e.source }
             }
         }
@@ -266,7 +228,7 @@ mod tests {
 
     fn err(stage: ConnectAttemptStage) -> ConnectAttemptError {
         let reason = match stage {
-            ConnectAttemptStage::Rejected(r) => Some(r.as_attach_reject()),
+            ConnectAttemptStage::Rejected(r) => Some(r),
             _ => None,
         };
         ConnectAttemptError {
@@ -299,21 +261,21 @@ mod tests {
 
     #[test]
     fn reject_target_classifies_as_definitive_not_retryable() {
-        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::Target)));
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(AttachRejectReason::Target)));
         assert!(matches!(failure, AttemptFailure::DefinitiveRejectNotRetryable { .. }));
         assert!(!failure.may_retry_pre_fencing());
     }
 
     #[test]
     fn reject_already_attached_classifies_as_lost_race() {
-        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::AlreadyAttached)));
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(AttachRejectReason::AlreadyAttached)));
         assert!(matches!(failure, AttemptFailure::LostRace { .. }));
         assert!(!failure.may_retry_pre_fencing());
     }
 
     #[test]
     fn reject_stale_generation_classifies_as_stale_attempt_with_current_generation() {
-        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::StaleGeneration {
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(AttachRejectReason::StaleGeneration {
             current_generation: ConnectionGeneration::new(7),
         })));
         match failure {
@@ -326,14 +288,14 @@ mod tests {
 
     #[test]
     fn reject_attach_already_established_classifies_as_must_resume() {
-        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::AttachAlreadyEstablished)));
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(AttachRejectReason::AttachAlreadyEstablished)));
         assert!(matches!(failure, AttemptFailure::MustResume { .. }));
         assert!(!failure.may_retry_pre_fencing());
     }
 
     #[test]
     fn reject_auth_unsupported_and_busy_other_session_classify_as_terminal() {
-        for reason in [RejectReason::Auth, RejectReason::Unsupported, RejectReason::BusyOtherSession] {
+        for reason in [AttachRejectReason::Auth, AttachRejectReason::Unsupported, AttachRejectReason::BusyOtherSession] {
             let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(reason)));
             assert!(matches!(failure, AttemptFailure::Terminal { .. }), "{reason:?} should be Terminal");
             assert!(!failure.may_retry_pre_fencing());
@@ -355,7 +317,7 @@ mod tests {
 
     #[test]
     fn attempt_failure_delegates_stale_trust_signal_to_its_source() {
-        let stale = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::Auth)));
+        let stale = AttemptFailure::from(err(ConnectAttemptStage::Rejected(AttachRejectReason::Auth)));
         assert!(stale.is_stale_trust_signal());
 
         let not_stale = AttemptFailure::from(err(ConnectAttemptStage::QuicConnect));

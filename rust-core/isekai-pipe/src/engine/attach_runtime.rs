@@ -42,7 +42,7 @@ const PENDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// (an ATTACH-unrelated policy value the connection task already knows),
 /// which this runtime has no reason to also track.
 pub enum HelloOutcome {
-    Ready { lease: LeaseId, attach_token: AttachToken },
+    Ready { attach_token: AttachToken },
     Reject(AttachRejectReason),
 }
 
@@ -247,8 +247,8 @@ impl AttachRuntime {
                 match effect {
                     AttachEffect::ConnectTarget { lease } => self.start_connect(lease).await,
                     AttachEffect::CancelLease { lease } => self.cancel_lease(lease).await,
-                    AttachEffect::SendReady { key, lease, attach_token } => {
-                        self.resolve_waiter(key, HelloOutcome::Ready { lease, attach_token }).await;
+                    AttachEffect::SendReady { key, attach_token } => {
+                        self.resolve_waiter(key, HelloOutcome::Ready { attach_token }).await;
                     }
                     AttachEffect::SendReject { key, reason } => {
                         self.resolve_waiter(key, HelloOutcome::Reject(reason)).await;

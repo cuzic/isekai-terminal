@@ -863,8 +863,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_diagnostichandle_fire_callback(
     ): Int
-    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward(
-    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor(
@@ -893,8 +891,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
     ): Int
-    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
-    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt(
@@ -902,8 +898,6 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background(
-    ): Int
-    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change(
     ): Int
@@ -914,8 +908,6 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_upstream_health_degraded(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground(
-    ): Int
-    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize(
     ): Int
@@ -1044,8 +1036,6 @@ external fun uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(`handle`: 
 ): Long
 external fun uniffi_isekai_terminal_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(`ptr`: Long,`id`: RustBuffer.ByValue,`bindAddress`: RustBuffer.ByValue,`bindPort`: Short,`remoteHost`: RustBuffer.ByValue,`remotePort`: Short,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(`ptr`: Long,`row`: Int,`col`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1074,8 +1064,6 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_prev
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Byte
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1083,8 +1071,6 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_p
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_background_budget_expired(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(`ptr`: Long,`focused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1095,8 +1081,6 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_ne
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_upstream_health_degraded(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1363,9 +1347,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_diagnostichandle_fire_callback() != 38453) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1408,9 +1389,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1421,9 +1399,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
@@ -1439,9 +1414,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize() != 11770) {
@@ -3018,13 +2990,6 @@ public object FfiConverterTypeDiagnosticHandle: FfiConverter<DiagnosticHandle, L
 public interface SessionOrchestratorInterface {
     
     /**
-     * 接続中にローカルポートフォワード(-L)を動的に追加する。
-     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-     */
-    fun `addLocalForward`(`id`: kotlin.String, `bindAddress`: kotlin.String, `bindPort`: kotlin.UShort, `remoteHost`: kotlin.String, `remotePort`: kotlin.UShort)
-    
-    /**
      * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
      * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
      * 「中止」操作を出す想定)。
@@ -3129,8 +3094,6 @@ public interface SessionOrchestratorInterface {
      */
     fun `forceReturnToWifi`()
     
-    fun `isQuic`(): kotlin.Boolean
-    
     /**
      * [jump_to_previous_prompt]の「次」版。
      */
@@ -3163,8 +3126,6 @@ public interface SessionOrchestratorInterface {
      * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
-    
-    fun `notifyError`(`message`: kotlin.String)
     
     /**
      * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
@@ -3223,8 +3184,6 @@ public interface SessionOrchestratorInterface {
      * 何もしない。
      */
     fun `notifyWillEnterForeground`()
-    
-    fun `removeForward`(`id`: kotlin.String)
     
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
@@ -3369,23 +3328,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             UniffiLib.uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(handle, status)
         }
     }
-
-    
-    /**
-     * 接続中にローカルポートフォワード(-L)を動的に追加する。
-     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
-     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
-     */override fun `addLocalForward`(`id`: kotlin.String, `bindAddress`: kotlin.String, `bindPort`: kotlin.UShort, `remoteHost`: kotlin.String, `remotePort`: kotlin.UShort)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(
-        it,
-        FfiConverterString.lower(`id`),FfiConverterString.lower(`bindAddress`),FfiConverterUShort.lower(`bindPort`),FfiConverterString.lower(`remoteHost`),FfiConverterUShort.lower(`remotePort`),_status)
-}
-    }
-    
-    
 
     
     /**
@@ -3648,19 +3590,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     
     
 
-    override fun `isQuic`(): kotlin.Boolean {
-            return FfiConverterBoolean.lift(
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(
-        it,
-        _status)
-}
-    }
-    )
-    }
-    
-
     
     /**
      * [jump_to_previous_prompt]の「次」版。
@@ -3729,18 +3658,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(
         it,
         FfiConverterUInt.lower(`budgetMs`),_status)
-}
-    }
-    
-    
-
-    override fun `notifyError`(`message`: kotlin.String)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
-        it,
-        FfiConverterString.lower(`message`),_status)
 }
     }
     
@@ -3849,18 +3766,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
         it,
         _status)
-}
-    }
-    
-    
-
-    override fun `removeForward`(`id`: kotlin.String)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(
-        it,
-        FfiConverterString.lower(`id`),_status)
 }
     }
     

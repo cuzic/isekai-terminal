@@ -1833,6 +1833,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "tempfile",
+ "thiserror 2.0.18",
  "windows 0.58.0",
 ]
 
@@ -1877,7 +1878,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "bytes",
  "env_logger",
  "hmac",
  "isekai-fs-guard",
@@ -2061,6 +2061,7 @@ dependencies = [
  "log",
  "russh-stream-session",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2344,15 +2345,6 @@ name = "ndk-context"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
-
-[[package]]
-name = "ndk-sys"
-version = "0.6.0+11769913"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
-dependencies = [
- "jni-sys 0.3.1",
-]
 
 [[package]]
 name = "netdev"
@@ -3082,11 +3074,11 @@ dependencies = [
 name = "quicmux"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "log",
  "noq",
  "qmux",
+ "quicmux",
  "rand 0.8.6",
  "rcgen",
  "rustls",
@@ -3101,7 +3093,6 @@ dependencies = [
 name = "quicsock"
 version = "0.1.0"
 dependencies = [
- "ndk-sys",
  "netdev",
  "socket2",
  "windows 0.58.0",
