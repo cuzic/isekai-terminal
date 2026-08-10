@@ -3340,28 +3340,7 @@ mod tests {
         let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = attempt_count.clone();
         let shared = Arc::new(OrchestratorShared {
-            state: Mutex::new(OrchestratorState {
-                current_host: Some("example.com".to_string()),
-                current_port: 22,
-                is_quic: false,
-                phase: ConnPhase::Connected,
-                current_transfer_id: None,
-                trzsz_mode: None,
-                download_buf: Vec::new(),
-                size_limit_exceeded_for: None,
-                pending_file_previews: HashMap::new(),
-                session_generation: 0,
-                reconnect_epoch: 0,
-                reconnect_loop_active: false,
-                retry_attempt_in_flight: false,
-                user_initiated_disconnect: false,
-                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
-                reconnect_policy: ReconnectPolicy::default(),
-                background_state: BackgroundState::Foreground,
-                tab_focused: false,
-                app_foreground: true,
-                recent_notify_seqs: std::collections::VecDeque::new(),
-            }),
+            state: Mutex::new(reconnect_test_state(ReconnectPolicy::default())),
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
@@ -3834,6 +3813,23 @@ mod tests {
             );
         }
 
+        /// VTEでの画面反映は`on_screen_update`コールバック駆動の非同期処理なので、
+        /// scrollbackへの反映が追いつくまで短時間ポーリングして`scrollback_len()`が
+        /// 0より大きくなるのを待つ(2つのテストがこの手順を独立に持っていたので共通化)。
+        /// 反映されなければ最後に観測した値(0)を返し、呼び出し側で`assert!(len > 0, ...)`
+        /// させる(パニックメッセージをテストごとに変えたいため、ここではpanicしない)。
+        async fn wait_scrollback_nonzero(orch: &SessionOrchestrator) -> u32 {
+            let mut len = 0u32;
+            for _ in 0..50 {
+                len = orch.scrollback_len();
+                if len > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            len
+        }
+
         async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
             let (addr, window_changes, channel_closed) = spawn_recording_server().await;
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
@@ -3899,14 +3895,7 @@ mod tests {
                 wait_echo(&mut rx, b"line-059").await;
                 // VTEでの画面反映は非同期(on_screen_updateコールバック駆動)なので、
                 // scrollbackへの反映が追いつくまで短時間ポーリングする。
-                let mut len = 0u32;
-                for _ in 0..50 {
-                    len = orch.scrollback_len();
-                    if len > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                let len = wait_scrollback_nonzero(&orch).await;
                 assert!(
                     len > 0,
                     "SessionOrchestrator::scrollback_len()が実際のtransport/terminal状態を \
@@ -4244,14 +4233,7 @@ mod tests {
                 }
                 wait_echo(&mut rx, b"line-059").await;
 
-                let mut len = 0u32;
-                for _ in 0..50 {
-                    len = orch.scrollback_len();
-                    if len > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                let len = wait_scrollback_nonzero(&orch).await;
                 assert!(len > 0, "scrollbackへの反映を待つ準備ができていない");
 
                 let cells = orch.scrollback_cells(0, 1);
