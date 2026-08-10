@@ -184,27 +184,10 @@ mod tests {
     const SNI: &str = "isekai-pipe.local";
 
     fn build_server_config() -> (MuxServerConfig, String) {
-        let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-        let cert_der = cert.cert.der().clone();
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
-        let cert_sha256_hex = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(cert_der.as_ref());
-            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
-        };
-        let config = MuxServerConfig {
-            alpn: isekai_protocol::hello::ALPN.to_vec(),
-            exporter_label: isekai_protocol::hello::EXPORTER_LABEL.to_vec(),
-            max_idle_timeout: Duration::from_secs(15),
-            keep_alive_interval: Duration::from_secs(5),
-            max_concurrent_bidi_streams: 4,
-            max_concurrent_uni_streams: 0,
-            multipath: false,
-            datagram_send_buffer_size: None,
-            cert_chain: vec![cert_der],
-            private_key: key_der,
-        };
+        let (mut config, cert_sha256_hex) = quicmux::test_support::self_signed_server_config(SNI);
+        config.alpn = isekai_protocol::hello::ALPN.to_vec();
+        config.exporter_label = isekai_protocol::hello::EXPORTER_LABEL.to_vec();
+        config.max_concurrent_bidi_streams = 4;
         (config, cert_sha256_hex)
     }
 

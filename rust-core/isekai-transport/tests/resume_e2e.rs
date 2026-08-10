@@ -24,7 +24,6 @@
 //! without depending on `isekai-ssh`'s own giving-up/backoff policy.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,21 +33,22 @@ use isekai_protocol::attach::{
     AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
     FRAME_ATTACH_HELLO,
 };
-use isekai_protocol::hello::{Proof, ALPN, EXPORTER_LABEL};
+use isekai_protocol::hello::{Proof, EXPORTER_LABEL};
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use isekai_transport::{
     connect_via_relay_resumable, reconnect_and_resume, C2hSentOffset, CandidateIdentity, H2cClientDeliveredOffset, RelayTarget,
     system_quic_factory,
 };
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+
+mod common;
+use common::{generate_cert, mock_noq_server as mock_helper_server, SNI};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const TEST_IDENTITY: CandidateIdentity<'static> =
     CandidateIdentity { kind: "relay", source: "test", provider: "test", id: "test" };
 
-const SNI: &str = "isekai-pipe.local";
 const CONTROL_HELLO: u8 = 0x10;
 const CONTROL_ACK: u8 = 0x11;
 // `RESUME` itself moved to `quicmux::resume` (quicmux-server-resume Stage
@@ -60,34 +60,6 @@ const CONTROL_ACK: u8 = 0x11;
 const QUICMUX_FRAME_RESUME: u8 = 0x01;
 const QUICMUX_FRAME_RESUME_ACK: u8 = 0x02;
 const QUICMUX_FRAME_RESUME_REJECT: u8 = 0x03;
-
-fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
-    // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
-    // `ring`, so rustls can no longer auto-select a single process-wide
-    // crypto provider when this crate is built with that feature on —
-    // every test in this file calls `generate_cert` first, so fixing it
-    // once here covers all of them.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let sha256_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    (cert_der, key_der, sha256_hex)
-}
-
-fn mock_helper_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> noq::Endpoint {
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .unwrap();
-    tls_config.alpn_protocols = vec![ALPN.to_vec()];
-    let quic_crypto = noq::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap();
-    let config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    noq::Endpoint::server(config, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap()
-}
 
 /// One resumable session's state, kept across QUIC connections
 /// (`isekai-helper/src/resume.rs::Session`, minus the parked-TCP-connection
