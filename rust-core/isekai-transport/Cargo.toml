@@ -85,3 +85,8 @@ env_logger = "0.11"
 # `[dependencies]`エントリ(`proof.rs`/`candidate_pool.rs`等が使用)がテストにも
 # そのまま見えるので、ここで別途宣言する必要はない。
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# `src/warm_standby.rs`/`src/physical_interface.rs`のcfg(test)コードが
+# quicmux::test_support::self_signed_server_configを使うため有効化する
+# (`[dependencies]`のquicmuxは`noq`featureのみ; 通常ビルドにtest-supportを
+# 持ち込まないためdev-dependency側でだけ追加する)。
+quicmux = { path = "../quicmux", features = ["test-support"] }
