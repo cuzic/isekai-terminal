@@ -276,6 +276,7 @@ async fn run(config: DaemonConfig) {
                 let now = Instant::now();
                 let event = match wire_event {
                     super::ClientEvent::Notify => HookEvent::Notify,
+                    super::ClientEvent::NotifyUnlessDeferred => HookEvent::NotifyUnlessDeferred,
                     super::ClientEvent::StopDeferred => HookEvent::StopDeferred,
                     super::ClientEvent::Resolve => HookEvent::Resolve,
                     super::ClientEvent::TeammateDispatched => {
@@ -347,8 +348,9 @@ async fn attention_sleep(state: &TabState) {
 }
 
 /// Reads exactly one
-/// `{"session_id": "...", "event": "notify"|"stop_deferred"|"resolve"|
-/// "teammate_dispatched"|"stop_ambiguous_teammate"}` line — this crate's own
+/// `{"session_id": "...", "event": "notify"|"notify_unless_deferred"|
+/// "stop_deferred"|"resolve"|"teammate_dispatched"|"stop_ambiguous_teammate"}`
+/// line — this crate's own
 /// minimal daemon wire format (`super::ClientEvent::as_wire_str`/
 /// `from_wire_str`), deliberately decoupled from Claude Code's own hook JSON
 /// schema (only `super::parse_hook_event`, the client side, needs to know
@@ -633,7 +635,96 @@ mod tests {
         // promotes the still-Deferred session to Attention on its own.
         poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must self-correct to the attention color").await;
         poll_tty_contains(&tty_path, "]9;Claude", "the self-correction must fire the popup, same as a real Notify would").await;
-        poll_tty_contains(&tty_path, "9;4;0;0", "the self-correction must also clear the progress ring").await;
+        // Plain `poll_tty_contains(&tty_path, "9;4;0;0", ...)` would pass
+        // vacuously here: `write_tty` opens in append mode (see that
+        // function's docs), and the startup self-heal already wrote
+        // "9;4;0;0" before `stop_deferred` ever started the ring — so the
+        // needle is present from t=0 regardless of whether this
+        // self-correction's own clear ever happens. Assert the *later*
+        // occurrence of "9;4;0;0" comes after the "9;4;3;0" this
+        // `stop_deferred` started, which only the self-correction's own
+        // clear can produce.
+        poll_until(Duration::from_secs(2), || {
+            let contents = std::fs::read_to_string(&tty_path).unwrap();
+            match (contents.find("9;4;3;0"), contents.rfind("9;4;0;0")) {
+                (Some(started_at), Some(cleared_at)) => cleared_at > started_at,
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the self-correction must clear the progress ring it started: {:?}",
+                std::fs::read_to_string(&tty_path).unwrap()
+            )
+        });
+
+        daemon.abort();
+    }
+
+    /// The 2026-08-10 fix, end to end (see `state::HookEvent::NotifyUnlessDeferred`'s
+    /// docs for the live report this pins): a `stop_deferred` (one or more
+    /// background subagents still running) must stay the waiting color when a
+    /// `notify_unless_deferred` wire event arrives next (one of those
+    /// subagents finishing) — not jump to the attention color the way a plain
+    /// `notify` would. The deferred session still self-corrects to attention
+    /// once `max_deferral` elapses with no further real `Stop`, exactly as an
+    /// unresolved `stop_deferred` alone would.
+    #[tokio::test]
+    async fn notify_unless_deferred_does_not_escalate_a_waiting_tab_but_still_self_corrects() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let hookd_sock_path = dir.path().join("hookd.sock");
+
+        let idle_color = (0x20, 0x20, 0x20);
+        let attention_color = (0xff, 0x88, 0x00);
+        let waiting_color = (0x00, 0x60, 0xa0);
+        let daemon = tokio::spawn(run(DaemonConfig {
+            sock_path: hookd_sock_path.clone(),
+            delivery: Delivery::DirectTty { path: tty_path.clone() },
+            idle_color,
+            attention_color,
+            waiting_color,
+            attention_timeout: Duration::from_millis(100),
+            max_deferral: Duration::from_millis(150),
+            idle_exit: Duration::from_secs(5),
+            teammate_dispatch_ttl: Duration::from_millis(150),
+            hooks_dir: None,
+        }));
+
+        poll_tty_contains(&tty_path, "4;264;rgb:20/20/20", "startup self-heal must paint idle").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"stop_deferred\"}\n").await.unwrap();
+        drop(client);
+        poll_tty_contains(&tty_path, "4;264;rgb:00/60/a0", "stop_deferred must paint the waiting color").await;
+
+        let mut client = UnixStream::connect(&hookd_sock_path).await.unwrap();
+        client.write_all(b"{\"session_id\":\"s1\",\"event\":\"notify_unless_deferred\"}\n").await.unwrap();
+        drop(client);
+
+        // Give the event a moment to be processed, then assert the attention
+        // color/popup never landed — this is the actual regression: an
+        // `agent_completed` notification for one of several still-running
+        // background jobs used to escalate straight to attention here. (A
+        // no-op transition writes nothing at all, so the tty's last bytes are
+        // still whatever `SetWaitingColor` wrote — the progress ring, not the
+        // color escape — hence checking "never appeared" rather than
+        // "currently ends with the waiting color".)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let tty_contents = std::fs::read_to_string(&tty_path).unwrap();
+        assert!(
+            !tty_contents.contains("4;264;rgb:ff/88/00") && !tty_contents.contains("]9;Claude"),
+            "notify_unless_deferred must not escalate an already-Deferred session to attention: {tty_contents:?}"
+        );
+
+        // No further events — max_deferral (150ms) elapses and the daemon
+        // still self-corrects to attention on its own, same as an unresolved
+        // plain stop_deferred would.
+        poll_tty_contains(&tty_path, "4;264;rgb:ff/88/00", "an unresolved deferral must still self-correct to the attention color").await;
+        poll_tty_contains(&tty_path, "]9;Claude", "the self-correction must fire the popup").await;
 
         daemon.abort();
     }

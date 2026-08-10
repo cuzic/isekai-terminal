@@ -2208,7 +2208,7 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
   テンプレート、`.claude/rules/rust-ssot.md`参照)
 - `AI_INTEGRATION_DESIGN.md` §6.1・§9 Epic AI-2/AI-3(本Epicが回答する既知のギャップ)
 
-### Epic Q-2: delivery層のプラグイン化と外部消費API — 設計・一部実装(2026-08-08〜09、他プロジェクト調査を踏まえた比較検討、§3は未マージのブランチで実装済み)
+### Epic Q-2: delivery層のプラグイン化と外部消費API — 設計・一部実装(2026-08-08〜09、他プロジェクト調査を踏まえた比較検討、§3はmainへマージ済み)
 
 **現状**: `claude-hookd`の検知ロジック(`state.rs`)はI/O無し純粋関数として既に
 分離済みで、これ自体は他プロジェクトと比べても遜色ない完成度にある。一方
@@ -2280,8 +2280,8 @@ tab-color増分のコミット時のOpusレビュー会話を参照)。そこで
    snapshot JSON、argv[1]に新しい集約状態名を渡す。timeoutスイープ由来の
    `Action`は単一`session_id`に紐付かない(複数セッションが同時に期限切れ
    しうる)ため、単一session_idを無理に付けずTabState全体を渡す。
-   **実装済み(2026-08-09、Opusレビュー2回反映、未マージ)**:
-   `feat/claude-hookd-external-command-hook`ブランチ(`worktree-claude-hookd-hook`)。
+   **実装済み(2026-08-09、Opusレビュー2回反映、`feat/claude-hookd-external-command-hook`
+   ブランチのcommit `42afa47f`で2026-08-10までにmainへマージ済み)**:
    併せて`delivery.rs`のタブ色OSC生成も、`~/.config/claude-hookd/hooks/tab-color`
    (実行可能ファイルがあれば優先、無ければ`include_str!`で埋め込んだデフォルト
    スクリプトへフォールバック)へシェルスクリプト化し、コンパイル時の
