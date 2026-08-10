@@ -1579,7 +1579,7 @@ impl SessionCallback for NoopSessionCallback {
     fn on_host_key(&self, _fingerprint: String) -> bool { true }
     fn on_connected(&self) {}
     fn on_disconnected(&self, _reason: Option<String>) {}
-    fn on_screen_update(&self, _update: ScreenUpdate) {}
+    fn on_screen_update(&self, _update: crate::ScreenUpdate) {}
     fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
     fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
     fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
