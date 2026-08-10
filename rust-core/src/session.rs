@@ -376,10 +376,9 @@ impl SessionCore {
     /// タスク#17: `TransportCommand::FilePreviewExec`を1本キューイングする。
     /// `run_ssh_channel_loop`は全トランスポート共通(SSH直結・tsshd QUIC・
     /// isekai-pipe QUIC系いずれもこのループ経由でSSHチャネルを持つ、
-    /// `transport/ssh_handler.rs`のモジュールdoc参照)なので、`add_local_forward`と
-    /// 違いトランスポートごとの対応可否分岐は不要——`command_sender()`が生きて
-    /// いれば常に対応できる。未接続/切断済みで`command_sender()`が無い場合のみ
-    /// `false`を返す。
+    /// `transport/ssh_handler.rs`のモジュールdoc参照)なのでトランスポートごとの
+    /// 対応可否分岐は不要——`command_sender()`が生きていれば常に対応できる。
+    /// 未接続/切断済みで`command_sender()`が無い場合のみ`false`を返す。
     pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
         if let Some(tx) = self.command_sender() {
             tx.try_send(TransportCommand::FilePreviewExec { request_id, command_line }).is_ok()
@@ -689,8 +688,8 @@ impl SessionCore {
 /// ではなく定義側(このモジュール)のスコープで名前解決されるため、相対名だと呼び出し元の
 /// importに依存してしまう。
 ///
-/// `add_local_forward`/`remove_forward`(SSH/tsshd-QUICのみ対応)のようにtransportごとに
-/// 挙動が違うメソッドはこのマクロの対象外とし、各implブロックに手書きのまま残す。
+/// `connect`(`SshSession`だけ`app_pane_id`引数を追加で取る等)のようにtransportごとに
+/// シグネチャ/挙動が違うメソッドはこのマクロの対象外とし、各implブロックに手書きのまま残す。
 macro_rules! impl_session_core_delegation {
     ($ty:ty) => {
         impl $ty {
