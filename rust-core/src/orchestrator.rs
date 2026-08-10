@@ -3608,32 +3608,50 @@ mod tests {
             ForwardingOrchestratorCallback as TestCallback, OrchestratorTestEvent as TestEvent,
         };
 
-        /// 公開鍵認証を無条件で受け入れ、`window_change_request`と`channel_close`を
-        /// 記録しつつ、受信データをそのままechoし返す最小SSHサーバ。
-        #[derive(Clone)]
-        struct RecordingServer {
-            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
-            channel_closed: Arc<AtomicBool>,
+        /// `MockServer::data`の挙動切り替え。`RecordingServer`(受信データをそのまま
+        /// echoし返す)と`ScriptedServer`(echoせず`received`に記録するだけで、代わりに
+        /// `shell_request`時に保存した`server::Handle`からテストコードが任意タイミングで
+        /// バイトを能動的に送り込める)は、以前は別々の`Server`/`Handler`ペアだったが、
+        /// `data()`以外の全メソッド(auth/pty/shell/window_change/channel_close/exec)は
+        /// バイト単位で同一実装だったため1つの`MockServer`に統合し、モードだけで分岐する。
+        #[derive(Clone, Copy, PartialEq)]
+        enum MockServerMode {
+            /// scrollback/focus/resize系のテスト向け(旧`RecordingServer`)。
+            Echo,
+            /// trzsz系のテスト向け(旧`ScriptedServer`)。
+            RecordOnly,
         }
 
-        impl server::Server for RecordingServer {
-            type Handler = RecordingHandler;
-            fn new_client(&mut self, _: Option<SocketAddr>) -> RecordingHandler {
-                RecordingHandler {
-                    window_changes: self.window_changes.clone(),
-                    channel_closed: self.channel_closed.clone(),
+        #[derive(Clone)]
+        struct MockServer {
+            mode: MockServerMode,
+            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
+            channel_closed: Arc<AtomicBool>,
+            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
+            received: Arc<StdMutex<Vec<u8>>>,
+        }
+
+        impl MockServer {
+            fn new(mode: MockServerMode) -> Self {
+                Self {
+                    mode,
+                    window_changes: Arc::new(StdMutex::new(Vec::new())),
+                    channel_closed: Arc::new(AtomicBool::new(false)),
+                    channel_handle: Arc::new(StdMutex::new(None)),
+                    received: Arc::new(StdMutex::new(Vec::new())),
                 }
             }
         }
 
-        #[derive(Clone)]
-        struct RecordingHandler {
-            window_changes: Arc<StdMutex<Vec<(u32, u32)>>>,
-            channel_closed: Arc<AtomicBool>,
+        impl server::Server for MockServer {
+            type Handler = MockServer;
+            fn new_client(&mut self, _: Option<SocketAddr>) -> MockServer {
+                self.clone()
+            }
         }
 
         #[async_trait::async_trait]
-        impl server::Handler for RecordingHandler {
+        impl server::Handler for MockServer {
             type Error = russh::Error;
 
             async fn auth_publickey(
@@ -3660,6 +3678,9 @@ mod tests {
                 &mut self, channel: ChannelId, session: &mut ServerSession,
             ) -> Result<(), Self::Error> {
                 session.channel_success(channel)?;
+                // ScriptedServer相当の用途(trzsz系)でのみ実際に読まれるが、常に保存して
+                // おいても他モードには無害(誰も読まない)。
+                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
                 Ok(())
             }
 
@@ -3674,7 +3695,14 @@ mod tests {
             async fn data(
                 &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
             ) -> Result<(), Self::Error> {
-                session.data(channel, CryptoVec::from(data.to_vec()))?;
+                match self.mode {
+                    MockServerMode::Echo => {
+                        session.data(channel, CryptoVec::from(data.to_vec()))?;
+                    }
+                    MockServerMode::RecordOnly => {
+                        self.received.lock().unwrap().extend_from_slice(data);
+                    }
+                }
                 Ok(())
             }
 
@@ -3702,7 +3730,7 @@ mod tests {
             }
         }
 
-        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+        async fn spawn_mock_server(mode: MockServerMode) -> (SocketAddr, MockServer) {
             let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
             let host_key = russh_keys::PrivateKey::from(keypair);
             let config = Arc::new(server::Config {
@@ -3711,17 +3739,23 @@ mod tests {
             });
             let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let window_changes = Arc::new(StdMutex::new(Vec::new()));
-            let channel_closed = Arc::new(AtomicBool::new(false));
-            let mut sh = RecordingServer {
-                window_changes: window_changes.clone(),
-                channel_closed: channel_closed.clone(),
-            };
+            let handle = MockServer::new(mode);
+            let mut sh = handle.clone();
             tokio::spawn(async move {
                 use server::Server as _;
                 let _ = sh.run_on_socket(config, &listener).await;
             });
-            (addr, window_changes, channel_closed)
+            (addr, handle)
+        }
+
+        async fn spawn_recording_server() -> (SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
+            let (addr, sh) = spawn_mock_server(MockServerMode::Echo).await;
+            (addr, sh.window_changes, sh.channel_closed)
+        }
+
+        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
+            let (addr, sh) = spawn_mock_server(MockServerMode::RecordOnly).await;
+            (addr, sh.channel_handle, sh.received)
         }
 
         fn key_auth(seed: u8) -> SshAuth {
@@ -3913,96 +3947,13 @@ mod tests {
 
         // ── trzsz_accept_download / trzsz_accept_upload / trzsz_cancel ──
         //
-        // 上のRecordingServerはクライアントからのデータを無条件にechoするだけなので、
-        // サーバー側が任意タイミングで能動的にバイトを送れる`ScriptedServer`を別途
-        // 用意する(`session.handle()`を`shell_request`時に保存し、テストコードから
-        // `Handle::data()`で直接送り込む)。これにより実物のtrzszトリガー/CFG/NUM
-        // フレームをワイヤ上に流し、`SessionOrchestrator::trzsz_accept_download`等の
-        // 委譲がno-opに変異した場合に実際に検知できるテストを組む。
-
-        #[derive(Clone)]
-        struct ScriptedServer {
-            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
-            received: Arc<StdMutex<Vec<u8>>>,
-        }
-
-        impl server::Server for ScriptedServer {
-            type Handler = ScriptedHandler;
-            fn new_client(&mut self, _: Option<SocketAddr>) -> ScriptedHandler {
-                ScriptedHandler {
-                    channel_handle: self.channel_handle.clone(),
-                    received: self.received.clone(),
-                }
-            }
-        }
-
-        #[derive(Clone)]
-        struct ScriptedHandler {
-            channel_handle: Arc<StdMutex<Option<(ChannelId, server::Handle)>>>,
-            received: Arc<StdMutex<Vec<u8>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl server::Handler for ScriptedHandler {
-            type Error = russh::Error;
-
-            async fn auth_publickey(
-                &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
-            ) -> Result<Auth, Self::Error> {
-                Ok(Auth::Accept)
-            }
-
-            async fn channel_open_session(
-                &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
-            ) -> Result<bool, Self::Error> {
-                Ok(true)
-            }
-
-            async fn pty_request(
-                &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
-                _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(channel)?;
-                Ok(())
-            }
-
-            async fn shell_request(
-                &mut self, channel: ChannelId, session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(channel)?;
-                *self.channel_handle.lock().unwrap() = Some((channel, session.handle()));
-                Ok(())
-            }
-
-            async fn data(
-                &mut self, _channel: ChannelId, data: &[u8], _session: &mut ServerSession,
-            ) -> Result<(), Self::Error> {
-                self.received.lock().unwrap().extend_from_slice(data);
-                Ok(())
-            }
-        }
-
-        async fn spawn_scripted_server() -> (SocketAddr, Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, Arc<StdMutex<Vec<u8>>>) {
-            let keypair = Ed25519Keypair::from_seed(&[7u8; 32]);
-            let host_key = russh_keys::PrivateKey::from(keypair);
-            let config = Arc::new(server::Config {
-                keys: vec![host_key],
-                ..Default::default()
-            });
-            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let channel_handle = Arc::new(StdMutex::new(None));
-            let received = Arc::new(StdMutex::new(Vec::new()));
-            let mut sh = ScriptedServer {
-                channel_handle: channel_handle.clone(),
-                received: received.clone(),
-            };
-            tokio::spawn(async move {
-                use server::Server as _;
-                let _ = sh.run_on_socket(config, &listener).await;
-            });
-            (addr, channel_handle, received)
-        }
+        // 上のRecordingServer相当(`MockServerMode::Echo`)はクライアントからのデータを
+        // 無条件にechoするだけなので、サーバー側が任意タイミングで能動的にバイトを送れる
+        // `MockServerMode::RecordOnly`を代わりに使う(`session.handle()`を`shell_request`
+        // 時に保存し、テストコードから`Handle::data()`で直接送り込む)。これにより実物の
+        // trzszトリガー/CFG/NUMフレームをワイヤ上に流し、`SessionOrchestrator::
+        // trzsz_accept_download`等の委譲がno-opに変異した場合に実際に検知できるテストを
+        // 組む(`spawn_scripted_server`は上の`MockServer`定義の直後を参照)。
 
         async fn connect_scripted_orchestrator() -> (
             Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>,
@@ -4016,7 +3967,7 @@ mod tests {
             (orch, rx, channel_handle, received)
         }
 
-        /// `shell_request`が届き`ScriptedHandler`が`Handle`を保存するまで待ってから、
+        /// `shell_request`が届き`MockServer`(`RecordOnly`モード)が`Handle`を保存するまで待ってから、
         /// テストコードから能動的にバイトをクライアントへ送り込む
         /// (実物のtrzszトリガー/CFG/NUMフレームをそのままワイヤに流すために使う)。
         async fn send_from_server(slot: &Arc<StdMutex<Option<(ChannelId, server::Handle)>>>, bytes: Vec<u8>) {
@@ -4224,7 +4175,7 @@ mod tests {
                 //
                 // SGR属性の実効色は「実行時点」でtheme.default_fg/bgから解決されて
                 // cur_attrsにスナップショットされる(以降テーマが変わっても、明示的な
-                // SGRリセットが無い限り再解決されない)。RecordingServerが素通しで
+                // SGRリセットが無い限り再解決されない)。MockServer(Echoモード)が素通しで
                 // echoする性質を利用し、`\x1b[0m`をecho往復させてからテキストを送ることで
                 // 新テーマでの解決を強制する。
                 orch.send(b"\x1b[0m".to_vec());
@@ -4264,7 +4215,7 @@ mod tests {
                 // SessionOrchestrator::file_preview_requestがno-op(session.file_preview_execを
                 // 呼ばない)に変異していれば、`queued`は常にfalseとなり即座に
                 // FilePreviewOutcome::Error{"not connected"}が同期的に返る。実transportまで
-                // 委譲されていれば、RecordingServerのexec_requestが返す実物のls JSONが
+                // 委譲されていれば、MockServerのexec_requestが返す実物のls JSONが
                 // 非同期に届くはず。
                 let outcome = wait_file_preview_result(&mut rx, "req-1").await;
                 match outcome {
