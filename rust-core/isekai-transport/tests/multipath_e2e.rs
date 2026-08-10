@@ -14,26 +14,9 @@ use std::time::Duration;
 use isekai_protocol::hello::ALPN;
 use isekai_transport::{connect_multipath, BindSpec, PathLabel, PathState, RemoteSpec, SecondaryPath, PRIMARY_PATH_LABEL};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use sha2::{Digest, Sha256};
 
-const SNI: &str = "isekai-pipe.local";
-
-fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
-    // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
-    // `ring`, so rustls can no longer auto-select a single process-wide
-    // crypto provider when this crate is built with that feature on —
-    // every test in this file calls `generate_cert` first, so fixing it
-    // once here covers all of them.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut hasher = Sha256::new();
-    hasher.update(cert_der.as_ref());
-    let sha256_hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    (cert_der, key_der, sha256_hex)
-}
+mod common;
+use common::{generate_cert, SNI};
 
 /// Bound to the IPv4 wildcard address (not just `127.0.0.1`, unlike
 /// `relay_e2e.rs`'s `mock_helper_server`) so it also receives datagrams
