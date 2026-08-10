@@ -2524,11 +2524,7 @@ mod tests {
     #[test]
     fn builds_connection_intent_from_persistent_profile() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home =
-            std::env::temp_dir().join(format!("isekai-ssh-wrapper-intent-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         let sample_trust = || HelperTrust {
             identity_pubkey: "pk".to_string(),
@@ -2679,13 +2675,6 @@ mod tests {
             intent.local_bind_port_range, distinctive_intent.local_bind_port_range,
             "local-bind-port-range directive"
         );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     fn sample_trust_with_stun_observed(stun_observed: Option<&str>) -> HelperTrust {
@@ -2779,10 +2768,7 @@ mod tests {
     #[test]
     fn build_connection_intent_selects_stun_p2p_when_profile_has_observed_address() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("isekai-ssh-wrapper-stun-intent-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
         let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
@@ -2835,13 +2821,6 @@ mod tests {
             }),
             "the connection intent should carry the relay transport as a cross-family fallback"
         );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
