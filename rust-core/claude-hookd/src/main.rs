@@ -42,6 +42,8 @@ mod hooks;
 mod state;
 #[cfg(unix)]
 mod tab_color;
+#[cfg(unix)]
+mod tab_progress;
 
 #[cfg(unix)]
 use delivery::Delivery;
