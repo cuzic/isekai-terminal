@@ -51,6 +51,23 @@ pub(crate) enum HookEvent {
     StopDeferred,
     /// `UserPromptSubmit`, or `PostToolUse` matched to `AskUserQuestion`.
     Resolve,
+    /// `Notification` with `notification_type: "agent_completed"` — one
+    /// background-dispatched agent/job finished. Unlike [`HookEvent::Notify`],
+    /// this must **not** unconditionally override an existing
+    /// [`Pending::Deferred`]: Claude Code's own `Notification` hook payload
+    /// carries no `background_tasks`/`session_crons` field at all (confirmed
+    /// live, 2026-08-10, by reading the CLI's own hook-payload builder — the
+    /// `Notification` envelope is built with no task-registry context, unlike
+    /// `Stop`'s), so this event alone can never tell "the only background job
+    /// just finished" from "one of several still-running ones just finished".
+    /// A real false-Attention report the same day traced to exactly this: a
+    /// session had legitimately deferred (multiple subagents dispatched in
+    /// parallel, `Stop`'s `background_tasks` correctly painted the waiting
+    /// color), then one of those subagents finishing fired `agent_completed`
+    /// — which the old unconditional-`Notify` mapping painted straight to the
+    /// attention color even though the others were still running. See
+    /// [`apply_event`]'s `NotifyUnlessDeferred` arm for the actual decision.
+    NotifyUnlessDeferred,
 }
 
 /// An effect the async driver should perform in response to a transition.
@@ -239,6 +256,20 @@ pub(crate) fn apply_event(
                 next.sessions.entry(session_id.to_string()).or_insert(Pending::Deferred(now + max_deferral));
             }
         }
+        HookEvent::NotifyUnlessDeferred => {
+            // If this session is currently `Deferred`, a background job
+            // finishing proves nothing on its own (see this variant's docs —
+            // the event carries no `background_tasks` to check against) —
+            // leave it alone, exactly like `StopDeferred`'s own
+            // never-refresh-an-existing-`Deferred` rule, so the *next* real
+            // `Stop` (which does carry `background_tasks`) stays the
+            // authoritative signal for whether the session is actually done.
+            // Otherwise (`Idle`, or already `Attention`) there is no locally
+            // known reason to hold back — behaves exactly like `Notify`.
+            if !matches!(next.sessions.get(session_id), Some(Pending::Deferred(_))) {
+                next.sessions.insert(session_id.to_string(), Pending::Attention(now + attention_timeout));
+            }
+        }
         HookEvent::Resolve => {
             // A `Resolve` for a session that was never pending (or already
             // resolved/timed out) is a no-op removal — deliberately not an
@@ -309,6 +340,10 @@ mod tests {
 
     fn stop_deferred(state: &TabState, session_id: &str, now: Instant) -> (TabState, Vec<Action>) {
         apply_event(state, session_id, HookEvent::StopDeferred, now, ATTENTION_TIMEOUT, MAX_DEFERRAL)
+    }
+
+    fn notify_unless_deferred(state: &TabState, session_id: &str, now: Instant) -> (TabState, Vec<Action>) {
+        apply_event(state, session_id, HookEvent::NotifyUnlessDeferred, now, ATTENTION_TIMEOUT, MAX_DEFERRAL)
     }
 
     fn resolve(state: &TabState, session_id: &str, now: Instant) -> (TabState, Vec<Action>) {
@@ -529,6 +564,55 @@ mod tests {
         let (state, actions) = notify(&state, "s1", now + Duration::from_secs(1));
         assert_eq!(actions, vec![Action::SetAttentionColorAndPopup]);
         assert!(state.is_attention());
+    }
+
+    /// Pins the actual fix for a real live false-Attention report (2026-08-10):
+    /// a session had legitimately deferred (`Stop`'s `background_tasks` showed
+    /// several parallel subagents still running), then one of those subagents
+    /// finishing fired `Notification(agent_completed)` — which the old
+    /// unconditional-`Notify` mapping painted straight to the attention color
+    /// even though the others were still running and the session was, in the
+    /// user's own words, "clearly still waiting." `NotifyUnlessDeferred` must
+    /// leave an existing `Deferred` session alone, on its *original* deadline
+    /// (not even a refresh — same rationale as `StopDeferred`'s own
+    /// never-refresh rule).
+    #[test]
+    fn notify_unless_deferred_on_a_deferred_session_does_not_escalate() {
+        let now = Instant::now();
+        let (state, actions) = stop_deferred(&TabState::new(), "s1", now);
+        assert_eq!(actions, vec![Action::SetWaitingColor]);
+        let later = now + Duration::from_secs(60);
+        let (state, actions) = notify_unless_deferred(&state, "s1", later);
+        assert!(actions.is_empty(), "one of several background jobs finishing must not escalate a Deferred session");
+        assert!(!state.is_attention());
+        assert_eq!(state.deferred_session_count(), 1);
+        assert_eq!(state.next_deadline(), Some(now + MAX_DEFERRAL), "the original deferral deadline must be untouched");
+    }
+
+    /// The other half: with no locally-known `Deferred` state at all (a fresh
+    /// tab, or one that was already fully `Idle`), a background job finishing
+    /// has nothing to be held back by — behaves exactly like a real `Notify`.
+    #[test]
+    fn notify_unless_deferred_on_an_idle_session_behaves_like_notify() {
+        let now = Instant::now();
+        let (state, actions) = notify_unless_deferred(&TabState::new(), "s1", now);
+        assert_eq!(actions, vec![Action::SetAttentionColorAndPopup]);
+        assert!(state.is_attention());
+    }
+
+    /// And a session already genuinely `Attention` (e.g. a real `Notify` fired
+    /// first) must still debounce/refresh under `NotifyUnlessDeferred`, same
+    /// as a second `Notify` would — only an *existing Deferred* is special-
+    /// cased, not "anything other than Idle."
+    #[test]
+    fn notify_unless_deferred_on_an_already_attention_session_refreshes_like_notify() {
+        let now = Instant::now();
+        let (state, _) = notify(&TabState::new(), "s1", now);
+        let later = now + Duration::from_secs(60);
+        let (state, actions) = notify_unless_deferred(&state, "s1", later);
+        assert!(actions.is_empty(), "debounce refresh must not resend the popup/color");
+        assert!(state.is_attention());
+        assert_eq!(state.next_deadline(), Some(later + ATTENTION_TIMEOUT));
     }
 
     #[test]

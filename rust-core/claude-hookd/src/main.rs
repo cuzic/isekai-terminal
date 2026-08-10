@@ -159,8 +159,16 @@ async fn event_command() -> ExitCode {
     // `StopDeferred` out of nothing. `TeammateDispatched` deliberately does
     // *not* spawn, same as plain `Resolve`: with no daemon running there is
     // no pending state to update and no `Stop` yet to inform, so recording
-    // the dispatch timestamp would have nothing to do.
-    if !matches!(event, ClientEvent::Notify | ClientEvent::StopDeferred | ClientEvent::StopAmbiguousTeammate) {
+    // the dispatch timestamp would have nothing to do. `NotifyUnlessDeferred`
+    // spawns for the same reason as `StopAmbiguousTeammate` and stays safe
+    // for the same reason: a freshly spawned daemon has no `Deferred` entry
+    // for this session yet, so `state.rs::apply_event` resolves it exactly
+    // like a plain `Notify` — spawning here can never wrongly suppress a
+    // genuine attention signal.
+    if !matches!(
+        event,
+        ClientEvent::Notify | ClientEvent::StopDeferred | ClientEvent::StopAmbiguousTeammate | ClientEvent::NotifyUnlessDeferred
+    ) {
         // `SessionEnd` alone still gets one direct, best-effort, idempotent
         // idle-color write — bypassing the daemon/state machine entirely —
         // when no daemon answers. Without this, "the daemon happened to be
@@ -246,6 +254,17 @@ enum ClientEvent {
     /// dispatch ⇒ probably just a long-idle teammate (`Notify`, the safe
     /// default).
     StopAmbiguousTeammate,
+    /// `Notification` with `notification_type: "agent_completed"` — see
+    /// `state::HookEvent::NotifyUnlessDeferred`'s docs for why this needs its
+    /// own variant rather than folding into plain `Notify`: unlike
+    /// `permission_prompt`/`idle_prompt`/etc, this specific notification
+    /// type's own hook payload carries no `background_tasks`, so whether it
+    /// should actually paint the attention color depends on this tab's
+    /// already-known pending state — daemon-held, not something a one-shot
+    /// `claude-hookd event` process can decide alone. No history to record on
+    /// this end, unlike `TeammateDispatched`/`StopAmbiguousTeammate` — the
+    /// daemon-side translation is a direct 1:1 map to `state::HookEvent`.
+    NotifyUnlessDeferred,
 }
 
 #[cfg(unix)]
@@ -264,12 +283,14 @@ impl ClientEvent {
             ClientEvent::Resolve => "resolve",
             ClientEvent::TeammateDispatched => "teammate_dispatched",
             ClientEvent::StopAmbiguousTeammate => "stop_ambiguous_teammate",
+            ClientEvent::NotifyUnlessDeferred => "notify_unless_deferred",
         }
     }
 
     fn from_wire_str(s: &str) -> Option<Self> {
         Some(match s {
             "notify" => ClientEvent::Notify,
+            "notify_unless_deferred" => ClientEvent::NotifyUnlessDeferred,
             "stop_deferred" => ClientEvent::StopDeferred,
             "resolve" => ClientEvent::Resolve,
             "teammate_dispatched" => ClientEvent::TeammateDispatched,
@@ -444,9 +465,13 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, ClientEvent, bool)> {
 
     let event = match hook_event_name {
         "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
-            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input" | "agent_completed") => {
-                ClientEvent::Notify
-            }
+            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input") => ClientEvent::Notify,
+            // Deliberately not lumped in with the unambiguous group above —
+            // see `ClientEvent::NotifyUnlessDeferred`'s docs: this specific
+            // notification_type's payload carries no background_tasks, so it
+            // must not unconditionally override a session already known
+            // (from an earlier Stop) to have other background work pending.
+            Some("agent_completed") => ClientEvent::NotifyUnlessDeferred,
             Some("elicitation_complete" | "elicitation_response") => ClientEvent::Resolve,
             Some(_) => return None,
             None => ClientEvent::Notify,
@@ -784,7 +809,7 @@ mod tests {
 
     #[test]
     fn notification_types_that_mean_needs_input_are_notify() {
-        for kind in ["permission_prompt", "idle_prompt", "elicitation_dialog", "agent_needs_input", "agent_completed"] {
+        for kind in ["permission_prompt", "idle_prompt", "elicitation_dialog", "agent_needs_input"] {
             let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
             assert_eq!(
                 parse_hook_event(payload.as_bytes()),
@@ -792,6 +817,19 @@ mod tests {
                 "notification_type {kind:?} should be Notify"
             );
         }
+    }
+
+    /// Pins the actual fix for a real live false-Attention report (2026-08-10,
+    /// see `state::HookEvent::NotifyUnlessDeferred`'s docs for the full
+    /// trail): `agent_completed`'s own payload carries no `background_tasks`,
+    /// so unlike the other needs-input notification types above it must not
+    /// be classified as an unconditional `Notify` — the daemon-held pending
+    /// state (`state.rs`) is what actually decides whether it should paint
+    /// attention, not this one-shot classification alone.
+    #[test]
+    fn notification_type_agent_completed_is_notify_unless_deferred_not_plain_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"agent_completed"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::NotifyUnlessDeferred, false)));
     }
 
     #[test]
@@ -1059,6 +1097,29 @@ mod tests {
         let b = derive_daemon_sock_path(&d);
         assert_eq!(a, b, "the same delivery target must always derive the same daemon socket");
         assert!(a.to_string_lossy().contains(DAEMON_SOCK_PREFIX));
+    }
+
+    /// Every `ClientEvent` variant must round-trip through the wire format
+    /// unchanged — pins a gap an adversarial review (2026-08-10) flagged:
+    /// nothing previously exercised `as_wire_str`/`from_wire_str` directly,
+    /// so a typo'd wire string on either side (e.g. `NotifyUnlessDeferred`'s
+    /// `"notify_unless_deferred"`) would have `daemon.rs::read_one_event_line`
+    /// silently drop the event (`from_wire_str` returns `None` for an
+    /// unrecognized string, same as malformed JSON) rather than fail loudly —
+    /// exactly the failure mode the daemon-loop end-to-end tests in
+    /// `daemon.rs` can't distinguish from "the event correctly did nothing."
+    #[test]
+    fn every_client_event_round_trips_through_the_wire_format() {
+        for event in [
+            ClientEvent::Notify,
+            ClientEvent::NotifyUnlessDeferred,
+            ClientEvent::StopDeferred,
+            ClientEvent::Resolve,
+            ClientEvent::TeammateDispatched,
+            ClientEvent::StopAmbiguousTeammate,
+        ] {
+            assert_eq!(ClientEvent::from_wire_str(event.as_wire_str()), Some(event), "{event:?} must round-trip");
+        }
     }
 
     #[test]
