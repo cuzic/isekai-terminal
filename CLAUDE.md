@@ -81,6 +81,26 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_termina
   (詳細は `android/migration_registry.toml` 参照)。CI(`room-migration-check.yml`)が
   `AppDatabase.kt` の版数と migration チェーンの整合性を検証する。
 
+## 並列worktree運用時の注意
+
+複数のworktree/エージェントを並列に走らせる大規模な作業(大規模リファクタ・
+一斉クリーンアップ等)では、以下の落とし穴を踏みやすい。詳細は各ルールファイル
+を参照(いずれも`.claude/rules/`配下、自動読込される):
+
+- **worktree間でのビルド成果物共有とディスク管理**: `git worktree add`のたびに
+  muslクロスビルド済みバイナリが空になりビルドが壊れる問題と、大量worktree
+  並列時にディスクを圧迫する問題。詳細は`.claude/rules/worktree-artifact-sharing.md`
+  を参照。
+- **並列worktreeエージェントの運用**: エージェントが意図したベースブランチでは
+  なく古いコミットから分岐してしまう問題、build-checkフックの通知が別worktree
+  や編集途中の状態を指していることがある問題、マージ時の3-way mergeを盲信しない
+  こと。詳細は`.claude/rules/parallel-worktree-agent-operations.md`を参照。
+- **UniFFIバインディングの再生成はローカルビルド禁止のためCI経由で行う**:
+  `regenerate-uniffi-bindings.yml`(workflow_dispatch)をトリガーし、生成物を
+  ダウンロードして反映する。本体ファイルだけでなく`.sha256`サイドカーも
+  忘れずにコピーしないとdrift-checkがCIで落ちる。詳細は
+  `.claude/rules/uniffi-binding-regeneration.md`を参照。
+
 ## コミット規約
 
 `git log --oneline` に従う: `<type>: <日本語での説明>(該当する場合は「（Phase X-Y）」を付す)`。
