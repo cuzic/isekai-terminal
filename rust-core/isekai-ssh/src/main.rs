@@ -34,6 +34,66 @@ mod wrapper;
 #[cfg(test)]
 pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Shared `$HOME` save/restore helpers for tests that need to point `$HOME`
+/// at a fresh, isolated directory. Used to be copied byte-for-byte across
+/// `ctl_forward.rs`/`native/mux/build_relay.rs`/`native/mux/client.rs`
+/// (the `with_build_profiles`/`HomeRestoreGuard` pair below), plus 4 more
+/// call sites in `init.rs`/`wrapper.rs` that saved/restored `$HOME`
+/// manually without an RAII guard — meaning a test panicking between the
+/// save and the restore leaked the mutated `$HOME` into every subsequent
+/// test in the same process. Consolidating onto `HomeRestoreGuard`
+/// everywhere fixes that panic-safety gap as a side effect.
+///
+/// Callers are responsible for holding `HOME_ENV_LOCK` for the guard's
+/// entire lifetime — this module does not acquire the lock itself, since
+/// callers need to hold it across their whole test body (not just the
+/// `$HOME` swap), and a lock acquired here would be released the moment
+/// the helper function returns.
+#[cfg(test)]
+pub(crate) mod test_home {
+    /// Restores the previous `$HOME` value (or unsets it, if it was unset
+    /// before) when dropped — including when the test panics, unlike a
+    /// bare save-then-restore without a guard.
+    pub(crate) struct HomeRestoreGuard(Option<std::ffi::OsString>);
+
+    impl Drop for HomeRestoreGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(old) => std::env::set_var("HOME", old),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Points `$HOME` at a fresh tempdir, returning it alongside a guard
+    /// that restores the previous `$HOME` on drop. Caller must hold
+    /// `HOME_ENV_LOCK` for the guard's whole lifetime.
+    pub(crate) fn with_temp_home() -> (tempfile::TempDir, HomeRestoreGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        (home, HomeRestoreGuard(old_home))
+    }
+
+    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
+    /// `build_profiles.toml` there. Shared by `ctl_forward.rs`'s,
+    /// `native/mux/build_relay.rs`'s, and `native/mux/client.rs`'s
+    /// build-profile tests (previously three byte-for-byte-identical
+    /// copies).
+    pub(crate) fn with_build_profiles(
+        profiles: Vec<crate::build_profile::BuildProfile>,
+    ) -> (tempfile::TempDir, HomeRestoreGuard) {
+        let (home, guard) = with_temp_home();
+        let mut store = crate::build_profile::BuildProfileStore::default();
+        for profile in profiles {
+            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
+        }
+        let path = crate::build_profile::default_build_profiles_path().unwrap();
+        crate::build_profile::save_build_profiles(&path, &store).unwrap();
+        (home, guard)
+    }
+}
+
 use clap::Parser;
 
 const EXIT_OTHER_ERROR: u8 = 1;

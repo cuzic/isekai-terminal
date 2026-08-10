@@ -267,10 +267,7 @@ mod tests {
     #[test]
     fn resolve_relay_jwt_sources_from_the_login_token_file() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("isekai-ssh-init-relay-jwt-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         isekai_auth::FileTokenProvider::from_default_path().unwrap().save_relay_jwt("token-from-login").unwrap();
 
@@ -278,35 +275,18 @@ mod tests {
         args.relay_jwt = None;
         args.relay_jwt_from_login = true;
         assert_eq!(resolve_relay_jwt(&args).unwrap(), "token-from-login");
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
     fn resolve_relay_jwt_errors_when_login_requested_but_no_token_file_exists() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("isekai-ssh-init-relay-jwt-missing-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
+        let (_home, _restore) = crate::test_home::with_temp_home();
 
         let mut args = sample_init_args();
         args.relay_jwt = None;
         args.relay_jwt_from_login = true;
         let err = resolve_relay_jwt(&args).unwrap_err();
         assert!(err.to_string().contains("isekai-ssh login"), "{err}");
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

@@ -863,39 +863,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("preamble"));
     }
 
-    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
-    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
-    /// `init.rs`'s own `$HOME`-dependent tests use, since `cargo test` runs
-    /// tests on multiple threads and `std::env::set_var` is process-global.
-    /// Returns the tempdir (kept alive for the caller's whole test) and a
-    /// guard that restores the previous `$HOME` on drop.
-    #[cfg(unix)]
-    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
-        let home = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
-        let mut store = crate::build_profile::BuildProfileStore::default();
-        for profile in profiles {
-            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
-        }
-        let path = crate::build_profile::default_build_profiles_path().unwrap();
-        crate::build_profile::save_build_profiles(&path, &store).unwrap();
-        (home, HomeRestoreGuard(old_home))
-    }
-
-    #[cfg(unix)]
-    struct HomeRestoreGuard(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl Drop for HomeRestoreGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(old) => std::env::set_var("HOME", old),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
     /// Reads `CtlMessage` lines off `client` until `BuildFinished`, decoding
     /// every `BuildOutputChunk` along the way and appending its bytes to the
     /// matching stream's buffer. Mirrors what `isekai-pipe ctl build` itself
@@ -934,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn run_build_reports_an_unknown_profile() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_home, _restore) = with_build_profiles(vec![]);
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![]);
 
         let (mut client, server_stream) = tokio::io::duplex(4096);
         let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
@@ -957,7 +924,7 @@ mod tests {
     async fn run_build_streams_output_and_reports_exit_code_and_results() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "t".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -997,7 +964,7 @@ mod tests {
     async fn run_build_kills_the_child_when_the_connection_breaks_mid_build() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![crate::build_profile::BuildProfile {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
@@ -1064,7 +1031,7 @@ mod tests {
     async fn a_running_ctl_listener_picks_up_build_profile_changes_without_restarting() {
         let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let workdir = tempfile::tempdir().unwrap();
-        let (_home, _restore) = with_build_profiles(vec![]);
+        let (_home, _restore) = crate::test_home::with_build_profiles(vec![]);
 
         let mut forward = prepare_ctl_forward(workdir.path()).unwrap();
         spawn_ctl_listener(&mut forward, "mybox".to_string()).await;
