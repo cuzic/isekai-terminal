@@ -39,6 +39,24 @@ fn isekai_pipe_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-pipe"))
 }
 
+/// A short-lived `$HOME` for this test, rooted at `/tmp` rather than
+/// `tempfile::tempdir()`'s OS-default base — real bug found running this
+/// very test file on macOS CI: `std::env::temp_dir()` there resolves under
+/// `/var/folders/<hash>/T/`, long enough that
+/// `<home>/.cache/isekai-pipe/tty/<name>.sock` (`unix_socket.rs::private_runtime_dir`)
+/// overflowed `sockaddr_un`'s `sun_path` (104 bytes on macOS, 108 on Linux)
+/// and every connect failed with "path must be shorter than SUN_LEN" — not a
+/// bug in the fixes under test, but a real, if narrow, latent limitation
+/// this crate's socket-path construction has on any real system whose
+/// `$HOME` is long enough (a plausible macOS default, and not impossible on
+/// Linux either). `/tmp` itself is short and available on every platform
+/// this feature targets (Unix only), sidestepping the issue for this test;
+/// see the PR this fix landed in for the follow-up tracking the underlying
+/// `private_runtime_dir` fragility.
+fn short_tmp_home() -> tempfile::TempDir {
+    tempfile::Builder::new().prefix("e").tempdir_in("/tmp").expect("failed to create a short-path temp dir under /tmp")
+}
+
 /// Opens a fresh pty pair the same way `src/tty/pty.rs::spawn` does for the
 /// shell it owns — here standing in for the pty `sshd` allocates for the
 /// SSH session `isekai-pipe tty attach` itself runs inside of.
@@ -100,7 +118,7 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, poll_interval: Duration,
 /// the kernel's cooked-mode default `openpty` starts every fresh pty at.
 #[tokio::test]
 async fn tty_attach_puts_its_own_pty_into_raw_mode() {
-    let home = tempfile::tempdir().unwrap();
+    let home = short_tmp_home();
     let name = "e2e-rawmode";
     let (master, slave_fd) = open_pty_pair();
 
@@ -149,7 +167,7 @@ async fn tty_attach_puts_its_own_pty_into_raw_mode() {
 async fn tty_attach_exits_promptly_and_cleanly_after_shell_exit() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let home = tempfile::tempdir().unwrap();
+    let home = short_tmp_home();
     let name = "e2e-exit-promptly";
 
     let mut attach = tokio::process::Command::new(isekai_pipe_bin_path())
