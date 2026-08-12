@@ -77,6 +77,44 @@ pub(crate) fn private_runtime_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Conservative bound on the *whole* socket path, safely under both
+/// platforms this module ships for: `sockaddr_un.sun_path` is 104 bytes on
+/// macOS and 108 on Linux, each including the NUL terminator — 90 leaves
+/// comfortable margin on the tighter (macOS) limit without needing a
+/// `cfg`-gated exact constant per platform.
+const MAX_SOCKET_PATH_LEN: usize = 90;
+
+/// `dir.join(format!("{name}.sock"))`, unless that would overflow
+/// [`MAX_SOCKET_PATH_LEN`] — real bug found live (2026-08-12, this
+/// feature's own e2e tests running on macOS CI): `dir` is
+/// [`private_runtime_dir`]'s `$HOME`-rooted path, so a long-enough `$HOME`
+/// (a plausible macOS default — CI's own `/var/folders/<hash>/T/...` is
+/// already close) plus a long `name` (this feature's own auto-derived
+/// `--isekai-tty` names, or simply a name near `validate_name`'s own
+/// 200-byte ceiling — chosen for ordinary filesystem filename limits, which
+/// have nothing to do with `sockaddr_un`'s much tighter one) can exceed the
+/// kernel's `sun_path` limit *regardless of `$HOME`'s length*, failing every
+/// `connect(2)`/`bind(2)` with "path must be shorter than SUN_LEN" — not a
+/// theoretical concern, an actual CI failure this exact function exists to
+/// prevent.
+///
+/// Falls back to a short, fixed-length hash of the natural path — not just
+/// of `name` alone, so a collision would need two different `dir` roots
+/// *and* names to hash alike, never just two long names sharing a prefix.
+/// Both `daemon.rs` (bind) and `attach.rs` (connect) call this same
+/// function with the same `(dir, name)`, so they always agree on which path
+/// — natural or hashed — a given session actually uses.
+pub(crate) fn socket_path(dir: &Path, name: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let natural = dir.join(format!("{name}.sock"));
+    if natural.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return natural;
+    }
+    let short = &isekai_trust::hex_sha256(natural.as_os_str().as_bytes())[..16];
+    dir.join(format!("{short}.sock"))
+}
+
 fn verify_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -138,4 +176,49 @@ pub(crate) fn verify_peer_is_self(stream: &UnixStream) -> io::Result<()> {
         return Err(io::Error::other(format!("peer uid {} does not match the current user (uid {euid})", cred.uid())));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_uses_the_natural_name_when_it_fits() {
+        let dir = PathBuf::from("/tmp/short");
+        let path = socket_path(&dir, "myhost");
+        assert_eq!(path, dir.join("myhost.sock"));
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_a_short_hash_when_the_natural_path_would_overflow_sun_path() {
+        // A `dir` long enough on its own that even a short `name` overflows
+        // `MAX_SOCKET_PATH_LEN` — standing in for a long `$HOME` (this
+        // module's real bug: CI's own long macOS temp-dir default).
+        let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
+        let name = "wt-7cf62198-6b3f-4b33-810f-6b93cf102770";
+        let path = socket_path(&dir, name);
+
+        assert_ne!(path, dir.join(format!("{name}.sock")), "must not use the natural (too-long) path");
+        assert!(
+            path.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
+            "the fallback path itself must respect the bound it exists to enforce: {path:?} ({} bytes)",
+            path.as_os_str().len()
+        );
+        assert_eq!(path.parent(), Some(dir.as_path()), "the fallback must still live in the same directory, just under a shorter filename");
+    }
+
+    #[test]
+    fn socket_path_is_deterministic_so_daemon_and_attach_always_agree() {
+        let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
+        let name = "wt-7cf62198-6b3f-4b33-810f-6b93cf102770";
+        assert_eq!(socket_path(&dir, name), socket_path(&dir, name), "the same (dir, name) must always hash to the same fallback path");
+    }
+
+    #[test]
+    fn socket_path_fallback_differs_for_different_names_in_the_same_dir() {
+        let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
+        let a = socket_path(&dir, "wt-11111111-1111-1111-1111-111111111111");
+        let b = socket_path(&dir, "wt-22222222-2222-2222-2222-222222222222");
+        assert_ne!(a, b, "two different long names in the same dir must not collide onto the same fallback socket path");
+    }
 }
