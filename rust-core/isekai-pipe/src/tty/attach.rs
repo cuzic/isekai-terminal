@@ -57,7 +57,7 @@ pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
     let _raw_mode = RawModeGuard::enable();
 
     let dir = super::unix_socket::private_runtime_dir()?;
-    let socket_path = dir.join(format!("{name}.sock"));
+    let socket_path = super::unix_socket::socket_path(&dir, name)?;
 
     let mut stream = match connect(&socket_path).await {
         Ok(stream) => stream,
