@@ -90,10 +90,21 @@ alternative to the auto-bootstrap path above — useful for one-off deploys via 
 jump host, relay JWT management, or diagnosing a specific host's trust state.
 Full design background: ISEKAI_PIPE_DESIGN.md.";
 
+/// `CARGO_PKG_VERSION` (from `Cargo.toml`, effectively frozen at `0.1.0` —
+/// this project doesn't bump it per release) tells you nothing about which
+/// commit a given binary was built from. `build.rs` captures the git commit
+/// short SHA at compile time into `ISEKAI_GIT_SHA`; this combines the two so
+/// `isekai-ssh --version`/`-V` alone is enough to confirm a freshly deployed
+/// binary matches a specific commit, without falling back to comparing
+/// sha256 hashes by hand (found needed 2026-08-12 verifying a production
+/// deploy of a hang fix — `--version` printed the same `0.1.0` before and
+/// after, which looked like the fix hadn't actually shipped).
+const VERSION_WITH_GIT_SHA: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ISEKAI_GIT_SHA"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "isekai-ssh",
-    version,
+    version = VERSION_WITH_GIT_SHA,
     about = "ssh(1) ProxyCommand wrapper reusing isekai-helper's QUIC connection resilience",
     long_about = LONG_ABOUT
 )]
