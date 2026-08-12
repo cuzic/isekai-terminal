@@ -33,6 +33,19 @@ const RING_BUFFER_CAPACITY: usize = 256 * 1024;
 /// this daemon's accept loop or the pty relay forever.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TEMPORARY diagnostic-only helper (2026-08-12 investigation into the shell
+/// exiting almost immediately when spawned via `spawn_detached`) — appends a
+/// timestamped line to a fixed path, since this process's own stderr is
+/// `Stdio::null()`'d by its caller and there is no `--isekai-log-file`
+/// equivalent for `isekai-pipe` the way `isekai-ssh` has. Remove once the
+/// root cause is found.
+fn debug_log(msg: &str) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/isekai-pipe-tty-daemon-debug.log") {
+        let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+    }
+}
+
 /// Spawns `isekai-pipe tty daemon <name>` as a **fully detached** process —
 /// not merely "backgrounded" — so it survives the SSH session `isekai-pipe
 /// tty attach` (this function's caller) is itself running inside of.
@@ -141,7 +154,9 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     let listener = super::unix_socket::bind_private_socket(&socket_path)?;
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    debug_log(&format!("about to spawn command={command:?} term={term:?}"));
     let (master, mut child) = super::pty::spawn(&command, &term, DEFAULT_COLS, DEFAULT_ROWS)?;
+    debug_log(&format!("spawned child pid={:?}", child.id()));
     let master = Arc::new(master);
     let attach_slot = Arc::new(AttachSlot::new(RING_BUFFER_CAPACITY));
 
@@ -156,10 +171,17 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
             let mut buf = [0u8; 8192];
             loop {
                 match master.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => attach_slot.broadcast(&buf[..n]),
+                    Ok(0) => {
+                        debug_log("pty read returned Ok(0) (EOF/EIO)");
+                        break;
+                    }
+                    Ok(n) => {
+                        debug_log(&format!("pty read {n} bytes: {:?}", String::from_utf8_lossy(&buf[..n])));
+                        attach_slot.broadcast(&buf[..n]);
+                    }
                     Err(e) => {
                         log::debug!("isekai-pipe tty daemon {name}: pty read ended: {e:#}");
+                        debug_log(&format!("pty read errored: {e:#}"));
                         break;
                     }
                 }
@@ -197,6 +219,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     // end" signal; per this feature's "daemon lifetime = shell lifetime"
     // design, everything else shuts down once this resolves.
     let exit_status = tokio::task::spawn_blocking(move || child.wait()).await??;
+    debug_log(&format!("child.wait() returned: {exit_status:?}"));
     let exit_code = exit_status.code().unwrap_or(1) as u8;
 
     attach_slot.notify_exit(exit_code);
