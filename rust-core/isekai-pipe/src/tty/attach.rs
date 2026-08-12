@@ -58,6 +58,7 @@ pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
 
     let dir = super::unix_socket::private_runtime_dir()?;
     let socket_path = super::unix_socket::socket_path(&dir, name)?;
+    refresh_ctl_sock_file(&dir, name);
 
     let mut stream = match connect(&socket_path).await {
         Ok(stream) => stream,
@@ -80,6 +81,39 @@ pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
     }
 
     relay(stream).await
+}
+
+/// Keeps `daemon.rs`'s `$ISEKAI_TTY_CTL_SOCK_FILE`-pointed indirection file
+/// in sync with *this* invocation's own `$ISEKAI_CTL_SOCK` — see
+/// `daemon.rs::run`'s doc comment for the staleness bug this exists to fix.
+/// Called unconditionally on every `tty attach` invocation, not just the
+/// one that ends up spawning a fresh daemon: a reconnect never re-execs the
+/// pty shell (so it can never see a new env var directly), but it *does*
+/// always run this function first, which is what lets `isekai-pipe ctl`
+/// (run later, from inside that same long-lived shell) observe the fresh
+/// value instead of whatever was current the first time this session's
+/// daemon happened to be spawned.
+///
+/// Best-effort: a write failure here (e.g. a momentarily-unwritable
+/// directory) must not fail the whole attach — this indirection is a
+/// convenience for `isekai-pipe ctl`'s title/clipboard/notify commands, not
+/// something the core "reconnect to my persistent shell" feature depends
+/// on. When `$ISEKAI_CTL_SOCK` isn't set for this invocation (ctl-socket
+/// forwarding disabled, or `--isekai-tty` used without it), any existing
+/// file is removed rather than left behind — a stale file here would look
+/// exactly as "fresh" as a real one to `ctl.rs`'s reader, silently pointing
+/// `isekai-pipe ctl` at a forward that was never set up for *this*
+/// reconnect.
+fn refresh_ctl_sock_file(dir: &std::path::Path, name: &str) {
+    let path = super::unix_socket::ctl_sock_file_path(dir, name);
+    match std::env::var("ISEKAI_CTL_SOCK") {
+        Ok(value) if !value.is_empty() => {
+            let _ = std::fs::write(&path, value);
+        }
+        _ => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// RAII guard: puts this process's own fd 0 (the pty `sshd` allocated for

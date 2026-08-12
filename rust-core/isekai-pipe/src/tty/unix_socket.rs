@@ -130,6 +130,17 @@ pub(crate) fn socket_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(fallback)
 }
 
+/// The per-session file `daemon.rs`/`attach.rs` use to keep the pty shell's
+/// view of `$ISEKAI_CTL_SOCK` fresh across reconnects — see `daemon.rs::run`
+/// for the real bug this exists to fix. Plain concatenation, unlike
+/// [`socket_path`]: an ordinary file has no `sockaddr_un`-style length
+/// limit, so there is nothing here for a long `dir`/`name` to overflow.
+/// Both callers pass the same `(dir, name)`, so they always agree on the
+/// path.
+pub(crate) fn ctl_sock_file_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.ctl_sock"))
+}
+
 /// A short, `$HOME`-independent private directory for [`socket_path`]'s
 /// fallback — `/tmp/isekai-pipe-<uid>`, verified the exact same way
 /// [`private_runtime_dir`] verifies its own directory (owner, mode, not a

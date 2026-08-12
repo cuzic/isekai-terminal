@@ -29,6 +29,18 @@ use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
 
+/// Set by `isekai-pipe tty daemon` (`tty/pty.rs::spawn`) on every pty shell
+/// it owns — a *path*, not the ctl-socket value itself, kept stable for the
+/// daemon's whole lifetime (unlike `$ISEKAI_CTL_SOCK`, which a `--isekai-tty`
+/// persistent session's shell only ever gets exported once, at first spawn —
+/// see `tty/daemon.rs::run`'s doc comment for the staleness bug this exists
+/// to fix). [`resolve_ctl_socket_path_with`] reads this file's *current*
+/// content, kept fresh by `tty/attach.rs::refresh_ctl_sock_file` on every
+/// `tty attach` invocation including reconnects, in preference to the
+/// (possibly long-stale) `$ISEKAI_CTL_SOCK` this same shell also has in its
+/// environment.
+const ENV_TTY_CTL_SOCK_FILE: &str = "ISEKAI_TTY_CTL_SOCK_FILE";
+
 #[derive(Debug, PartialEq, Eq)]
 enum CtlLaunch {
     Title { sock: Option<String>, value: String },
@@ -386,10 +398,20 @@ fn query_tmux_ctl_sock_option() -> Option<String> {
 /// 薄いラッパーにする)。
 fn resolve_ctl_socket_path_with(
     explicit: Option<String>,
+    tty_ctl_sock_file_value: impl FnOnce() -> Option<String>,
     tmux_query: impl FnOnce() -> Option<String>,
 ) -> Result<PathBuf, ExitCode> {
     if let Some(explicit) = explicit {
         return Ok(PathBuf::from(explicit));
+    }
+    // Checked *before* the plain env var below: see `ENV_TTY_CTL_SOCK_FILE`'s
+    // doc comment for why this dynamically-refreshed source must win over a
+    // `$ISEKAI_CTL_SOCK` that a `--isekai-tty` persistent shell can be
+    // holding stale for the rest of its life. A `--isekai-tty`-less session
+    // never has `$ISEKAI_TTY_CTL_SOCK_FILE` set at all, so this is a no-op
+    // for every other topology.
+    if let Some(path) = tty_ctl_sock_file_value() {
+        return Ok(PathBuf::from(path));
     }
     if let Some(v) = std::env::var_os(ENV_CTL_SOCK) {
         if !v.is_empty() {
@@ -403,6 +425,23 @@ fn resolve_ctl_socket_path_with(
         "isekai-pipe ctl: no --sock given, ${ENV_CTL_SOCK} is unset or empty, and no tmux @isekai_ctl_sock pane option was found"
     );
     Err(ExitCode::from(EX_USAGE))
+}
+
+/// Production implementation of `resolve_ctl_socket_path_with`'s
+/// `tty_ctl_sock_file_value` parameter: reads `$ISEKAI_TTY_CTL_SOCK_FILE`
+/// (if set) and returns that file's trimmed content, or `None` if the env
+/// var is unset or the file can't be read (e.g. this daemon hasn't had any
+/// `$ISEKAI_CTL_SOCK`-carrying attach yet — falls through to the plain env
+/// var / tmux checks, same as if `--isekai-tty` weren't in use at all).
+fn read_tty_ctl_sock_file() -> Option<String> {
+    let path = std::env::var_os(ENV_TTY_CTL_SOCK_FILE)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_ctl_setvar(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
@@ -557,7 +596,7 @@ fn parse_ctl_build(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
 }
 
 fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode> {
-    resolve_ctl_socket_path_with(explicit, query_tmux_ctl_sock_option)
+    resolve_ctl_socket_path_with(explicit, read_tty_ctl_sock_file, query_tmux_ctl_sock_option)
 }
 
 /// The `-R` remote path convention `isekai-ssh`'s `ctl_forward.rs` uses
@@ -1263,7 +1302,7 @@ mod tests {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
         let resolved =
-            resolve_ctl_socket_path_with(Some("/from/flag.sock".to_string()), || None).unwrap();
+            resolve_ctl_socket_path_with(Some("/from/flag.sock".to_string()), || None, || None).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/flag.sock"));
         std::env::remove_var(ENV_CTL_SOCK);
     }
@@ -1272,7 +1311,7 @@ mod tests {
     fn resolves_sock_from_env_when_no_flag() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
-        let resolved = resolve_ctl_socket_path_with(None, || None).unwrap();
+        let resolved = resolve_ctl_socket_path_with(None, || None, || None).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/env.sock"));
         std::env::remove_var(ENV_CTL_SOCK);
     }
@@ -1283,9 +1322,10 @@ mod tests {
     fn resolves_sock_from_tmux_pane_option_when_no_flag_or_env() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_CTL_SOCK);
-        let resolved =
-            resolve_ctl_socket_path_with(None, || Some("/tmp/isekai-pipe-ctl-from-tmux.sock".to_string()))
-                .unwrap();
+        let resolved = resolve_ctl_socket_path_with(None, || None, || {
+            Some("/tmp/isekai-pipe-ctl-from-tmux.sock".to_string())
+        })
+        .unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/isekai-pipe-ctl-from-tmux.sock"));
     }
 
@@ -1294,8 +1334,60 @@ mod tests {
     fn rejects_missing_sock() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_CTL_SOCK);
-        let err = resolve_ctl_socket_path_with(None, || None).unwrap_err();
+        let err = resolve_ctl_socket_path_with(None, || None, || None).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    /// Regression coverage for a real bug found via pre-mortem review
+    /// (2026-08-12, `ENV_TTY_CTL_SOCK_FILE`'s own doc comment has the full
+    /// mechanism): the dynamically-refreshed `--isekai-tty` indirection
+    /// must win over a `$ISEKAI_CTL_SOCK` that's present but stale — not
+    /// merely used as a fallback when the env var is absent, the way the
+    /// tmux pane-option candidate is.
+    #[test]
+    fn resolves_sock_from_the_tty_ctl_sock_file_even_when_env_is_also_set() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(ENV_CTL_SOCK, "/from/stale-env.sock");
+        let resolved =
+            resolve_ctl_socket_path_with(None, || Some("/from/fresh-tty-file.sock".to_string()), || None)
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/from/fresh-tty-file.sock"));
+        std::env::remove_var(ENV_CTL_SOCK);
+    }
+
+    /// `read_tty_ctl_sock_file` itself (not the injected-closure version
+    /// above): a real tempfile, exercising the actual env-var-then-file-read
+    /// path `resolve_ctl_socket_path` (the production, non-test entry point)
+    /// uses.
+    #[test]
+    fn read_tty_ctl_sock_file_reads_and_trims_the_pointed_to_files_content() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.ctl_sock");
+        std::fs::write(&file, "/tmp/isekai-pipe-ctl-fresh.sock\n").unwrap();
+        std::env::set_var(ENV_TTY_CTL_SOCK_FILE, &file);
+        assert_eq!(read_tty_ctl_sock_file(), Some("/tmp/isekai-pipe-ctl-fresh.sock".to_string()));
+        std::env::remove_var(ENV_TTY_CTL_SOCK_FILE);
+    }
+
+    /// The env var pointing at a file that doesn't exist yet (this session's
+    /// daemon has never had a `$ISEKAI_CTL_SOCK`-carrying attach) must fall
+    /// through cleanly rather than error — same "opportunistic" convention
+    /// as every other candidate here.
+    #[test]
+    fn read_tty_ctl_sock_file_is_none_when_the_pointed_to_file_does_not_exist() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var(ENV_TTY_CTL_SOCK_FILE, dir.path().join("never-written.ctl_sock"));
+        assert_eq!(read_tty_ctl_sock_file(), None);
+        std::env::remove_var(ENV_TTY_CTL_SOCK_FILE);
+    }
+
+    #[test]
+    fn read_tty_ctl_sock_file_is_none_when_the_env_var_is_unset() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ENV_TTY_CTL_SOCK_FILE);
+        assert_eq!(read_tty_ctl_sock_file(), None);
     }
 
     /// e2e: a minimal hand-written listener (matches this crate's convention
