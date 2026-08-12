@@ -631,7 +631,9 @@ Windows が無いため、この機能自体はモックSSHサーバーでのユ
 `#@isekai ctl-socket yes` の上に乗る形で、リモートで動いている Claude Code の状態
 (権限確認待ち・応答待ちなど)に応じて、ローカルの実端末(Windows Terminal または
 iTerm2 — `$TERM_PROGRAM`/`$ISEKAI_TERMINAL_KIND` から自動判別、2026-08)のタブ背景色を
-自動的に変える(`ISEKAI_PIPE_DESIGN.md` §8 Epic Q)。tmux の pane ごとに独立した
+自動的に変える(独立リポジトリ [cuzic/claude-hookd](https://github.com/cuzic/claude-hookd)、
+2026-08-12に`rust-core/claude-hookd/`から分離。設計経緯は`ISEKAI_PIPE_DESIGN.md`の
+「Epic Q / Epic Q-2」節参照)。tmux の pane ごとに独立した
 Claude Code セッションとして扱われるので、同じタブ内の複数 pane が互いの状態を
 打ち消し合うことはない。
 
@@ -678,8 +680,8 @@ stdoutも出力しないので、asyncにしても判定への影響は無い)�
 hook設定を参考にした。
 
 これで、Claude Codeが権限確認(`PermissionRequest`、または`Notification`の
-`permission_prompt`——両方使うのは意図的な冗長化、`claude_hookd::mod::
-parse_hook_event`のdocコメント参照)や`AskUserQuestion`で止まっている間、
+`permission_prompt`——両方使うのは意図的な冗長化、`claude-hookd`側の
+`parse_hook_event`実装参照)や`AskUserQuestion`で止まっている間、
 あるいはAPIエラーで応答が終わった(`StopFailure`)間はタブがattention色になり、
 ポップアップ通知(`AI_INTEGRATION_DESIGN.md` §6.1 の`ctl notify`)が一度だけ出る。
 次のプロンプト送信・ツール呼び出しの完了・セッション終了のいずれかで即座に

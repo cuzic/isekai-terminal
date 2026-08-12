@@ -124,9 +124,10 @@ fn print_help() {
     println!("    version    print version");
     println!();
     println!("Claude Code hook state indicator (tab color/notification) moved out of this binary");
-    println!("into the standalone `claude-hookd` crate (2026-08) — install it separately and put");
-    println!("`claude-hookd event` in your .claude/settings.json hooks instead of");
-    println!("`isekai-pipe claude-hookd event`. See rust-core/claude-hookd/src/main.rs.");
+    println!("into the standalone `claude-hookd` project (2026-08, split into its own repo");
+    println!("2026-08-12) — install it separately and put `claude-hookd event` in your");
+    println!(".claude/settings.json hooks instead of `isekai-pipe claude-hookd event`. See the");
+    println!("claude-hookd project's own README for installation.");
     println!();
     println!(
         "The command surface is reserved for the staged isekai-helper -> isekai-pipe migration."
