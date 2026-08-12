@@ -33,7 +33,10 @@ repository = "https://github.com/cuzic/quicsock"
 # 際はnoq自身のCONTRIBUTING.mdが文書化している手順(`git fetch upstream main` →
 # 差分をcherry-pickしてこのforkに反映 → ここの`rev`を更新)を踏襲する。
 [workspace.dependencies]
-noq = { git = "https://github.com/cuzic/noq.git", rev = "db998f2dd883d15d763f8f32147f3c903ca88667" }
+# `default-features = true`は明示が必須: workspace.dependencies側でdefault-features
+# を指定しないと、各member crate側の`default-features = false`指定が無視される
+# (cargoの既知の仕様、警告「this could become a hard error in the future」)。
+noq = { git = "https://github.com/cuzic/noq.git", rev = "db998f2dd883d15d763f8f32147f3c903ca88667", default-features = true }
 
 [package]
 name = "isekai-terminal-core"

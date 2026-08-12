@@ -47,6 +47,10 @@ jobs:
         with:
           version: latest
 
+      - name: Regenerate Cargo.lock (full re-resolution, not an incremental build-time update)
+        working-directory: rust-core
+        run: cargo generate-lockfile
+
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           set -euo pipefail
