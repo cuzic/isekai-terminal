@@ -70,6 +70,41 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 /// little headroom under load. 10s gives 5x that legitimate worst case.
 const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`relay_loop`] waits, after forwarding the client's local stdin
+/// EOF to the remote as a channel EOF (`Frame::Shutdown` → `channel.eof()`),
+/// for the remote to actually confirm the channel is done
+/// (`ChannelMsg::ExitStatus`/`Close`) before giving up and force-closing it.
+///
+/// Exists because live reproduction (2026-08-12, `isekai-ssh vpsmart` +
+/// Ctrl-D against this project's own dev sandbox) found `channel.wait()`
+/// can simply stop yielding further messages for a channel after
+/// `channel.eof()` was called on it — the remote side had already fully
+/// logged out (confirmed via the remote shell's own `logout` banner reaching
+/// this process's stdout in an earlier, unbounded-wait repro), but this
+/// process's `channel.wait()` never observed `Close`, so [`relay_loop`]
+/// blocked forever and neither this owner nor its client ever exited
+/// (`always-connects.md`: an unbounded hang here is exactly the class of bug
+/// that rule exists to catch, even though the failure is local-process, not
+/// network). Root cause not yet isolated (a `russh` channel-object quirk
+/// after `.eof()`, or a bug in how this code drives it), so this is a
+/// defensive backstop, not a real fix — kept deliberately short (most remote
+/// shells close within milliseconds of receiving `exit`/EOF; this is not the
+/// unrelated `--resume-window`, which covers *network* loss, not a process
+/// that's simply not responding on an otherwise-healthy connection).
+const SHUTDOWN_CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// A future that resolves [`SHUTDOWN_CLOSE_GRACE`] after `stdin_done_at`, or
+/// never resolves while it's `None` (stdin not yet EOF) — so this can be an
+/// always-present `select!` branch, inert until [`relay_loop`] sets the
+/// deadline, mirroring [`recv_ctl_bytes`]'s optional-branch pattern just
+/// below.
+async fn shutdown_close_deadline(stdin_done_at: Option<tokio::time::Instant>) {
+    match stdin_done_at {
+        Some(at) => tokio::time::sleep_until(at + SHUTDOWN_CLOSE_GRACE).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Accepts clients on `channel` until either `accept` itself fails (the
 /// underlying IPC channel died — a genuine local-pipe infrastructure
 /// problem), or the client count drops to (and stays at) zero for the
@@ -375,6 +410,11 @@ where
     // task and its channel forever (session cleanup). We do not gate the read
     // branch off, precisely so that drop is always observable.
     let mut stdin_done = false;
+    // When `stdin_done` flips true, set to the current time — arms the
+    // `shutdown_close_deadline` branch below (`SHUTDOWN_CLOSE_GRACE` after
+    // this instant, the loop force-closes the channel and gives up waiting
+    // for a clean `Close`/`ExitStatus`). `None` keeps that branch inert.
+    let mut stdin_done_at: Option<tokio::time::Instant> = None;
     // Set while a mux client is streaming a build's output back to us (Epic P
     // Phase 2, `ctl_forward::pump_to_frames`'s `CtlRelayEvent::BuildStarted`)
     // — routes the client's own `Frame::Ctl` replies into the pump task that
@@ -416,8 +456,10 @@ where
                     Some(Ok(Some(Frame::Stdin(_)))) | Some(Ok(Some(Frame::Resize { .. }))) => {}
                     Some(Ok(Some(Frame::Shutdown))) => {
                         if !stdin_done {
+                            log_line!("isekai-ssh mux owner: client sent Shutdown (local stdin EOF); sending channel EOF to remote");
                             let _ = channel.eof().await;
                             stdin_done = true;
+                            stdin_done_at = Some(tokio::time::Instant::now());
                         }
                     }
                     // A mux client's build streaming its output back to us
@@ -445,7 +487,10 @@ where
                     // (`None`) both mean the client is gone: tear down its remote
                     // shell (dropping `channel` on return closes it) rather than
                     // leaking a session (session cleanup).
-                    Some(Ok(None)) | None => break,
+                    Some(Ok(None)) | None => {
+                        log_line!("isekai-ssh mux owner: client connection ended before the remote channel did; tearing down its remote shell");
+                        break;
+                    }
                     // A truncated or malformed frame is a hard error, surfaced to
                     // `serve_clients` (which logs and contains it per-client).
                     Some(Err(e)) => return Err(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}")),
@@ -461,12 +506,16 @@ where
                         write_frame(writer, &Frame::Stderr(data.to_vec())).await?;
                     }
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                        log_line!("isekai-ssh mux owner: remote channel sent ExitStatus={exit_status}");
                         exit_code = Some(exit_status as u8);
                     }
                     // Like the single-process loop, `Eof` is a no-op (an
                     // exit-status may still legally follow it, RFC 4254); only
                     // `Close`/`None` end the session.
-                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(russh::ChannelMsg::Close) | None => {
+                        log_line!("isekai-ssh mux owner: remote channel closed (exit_code so far: {exit_code:?}); breaking relay loop");
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -565,6 +614,19 @@ where
                     None => ctl_frame_rx = None,
                 }
             }
+            // Defensive backstop (`SHUTDOWN_CLOSE_GRACE`'s own docs): inert
+            // until `stdin_done_at` is set above. If the remote hasn't
+            // confirmed the channel is done within the grace period after we
+            // sent it EOF, stop waiting and force the channel closed —
+            // better to report a slightly-early `Frame::Exit` than hang this
+            // client (and its owning process) forever.
+            _ = shutdown_close_deadline(stdin_done_at) => {
+                log_line!(
+                    "isekai-ssh mux owner: remote channel did not confirm close within {SHUTDOWN_CLOSE_GRACE:?} of local EOF; forcing close (exit_code so far: {exit_code:?})"
+                );
+                let _ = channel.close().await;
+                break;
+            }
         }
     }
 
@@ -572,7 +634,9 @@ where
     // without an exit status" (abnormal disconnect), matching the
     // single-process path's `NO_EXIT_STATUS_RECEIVED`. Best-effort: if the
     // client already vanished, there's no one to tell.
-    let _ = write_frame(writer, &Frame::Exit(exit_code.unwrap_or(255))).await;
+    let final_code = exit_code.unwrap_or(255);
+    let write_result = write_frame(writer, &Frame::Exit(final_code)).await;
+    log_line!("isekai-ssh mux owner: sent Frame::Exit({final_code}) to client, write_result_ok={}", write_result.is_ok());
     Ok(())
 }
 
