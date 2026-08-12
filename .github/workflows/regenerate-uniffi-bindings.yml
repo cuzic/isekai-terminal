@@ -47,16 +47,6 @@ jobs:
         with:
           version: latest
 
-      - name: Update Cargo.lock for the noq fork (targeted, not a full re-resolution)
-        working-directory: rust-core
-        # `cargo generate-lockfile`(フル再解決)はnoqと無関係な依存まで大量に
-        # バージョンが動いてしまうため使わない。`-p noq -p cfg_aliases`で対象を
-        # 絞る: noq自体の切り替えに加えて、forkのnoq(cfg_aliases要求^0.2.2)と
-        # quinn(isekai-pipeのquinn互換確認コード経由、cfg_aliases要求^0.2)が
-        # 旧lockのcfg_aliases 0.2.1固定と衝突するため、cfg_aliasesも明示的に
-        # 対象に含める(両者は本来semver互換だが、対象外にすると再解決されない)。
-        run: cargo update -p noq -p cfg_aliases
-
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           set -euo pipefail
@@ -94,11 +84,4 @@ jobs:
         with:
           name: uniffi-swift-bindings
           path: ios/Sources/IsekaiTerminalCoreLogic/generated/
-          retention-days: 7
-
-      - name: Upload Cargo.lock
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lock
-          path: rust-core/Cargo.lock
           retention-days: 7
