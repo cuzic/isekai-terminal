@@ -155,6 +155,27 @@ async fn reconnecting_with_a_different_ctl_sock_updates_the_daemon_tracked_value
     let _ = attach2.wait().await;
 }
 
+/// Scans `output` for a `<<...>>`-delimited match that looks like real
+/// command output rather than the pty's own echo of the still-unexpanded
+/// typed command line — see the caller's doc comment for why both can
+/// appear in the same stream. Returns the *last* such match (a real shell
+/// only executes the command once, so if this is called repeatedly as more
+/// output arrives, the most recent valid match is the most complete one).
+fn extract_reported_path(output: &str) -> Option<String> {
+    output
+        .split("<<")
+        .skip(1)
+        // `s.split_once(">>")` (not the unconditional `.split("...").next()`)
+        // matters: on a partial read that has `<<` but no `>>` yet, treating
+        // the unterminated remainder as a "match" would report a truncated
+        // path as if it were complete.
+        .filter_map(|s| s.split_once(">>"))
+        .map(|(candidate, _rest)| candidate.trim())
+        .filter(|candidate| !candidate.is_empty() && !candidate.contains('$') && !candidate.contains("printf"))
+        .last()
+        .map(str::to_string)
+}
+
 /// The pty shell itself must see a *stable* `$ISEKAI_TTY_CTL_SOCK_FILE`
 /// pointing at exactly the file the first assertion above observes being
 /// kept fresh — proving `pty.rs::spawn`'s env wiring actually reaches the
@@ -185,35 +206,36 @@ async fn the_ptys_shell_sees_isekai_tty_ctl_sock_file_pointing_at_the_daemon_tra
         .await
         .expect("failed to write the probe command to tty attach's stdin");
 
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 4096];
-    let found = tokio::time::timeout(Duration::from_secs(5), async {
+    // Real bug found writing this test (2026-08-12, caught by its own real
+    // CI run, not a regression in the fix under test): the pty this probe
+    // command runs over is a normal cooked-mode interactive shell, which
+    // echoes back the *typed* command line (literally containing
+    // `<<%s>>` as source text, since that's what was typed) before it ever
+    // executes and produces the *real* substituted output. A naive
+    // "stop reading at the first `>>`" scan matches that echo, not the real
+    // output. `extract_reported_path` below only accepts a `<<...>>` match
+    // whose content contains neither `$` nor the literal command name —
+    // both are reliable markers of "this is still the unexpanded echoed
+    // input line, not real command output" — and keeps reading until it
+    // finds one or times out.
+    let reported_path = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
         loop {
             let n = stdout.read(&mut buf).await.expect("read from tty attach's stdout failed");
-            if n == 0 {
-                break false;
-            }
+            assert_ne!(n, 0, "tty attach's stdout closed before the probe command's real output ever appeared; got so far: {:?}", String::from_utf8_lossy(&collected));
             collected.extend_from_slice(&buf[..n]);
-            if String::from_utf8_lossy(&collected).contains(">>") {
-                break true;
+            if let Some(path) = extract_reported_path(&String::from_utf8_lossy(&collected)) {
+                return path;
             }
         }
     })
     .await
-    .unwrap_or(false);
-    assert!(found, "did not see the probe command's output within 5s; got so far: {:?}", String::from_utf8_lossy(&collected));
-
-    let output = String::from_utf8_lossy(&collected);
-    let reported_path = output
-        .split("<<")
-        .nth(1)
-        .and_then(|s| s.split(">>").next())
-        .unwrap_or_default()
-        .trim();
+    .expect("did not see the probe command's real (non-echoed) output within 5s");
     assert_eq!(
         reported_path,
         expected_file.to_string_lossy(),
-        "the pty shell's own $ISEKAI_TTY_CTL_SOCK_FILE must point at the exact file attach.rs keeps fresh, got {reported_path:?} (full output: {output:?})"
+        "the pty shell's own $ISEKAI_TTY_CTL_SOCK_FILE must point at the exact file attach.rs keeps fresh, got {reported_path:?}"
     );
 
     let _ = stdin.write_all(b"exit 0\n").await;
