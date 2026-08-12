@@ -168,7 +168,13 @@ async fn relay(stream: UnixStream) -> anyhow::Result<u8> {
     let (mut read_half, mut write_half) = stream.into_split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
-    let stdin_task = {
+    // Deliberately fire-and-forget, not bound to a `JoinHandle` this
+    // function later `.abort()`s — see the doc comment down by
+    // `std::process::exit` on why an abort here would be a no-op anyway
+    // (this task's real work is a blocking `read(2)` on a background
+    // thread, which `abort` cannot reach anyway) and why this function
+    // force-exits the whole process instead of waiting for it.
+    {
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut stdin = tokio::io::stdin();
@@ -216,12 +222,48 @@ async fn relay(stream: UnixStream) -> anyhow::Result<u8> {
         }
     };
 
-    stdin_task.abort();
     if let Some(task) = resize_task {
         task.abort();
     }
     writer_task.abort();
-    outcome
+
+    // `stdin_task.abort()` (removed above — see why) cannot actually
+    // interrupt this: `tokio::io::Stdin` on Unix reads via its own
+    // internal blocking-thread pool (there is no portable way to poll
+    // stdin's readiness directly), and `JoinHandle::abort` only takes
+    // effect at an `.await` point inside the *async* task — it does not,
+    // and cannot, kill the underlying OS thread blocked in the real
+    // `read(2)` syscall. That thread stays blocked forever once the user
+    // stops typing (nothing more will ever arrive on this session's pty
+    // once the daemon/shell has already exited), and it still holds this
+    // process's fd 0 open.
+    //
+    // Real bug this caused (found live, 2026-08-12): letting this
+    // function return normally so `main`'s `#[tokio::main]`-equivalent
+    // multi-thread `Runtime` drops and performs its default *graceful*
+    // shutdown — which waits for exactly this kind of outstanding
+    // blocking work to finish — deadlocked the whole process forever
+    // after a clean `exit`/logout: the shell had already exited, the
+    // daemon had already relayed `Frame::Exit` here, but this process
+    // itself never actually terminated, so `sshd` never saw every fd
+    // referencing the SSH channel close and never reported the channel
+    // closed — leaving the *client* (`isekai-ssh`) hanging too, congruent
+    // with (but distinct from — this is this process failing to exit at
+    // all, not a channel-close-detection gap) the mux owner-side hang
+    // fixed in PR #85.
+    //
+    // `std::process::exit` skips the stuck thread (and every other
+    // destructor, including `RawModeGuard`'s termios restore above — moot
+    // anyway, since this pty is being torn down by `sshd` regardless) and
+    // ends the process immediately, which is exactly what's needed here.
+    let code = match outcome {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("isekai-pipe tty attach: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code as i32);
 }
 
 /// Queries this process's own pty (see the module doc comment on why that's
