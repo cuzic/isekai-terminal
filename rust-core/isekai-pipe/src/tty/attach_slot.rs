@@ -165,6 +165,30 @@ mod tests {
         assert_eq!(gen1, 1);
     }
 
+    /// Regression for a real bug found via pre-mortem review (2026-08-12):
+    /// `RingBuffer::replay()` used to prepend the soft-reset sequence (`ESC
+    /// c` / RIS) *unconditionally*, so the very first `install()` on a
+    /// session nobody has ever broadcast to — the literal "first ever tty
+    /// attach" case — handed the caller a non-empty replay whose only
+    /// content was a full terminal reset, which `daemon.rs` then sent
+    /// straight to the connecting client's real terminal, silently wiping
+    /// its scrollback. This is checked here rather than by spawning a real
+    /// shell (as an earlier version of this fix's regression test did)
+    /// because a real shell's own startup output (e.g. macOS's default
+    /// bash printing "The default interactive shell is now zsh...") can
+    /// legitimately race into the ring buffer before a client's `install()`
+    /// call — at which point a non-empty, soft-reset-prefixed replay is
+    /// correct, not a bug. `AttachSlot::install` on a slot nobody has ever
+    /// called [`AttachSlot::broadcast`] on is the one case where "empty"
+    /// is guaranteed without racing real process I/O.
+    #[test]
+    fn first_ever_install_on_a_slot_nobody_has_broadcast_to_returns_no_replay_at_all() {
+        let slot = AttachSlot::new(1024);
+        let (tx, _rx) = AttachSlot::new_occupant_channel();
+        let (_gen, replay) = slot.install(tx);
+        assert_eq!(replay, Vec::<u8>::new(), "must not send a soft-reset when there is nothing buffered to protect");
+    }
+
     #[test]
     fn a_second_install_preempts_the_first_and_bumps_generation_again() {
         let slot = AttachSlot::new(1024);
