@@ -21,7 +21,7 @@ bytes = "1"
 # that only wants the `qmux` backend (or only the backend-agnostic
 # `race_with_stagger` combinator, which needs neither) doesn't have to pull
 # it in.
-noq = { version = "1.0.1", features = ["rustls", "ring"], optional = true }
+noq = { workspace = true, features = ["rustls", "ring"], optional = true }
 
 # `qmux` backend (draft-ietf-quic-qmux, QUIC's stream API polyfilled over
 # TLS-over-TCP) — pre-1.0, opt-in. crates.io's published qmux (0.3.1) predates

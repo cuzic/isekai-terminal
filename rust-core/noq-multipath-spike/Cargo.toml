@@ -34,7 +34,7 @@ name = "compat-check"
 path = "src/bin/compat_check.rs"
 
 [dependencies]
-noq = { version = "1.0.1", features = ["rustls", "ring"] }
+noq = { git = "https://github.com/cuzic/noq.git", rev = "db998f2dd883d15d763f8f32147f3c903ca88667", features = ["rustls", "ring"] }
 # Phase 9-0 only: proves an unmodified quinn client can still talk to a noq
 # server (see compat_check.rs). Not a dependency of the noq client/server
 # paths themselves -- kept isolated here, same as `noq` is kept out of

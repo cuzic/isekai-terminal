@@ -28,7 +28,7 @@ timed-fsm = { version = "0.4.0", features = ["tokio"] }
 # 直接依存としても残す。`FaultyUdpSocket`等のAndroid専用型・UniFFIはこの
 # crateからは一切参照しない
 # （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。
-noq = { version = "1.0.1", features = ["rustls", "ring"] }
+noq = { workspace = true, features = ["rustls", "ring"] }
 # `qmux-relay`(既定OFF、opt-in): UDP遮断環境向けのQMux-over-TLS-over-TCP経路。
 # backend実装自体は`quicmux`の`qmux`featureへ移動したので本体コード
 # (`src/`)からはこの3つを直接importしなくなったが、`tests/qmux_relay_e2e.rs`
