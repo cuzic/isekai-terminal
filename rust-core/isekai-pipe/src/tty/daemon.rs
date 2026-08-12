@@ -148,8 +148,32 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     }
     let listener = super::unix_socket::bind_private_socket(&socket_path)?;
 
+    // Real bug found via pre-mortem review (2026-08-12): a plain
+    // `$ISEKAI_CTL_SOCK` env var, exported once by the login shell that
+    // spawned this daemon (`ctl_forward.rs::build_login_shell_command`),
+    // gets baked into this daemon's own env and, from there, into the pty
+    // shell's env forever — but every *reconnect* to this same session
+    // creates a brand-new `-R` ctl-socket forward with a fresh random path
+    // (`ctl_forward.rs::new_ctl_token`), and `attach.rs::run` only calls
+    // `spawn_detached` (which is what would have picked up that fresh
+    // value) on the very first connection to a name; every later reconnect
+    // just dials the already-running daemon directly. So the persistent
+    // shell's `$ISEKAI_CTL_SOCK` silently goes stale — pointing at a `-R`
+    // forward whose owning `ssh(1)`/`isekai-ssh` process already exited —
+    // the moment the *first* connection to a session ends, breaking every
+    // `isekai-pipe ctl` (title/clipboard/notify) invocation from inside
+    // that shell for the rest of the daemon's life, with no error visible
+    // anywhere near the failure. `ctl_sock_file` is a stable indirection,
+    // fixed for this daemon's whole lifetime, that `tty attach` (`attach.rs`)
+    // rewrites with its own `$ISEKAI_CTL_SOCK` on *every* invocation
+    // (including reconnects, where no new shell is spawned) — the shell
+    // this daemon owns reads through it dynamically (via `isekai-pipe ctl`,
+    // `ctl.rs::resolve_ctl_socket_path_with`) instead of relying on a
+    // `$ISEKAI_CTL_SOCK` baked into its own environment once at spawn time.
+    let ctl_sock_file = super::unix_socket::ctl_sock_file_path(&dir, name);
+
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-    let (master, mut child) = super::pty::spawn(&command, &term, DEFAULT_COLS, DEFAULT_ROWS)?;
+    let (master, mut child) = super::pty::spawn(&command, &term, DEFAULT_COLS, DEFAULT_ROWS, Some(&ctl_sock_file))?;
     let master = Arc::new(master);
     let attach_slot = Arc::new(AttachSlot::new(RING_BUFFER_CAPACITY));
 
@@ -228,6 +252,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     read_loop.abort();
     accept_loop.abort();
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&ctl_sock_file);
 
     Ok(exit_code)
 }

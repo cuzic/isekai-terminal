@@ -18,6 +18,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use tokio::io::unix::AsyncFd;
@@ -47,7 +48,13 @@ pub(crate) struct PtyMaster {
 /// acquire a new one via `TIOCSCTTY` as a session leader with none set) —
 /// see `daemon.rs`'s own `setsid`/detach step, which must run before this
 /// function is ever called.
-pub(crate) fn spawn(command: &[String], term: &str, cols: u16, rows: u16) -> io::Result<(PtyMaster, Child)> {
+///
+/// `ctl_sock_file`, when given, is exported to the child as
+/// `$ISEKAI_TTY_CTL_SOCK_FILE` — see `daemon.rs::run`'s doc comment on why
+/// this indirection (a *path*, set once and never changing for this
+/// daemon's whole lifetime) exists instead of exporting the ctl-socket
+/// value itself the way an ordinary login shell does.
+pub(crate) fn spawn(command: &[String], term: &str, cols: u16, rows: u16, ctl_sock_file: Option<&Path>) -> io::Result<(PtyMaster, Child)> {
     let (program, args) = command.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spawn: empty command"))?;
 
     let mut master_fd: libc::c_int = -1;
@@ -75,6 +82,9 @@ pub(crate) fn spawn(command: &[String], term: &str, cols: u16, rows: u16) -> io:
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.env("TERM", term);
+    if let Some(ctl_sock_file) = ctl_sock_file {
+        cmd.env("ISEKAI_TTY_CTL_SOCK_FILE", ctl_sock_file);
+    }
     // Whatever these are set to is overwritten by `login_tty`'s own
     // dup2(slave_fd, 0/1/2) inside `pre_exec` below — `null()` here only
     // covers the brief window between fork and that call, so a `pre_exec`
