@@ -33,6 +33,14 @@ const RING_BUFFER_CAPACITY: usize = 256 * 1024;
 /// this daemon's accept loop or the pty relay forever.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`run`] waits, after [`super::attach_slot::AttachSlot::notify_exit`]
+/// queues `RelayMsg::Exit` for the current occupant, before tearing the rest
+/// of this process down — gives that occupant's writer task (`handle_client`)
+/// a real chance to get scheduled and flush `Frame::Exit` to the socket
+/// before this process's own shutdown can race it. See the call site's doc
+/// comment for the real bug this fixes.
+const EXIT_NOTIFY_GRACE: Duration = Duration::from_millis(300);
+
 /// Spawns `isekai-pipe tty daemon <name>` as a **fully detached** process —
 /// not merely "backgrounded" — so it survives the SSH session `isekai-pipe
 /// tty attach` (this function's caller) is itself running inside of.
@@ -200,6 +208,23 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     let exit_code = exit_status.code().unwrap_or(1) as u8;
 
     attach_slot.notify_exit(exit_code);
+    // `notify_exit` only *queues* `RelayMsg::Exit` on the current occupant's
+    // channel (`try_send`, non-blocking) — the attached client's own
+    // per-connection writer task (spawned in `handle_client`, not tracked
+    // here) still needs to actually get scheduled to pick that message up
+    // and write `Frame::Exit` to the socket. Real race found live
+    // (2026-08-12): returning immediately after `notify_exit` let this
+    // process's own shutdown (and the client-visible fd/socket teardown
+    // that comes with it) win that race often enough in practice that the
+    // attached `isekai-pipe tty attach` frequently saw the connection drop
+    // before ever receiving `Frame::Exit` — reported as "connection to the
+    // tty daemon closed unexpectedly" instead of a clean exit, even though
+    // the underlying hang this was found alongside (the attach process
+    // itself failing to terminate — see `attach.rs`) was already fixed.
+    // A short bounded wait is enough: this is a single small write over a
+    // local Unix domain socket, not anything that could legitimately take
+    // long.
+    tokio::time::sleep(EXIT_NOTIFY_GRACE).await;
     read_loop.abort();
     accept_loop.abort();
     let _ = std::fs::remove_file(&socket_path);
