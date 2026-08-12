@@ -171,7 +171,20 @@ fn extract_reported_path(output: &str) -> Option<String> {
         // path as if it were complete.
         .filter_map(|s| s.split_once(">>"))
         .map(|(candidate, _rest)| candidate.trim())
-        .filter(|candidate| !candidate.is_empty() && !candidate.contains('$') && !candidate.contains("printf"))
+        // Real bug found in CI (2026-08-12, this exact function's first
+        // version): checking whether the *candidate itself* contains `$`
+        // or `printf` doesn't help — the echoed, not-yet-executed command
+        // line's `<<%s>>` segment captures as the literal candidate `%s`,
+        // which contains neither. `$ISEKAI_TTY_CTL_SOCK_FILE` and `printf`
+        // are real substrings of that same echoed line, but they land
+        // *outside* the `<<...>>` delimiters this function extracts from,
+        // so checking the candidate alone can never see them. The only
+        // property that reliably distinguishes real output from an echoed,
+        // unexpanded command line is that real output is always the
+        // absolute path `expected_file` — so require the candidate to
+        // start with `/`, which `%s` (and any other echo fragment) never
+        // does.
+        .filter(|candidate| candidate.starts_with('/'))
         .last()
         .map(str::to_string)
 }
