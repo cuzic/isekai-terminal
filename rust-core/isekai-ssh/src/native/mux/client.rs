@@ -383,6 +383,7 @@ where
                     // in-flight build, this one didn't, orphaning the real
                     // child process since nothing else will ever kill it).
                     Some(Ok(Some(Frame::Exit(code)))) => {
+                        log_line!("isekai-ssh: received Frame::Exit({code}) from owner");
                         abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::Exited(code));
                     }
@@ -394,6 +395,7 @@ where
                     // pipe), or the reader task ending all mean the owner died
                     // mid-session.
                     Some(Ok(None)) | Some(Err(_)) | None => {
+                        log_line!("isekai-ssh: owner connection ended without Frame::Exit; treating as OwnerLost");
                         abort_active(&mut active_build).await;
                         return Ok(ClientOutcome::OwnerLost);
                     }

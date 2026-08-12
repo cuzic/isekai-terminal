@@ -416,6 +416,7 @@ where
                     Some(Ok(Some(Frame::Stdin(_)))) | Some(Ok(Some(Frame::Resize { .. }))) => {}
                     Some(Ok(Some(Frame::Shutdown))) => {
                         if !stdin_done {
+                            log_line!("isekai-ssh mux owner: client sent Shutdown (local stdin EOF); sending channel EOF to remote");
                             let _ = channel.eof().await;
                             stdin_done = true;
                         }
@@ -445,7 +446,10 @@ where
                     // (`None`) both mean the client is gone: tear down its remote
                     // shell (dropping `channel` on return closes it) rather than
                     // leaking a session (session cleanup).
-                    Some(Ok(None)) | None => break,
+                    Some(Ok(None)) | None => {
+                        log_line!("isekai-ssh mux owner: client connection ended before the remote channel did; tearing down its remote shell");
+                        break;
+                    }
                     // A truncated or malformed frame is a hard error, surfaced to
                     // `serve_clients` (which logs and contains it per-client).
                     Some(Err(e)) => return Err(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}")),
@@ -461,12 +465,16 @@ where
                         write_frame(writer, &Frame::Stderr(data.to_vec())).await?;
                     }
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                        log_line!("isekai-ssh mux owner: remote channel sent ExitStatus={exit_status}");
                         exit_code = Some(exit_status as u8);
                     }
                     // Like the single-process loop, `Eof` is a no-op (an
                     // exit-status may still legally follow it, RFC 4254); only
                     // `Close`/`None` end the session.
-                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(russh::ChannelMsg::Close) | None => {
+                        log_line!("isekai-ssh mux owner: remote channel closed (exit_code so far: {exit_code:?}); breaking relay loop");
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -572,7 +580,9 @@ where
     // without an exit status" (abnormal disconnect), matching the
     // single-process path's `NO_EXIT_STATUS_RECEIVED`. Best-effort: if the
     // client already vanished, there's no one to tell.
-    let _ = write_frame(writer, &Frame::Exit(exit_code.unwrap_or(255))).await;
+    let final_code = exit_code.unwrap_or(255);
+    let write_result = write_frame(writer, &Frame::Exit(final_code)).await;
+    log_line!("isekai-ssh mux owner: sent Frame::Exit({final_code}) to client, write_result_ok={}", write_result.is_ok());
     Ok(())
 }
 
