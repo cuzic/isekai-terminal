@@ -365,7 +365,13 @@ enum WaitOutcome {
 /// raw mode can't be enabled (non-interactive stdio), the wait still runs,
 /// it just can't recognize Ctrl+C as an early-abort signal.
 async fn wait_or_abort(delay: Duration) -> WaitOutcome {
-    let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
+    let _raw_mode = match crate::native::console::RawModeGuard::enable() {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            log_line!("isekai-ssh: failed to enable local raw terminal mode (reconnect-wait path): {e:#}");
+            None
+        }
+    };
     wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await
 }
 

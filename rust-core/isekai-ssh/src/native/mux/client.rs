@@ -159,8 +159,21 @@ where
     // `connect::prepare`/`dispatch`, in normal (non-raw) mode. Safe to enable
     // for the rest of this attempt's lifetime. Best-effort: a terminal that
     // can't be put in raw mode (piped/non-interactive stdio) shouldn't block
-    // the mux relay itself, only degrade its local key handling.
-    let _raw_mode = super::super::console::RawModeGuard::enable().ok();
+    // the mux relay itself, only degrade its local key handling — but a
+    // *real* console failing this silently (no log line existed here before)
+    // is indistinguishable from a working session except for the resulting
+    // local echo/`^X`-style control-character rendering and Ctrl-D having no
+    // effect (2026-08-12 real-terminal report), so log it.
+    let _raw_mode = match super::super::console::RawModeGuard::enable() {
+        Ok(guard) => {
+            log_line!("isekai-ssh: local raw terminal mode enabled (mux client path)");
+            Some(guard)
+        }
+        Err(e) => {
+            log_line!("isekai-ssh: failed to enable local raw terminal mode (mux client path): {e:#}");
+            None
+        }
+    };
 
     let resize_rx = if want_pty { super::super::console::spawn_resize_watcher() } else { None };
 
