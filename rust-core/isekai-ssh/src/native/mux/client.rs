@@ -305,6 +305,7 @@ where
                         let _ = write_frame(conn_write, &Frame::Shutdown).await;
                     }
                     Ok(n) => {
+                        log_line!("isekai-ssh: local stdin read {n} bytes: {:02x?}", &buf[..n]);
                         if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
                             abort_active(&mut active_build).await;
                             return Ok(ClientOutcome::OwnerLost);
