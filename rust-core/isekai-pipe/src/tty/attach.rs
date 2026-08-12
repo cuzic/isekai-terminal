@@ -3,13 +3,27 @@
 //! first use, spawns then connects to) `isekai-pipe tty daemon <name>` and
 //! pumps this process's own stdio through it.
 //!
-//! **No raw-mode/terminal-setup work happens here**, unlike a typical local
-//! terminal client: this process's own stdin/stdout *are* the pty `sshd`
-//! already allocated for this interactive SSH session (that's what `-t`/PTY
-//! allocation on the SSH client side already arranged) — the local `ssh(1)`/
-//! `russh` on the *other* end of the SSH connection is what puts the user's
-//! real local terminal into raw mode. This process just needs to relay its
-//! already-correctly-configured stdio through to the daemon.
+//! **This process puts its own pty (fd 0) into raw mode** — a real bug found
+//! 2026-08-12 via live reproduction: this module used to assume "no raw-mode
+//! work needed here, the *local* `isekai-ssh`/`ssh(1)` on the other end of
+//! the SSH connection already puts the user's real terminal into raw mode."
+//! That's true of the *local* (client-side) terminal, but irrelevant to
+//! *this* pty — the one `sshd` allocated on *this* host for this process,
+//! which is a completely separate tty. For a normal login shell, bash's own
+//! `readline` reconfigures that remote pty into raw/cbreak mode itself once
+//! it starts (which is why `isekai-ssh`'s own initial `PTY_REQ` modes are
+//! deliberately cooked-mode defaults — see
+//! `isekai-ssh/src/native/console.rs::build_terminal_modes`'s doc comment).
+//! But `isekai-ssh` execs *this process* in place of a shell for a
+//! `--isekai-tty` session, and nothing here ever reconfigured the pty — so
+//! it stayed in the kernel's default cooked/canonical mode for the entire
+//! session: normal typing looked fine (the kernel's own `ECHO` renders
+//! printable characters same as `readline` would), but control characters
+//! were echoed by the kernel's `ECHOCTL` as literal `^X` text instead of
+//! being forwarded as raw bytes, and Ctrl-D (`VEOF`) only flushed whatever
+//! the kernel's line buffer already held instead of behaving like the raw
+//! EOF a shell reading in raw mode would see — reported as "Ctrl-D doesn't
+//! exit" and "Ctrl-A/Ctrl-K show up as `^A`/`^K`".
 
 use std::io;
 use std::time::Duration;
@@ -36,6 +50,12 @@ const CONNECT_RETRY_DELAYS: [Duration; 6] =
 const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
+    // Best-effort: a non-tty fd 0 (piped/redirected, e.g. under test) just
+    // means `enable()` returns `None` and the relay runs without it — same
+    // opportunistic-fallback convention as `isekai-ssh`'s own
+    // `RawModeGuard`, not a reason to fail the whole session.
+    let _raw_mode = RawModeGuard::enable();
+
     let dir = super::unix_socket::private_runtime_dir()?;
     let socket_path = dir.join(format!("{name}.sock"));
 
@@ -60,6 +80,54 @@ pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
     }
 
     relay(stream).await
+}
+
+/// RAII guard: puts this process's own fd 0 (the pty `sshd` allocated for
+/// this SSH session) into raw mode on construction, restores the original
+/// termios on drop. Mirrors `isekai-ssh/src/native/console.rs::RawModeGuard`
+/// (same rationale, opposite side of the connection) but hand-rolled with
+/// `libc::cfmakeraw` directly rather than pulling in `crossterm` — this
+/// crate has no other terminal-handling needs, and `cfmakeraw` is the
+/// single POSIX-standard call for exactly this.
+struct RawModeGuard {
+    original: libc::termios,
+}
+
+impl RawModeGuard {
+    /// Returns `None` (rather than an `Err`) when fd 0 isn't actually a tty
+    /// or `tcgetattr`/`tcsetattr` otherwise fails — piped/redirected stdin
+    /// (tests, a non-interactive invocation) shouldn't fail the session over
+    /// a cosmetic degrade, same as `terminal_size`'s own fallback just below.
+    fn enable() -> Option<Self> {
+        // SAFETY: `termios` is a plain repr(C) struct with no invariants
+        // beyond being zero-initializable (`tcgetattr` fully populates it on
+        // success); fd 0 is always a valid, open descriptor for the
+        // lifetime of this process.
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut original) } != 0 {
+            return None;
+        }
+        let mut raw = original;
+        // SAFETY: `raw` is a valid, fully-initialized `termios` (copied from
+        // the successful `tcgetattr` above); `cfmakeraw` only mutates the
+        // flag/`c_cc` fields in place.
+        unsafe { libc::cfmakeraw(&mut raw) };
+        // SAFETY: `raw` is a valid, fully-initialized `termios`; fd 0 is the
+        // same valid descriptor `tcgetattr` just succeeded on.
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+            return None;
+        }
+        Some(Self { original })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // Best-effort: nothing sensible to do if this fails on the way out
+        // (e.g. the pty was already torn down), and this process is about
+        // to exit regardless.
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.original) };
+    }
 }
 
 /// A single, non-retrying connect attempt, with `SO_PEERCRED` verification —
