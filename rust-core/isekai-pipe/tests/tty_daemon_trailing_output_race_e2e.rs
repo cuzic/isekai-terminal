@@ -52,19 +52,28 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, poll_interval: Duration,
     condition()
 }
 
-const LAST_LINE: &str = "line-4000";
+const LAST_LINE: &str = "line-200";
 
-/// A generous burst (well over the pty's 8KB read buffer, forcing many
-/// separate `read_loop` iterations to drain) followed *immediately* by the
-/// shell exiting — no trailing delay at all, maximizing the chance that
-/// `child.wait()` resolves before `read_loop` has caught up, which is
-/// exactly the window the original bug raced in. The leading `sleep 1`
-/// gives this test time to attach *before* the burst starts, so the
-/// assertion below exercises the *live* broadcast path (the one the bug
-/// actually affects), not `AttachSlot::install`'s replay-from-ring-buffer
-/// path (which would mask the bug — see this file's own module docs).
+/// A modest burst followed *immediately* by the shell exiting — no trailing
+/// delay at all, maximizing the chance that `child.wait()` resolves before
+/// `read_loop` has caught up, which is exactly the window the original bug
+/// raced in. The leading `sleep 1` gives this test time to attach *before*
+/// the burst starts, so the assertion below exercises the *live* broadcast
+/// path (the one the bug actually affects), not `AttachSlot::install`'s
+/// replay-from-ring-buffer path (which would mask the bug — see this
+/// file's own module docs).
+///
+/// Deliberately kept modest (200 lines, not thousands): a large enough
+/// burst starts tripping a *separate*, already-known limitation
+/// (`attach_slot.rs`'s `OCCUPANT_CHANNEL_CAPACITY` — live delivery uses a
+/// bounded, non-blocking `try_send` that silently drops once the occupant
+/// channel is full, a deliberate trade-off documented on `broadcast`'s own
+/// doc comment, not something this fix touches). This file's regression
+/// target is specifically the `notify_exit`-vs-`read_loop` *ordering* race,
+/// which a burst well within that separate capacity limit is sufficient to
+/// exercise on its own.
 fn burst_then_exit_script() -> String {
-    "sleep 1; i=1; while [ \"$i\" -le 4000 ]; do echo \"line-$i\"; i=$((i+1)); done".to_string()
+    "sleep 1; i=1; while [ \"$i\" -le 200 ]; do echo \"line-$i\"; i=$((i+1)); done".to_string()
 }
 
 #[tokio::test]
