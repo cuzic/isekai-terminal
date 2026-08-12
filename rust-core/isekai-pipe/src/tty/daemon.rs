@@ -41,6 +41,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// comment for the real bug this fixes.
 const EXIT_NOTIFY_GRACE: Duration = Duration::from_millis(300);
 
+/// Bounds how long [`run`] waits for `read_loop` to finish draining the pty
+/// after the shell has exited, before giving up and calling
+/// [`super::attach_slot::AttachSlot::notify_exit`] anyway — see the call
+/// site's doc comment for the real bug this fixes. Generous for even a
+/// large burst of trailing output over a local pty (not a network path),
+/// while still bounding how long a pathological "the pty never gives EOF"
+/// case (a bug elsewhere leaking a slave-fd reference, say) can delay
+/// shutdown.
+const READ_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Spawns `isekai-pipe tty daemon <name>` as a **fully detached** process —
 /// not merely "backgrounded" — so it survives the SSH session `isekai-pipe
 /// tty attach` (this function's caller) is itself running inside of.
@@ -180,7 +190,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     // pty -> ring buffer + current occupant, unconditionally — this loop
     // must run even with zero clients attached (see `AttachSlot::broadcast`'s
     // doc comment on the classic dtach freeze this avoids).
-    let read_loop = {
+    let mut read_loop = {
         let master = master.clone();
         let attach_slot = attach_slot.clone();
         let name = name.to_string();
@@ -230,6 +240,35 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     // design, everything else shuts down once this resolves.
     let exit_status = tokio::task::spawn_blocking(move || child.wait()).await??;
     let exit_code = exit_status.code().unwrap_or(1) as u8;
+
+    // Real bug found via pre-mortem review (2026-08-12): `child.wait()`
+    // resolving only means the shell process itself has terminated — it
+    // says nothing about whether `read_loop` (a fully independent task)
+    // has actually drained every byte the shell wrote to the pty right
+    // before exiting. Calling `notify_exit` immediately here, with no
+    // synchronization against `read_loop`'s progress, raced the two: if
+    // `notify_exit`'s `RelayMsg::Exit` reached the occupant's channel
+    // before some trailing `RelayMsg::Data` chunk(s) `read_loop` hadn't
+    // broadcast yet, `handle_client`'s writer task would process `Exit`
+    // first and `return` immediately — permanently discarding whatever
+    // Data messages were still queued behind it (or arrived after). A
+    // program's last line of output right before `exit` (a final error
+    // message, a build's "done" line) could therefore silently never
+    // reach the attached client. Waiting for `read_loop` to actually
+    // finish — which only happens once `master.read()` sees EOF, i.e.
+    // after every byte the pty ever held has already been read and
+    // broadcast — closes this gap: by the time this `.await` resolves,
+    // every `broadcast()` call happens-before this point, so `notify_exit`
+    // below can no longer race ahead of any of them. Bounded by
+    // `READ_LOOP_DRAIN_TIMEOUT` rather than awaited unconditionally, so a
+    // pty that pathologically never gives EOF (a bug elsewhere leaking a
+    // slave-fd reference) still can't block shutdown forever.
+    if tokio::time::timeout(READ_LOOP_DRAIN_TIMEOUT, &mut read_loop).await.is_err() {
+        log::warn!(
+            "isekai-pipe tty daemon {name}: pty read loop did not drain within {READ_LOOP_DRAIN_TIMEOUT:?} \
+             after the shell exited; some trailing output may not have reached the attached client"
+        );
+    }
 
     attach_slot.notify_exit(exit_code);
     // `notify_exit` only *queues* `RelayMsg::Exit` on the current occupant's
