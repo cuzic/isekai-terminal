@@ -205,3 +205,53 @@ async fn tty_attach_exits_promptly_and_cleanly_after_shell_exit() {
     );
     assert!(wait_result.success(), "`exit 0` in the remote shell must produce a successful exit status end-to-end, got {wait_result:?} (stderr: {stderr:?})");
 }
+
+/// Regression test for the `SUN_LEN` bug found *while writing the two tests
+/// above*: a `$HOME` long enough (deliberately manufactured here via a
+/// deeply nested subdirectory — real-world equivalents are a long macOS
+/// default temp/home path, or simply a long `--isekai-tty` session name)
+/// that `<$HOME>/.cache/isekai-pipe/tty/<name>.sock` overflows
+/// `sockaddr_un`'s `sun_path` must still work end-to-end — `unix_socket.rs`'s
+/// `socket_path` falls back to a short hashed filename instead of failing
+/// every `bind`/`connect` with "path must be shorter than SUN_LEN".
+#[tokio::test]
+async fn tty_attach_works_even_when_home_is_too_long_for_a_plain_socket_path() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let base = short_tmp_home();
+    // Manufactures a `$HOME` long enough on its own to overflow
+    // `sockaddr_un.sun_path` even with a short session name — standing in
+    // for a real long `$HOME` (macOS default temp/home paths, deeply nested
+    // corporate home directories) without depending on the test-runner's
+    // own environment actually having one.
+    let long_home = base.path().join("a".repeat(150));
+    std::fs::create_dir_all(&long_home).expect("failed to create the deliberately long $HOME");
+    let name = "e2e-longhome";
+
+    let mut attach = tokio::process::Command::new(isekai_pipe_bin_path())
+        .args(["tty", "attach", name])
+        .env("HOME", &long_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn `isekai-pipe tty attach`");
+
+    let mut stdin = attach.stdin.take().expect("stdin must be piped");
+    stdin.write_all(b"exit 0\n").await.expect("failed to write `exit 0` to tty attach's stdin");
+    drop(stdin);
+
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), attach.wait())
+        .await
+        .expect("isekai-pipe tty attach must not hang even with a too-long $HOME")
+        .expect("wait() on the child itself failed");
+
+    let mut stderr = String::new();
+    attach.stderr.take().expect("stderr must be piped").read_to_string(&mut stderr).await.expect("failed to read stderr");
+
+    assert!(
+        !stderr.contains("SUN_LEN"),
+        "a long $HOME must not surface the raw SUN_LEN failure to the user (regression: unix_socket.rs's socket_path fallback); stderr was: {stderr:?}"
+    );
+    assert!(wait_result.success(), "`exit 0` must still succeed end-to-end with a too-long $HOME, got {wait_result:?} (stderr: {stderr:?})");
+}
