@@ -98,21 +98,57 @@ const MAX_SOCKET_PATH_LEN: usize = 90;
 /// theoretical concern, an actual CI failure this exact function exists to
 /// prevent.
 ///
-/// Falls back to a short, fixed-length hash of the natural path — not just
+/// **First fix attempt was itself wrong** (caught by this same module's own
+/// unit test, before ever reaching a real user): hashing only the
+/// *filename* and keeping the same long `dir` doesn't help when `dir` alone
+/// already overflows the budget — true for both real long-`$HOME` cases and
+/// for the CI failure that found this bug in the first place. The fallback
+/// must move to a short directory too, not just shorten the filename within
+/// the original one.
+///
+/// Falls back to [`short_fallback_dir`] (a bounded, `$HOME`-independent
+/// path) plus a short, fixed-length hash of the *natural* path — not just
 /// of `name` alone, so a collision would need two different `dir` roots
 /// *and* names to hash alike, never just two long names sharing a prefix.
 /// Both `daemon.rs` (bind) and `attach.rs` (connect) call this same
 /// function with the same `(dir, name)`, so they always agree on which path
-/// — natural or hashed — a given session actually uses.
-pub(crate) fn socket_path(dir: &Path, name: &str) -> PathBuf {
+/// — natural or hashed-fallback — a given session actually uses.
+pub(crate) fn socket_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let natural = dir.join(format!("{name}.sock"));
     if natural.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        return natural;
+        return Ok(natural);
     }
+    let fallback_dir = short_fallback_dir()?;
     let short = &isekai_trust::hex_sha256(natural.as_os_str().as_bytes())[..16];
-    dir.join(format!("{short}.sock"))
+    let fallback = fallback_dir.join(format!("{short}.sock"));
+    debug_assert!(
+        fallback.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
+        "short_fallback_dir + a 16-hex-char filename must itself always fit: {fallback:?}"
+    );
+    Ok(fallback)
+}
+
+/// A short, `$HOME`-independent private directory for [`socket_path`]'s
+/// fallback — `/tmp/isekai-pipe-<uid>`, verified the exact same way
+/// [`private_runtime_dir`] verifies its own directory (owner, mode, not a
+/// symlink) since `/tmp` itself is world-writable and shared across every
+/// user on the system, unlike `$HOME`. The `<uid>` suffix is what keeps two
+/// different users from ever contending over (or, worse, one squatting)
+/// the same directory — `/tmp` alone would not be private to begin with.
+fn short_fallback_dir() -> io::Result<PathBuf> {
+    // SAFETY: `geteuid()` takes no arguments and cannot fail (POSIX
+    // guarantees it always succeeds) — same call as `verify_private_dir`'s.
+    let euid = unsafe { libc::geteuid() };
+    let dir = PathBuf::from(format!("/tmp/isekai-pipe-{euid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    verify_private_dir(&dir)?;
+    Ok(dir)
 }
 
 fn verify_private_dir(dir: &Path) -> io::Result<()> {
@@ -185,40 +221,49 @@ mod tests {
     #[test]
     fn socket_path_uses_the_natural_name_when_it_fits() {
         let dir = PathBuf::from("/tmp/short");
-        let path = socket_path(&dir, "myhost");
+        let path = socket_path(&dir, "myhost").unwrap();
         assert_eq!(path, dir.join("myhost.sock"));
     }
 
     #[test]
-    fn socket_path_falls_back_to_a_short_hash_when_the_natural_path_would_overflow_sun_path() {
+    fn socket_path_falls_back_to_a_short_directory_and_hash_when_the_natural_path_would_overflow_sun_path() {
         // A `dir` long enough on its own that even a short `name` overflows
         // `MAX_SOCKET_PATH_LEN` — standing in for a long `$HOME` (this
-        // module's real bug: CI's own long macOS temp-dir default).
+        // module's real bug: CI's own long macOS temp-dir default). The
+        // fallback must move to a *different*, short directory — the first
+        // fix attempt only shortened the filename and kept this same long
+        // `dir`, which this exact test caught still overflowing.
         let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
         let name = "wt-7cf62198-6b3f-4b33-810f-6b93cf102770";
-        let path = socket_path(&dir, name);
+        let path = socket_path(&dir, name).unwrap();
 
         assert_ne!(path, dir.join(format!("{name}.sock")), "must not use the natural (too-long) path");
+        assert_ne!(path.parent(), Some(dir.as_path()), "the fallback must live in a short directory of its own, not just a shorter filename in the same long dir");
         assert!(
             path.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
             "the fallback path itself must respect the bound it exists to enforce: {path:?} ({} bytes)",
             path.as_os_str().len()
         );
-        assert_eq!(path.parent(), Some(dir.as_path()), "the fallback must still live in the same directory, just under a shorter filename");
     }
 
     #[test]
     fn socket_path_is_deterministic_so_daemon_and_attach_always_agree() {
         let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
         let name = "wt-7cf62198-6b3f-4b33-810f-6b93cf102770";
-        assert_eq!(socket_path(&dir, name), socket_path(&dir, name), "the same (dir, name) must always hash to the same fallback path");
+        assert_eq!(socket_path(&dir, name).unwrap(), socket_path(&dir, name).unwrap(), "the same (dir, name) must always hash to the same fallback path");
     }
 
     #[test]
     fn socket_path_fallback_differs_for_different_names_in_the_same_dir() {
         let dir = PathBuf::from("/tmp/a-suspiciously-long-directory-name-standing-in-for-a-long-home-path/.cache/isekai-pipe/tty");
-        let a = socket_path(&dir, "wt-11111111-1111-1111-1111-111111111111");
-        let b = socket_path(&dir, "wt-22222222-2222-2222-2222-222222222222");
+        let a = socket_path(&dir, "wt-11111111-1111-1111-1111-111111111111").unwrap();
+        let b = socket_path(&dir, "wt-22222222-2222-2222-2222-222222222222").unwrap();
         assert_ne!(a, b, "two different long names in the same dir must not collide onto the same fallback socket path");
+    }
+
+    #[test]
+    fn short_fallback_dir_is_private() {
+        let dir = short_fallback_dir().unwrap();
+        verify_private_dir(&dir).expect("short_fallback_dir's own directory must pass the same privacy checks private_runtime_dir's does");
     }
 }

@@ -137,7 +137,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
         }
     };
 
-    let socket_path = super::unix_socket::socket_path(&dir, name);
+    let socket_path = super::unix_socket::socket_path(&dir, name)?;
     // Holding `_lock` proves no live daemon owns `name` right now, so any
     // socket file already at this path is unreachable/stale — safe to
     // remove before binding a fresh one.
