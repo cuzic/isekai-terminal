@@ -22,7 +22,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use isekai_protocol::ProgressState;
+use crate::protocol::ProgressState;
 
 /// Same bound as [`super::tab_color::SCRIPT_TIMEOUT`] — a script here should
 /// be near-instant, and a hanging one must only ever delay one progress

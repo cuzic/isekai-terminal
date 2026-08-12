@@ -39,6 +39,8 @@ mod delivery;
 mod hexcolor;
 #[cfg(unix)]
 mod hooks;
+#[cfg(unix)]
+mod protocol;
 mod state;
 #[cfg(unix)]
 mod tab_color;
@@ -227,7 +229,7 @@ async fn event_command() -> ExitCode {
 #[cfg(unix)]
 async fn session_end_self_heal_with(delivery: &Delivery, idle_color: (u8, u8, u8), hooks_dir: Option<&Path>) {
     delivery::send_tab_color(delivery, idle_color, hooks_dir).await;
-    delivery::send_progress(delivery, isekai_protocol::ProgressState::None, 0, hooks_dir).await;
+    delivery::send_progress(delivery, protocol::ProgressState::None, 0, hooks_dir).await;
 }
 
 /// A hook event as classified purely from Claude Code's own hook JSON — the

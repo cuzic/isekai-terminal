@@ -14,6 +14,7 @@ use tokio::net::UnixListener;
 
 use super::delivery::{self, Delivery};
 use super::hooks;
+use super::protocol;
 use super::state::{apply_event, apply_timeout, Action, HookEvent, TabState};
 
 /// How long an `Attention` session stays that way without a debounce
@@ -214,7 +215,7 @@ async fn run(config: DaemonConfig) {
     // Same self-heal reasoning, for the progress ring: a daemon that
     // crashed/self-exited mid-`Waiting` would otherwise leave the
     // indeterminate ring spinning forever with nothing left to clear it.
-    delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
+    delivery::send_progress(&config.delivery, protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
 
     // Accepting and reading each connection happens on its own spawned
     // task, separate from the main loop below: a connection that opens and
@@ -395,19 +396,19 @@ async fn execute_actions(config: &DaemonConfig, actions: &[Action], state: &TabS
                 // was never a ring showing (e.g. a fresh Idle->Attention
                 // Notify), same idempotent-clear posture as `SetIdleColor`
                 // below.
-                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
+                delivery::send_progress(&config.delivery, protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
                 delivery::send_notify_popup(&config.delivery).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "attention", state, now).await;
             }
             Action::SetWaitingColor => {
                 delivery::send_tab_color(&config.delivery, config.waiting_color, config.hooks_dir.as_deref()).await;
-                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::Indeterminate, 0, config.hooks_dir.as_deref())
+                delivery::send_progress(&config.delivery, protocol::ProgressState::Indeterminate, 0, config.hooks_dir.as_deref())
                     .await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "waiting", state, now).await;
             }
             Action::SetIdleColor => {
                 delivery::send_tab_color(&config.delivery, config.idle_color, config.hooks_dir.as_deref()).await;
-                delivery::send_progress(&config.delivery, isekai_protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
+                delivery::send_progress(&config.delivery, protocol::ProgressState::None, 0, config.hooks_dir.as_deref()).await;
                 hooks::run_hook(config.hooks_dir.as_deref(), "idle", state, now).await;
             }
         }
