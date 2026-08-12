@@ -193,6 +193,33 @@ async fn send_tab_color_with(
     deliver(delivery, isekai_protocol::CtlMessage::SetTabColor { r, g, b }, &raw_osc, &resolve_active_pane_tty).await
 }
 
+/// Same shape as [`send_tab_color`]/[`send_tab_color_with`], for
+/// `CtlMessage::SetProgress` — see [`super::tab_progress::resolve`] for how
+/// the raw OSC 9;4 bytes are produced for the `TmuxSession`/`DirectTty`
+/// paths. `IsekaiPipeCtl` sends the raw `(state, progress)` value over the
+/// ctl-socket and lets the receiving end (`isekai-ssh`) decide how to render
+/// it, exactly like `send_tab_color` does for RGB — so it has no use for a
+/// local progress script either.
+pub(crate) async fn send_progress(delivery: &Delivery, state: isekai_protocol::ProgressState, progress: u8, hooks_dir: Option<&Path>) {
+    send_progress_with(delivery, state, progress, hooks_dir, query_current_pane_tty).await
+}
+
+async fn send_progress_with(
+    delivery: &Delivery,
+    state: isekai_protocol::ProgressState,
+    progress: u8,
+    hooks_dir: Option<&Path>,
+    resolve_active_pane_tty: impl Fn(&str) -> Option<PathBuf>,
+) {
+    let raw_osc = match delivery {
+        Delivery::IsekaiPipeCtl { .. } => String::new(),
+        Delivery::TmuxSession { .. } | Delivery::DirectTty { .. } => {
+            super::tab_progress::resolve(hooks_dir, state, progress).await
+        }
+    };
+    deliver(delivery, isekai_protocol::CtlMessage::SetProgress { state, progress }, &raw_osc, &resolve_active_pane_tty).await
+}
+
 pub(crate) async fn send_notify_popup(delivery: &Delivery) {
     send_notify_popup_with(delivery, query_current_pane_tty).await
 }
@@ -467,5 +494,88 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.starts_with("\x1bPtmux;"), "direct delivery must not wrap: {written:?}");
         assert!(written.contains("OSCTEST:00ff00"));
+    }
+
+    /// Writes a deterministic `hooks_dir/tab-progress` script — same
+    /// rationale as [`custom_tab_color_hooks_dir`] (isolates these tests
+    /// from `tab_progress`'s own terminal-kind detection, already covered by
+    /// that module's own tests).
+    fn custom_tab_progress_hooks_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("tab-progress");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf 'OSCTEST:%s:%s' \"$1\" \"$2\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn send_progress_over_tmux_session_resolves_the_active_pane_at_write_time() {
+        let tty_dir = tempfile::tempdir().unwrap();
+        let path = tty_dir.path().join("fake-tty");
+        std::fs::write(&path, b"").unwrap();
+        let hooks_dir = custom_tab_progress_hooks_dir();
+        let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
+        let resolved_path = path.clone();
+        send_progress_with(&delivery, isekai_protocol::ProgressState::Indeterminate, 0, Some(hooks_dir.path()), move |session_id| {
+            assert_eq!(session_id, "$3");
+            Some(resolved_path.clone())
+        })
+        .await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("\x1bPtmux;"), "must be wrapped for tmux passthrough: {written:?}");
+        assert!(written.contains("OSCTEST:3:0"), "must contain the tab-progress script's output: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn send_progress_over_tmux_session_is_a_silent_no_op_when_no_pane_resolves() {
+        let delivery = Delivery::TmuxSession { session_id: "$3".to_string() };
+        send_progress_with(&delivery, isekai_protocol::ProgressState::Indeterminate, 0, None, |_| None).await;
+    }
+
+    #[tokio::test]
+    async fn send_progress_over_direct_tty_is_not_wrapped() {
+        let tty_dir = tempfile::tempdir().unwrap();
+        let path = tty_dir.path().join("fake-tty");
+        std::fs::write(&path, b"").unwrap();
+        let hooks_dir = custom_tab_progress_hooks_dir();
+        let delivery = Delivery::DirectTty { path: path.clone() };
+        send_progress(&delivery, isekai_protocol::ProgressState::Normal, 42, Some(hooks_dir.path())).await;
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.starts_with("\x1bPtmux;"), "direct delivery must not wrap: {written:?}");
+        assert!(written.contains("OSCTEST:1:42"));
+    }
+
+    /// Unlike `send_tab_color`, `IsekaiPipeCtl` delivery has no prior direct
+    /// test of the actual bytes written to the ctl-socket — this pins that
+    /// `send_progress` forwards the raw `CtlMessage::SetProgress` value
+    /// unchanged, letting the receiving `isekai-ssh` decide the OSC (see
+    /// this module's docs on why `IsekaiPipeCtl` never resolves a local raw
+    /// OSC sequence at all).
+    #[tokio::test]
+    async fn send_progress_over_isekai_pipe_ctl_sends_the_raw_ctl_message() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let accept = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        let delivery = Delivery::IsekaiPipeCtl { ctl_sock: sock_path.clone() };
+        send_progress(&delivery, isekai_protocol::ProgressState::Indeterminate, 0, None).await;
+
+        let received = accept.await.unwrap();
+        let text = String::from_utf8(received).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(sock_path.to_string_lossy().as_ref()), "preamble must be the ctl-sock path");
+        let msg: isekai_protocol::CtlMessage = serde_json::from_str(lines.next().expect("a message line")).unwrap();
+        assert_eq!(msg, isekai_protocol::CtlMessage::SetProgress { state: isekai_protocol::ProgressState::Indeterminate, progress: 0 });
     }
 }

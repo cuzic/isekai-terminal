@@ -42,6 +42,8 @@ mod hooks;
 mod state;
 #[cfg(unix)]
 mod tab_color;
+#[cfg(unix)]
+mod tab_progress;
 
 #[cfg(unix)]
 use delivery::Delivery;
@@ -159,8 +161,16 @@ async fn event_command() -> ExitCode {
     // `StopDeferred` out of nothing. `TeammateDispatched` deliberately does
     // *not* spawn, same as plain `Resolve`: with no daemon running there is
     // no pending state to update and no `Stop` yet to inform, so recording
-    // the dispatch timestamp would have nothing to do.
-    if !matches!(event, ClientEvent::Notify | ClientEvent::StopDeferred | ClientEvent::StopAmbiguousTeammate) {
+    // the dispatch timestamp would have nothing to do. `NotifyUnlessDeferred`
+    // spawns for the same reason as `StopAmbiguousTeammate` and stays safe
+    // for the same reason: a freshly spawned daemon has no `Deferred` entry
+    // for this session yet, so `state.rs::apply_event` resolves it exactly
+    // like a plain `Notify` — spawning here can never wrongly suppress a
+    // genuine attention signal.
+    if !matches!(
+        event,
+        ClientEvent::Notify | ClientEvent::StopDeferred | ClientEvent::StopAmbiguousTeammate | ClientEvent::NotifyUnlessDeferred
+    ) {
         // `SessionEnd` alone still gets one direct, best-effort, idempotent
         // idle-color write — bypassing the daemon/state machine entirely —
         // when no daemon answers. Without this, "the daemon happened to be
@@ -172,19 +182,7 @@ async fn event_command() -> ExitCode {
         // `Resolve`.
         if is_session_end {
             let (r, g, b) = idle_color.unwrap_or(DEFAULT_IDLE_COLOR);
-            // Note for anyone reading `tab_color`'s/`hooks`'s module docs
-            // alongside this call: their "runs with the daemon process's
-            // environment" claim doesn't apply here specifically — this one
-            // direct write happens in this short-lived `claude-hookd event`
-            // process itself (no daemon involved at all), so a `tab-color`
-            // script invoked from *this* call site sees the actual Claude
-            // Code session's own environment, not some other session's that
-            // happened to win an earlier spawn race. Harmless in practice
-            // (if anything, more accurate), but worth knowing if you're
-            // debugging why `$TERM_PROGRAM` looks different here. This path
-            // also never fires `on-idle` (see `daemon.rs::run`'s startup
-            // self-heal comment for the same non-firing behavior and why).
-            delivery::send_tab_color(&delivery, (r, g, b), hooks_dir().as_deref()).await;
+            session_end_self_heal_with(&delivery, (r, g, b), hooks_dir().as_deref()).await;
         }
         return ExitCode::SUCCESS;
     }
@@ -200,6 +198,36 @@ async fn event_command() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The `SessionEnd`-without-a-reachable-daemon self-heal: one direct,
+/// best-effort, idempotent idle-color + progress-clear write, bypassing the
+/// daemon/state machine entirely (see `event_command`'s call site for why
+/// this exists at all — the short version: a dead daemon right as the last
+/// event for a tab arrives must not strand that tab in the attention color/
+/// progress ring forever). Extracted into its own function, taking
+/// `delivery`/`hooks_dir` as parameters instead of resolving them from `$HOME`/
+/// `Delivery::resolve()` itself, so this path is directly test-injectable —
+/// this crate's other delivery-adjacent functions (`send_tab_color`/
+/// `send_progress`) already follow the same "resolve once, thread the value
+/// through" shape; this call site just hadn't needed it until a progress
+/// write was added alongside the color write here too.
+///
+/// Note for anyone reading `tab_color`'s/`tab_progress`'s/`hooks`'s module
+/// docs alongside this call: their "runs with the daemon process's
+/// environment" claim doesn't apply here specifically — this one direct
+/// write happens in this short-lived `claude-hookd event` process itself (no
+/// daemon involved at all), so a `tab-color`/`tab-progress` script invoked
+/// from *this* call site sees the actual Claude Code session's own
+/// environment, not some other session's that happened to win an earlier
+/// spawn race. Harmless in practice (if anything, more accurate), but worth
+/// knowing if you're debugging why `$TERM_PROGRAM` looks different here.
+/// This path also never fires `on-idle` (see `daemon.rs::run`'s startup
+/// self-heal comment for the same non-firing behavior and why).
+#[cfg(unix)]
+async fn session_end_self_heal_with(delivery: &Delivery, idle_color: (u8, u8, u8), hooks_dir: Option<&Path>) {
+    delivery::send_tab_color(delivery, idle_color, hooks_dir).await;
+    delivery::send_progress(delivery, isekai_protocol::ProgressState::None, 0, hooks_dir).await;
 }
 
 /// A hook event as classified purely from Claude Code's own hook JSON — the
@@ -246,6 +274,17 @@ enum ClientEvent {
     /// dispatch ⇒ probably just a long-idle teammate (`Notify`, the safe
     /// default).
     StopAmbiguousTeammate,
+    /// `Notification` with `notification_type: "agent_completed"` — see
+    /// `state::HookEvent::NotifyUnlessDeferred`'s docs for why this needs its
+    /// own variant rather than folding into plain `Notify`: unlike
+    /// `permission_prompt`/`idle_prompt`/etc, this specific notification
+    /// type's own hook payload carries no `background_tasks`, so whether it
+    /// should actually paint the attention color depends on this tab's
+    /// already-known pending state — daemon-held, not something a one-shot
+    /// `claude-hookd event` process can decide alone. No history to record on
+    /// this end, unlike `TeammateDispatched`/`StopAmbiguousTeammate` — the
+    /// daemon-side translation is a direct 1:1 map to `state::HookEvent`.
+    NotifyUnlessDeferred,
 }
 
 #[cfg(unix)]
@@ -264,12 +303,14 @@ impl ClientEvent {
             ClientEvent::Resolve => "resolve",
             ClientEvent::TeammateDispatched => "teammate_dispatched",
             ClientEvent::StopAmbiguousTeammate => "stop_ambiguous_teammate",
+            ClientEvent::NotifyUnlessDeferred => "notify_unless_deferred",
         }
     }
 
     fn from_wire_str(s: &str) -> Option<Self> {
         Some(match s {
             "notify" => ClientEvent::Notify,
+            "notify_unless_deferred" => ClientEvent::NotifyUnlessDeferred,
             "stop_deferred" => ClientEvent::StopDeferred,
             "resolve" => ClientEvent::Resolve,
             "teammate_dispatched" => ClientEvent::TeammateDispatched,
@@ -444,9 +485,13 @@ fn parse_hook_event(payload: &[u8]) -> Option<(String, ClientEvent, bool)> {
 
     let event = match hook_event_name {
         "Notification" => match value.get("notification_type").and_then(|v| v.as_str()) {
-            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input" | "agent_completed") => {
-                ClientEvent::Notify
-            }
+            Some("permission_prompt" | "idle_prompt" | "elicitation_dialog" | "agent_needs_input") => ClientEvent::Notify,
+            // Deliberately not lumped in with the unambiguous group above —
+            // see `ClientEvent::NotifyUnlessDeferred`'s docs: this specific
+            // notification_type's payload carries no background_tasks, so it
+            // must not unconditionally override a session already known
+            // (from an earlier Stop) to have other background work pending.
+            Some("agent_completed") => ClientEvent::NotifyUnlessDeferred,
             Some("elicitation_complete" | "elicitation_response") => ClientEvent::Resolve,
             Some(_) => return None,
             None => ClientEvent::Notify,
@@ -784,7 +829,7 @@ mod tests {
 
     #[test]
     fn notification_types_that_mean_needs_input_are_notify() {
-        for kind in ["permission_prompt", "idle_prompt", "elicitation_dialog", "agent_needs_input", "agent_completed"] {
+        for kind in ["permission_prompt", "idle_prompt", "elicitation_dialog", "agent_needs_input"] {
             let payload = format!(r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#);
             assert_eq!(
                 parse_hook_event(payload.as_bytes()),
@@ -792,6 +837,19 @@ mod tests {
                 "notification_type {kind:?} should be Notify"
             );
         }
+    }
+
+    /// Pins the actual fix for a real live false-Attention report (2026-08-10,
+    /// see `state::HookEvent::NotifyUnlessDeferred`'s docs for the full
+    /// trail): `agent_completed`'s own payload carries no `background_tasks`,
+    /// so unlike the other needs-input notification types above it must not
+    /// be classified as an unconditional `Notify` — the daemon-held pending
+    /// state (`state.rs`) is what actually decides whether it should paint
+    /// attention, not this one-shot classification alone.
+    #[test]
+    fn notification_type_agent_completed_is_notify_unless_deferred_not_plain_notify() {
+        let payload = br#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"agent_completed"}"#;
+        assert_eq!(parse_hook_event(payload), Some(("s1".to_string(), ClientEvent::NotifyUnlessDeferred, false)));
     }
 
     #[test]
@@ -1061,6 +1119,29 @@ mod tests {
         assert!(a.to_string_lossy().contains(DAEMON_SOCK_PREFIX));
     }
 
+    /// Every `ClientEvent` variant must round-trip through the wire format
+    /// unchanged — pins a gap an adversarial review (2026-08-10) flagged:
+    /// nothing previously exercised `as_wire_str`/`from_wire_str` directly,
+    /// so a typo'd wire string on either side (e.g. `NotifyUnlessDeferred`'s
+    /// `"notify_unless_deferred"`) would have `daemon.rs::read_one_event_line`
+    /// silently drop the event (`from_wire_str` returns `None` for an
+    /// unrecognized string, same as malformed JSON) rather than fail loudly —
+    /// exactly the failure mode the daemon-loop end-to-end tests in
+    /// `daemon.rs` can't distinguish from "the event correctly did nothing."
+    #[test]
+    fn every_client_event_round_trips_through_the_wire_format() {
+        for event in [
+            ClientEvent::Notify,
+            ClientEvent::NotifyUnlessDeferred,
+            ClientEvent::StopDeferred,
+            ClientEvent::Resolve,
+            ClientEvent::TeammateDispatched,
+            ClientEvent::StopAmbiguousTeammate,
+        ] {
+            assert_eq!(ClientEvent::from_wire_str(event.as_wire_str()), Some(event), "{event:?} must round-trip");
+        }
+    }
+
     #[test]
     fn derive_daemon_sock_path_differs_for_different_targets() {
         let a = derive_daemon_sock_path(&Delivery::TmuxSession { session_id: "$1".to_string() });
@@ -1091,5 +1172,46 @@ mod tests {
             send_event(&sock_path, "s1", ClientEvent::Notify).await,
             "a real listener owned by this same process's own uid must be treated as reachable"
         );
+    }
+
+    /// This test is the first in this module to drive a real
+    /// `delivery::send_tab_color`/`send_progress` write against
+    /// `Delivery::DirectTty` with no `hooks_dir` override — which falls
+    /// through to the embedded default scripts' real `$TERM_PROGRAM`-based
+    /// terminal-kind detection. Same fix as `daemon.rs`'s
+    /// `ensure_deterministic_terminal_kind`: pin `$ISEKAI_TERMINAL_KIND`
+    /// once, process-wide, so this doesn't flip to the iTerm2 OSC sequences
+    /// on a real macOS iTerm2 CI runner (adversarial review precedent this
+    /// crate has already hit once, see that function's doc comment).
+    fn ensure_deterministic_terminal_kind() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            // SAFETY: `call_once` guarantees this runs exactly once, and no
+            // test in this module ever sets a *different* value.
+            unsafe { std::env::set_var("ISEKAI_TERMINAL_KIND", "windows-terminal") };
+        });
+    }
+
+    /// `session_end_self_heal_with` (the `SessionEnd`-without-a-reachable-
+    /// daemon fallback) must write both the idle color *and* clear the
+    /// progress ring — before this function was extracted, `event_command`'s
+    /// inline version of this path was only reachable via real `$HOME`/
+    /// `Delivery::resolve()` env resolution and had no direct test at all
+    /// (the only `SessionEnd`-related test in this module,
+    /// `session_end_is_resolve_and_flagged_for_the_self_heal_fallback`, is a
+    /// pure `parse_hook_event` test that never exercises this write).
+    #[tokio::test]
+    async fn session_end_self_heal_writes_idle_color_and_clears_progress() {
+        ensure_deterministic_terminal_kind();
+        let dir = tempfile::tempdir().unwrap();
+        let tty_path = dir.path().join("fake-tty");
+        std::fs::write(&tty_path, b"").unwrap();
+        let delivery = Delivery::DirectTty { path: tty_path.clone() };
+
+        session_end_self_heal_with(&delivery, (0x20, 0x20, 0x20), None).await;
+
+        let written = std::fs::read_to_string(&tty_path).unwrap();
+        assert!(written.contains("4;264;rgb:20/20/20"), "must paint the idle color: {written:?}");
+        assert!(written.contains("9;4;0;0"), "must also clear the progress ring: {written:?}");
     }
 }
