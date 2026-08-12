@@ -58,8 +58,28 @@ impl RingBuffer {
     }
 
     /// The soft-reset sequence followed by everything currently buffered,
-    /// ready to send to a newly-attaching client in one shot.
+    /// ready to send to a newly-attaching client in one shot — or an empty
+    /// `Vec` if nothing has ever been written yet.
+    ///
+    /// Real bug found live (2026-08-12, pre-mortem review): this used to
+    /// prepend [`SOFT_RESET`] *unconditionally*, even for a brand-new,
+    /// never-appended-to buffer. `daemon.rs`'s `if !replay.is_empty()` guard
+    /// around sending this as the connecting client's first `Frame::Stdout`
+    /// was written assuming `replay()` *could* return empty — but since it
+    /// never did, that guard was dead code, and **every single `tty attach`,
+    /// including the very first one to a fresh session**, sent `ESC c` (RIS,
+    /// a full terminal reset) to the user's real terminal. On most emulators
+    /// (Windows Terminal, iTerm2, VTE-based ones) that clears the visible
+    /// screen *and* the scrollback buffer — silently, with no error, on
+    /// every connect. `SOFT_RESET` only exists to guard against a *replayed*
+    /// escape sequence that got truncated mid-sequence by eviction (see its
+    /// own doc comment) — there is nothing to guard against, and no reason
+    /// to reset the client's terminal at all, when there is no buffered
+    /// output to replay in the first place.
     pub(crate) fn replay(&self) -> Vec<u8> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(SOFT_RESET.len() + self.buf.len());
         out.extend_from_slice(SOFT_RESET);
         out.extend(self.buf.iter().copied());
@@ -104,8 +124,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_buffer_replays_just_the_soft_reset() {
+    fn empty_buffer_replays_nothing_not_even_the_soft_reset() {
+        // Regression for the real bug this fixed: a fresh session's first
+        // `tty attach` must not blast RIS (`ESC c`) at the user's terminal
+        // and wipe their scrollback when there is nothing buffered to
+        // replay in the first place.
         let rb = RingBuffer::new(16);
-        assert_eq!(rb.replay(), SOFT_RESET);
+        assert_eq!(rb.replay(), Vec::<u8>::new());
     }
 }
