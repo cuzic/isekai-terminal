@@ -1,0 +1,49 @@
+name: Regenerate Cargo.lock (on-demand)
+
+# 手動実行専用: ローカルサンドボックスでcargoを一切実行せずに、rust-core/Cargo.toml
+# の依存宣言に対応する rust-core/Cargo.lock を再生成し、artifactとして出力する
+# (ダウンロード後、呼び出し元がdiffを確認して手動でコミットする想定。CI自身はpushしない)。
+#
+# `cargo generate-lockfile`は依存グラフの解決のみを行い、実コンパイルは一切行わない
+# ため、isekai_pipe_quic_transport.rsが要求するmusl静的バイナリの事前ビルド
+# (build-isekai-pipe-musl.sh)は不要 — regenerate-uniffi-bindings.ymlより大幅に軽い。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: regenerate-lockfile-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry/git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: regenerate-lockfile-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml', 'rust-core/*/Cargo.toml') }}
+          restore-keys: |
+            regenerate-lockfile-${{ runner.os }}-
+
+      - name: Regenerate Cargo.lock (dependency resolution only, no build)
+        working-directory: rust-core
+        run: cargo generate-lockfile
+
+      - name: Upload Cargo.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: rust-core/Cargo.lock
+          retention-days: 7

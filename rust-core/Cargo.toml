@@ -25,6 +25,16 @@ rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cuzic/quicsock"
 
+# `noq`をcrates.io版から`cuzic/noq`のfork(noq#738のmultipath address-family正規化
+# fix、upstream PR https://github.com/n0-computer/noq/pull/784としてレビュー中)へ
+# 切り替え。upstreamのレビューサイクルを待たずにこのfixを取り込むため。`branch`では
+# なく特定commitへの`rev`固定にしているのは、PRが今後もレビュー対応で更新され続ける
+# ため、ビルドが知らないうちに変わらないようにするため。upstream本流の変更を取り込む
+# 際はnoq自身のCONTRIBUTING.mdが文書化している手順(`git fetch upstream main` →
+# 差分をcherry-pickしてこのforkに反映 → ここの`rev`を更新)を踏襲する。
+[workspace.dependencies]
+noq = { git = "https://github.com/cuzic/noq.git", rev = "db998f2dd883d15d763f8f32147f3c903ca88667" }
+
 [package]
 name = "isekai-terminal-core"
 version = "0.1.0"
@@ -74,7 +84,7 @@ zeroize = "1"
 # resume_client.rs も含め、quinn は使っていない
 # （Phase 9-0/9-1 でquinnクライアント⇔noqサーバーの後方互換を実証済みなので、
 # noqは単一パス用途でも quinn と相互接続可能）。
-noq = { version = "1.0.1", features = ["rustls", "ring"] }
+noq = { workspace = true, features = ["rustls", "ring"] }
 tokio-stream = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }

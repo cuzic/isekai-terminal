@@ -12,7 +12,7 @@ h3-qmux = { path = "../h3-qmux", features = ["datagram"] }
 qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3" }
 h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
 h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
-noq = { version = "1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+noq = { workspace = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 bytes = "1"
 http = "1"
 tokio = { version = "1", features = ["full"] }
