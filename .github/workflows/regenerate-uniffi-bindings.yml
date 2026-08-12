@@ -85,3 +85,10 @@ jobs:
           name: uniffi-swift-bindings
           path: ios/Sources/IsekaiTerminalCoreLogic/generated/
           retention-days: 7
+
+      - name: Upload Cargo.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: rust-core/Cargo.lock
+          retention-days: 7
