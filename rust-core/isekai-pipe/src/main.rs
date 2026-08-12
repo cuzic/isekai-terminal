@@ -335,7 +335,7 @@ async fn run() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("version") | Some("--version") => {
-            println!("isekai-pipe {}", env!("CARGO_PKG_VERSION"));
+            println!("isekai-pipe {} ({})", env!("CARGO_PKG_VERSION"), env!("ISEKAI_GIT_SHA"));
             ExitCode::SUCCESS
         }
         Some("connect") => connect::connect_command(args).await,

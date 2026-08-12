@@ -364,7 +364,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--once" => once = true,
             "--log-level" => log_level = next_val(&mut iter, "--log-level")?,
             "--version" => {
-                println!("isekai-pipe {}", env!("CARGO_PKG_VERSION"));
+                println!("isekai-pipe {} ({})", env!("CARGO_PKG_VERSION"), env!("ISEKAI_GIT_SHA"));
                 std::process::exit(0);
             }
             "-h" | "--help" => {
