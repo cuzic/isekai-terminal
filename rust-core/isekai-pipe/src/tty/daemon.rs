@@ -23,6 +23,37 @@ use super::unix_socket::verify_peer_is_self;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// `$TERM` for the pty shell — always this fixed, widely-compatible value,
+/// deliberately **not** whatever `$TERM` happened to be set to in this
+/// daemon process's own environment (which itself is only ever whatever
+/// the *first* `tty attach` invocation to ever spawn this daemon happened
+/// to have — see [`run`]'s call site).
+///
+/// Real gap found via pre-mortem review (2026-08-12): `cols`/`rows` are
+/// correctly refreshed from every `Frame::Hello` a reconnecting client
+/// sends (`handle_client`'s `master.resize` call), but `$TERM` itself is
+/// an environment variable of the pty shell's *own, already-running*
+/// process — nothing can retroactively change it for a process that's
+/// already running (or for whatever it's already `exec`'d), so it can
+/// never be kept in sync with each reconnecting client's own `$TERM` the
+/// way window size can. A previous version of this code used
+/// `std::env::var("TERM")` from the daemon's own environment instead —
+/// which is not "the terminal this session should behave as" in any
+/// meaningful sense either, just an accident of which SSH invocation
+/// happened to be the one that spawned this daemon. Between "correct for
+/// literally nobody" (the old behavior — right only for whichever client
+/// was first, wrong for everyone who reconnects from a different
+/// terminal) and "a single well-known, broadly-supported value, chosen
+/// deliberately and documented as such," the latter is the honest choice:
+/// `isekai-pipe tty daemon` is not a terminal multiplexer (see this
+/// module's own docs on being `tmux`'s replacement, not `tmux` itself) —
+/// it does not translate between the real client terminal's capabilities
+/// and the shell's, the way `tmux`/`screen` do via their own `$TERM`
+/// (`screen`/`tmux`) and terminfo definitions. Properly tracking each
+/// reconnecting client's real `$TERM` would need that same kind of
+/// translation layer, out of scope for this fix.
+const PTY_TERM: &str = "xterm-256color";
+
 /// Bound on the replay-on-attach ring buffer — generous for "recent
 /// terminal scrollback," not sized to hold a session's entire output.
 const RING_BUFFER_CAPACITY: usize = 256 * 1024;
@@ -182,8 +213,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     // `$ISEKAI_CTL_SOCK` baked into its own environment once at spawn time.
     let ctl_sock_file = super::unix_socket::ctl_sock_file_path(&dir, name);
 
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-    let (master, mut child) = super::pty::spawn(&command, &term, DEFAULT_COLS, DEFAULT_ROWS, Some(&ctl_sock_file))?;
+    let (master, mut child) = super::pty::spawn(&command, PTY_TERM, DEFAULT_COLS, DEFAULT_ROWS, Some(&ctl_sock_file))?;
     let master = Arc::new(master);
     let attach_slot = Arc::new(AttachSlot::new(RING_BUFFER_CAPACITY));
 
@@ -310,6 +340,10 @@ async fn handle_client(stream: UnixStream, master: &Arc<PtyMaster>, attach_slot:
         .await
         .map_err(|_| anyhow::anyhow!("no Hello within {HELLO_TIMEOUT:?}"))??
         .ok_or_else(|| anyhow::anyhow!("client closed before sending Hello"))?;
+    // `term` (`..`) is deliberately never used here — see `PTY_TERM`'s own
+    // doc comment for why the pty shell's `$TERM` is a fixed constant
+    // rather than tracking whatever a (re)connecting client's `Frame::Hello`
+    // reports, unlike `cols`/`rows` just below.
     let Frame::Hello { cols, rows, .. } = hello else {
         anyhow::bail!("expected Hello as the first frame, got {hello:?}");
     };
