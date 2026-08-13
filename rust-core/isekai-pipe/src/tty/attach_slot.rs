@@ -468,10 +468,26 @@ mod tests {
 
         let (freed_slot, mut rx) = drain_task.await.unwrap();
         assert_eq!(freed_slot, Some(RelayMsg::Data(Vec::new())), "sanity: the freed slot was the pre-filled dummy data");
+
+        // `notify_exit`'s successful `try_send` filled the *one* slot
+        // `drain_task` just freed — it does not jump the queue, so the
+        // remaining pre-filled dummy messages (255 of them) are still
+        // ahead of it. Drain everything left and confirm `Exit(7)` shows
+        // up exactly once, as the very last message (FIFO: it was enqueued
+        // after every dummy still in the channel at that point).
+        let mut remaining = Vec::new();
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            remaining.push(msg);
+        }
         assert_eq!(
-            rx.recv().await,
-            Some(RelayMsg::Exit(7)),
-            "the next message after the one freed slot must be the Exit notify_exit was retrying to deliver"
+            remaining.last(),
+            Some(&RelayMsg::Exit(7)),
+            "Exit(7) must eventually be delivered, as the last message once every earlier one has drained: {remaining:?}"
+        );
+        assert_eq!(
+            remaining.iter().filter(|m| **m == RelayMsg::Exit(7)).count(),
+            1,
+            "Exit must be delivered exactly once, not retried again after it already succeeded: {remaining:?}"
         );
     }
 
