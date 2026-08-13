@@ -41,6 +41,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// comment for the real bug this fixes.
 const EXIT_NOTIFY_GRACE: Duration = Duration::from_millis(300);
 
+/// Bounds how long [`run`] waits for `read_loop` to finish draining the pty
+/// after the shell has exited, before giving up and calling
+/// [`super::attach_slot::AttachSlot::notify_exit`] anyway — see the call
+/// site's doc comment for the real bug this fixes. Generous for even a
+/// large burst of trailing output over a local pty (not a network path),
+/// while still bounding how long a pathological "the pty never gives EOF"
+/// case (a bug elsewhere leaking a slave-fd reference, say) can delay
+/// shutdown.
+const READ_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Spawns `isekai-pipe tty daemon <name>` as a **fully detached** process —
 /// not merely "backgrounded" — so it survives the SSH session `isekai-pipe
 /// tty attach` (this function's caller) is itself running inside of.
@@ -180,7 +190,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     // pty -> ring buffer + current occupant, unconditionally — this loop
     // must run even with zero clients attached (see `AttachSlot::broadcast`'s
     // doc comment on the classic dtach freeze this avoids).
-    let read_loop = {
+    let mut read_loop = {
         let master = master.clone();
         let attach_slot = attach_slot.clone();
         let name = name.to_string();
@@ -231,7 +241,36 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
     let exit_status = tokio::task::spawn_blocking(move || child.wait()).await??;
     let exit_code = exit_status.code().unwrap_or(1) as u8;
 
-    attach_slot.notify_exit(exit_code);
+    // Real bug found via pre-mortem review (2026-08-12): `child.wait()`
+    // resolving only means the shell process itself has terminated — it
+    // says nothing about whether `read_loop` (a fully independent task)
+    // has actually drained every byte the shell wrote to the pty right
+    // before exiting. Calling `notify_exit` immediately here, with no
+    // synchronization against `read_loop`'s progress, raced the two: if
+    // `notify_exit`'s `RelayMsg::Exit` reached the occupant's channel
+    // before some trailing `RelayMsg::Data` chunk(s) `read_loop` hadn't
+    // broadcast yet, `handle_client`'s writer task would process `Exit`
+    // first and `return` immediately — permanently discarding whatever
+    // Data messages were still queued behind it (or arrived after). A
+    // program's last line of output right before `exit` (a final error
+    // message, a build's "done" line) could therefore silently never
+    // reach the attached client. Waiting for `read_loop` to actually
+    // finish — which only happens once `master.read()` sees EOF, i.e.
+    // after every byte the pty ever held has already been read and
+    // broadcast — closes this gap: by the time this `.await` resolves,
+    // every `broadcast()` call happens-before this point, so `notify_exit`
+    // below can no longer race ahead of any of them. Bounded by
+    // `READ_LOOP_DRAIN_TIMEOUT` rather than awaited unconditionally, so a
+    // pty that pathologically never gives EOF (a bug elsewhere leaking a
+    // slave-fd reference) still can't block shutdown forever.
+    if tokio::time::timeout(READ_LOOP_DRAIN_TIMEOUT, &mut read_loop).await.is_err() {
+        log::warn!(
+            "isekai-pipe tty daemon {name}: pty read loop did not drain within {READ_LOOP_DRAIN_TIMEOUT:?} \
+             after the shell exited; some trailing output may not have reached the attached client"
+        );
+    }
+
+    attach_slot.notify_exit(exit_code).await;
     // `notify_exit` only *queues* `RelayMsg::Exit` on the current occupant's
     // channel (`try_send`, non-blocking) — the attached client's own
     // per-connection writer task (spawned in `handle_client`, not tracked
@@ -288,26 +327,56 @@ async fn handle_client(stream: UnixStream, master: &Arc<PtyMaster>, attach_slot:
     // client until preempted (the channel closes without an explicit
     // message — `AttachSlot::install` dropped our sender) or a write fails
     // (the client itself disconnected).
-    let writer_task = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Some(RelayMsg::Data(data)) => {
-                    if write_frame(&mut write_half, &Frame::Stdout(data)).await.is_err() {
+    //
+    // Checks `take_missed` before forwarding *every* message (not just
+    // `Data`) — see `AttachSlot::take_missed`'s own doc comment: a drop can
+    // just as easily be the very last thing that happens before `Exit`
+    // arrives (a bursty command's output right before it exits, the exact
+    // scenario that motivated this), so `Exit` must resync too, not only
+    // `Data`.
+    let writer_task = {
+        let attach_slot = attach_slot.clone();
+        tokio::spawn(async move {
+            loop {
+                if attach_slot.take_missed(generation) {
+                    if write_frame(&mut write_half, &Frame::Stdout(attach_slot.current_replay())).await.is_err() {
                         return;
                     }
                 }
-                Some(RelayMsg::Exit(code)) => {
-                    let _ = write_frame(&mut write_half, &Frame::Exit(code)).await;
-                    return;
-                }
-                None => {
-                    // Preempted: `AttachSlot::install` dropped our sender.
-                    let _ = write_frame(&mut write_half, &Frame::Preempted).await;
-                    return;
+                match rx.recv().await {
+                    // Forwarded unconditionally, even right after sending a
+                    // resync above: whatever was already queued at the
+                    // moment of that resync is guaranteed to be older than
+                    // the snapshot just sent (both go through the same
+                    // lock, and `broadcast` always appends to the ring
+                    // before attempting delivery) — forwarding it too just
+                    // duplicates a few already-seen bytes, a cosmetic
+                    // blip. Deliberately not trying to detect and skip that
+                    // case: doing so correctly would need per-message
+                    // sequence numbers to distinguish "queued before the
+                    // resync" (skip) from "arrived after, while `recv`
+                    // above was still waiting" (must forward) — real
+                    // complexity this design doesn't need, since the
+                    // failure mode it would prevent is "a line is shown
+                    // twice," not data loss.
+                    Some(RelayMsg::Data(data)) => {
+                        if write_frame(&mut write_half, &Frame::Stdout(data)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(RelayMsg::Exit(code)) => {
+                        let _ = write_frame(&mut write_half, &Frame::Exit(code)).await;
+                        return;
+                    }
+                    None => {
+                        // Preempted: `AttachSlot::install` dropped our sender.
+                        let _ = write_frame(&mut write_half, &Frame::Preempted).await;
+                        return;
+                    }
                 }
             }
-        }
-    });
+        })
+    };
 
     // Reader half: forwards this client's own Stdin/Resize into the pty,
     // for as long as (checked immediately before every pty write, under
