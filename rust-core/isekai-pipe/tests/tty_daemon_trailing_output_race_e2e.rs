@@ -64,14 +64,13 @@ const LAST_LINE: &str = "line-200";
 /// file's own module docs).
 ///
 /// Deliberately kept modest (200 lines, not thousands): a large enough
-/// burst starts tripping a *separate*, already-known limitation
-/// (`attach_slot.rs`'s `OCCUPANT_CHANNEL_CAPACITY` — live delivery uses a
-/// bounded, non-blocking `try_send` that silently drops once the occupant
-/// channel is full, a deliberate trade-off documented on `broadcast`'s own
-/// doc comment, not something this fix touches). This file's regression
-/// target is specifically the `notify_exit`-vs-`read_loop` *ordering* race,
-/// which a burst well within that separate capacity limit is sufficient to
-/// exercise on its own.
+/// burst also exercises a *separate* mechanism — `attach_slot.rs`'s
+/// `OCCUPANT_CHANNEL_CAPACITY`-driven drop-and-resync path (now fixed too,
+/// see `tty_daemon_dropped_output_resync_e2e.rs`, the dedicated test for
+/// *that* mechanism, sized specifically to trigger it). This file's
+/// regression target is specifically the `notify_exit`-vs-`read_loop`
+/// *ordering* race, which a burst well within the occupant channel's
+/// capacity is sufficient to exercise on its own.
 fn burst_then_exit_script() -> String {
     "sleep 1; i=1; while [ \"$i\" -le 200 ]; do echo \"line-$i\"; i=$((i+1)); done".to_string()
 }

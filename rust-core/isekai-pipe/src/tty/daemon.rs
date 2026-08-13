@@ -270,7 +270,7 @@ pub(crate) async fn run(name: &str, command: Vec<String>) -> anyhow::Result<u8> 
         );
     }
 
-    attach_slot.notify_exit(exit_code);
+    attach_slot.notify_exit(exit_code).await;
     // `notify_exit` only *queues* `RelayMsg::Exit` on the current occupant's
     // channel (`try_send`, non-blocking) — the attached client's own
     // per-connection writer task (spawned in `handle_client`, not tracked
@@ -327,26 +327,56 @@ async fn handle_client(stream: UnixStream, master: &Arc<PtyMaster>, attach_slot:
     // client until preempted (the channel closes without an explicit
     // message — `AttachSlot::install` dropped our sender) or a write fails
     // (the client itself disconnected).
-    let writer_task = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Some(RelayMsg::Data(data)) => {
-                    if write_frame(&mut write_half, &Frame::Stdout(data)).await.is_err() {
+    //
+    // Checks `take_missed` before forwarding *every* message (not just
+    // `Data`) — see `AttachSlot::take_missed`'s own doc comment: a drop can
+    // just as easily be the very last thing that happens before `Exit`
+    // arrives (a bursty command's output right before it exits, the exact
+    // scenario that motivated this), so `Exit` must resync too, not only
+    // `Data`.
+    let writer_task = {
+        let attach_slot = attach_slot.clone();
+        tokio::spawn(async move {
+            loop {
+                if attach_slot.take_missed(generation) {
+                    if write_frame(&mut write_half, &Frame::Stdout(attach_slot.current_replay())).await.is_err() {
                         return;
                     }
                 }
-                Some(RelayMsg::Exit(code)) => {
-                    let _ = write_frame(&mut write_half, &Frame::Exit(code)).await;
-                    return;
-                }
-                None => {
-                    // Preempted: `AttachSlot::install` dropped our sender.
-                    let _ = write_frame(&mut write_half, &Frame::Preempted).await;
-                    return;
+                match rx.recv().await {
+                    // Forwarded unconditionally, even right after sending a
+                    // resync above: whatever was already queued at the
+                    // moment of that resync is guaranteed to be older than
+                    // the snapshot just sent (both go through the same
+                    // lock, and `broadcast` always appends to the ring
+                    // before attempting delivery) — forwarding it too just
+                    // duplicates a few already-seen bytes, a cosmetic
+                    // blip. Deliberately not trying to detect and skip that
+                    // case: doing so correctly would need per-message
+                    // sequence numbers to distinguish "queued before the
+                    // resync" (skip) from "arrived after, while `recv`
+                    // above was still waiting" (must forward) — real
+                    // complexity this design doesn't need, since the
+                    // failure mode it would prevent is "a line is shown
+                    // twice," not data loss.
+                    Some(RelayMsg::Data(data)) => {
+                        if write_frame(&mut write_half, &Frame::Stdout(data)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(RelayMsg::Exit(code)) => {
+                        let _ = write_frame(&mut write_half, &Frame::Exit(code)).await;
+                        return;
+                    }
+                    None => {
+                        // Preempted: `AttachSlot::install` dropped our sender.
+                        let _ = write_frame(&mut write_half, &Frame::Preempted).await;
+                        return;
+                    }
                 }
             }
-        }
-    });
+        })
+    };
 
     // Reader half: forwards this client's own Stdin/Resize into the pty,
     // for as long as (checked immediately before every pty write, under
