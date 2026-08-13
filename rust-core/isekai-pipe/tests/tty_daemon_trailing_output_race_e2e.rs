@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncReadExt as _;
 
 fn isekai_pipe_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-pipe"))

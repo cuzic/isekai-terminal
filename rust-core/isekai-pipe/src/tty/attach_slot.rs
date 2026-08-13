@@ -446,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn notify_exit_retries_until_the_occupant_channel_has_room() {
         let slot = AttachSlot::new(1024);
-        let (tx, rx) = AttachSlot::new_occupant_channel();
+        let (tx, mut rx) = AttachSlot::new_occupant_channel();
         let (generation, _) = slot.install(tx.clone());
         fill_occupant_channel(&tx);
 
