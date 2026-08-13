@@ -96,13 +96,32 @@ pub(crate) fn spawn(command: &[String], term: &str, cols: u16, rows: u16, ctl_so
     cmd.stderr(Stdio::null());
 
     // SAFETY: this closure runs in the forked child before exec, so it must
-    // be async-signal-safe. Its body is exactly one libc call
-    // (`login_tty`) — no allocation, no locking, no Rust runtime machinery —
-    // satisfying `pre_exec`'s safety contract. `slave_fd` is `Copy` (a raw
-    // `c_int`), so the closure captures it by value; nothing borrowed from
-    // the parent process's heap crosses into the child through it.
+    // be async-signal-safe. Its body is two plain libc calls
+    // (`signal`/`login_tty`) — no allocation, no locking, no Rust runtime
+    // machinery — satisfying `pre_exec`'s safety contract. `slave_fd` is
+    // `Copy` (a raw `c_int`), so the closure captures it by value; nothing
+    // borrowed from the parent process's heap crosses into the child
+    // through it.
     unsafe {
         cmd.pre_exec(move || {
+            // Real bug found via pre-mortem review (2026-08-12): the
+            // *daemon* process (this function's caller) sets `SIGHUP` to
+            // `SIG_IGN` for itself in `daemon.rs::spawn_detached`'s own
+            // `pre_exec` — necessary so it survives the SSH session that
+            // spawned it hanging up. Signal *dispositions* (unlike blocked
+            // masks) survive `exec()`, so without this reset every shell
+            // (and everything that shell later runs) `pty::spawn` execs
+            // here would silently inherit `SIGHUP` ignored too — not
+            // because anything about *this* session's own controlling
+            // terminal warrants it, but purely as an accidental side
+            // effect of which process happened to spawn it. A real login
+            // shell (and everything it in turn execs) always starts with
+            // ordinary, unmodified signal dispositions; this restores that
+            // baseline before the shell — or whatever custom command `tty
+            // daemon` was given — ever runs.
+            if libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
             if libc::login_tty(slave_fd) != 0 {
                 return Err(io::Error::last_os_error());
             }
