@@ -26,6 +26,7 @@
 //! exit" and "Ctrl-A/Ctrl-K show up as `^A`/`^K`".
 
 use std::io;
+use std::os::unix::process::CommandExt as _;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -49,13 +50,57 @@ const CONNECT_RETRY_DELAYS: [Duration; 6] =
 /// to this feature specifically).
 const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `--isekai-tty` is an opt-in convenience feature layered on top of an
+/// otherwise-working SSH session (`ctl_forward.rs`'s `exec_target`
+/// mechanism *replaces* the login shell entirely via `exec`) — a failure
+/// here must never be the reason a user gets no shell at all. Real gap
+/// found via pre-mortem review (2026-08-12): every failure path before a
+/// live session was ever established (daemon spawn failure, socket
+/// errors, no `HelloAck`, ...) used to just propagate an `Err` straight
+/// out to `tty_attach_command`, which printed it and exited — since the
+/// remote command was `exec isekai-pipe tty attach '<name>'`, that exit
+/// *was* the whole SSH session ending, with no shell ever having run.
+///
+/// Fixed by splitting the connect+handshake phase out into
+/// [`run_until_attached`] and falling back to a plain login shell (via
+/// [`fall_back_to_plain_shell`]) on any error from *that* phase. Once a
+/// live session genuinely exists (past `HelloAck`), [`relay`] takes over
+/// and this fallback deliberately does not apply — a *mid-session*
+/// connection drop or a clean `exit` from inside the real attached shell
+/// must not silently swap the user into a brand-new, unrelated plain
+/// shell (their real persistent session may well still be alive
+/// server-side and worth reconnecting to, which conjuring up a fallback
+/// shell here would obscure).
 pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
     // Best-effort: a non-tty fd 0 (piped/redirected, e.g. under test) just
     // means `enable()` returns `None` and the relay runs without it — same
     // opportunistic-fallback convention as `isekai-ssh`'s own
     // `RawModeGuard`, not a reason to fail the whole session.
-    let _raw_mode = RawModeGuard::enable();
+    let raw_mode = RawModeGuard::enable();
 
+    match run_until_attached(name).await {
+        Ok(stream) => relay(stream).await,
+        Err(e) => {
+            eprintln!("isekai-pipe tty attach: {e:#}");
+            eprintln!("isekai-pipe tty attach: falling back to a plain login shell");
+            // Restore the pty to its original (cooked) mode before handing
+            // off — matches what an ordinary login shell would see; its
+            // own readline reconfigures the pty itself regardless (see
+            // this module's own doc comment), but there is no reason to
+            // leave it in a state the fallback shell never asked for.
+            drop(raw_mode);
+            let exec_err = fall_back_to_plain_shell();
+            Err(anyhow::anyhow!(exec_err).context("tty-attach itself failed, and falling back to a plain login shell also failed"))
+        }
+    }
+}
+
+/// Connects to (spawning if needed) the tty daemon and completes the
+/// `Hello`/`HelloAck` handshake — everything [`run`] needs before handing
+/// off to [`relay`]. Split out from `run` specifically so its errors can be
+/// distinguished from `relay`'s: see `run`'s own doc comment for why only
+/// *this* phase's failures fall back to a plain shell.
+async fn run_until_attached(name: &str) -> anyhow::Result<UnixStream> {
     let dir = super::unix_socket::private_runtime_dir()?;
     let socket_path = super::unix_socket::socket_path(&dir, name)?;
     refresh_ctl_sock_file(&dir, name);
@@ -80,7 +125,23 @@ pub(crate) async fn run(name: &str) -> anyhow::Result<u8> {
         Err(_) => anyhow::bail!("no HelloAck from the daemon within {HELLO_ACK_TIMEOUT:?}"),
     }
 
-    relay(stream).await
+    Ok(stream)
+}
+
+/// Replaces this process with a plain interactive login shell — exactly
+/// the command `isekai-ssh/src/tty_attach.rs`'s own `ctl_forward.rs`
+/// composition would have run if `--isekai-tty`/`#@isekai tty` had never
+/// been requested at all (`"${SHELL:-/bin/sh}" -i -l`,
+/// `ctl_forward.rs::build_login_shell_command`'s own default). On success
+/// this never returns — `Command::exec` replaces the process image in
+/// place, same pid, same controlling terminal, no intervening shell layer.
+/// The `io::Error` it returns is only ever observed if the exec itself
+/// failed (e.g. neither `$SHELL` nor `/bin/sh` could be executed), a
+/// condition severe enough that there is genuinely nothing left to fall
+/// back to.
+fn fall_back_to_plain_shell() -> io::Error {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    std::process::Command::new(&shell).args(["-i", "-l"]).exec()
 }
 
 /// Keeps `daemon.rs`'s `$ISEKAI_TTY_CTL_SOCK_FILE`-pointed indirection file
