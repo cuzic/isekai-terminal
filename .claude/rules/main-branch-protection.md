@@ -52,16 +52,20 @@
 5つとも元は各ワークフローのjob id(`test`/`drift-check`/`check`等)がGitHub上の
 check-run context名になっていたが、`android-test-check.yml`と`rust-core-test-check.yml`
 が両方job id `test`を使っており**context名が衝突していた**(2026-08-17発見)。
-Phase 1で各jobに明示的な`name:`を付けてこれを解消した。**この5つのcontext名は
-branch protectionのrequired status checkとして直接参照されているため、対応する
-ワークフローファイルの`name:`を変更する場合は、必ず同時に
-`gh api -X PUT repos/cuzic/isekai-terminal/branches/main/protection`で
+同様に`lockfile-drift-check.yml`と`room-migration-check.yml`も両方job id `check`を
+使っており、もう1つの実際の衝突だった。Phase 1で各jobに明示的な`name:`を付けて
+これを解消した。**この5つのcontext名はbranch protectionのrequired status checkとして
+直接参照されているため、対応するワークフローファイルの`name:`を変更する場合は、
+必ず同時に`gh api -X PUT repos/cuzic/isekai-terminal/branches/main/protection`で
 protection設定側の`checks[].context`も更新すること**(更新を忘れると、その
 contextは二度と緑にならず恒久pendingでmainへのマージが詰まる)。
 
 対象外(required化しなかったもの):
 - `rust-core-test-check.yml`の`test-macos`/`test-windows`: 将来のrequired候補として
-  維持しているが、まだ安定性が未検証(Phase 6参照)。
+  維持しているが、まだ安定性が未検証(Phase 6参照)。既に`name: rust-core-test-macos`/
+  `name: rust-core-test-windows`は付与済み(2026-08-17、pr-path-gate信頼性修正の
+  ついでに前倒しで対応——job id(`test-macos`/`test-windows`)そのままでは`test`job
+  のときと同じcontext名衝突を将来招きかねないため)。
 - `ios-*-check.yml`各種、`ios-app-build-check.yml`(31分)、
   `ios-ssh-vertical-slice-check.yml`(27分): コスト対効果が悪いため対象外のまま
   (Phase 6でも`ios-app-build`/`ios-ssh-vertical-slice`は除外予定)。
@@ -132,8 +136,12 @@ gh api -X POST repos/cuzic/isekai-terminal/branches/main/protection/enforce_admi
 ## Phase 6(将来、任意)
 
 green rateが95%以上安定したら`ios-logic-linux`→`rust-core-test-windows`→
-`rust-core-test-macos`の順でrequiredに追加する。`ios-app-build`(31分)/
-`ios-ssh-vertical-slice`(27分)はコスト対効果が悪いため対象外のまま維持する。
+`rust-core-test-macos`の順でrequiredに追加する。`rust-core-test-check.yml`の
+`test-macos`/`test-windows`両jobには既に`name:`が付与済み(上記参照)なので、
+Phase 6実行時に改めて`name:`追加の作業をする必要はない——そのまま
+`checks[].context`に`rust-core-test-macos`/`rust-core-test-windows`を追加するだけでよい。
+`ios-app-build`(31分)/`ios-ssh-vertical-slice`(27分)はコスト対効果が悪いため
+対象外のまま維持する。
 
 ## 参照実装
 
@@ -141,6 +149,9 @@ green rateが95%以上安定したら`ios-logic-linux`→`rust-core-test-windows
   `android-uniffi-drift-check.yml` / `lockfile-drift-check.yml` /
   `room-migration-check.yml`: 各`jobs.<id>.name:`(context名の実体)
 - `.github/actions/pr-path-gate/action.yml`: path-filter付きワークフローの
-  恒久pending対策(`gh pr diff --name-only`によるERE照合)
+  恒久pending対策(base.sha/github.shaのローカルgit diffによるERE照合。
+  当初`gh pr diff --name-only`を使っていたが、大規模PRでのdiff切り詰め・
+  `synchronize`時のSHAレースのリスクがあったため2026-08-17にgit diffベースへ
+  置き換えた)
 - `/home/cuzic/.claude/plans/flickering-wondering-petal.md` 項目3セクション:
   この導入の元になった設計プラン全文
