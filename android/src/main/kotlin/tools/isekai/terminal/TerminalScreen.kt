@@ -242,6 +242,19 @@ private suspend fun AwaitPointerEventScope.awaitLongPressOrDragCancellation(
  * シーム」方式でIME表示状態を注入できるようにし、Robolectric実行結果に依存せず決定論的に
  * IMEレイアウトの回帰([tools.isekai.terminal.TerminalImeLayoutTest]・[TerminalResizeTest])
  * を検証できるようにする。
+ *
+ * [pointerEventEncoderOverride]も同種のテスト用シーム(項目6 Tier 3)。`terminalPointerEventBytes`
+ * (UniFFI経由のRustネイティブ呼び出し)は`android/src/test`(Robolectric、JVM単体テスト)からは
+ * 呼び出せない——isekai-terminal-coreのネイティブライブラリは`aarch64-linux-android`向けにしか
+ * ビルドされておらず(`android/build.gradle.kts`の`cargoBuildRustCore`参照)、JVMのライブラリ
+ * パス上にホスト(linux-x86_64等)向けの共有ライブラリが存在しないため、最初の呼び出しで
+ * `UnsatisfiedLinkError`になる(このプロジェクトの`android/src/test`は現時点で一つも
+ * UniFFIネイティブ関数を実際に呼び出していない——`TerminalKeyEncoder.specialKeyBytes`等は
+ * 純Kotlin実装であり、この制約に該当しない)。実際のSGR/legacy X10エンコード自体の正しさは
+ * rust-core側`terminal.rs::encode_pointer_event_bytes`のユニットテストが担うため、Compose境界の
+ * 統合テスト([TerminalGestureIntegrationTest])はこのシームでエンコーダを差し替え、
+ * press/drag/release等の「配線」(呼び出し順序・座標・重複排除・ピンチ引き継ぎ・scrollback表示中の
+ * 抑止)だけを検証する。
  */
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
@@ -258,6 +271,13 @@ fun TerminalScreenBody(
     onUserActivity: () -> Unit = {},
     /** テスト用シーム。プロダクションコードからは渡さないこと(このComposableのdocstring参照)。 */
     imeVisibleOverride: Boolean? = null,
+    /**
+     * テスト用シーム。プロダクションコードからは渡さないこと(このComposableのdocstring参照)。
+     * `terminalPointerEventBytes`(UniFFI経由のRustネイティブ呼び出し)を差し替える。
+     */
+    pointerEventEncoderOverride: (
+        (MouseEventKind, MouseButton?, UInt, UInt, TerminalKeyModifiers, UInt, UInt, MouseReportingMode, Boolean, Boolean) -> ByteArray?
+    )? = null,
 ) {
     val context = LocalContext.current
     val connected = uiState.connected
@@ -711,19 +731,28 @@ fun TerminalScreenBody(
                         mouseReportingMode = latestDisplayUpdate.value.mouseReportingMode,
                     )
                 }
+                // pointerEventEncoderOverride(テスト用シーム、上記docstring参照): JVM単体テスト
+                // (android/src/test、Robolectric)はisekai-terminal-coreのネイティブライブラリを
+                // ロードできない(aarch64-linux-android向けにしかビルドされないため
+                // `UnsatisfiedLinkError`になる)。実際のRustエンコード自体はrust-core側
+                // (`terminal.rs::encode_pointer_event_bytes`)のユニットテストが担うので、ここでは
+                // Compose境界での配線(press/drag/releaseのライフサイクル・同一セル内motionの
+                // 重複排除・ピンチ引き継ぎ・scrollback表示中の送出抑止)を、ネイティブ呼び出しに
+                // 触れずに検証できるようにする(TerminalGestureIntegrationTest参照)。
+                val encodePointerEvent = pointerEventEncoderOverride ?: ::terminalPointerEventBytes
                 val sendPointerEvent: (MouseEventKind, MouseButton?, Int, Int) -> Unit = { kind, button, row, col ->
                     val u = latestDisplayUpdate.value
-                    val bytes = terminalPointerEventBytes(
-                        kind = kind,
-                        button = button,
-                        row = row.toUInt(),
-                        col = col.toUInt(),
-                        modifiers = noPointerModifiers,
-                        cols = u.cols,
-                        rows = u.rows,
-                        mouseReportingMode = u.mouseReportingMode,
-                        sgrMouseMode = u.sgrMouseMode,
-                        urxvtMouseMode = u.urxvtMouseMode,
+                    val bytes = encodePointerEvent(
+                        kind,
+                        button,
+                        row.toUInt(),
+                        col.toUInt(),
+                        noPointerModifiers,
+                        u.cols,
+                        u.rows,
+                        u.mouseReportingMode,
+                        u.sgrMouseMode,
+                        u.urxvtMouseMode,
                     )
                     if (bytes != null) actions.onSend(bytes)
                 }
