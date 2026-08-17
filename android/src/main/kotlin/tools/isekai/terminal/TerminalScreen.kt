@@ -233,6 +233,15 @@ private suspend fun AwaitPointerEventScope.awaitLongPressOrDragCancellation(
  * 「タブ/ペインを跨いで1つしか存在しない」UIは [hasFocus] が true の側にだけ表示する
  * （「フォーカス中のペインに対して表示する」設計。未分割時は既定で isActive と同じ値になり、
  * 既存の挙動と変わらない）。
+ *
+ * [imeVisibleOverride]はテスト用シーム(項目6 Tier 1)。プロダクションコードからは渡さないこと。
+ * `WindowInsets.isImeVisible`はComposeのroot Viewへの実際の`OnApplyWindowInsetsListener`配線に
+ * 依存しており、`createComposeRule()`(Activityへの参照を持たない)からは安全にdispatchできる
+ * root Viewを取得できない(`createAndroidComposeRule<ComponentActivity>()`への切り替えが必要に
+ * なり、既存テストの構成への影響が大きい)。そのため、既存の[chromeVisible]等と同じ「テスト用
+ * シーム」方式でIME表示状態を注入できるようにし、Robolectric実行結果に依存せず決定論的に
+ * IMEレイアウトの回帰([tools.isekai.terminal.TerminalImeLayoutTest]・[TerminalResizeTest])
+ * を検証できるようにする。
  */
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
@@ -247,6 +256,8 @@ fun TerminalScreenBody(
     hasFocus: Boolean = isActive,
     chromeVisible: Boolean = true,
     onUserActivity: () -> Unit = {},
+    /** テスト用シーム。プロダクションコードからは渡さないこと(このComposableのdocstring参照)。 */
+    imeVisibleOverride: Boolean? = null,
 ) {
     val context = LocalContext.current
     val connected = uiState.connected
@@ -543,7 +554,7 @@ fun TerminalScreenBody(
                 // 飛ぶのを防ぐ)ため、resize先のcols/rowsには「IMEが非表示だった直近の
                 // 高さ」を凍結して使う(生のIME insetを足し戻して補正しない理由・初回
                 // composition時の扱いは advanceResizeStability のdoc参照)。
-                val isImeVisible = WindowInsets.isImeVisible
+                val isImeVisible = imeVisibleOverride ?: WindowInsets.isImeVisible
                 var resizeStability by remember {
                     mutableStateOf(
                         ResizeStabilityState(
