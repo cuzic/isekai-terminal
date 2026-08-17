@@ -2,6 +2,8 @@ package tools.isekai.terminal
 
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -51,5 +53,27 @@ class TerminalSessionServiceTest {
             "cuzic@example.com",
             shadowOf(service).lastForegroundNotification?.extras?.getCharSequence(android.app.Notification.EXTRA_TEXT).toString(),
         )
+    }
+
+    /**
+     * `foregroundServiceType`をdataSync/mediaProcessing/shortService等の
+     * タイムアウト対象型へうっかり戻すことを機械的に防ぐ回帰テスト
+     * (`AndroidManifest.xml`の型選択の経緯コメント参照)。specialUseであることを
+     * PackageManager経由で確認する。
+     *
+     * `specialUse`のマニフェスト属性値はAPI 34以降で定義されているため、クラス
+     * デフォルトのsdk=33ではAndroidManifest.xmlのパース時にenum値を正しく解決
+     * できない。このテストだけsdk=34にオーバーライドする。
+     */
+    @Test
+    @Config(sdk = [34])
+    fun manifest_declaresSpecialUseForegroundServiceType() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val serviceInfo = context.packageManager.getServiceInfo(
+            android.content.ComponentName(context, TerminalSessionService::class.java),
+            PackageManager.GET_META_DATA,
+        )
+
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, serviceInfo.foregroundServiceType)
     }
 }

@@ -65,7 +65,7 @@ class TerminalSessionService : Service() {
             // ここで無条件にstartForeground()していた旧実装は、Android 15以降
             // dataSync/mediaProcessing等のFGSがバックグラウンドから起動されると
             // システムに短時間で強制終了され(ForegroundServiceDidNotStopInTimeException、
-            // 当時の型はdataSyncだった。現在はremoteMessagingへ変更済みだが、
+            // 当時の型はdataSyncだった。現在はspecialUseへ変更済みだが、
             // このnullチェック自体は型に関係なく必要な修正)、
             // それによる2回目の自動再起動がmAllowStartForeground=falseで即
             // ForegroundServiceStartNotAllowedExceptionとなり、"アプリが繰り返し
@@ -93,7 +93,7 @@ class TerminalSessionService : Service() {
 
     private fun startForegroundWithNotification(label: String) {
         val notification = buildNotification(label)
-        // Android 14+: foregroundServiceType は Manifest で宣言（remoteMessaging）
+        // Android 14+: foregroundServiceType は Manifest で宣言（specialUse）
         startForeground(NOTIFICATION_ID, notification)
     }
 
