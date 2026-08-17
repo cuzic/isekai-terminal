@@ -1,0 +1,77 @@
+name: PR path gate
+
+# path-filter付き`pull_request`トリガー(GitHub Actionsの`on.pull_request.paths:`)は、
+# branch protectionのrequired status checkとして使うと、対象パスに触れないPRでは
+# check-run自体が一度も作られず「pending」のまま残り続け、マージ不能になる
+# (`.claude/rules/main-branch-protection.md`参照)。
+#
+# このcomposite actionは、path-filterの代わりに「ワークフロー自体は常に発火させ、
+# 重いステップだけをif条件でスキップする」方式のゲートを提供する。checkout直後に
+# 呼び出し、`gh pr diff --name-only`で変更ファイル一覧を取得して`patterns`
+# (改行区切りのERE)のいずれかにマッチするか判定する。以降の重いステップに
+# `if: steps.<この呼び出しのstep id>.outputs.relevant == 'true'`を付ければ、
+# 無関係なPRはcheck-runが即座に(数十秒で)成功し、関係するPRだけ実際のビルド/
+# テストが走る。
+#
+# `pull_request`イベント専用(`push`トリガーでは元々paths:フィルタを維持しており、
+# そちらはpush先ブランチのcheck-run自体を作らないだけで恒久pending問題を起こさない
+# ため、このゲートを挟む必要がない)。
+
+description: >-
+  変更されたファイルパスがpatterns(改行区切りのERE)のいずれかにマッチするかを
+  判定する。path-filter付きpull_requestワークフローをrequired status checkにする際の
+  恒久pending対策として、checkout直後に挟んで使う。
+
+inputs:
+  patterns:
+    description: >-
+      改行区切りの拡張正規表現(ERE, `grep -E`互換)パターンのリスト。変更ファイルの
+      パスのうち1つでもいずれかのパターンにマッチすればrelevant=trueになる。
+    required: true
+  github-token:
+    description: gh CLIの認証に使うトークン。
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  relevant:
+    description: "'true'または'false'。変更ファイルがpatternsのいずれかにマッチしたか。"
+    value: ${{ steps.gate.outputs.relevant }}
+
+runs:
+  using: composite
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PATTERNS: ${{ inputs.patterns }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+
+        if [ "$EVENT_NAME" != "pull_request" ]; then
+          echo "::error::pr-path-gate is meant for pull_request-triggered workflows only (got '$EVENT_NAME')."
+          exit 1
+        fi
+        if [ -z "$PR_NUMBER" ]; then
+          echo "::error::pr-path-gate: github.event.pull_request.number is empty; is this really a pull_request event?"
+          exit 1
+        fi
+
+        echo "Changed files in PR #$PR_NUMBER:"
+        CHANGED_FILES="$(gh pr diff "$PR_NUMBER" --name-only)"
+        echo "$CHANGED_FILES"
+
+        relevant=false
+        while IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          if echo "$CHANGED_FILES" | grep -qE "$pattern"; then
+            echo "matched pattern: $pattern"
+            relevant=true
+          fi
+        done <<< "$PATTERNS"
+
+        echo "relevant=$relevant"
+        echo "relevant=$relevant" >> "$GITHUB_OUTPUT"

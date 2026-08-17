@@ -17,10 +17,12 @@ on:
     paths:
       - "rust-core/**/Cargo.toml"
       - "rust-core/Cargo.lock"
+  # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
+  # protectionのrequired status checkにする際、path-filter付きpull_requestは
+  # 対象パスに触れないPRでcheck-run自体が作られず恒久pendingになる。このjobは
+  # 10秒〜十数秒と軽量なので、pr-path-gateを挟まず単純に常時実行にする(以前の
+  # paths:リストは上のpush.pathsと同一)。
   pull_request:
-    paths:
-      - "rust-core/**/Cargo.toml"
-      - "rust-core/Cargo.lock"
   workflow_dispatch:
 
 permissions:

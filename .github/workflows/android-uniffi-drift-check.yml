@@ -25,11 +25,13 @@ on:
       - "rust-core/**"
       - "android/src/main/kotlin/uniffi/**"
       - ".github/workflows/android-uniffi-drift-check.yml"
+  # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
+  # protectionのrequired status checkにする際、path-filter付きpull_requestは
+  # 対象パスに触れないPRでcheck-run自体が作られず恒久pendingになる。代わりに
+  # 常時発火させ、`.github/actions/pr-path-gate`(下のjob参照)で無関係な変更を
+  # 判定して重いステップだけスキップする。以前のpaths:リスト(pr-path-gateの
+  # patternsと同義)は上のpush.pathsと同一だったものをそのまま維持している。
   pull_request:
-    paths:
-      - "rust-core/**"
-      - "android/src/main/kotlin/uniffi/**"
-      - ".github/workflows/android-uniffi-drift-check.yml"
   workflow_dispatch:
 
 concurrency:
@@ -38,6 +40,8 @@ concurrency:
 
 permissions:
   contents: read
+  # pr-path-gate(`gh pr diff`)がPRの変更ファイル一覧を読むために必要。
+  pull-requests: read
 
 jobs:
   drift-check:
@@ -51,12 +55,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
+      # `gh pr diff`が使えない(PR番号が無い)ため、無条件relevant=trueとして
+      # 後続のif条件を素通りさせる。
+      - name: Determine PR relevance
+        id: relevant
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/pr-path-gate
+        with:
+          patterns: |
+            ^rust-core/
+            ^android/src/main/kotlin/uniffi/
+            ^\.github/workflows/android-uniffi-drift-check\.yml$
+            ^\.github/actions/pr-path-gate/
+
       - name: Show toolchain versions
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           rustc --version
           cargo --version
 
       - name: Cache cargo (rust-core)
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -69,11 +89,13 @@ jobs:
             android-uniffi-drift-${{ runner.os }}-
 
       - name: Install zig (mlugg/setup-zig)
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: mlugg/setup-zig@v2
         with:
           version: latest
 
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           if ! command -v cargo-zigbuild >/dev/null; then
@@ -83,10 +105,12 @@ jobs:
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: Build isekai-terminal-core (host debug)
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         working-directory: rust-core
         run: cargo build -p isekai-terminal-core
 
       - name: Regenerate Kotlin bindings
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         working-directory: rust-core
         run: |
           set -euo pipefail
@@ -100,6 +124,7 @@ jobs:
         # `git diff --exit-code`だけでは、UniFFIが新規ファイルを生成した場合
         # (未追跡ファイルになる)を取りこぼすため、`git status --porcelain`でも
         # 同じパスを確認する。
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           GENERATED_DIR=android/src/main/kotlin/uniffi
