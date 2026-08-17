@@ -94,19 +94,6 @@ pub fn decide_battery_guidance(facts: BackgroundKillFacts) -> BatteryGuidanceDec
     BatteryGuidanceDecision { should_show }
 }
 
-/// [`UNEXPECTED_KILL_THRESHOLD`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
-/// Kotlin側にハードコードで複製させないための単純なgetter。
-#[uniffi::export]
-pub fn battery_guidance_unexpected_kill_threshold() -> u32 {
-    UNEXPECTED_KILL_THRESHOLD
-}
-
-/// [`GUIDANCE_COOLDOWN_SECS`]をUniFFI経由でKotlin/Swift側に公開する。
-#[uniffi::export]
-pub fn battery_guidance_cooldown_secs() -> u64 {
-    GUIDANCE_COOLDOWN_SECS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,11 +188,5 @@ mod tests {
             ..base_facts()
         };
         assert!(!decide_battery_guidance(facts).should_show);
-    }
-
-    #[test]
-    fn threshold_and_cooldown_getters_match_constants() {
-        assert_eq!(battery_guidance_unexpected_kill_threshold(), UNEXPECTED_KILL_THRESHOLD);
-        assert_eq!(battery_guidance_cooldown_secs(), GUIDANCE_COOLDOWN_SECS);
     }
 }
