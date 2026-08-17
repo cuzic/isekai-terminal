@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import tools.isekai.terminal.data.AuthType
+import tools.isekai.terminal.data.BatteryGuidanceSettings
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.KeySequence
@@ -39,12 +40,15 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
+import tools.isekai.terminal.util.BatteryOptimization
 import tools.isekai.terminal.util.ClientIdentity
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.isekai_terminal_core.BackgroundKillFacts
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.PlatformFd
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
+import uniffi.isekai_terminal_core.decideBatteryGuidance
 import uniffi.isekai_terminal_core.reattachRecordIsFresh
 
 /**
@@ -94,6 +98,17 @@ data class PaneAddress(val tabId: String, val paneId: String)
  */
 fun interface ReattachFreshnessPolicy {
     fun isFresh(savedAtUnixSecs: Long, nowUnixSecs: Long): Boolean
+}
+
+/**
+ * 項目2(OEMバッテリー最適化への案内UI): 「予期しないkillの事実」から案内ダイアログを
+ * 表示すべきかを判定するポリシー。本番実装はRust側`background_reliability_policy.rs`の
+ * `decide_battery_guidance`(rust-ssot準拠のポリシー判断)へそのまま委譲するだけの
+ * 薄いラッパーであり、この関数型インターフェース自体は[ReattachFreshnessPolicy]と同じ
+ * 理由でテストがネイティブ呼び出し無しに差し替えるためだけに存在する。
+ */
+fun interface BatteryGuidancePolicy {
+    fun shouldShow(facts: BackgroundKillFacts): Boolean
 }
 
 /**
@@ -169,6 +184,12 @@ class TerminalTabsViewModel(
     // (`FakeSshGateway.kt`のdocコメント「実Rust側のConnPhaseを模した最小限の状態」参照)。
     private val reattachFreshnessPolicy: ReattachFreshnessPolicy = ReattachFreshnessPolicy { savedAtUnixSecs, nowUnixSecs ->
         reattachRecordIsFresh(savedAtUnixSecs.toULong(), nowUnixSecs.toULong())
+    },
+    // 項目2: 「案内すべきか」の判定(既定はRust側`decide_battery_guidance`への委譲、
+    // rust-ssot準拠)。[reattachFreshnessPolicy]と全く同じ理由でテストから差し替え可能に
+    // しておく。
+    private val batteryGuidancePolicy: BatteryGuidancePolicy = BatteryGuidancePolicy { facts ->
+        decideBatteryGuidance(facts).shouldShow
     },
 ) : AndroidViewModel(app) {
 
@@ -399,6 +420,18 @@ class TerminalTabsViewModel(
     private val _activeTabId = MutableStateFlow<String?>(null)
     val activeTabId: StateFlow<String?> = _activeTabId.asStateFlow()
 
+    /** 項目2: コールドスタート時にOEMバッテリー最適化の案内ダイアログを自動表示すべきか。
+     *  [MainActivity.AppRoot]がNavHost外で購読する(タスク#14の黙示的再アタッチによる
+     *  自動画面遷移とは独立させるため)。 */
+    private val _showBatteryGuidance = MutableStateFlow(false)
+    val showBatteryGuidance: StateFlow<Boolean> = _showBatteryGuidance.asStateFlow()
+
+    /** [showBatteryGuidance]を消費してダイアログを閉じる。「設定を開く」「閉じる」
+     *  いずれを選んだ場合も呼ばれる(このセッション中の自動表示は最大1回)。 */
+    fun dismissBatteryGuidance() {
+        _showBatteryGuidance.value = false
+    }
+
     // タブごとの監視コルーチン（通知集約の再計算・ダウンロード完了ファンアウト・接続状態遷移）。closeTab で cancel する。
     private val watchJobs = mutableMapOf<String, Job>()
 
@@ -451,11 +484,17 @@ class TerminalTabsViewModel(
     private fun restorePersistedReattachTabs() {
         viewModelScope.launch(ioDispatcher) {
             val records = reattachStore.load()
+            val nowUnixSecs = System.currentTimeMillis() / 1000L
+            // 項目2: 「新鮮なreattachレコードがあったか」を、このレコードが復元処理で
+            // 消費される前に判定材料として使う(実際のclear()より先に呼ぶ必要はないが、
+            // 意味的にこの位置が自然)。
+            checkBatteryGuidance(
+                hasFreshReattachRecord = records.any { reattachFreshnessPolicy.isFresh(it.savedAtUnixSecs, nowUnixSecs) },
+            )
             if (records.isEmpty()) return@launch
             // 復元後は全レコードを新しいタブIDで作り直す([openTab]が[persistReattachRecord]
             // 経由で新しいレコードを書き戻す)ため、古いレコードは先にまとめて捨てる。
             reattachStore.clear()
-            val nowUnixSecs = System.currentTimeMillis() / 1000L
             for (record in records) {
                 if (!reattachFreshnessPolicy.isFresh(record.savedAtUnixSecs, nowUnixSecs)) {
                     RemoteLogger.i(
@@ -483,6 +522,45 @@ class TerminalTabsViewModel(
                 RemoteLogger.i("IsekaiTerminalReattach", "implicitly reattaching '${profile.label}' after process restart")
                 openTab(profile)
             }
+        }
+    }
+
+    /**
+     * 項目2(OEMバッテリー最適化への案内UI): 「新鮮なreattachレコードあり &&
+     * clean-shutdownマーカー無し」を1回の予期しないkillとしてカウントし、Rust側の
+     * `decide_battery_guidance`([batteryGuidancePolicy]経由)へ生の事実を渡して
+     * 案内すべきか判断する。切断回数はトリガーにしない(ネットワーク起因の切断と
+     * OEMによるプロセスkillは別事象でノイズが多すぎるため、`PLAN.md`参照)。
+     *
+     * [hasFreshReattachRecord]が`false`(新鮮なレコードが1件も無い)場合は「今回の
+     * プロセス起動が予期しないkillからのものかどうか」を判定する材料が無いため、
+     * カウンタの増減も判断も一切行わない——ただし[TerminalSessionService.
+     * consumeCleanShutdownMarker]の呼び出しだけは常に行う(呼ばないとdirty-bitが
+     * リセットされず、次回起動時に2世代前の"clean"痕跡を誤って読んでしまう、
+     * `TerminalSessionService`のdoc参照)。
+     */
+    private fun checkBatteryGuidance(hasFreshReattachRecord: Boolean) {
+        val context = getApplication<Application>()
+        val wasCleanShutdown = TerminalSessionService.consumeCleanShutdownMarker(context)
+        if (!hasFreshReattachRecord || wasCleanShutdown) return
+
+        RemoteLogger.i(
+            "IsekaiTerminalBattery",
+            "unexpected process kill detected (fresh reattach record found without a clean-shutdown marker)",
+        )
+        BatteryGuidanceSettings.incrementUnexpectedKillCount(context)
+
+        val nowUnixSecs = System.currentTimeMillis() / 1000L
+        val facts = BackgroundKillFacts(
+            unexpectedKillCount = BatteryGuidanceSettings.unexpectedKillCount(context).toUInt(),
+            lastShownUnixSecs = BatteryGuidanceSettings.lastShownUnixSecs(context)?.toULong(),
+            nowUnixSecs = nowUnixSecs.toULong(),
+            isIgnoringBatteryOptimizations = BatteryOptimization.isIgnoringBatteryOptimizations(context),
+            userOptedOut = BatteryGuidanceSettings.isOptedOut(context),
+        )
+        if (batteryGuidancePolicy.shouldShow(facts)) {
+            BatteryGuidanceSettings.markShownNow(context, nowUnixSecs)
+            _showBatteryGuidance.value = true
         }
     }
 
