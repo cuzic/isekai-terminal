@@ -217,12 +217,12 @@ class TerminalImeLayoutTest {
         // 手動Resizeボタン(PR#64): stableHeightPxを現在の(縮んだ)heightPxへ強制的に
         // 合わせ、既存のLaunchedEffect(cols, rows, connected)経由でonResizeが再度呼ばれる。
         composeTestRule.onNodeWithText("Resize").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
-        composeTestRule.waitForIdle()
+        // LaunchedEffect(cols, rows, connected)の再起動(旧コルーチンのキャンセル→新規launch)が
+        // 単一のwaitForIdle()呼び出し内で確実に完結する保証がRobolectric+kotlinx-coroutines-test
+        // 環境では無い(実際にCIで単発のwaitForIdle()直後だとまだ反映されていないケースを確認した)
+        // ため、条件が満たされるまで能動的にアイドル処理を繰り返すwaitUntilを使う。
+        composeTestRule.waitUntil(timeoutMillis = 5_000) { rowsSeen.size > 1 }
 
-        assertTrue(
-            "Resizeボタン押下後に新しいonResize呼び出しが発生するはず",
-            rowsSeen.size > 1,
-        )
         assertTrue(
             "縮んだviewport相当のrows($rowsBeforeShrink→${rowsSeen.last()})に減っているはず",
             rowsSeen.last() < rowsBeforeShrink,
@@ -273,12 +273,10 @@ class TerminalImeLayoutTest {
             imeState.value = false
             heightState.value = resumedHeightDp
         }
-        composeTestRule.waitForIdle()
-
-        assertTrue(
-            "IME非表示に戻ったら追随が再開し、新しいonResize呼び出しが発生するはず",
-            rowsSeen.size > 1,
-        )
+        // auxDrawerResizeButton_triggersOnResize_forTheShrunkViewportと同じ理由
+        // (このファイル該当コメント参照): LaunchedEffectの再起動が単一のwaitForIdle()内で
+        // 確実に完結する保証が無いため、waitUntilで能動的に確認する。
+        composeTestRule.waitUntil(timeoutMillis = 5_000) { rowsSeen.size > 1 }
         assertTrue(
             "新しい実測高さに基づくrows数は、縮小時のrows数と異なるはず",
             rowsSeen.last() != rowsSeen[rowsSeen.size - 2],
