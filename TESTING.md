@@ -744,6 +744,26 @@ Swiftツールチェーンの無い開発環境で書かれたため、macOS Git
 
 ---
 
+## `android/src/androidTest` は CI で実行されない
+
+`android/src/androidTest`(instrumented test、実機/エミュレータ上で `connectedAndroidTest`
+として動く)は、このリポジトリの現行 CI ワークフロー(`android-test-check.yml` 等)に
+emulator ジョブが存在しないため、**PR/main push のどちらでも一度も実行されない**。
+実機での手動確認(本ファイルの各セクション)を除けば、事実上「書いても誰も回さない
+テスト」になる。
+
+- **JVM(Robolectric)で書ける回帰テストは必ず `android/src/test` に置く**こと。
+  `android/src/test` は `./gradlew testDebugUnitTest` として毎回 CI で実行される。
+  Compose UI・ジェスチャー・IME 等、実機依存に見えるものの多くも Robolectric +
+  `createComposeRule()` で代替できる(`TerminalScreenBodyTest.kt` 等が既存の参考実装)。
+- `android/src/androidTest` に新しくテストを足す場合は、**それを実際に回す emulator
+  ワークフローの追加とセット**で行うこと。ワークフロー無しでの追加は「動いているように
+  見えて実は誰も検証していないテスト」を増やすだけで、Tier 0 のクリーンアップ
+  (`TerminalInputConnectionTest.kt` の androidTest 版削除、2026-08-17)で解消した問題を
+  再発させる。
+
+---
+
 ## ホスト側ビルド・テスト（Rust コア）
 
 ```bash
