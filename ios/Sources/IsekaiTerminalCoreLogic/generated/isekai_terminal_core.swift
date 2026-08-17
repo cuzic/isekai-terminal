@@ -1969,6 +1969,171 @@ public func FfiConverterTypeAttributeRun_lower(_ value: AttributeRun) -> RustBuf
 }
 
 
+/**
+ * [`decide_battery_guidance`]への入力となる生の事実。判断ロジックを持たず、
+ * Kotlin側が観測した値をそのまま渡すだけのデータ。
+ */
+public struct BackgroundKillFacts: Equatable, Hashable {
+    /**
+     * 「新鮮なreattachレコードあり && clean-shutdownマーカー無し」で起動した回数の
+     * 累積(Kotlin側が単調増加でカウントし永続化する)。
+     */
+    public var unexpectedKillCount: UInt32
+    /**
+     * 前回この案内ダイアログを表示した時刻(Unix epoch秒)。一度も表示したことが
+     * 無ければ`None`。
+     */
+    public var lastShownUnixSecs: UInt64?
+    /**
+     * 判定時刻(Unix epoch秒)。
+     */
+    public var nowUnixSecs: UInt64
+    /**
+     * `PowerManager.isIgnoringBatteryOptimizations()`の結果。既にOSのバッテリー
+     * 最適化対象外になっている(=免除済み)なら、これ以上案内する意味が無い。
+     */
+    public var isIgnoringBatteryOptimizations: Bool
+    /**
+     * ユーザーが案内ダイアログの「今後表示しない」トグルを選んでいるか。
+     */
+    public var userOptedOut: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 「新鮮なreattachレコードあり && clean-shutdownマーカー無し」で起動した回数の
+         * 累積(Kotlin側が単調増加でカウントし永続化する)。
+         */unexpectedKillCount: UInt32, 
+        /**
+         * 前回この案内ダイアログを表示した時刻(Unix epoch秒)。一度も表示したことが
+         * 無ければ`None`。
+         */lastShownUnixSecs: UInt64?, 
+        /**
+         * 判定時刻(Unix epoch秒)。
+         */nowUnixSecs: UInt64, 
+        /**
+         * `PowerManager.isIgnoringBatteryOptimizations()`の結果。既にOSのバッテリー
+         * 最適化対象外になっている(=免除済み)なら、これ以上案内する意味が無い。
+         */isIgnoringBatteryOptimizations: Bool, 
+        /**
+         * ユーザーが案内ダイアログの「今後表示しない」トグルを選んでいるか。
+         */userOptedOut: Bool) {
+        self.unexpectedKillCount = unexpectedKillCount
+        self.lastShownUnixSecs = lastShownUnixSecs
+        self.nowUnixSecs = nowUnixSecs
+        self.isIgnoringBatteryOptimizations = isIgnoringBatteryOptimizations
+        self.userOptedOut = userOptedOut
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BackgroundKillFacts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackgroundKillFacts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackgroundKillFacts {
+        return
+            try BackgroundKillFacts(
+                unexpectedKillCount: FfiConverterUInt32.read(from: &buf), 
+                lastShownUnixSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                nowUnixSecs: FfiConverterUInt64.read(from: &buf), 
+                isIgnoringBatteryOptimizations: FfiConverterBool.read(from: &buf), 
+                userOptedOut: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackgroundKillFacts, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.unexpectedKillCount, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastShownUnixSecs, into: &buf)
+        FfiConverterUInt64.write(value.nowUnixSecs, into: &buf)
+        FfiConverterBool.write(value.isIgnoringBatteryOptimizations, into: &buf)
+        FfiConverterBool.write(value.userOptedOut, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackgroundKillFacts_lift(_ buf: RustBuffer) throws -> BackgroundKillFacts {
+    return try FfiConverterTypeBackgroundKillFacts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackgroundKillFacts_lower(_ value: BackgroundKillFacts) -> RustBuffer {
+    return FfiConverterTypeBackgroundKillFacts.lower(value)
+}
+
+
+/**
+ * [`decide_battery_guidance`]の判定結果。
+ */
+public struct BatteryGuidanceDecision: Equatable, Hashable {
+    /**
+     * コールドスタート時に案内ダイアログを表示すべきか。
+     */
+    public var shouldShow: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * コールドスタート時に案内ダイアログを表示すべきか。
+         */shouldShow: Bool) {
+        self.shouldShow = shouldShow
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BatteryGuidanceDecision: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBatteryGuidanceDecision: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BatteryGuidanceDecision {
+        return
+            try BatteryGuidanceDecision(
+                shouldShow: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BatteryGuidanceDecision, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.shouldShow, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBatteryGuidanceDecision_lift(_ buf: RustBuffer) throws -> BatteryGuidanceDecision {
+    return try FfiConverterTypeBatteryGuidanceDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBatteryGuidanceDecision_lower(_ value: BatteryGuidanceDecision) -> RustBuffer {
+    return FfiConverterTypeBatteryGuidanceDecision.lower(value)
+}
+
+
 public struct CellData: Equatable, Hashable {
     public var ch: String
     public var fg: UInt32
@@ -8994,6 +9159,44 @@ public func terminalUnicodeCharBytes(unicodeChar: UInt32) -> Data?  {
 })
 }
 /**
+ * [`GUIDANCE_COOLDOWN_SECS`]をUniFFI経由でKotlin/Swift側に公開する。
+ */
+public func batteryGuidanceCooldownSecs() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_battery_guidance_cooldown_secs($0
+    )
+})
+}
+/**
+ * [`UNEXPECTED_KILL_THRESHOLD`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
+ * Kotlin側にハードコードで複製させないための単純なgetter。
+ */
+public func batteryGuidanceUnexpectedKillThreshold() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_battery_guidance_unexpected_kill_threshold($0
+    )
+})
+}
+/**
+ * 「予期しないkillが2回以上」かつ「前回案内から14日以上(または未表示)」かつ
+ * 「既に免除済みでない」かつ「ユーザーがオプトアウトしていない」場合のみ`true`を返す
+ * 純関数。
+ *
+ * クールダウン判定は`now_unix_secs`が`last_shown_unix_secs`より前(端末の時計調整等で
+ * 稀に起こりうる)の場合、`saturating_sub`により経過時間0として扱う——つまり
+ * 「直近案内したばかり」と同じ扱いになり、`should_show`はfalse側に倒れる
+ * (`reattach_record_is_fresh`とは異なり、クロックスキュー時は「案内すべき」ではなく
+ * 「案内を控える」安全側に倒す設計。案内を出しすぎることの実害[迷惑通知]の方が、
+ * 出し足りないことの実害[案内が遅れるだけ]より大きいと判断したため)。
+ */
+public func decideBatteryGuidance(facts: BackgroundKillFacts) -> BatteryGuidanceDecision  {
+    return try!  FfiConverterTypeBatteryGuidanceDecision_lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_decide_battery_guidance(
+        FfiConverterTypeBackgroundKillFacts_lower(facts),$0
+    )
+})
+}
+/**
  * 遅延・ロス・完全断すべてを既定値（無効）へ戻す。
  */
 public func debugClearUdpFault()  {try! rustCall() {
@@ -9116,6 +9319,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_battery_guidance_cooldown_secs() != 44081) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_battery_guidance_unexpected_kill_threshold() != 37317) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance() != 58303) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault() != 8630) {
