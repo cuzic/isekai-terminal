@@ -201,6 +201,7 @@ class TerminalImeLayoutTest {
         setImeAwareScreen(heightState, imeState) { _, rows -> rowsSeen.add(rows) }
         composeTestRule.waitForIdle()
         val rowsBeforeShrink = rowsSeen.last()
+        val canvasHeightBeforeShrink = composeTestRule.onNodeWithTag("terminalCanvas").fetchSemanticsNode().size.height
 
         composeTestRule.runOnIdle {
             imeState.value = true
@@ -208,6 +209,17 @@ class TerminalImeLayoutTest {
         }
         composeTestRule.waitForIdle()
         assertEquals("縮小直後は凍結されて追加callが無いはず", 1, rowsSeen.size)
+
+        // 診断用: onResizeの再呼び出しを云々する前に、そもそもBox(Modifier.size(...))の
+        // 外側からの高さ変更がterminalCanvasノードの実測サイズまで伝播しているか自体を確認する
+        // (伝播していなければ、以降のResizeボタン押下がstableHeightPxを正しい値に更新できず、
+        // onResizeが再度呼ばれないのも当然の帰結になるため切り分けが必要)。
+        val canvasHeightAfterShrink = composeTestRule.onNodeWithTag("terminalCanvas").fetchSemanticsNode().size.height
+        assertTrue(
+            "外側のBoxの高さ変更がterminalCanvasの実測サイズへ伝播しているはず" +
+                "(shrink前=$canvasHeightBeforeShrink px, shrink後=$canvasHeightAfterShrink px)",
+            canvasHeightAfterShrink < canvasHeightBeforeShrink,
+        )
 
         // 上向きスワイプで補助ドロワーを表示する(タスク#89、TerminalScreen.ktの
         // shouldRevealAuxDrawer)。
