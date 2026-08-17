@@ -24,8 +24,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import tools.isekai.terminal.ui.effectiveCanvasHeightPx
 import tools.isekai.terminal.ui.isCursorRowVisible
+import tools.isekai.terminal.ui.testCellH
 import tools.isekai.terminal.ui.visibleRowRange
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
@@ -181,7 +181,7 @@ class TerminalImeLayoutTest {
         val stableHeightPx = with(density) { fullHeightDp.toPx() }
         val liveHeightPx = with(density) { shrunkHeightDp.toPx() }
         val rows = 24
-        val cellH = effectiveCanvasHeightPx(stableHeightPx, liveHeightPx) / rows
+        val cellH = testCellH(stableHeightPx, liveHeightPx, rows)
         val visible = visibleRowRange(stableHeightPx, liveHeightPx, cellH, rows)
 
         // 接続直後の空バッファのプロンプトはrow 0(グリッド最上段)にある(minimalScreenUpdate

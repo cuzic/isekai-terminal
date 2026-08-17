@@ -3,6 +3,17 @@ package tools.isekai.terminal.ui
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
+/**
+ * [visibleRowRange]の`cellH`引数に渡す、実描画側([TerminalScreen.kt]の
+ * `renderCellDims.second`)と同じ計算式`effectiveCanvasHeightPx(stableHeightPx,
+ * liveHeightPx) / rows`をテストコードから使うための共有ヘルパー(コードレビュー指摘:
+ * [TerminalResizeTest]と[tools.isekai.terminal.TerminalImeLayoutTest]の両方に同じ式が
+ * 重複していたのをここへ集約)。`internal`にして両テストファイル(同じ`android/src/test`
+ * ソースセット)から参照できるようにする。
+ */
+internal fun testCellH(stableHeightPx: Float, liveHeightPx: Float, rows: Int): Float =
+    effectiveCanvasHeightPx(stableHeightPx, liveHeightPx) / rows
+
 class TerminalResizeTest {
 
     // ── advanceResizeStability ───────────────────────────────────────
@@ -159,7 +170,7 @@ class TerminalResizeTest {
         val rows = 24
         val stableHeightPx = 1000f
         val liveHeightPx = stableHeightPx * 0.45f
-        val cellH = effectiveCanvasHeightPx(stableHeightPx, liveHeightPx) / rows
+        val cellH = testCellH(stableHeightPx, liveHeightPx, rows)
 
         val visible = visibleRowRange(stableHeightPx, liveHeightPx, cellH, rows)
 
