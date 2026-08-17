@@ -833,10 +833,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes(
     ): Int
-    external fun uniffi_isekai_terminal_core_checksum_func_battery_guidance_cooldown_secs(
-    ): Int
-    external fun uniffi_isekai_terminal_core_checksum_func_battery_guidance_unexpected_kill_threshold(
-    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault(
@@ -1140,10 +1136,6 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_func_battery_guidance_cooldown_secs(uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_isekai_terminal_core_fn_func_battery_guidance_unexpected_kill_threshold(uniffi_out_err: UniffiRustCallStatus, 
-): Int
 external fun uniffi_isekai_terminal_core_fn_func_decide_battery_guidance(`facts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
@@ -1312,12 +1304,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_battery_guidance_cooldown_secs() != 44081) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_battery_guidance_unexpected_kill_threshold() != 37317) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance() != 58303) {
@@ -9927,33 +9913,6 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(
     
         FfiConverterUInt.lower(`unicodeChar`),_status)
-}
-    )
-    }
-    
-
-        /**
-         * [`GUIDANCE_COOLDOWN_SECS`]をUniFFI経由でKotlin/Swift側に公開する。
-         */ fun `batteryGuidanceCooldownSecs`(): kotlin.ULong {
-            return FfiConverterULong.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_func_battery_guidance_cooldown_secs(
-    
-        _status)
-}
-    )
-    }
-    
-
-        /**
-         * [`UNEXPECTED_KILL_THRESHOLD`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
-         * Kotlin側にハードコードで複製させないための単純なgetter。
-         */ fun `batteryGuidanceUnexpectedKillThreshold`(): kotlin.UInt {
-            return FfiConverterUInt.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_func_battery_guidance_unexpected_kill_threshold(
-    
-        _status)
 }
     )
     }

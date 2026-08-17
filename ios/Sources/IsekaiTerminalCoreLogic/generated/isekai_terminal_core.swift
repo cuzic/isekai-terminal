@@ -9159,25 +9159,6 @@ public func terminalUnicodeCharBytes(unicodeChar: UInt32) -> Data?  {
 })
 }
 /**
- * [`GUIDANCE_COOLDOWN_SECS`]をUniFFI経由でKotlin/Swift側に公開する。
- */
-public func batteryGuidanceCooldownSecs() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_func_battery_guidance_cooldown_secs($0
-    )
-})
-}
-/**
- * [`UNEXPECTED_KILL_THRESHOLD`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
- * Kotlin側にハードコードで複製させないための単純なgetter。
- */
-public func batteryGuidanceUnexpectedKillThreshold() -> UInt32  {
-    return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_func_battery_guidance_unexpected_kill_threshold($0
-    )
-})
-}
-/**
  * 「予期しないkillが2回以上」かつ「前回案内から14日以上(または未表示)」かつ
  * 「既に免除済みでない」かつ「ユーザーがオプトアウトしていない」場合のみ`true`を返す
  * 純関数。
@@ -9319,12 +9300,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_func_battery_guidance_cooldown_secs() != 44081) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_func_battery_guidance_unexpected_kill_threshold() != 37317) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance() != 58303) {
