@@ -95,6 +95,41 @@ fun effectiveCanvasHeightPx(stableHeightPx: Float, liveHeightPx: Float): Float =
     stableHeightPx.coerceAtLeast(liveHeightPx)
 
 /**
+ * IME表示時に凍結される高さ([stableHeightPx])と実際のビューポート高さ([liveHeightPx])から、
+ * 現在画面上に実際に見えている行(0-indexed、上端が0)の範囲を返す純関数。
+ *
+ * PR#64(コミット`6673e34f`)で見つかった「接続直後の空バッファでIMEを開くと凍結グリッド
+ * (タスク#19)の下端クリップでプロンプト行が画面外に追いやられる」症状を不変条件として
+ * 表現するために追加した([TerminalResizeTest.kt]・[tools.isekai.terminal.TerminalImeLayoutTest]
+ * 参照)。
+ *
+ * [TerminalScreen.kt]の`SshTerminalCanvas`は常に`effectiveCanvasHeightPx(stableHeightPx,
+ * liveHeightPx)`の高さで描画され、`Alignment.Bottom`で親`Box`の下端に揃えて配置された上で
+ * `clipToBounds()`される(`effectiveHeightPx`周辺のコメント参照)。つまりキャンバスの実描画
+ * 高さがビューポート([liveHeightPx])より高い分だけ*上側*の行が画面外へクリップされ、
+ * 下側([rows - 1]に近い側)の行だけが見え続ける——このため接続直後の空バッファ(プロンプトは
+ * 上端付近のrow 0)は、キャンバス高さがビューポートより高いほど画面外に押し出されやすい。
+ *
+ * [cellH]には呼び出し側([TerminalScreen.kt]の`renderCellDims.second`)と同じ
+ * `effectiveCanvasHeightPx(stableHeightPx, liveHeightPx) / rows`を渡す想定
+ * (セル自体の高さはIME開閉に関わらず一定に保たれる、タスク#19)。
+ */
+fun visibleRowRange(stableHeightPx: Float, liveHeightPx: Float, cellH: Float, rows: Int): IntRange {
+    if (rows <= 0 || cellH <= 0f) return IntRange.EMPTY
+    val effectiveHeightPx = effectiveCanvasHeightPx(stableHeightPx, liveHeightPx)
+    // ビューポートが凍結キャンバスと同じかそれ以上に広い(IME非表示・凍結解除直後等)場合は
+    // クリップが発生しないので全行が見える。
+    if (liveHeightPx >= effectiveHeightPx) return 0 until rows
+    val visibleCount = (liveHeightPx / cellH).toInt().coerceIn(0, rows)
+    if (visibleCount <= 0) return IntRange.EMPTY
+    val firstVisibleRow = rows - visibleCount
+    return firstVisibleRow until rows
+}
+
+/** [cursorRow]が[visibleRowRange]の結果に含まれているか。 */
+fun isCursorRowVisible(cursorRow: Int, visible: IntRange): Boolean = cursorRow in visible
+
+/**
  * ビューポート寸法とセルサイズから、tty(Rust側`SessionCore::resize`)へ要求する
  * cols/rows を計算する(タスク#19)。[heightPx]には呼び出し側が
  * [advanceResizeStability]等で解決した「IME開閉の影響を除いた安定した高さ」を渡す

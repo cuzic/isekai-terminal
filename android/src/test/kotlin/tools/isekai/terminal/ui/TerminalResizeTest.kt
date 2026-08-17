@@ -146,6 +146,66 @@ class TerminalResizeTest {
         assertEquals(480f, state.stableHeightPx)
     }
 
+    // ── visibleRowRange / isCursorRowVisible ─────────────────────────
+
+    @Test
+    fun `PR64 reproduction- fresh empty buffer prompt at row 0 is pushed off-screen when IME opens`() {
+        // PR#64(コミット6673e34f)の実機再現配置: rows=24、凍結高さ=全画面(1000px)、
+        // IME表示でliveHeightPxが45%(450px)まで縮む。cellHは
+        // effectiveCanvasHeightPx/rows(=stableHeightPx/rows、キャンバスの実描画セル高)。
+        // これは修正済みの挙動ではなく「手動Resizeボタンが唯一の脱出口」という
+        // 既知の制約そのものを回帰確認として明示的にアサートする(TerminalScreen.kt
+        // のドロワー「Resize」ボタン、TerminalImeLayoutTest参照)。
+        val rows = 24
+        val stableHeightPx = 1000f
+        val liveHeightPx = stableHeightPx * 0.45f
+        val cellH = effectiveCanvasHeightPx(stableHeightPx, liveHeightPx) / rows
+
+        val visible = visibleRowRange(stableHeightPx, liveHeightPx, cellH, rows)
+
+        // 接続直後の空バッファのプロンプトはrow 0(グリッド最上段)にある。
+        val cursorRow = 0
+        assertEquals(
+            "既知の制約: 接続直後の空バッファでIMEを開くとプロンプト行(row 0)は" +
+                "画面外にクリップされる。脱出口は補助ドロワーのResizeボタン(TerminalScreen.kt)。",
+            false,
+            isCursorRowVisible(cursorRow, visible),
+        )
+    }
+
+    @Test
+    fun `visibleRowRange shows only the bottom rows when the frozen canvas is taller than the viewport`() {
+        val visible = visibleRowRange(stableHeightPx = 480f, liveHeightPx = 240f, cellH = 20f, rows = 24)
+        // liveHeightPx(240) / cellH(20) = 12行だけが、下端揃えのため下側12行(row 12..23)に見える。
+        assertEquals(12..23, visible)
+        assertEquals(false, isCursorRowVisible(0, visible))
+        assertEquals(true, isCursorRowVisible(23, visible))
+        assertEquals(true, isCursorRowVisible(12, visible))
+        assertEquals(false, isCursorRowVisible(11, visible))
+    }
+
+    @Test
+    fun `visibleRowRange shows all rows when the viewport is not shrunk (IME closed)`() {
+        val visible = visibleRowRange(stableHeightPx = 480f, liveHeightPx = 480f, cellH = 20f, rows = 24)
+        assertEquals(0..23, visible)
+        assertEquals(true, isCursorRowVisible(0, visible))
+        assertEquals(true, isCursorRowVisible(23, visible))
+    }
+
+    @Test
+    fun `visibleRowRange shows all rows when the live viewport exceeds the frozen height`() {
+        // effectiveCanvasHeightPxがliveHeightPxを採用するケース(Opusレビュー指摘の
+        // 一時的な高さ増加)ではクリップは発生しない。
+        val visible = visibleRowRange(stableHeightPx = 280f, liveHeightPx = 320f, cellH = 320f / 24, rows = 24)
+        assertEquals(0..23, visible)
+    }
+
+    @Test
+    fun `visibleRowRange returns an empty range for non-positive rows or cellH`() {
+        assertEquals(IntRange.EMPTY, visibleRowRange(480f, 240f, 20f, rows = 0))
+        assertEquals(IntRange.EMPTY, visibleRowRange(480f, 240f, cellH = 0f, rows = 24))
+    }
+
     // ── computeResizeTargetColsRows ──────────────────────────────────
 
     @Test
