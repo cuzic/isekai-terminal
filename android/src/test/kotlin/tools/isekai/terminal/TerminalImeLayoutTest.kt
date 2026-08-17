@@ -67,9 +67,13 @@ class TerminalImeLayoutTest {
     private val fullHeightDp = 20000.dp
 
     // IME表示中に縮んだ実測ビューポート高さ相当。onResize呼び出し(rows変化)を検証する
-    // テスト専用: fullHeightDpとの比率を極端にするため、ボタンが実際に見えるかどうかの
-    // 検証には使わない(下の[auxDrawerReachabilityHeightDp]を使う)。
-    private val shrunkHeightDp = 20.dp
+    // テスト専用。20dpのように極端に小さくすると、補助ドロワーを出すための上向きスワイプ
+    // ([TerminalScreen.kt]の`shouldRevealAuxDrawer`、しきい値32dp)がterminalCanvasノード
+    // 自身の高さ(=このBoxの高さ)を超えて動けず、スワイプが検出されなくなってしまう
+    // (これも実際にCIで踏んだ失敗——「Resizeボタンが見つからない」)。150dpならしきい値
+    // 32dpに対して十分な余裕(4倍以上)を保ちつつ、fullHeightDp(20000dp)との比率も
+    // 133倍とminRowsクランプの区別には十分となる値を選んだ。
+    private val shrunkHeightDp = 150.dp
 
     // 補助ドロワーの全ボタン到達性テスト専用の縮小高さ。⌨/履歴▲▼/Wheel×4/Resize
     // (PR#64時点で10個)がverticalScroll無しには収まらない、かつ各ボタンがscrollTo後に
