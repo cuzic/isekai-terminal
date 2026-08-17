@@ -152,8 +152,14 @@ mod tests {
 
     #[test]
     fn does_not_show_within_cooldown_window() {
+        // `now_unix_secs`をGUIDANCE_COOLDOWN_SECSより大きく取る(base_facts()の
+        // 1_000_000はGUIDANCE_COOLDOWN_SECS=14日=1,209,600秒より小さく、
+        // そのまま`1_000_000 - GUIDANCE_COOLDOWN_SECS`を計算するとu64アンダーフローで
+        // コンパイルエラーになる)。
+        let now = GUIDANCE_COOLDOWN_SECS * 2;
         let facts = BackgroundKillFacts {
-            last_shown_unix_secs: Some(1_000_000 - (GUIDANCE_COOLDOWN_SECS - 1)),
+            now_unix_secs: now,
+            last_shown_unix_secs: Some(now - (GUIDANCE_COOLDOWN_SECS - 1)),
             ..base_facts()
         };
         assert!(!decide_battery_guidance(facts).should_show);
@@ -161,8 +167,10 @@ mod tests {
 
     #[test]
     fn shows_exactly_at_cooldown_boundary() {
+        let now = GUIDANCE_COOLDOWN_SECS * 2;
         let facts = BackgroundKillFacts {
-            last_shown_unix_secs: Some(1_000_000 - GUIDANCE_COOLDOWN_SECS),
+            now_unix_secs: now,
+            last_shown_unix_secs: Some(now - GUIDANCE_COOLDOWN_SECS),
             ..base_facts()
         };
         assert!(decide_battery_guidance(facts).should_show);

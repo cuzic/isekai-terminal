@@ -25,7 +25,7 @@ class BatteryOptimizationTest {
 
         assertFalse(BatteryOptimization.isIgnoringBatteryOptimizations(context))
 
-        shadowPowerManager.setIsIgnoringBatteryOptimizations(true)
+        shadowPowerManager.setIgnoringBatteryOptimizations(context.packageName, true)
 
         assertTrue(BatteryOptimization.isIgnoringBatteryOptimizations(context))
     }
