@@ -55,12 +55,27 @@ class TerminalImeLayoutTest {
     @get:Rule val composeTestRule = createComposeRule()
 
     // IME非表示時の全画面高さ相当。
-    private val fullHeightDp = 800.dp
+    //
+    // fullHeightDp/shrunkHeightDpの比率をあえて極端(500倍)にしてある: 当初800dp/220dp
+    // (実機に近い比率)で書いたところCI(Robolectric、実機とは異なるフォントメトリクス)で
+    // 「Resize後にonResizeが増えるはず」系のアサートが失敗した——computeResizeTargetColsRows
+    // のminRows=5クランプにより、CI環境のcellHの値次第では800dp/220dpどちらも同じrows数へ
+    // クランプされてしまい得る(cellHの実際の値はフォント描画に依存し、実機とCIで異なりうる
+    // ことをテスト側が過小評価していた)。極端な比率にすることで、cellHがどんな現実的な値でも
+    // 「小さい方はminRowsへクランプされ、大きい方は明確にそれを上回る」という関係が
+    // 崩れないようにする。
+    private val fullHeightDp = 20000.dp
 
-    // IME表示中に縮んだ実測ビューポート高さ相当(PR#64の実機再現に合わせ、全画面の半分以下。
-    // 220dpは補助ドロワーの全ボタン(⌨/履歴▲▼/Wheel×4/Resize、PR#64時点で10個)がverticalScroll
-    // 無しには収まらない高さ——スクロールパス自体を実際に踏ませるため意図的に小さくしてある)。
-    private val shrunkHeightDp = 220.dp
+    // IME表示中に縮んだ実測ビューポート高さ相当。onResize呼び出し(rows変化)を検証する
+    // テスト専用: fullHeightDpとの比率を極端にするため、ボタンが実際に見えるかどうかの
+    // 検証には使わない(下の[auxDrawerReachabilityHeightDp]を使う)。
+    private val shrunkHeightDp = 20.dp
+
+    // 補助ドロワーの全ボタン到達性テスト専用の縮小高さ。⌨/履歴▲▼/Wheel×4/Resize
+    // (PR#64時点で10個)がverticalScroll無しには収まらない、かつ各ボタンがscrollTo後に
+    // 実際にassertIsDisplayed()できる程度の現実的な高さ(shrunkHeightDpほど極端にすると
+    // ボタン自体がviewportより大きくなり常に部分クリップされてしまう)。
+    private val auxDrawerReachabilityHeightDp = 220.dp
 
     private val viewportWidthDp = 400.dp
 
@@ -212,7 +227,7 @@ class TerminalImeLayoutTest {
 
     @Test
     fun auxDrawer_allButtonsIncludingTheLast_areReachableViaScroll_inShrunkViewport() {
-        val heightState = mutableStateOf(shrunkHeightDp)
+        val heightState = mutableStateOf(auxDrawerReachabilityHeightDp)
         val imeState = mutableStateOf(true)
         setImeAwareScreen(heightState, imeState) { _, _ -> }
         composeTestRule.waitForIdle()
@@ -246,8 +261,10 @@ class TerminalImeLayoutTest {
         assertEquals("凍結中は追加callが無いはず", 1, rowsSeen.size)
 
         // IMEが閉じ、実測ビューポートが(元の全画面とも縮んだ値とも異なる)新しい高さへ変わる
-        // ——回転等による本当のサイズ変化が同時に起きたケースを模す。
-        val resumedHeightDp = 500.dp
+        // ——回転等による本当のサイズ変化が同時に起きたケースを模す。fullHeightDp付近の
+        // コメント参照: minRowsクランプで区別が付かなくならないよう、shrunkHeightDpからも
+        // fullHeightDpからも十分離れた大きな値にしてある。
+        val resumedHeightDp = 10_000.dp
         composeTestRule.runOnIdle {
             imeState.value = false
             heightState.value = resumedHeightDp
