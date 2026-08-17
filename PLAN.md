@@ -3575,9 +3575,14 @@ ROMのバージョンごとに壊れやすく、検証できる実機も無い�
 **提示タイミングは接続の切断回数をトリガーにしない**: ネットワーク起因の切断とOEMによる
 プロセスkillは別事象で、切断回数はノイズが多すぎる。代わりに「プロセスkill自体」を検出する:
 
-1. `TerminalSessionService`が`onTaskRemoved`/`onDestroy`両方で「正常終了マーカー」を
-   `commit()`(同期書き込み。`onTaskRemoved`直後にプロセスが死ぬケースがあるため`apply()`
-   は不可)で書く。
+1. `TerminalSessionService`が`onDestroy`(サービスが正規のライフサイクル経由で終了する
+   唯一の経路)でのみ「正常終了マーカー」を`commit()`(同期書き込み。直後にプロセスが
+   死ぬケースがあるため`apply()`は不可)で書く。`onTaskRemoved`(タスクがrecentsから
+   スワイプ削除された時)では書かない——FGS自体はここでは止めない設計
+   (`updateSessionsSummary`参照)なので、その時点ではまだ「正常終了」ではなく、書いて
+   しまうと直後にOEMのバックグラウンドキラーがプロセスを直接killして`onDestroy`が
+   呼ばれなかった場合に「予期しないkill」の検出を取りこぼす(このモジュールが検出
+   しようとしているシナリオそのものを見逃す)。
 2. 起動時(`TerminalTabsViewModel.restorePersistedReattachTabs`)、既存の`ReattachStateStore`
    が持つ「新鮮なreattachレコード」の有無と、このマーカーの有無を突き合わせる:
    「新鮮なレコードあり && マーカー無し」= 予期しないkill。マーカーは

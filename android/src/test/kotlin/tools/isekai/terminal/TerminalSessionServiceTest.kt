@@ -97,15 +97,23 @@ class TerminalSessionServiceTest {
         assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
     }
 
+    /**
+     * 回帰防止テスト: `onTaskRemoved`(タスクがrecentsからスワイプ削除された)は
+     * FGS自体を止めない設計(`updateSessionsSummary`参照)なので、その時点で
+     * マーカーを書いて「正常終了」扱いしてはいけない。書いてしまうと、直後に
+     * OEMのバックグラウンドキラーがプロセスを直接killして`onDestroy`が呼ばれなく
+     * ても、次回起動時に古い(誤った)"clean"マーカーが残っていて「予期しないkill」
+     * の検出を取りこぼす(本来この機能が検出したいシナリオそのものを見逃す)。
+     */
     @Test
-    fun onTaskRemoved_marksCleanShutdown_detectedByNextConsume() {
+    fun onTaskRemoved_doesNotMarkCleanShutdown() {
         val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
         val service = controller.get()
         val context = org.robolectric.RuntimeEnvironment.getApplication()
 
         service.onTaskRemoved(null)
 
-        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
     }
 
     @Test
