@@ -385,7 +385,10 @@ fun ProfileListScreen(
                 optedOut = newValue
                 BatteryGuidanceSettings.setOptedOut(context, newValue)
             },
-            onOpenSettings = { BatteryOptimization.openIgnoreBatteryOptimizationSettings(context) },
+            onOpenSettings = {
+                BatteryOptimization.openIgnoreBatteryOptimizationSettings(context)
+                showBackgroundReliabilityDialog = false
+            },
             onDismiss = { showBackgroundReliabilityDialog = false },
         )
     }

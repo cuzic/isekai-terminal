@@ -548,11 +548,11 @@ class TerminalTabsViewModel(
             "IsekaiTerminalBattery",
             "unexpected process kill detected (fresh reattach record found without a clean-shutdown marker)",
         )
-        BatteryGuidanceSettings.incrementUnexpectedKillCount(context)
+        val unexpectedKillCount = BatteryGuidanceSettings.incrementUnexpectedKillCount(context)
 
         val nowUnixSecs = System.currentTimeMillis() / 1000L
         val facts = BackgroundKillFacts(
-            unexpectedKillCount = BatteryGuidanceSettings.unexpectedKillCount(context).toUInt(),
+            unexpectedKillCount = unexpectedKillCount.toUInt(),
             lastShownUnixSecs = BatteryGuidanceSettings.lastShownUnixSecs(context)?.toULong(),
             nowUnixSecs = nowUnixSecs.toULong(),
             isIgnoringBatteryOptimizations = BatteryOptimization.isIgnoringBatteryOptimizations(context),
