@@ -103,6 +103,15 @@ fun effectiveCanvasHeightPx(stableHeightPx: Float, liveHeightPx: Float): Float =
  * 表現するために追加した([TerminalResizeTest.kt]・[tools.isekai.terminal.TerminalImeLayoutTest]
  * 参照)。
  *
+ * **これは本番のレンダリング経路からは一度も呼ばれないテスト専用ヘルパーである**
+ * (コードレビュー指摘)。[TerminalScreen.kt]の`SshTerminalCanvas`呼び出しやスクロール制御は
+ * この関数を経由せず、上記の「プロンプト行が画面外に追いやられる」挙動自体は現状
+ * *修正されていない既知の制約*(脱出口は補助ドロワーの手動Resizeボタンのみ)として残っている。
+ * この関数の役割は、その既知の制約が意図せず別の形に変わってしまう(=誰かが
+ * [advanceResizeStability]/`effectiveCanvasHeightPx`まわりを変更した際に、この不変条件が
+ * 静かに崩れる)ことをユニットテストで検知できるようにすることに限られる——実行時に
+ * カーソル行の可視性を判定して自動スクロールする、といった本番ガードではない。
+ *
  * [TerminalScreen.kt]の`SshTerminalCanvas`は常に`effectiveCanvasHeightPx(stableHeightPx,
  * liveHeightPx)`の高さで描画され、`Alignment.Bottom`で親`Box`の下端に揃えて配置された上で
  * `clipToBounds()`される(`effectiveHeightPx`周辺のコメント参照)。つまりキャンバスの実描画
@@ -126,7 +135,12 @@ fun visibleRowRange(stableHeightPx: Float, liveHeightPx: Float, cellH: Float, ro
     return firstVisibleRow until rows
 }
 
-/** [cursorRow]が[visibleRowRange]の結果に含まれているか。 */
+/**
+ * [cursorRow]が[visibleRowRange]の結果に含まれているか。
+ *
+ * [visibleRowRange]と同様、これも本番のレンダリング/スクロール制御からは呼ばれない
+ * テスト専用ヘルパー([visibleRowRange]のdoc参照)。
+ */
 fun isCursorRowVisible(cursorRow: Int, visible: IntRange): Boolean = cursorRow in visible
 
 /**
