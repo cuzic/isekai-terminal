@@ -52,11 +52,40 @@ concurrency:
 
 permissions:
   contents: read
-  # pr-path-gate(`gh pr diff`)がPRの変更ファイル一覧を読むために必要。
-  pull-requests: read
 
 jobs:
+  # pr-path-gate呼び出しだけを行う軽量job(修正3+4、2026-08-17)。以前は
+  # `test`/`test-macos`/`test-windows`の3jobがそれぞれ独立して同じpatternsで
+  # `pr-path-gate`を呼んでいた(3重複)ため、ここに一本化する。cargo/zig等の
+  # セットアップは一切行わず、3jobをまるごとスキップするかどうかを一度だけ判定
+  # する。ジョブがskipされてもGitHub上のcheck-runは作られ、conclusionは
+  # `skipped`になる——required status check(`test`のみ)において`skipped`は
+  # `success`と同様にマージをブロックしないため、恒久pending対策としての効果は
+  # 従来の「job常時実行+ステップ単位if」と変わらない。
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
+      # PRのbase.shaが存在しないため、上のjob outputsで無条件relevant=trueとして
+      # 扱う。
+      - name: Determine PR relevance
+        id: relevant
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/pr-path-gate
+        with:
+          patterns: |
+            ^rust-core/
+            ^\.github/workflows/rust-core-test-check\.yml$
+            ^\.github/actions/pr-path-gate/
+
   test:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: rust-core-test-linux
@@ -71,21 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
-      # `gh pr diff`が使えない(PR番号が無い)ため、無条件relevant=trueとして
-      # 後続のif条件を素通りさせる。
-      - name: Determine PR relevance
-        id: relevant
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/pr-path-gate
-        with:
-          patterns: |
-            ^rust-core/
-            ^\.github/workflows/rust-core-test-check\.yml$
-            ^\.github/actions/pr-path-gate/
-
       - name: Show toolchain versions
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           rustc --version
           cargo --version
@@ -98,7 +113,6 @@ jobs:
       # 一切効かないままcargo-zigbuildの毎回のcompile-from-scratchとisekai-pipeの
       # musl再ビルドが走っていた)。
       - name: Cache cargo (rust-core)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -148,7 +162,6 @@ jobs:
       # (awk、次のトップレベルjobキーの手前まで)、コメント行(`#`始まり)を
       # 除外してgrepする。
       - name: Verify every isekai-ssh e2e test file is accounted for in Windows CI
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           WORKFLOW_FILE=".github/workflows/rust-core-test-check.yml"
@@ -208,11 +221,9 @@ jobs:
           exit $missing
 
       - name: Install cargo-nextest
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Install openssh-server (opt-in real-sshd E2E tests need /usr/sbin/sshd)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y openssh-server
@@ -225,7 +236,6 @@ jobs:
         # ios-logic-linux-check.ymlは既に対応済みだったが、このワークフローだけ追従が漏れていた)。
         # `~/.cargo/bin`もキャッシュ対象なので、既にキャッシュヒットでcargo-zigbuildが
         # 入っていれば再インストールしない(2026-07-14、ci-github-actions-speedupで追加)。
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
@@ -249,16 +259,22 @@ jobs:
       # noq-multipath-spikeはworkspace member自体から外してあるため`--exclude`は不要
       # (Codexアーキテクチャレビュー指摘、role-separation-fixesブランチで対応)。
       - name: cargo nextest run --workspace
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         working-directory: rust-core
         run: cargo nextest run --profile ci --workspace
 
       - name: cargo test --doc --workspace
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         working-directory: rust-core
         run: cargo test --doc --workspace
 
   test-macos:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    # まだrequired status checkではないが、将来Phase 6でrequired化する際に
+    # job idそのまま(`test-macos`)がcontext名になっていると、`test`job(id
+    # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
+    # 再現しかねないため、今のうちに明示的な`name:`を付けておく
+    # (`.claude/rules/main-branch-protection.md`参照)。
+    name: rust-core-test-macos
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -267,24 +283,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
-      # `gh pr diff`が使えない(PR番号が無い)ため、無条件relevant=trueとして
-      # 後続のif条件を素通りさせる。requiredではないjobだが、上のtop-level
-      # `on.pull_request`からpaths:フィルタを削除した(test jobを恒久pending
-      # 対策の対象にするため)ため、これが無いと無関係PRでも毎回macOSランナーを
-      # 消費してしまう。
-      - name: Determine PR relevance
-        id: relevant
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/pr-path-gate
-        with:
-          patterns: |
-            ^rust-core/
-            ^\.github/workflows/rust-core-test-check\.yml$
-            ^\.github/actions/pr-path-gate/
-
       - name: Show toolchain versions
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           rustc --version
           cargo --version
@@ -293,7 +292,6 @@ jobs:
           ssh-keygen -V || true
 
       - name: Cache cargo (rust-core)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -316,7 +314,6 @@ jobs:
       # isekai-terminal-core側の.3/.6)に加え、将来同種のテストが増えても踏み台に
       # ならないよう.2〜.6の範囲をまとめてaliasしておく。
       - name: Alias 127.0.0.2-6 onto lo0 (isekai-transport e2e tests use them as pseudo physical paths; macOS doesn't route 127.0.0.0/8 to lo automatically)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           for i in 2 3 4 5 6; do
             sudo ifconfig lo0 alias 127.0.0.$i 255.255.255.255 up
@@ -329,11 +326,18 @@ jobs:
       # iOS向けクロスビルドの検証はios-rust-core-check.ymlが別途カバー済み。
       # uniffi-bindgenはAndroid/iOS binding生成専用のCLIツールで同様に対象外。
       - name: cargo test --workspace (macOS, excluding Android/iOS-only crates)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
   test-windows:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    # まだrequired status checkではないが、将来Phase 6でrequired化する際に
+    # job idそのまま(`test-windows`)がcontext名になっていると、`test`job(id
+    # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
+    # 再現しかねないため、今のうちに明示的な`name:`を付けておく
+    # (`.claude/rules/main-branch-protection.md`参照)。
+    name: rust-core-test-windows
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -342,31 +346,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
-      # `gh pr diff`が使えない(PR番号が無い)ため、無条件relevant=trueとして
-      # 後続のif条件を素通りさせる。requiredではないjobだが、上のtop-level
-      # `on.pull_request`からpaths:フィルタを削除した(test jobを恒久pending
-      # 対策の対象にするため)ため、これが無いと無関係PRでも毎回Windowsランナーを
-      # 消費してしまう。
-      - name: Determine PR relevance
-        id: relevant
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/pr-path-gate
-        with:
-          patterns: |
-            ^rust-core/
-            ^\.github/workflows/rust-core-test-check\.yml$
-            ^\.github/actions/pr-path-gate/
-
       - name: Show toolchain versions
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         run: |
           rustc --version
           cargo --version
 
       - name: Cache cargo (rust-core)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -398,13 +384,11 @@ jobs:
       #   `chmod`/`setsid`によるUnix専用のプロセス起動をシェルスクリプト
       #   スタンドイン経由で検証しておりWindows上での動作は未検証・未対応。
       - name: cargo build --workspace (Windows, build-only regression check)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo build --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
       - name: cargo test --lib --bins --workspace (Windows, unit tests only)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
@@ -427,7 +411,6 @@ jobs:
       # `quicmux`, not this crate) that currently fails that loop — revert
       # this ordering once that's fixed.
       - name: cargo test -p isekai-ssh --test mux_holder_windows_e2e (Windows, real detached mux holder e2e)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test mux_holder_windows_e2e
@@ -438,7 +421,6 @@ jobs:
       # 認証(非対話)のみを検証する — keyboard-interactive/パスフレーズ対話認証は
       # このファイルのモジュールdocが説明する通り原理的にe2eで到達不能なため対象外。
       - name: cargo test -p isekai-ssh --test native_auth_windows_e2e (Windows, CertificateFile auth over the native path)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test native_auth_windows_e2e
@@ -449,7 +431,6 @@ jobs:
       # 一度もテストされていなかった経路)をin-process russh_keys::agent::server
       # 経由で検証する。
       - name: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e (Windows, SSH agent auth over a named pipe)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test native_agent_auth_windows_e2e
@@ -460,7 +441,6 @@ jobs:
       # 自身が実Windows機での検証が一度も行われていないと明記していた経路)を
       # 実cmd.exe子プロセスの起動まで含めて検証する。
       - name: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e (Windows, native mux ctl-forward + Epic P build relay)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: cargo test -p isekai-ssh --test native_ctl_build_relay_windows_e2e
@@ -481,7 +461,6 @@ jobs:
       # 残り4ファイルが同じ原因で落ちるかどうか一度のCI実行で分からなかった)。
       # 5本全部を必ず実行し、失敗があれば最後にまとめて報告する。
       - name: cargo test -p isekai-ssh (Windows, ssh_test_shim対応e2eファイル5本)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         shell: bash
         working-directory: rust-core
         run: |

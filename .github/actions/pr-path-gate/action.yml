@@ -7,11 +7,33 @@ name: PR path gate
 #
 # このcomposite actionは、path-filterの代わりに「ワークフロー自体は常に発火させ、
 # 重いステップだけをif条件でスキップする」方式のゲートを提供する。checkout直後に
-# 呼び出し、`gh pr diff --name-only`で変更ファイル一覧を取得して`patterns`
-# (改行区切りのERE)のいずれかにマッチするか判定する。以降の重いステップに
-# `if: steps.<この呼び出しのstep id>.outputs.relevant == 'true'`を付ければ、
+# 呼び出し、変更ファイル一覧を取得して`patterns`(改行区切りのERE)のいずれかに
+# マッチするか判定する。以降の重いステップ(またはjob全体、`needs.<この呼び出しを
+# 含むjob>.outputs.relevant`経由)に`relevant == 'true'`の条件を付ければ、
 # 無関係なPRはcheck-runが即座に(数十秒で)成功し、関係するPRだけ実際のビルド/
 # テストが走る。
+#
+# 変更ファイル一覧はローカルgitの`git diff --name-only`で取得する
+# (`gh pr diff --name-only`は使わない、2026-08-17修正):
+#   - [重大] `gh pr diff --name-only`はGitHub側のdiff表示APIを使っており、
+#     非常に大きなPRでは変更ファイル一覧が切り詰められることがある。関係パス
+#     (例: `rust-core/**`)が切り詰められた範囲の外にあるとrelevant=falseに
+#     誤判定され、requiredなジョブが実際には何もテストせずに緑になり、
+#     branch protectionの目的を静かに無効化してしまう。
+#   - SHAレース: `gh pr diff`はPRの「現在の」head diffをAPI経由で取得するため、
+#     `synchronize`イベントで実行中のこのワークフロー実行が、より新しいheadの
+#     diffを見てしまうことがある(古いSHAに対する実行が新しいheadの差分で
+#     relevant判定してしまう)。
+# `base.sha`(PRのベースコミット)と`github.sha`(このワークフロー実行が実際に
+# チェックアウトしているSHA)の2つの実コミットオブジェクトを直接diffすることで
+# 両方解消する。祖先関係(merge-base)を辿る`...`(triple-dot)ではなく、2つの
+# commit/tree自体を直接比較する2引数`git diff`を使う: 呼び出し元workflowの
+# checkoutは既定でshallow(fetch-depth: 1)なので、triple-dotのmerge-base計算に
+# 必要な共有履歴が無い場合がある。2引数diffなら、両方のcommitオブジェクト
+# (とそのtree)さえローカルにあれば祖先関係を問わず比較できる。`github.sha`は
+# checkout済みなので、このaction自身は`base.sha`だけを`git fetch --depth=1`で
+# 追加取得する(呼び出し元が`fetch-depth: 0`等の深いcheckoutをしていなくても
+# 正しく動く)。
 #
 # `pull_request`イベント専用(`push`トリガーでは元々paths:フィルタを維持しており、
 # そちらはpush先ブランチのcheck-run自体を作らないだけで恒久pending問題を起こさない
@@ -28,10 +50,6 @@ inputs:
       改行区切りの拡張正規表現(ERE, `grep -E`互換)パターンのリスト。変更ファイルの
       パスのうち1つでもいずれかのパターンにマッチすればrelevant=trueになる。
     required: true
-  github-token:
-    description: gh CLIの認証に使うトークン。
-    required: false
-    default: ${{ github.token }}
 
 outputs:
   relevant:
@@ -44,12 +62,26 @@ runs:
     - id: gate
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.github-token }}
         PATTERNS: ${{ inputs.patterns }}
         EVENT_NAME: ${{ github.event_name }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.sha }}
       run: |
-        set -euo pipefail
+        set -uo pipefail
+
+        # git fetch/diff自体が(一時的なネットワーク・API障害等で)失敗した場合は
+        # failクローズ(relevant=false、無関係と誤判定してrequiredなテストを
+        # スキップ)ではなく、failオープン(relevant=true、念のため重いテストを
+        # 実行する)側に倒す。不確実な場合はテストを回す方が、誤って必要な
+        # テストをスキップして「無関係なPRまで赤くする(旧来の恒久pending問題を
+        # flakyな赤に置き換えただけ)」よりも安全という判断。ジョブ全体を
+        # 失敗させないよう、必ずexit 0で終える。
+        fail_open() {
+          echo "::warning::pr-path-gate: $1 — failing open (relevant=true) so the heavy steps still run instead of silently skipping a required check."
+          echo "relevant=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
 
         if [ "$EVENT_NAME" != "pull_request" ]; then
           echo "::error::pr-path-gate is meant for pull_request-triggered workflows only (got '$EVENT_NAME')."
@@ -59,19 +91,49 @@ runs:
           echo "::error::pr-path-gate: github.event.pull_request.number is empty; is this really a pull_request event?"
           exit 1
         fi
+        if [ -z "$BASE_SHA" ]; then
+          echo "::error::pr-path-gate: github.event.pull_request.base.sha is empty; is this really a pull_request event?"
+          exit 1
+        fi
+        if [ -z "$HEAD_SHA" ]; then
+          echo "::error::pr-path-gate: github.sha is empty."
+          exit 1
+        fi
 
-        echo "Changed files in PR #$PR_NUMBER:"
-        CHANGED_FILES="$(gh pr diff "$PR_NUMBER" --name-only)"
+        if ! git fetch --depth=1 origin "$BASE_SHA"; then
+          fail_open "git fetch of base commit $BASE_SHA failed"
+        fi
+
+        if ! CHANGED_FILES="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"; then
+          fail_open "git diff between base $BASE_SHA and head $HEAD_SHA failed"
+        fi
+
+        echo "Changed files ($BASE_SHA -> $HEAD_SHA):"
         echo "$CHANGED_FILES"
 
-        relevant=false
-        while IFS= read -r pattern; do
-          [ -z "$pattern" ] && continue
-          if echo "$CHANGED_FILES" | grep -qE "$pattern"; then
-            echo "matched pattern: $pattern"
-            relevant=true
-          fi
-        done <<< "$PATTERNS"
+        if [ -z "$CHANGED_FILES" ]; then
+          echo "relevant=false"
+          echo "relevant=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # PATTERNSは改行区切りのERE。空行(YAMLブロックスカラー末尾の暗黙の
+        # trailing newline含む)をgrep -fにそのまま渡すと、空パターンは
+        # ERE的に「常に一致」してしまいrelevant判定が壊れるため、先に除去する。
+        FILTERED_PATTERNS="$(echo "$PATTERNS" | grep -v '^[[:space:]]*$' || true)"
+        if [ -z "$FILTERED_PATTERNS" ]; then
+          echo "::error::pr-path-gate: patterns input is empty after filtering blank lines."
+          exit 1
+        fi
+
+        MATCHED_FILES="$(echo "$CHANGED_FILES" | grep -E -f <(echo "$FILTERED_PATTERNS") || true)"
+        if [ -n "$MATCHED_FILES" ]; then
+          echo "matched files:"
+          echo "$MATCHED_FILES"
+          relevant=true
+        else
+          relevant=false
+        fi
 
         echo "relevant=$relevant"
         echo "relevant=$relevant" >> "$GITHUB_OUTPUT"

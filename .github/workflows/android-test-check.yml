@@ -42,22 +42,26 @@ concurrency:
 
 permissions:
   contents: read
-  # pr-path-gate(`gh pr diff`)がPRの変更ファイル一覧を読むために必要。
-  pull-requests: read
 
 jobs:
-  test:
-    # branch protectionのrequired status checkのcontextとして使われている、
-    # 変更時は同時にprotection設定も更新すること。
-    name: android-unit-test
+  # pr-path-gate呼び出しだけを行う軽量job(修正4、2026-08-17)。JDK/NDK/cargoの
+  # セットアップは一切行わず、`test` jobをまるごとスキップするかどうかを
+  # 一度だけ判定する。ジョブがskipされてもGitHub上のcheck-runは作られ、
+  # conclusionは`skipped`になる——required status checkにおいて`skipped`は
+  # `success`と同様にマージをブロックしないため、恒久pending対策としての効果は
+  # 従来の「job常時実行+ステップ単位if」と変わらないまま、以前は~34ステップに
+  # コピペされていた同一の`if:`条件文を1箇所(このjobの`if:`)に集約できる。
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
       # pull_requestイベントでのみ意味を持つゲート。push/workflow_dispatchでは
-      # `gh pr diff`が使えない(PR番号が無い)ため、無条件relevant=trueとして
-      # 後続のif条件を素通りさせる。
+      # PRのbase.shaが存在しないため、上のjob outputsで無条件relevant=trueとして
+      # 扱う。
       - name: Determine PR relevance
         id: relevant
         if: github.event_name == 'pull_request'
@@ -73,8 +77,18 @@ jobs:
             ^\.github/workflows/android-test-check\.yml$
             ^\.github/actions/pr-path-gate/
 
+  test:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    # branch protectionのrequired status checkのcontextとして使われている、
+    # 変更時は同時にprotection設定も更新すること。
+    name: android-unit-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Set up JDK 17
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -82,7 +96,6 @@ jobs:
           cache: gradle
 
       - name: Cache cargo (rust-core)
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -96,7 +109,6 @@ jobs:
       - name: Install the NDK version pinned by the F-Droid recipe
         # fdroid/tools.isekai.terminal.yml の`ndk:`と同じバージョンを使う
         # (android-arm64-clang.sh/android-arm64-ar.shが期待するツールチェーンと揃える)。
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           NDK_VERSION="$(grep -m1 '^\s*ndk:' fdroid/tools.isekai.terminal.yml | awk '{print $2}')"
           echo "Installing NDK $NDK_VERSION"
@@ -104,7 +116,6 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Add aarch64-linux-android rustup target
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: rustup target add aarch64-linux-android
 
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
@@ -112,7 +123,6 @@ jobs:
         # isekai-pipe の x86_64/aarch64 musl静的バイナリ。ターゲットに関わらず
         # isekai-terminal-coreをビルドするだけで常に必要(rust-core-test-check.yml/
         # ios-*-check.yml各ワークフロー参照)。
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
@@ -126,7 +136,6 @@ jobs:
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: ./gradlew :android:testDebugUnitTest
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.relevant == 'true'
         run: ./gradlew :android:testDebugUnitTest --stacktrace
 
       - name: Upload test reports on failure
