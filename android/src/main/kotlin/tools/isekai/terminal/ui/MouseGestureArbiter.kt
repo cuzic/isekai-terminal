@@ -14,6 +14,12 @@ import uniffi.isekai_terminal_core.MouseReportingMode
  * これにより、実際にCompose実行環境(Robolectric)なしのプレーンJUnitで裁定ロジック
  * 自体の回帰テストが書ける([MouseGestureArbiterTest]参照)。iOS版
  * `TerminalScreenView.swift`の`isPointerReportingActive`/`touchesBegan`と対称の判断。
+ *
+ * 項目6 Tier 3(2026-08): 純粋関数側の回帰は[MouseGestureArbiterTest]が守るが、これらの
+ * 関数が実際に`TerminalScreen.kt`のCanvasジェスチャーハンドラから正しい順序・引数で
+ * 呼ばれているか(Compose境界での配線)はこれらの関数単体のテストでは原理的に検出できない。
+ * この境界側は`tools.isekai.terminal.TerminalGestureIntegrationTest`
+ * (`createComposeRule()` + `performTouchInput`/`performMouseInput`)が守る。
  */
 
 /**
