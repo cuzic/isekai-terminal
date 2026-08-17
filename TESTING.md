@@ -752,3 +752,5 @@ cargo build --lib
 cargo test --lib      # 22 tests（trzsz FSM / detector / codec）
 cargo check --lib     # warning 0 / error 0
 ```
+
+<!-- pr-path-gate relevant=false verification, throwaway commit -->
