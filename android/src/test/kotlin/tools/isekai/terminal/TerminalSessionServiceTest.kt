@@ -76,4 +76,44 @@ class TerminalSessionServiceTest {
 
         assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, serviceInfo.foregroundServiceType)
     }
+
+    // ── 項目2: 正常終了マーカー ──────────────────────────────
+
+    @Test
+    fun consumeCleanShutdownMarker_withoutPriorMark_returnsFalse() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    @Test
+    fun onDestroy_marksCleanShutdown_detectedByNextConsume() {
+        val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
+        val service = controller.get()
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        controller.destroy()
+
+        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    @Test
+    fun onTaskRemoved_marksCleanShutdown_detectedByNextConsume() {
+        val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
+        val service = controller.get()
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        service.onTaskRemoved(null)
+
+        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    @Test
+    fun consumeCleanShutdownMarker_isConsumedOnce_secondCallReturnsFalse() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        TerminalSessionService.markCleanShutdown(context)
+
+        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
 }
