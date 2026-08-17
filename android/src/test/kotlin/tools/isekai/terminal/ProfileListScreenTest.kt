@@ -2,14 +2,17 @@ package tools.isekai.terminal
 
 import android.app.Application
 import android.content.Context
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
@@ -341,5 +344,39 @@ class ProfileListScreenTest {
 
         val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertEquals(null, prefs.getString(tools.isekai.terminal.input.KeyboardLayoutMode.PREF_KEY, null))
+    }
+
+    // ── 項目2: OEMバッテリー最適化への案内UI（恒常入口）─────────────────
+
+    @Test fun backgroundReliabilityMenuItem_opensDialog() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        waitForText("バックグラウンド動作の最適化")
+        composeTestRule.onNodeWithText("バックグラウンド動作の最適化").assertIsDisplayed()
+    }
+
+    @Test fun backgroundReliabilityDialog_optOutTogglePersists() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        waitForText("バックグラウンド動作の最適化")
+
+        composeTestRule.onNodeWithTag("batteryGuidanceOptOutSwitch")
+            .performSemanticsAction(SemanticsActions.OnClick)
+
+        assertTrue(tools.isekai.terminal.data.BatteryGuidanceSettings.isOptedOut(ctx))
+    }
+
+    @Test fun backgroundReliabilityDialog_dismiss_closesDialog() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        waitForText("バックグラウンド動作の最適化")
+
+        composeTestRule.onNodeWithTag("batteryGuidanceDismissButton").performClick()
+
+        composeTestRule.onAllNodesWithText("バックグラウンド動作の最適化").assertCountEquals(0)
     }
 }
