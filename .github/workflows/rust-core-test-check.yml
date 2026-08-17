@@ -48,6 +48,9 @@ permissions:
 
 jobs:
   test:
+    # branch protectionのrequired status checkのcontextとして使われている、
+    # 変更時は同時にprotection設定も更新すること。
+    name: rust-core-test-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:

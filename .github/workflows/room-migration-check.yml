@@ -25,6 +25,9 @@ permissions:
 
 jobs:
   check:
+    # branch protectionのrequired status checkのcontextとして使われている、
+    # 変更時は同時にprotection設定も更新すること。
+    name: room-migration
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

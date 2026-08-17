@@ -41,6 +41,9 @@ permissions:
 
 jobs:
   drift-check:
+    # branch protectionのrequired status checkのcontextとして使われている、
+    # 変更時は同時にprotection設定も更新すること。
+    name: android-uniffi-drift
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
