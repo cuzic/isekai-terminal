@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
@@ -65,7 +66,7 @@ class TerminalSessionService : Service() {
             // ここで無条件にstartForeground()していた旧実装は、Android 15以降
             // dataSync/mediaProcessing等のFGSがバックグラウンドから起動されると
             // システムに短時間で強制終了され(ForegroundServiceDidNotStopInTimeException、
-            // 当時の型はdataSyncだった。現在はremoteMessagingへ変更済みだが、
+            // 当時の型はdataSyncだった。現在はspecialUseへ変更済みだが、
             // このnullチェック自体は型に関係なく必要な修正)、
             // それによる2回目の自動再起動がmAllowStartForeground=falseで即
             // ForegroundServiceStartNotAllowedExceptionとなり、"アプリが繰り返し
@@ -86,6 +87,13 @@ class TerminalSessionService : Service() {
     }
 
     override fun onDestroy() {
+        // 項目2: サービスが正規のライフサイクル経由で終了することを示す「正常終了
+        // マーカー」を書く。OEMのバックグラウンドキラー等がプロセスを直接killする
+        // 場合はonDestroyが呼ばれずこのマーカーが書かれないため、次回起動時に
+        // 「新鮮なreattachレコードあり && マーカー無し」から予期しないkillを検出できる
+        // (`background_reliability_policy.rs`のモジュールdoc、`TerminalTabsViewModel`
+        // 側の突き合わせロジック参照)。
+        markCleanShutdown(this)
         super.onDestroy()
     }
 
@@ -93,7 +101,7 @@ class TerminalSessionService : Service() {
 
     private fun startForegroundWithNotification(label: String) {
         val notification = buildNotification(label)
-        // Android 14+: foregroundServiceType は Manifest で宣言（remoteMessaging）
+        // Android 14+: foregroundServiceType は Manifest で宣言（specialUse）
         startForeground(NOTIFICATION_ID, notification)
     }
 
@@ -129,5 +137,43 @@ class TerminalSessionService : Service() {
         const val EXTRA_SESSION_LABEL = "session_label"
         private const val CHANNEL_ID = "isekai_terminal_session_main"
         private const val NOTIFICATION_ID = 1002
+
+        // ── 項目2: 正常終了マーカー ──────────────────────────────
+        // OEMバッテリー最適化への案内UI(`background_reliability_policy.rs`参照)の
+        // ための「予期しないkill」検出に使う。`onDestroy`到達時にのみ書き込み、
+        // `TerminalTabsViewModel`が起動時に消費する。`onTaskRemoved`では書かない
+        // (タスクがrecentsからスワイプ削除されてもFGSは止めない設計であり、その
+        // 時点ではまだ「正常終了」ではない——直後にOEMのバックグラウンドキラーに
+        // プロセスごとkillされれば`onDestroy`は呼ばれず、それこそがこのマーカーで
+        // 検出したい「予期しないkill」そのものになる)。
+        private const val LIFECYCLE_PREFS_NAME = "isekai_terminal_service_lifecycle"
+        private const val PREF_KEY_CLEAN_SHUTDOWN = "clean_shutdown"
+
+        /**
+         * 正常終了マーカーを同期的に書き込む。`commit()`を使う理由:
+         * `onDestroy`直後にOSがプロセスを終了させることがあり、`apply()`の
+         * 非同期書き込みが完了する前にプロセスが死ぬと書き込みが失われて
+         * このマーカーの意味が無くなる(項目2の設計判断、`PLAN.md`参照)。
+         */
+        fun markCleanShutdown(context: Context) {
+            context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_KEY_CLEAN_SHUTDOWN, true)
+                .commit()
+        }
+
+        /**
+         * アプリ起動時に1回だけ呼ぶ。マーカーが存在すれば「前回プロセスは正常終了
+         * だった」ことを意味するので`true`を返しつつ、直後にマーカーを消費(false相当
+         * にリセット)する。消費せずに残しておくと、今回のセッションが予期せずkillされた
+         * 場合でも次回起動時に2世代前の"clean"痕跡を誤って読み、予期しないkillの検出を
+         * 取りこぼしてしまう(dirty-bit方式と同じ考え方)。
+         */
+        fun consumeCleanShutdownMarker(context: Context): Boolean {
+            val prefs = context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
+            val wasClean = prefs.getBoolean(PREF_KEY_CLEAN_SHUTDOWN, false)
+            prefs.edit().putBoolean(PREF_KEY_CLEAN_SHUTDOWN, false).commit()
+            return wasClean
+        }
     }
 }

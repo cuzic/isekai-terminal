@@ -2,6 +2,7 @@ package tools.isekai.terminal
 
 import android.app.Activity
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -53,10 +54,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tools.isekai.terminal.data.AuthType
+import tools.isekai.terminal.data.BatteryGuidanceSettings
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.needsPasswordPrompt
 import tools.isekai.terminal.input.KeyboardLayoutMode
+import tools.isekai.terminal.ui.BackgroundReliabilityDialog
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.ListItemCard
 import tools.isekai.terminal.ui.RadioChoiceDialog
@@ -64,6 +67,7 @@ import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
+import tools.isekai.terminal.util.BatteryOptimization
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.setCtlSocketForwardEnabled
 import uniffi.isekai_terminal_core.setTerminalTheme
@@ -103,6 +107,10 @@ fun ProfileListScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showSecurityDialog by remember { mutableStateOf(false) }
     var showKeyboardLayoutDialog by remember { mutableStateOf(false) }
+    // 項目2: OEMバッテリー最適化への案内UIの恒常入口(nagなし、いつでも自分で開ける)。
+    // コールドスタート時の自動案内([MainActivity.AppRoot]・`TerminalTabsViewModel`)とは
+    // 別経路で、こちらはローカルなComposeの開閉状態のみを持つ。
+    var showBackgroundReliabilityDialog by remember { mutableStateOf(false) }
 
     // 外部/BluetoothキーボードのJIS/US配列モード。テーマと同じく、どのホストに
     // 接続していても使う物理キーボード側の特性なのでグローバル設定として永続化する。
@@ -248,6 +256,10 @@ fun ProfileListScreen(
                             text = { Text("セキュリティ") },
                             onClick = { showMenu = false; showSecurityDialog = true },
                         )
+                        DropdownMenuItem(
+                            text = { Text("バックグラウンド動作") },
+                            onClick = { showMenu = false; showBackgroundReliabilityDialog = true },
+                        )
                     }
                 }
             }
@@ -361,6 +373,23 @@ fun ProfileListScreen(
                 prefs.edit().putString(KeyboardLayoutMode.PREF_KEY, mode.name).apply()
             },
             onDismiss = { showKeyboardLayoutDialog = false },
+        )
+    }
+
+    if (showBackgroundReliabilityDialog) {
+        var optedOut by remember { mutableStateOf(BatteryGuidanceSettings.isOptedOut(context)) }
+        BackgroundReliabilityDialog(
+            manufacturer = Build.MANUFACTURER ?: "",
+            optedOut = optedOut,
+            onOptOutChanged = { newValue ->
+                optedOut = newValue
+                BatteryGuidanceSettings.setOptedOut(context, newValue)
+            },
+            onOpenSettings = {
+                BatteryOptimization.openIgnoreBatteryOptimizationSettings(context)
+                showBackgroundReliabilityDialog = false
+            },
+            onDismiss = { showBackgroundReliabilityDialog = false },
         )
     }
 }

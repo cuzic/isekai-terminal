@@ -3525,3 +3525,96 @@ Android側`TerminalTabsViewModel.kt`(`maybeEnsureTmuxTabWindow`)・
 `TabAlertNotifier.kt`・`ConnectionProfile.kt`(`enableTabNotifications`)、
 iOS側`ios/Sources/IsekaiTerminalCoreLogic/TmuxTabWindowCoordinator.swift`(Androidの#60配線を
 移植、通知UIが未実装のため`enableNotifications`は呼び出し側で固定`false`)。
+
+## Pre-mortem対応: `foregroundServiceType`変更 + OEMバッテリー最適化への案内UI（2026-08-17）
+
+半年後の失敗要因を先回りして洗い出す pre-mortem レビュー(4並列調査)の結果、優先度の
+高かった項目のうち「`foregroundServiceType`の型選択」と「OEMバッテリー最適化への案内UI」
+の2件をここに記録する。
+
+### `foregroundServiceType`: `remoteMessaging` → `specialUse`
+
+`TerminalSessionService`の型を`remoteMessaging`から`specialUse`へ変更した。他候補の
+却下理由:
+
+- **`connectedDevice`は却下**: 前提権限が実験的機能(Phase 9-4)の`CHANGE_NETWORK_STATE`
+  頼みになり、将来この権限を外すと`SecurityException`になる隠れた結合を生む。
+- **`remoteMessaging`(旧値)も却下**: Play Storeの用途定義が「テキストメッセージの中継」
+  であり、SSHセッション保持という実態と一致しない。
+- **`dataSync`/`mediaProcessing`/`shortService`には絶対に戻さない**: 2026-07-27に実機で
+  確認した無限クラッシュループ(プロセスkill後、STARTSTICKYによるOSの自動再起動→中身の
+  無いforeground通知→Android 15+のFGS制限で強制終了→2回目の自動再起動が
+  `mAllowStartForeground=false`で即クラッシュ、を無限に繰り返す)の直接原因になった型。
+  このクラッシュループの本質的な修正は型ではなく`TerminalSessionService.onStartCommand`
+  のnull Intentガード(コミット`de4cb730`)であり、これは型に関係なく維持されるため、
+  `specialUse`への変更で再発リスクが戻ることはない。
+
+Web調査で`specialUse`はAndroid 15/16/17いずれでもタイムアウト対象外であることを確認済み。
+`PROPERTY_SPECIAL_USE_FGS_SUBTYPE`で「ユーザーが明示的に開始した対話的リモートシェルを
+保持するため」という用途を明示している(`AndroidManifest.xml`参照)。回帰防止として
+`TerminalSessionServiceTest.kt`に`PackageManager.getServiceInfo(...).foregroundServiceType`
+が`FOREGROUND_SERVICE_TYPE_SPECIAL_USE`であることを確認するテストを追加した。
+
+### OEMバッテリー最適化への案内UI
+
+一部OEM(Xiaomi/OPPO/Vivo等)の独自バックグラウンドキラーがアプリプロセスをkillする
+ことがあり、タスク#14(黙示的セッション再アタッチ)により自動復旧はするものの、接続が
+一瞬途切れること自体は避けられない。これを軽減するため、標準API(権限不要)のみを
+使ってOEM設定への案内を出す。
+
+**`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`権限は追加しない**: Playの
+acceptable use casesにSSHクライアントは該当せず、誤用はアプリ停止措置の対象になりうる。
+`PowerManager.isIgnoringBatteryOptimizations`(照会)と
+`Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`(OS標準の一覧設定画面を開く)
+という権限不要の標準APIのみを使う(`BatteryOptimization.kt`)。OEM別Activity(Xiaomiの
+自動起動管理画面等)への直接遷移も実装しない——非公開のコンポーネント名に依存するため
+ROMのバージョンごとに壊れやすく、検証できる実機も無い。遷移先は標準API1本に統一しつつ、
+`BatteryGuidanceCopy.kt`で`Build.MANUFACTURER`から文言(タイトル・本文・OEM別ヒント)
+だけを出し分ける。
+
+**提示タイミングは接続の切断回数をトリガーにしない**: ネットワーク起因の切断とOEMによる
+プロセスkillは別事象で、切断回数はノイズが多すぎる。代わりに「プロセスkill自体」を検出する:
+
+1. `TerminalSessionService`が`onDestroy`(サービスが正規のライフサイクル経由で終了する
+   唯一の経路)でのみ「正常終了マーカー」を`commit()`(同期書き込み。直後にプロセスが
+   死ぬケースがあるため`apply()`は不可)で書く。`onTaskRemoved`(タスクがrecentsから
+   スワイプ削除された時)では書かない——FGS自体はここでは止めない設計
+   (`updateSessionsSummary`参照)なので、その時点ではまだ「正常終了」ではなく、書いて
+   しまうと直後にOEMのバックグラウンドキラーがプロセスを直接killして`onDestroy`が
+   呼ばれなかった場合に「予期しないkill」の検出を取りこぼす(このモジュールが検出
+   しようとしているシナリオそのものを見逃す)。
+2. 起動時(`TerminalTabsViewModel.restorePersistedReattachTabs`)、既存の`ReattachStateStore`
+   が持つ「新鮮なreattachレコード」の有無と、このマーカーの有無を突き合わせる:
+   「新鮮なレコードあり && マーカー無し」= 予期しないkill。マーカーは
+   `TerminalSessionService.consumeCleanShutdownMarker`でdirty-bit方式(読んだら即リセット)
+   で消費し、2世代前の"clean"痕跡を誤って引き継がないようにする。
+3. 「案内すべきか」の判断は`.claude/rules/rust-ssot.md`に従いRust側に一元化する
+   (`rust-core/src/background_reliability_policy.rs::decide_battery_guidance`)。
+   「予期しないkillが2回以上」かつ「前回案内から14日以上(クールダウン)」かつ「既に
+   `PowerManager.isIgnoringBatteryOptimizations`で免除済みでない」かつ「ユーザーが
+   オプトアウトしていない」場合のみ、コールドスタート時に1回だけ案内ダイアログを出す。
+   クールダウン判定のクロックスキュー(端末の時計調整等で`now < last_shown`になるケース)
+   は、`reattach_persistence.rs::reattach_record_is_fresh`とは逆に「案内を控える」安全側
+   に倒す(案内を出しすぎる実害の方が、出し足りない実害より大きいと判断したため、
+   `background_reliability_policy.rs`のモジュールdoc参照)。
+4. 恒常的な入口として`ProfileListScreen`のオーバーフローメニューに「バックグラウンド動作」
+   項目も常設する(nagなし、いつでも自分で開ける)。
+
+**`.claude/rules/always-connects.md`との関係**: この案内UIはあくまで予防策(「案内すれば
+頻度が減るかもしれない」)であり、実際の復旧保証はタスク#14の黙示的自動再アタッチが既に
+担っている——このモジュールが無くても`always-connects.md`の原則(`isekai-ssh`/ネットワーク
+アクセスが生きている限り自動的に接続できる)は満たされたままである、という位置づけ。
+
+**実装**: `rust-core/src/background_reliability_policy.rs`(`BackgroundKillFacts`/
+`BatteryGuidanceDecision`/`decide_battery_guidance`、UniFFI export済み)、Android側
+`TerminalSessionService.kt`(正常終了マーカー)・`data/BatteryGuidanceSettings.kt`
+(永続化)・`util/BatteryOptimization.kt`(標準API呼び出し)・`ui/BatteryGuidanceCopy.kt`
+(文言)・`ui/BackgroundReliabilityDialog.kt`(ダイアログ)・`ProfileListScreen.kt`
+(恒常メニュー)・`TerminalTabsViewModel.kt`(`checkBatteryGuidance`・`BatteryGuidancePolicy`・
+`showBatteryGuidance` StateFlow)・`MainActivity.kt`(`AppRoot`のNavHost外でのダイアログ表示)。
+
+**実機確認は未了(このタスクのスコープ外)**: `adb shell am kill`(またはkill -9)後に
+クラッシュループが起きず黙示的再アタッチが動くこと(2026-07-27の回帰確認)、2回kill後に
+ダイアログが出ること、オプトアウトで出なくなること、`FOREGROUND_SERVICE_SPECIAL_USE`
+権限の付け忘れによる`startForeground()`の`SecurityException`が無いこと——いずれも
+Robolectricでは検出できないため、`android-adb-remote`スキル経由での確認が別途必要。

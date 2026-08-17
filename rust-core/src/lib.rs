@@ -44,6 +44,9 @@ pub mod debug_fault;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
 pub mod reattach_persistence;
+// 項目2: OEMバッテリー最適化への案内UI。「案内すべきか」の判断ポリシー
+// (`.claude/rules/rust-ssot.md`準拠、reattach_persistence.rsと同型)。
+pub mod background_reliability_policy;
 
 pub use quic_transport::QuicConfig;
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};

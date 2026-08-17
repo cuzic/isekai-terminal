@@ -1,6 +1,7 @@
 package tools.isekai.terminal
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -11,17 +12,25 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import tools.isekai.terminal.data.BatteryGuidanceSettings
+import tools.isekai.terminal.ui.BackgroundReliabilityDialog
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
+import tools.isekai.terminal.util.BatteryOptimization
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.setCtlSocketForwardEnabled
 import uniffi.isekai_terminal_core.setTerminalTheme
@@ -181,6 +190,29 @@ fun AppRoot() {
                 navController.navigate(AppRoutes.TERMINAL)
             }
         }
+    }
+
+    // 項目2: OEMバッテリー最適化への案内UI(コールドスタート時の自動案内)。
+    // `TerminalTabsViewModel.restorePersistedReattachTabs`(黙示的セッション再アタッチ、
+    // タスク#14)によるナビゲーション(上の LaunchedEffect)とは独立に扱うため、意図的に
+    // NavHost の外(このダイアログはどの画面routeにいても被さって表示される)に置く。
+    val showBatteryGuidance by tabsVm.showBatteryGuidance.collectAsStateWithLifecycle()
+    if (showBatteryGuidance) {
+        val context = LocalContext.current
+        var optedOut by remember { mutableStateOf(BatteryGuidanceSettings.isOptedOut(context)) }
+        BackgroundReliabilityDialog(
+            manufacturer = Build.MANUFACTURER ?: "",
+            optedOut = optedOut,
+            onOptOutChanged = { newValue ->
+                optedOut = newValue
+                BatteryGuidanceSettings.setOptedOut(context, newValue)
+            },
+            onOpenSettings = {
+                BatteryOptimization.openIgnoreBatteryOptimizationSettings(context)
+                tabsVm.dismissBatteryGuidance()
+            },
+            onDismiss = { tabsVm.dismissBatteryGuidance() },
+        )
     }
 
     NavHost(navController = navController, startDestination = startDestination) {

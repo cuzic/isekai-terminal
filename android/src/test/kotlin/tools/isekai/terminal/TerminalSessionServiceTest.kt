@@ -2,6 +2,8 @@ package tools.isekai.terminal
 
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -51,5 +53,75 @@ class TerminalSessionServiceTest {
             "cuzic@example.com",
             shadowOf(service).lastForegroundNotification?.extras?.getCharSequence(android.app.Notification.EXTRA_TEXT).toString(),
         )
+    }
+
+    /**
+     * `foregroundServiceType`をdataSync/mediaProcessing/shortService等の
+     * タイムアウト対象型へうっかり戻すことを機械的に防ぐ回帰テスト
+     * (`AndroidManifest.xml`の型選択の経緯コメント参照)。specialUseであることを
+     * PackageManager経由で確認する。
+     *
+     * `specialUse`のマニフェスト属性値はAPI 34以降で定義されているため、クラス
+     * デフォルトのsdk=33ではAndroidManifest.xmlのパース時にenum値を正しく解決
+     * できない。このテストだけsdk=34にオーバーライドする。
+     */
+    @Test
+    @Config(sdk = [34])
+    fun manifest_declaresSpecialUseForegroundServiceType() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val serviceInfo = context.packageManager.getServiceInfo(
+            android.content.ComponentName(context, TerminalSessionService::class.java),
+            PackageManager.GET_META_DATA,
+        )
+
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, serviceInfo.foregroundServiceType)
+    }
+
+    // ── 項目2: 正常終了マーカー ──────────────────────────────
+
+    @Test
+    fun consumeCleanShutdownMarker_withoutPriorMark_returnsFalse() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    @Test
+    fun onDestroy_marksCleanShutdown_detectedByNextConsume() {
+        val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
+        val service = controller.get()
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        controller.destroy()
+
+        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    /**
+     * 回帰防止テスト: `onTaskRemoved`(タスクがrecentsからスワイプ削除された)は
+     * FGS自体を止めない設計(`updateSessionsSummary`参照)なので、その時点で
+     * マーカーを書いて「正常終了」扱いしてはいけない。書いてしまうと、直後に
+     * OEMのバックグラウンドキラーがプロセスを直接killして`onDestroy`が呼ばれなく
+     * ても、次回起動時に古い(誤った)"clean"マーカーが残っていて「予期しないkill」
+     * の検出を取りこぼす(本来この機能が検出したいシナリオそのものを見逃す)。
+     */
+    @Test
+    fun onTaskRemoved_doesNotMarkCleanShutdown() {
+        val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
+        val service = controller.get()
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+
+        service.onTaskRemoved(null)
+
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
+    @Test
+    fun consumeCleanShutdownMarker_isConsumedOnce_secondCallReturnsFalse() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        TerminalSessionService.markCleanShutdown(context)
+
+        assertTrue(TerminalSessionService.consumeCleanShutdownMarker(context))
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
     }
 }

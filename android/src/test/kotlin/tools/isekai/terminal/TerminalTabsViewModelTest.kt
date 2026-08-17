@@ -28,6 +28,7 @@ import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.ReattachRecord
 import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.TerminalSession
+import uniffi.isekai_terminal_core.BackgroundKillFacts
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.InternalException
 import uniffi.isekai_terminal_core.MouseReportingMode
@@ -121,6 +122,11 @@ class TerminalTabsViewModelTest {
     private fun newViewModel(
         reattachStore: ReattachStateStore,
         freshnessPolicy: ReattachFreshnessPolicy = ReattachFreshnessPolicy { _, _ -> true },
+        // 項目2: [freshnessPolicy]と全く同じ理由(UniFFI free functionを直接呼ぶ本番実装は
+        // JVM単体テストでUnsatisfiedLinkErrorになる)でフェイクを既定注入する。多くの既存
+        // reattachテストは新鮮なレコードを持つため、この既定が無いと本番の
+        // `decideBatteryGuidance`呼び出しに落ちてクラッシュする。
+        batteryGuidancePolicy: BatteryGuidancePolicy = BatteryGuidancePolicy { false },
     ): TerminalTabsViewModel {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, ConnectionProfile) -> TerminalSession = { _, _, _ ->
@@ -129,7 +135,7 @@ class TerminalTabsViewModelTest {
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
         return TerminalTabsViewModel(
-            app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore, freshnessPolicy,
+            app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore, freshnessPolicy, batteryGuidancePolicy,
         )
     }
 
@@ -1157,5 +1163,109 @@ class TerminalTabsViewModelTest {
         withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
         delay(300)
         assertTrue(vm2.tabs.value.isEmpty())
+    }
+
+    // ── 項目2: OEMバッテリー最適化への案内UI ──────────────────────────
+
+    private fun clearBatteryGuidancePrefs() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        ctx.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE).edit().clear().apply()
+        // TerminalSessionService.consumeCleanShutdownMarker が読む正常終了マーカー用の
+        // 別SharedPreferences("isekai_terminal_service_lifecycle")もクリアする。
+        TerminalSessionService.consumeCleanShutdownMarker(ctx)
+    }
+
+    @Test
+    fun unexpectedKill_withFreshRecordAndNoCleanMarker_incrementsCountAndCallsPolicy() = runBlocking {
+        clearBatteryGuidancePrefs()
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("battery-guidance-a"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "battery-guidance-a", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+        // clean-shutdownマーカーは書かない = 予期しないkill
+
+        var observedFacts: BackgroundKillFacts? = null
+        val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { facts -> observedFacts = facts; true })
+
+        withTimeout(3000) { while (observedFacts == null) delay(10) }
+        assertEquals(1u, observedFacts!!.unexpectedKillCount)
+        assertEquals(1, tools.isekai.terminal.data.BatteryGuidanceSettings.unexpectedKillCount(ctx))
+        withTimeout(3000) { while (!vm2.showBatteryGuidance.value) delay(10) }
+        assertTrue(vm2.showBatteryGuidance.value)
+    }
+
+    @Test
+    fun unexpectedKill_policyDecidesNotToShow_leavesShowBatteryGuidanceFalse() = runBlocking {
+        clearBatteryGuidancePrefs()
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("battery-guidance-b"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "battery-guidance-b", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+
+        val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { false })
+
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        delay(300)
+        assertTrue(!vm2.showBatteryGuidance.value)
+    }
+
+    @Test
+    fun cleanShutdownMarkerPresent_doesNotCountAsUnexpectedKill() = runBlocking {
+        clearBatteryGuidancePrefs()
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        TerminalSessionService.markCleanShutdown(ctx)
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("battery-guidance-c"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "battery-guidance-c", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+
+        var policyCalled = false
+        val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { policyCalled = true; true })
+
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        delay(300)
+        assertTrue("clean shutdown must not be counted as an unexpected kill", !policyCalled)
+        assertEquals(0, tools.isekai.terminal.data.BatteryGuidanceSettings.unexpectedKillCount(ctx))
+        assertTrue(!vm2.showBatteryGuidance.value)
+    }
+
+    @Test
+    fun noFreshReattachRecord_doesNotIncrementOrCallPolicy() = runBlocking {
+        clearBatteryGuidancePrefs()
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        val store = tempReattachStore()
+        // レコードを一切仕込まない(= 判断材料が無い)。
+
+        var policyCalled = false
+        val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { policyCalled = true; true })
+
+        delay(300)
+        assertTrue(!policyCalled)
+        assertEquals(0, tools.isekai.terminal.data.BatteryGuidanceSettings.unexpectedKillCount(ctx))
+        assertTrue(!vm2.showBatteryGuidance.value)
+    }
+
+    @Test
+    fun dismissBatteryGuidance_resetsShowFlag() = runBlocking {
+        clearBatteryGuidancePrefs()
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("battery-guidance-d"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "battery-guidance-d", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+        val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { true })
+        withTimeout(3000) { while (!vm2.showBatteryGuidance.value) delay(10) }
+
+        vm2.dismissBatteryGuidance()
+
+        assertTrue(!vm2.showBatteryGuidance.value)
     }
 }

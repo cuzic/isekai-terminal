@@ -833,6 +833,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_debug_cut_udp_fault(
@@ -1134,6 +1136,8 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_decide_battery_guidance(`facts`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_debug_cut_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
@@ -1300,6 +1304,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_decide_battery_guidance() != 58303) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault() != 8630) {
@@ -4035,6 +4042,120 @@ public object FfiConverterTypeAttributeRun: FfiConverterRustBuffer<AttributeRun>
             FfiConverterUInt.write(value.`bgArgb`, buf)
             FfiConverterBoolean.write(value.`bold`, buf)
             FfiConverterBoolean.write(value.`underline`, buf)
+    }
+}
+
+
+
+/**
+ * [`decide_battery_guidance`]への入力となる生の事実。判断ロジックを持たず、
+ * Kotlin側が観測した値をそのまま渡すだけのデータ。
+ */
+data class BackgroundKillFacts (
+    /**
+     * 「新鮮なreattachレコードあり && clean-shutdownマーカー無し」で起動した回数の
+     * 累積(Kotlin側が単調増加でカウントし永続化する)。
+     */
+    var `unexpectedKillCount`: kotlin.UInt
+    , 
+    /**
+     * 前回この案内ダイアログを表示した時刻(Unix epoch秒)。一度も表示したことが
+     * 無ければ`None`。
+     */
+    var `lastShownUnixSecs`: kotlin.ULong?
+    , 
+    /**
+     * 判定時刻(Unix epoch秒)。
+     */
+    var `nowUnixSecs`: kotlin.ULong
+    , 
+    /**
+     * `PowerManager.isIgnoringBatteryOptimizations()`の結果。既にOSのバッテリー
+     * 最適化対象外になっている(=免除済み)なら、これ以上案内する意味が無い。
+     */
+    var `isIgnoringBatteryOptimizations`: kotlin.Boolean
+    , 
+    /**
+     * ユーザーが案内ダイアログの「今後表示しない」トグルを選んでいるか。
+     */
+    var `userOptedOut`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeBackgroundKillFacts: FfiConverterRustBuffer<BackgroundKillFacts> {
+    override fun read(buf: ByteBuffer): BackgroundKillFacts {
+        return BackgroundKillFacts(
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: BackgroundKillFacts) = (
+            FfiConverterUInt.allocationSize(value.`unexpectedKillCount`) +
+            FfiConverterOptionalULong.allocationSize(value.`lastShownUnixSecs`) +
+            FfiConverterULong.allocationSize(value.`nowUnixSecs`) +
+            FfiConverterBoolean.allocationSize(value.`isIgnoringBatteryOptimizations`) +
+            FfiConverterBoolean.allocationSize(value.`userOptedOut`)
+    )
+
+    override fun write(value: BackgroundKillFacts, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`unexpectedKillCount`, buf)
+            FfiConverterOptionalULong.write(value.`lastShownUnixSecs`, buf)
+            FfiConverterULong.write(value.`nowUnixSecs`, buf)
+            FfiConverterBoolean.write(value.`isIgnoringBatteryOptimizations`, buf)
+            FfiConverterBoolean.write(value.`userOptedOut`, buf)
+    }
+}
+
+
+
+/**
+ * [`decide_battery_guidance`]の判定結果。
+ */
+data class BatteryGuidanceDecision (
+    /**
+     * コールドスタート時に案内ダイアログを表示すべきか。
+     */
+    var `shouldShow`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeBatteryGuidanceDecision: FfiConverterRustBuffer<BatteryGuidanceDecision> {
+    override fun read(buf: ByteBuffer): BatteryGuidanceDecision {
+        return BatteryGuidanceDecision(
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: BatteryGuidanceDecision) = (
+            FfiConverterBoolean.allocationSize(value.`shouldShow`)
+    )
+
+    override fun write(value: BatteryGuidanceDecision, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`shouldShow`, buf)
     }
 }
 
@@ -9792,6 +9913,28 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(
     
         FfiConverterUInt.lower(`unicodeChar`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 「予期しないkillが2回以上」かつ「前回案内から14日以上(または未表示)」かつ
+         * 「既に免除済みでない」かつ「ユーザーがオプトアウトしていない」場合のみ`true`を返す
+         * 純関数。
+         *
+         * クールダウン判定は`now_unix_secs`が`last_shown_unix_secs`より前(端末の時計調整等で
+         * 稀に起こりうる)の場合、`saturating_sub`により経過時間0として扱う——つまり
+         * 「直近案内したばかり」と同じ扱いになり、`should_show`はfalse側に倒れる
+         * (`reattach_record_is_fresh`とは異なり、クロックスキュー時は「案内すべき」ではなく
+         * 「案内を控える」安全側に倒す設計。案内を出しすぎることの実害[迷惑通知]の方が、
+         * 出し足りないことの実害[案内が遅れるだけ]より大きいと判断したため)。
+         */ fun `decideBatteryGuidance`(`facts`: BackgroundKillFacts): BatteryGuidanceDecision {
+            return FfiConverterTypeBatteryGuidanceDecision.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_decide_battery_guidance(
+    
+        FfiConverterTypeBackgroundKillFacts.lower(`facts`),_status)
 }
     )
     }

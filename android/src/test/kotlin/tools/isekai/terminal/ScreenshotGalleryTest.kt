@@ -153,6 +153,24 @@ class ScreenshotGalleryTest {
         composeTestRule.onRoot().captureRoboImage("profile_list_theme_dialog.png")
     }
 
+    // 項目2: OEMバッテリー最適化への案内UI(恒常入口)
+    @Test fun profileList_backgroundReliabilityDialog() {
+        composeTestRule.setContent {
+            ProfileListScreen(
+                onConnect = { _, _, _ -> },
+                onAddProfile = {},
+                onEditProfile = {},
+                onManageKeys = {},
+                applyTerminalTheme = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performScrollTo().performClick()
+        waitForText("バックグラウンド動作の最適化")
+        composeTestRule.onRoot().captureRoboImage("profile_list_background_reliability_dialog.png")
+    }
+
     // ── プロファイル編集 ─────────────────────────────────────────────
 
     @Test fun profileEdit_new() {

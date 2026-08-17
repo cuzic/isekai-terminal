@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -31,15 +31,30 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- dataSyncではなくremoteMessagingを使う: dataSync/mediaProcessing型は
-             Android 15+でバックグラウンド起動後の短時間強制終了・長時間セッションでの
-             累積6時間クォータの対象になり、SSHセッションのように「接続している間ずっと
-             生きているべき」用途に適さない(実機でクラッシュループを確認、2026-07-27、
-             TerminalSessionService.kt参照)。 -->
+        <!-- foregroundServiceType は specialUse を使う。型選択の経緯:
+             - dataSync/mediaProcessing/shortServiceには絶対に戻さない: Android 15+で
+               バックグラウンド起動後の短時間強制終了・長時間セッションでの累積6時間
+               クォータの対象になり、SSHセッションのように「接続している間ずっと
+               生きているべき」用途に適さない(実機でクラッシュループを確認、
+               2026-07-27、TerminalSessionService.kt参照)。
+             - remoteMessagingは却下: Play Storeの用途定義が「テキストメッセージの
+               中継」であり、SSHセッション保持という実態と一致しない。
+             - connectedDeviceも却下: 前提権限がPhase 9-4の実験的機能
+               (CHANGE_NETWORK_STATE)頼みになり、将来その権限を外すと
+               SecurityExceptionになる隠れた結合を生む。
+             - specialUseはAndroid 15/16/17いずれでもタイムアウト対象外であることを
+               Web調査で確認済み。PROPERTY_SPECIAL_USE_FGS_SUBTYPEで用途を明示する。
+             2026-07-27のクラッシュループの本質的な修正は型ではなく
+             onStartCommandのnull Intentガードであり、型変更でこの修正が失われる
+             ことはない(TerminalSessionService.kt参照)。 -->
         <service
             android:name=".TerminalSessionService"
             android:exported="false"
-            android:foregroundServiceType="remoteMessaging" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps user-initiated interactive SSH/QUIC terminal sessions alive while the app is backgrounded. The session is an interactive remote shell explicitly started by the user; terminating it loses unsaved remote work. No other foreground service type applies." />
+        </service>
         <!-- クリップボード画像同期(`ISEKAI_PIPE_DESIGN.md` §8 Epic M follow-up)用。
              リモートから受け取ったPNGを一時ファイルとして書き出し、他アプリの
              ペースト操作から読める content:// URI を発行するためだけに使う。 -->

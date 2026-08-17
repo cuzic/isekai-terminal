@@ -726,6 +726,55 @@ Swiftツールチェーンの無い開発環境で書かれたため、macOS Git
 
 ---
 
+## 18. `foregroundServiceType=specialUse` 変更 + OEMバッテリー最適化案内 実機確認
+
+`TerminalSessionService`の`foregroundServiceType`を`remoteMessaging`から`specialUse`へ
+変更したこと(`FOREGROUND_SERVICE_SPECIAL_USE`権限の付け忘れは`startForeground()`が即
+`SecurityException`になり、Robolectricでは検出できない)と、OEMバッテリー最適化への案内UI
+(プロセスkillからの黙示的再アタッチが正しく動くことが前提)は、いずれも実機での確認が
+必須。`PLAN.md`「Pre-mortem対応: `foregroundServiceType`変更 + OEMバッテリー最適化への
+案内UI」参照。
+
+### 18-A `specialUse`での起動確認(権限付け忘れの検出)
+1. アプリをインストールし、任意のプロファイルへ接続する
+2. 通知欄にSSHセッションの通知(FGS)が表示され、`SecurityException`によるクラッシュが
+   発生しないことを確認する
+3. `adb shell dumpsys activity services tools.isekai.terminal` で該当サービスの
+   `foregroundServiceType`が`specialUse`(値`1073741824`)になっていることを確認する
+
+### 18-B プロセスkillからの黙示的再アタッチ(2026-07-27回帰確認)
+1. プロファイルへ接続し、セッションがConnectedになることを確認する
+2. アプリをバックグラウンドへ回した状態で `adb shell am kill tools.isekai.terminal` を
+   実行する(またはOEM端末の「最近使ったアプリ」から強制終了する)
+3. アプリを再度開き、クラッシュループ(「アプリが繰り返し停止しています」)が発生せず、
+   黙示的にタブが復元されて再接続が始まることを確認する
+
+### 18-C バッテリー最適化案内ダイアログ
+1. 18-Bの手順を2回繰り返す(=予期しないkillを2回発生させる)
+2. 2回目のkill後の起動で、コールドスタート時にバックグラウンド動作の最適化案内ダイアログ
+   が自動表示されることを確認する(端末が既にバッテリー最適化の対象外の場合は表示されない
+   — 事前に`設定 → アプリ → isekai-terminal → バッテリー`で対象になっていることを確認する)
+3. ダイアログの「設定を開く」をタップし、`Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`
+   の一覧設定画面が開くことを確認する
+4. ダイアログの「今後表示しない」をONにして閉じ、再度2回killを繰り返しても案内ダイアログが
+   出なくなることを確認する
+5. `ProfileListScreen`のオーバーフローメニュー「バックグラウンド動作」から、kill回数に
+   関係なくいつでも同じダイアログを開けることを確認する
+
+### NG 時の確認ポイント
+- `startForeground()`が`SecurityException`で落ちる
+  → `AndroidManifest.xml`の`FOREGROUND_SERVICE_SPECIAL_USE`権限宣言漏れ、または
+    `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`の`<property>`宣言漏れを確認
+- kill後にクラッシュループが再発する
+  → `TerminalSessionService.onStartCommand`のnull Intentガードが退行していないか確認
+    (`specialUse`への型変更そのものはこのガードと無関係)
+- 案内ダイアログが2回kill後も出ない
+  → `TerminalSessionService.markCleanShutdown`/`consumeCleanShutdownMarker`が正しく
+    呼ばれているか、`BatteryGuidanceSettings`の永続化状態(`unexpectedKillCount`等)を
+    確認する
+
+---
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
