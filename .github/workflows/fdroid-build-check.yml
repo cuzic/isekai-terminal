@@ -116,11 +116,19 @@ jobs:
           # zig and cargo-zigbuild are checked the same way: they are installed
           # into /opt by the recipe and reached via /usr/local/bin symlinks, and
           # the musl builds below need them as a non-root user.
+          # NOTE: this must call the `cargo-zigbuild` binary directly, not
+          # `cargo zigbuild --version` — cargo's subcommand dispatch forwards
+          # `--version` into the `zigbuild` subcommand's own clap parser
+          # (pinned cargo-zigbuild 0.23.0), which only defines `--verbose`
+          # there and rejects `--version` with exit code 2. Confirmed against
+          # a real CI run of this step. The actual build
+          # (build-isekai-pipe-musl.sh) never passes `--version`, so this was
+          # a bug in this diagnostic step only, not in the recipe/build.
           which cargo rustc zig cargo-zigbuild
           cargo --version
           rustc --version
           zig version
-          cargo zigbuild --version
+          cargo-zigbuild --version
 
       - name: Cache Gradle and Cargo
         uses: actions/cache@v4
