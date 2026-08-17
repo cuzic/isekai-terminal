@@ -166,7 +166,7 @@ class ScreenshotGalleryTest {
         }
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithContentDescription("メニュー").performClick()
-        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performScrollTo().performClick()
         waitForText("バックグラウンド動作の最適化")
         composeTestRule.onRoot().captureRoboImage("profile_list_background_reliability_dialog.png")
     }

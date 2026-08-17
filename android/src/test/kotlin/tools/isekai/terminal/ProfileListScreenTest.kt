@@ -351,7 +351,7 @@ class ProfileListScreenTest {
     @Test fun backgroundReliabilityMenuItem_opensDialog() {
         setScreen()
         composeTestRule.onNodeWithContentDescription("メニュー").performClick()
-        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performScrollTo().performClick()
         waitForText("バックグラウンド動作の最適化")
         composeTestRule.onNodeWithText("バックグラウンド動作の最適化").assertIsDisplayed()
     }
@@ -360,7 +360,7 @@ class ProfileListScreenTest {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
         setScreen()
         composeTestRule.onNodeWithContentDescription("メニュー").performClick()
-        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performScrollTo().performClick()
         waitForText("バックグラウンド動作の最適化")
 
         composeTestRule.onNodeWithTag("batteryGuidanceOptOutSwitch")
@@ -372,7 +372,7 @@ class ProfileListScreenTest {
     @Test fun backgroundReliabilityDialog_dismiss_closesDialog() {
         setScreen()
         composeTestRule.onNodeWithContentDescription("メニュー").performClick()
-        composeTestRule.onNodeWithText("バックグラウンド動作").performClick()
+        composeTestRule.onNodeWithText("バックグラウンド動作").performScrollTo().performClick()
         waitForText("バックグラウンド動作の最適化")
 
         composeTestRule.onNodeWithTag("batteryGuidanceDismissButton").performClick()

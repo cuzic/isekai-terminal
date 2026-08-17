@@ -31,8 +31,15 @@ object BatteryOptimization {
      * その場合はアプリ詳細設定画面へフォールバックする。
      */
     fun openIgnoreBatteryOptimizationSettings(context: Context) {
+        // 呼び出し元がActivity contextとは限らない(将来Composeの外から呼ばれる可能性も
+        // 含め、この関数はContextを汎用的に受け取る設計にしている)ため、
+        // FLAG_ACTIVITY_NEW_TASKを常に付ける。Activity context起点の呼び出しでは
+        // 無害(新規タスクは作られず既存タスクにActivityが積まれるだけ)。
         try {
-            context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            context.startActivity(
+                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
             return
         } catch (e: ActivityNotFoundException) {
             RemoteLogger.w("IsekaiTerminalBattery", "ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS unavailable, falling back")
@@ -40,7 +47,8 @@ object BatteryOptimization {
         try {
             context.startActivity(
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                    .setData(Uri.parse("package:${context.packageName}")),
+                    .setData(Uri.parse("package:${context.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         } catch (e: ActivityNotFoundException) {
             RemoteLogger.w("IsekaiTerminalBattery", "no activity found to handle battery/app settings intent")
