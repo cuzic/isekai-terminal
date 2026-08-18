@@ -358,8 +358,16 @@ pub(crate) async fn build_install_script(
     // its process dies (`crate::reuse::pid_file_path`'s own docs, and
     // `openssh_e2e.rs`'s GC test asserts on this exact path surviving).
     // On the failure branches (`upload_ok=0`, handshake never appears) the
-    // `.$$`-suffixed scratch file is `rm -f`'d explicitly, since it lives
-    // outside `$tmpdir` and nothing else would ever clean it up.
+    // `.$$`-suffixed scratch files are `rm -f`'d explicitly, since they live
+    // outside `$tmpdir` and nothing else would ever clean them up — and the
+    // `trap ... EXIT` below additionally covers them (not just `$tmpdir`
+    // itself) for the case an *ssh connection drop or the script itself
+    // being killed* interrupts the upload/launch mid-flight, before either
+    // explicit branch runs. Without that, unique-per-invocation naming
+    // (unlike the old fixed `.tmp` name, silently clobbered/reused by the
+    // next attempt) would instead leave one orphaned multi-megabyte binary
+    // copy behind per abnormal termination, quietly filling up the remote
+    // home directory (found in review before this ever shipped).
     let expected_sha256 = isekai_trust::hex_sha256(binary);
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
     let encoded_len = encoded.len();
@@ -387,7 +395,7 @@ sha256_of() {{
     echo "isekai-pipe bootstrap: no sha256sum/shasum on remote, binary reuse detection permanently disabled (always re-uploading+relaunching)" >&2
   fi
 }}
-tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
+tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
