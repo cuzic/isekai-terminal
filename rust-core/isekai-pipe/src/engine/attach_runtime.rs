@@ -36,6 +36,18 @@ use super::attach_arbiter::{AttachArbiter, AttachEffect, AttachEvent, AttachStat
 /// original v1 HELLO/ACK exchange.
 const PENDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounds `start_connect`'s `TcpStream::connect` to `target` (normally
+/// `127.0.0.1:22`, but configurable). Without this, a target that
+/// blackholes the SYN (firewalled but not RST-ing) leaves the lease stuck in
+/// `Connecting` for however long the OS's own TCP connect timeout is
+/// (minutes on Linux) — a client retry with a new `generation` still
+/// self-heals via `ClosingForSupersede`, so this isn't a stuck-forever bug,
+/// just an unnecessarily long first-attempt hang. Deliberately longer than
+/// `HELLO_TIMEOUT`/`PENDING_ACTIVATION_TIMEOUT` (both 5s, bounding a
+/// same-process wire exchange) since this bounds an actual TCP handshake
+/// over the network to `target`.
+const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// What a `hello()` caller needs in order to build the wire-level
 /// `AttachResponse` — deliberately *not* the full wire type, since
 /// `negotiated_resume_grace_secs` depends on `requested_resume_grace_secs`
@@ -280,8 +292,8 @@ impl AttachRuntime {
         let this = self.clone();
         let target_addr = self.target;
         let task = tokio::spawn(async move {
-            match TcpStream::connect(target_addr).await {
-                Ok(tcp) => {
+            match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
+                Ok(Ok(tcp)) => {
                     let target_id = TargetHandleId(this.next_target_id.fetch_add(1, Ordering::SeqCst));
                     let mut token_bytes = [0u8; ATTACH_TOKEN_LEN];
                     rand::rngs::OsRng.fill_bytes(&mut token_bytes);
@@ -294,8 +306,15 @@ impl AttachRuntime {
                     });
                     this.execute_effects(effects).await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     log::info!("attach_runtime: target connect failed for lease {lease:?}: {e}");
+                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
+                    this.execute_effects(effects).await;
+                }
+                Err(_elapsed) => {
+                    log::info!(
+                        "attach_runtime: target connect timed out after {TARGET_CONNECT_TIMEOUT:?} for lease {lease:?}"
+                    );
                     let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
                     this.execute_effects(effects).await;
                 }
