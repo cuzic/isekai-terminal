@@ -383,6 +383,8 @@ sha256_of() {{
     sha256sum "$1" 2>/dev/null | cut -d' ' -f1
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    echo "isekai-pipe bootstrap: no sha256sum/shasum on remote, binary reuse detection permanently disabled (always re-uploading+relaunching)" >&2
   fi
 }}
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
