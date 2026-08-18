@@ -405,7 +405,49 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     crate::install_panic_hook();
 
     let profile_for_outcome = launch.profile.clone().unwrap_or_default();
-    match run_connect(launch).await {
+    // Guards against a panic inside `run_connect` unwinding straight through
+    // the `match` below and skipping `write_connect_outcome_for_wrapper`
+    // entirely — without this, a panic left no outcome file for
+    // `isekai-ssh`'s wrapper to notice, which reads as `NoRecoverableSignal`
+    // and skips the silent re-bootstrap+retry every other `run_connect`
+    // failure gets (the "always connects" principle,
+    // `.claude/rules/always-connects.md`, implicitly assumed every failure
+    // was a plain `Err`, not a panic). `install_panic_hook` (called above)
+    // already logs the panic itself; this only closes the gap in the
+    // wrapper-facing side channel. Deliberately a Drop guard rather than
+    // `tokio::spawn(run_connect(..))` + join — the latter requires
+    // `run_connect`'s future to be `Send`, which it currently is not (a
+    // `std::sync::MutexGuard` is held across an `.await` deep in
+    // `resume_loop::pump_c2h`'s replay buffer handling); a Drop guard needs
+    // no such bound, since Rust's normal unwind-drops-locals guarantee for
+    // async fn state machines is enough (same reasoning as this crate's
+    // `SessionTableEntryGuard`/`EstablishedLease`).
+    struct PanicOutcomeGuard<'a> {
+        profile: &'a str,
+        armed: bool,
+    }
+    impl Drop for PanicOutcomeGuard<'_> {
+        // Runs during unwind when `armed` — must never itself panic (a panic
+        // inside a `Drop` reached during unwind aborts the process
+        // immediately instead of letting the outer panic finish unwinding,
+        // same reasoning as this crate's `SessionTableEntryGuard`/
+        // `EstablishedLease`). `write_connect_outcome_for_wrapper` only ever
+        // returns via `log::warn!`-and-swallow on any internal failure, so
+        // this holds today; keep it that way if this guard's body ever grows.
+        fn drop(&mut self) {
+            if self.armed {
+                write_connect_outcome_for_wrapper(
+                    self.profile,
+                    &anyhow::anyhow!("isekai-pipe connect: run_connect panicked"),
+                );
+            }
+        }
+    }
+    let mut panic_guard = PanicOutcomeGuard { profile: &profile_for_outcome, armed: true };
+    let result = run_connect(launch).await;
+    panic_guard.armed = false;
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e:?}");

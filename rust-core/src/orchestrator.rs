@@ -805,6 +805,20 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         }
     };
 
+    // `Connected`から離脱するあらゆる経路の唯一の合流点であるこの関数の中で
+    // 無効化する — `begin_connect`(新しい手動接続開始時)しか
+    // `path_observer.invalidate()`を呼んでいなかったため、`disconnect()`
+    // (ユーザー操作)経由やトランスポート層由来の切断がここへ到達した直後、
+    // 直前のセッションに対して保留中だったnetwork-loss debounceタイマーが
+    // 期限通り発火すると`is_current(epoch)`がまだtrueのまま`apply_network_lost`
+    // を呼び、既に`Idle`になっている(=`was_connected=false`)このセッションに
+    // 対して2回目の`Disconnected{reason: "network lost"}`通知を誤って上書き
+    // 送出してしまう(pre-mortemレビューで発見、実際に踏める競合)。
+    // `apply_network_lost`自身がこの関数を呼ぶ経路では、debounceクロージャの
+    // `is_current(epoch)`判定は既にこの呼び出しより前に完了しているため、
+    // ここでの無効化は次回以降の保留debounceにのみ作用し自己無効化にはならない。
+    shared.path_observer.lock().invalidate();
+
     match action {
         Action::Suppress => {}
         Action::StartLoop(attempt, epoch) => {

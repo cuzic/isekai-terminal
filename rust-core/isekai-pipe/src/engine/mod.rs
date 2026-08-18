@@ -786,9 +786,27 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                let expired = sessions.sweep_expired_parked(max_parked).await;
-                for id in expired {
-                    release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
+                // Each sweep runs in its own `tokio::spawn`'d task so a panic
+                // inside `sweep_expired_parked` or `release_slot_for` (e.g. a
+                // future bug in either) surfaces as a `JoinError` here rather
+                // than unwinding this loop's own task and permanently killing
+                // this backstop — since nothing supervises/restarts this
+                // outer `tokio::spawn` (started once, above), an unhandled
+                // panic here used to mean `sweep_expired_parked` silently
+                // stopped running for the rest of the process's lifetime,
+                // the exact "backstop stops recovering leaked fencing slots"
+                // failure `.claude/rules/always-connects.md` warns about.
+                let sessions = sessions.clone();
+                let attach_runtime = attach_runtime.clone();
+                if let Err(e) = tokio::spawn(async move {
+                    let expired = sessions.sweep_expired_parked(max_parked).await;
+                    for id in expired {
+                        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
+                    }
+                })
+                .await
+                {
+                    log::error!("park-sweep backstop: sweep task panicked, continuing on next tick: {e}");
                 }
             }
         });
@@ -1246,7 +1264,23 @@ async fn handle_attach_stream(
             Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes))
         }
         resume::InsertOutcome::Inserted => Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes)),
-        resume::InsertOutcome::Rejected => None,
+        resume::InsertOutcome::Rejected => {
+            // No `SessionTable` entry exists to guard, so relaying continues
+            // below (unchanged, existing behavior) — but this session is now
+            // silently unresumable for its entire lifetime: a client-side
+            // network blip that would normally RESUME instead permanently
+            // loses the connection, exactly the kind of "recovers only with
+            // manual intervention" state `.claude/rules/always-connects.md`
+            // treats as a bug. This was previously unobserved (the return
+            // value was discarded); logging it at least makes an operator
+            // able to notice a host is chronically hitting `--max-sessions`.
+            log::warn!(
+                "attach established but SessionTable rejected the entry (at capacity), \
+                 session_id={} will not be resumable if its data stream drops",
+                hex_lower(&session_id_bytes)
+            );
+            None
+        }
     };
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 

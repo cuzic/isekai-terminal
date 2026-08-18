@@ -340,6 +340,34 @@ pub(crate) async fn build_install_script(
     let lock_path = lock_file_path(remote_binary_path);
     let state_path = state_file_path(remote_binary_path, &fingerprint);
     let pid_path = pid_file_path(remote_binary_path, &fingerprint);
+    // `remote_binary_path`/`pid_path` writes below go through a `.$$`
+    // (this script's own shell pid, always unique per invocation)-suffixed
+    // scratch path followed by an atomic same-directory `mv` into the final
+    // fixed name — the same pattern `state_path` already used. Without this,
+    // two concurrent bootstraps of the same host (realistic: a second client
+    // dialing in while the first is still mid-upload) racing past the
+    // best-effort `flock` below — either because it times out after 30s
+    // (never made unconditional-fail, see the comment above the `flock`
+    // invocation itself) or because the remote has no `flock(1)` at all —
+    // would both write through the *same* fixed `.tmp`/pid path, corrupting
+    // each other's in-flight upload or silently overwriting each other's
+    // recorded launch pid. `pid_path` itself must still end up at its fixed,
+    // persistent name once launch succeeds (not e.g. inside `$tmpdir`,
+    // which is `rm -rf`'d on this script's own exit) — a *later* invocation's
+    // GC pass (below) discovers and reaps it by that exact fixed name once
+    // its process dies (`crate::reuse::pid_file_path`'s own docs, and
+    // `openssh_e2e.rs`'s GC test asserts on this exact path surviving).
+    // On the failure branches (`upload_ok=0`, handshake never appears) the
+    // `.$$`-suffixed scratch files are `rm -f`'d explicitly, since they live
+    // outside `$tmpdir` and nothing else would ever clean them up — and the
+    // `trap ... EXIT` below additionally covers them (not just `$tmpdir`
+    // itself) for the case an *ssh connection drop or the script itself
+    // being killed* interrupts the upload/launch mid-flight, before either
+    // explicit branch runs. Without that, unique-per-invocation naming
+    // (unlike the old fixed `.tmp` name, silently clobbered/reused by the
+    // next attempt) would instead leave one orphaned multi-megabyte binary
+    // copy behind per abnormal termination, quietly filling up the remote
+    // home directory (found in review before this ever shipped).
     let expected_sha256 = isekai_trust::hex_sha256(binary);
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
     let encoded_len = encoded.len();
@@ -363,9 +391,11 @@ sha256_of() {{
     sha256sum "$1" 2>/dev/null | cut -d' ' -f1
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    echo "isekai-pipe bootstrap: no sha256sum/shasum on remote, binary reuse detection permanently disabled (always re-uploading+relaunching)" >&2
   fi
 }}
-tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
+tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
@@ -422,7 +452,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
-      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp && chmod 0700 {remote_binary_path}.tmp && mv {remote_binary_path}.tmp {remote_binary_path} || upload_ok=0
+      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
     else
       head -c {encoded_len} > /dev/null
     fi
@@ -430,9 +460,9 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
       echo {upload_failed_marker}
     else
       if command -v setsid >/dev/null 2>&1; then
-        ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+        ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path}.$$ )
       else
-        ( ( trap '' HUP; exec {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- ) & echo $! > {pid_path} )
+        ( ( trap '' HUP; exec {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- ) & echo $! > {pid_path}.$$ )
       fi
       for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do
         [ -s $tmpdir/handshake ] && break
@@ -440,9 +470,12 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
       done
       if [ -s $tmpdir/handshake ]; then
         envelope=$(cat $tmpdir/handshake)
-        new_pid=$(cat {pid_path} 2>/dev/null)
+        new_pid=$(cat {pid_path}.$$ 2>/dev/null)
+        mv {pid_path}.$$ {pid_path} 2>/dev/null
         ( printf '%s %s\n' "$new_pid" "{fingerprint}"; printf '%s\n' "$envelope" ) > {state_path}.tmp.$$ && mv {state_path}.tmp.$$ {state_path}
         printf '%s\n' "$envelope"
+      else
+        rm -f {pid_path}.$$ 2>/dev/null
       fi
     fi
   fi
