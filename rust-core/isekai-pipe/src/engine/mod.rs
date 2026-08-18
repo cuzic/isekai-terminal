@@ -786,9 +786,27 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                let expired = sessions.sweep_expired_parked(max_parked).await;
-                for id in expired {
-                    release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
+                // Each sweep runs in its own `tokio::spawn`'d task so a panic
+                // inside `sweep_expired_parked` or `release_slot_for` (e.g. a
+                // future bug in either) surfaces as a `JoinError` here rather
+                // than unwinding this loop's own task and permanently killing
+                // this backstop — since nothing supervises/restarts this
+                // outer `tokio::spawn` (started once, above), an unhandled
+                // panic here used to mean `sweep_expired_parked` silently
+                // stopped running for the rest of the process's lifetime,
+                // the exact "backstop stops recovering leaked fencing slots"
+                // failure `.claude/rules/always-connects.md` warns about.
+                let sessions = sessions.clone();
+                let attach_runtime = attach_runtime.clone();
+                if let Err(e) = tokio::spawn(async move {
+                    let expired = sessions.sweep_expired_parked(max_parked).await;
+                    for id in expired {
+                        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
+                    }
+                })
+                .await
+                {
+                    log::error!("park-sweep backstop: sweep task panicked, continuing on next tick: {e}");
                 }
             }
         });
