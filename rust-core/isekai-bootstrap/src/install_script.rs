@@ -442,7 +442,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
-      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || { rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }
+      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
     else
       head -c {encoded_len} > /dev/null
     fi
