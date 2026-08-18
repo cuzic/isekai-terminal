@@ -1264,7 +1264,23 @@ async fn handle_attach_stream(
             Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes))
         }
         resume::InsertOutcome::Inserted => Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes)),
-        resume::InsertOutcome::Rejected => None,
+        resume::InsertOutcome::Rejected => {
+            // No `SessionTable` entry exists to guard, so relaying continues
+            // below (unchanged, existing behavior) — but this session is now
+            // silently unresumable for its entire lifetime: a client-side
+            // network blip that would normally RESUME instead permanently
+            // loses the connection, exactly the kind of "recovers only with
+            // manual intervention" state `.claude/rules/always-connects.md`
+            // treats as a bug. This was previously unobserved (the return
+            // value was discarded); logging it at least makes an operator
+            // able to notice a host is chronically hitting `--max-sessions`.
+            log::warn!(
+                "attach established but SessionTable rejected the entry (at capacity), \
+                 session_id={} will not be resumable if its data stream drops",
+                hex_lower(&session_id_bytes)
+            );
+            None
+        }
     };
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 
