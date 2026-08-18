@@ -427,6 +427,13 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
         armed: bool,
     }
     impl Drop for PanicOutcomeGuard<'_> {
+        // Runs during unwind when `armed` — must never itself panic (a panic
+        // inside a `Drop` reached during unwind aborts the process
+        // immediately instead of letting the outer panic finish unwinding,
+        // same reasoning as this crate's `SessionTableEntryGuard`/
+        // `EstablishedLease`). `write_connect_outcome_for_wrapper` only ever
+        // returns via `log::warn!`-and-swallow on any internal failure, so
+        // this holds today; keep it that way if this guard's body ever grows.
         fn drop(&mut self) {
             if self.armed {
                 write_connect_outcome_for_wrapper(
