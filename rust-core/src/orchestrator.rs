@@ -1302,10 +1302,35 @@ impl SessionOrchestrator {
             // 経路)に入ったケースを見落とす。`reconnect_loop_active`/`phase`も
             // 合わせて見ることで、「復帰時点で接続が生きていない」を
             // `background_state`の値に関わらず正しく判定する(B2と同型の穴の再発防止)。
+            //
+            // `s.reconnect_loop_active`の項は、`handle_unexpected_disconnect`/
+            // `on_connected`の現在の実装だけを見れば`s.phase != ConnPhase::Connected`
+            // に包含され厳密には冗長(コードレビューで指摘・実装時に検証済み:
+            // `reconnect_loop_active`をtrueにする唯一の経路(`:781`)は
+            // 必ずその前に`phase = Idle`を設定済み(`:773`)であり、`on_connected`は
+            // `phase = Connected`と`reconnect_loop_active = false`を同一ロック内で
+            // 常に対にして設定する(`:526-530`))。**意図的に残してある**——
+            // この式はまさに「復帰時点で本当に接続が生きていないか」を保証する
+            // ためのものなので、将来どちらかの不変条件が崩れても(例:
+            // `phase`の更新漏れがあっても)もう一方の条件が独立に安全側へ倒れる
+            // 二重の保険にする。「冗長だから」と`s.phase != ConnPhase::Connected`
+            // だけに簡約しないこと——B2/S-1が示すとおり、この関数はまさに
+            // そうした「暗黙の不変条件への依存」が実害を生んだ場所である。
             let did_reconnect =
                 was_suspended || s.reconnect_loop_active || s.phase != ConnPhase::Connected;
             (!was_foreground, did_reconnect, reconnect_with)
         };
+        // コードレビュー指摘: ここは`self.shared.state`のロックを解放した後なので、
+        // 別スレッドが同時に発火させる無関係なイベント(例: 別経路の
+        // `notify_network_path_changed`→`handle_unexpected_disconnect`による
+        // `on_connection_state_changed`)がこの`on_foreground_resume`より先に
+        // コールバックへ届く可能性はゼロではない。`did_reconnect`のトレイトdoc
+        // (`lib.rs`)が保証する発火順序は、**この呼び出し自身が同期的に引き起こす**
+        // `reconnect_attempt`/その失敗時の`on_connection_state_changed`との相対順序
+        // のみであり、無関係な別スレッド発のイベントとの順序までは保証しない。
+        // Y-Rの時点ではSwift/Kotlin側はログのみ(実UIはY-P3)なのでこの窓は
+        // 無害だが、Y-P3で実UIを配線する際はこの限界を踏まえること
+        // (`TASKS_IOS_ADR_YR_IMPL_REVIEW.md`のコードレビュー追記を参照)。
         if should_notify {
             self.shared.callback.on_foreground_resume(did_reconnect);
         }

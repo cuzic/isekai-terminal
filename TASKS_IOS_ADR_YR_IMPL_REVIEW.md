@@ -39,6 +39,42 @@
   の追加アサーションのみを残した。
 - M-2/M-3/M-4/M-5は対応せず、記録のみ(いずれもレビューが「任意」と明記)。
 
+## 追記2: `/code-review 104`（独立レビュー、PR作成後）の指摘と対応
+
+PR作成後、別セッションが`/code-review 104`を実行し2件の指摘が来た。いずれも
+コード自体の修正はせず(理由は各項目に記載)、コメントで文書化するに留めた:
+
+1. **`on_foreground_resume`のコールバック発火は`state`ロック解放後なので、
+   別スレッドが発火させる無関係なイベント(例: 別経路の
+   `notify_network_path_changed`→`handle_unexpected_disconnect`)が先に
+   `on_connection_state_changed`を届けうる**。トレイトdoc(`lib.rs`)が保証する
+   発火順序は「この呼び出し自身が同期的に引き起こす`reconnect_attempt`/
+   その失敗時の`on_connection_state_changed`」との相対順序のみで、無関係な
+   別スレッド発イベントとの順序は元々保証していない——ただし実際の誤解を
+   招きうる指摘なので、`orchestrator.rs`の`on_foreground_resume`呼び出し
+   直前にこの限界を明記するコメントを追加した(`:1309`付近)。**Y-Rの時点では
+   Swift/Kotlin側はログのみ(実UIはY-P3)なのでこの窓は無害。Y-P3で実UIを
+   配線する際、この限界(複数コールバックメソッド間でグローバルな発火順序は
+   保証されない)を踏まえた設計にすること**——これは`on_foreground_resume`
+   固有の問題ではなく、このオーケストレータのコールバック配送方式全体が
+   持つ既存の特性であり、Y-Rの2API追加だけでは解消できない(解消するなら
+   全コールバック呼び出しを単一のシリアルキュー/actorへ通す設計変更が要る、
+   本ADRのスコープ外)。
+2. **`did_reconnect`の`s.reconnect_loop_active`の項は、現在の実装だけを見れば
+   `s.phase != ConnPhase::Connected`に包含され厳密には冗長**
+   （`reconnect_loop_active`をtrueにする唯一の経路は必ずその前に
+   `phase = Idle`を設定済み、`on_connected`は`phase = Connected`と
+   `reconnect_loop_active = false`を同一ロック内で常に対にして設定する
+   ——実装時に自分で該当箇所を再読して検証済み)。**意図的に削らなかった**:
+   この式はまさに「復帰時点で本当に接続が生きていないか」を保証するための
+   ものであり、将来どちらかの不変条件が崩れても(例: `phase`の更新漏れ)
+   もう一方の条件が独立に安全側へ倒れる二重の保険として残す方が、
+   B2/S-1が示した「暗黙の不変条件への依存が実害を生んだ」教訓に合う。
+   `orchestrator.rs`に理由を明記するコメントを追加した。同レビューの
+   別findingが正しく指摘したとおり、`phase != Connected`の項自体は
+   `Connecting`中のバックグラウンド化→復帰という別の実経路をカバーする
+   非冗長な項であり、こちらは削ってはいけない。
+
 ---
 
 ## Blocking
