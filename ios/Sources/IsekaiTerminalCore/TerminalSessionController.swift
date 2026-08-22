@@ -988,4 +988,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // Android版と同じく`kind`(`NotifyKind`)をそのままローカル通知APIへ橋渡しすればよい
     // (抑制/重複排除の判断はRust側`orchestrator.rs`のSSOTで既に完結している)。
     public func onNotify(kind: NotifyKind) {}
+
+    // D-6(Y-R): 前面復帰時にRustが下した「再接続を開始したか/猶予内で接続が
+    // 生きていたか」の判断。Y-Rではログのみ(バナー表示等の実UIはY-P3で実装、
+    // `ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照)。didReconnect=trueは
+    // 「開始した」であって「成功した」ではない(N2b)——結果は既存の
+    // onConnectionStateChangedが伝える。
+    public func onForegroundResume(didReconnect: Bool) {
+        Self.logger.info("onForegroundResume: didReconnect=\(didReconnect, privacy: .public)")
+    }
 }

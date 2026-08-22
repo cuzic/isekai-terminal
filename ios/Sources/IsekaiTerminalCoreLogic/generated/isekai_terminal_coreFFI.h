@@ -383,6 +383,13 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod17)(uint64_t, Ru
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD18
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD18
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod18)(uint64_t, int8_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
@@ -424,6 +431,7 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod15 _Nonnull onPromptJump;
     UniffiCallbackInterfaceOrchestratorCallbackMethod16 _Nonnull onPromptOutputCopyReady;
     UniffiCallbackInterfaceOrchestratorCallbackMethod17 _Nonnull onFilePreviewResult;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod18 _Nonnull onForegroundResume;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -816,6 +824,16 @@ uint64_t uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(RustCall
 int8_t uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(uint64_t saved_at_unix_secs, uint64_t now_unix_secs, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_RELEASE_TMUX_WINDOW_CLAIM
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_RELEASE_TMUX_WINDOW_CLAIM
+void uniffi_isekai_terminal_core_fn_func_release_tmux_window_claim(RustBuffer profile_identity, RustBuffer owner_id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_TRY_CLAIM_TMUX_WINDOW
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_TRY_CLAIM_TMUX_WINDOW
+int8_t uniffi_isekai_terminal_core_fn_func_try_claim_tmux_window(RustBuffer profile_identity, RustBuffer owner_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_ISEKAI_TERMINAL_CORE_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_ISEKAI_TERMINAL_CORE_RUSTBUFFER_ALLOC
 RustBuffer ffi_isekai_terminal_core_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -1193,6 +1211,18 @@ uint16_t uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs(vo
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_REATTACH_RECORD_IS_FRESH
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_REATTACH_RECORD_IS_FRESH
 uint16_t uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_RELEASE_TMUX_WINDOW_CLAIM
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_RELEASE_TMUX_WINDOW_CLAIM
+uint16_t uniffi_isekai_terminal_core_checksum_func_release_tmux_window_claim(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_TRY_CLAIM_TMUX_WINDOW
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_TRY_CLAIM_TMUX_WINDOW
+uint16_t uniffi_isekai_terminal_core_checksum_func_try_claim_tmux_window(void
     
 );
 #endif
@@ -1583,6 +1613,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_pro
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FILE_PREVIEW_RESULT
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FILE_PREVIEW_RESULT
 uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FOREGROUND_RESUME
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FOREGROUND_RESUME
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume(void
     
 );
 #endif

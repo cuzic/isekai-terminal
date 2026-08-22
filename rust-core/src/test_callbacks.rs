@@ -89,4 +89,5 @@ impl OrchestratorCallback for ForwardingOrchestratorCallback {
     fn on_file_preview_result(&self, request_id: String, outcome: FilePreviewOutcome) {
         let _ = self.tx.send(OrchestratorTestEvent::FilePreview(request_id, outcome));
     }
+    fn on_foreground_resume(&self, _did_reconnect: bool) {}
 }
