@@ -1918,6 +1918,7 @@ mod pooling_e2e_tests {
         fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
         fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
+        fn on_foreground_resume(&self, _did_reconnect: bool) {}
     }
 
     /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで
