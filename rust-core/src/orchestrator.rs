@@ -1296,7 +1296,15 @@ impl SessionOrchestrator {
             } else {
                 None
             };
-            (!was_foreground, was_suspended, reconnect_with)
+            // round-3レビューS-1: `was_suspended`だけでは、`Quiescing`(猶予内)の
+            // 間にバックグラウンドで接続が切れ`handle_unexpected_disconnect`の
+            // `Action::StartLoop`/`Suppress`経路(`background_state`を書き換えない
+            // 経路)に入ったケースを見落とす。`reconnect_loop_active`/`phase`も
+            // 合わせて見ることで、「復帰時点で接続が生きていない」を
+            // `background_state`の値に関わらず正しく判定する(B2と同型の穴の再発防止)。
+            let did_reconnect =
+                was_suspended || s.reconnect_loop_active || s.phase != ConnPhase::Connected;
+            (!was_foreground, did_reconnect, reconnect_with)
         };
         if should_notify {
             self.shared.callback.on_foreground_resume(did_reconnect);
@@ -1799,6 +1807,10 @@ mod tests {
         notifications: StdMutex<Vec<crate::NotifyKind>>,
         file_preview_outcomes: StdMutex<Vec<FilePreviewOutcome>>,
         foreground_resumes: StdMutex<Vec<bool>>,
+        /// round-3レビューS-2: `on_foreground_resume`と`on_connection_state_changed`が
+        /// 発火した相対順序を検証するため(`foreground_resumes`/`connection_states`は
+        /// 別々の`Vec`なので単体では順序を観測できない)。
+        event_order: StdMutex<Vec<&'static str>>,
         /// `on_host_key`へ渡された`(host, port, fingerprint)`。`host`/`port`は
         /// `OrchestratorState::current_target()`(=`last_connect_attempt`)からの
         /// 導出結果そのものなので、ミラーフィールド廃止後もUIへ正しい接続先が
@@ -1822,6 +1834,7 @@ mod tests {
 
     impl OrchestratorCallback for RecordingCallback {
         fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            self.event_order.lock().unwrap().push("connection_state_changed");
             self.connection_states.lock().unwrap().push(state);
         }
         fn on_screen_update(&self, _update: ScreenUpdate) {}
@@ -1879,6 +1892,7 @@ mod tests {
             self.notifications.lock().unwrap().push(kind);
         }
         fn on_foreground_resume(&self, did_reconnect: bool) {
+            self.event_order.lock().unwrap().push("foreground_resume");
             self.foreground_resumes.lock().unwrap().push(did_reconnect);
         }
     }
@@ -3180,19 +3194,47 @@ mod tests {
     }
 
     #[test]
+    fn notify_will_enter_foreground_fires_true_when_quiescing_with_reconnect_loop_active() {
+        // 実装後レビューS-1の再発防止線: `handle_unexpected_disconnect`の
+        // `Action::StartLoop`/`Suppress`経路(`:776-784`)は`background_state`を
+        // 書き換えない。したがって`Quiescing`(猶予内)の間にバックグラウンドで
+        // 接続が切れて自動再接続ループが始まっても`background_state`は
+        // `Quiescing`のままになりうる。`was_suspended`だけを見ると
+        // このケースを見落として`false`(「接続は維持されています」)を
+        // 発火してしまう(B2と同型の穴)。`reconnect_loop_active`も見ることで
+        // これを塞ぐ。
+        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Quiescing);
+
+        orch.shared.state.lock().reconnect_loop_active = true;
+
+        orch.notify_will_enter_foreground();
+
+        assert_eq!(cb.foreground_resumes.lock().unwrap().as_slice(), &[true]);
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_fires_true_when_quiescing_with_phase_not_connected() {
+        // 実装後レビューS-1の再発防止線(2件目): `reconnect_loop_active`は立って
+        // いないが`phase`が`Connected`でない(例: 切断直後で`Idle`)場合も同様に
+        // 「復帰時点で接続が生きていない」ので`true`が正しい。
+        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+
+        orch.shared.state.lock().phase = ConnPhase::Idle;
+
+        orch.notify_will_enter_foreground();
+
+        assert_eq!(cb.foreground_resumes.lock().unwrap().as_slice(), &[true]);
+    }
+
+    #[test]
     fn notify_will_enter_foreground_is_noop_without_prior_backgrounding() {
         let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
         orch.notify_will_enter_foreground();
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
-        assert!(cb.foreground_resumes.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn notify_will_enter_foreground_is_noop_without_prior_backgrounding_does_not_fire_on_foreground_resume() {
-        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
-        orch.notify_will_enter_foreground();
-
         assert!(cb.foreground_resumes.lock().unwrap().is_empty());
     }
 
@@ -3306,6 +3348,12 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, ConnectionPublicState::Disconnected { .. })),
             "同期失敗はDisconnectedとして通知されるはず, got: {events:?}"
+        );
+        drop(events);
+        assert_eq!(
+            cb.event_order.lock().unwrap().as_slice(),
+            &["foreground_resume", "connection_state_changed"],
+            "on_foreground_resumeはreconnect_attempt(および同期失敗時のon_connection_state_changed)より前に発火するはず(round-3レビューS1)"
         );
     }
 
