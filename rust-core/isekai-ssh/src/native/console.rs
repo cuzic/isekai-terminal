@@ -50,14 +50,15 @@ fn terminal_size_from(size_lookup: impl Fn() -> std::io::Result<(u16, u16)>) -> 
 /// restores it on drop (including on an early return via `?` or a panic
 /// unwind) — mirrors `crossterm::terminal::enable_raw_mode`'s own
 /// recommended usage pattern. On Windows, also best-effort enables VT
-/// (ANSI) output processing on stdout/stderr for the session's lifetime,
-/// restoring each handle's original mode on drop (see
-/// [`enable_vt_output_processing`]) — bundled here rather than as a
-/// separate guard because both are "make this console behave like a VT
-/// terminal for the duration of the interactive session" setup done at the
-/// exact same call site (`native/connect.rs`, right before
-/// `run_shell_io_loop`), with the same "restore exactly what was there
-/// before" lifecycle.
+/// (ANSI) output processing on stdout/stderr (see
+/// [`enable_vt_output_processing`]) *and* stdin's VT/mouse-input mode (see
+/// `super::console_stdin::apply_interactive_input_mode`) for the session's
+/// lifetime, restoring each handle's original mode on drop — bundled here
+/// rather than as separate guards because all three are "make this console
+/// behave like a VT terminal for the duration of the interactive session"
+/// setup done at the exact same call sites (`native/connect.rs` and
+/// `native/mux/{mod,client}.rs`, right before/around the actual I/O loop),
+/// with the same "restore exactly what was there before" lifecycle.
 pub(crate) struct RawModeGuard {
     _private: (),
     /// `(handle, original_mode)` pairs to restore on drop — only the
@@ -66,6 +67,15 @@ pub(crate) struct RawModeGuard {
     /// there's nothing to restore for it). Empty on non-Windows.
     #[cfg(windows)]
     saved_output_modes: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+    /// The stdin console handle's pre-existing mode, from
+    /// [`super::console_stdin::apply_interactive_input_mode`] — `None` if
+    /// stdin isn't a real console handle. Restored bit-selectively on drop
+    /// via [`super::console_stdin::restore_input_mode`]; see that function's
+    /// doc for why a wholesale restore would be wrong. `None` on non-Windows
+    /// (nothing to restore — this crate never touches input console modes
+    /// outside the Windows-native path).
+    #[cfg(windows)]
+    saved_input_mode: Option<(windows_sys::Win32::Foundation::HANDLE, u32)>,
 }
 
 impl RawModeGuard {
@@ -73,12 +83,49 @@ impl RawModeGuard {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw terminal mode")?;
         #[cfg(windows)]
         let saved_output_modes = enable_vt_output_processing();
+        // Applies stdin's VT-input/mouse-input/QuickEdit mode for this
+        // session's lifetime, scoped here (rather than being set once,
+        // permanently, by `console_stdin`'s own singleton setup) precisely
+        // so it can be restored below on drop — see `console_stdin`'s module
+        // docs for why that matters (QuickEdit, unlike VT input, is a
+        // visible feature outside any SSH session).
+        #[cfg(windows)]
+        let saved_input_mode = super::console_stdin::apply_interactive_input_mode();
         Ok(Self {
             _private: (),
             #[cfg(windows)]
             saved_output_modes,
+            #[cfg(windows)]
+            saved_input_mode,
         })
     }
+}
+
+/// Resolves `std_handle` (e.g. `STD_OUTPUT_HANDLE`/`STD_INPUT_HANDLE`) to a
+/// real console character-device handle, or `None` if it's invalid, closed,
+/// or redirected (piped/file) — the common "is this actually an interactive
+/// console, not a redirected/piped stream" gate every Win32-console-mode
+/// function in this crate needs before touching
+/// `GetConsoleMode`/`SetConsoleMode`, factored out so the same
+/// null/`-1`/`GetFileType` check isn't hand-copied at every call site
+/// ([`enable_vt_output_processing`] below, [`RawModeGuard`]'s `Drop`, and
+/// `super::console_stdin::apply_interactive_input_mode`/`try_open_console`).
+#[cfg(windows)]
+pub(crate) fn console_char_handle(std_handle: u32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
+    use windows_sys::Win32::System::Console::GetStdHandle;
+
+    const FILE_TYPE_CHAR: u32 = 0x0002;
+
+    let handle = unsafe { GetStdHandle(std_handle) };
+    if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
+        return None;
+    }
+    if unsafe { GetFileType(handle) } != FILE_TYPE_CHAR {
+        return None;
+    }
+    Some(handle)
 }
 
 /// Enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (plus
@@ -103,27 +150,25 @@ impl RawModeGuard {
 /// visibly broken by this than a plain shell prompt's occasional color
 /// code, which matches the native-pty-gaps bug report this fixes.
 ///
-/// Best-effort and silent: `GetStdHandle`/`GetConsoleMode`/`SetConsoleMode`
-/// failing (piped/redirected stdout, a handle that isn't a console at all,
-/// or an ancient Windows without VT support) just leaves the mode
-/// unchanged — matches `console_stdin.rs::try_open_console`'s same
+/// Best-effort and silent: [`console_char_handle`]/`GetConsoleMode`/
+/// `SetConsoleMode` failing (piped/redirected stdout, a handle that isn't a
+/// console at all, or an ancient Windows without VT support) just leaves the
+/// mode unchanged — matches `console_stdin.rs::try_open_console`'s same
 /// best-effort convention for the input side. Returns the `(handle,
 /// original_mode)` pairs that were actually changed, for [`RawModeGuard`]'s
 /// `Drop` to restore.
 #[cfg(windows)]
 fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE, u32)> {
-    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        GetConsoleMode, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     let mut saved = Vec::new();
     for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(std_handle) };
-        if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
+        let Some(handle) = console_char_handle(std_handle) else {
             continue;
-        }
+        };
         let mut mode: u32 = 0;
         if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
             continue;
@@ -138,15 +183,88 @@ fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE,
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // Best-effort: there's nothing sensible to do if disabling raw mode
-        // fails on the way out (e.g. the terminal was already torn down),
-        // and panicking from a `Drop` impl is its own hazard.
+        // Best-effort, and in this specific order: reset any mouse-tracking
+        // mode (`?1000`/`?1002`/`?1003`/`?1006`) the *remote* side (e.g.
+        // `tmux`) turned on via DECSET, while VT output processing is still
+        // enabled so conhost actually interprets these bytes rather than
+        // printing them literally. Without this, an abnormal disconnect
+        // never delivers the remote's own mouse-tracking-off sequence, and
+        // — combined with `saved_input_mode` being restored below —
+        // conhost would otherwise keep translating clicks as VT mouse
+        // reports (typed as literal escape-sequence text) into whatever
+        // reuses this console window next, which is a worse, more confusing
+        // failure than mouse simply not working.
+        //
+        // Accepted trade-off (code-review finding, PR #102): this bundles a
+        // remote-protocol-level reset (DECRST for mouse tracking) into what
+        // is otherwise a purely local Win32-console-mode guard, and it fires
+        // on *every* `RawModeGuard` drop — including the narrowly-scoped
+        // guard `native/mux/mod.rs::wait_or_abort` creates fresh for each
+        // reconnect-backoff wait, where no live tmux mouse session exists
+        // yet. Harmless today (resetting an already-off mode is a no-op, and
+        // this write is now gated on/flushed to a real console same as
+        // everything else here), but if more remote-protocol cleanup ever
+        // gets layered onto this guard, it likely belongs at the mux/session
+        // layer (which actually knows whether mouse tracking was negotiated)
+        // rather than accreting further here.
+        //
+        // Two things this must get right that an earlier version of this
+        // code didn't (code-review finding, PR #102):
+        //
+        // 1. **Gated on stdout actually being a real console.** An `Exec`
+        //    session (`isekai-ssh host -- cmd`) shares this exact
+        //    `RawModeGuard` scope with an interactive `Shell` session (see
+        //    `native/connect.rs`), and its stdout is routinely redirected —
+        //    `isekai-ssh host -- cmd > out.txt` or piped into another
+        //    program. Writing this sequence unconditionally would append 20
+        //    literal bytes to the end of every such capture, silently
+        //    corrupting non-interactive output that has nothing to do with
+        //    an interactive mouse session. [`console_char_handle`] is the
+        //    same "is this a real console, not a redirect" check
+        //    [`enable_vt_output_processing`] already gates on.
+        // 2. **Explicitly flushed.** `std::io::stdout()` is a global,
+        //    internally line-buffered writer; this payload contains no
+        //    `\n`, so `write_all` alone only buffers it. `main.rs`'s `fn
+        //    main` always finishes via `std::process::exit`, which runs no
+        //    destructors *and* flushes no stdio buffers — an unflushed
+        //    write here would sit in that buffer and simply be discarded on
+        //    exit, silently defeating the entire point of this reset
+        //    (this crate's `RawModeGuard` itself *does* still `Drop`
+        //    normally before `std::process::exit` runs, since
+        //    `run(): u8`'s `.await` chain — and this guard's scope within
+        //    it — fully unwinds before `main` ever calls `std::process::exit`;
+        //    it's specifically the stdout *buffer*, not this `Drop`, that
+        //    `std::process::exit` skips past).
+        #[cfg(windows)]
+        {
+            if console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some() {
+                let mut stdout = std::io::stdout();
+                let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+                let _ = std::io::Write::flush(&mut stdout);
+            }
+        }
+        // There's nothing sensible to do if disabling raw mode fails on the
+        // way out (e.g. the terminal was already torn down), and panicking
+        // from a `Drop` impl is its own hazard.
         let _ = crossterm::terminal::disable_raw_mode();
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::Console::SetConsoleMode;
             for (handle, original_mode) in &self.saved_output_modes {
                 unsafe { SetConsoleMode(*handle, *original_mode) };
+            }
+            // Must run *after* `disable_raw_mode()`, not before: crossterm's
+            // Windows `disable_raw_mode()` unconditionally ORs
+            // `ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT`
+            // into whatever the *current* mode is rather than restoring a
+            // saved value — restoring the input mode first would just have
+            // those three bits re-cleared by `disable_raw_mode()` right
+            // afterward, leaving the console with no line input/echo. See
+            // `console_stdin::restore_input_mode`'s doc for the full
+            // reasoning; that function is itself bit-selective so this
+            // ordering is the only thing this call site needs to get right.
+            if let Some((handle, original_mode)) = self.saved_input_mode {
+                super::console_stdin::restore_input_mode(handle, original_mode);
             }
         }
     }
