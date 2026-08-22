@@ -771,7 +771,7 @@ async fn resume_preempts_a_still_established_connection() {
     let resume_proof = mac.finalize().into_bytes();
 
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, 0, 0);
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, payload.len() as u64, 0);
     send2.write_all(&resume_frame).await.unwrap();
 
     // `PREEMPT_WAIT_TIMEOUT`(サーバー側、2秒)+ 猶予。プリエンプションが
@@ -784,7 +784,16 @@ async fn resume_preempts_a_still_established_connection() {
         panic!("expected RESUME_ACK via preemption, got {ack:?}");
     };
 
-    // 明け渡された TCP 接続の上で、確かに中継が継続していることを確認する。
+    // conn1 が受け取れなかった echo(`payload`)は、reattach 後の同じ stream の
+    // 続きとして再送される(他のresumeテストと同じ契約) — 先にそれを
+    // 読み切ってから、明け渡された TCP 接続の上で新しい中継を確認する。
+    let mut replayed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut replayed))
+        .await
+        .expect("timed out waiting for replayed bytes")
+        .unwrap();
+    assert_eq!(&replayed[..], payload, "プリエンプション前の未確認echoが再送されるはず");
+
     let more = b"after-preemption";
     send2.write_all(more).await.unwrap();
     let mut more_echo = vec![0u8; more.len()];
