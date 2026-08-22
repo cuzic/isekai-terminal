@@ -44,6 +44,7 @@ pub mod debug_fault;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
 pub mod reattach_persistence;
+pub mod tmux_window_claim;
 // 項目2: OEMバッテリー最適化への案内UI。「案内すべきか」の判断ポリシー
 // (`.claude/rules/rust-ssot.md`準拠、reattach_persistence.rsと同型)。
 pub mod background_reliability_policy;
@@ -1502,6 +1503,18 @@ pub trait OrchestratorCallback: Send + Sync {
     /// 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
     /// パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
     fn on_file_preview_result(&self, request_id: String, outcome: crate::file_preview::FilePreviewOutcome);
+    /// #9(iOS)/D-6: 前面復帰時にRustが下した「再接続を開始したか / 猶予内で
+    /// 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
+    /// (`orchestrator.rs::notify_will_enter_foreground`から発火)。
+    /// `did_reconnect`は「再接続を開始した」であって「成功した」ではない
+    /// (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+    /// `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
+    /// 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
+    /// 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し
+    /// (および同期失敗時の`on_connection_state_changed(Disconnected)`)より
+    /// **前**に発火する(round-3 レビュー S1)——順序を逆にすると「Disconnected
+    /// 直後に『再接続しています』」という矛盾した一過性表示になる。
+    fn on_foreground_resume(&self, did_reconnect: bool);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
