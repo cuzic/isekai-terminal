@@ -177,6 +177,23 @@ impl WarmStandby {
         self.standby.lock().await.is_some()
     }
 
+    /// Unconditionally discards the current standby connection, if any,
+    /// without probing it — the caller's own `ensure_warm` on the next tick
+    /// then dials a completely fresh one. For use when the caller has
+    /// independent evidence (e.g. a wall-clock jump across a host suspend/
+    /// resume — see `resume_loop.rs`'s warm-standby task) that the existing
+    /// standby, even if it would still pass [`WarmStandby::ensure_warm`]'s
+    /// own probe, is more likely a zombie than a genuinely healthy
+    /// connection (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-3): a standby dialed
+    /// *before* a suspend has zero value and negative value if promoted
+    /// (it can win the server's park race against a healthy resume attempt —
+    /// see that ADR's RC-3/RC-4). `probe`'s own liveness check cannot catch
+    /// this case — a zombie connection is, by definition, one that still
+    /// looks alive to both sides.
+    pub async fn invalidate(&self) {
+        *self.standby.lock().await = None;
+    }
+
     /// (Re-)establishes the standby connection if it isn't already warm and
     /// responsive. Call this periodically — see this module's docs for the
     /// agreed keepalive tiering — rather than only once at startup, both to

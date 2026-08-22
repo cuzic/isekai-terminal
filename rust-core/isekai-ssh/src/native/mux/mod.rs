@@ -121,8 +121,15 @@ const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 struct ReconnectBackoff {
     initial: Duration,
     max: Duration,
+    /// Fraction in `0.0..=1.0` of random jitter applied on top of the
+    /// exponential delay (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4) — same
+    /// rationale and shape as `isekai_transport::backoff::BackoffPolicy`'s
+    /// own `jitter` field (not reused directly: this struct exists
+    /// specifically to avoid depending on `isekai-transport`, see its own
+    /// doc comment above). `0.0` disables jitter entirely.
+    jitter: f64,
 }
-const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10) };
+const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.25 };
 
 /// An `OwnerLost` attempt that stayed connected at least this long before
 /// losing its (new) owner again counts as a genuinely separate, later
@@ -139,12 +146,30 @@ const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration
 const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
 
 impl ReconnectBackoff {
-    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+    fn base_delay(&self, attempt: u32) -> Duration {
         let shift = attempt.min(32);
         let multiplier: u64 = 1u64 << shift;
         let initial_millis = u64::try_from(self.initial.as_millis()).unwrap_or(u64::MAX);
         let max_millis = u64::try_from(self.max.as_millis()).unwrap_or(u64::MAX);
         Duration::from_millis(initial_millis.saturating_mul(multiplier).min(max_millis))
+    }
+
+    /// `base_delay` with random jitter applied (mirrors
+    /// `isekai_transport::backoff::BackoffPolicy::delay_for_attempt`) — a
+    /// sleep/resume or a roaming network change wakes every open tab's
+    /// reconnect loop at once, and a jitter-free exponential backoff would
+    /// have them all retry (and silently re-deploy, `native::connect::
+    /// drive_connect_recovery`) on the exact same schedule.
+    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        use rand::Rng as _;
+        let base = self.base_delay(attempt);
+        if self.jitter <= 0.0 {
+            return base;
+        }
+        let jitter = self.jitter.min(1.0);
+        let factor = 1.0 + rand::thread_rng().gen_range(-jitter..=jitter);
+        let jittered_secs = (base.as_secs_f64() * factor).max(0.0);
+        Duration::from_secs_f64(jittered_secs).min(self.max)
     }
 }
 
@@ -1331,20 +1356,44 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_doubles_each_attempt_until_capped() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5) };
-        assert_eq!(backoff.delay_for_attempt(0), Duration::from_millis(100));
-        assert_eq!(backoff.delay_for_attempt(1), Duration::from_millis(200));
-        assert_eq!(backoff.delay_for_attempt(2), Duration::from_millis(400));
-        assert_eq!(backoff.delay_for_attempt(3), Duration::from_millis(800));
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5), jitter: 0.0 };
+        assert_eq!(backoff.base_delay(0), Duration::from_millis(100));
+        assert_eq!(backoff.base_delay(1), Duration::from_millis(200));
+        assert_eq!(backoff.base_delay(2), Duration::from_millis(400));
+        assert_eq!(backoff.base_delay(3), Duration::from_millis(800));
     }
 
     #[test]
     fn reconnect_backoff_converges_to_and_never_exceeds_max() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5) };
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5), jitter: 0.0 };
         for attempt in 0..64 {
-            assert!(backoff.delay_for_attempt(attempt) <= backoff.max, "attempt {attempt} exceeded max");
+            assert!(backoff.base_delay(attempt) <= backoff.max, "attempt {attempt} exceeded max");
         }
-        assert_eq!(backoff.delay_for_attempt(63), backoff.max, "backoff must saturate at max for a large attempt count, not overflow/panic");
+        assert_eq!(backoff.base_delay(63), backoff.max, "backoff must saturate at max for a large attempt count, not overflow/panic");
+    }
+
+    #[test]
+    fn reconnect_backoff_jitter_stays_within_the_configured_fraction_and_never_exceeds_max() {
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(200), max: Duration::from_secs(2), jitter: 0.5 };
+        let base = backoff.base_delay(3);
+        for _ in 0..200 {
+            let jittered = backoff.delay_for_attempt(3);
+            assert!(jittered <= backoff.max, "jittered delay must never exceed max");
+            let lower = base.mul_f64(0.5);
+            let upper = base.min(backoff.max).mul_f64(1.5).min(backoff.max);
+            assert!(
+                jittered + Duration::from_millis(1) >= lower && jittered <= upper + Duration::from_millis(1),
+                "jittered delay {jittered:?} outside [{lower:?}, {upper:?}]"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_zero_jitter_returns_exactly_the_base_delay() {
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(50), max: Duration::from_secs(1), jitter: 0.0 };
+        for attempt in 0..5 {
+            assert_eq!(backoff.delay_for_attempt(attempt), backoff.base_delay(attempt));
+        }
     }
 
     #[test]
@@ -1366,7 +1415,7 @@ mod tests {
         // Mirrors `isekai_transport::backoff::BackoffPolicy`'s own overflow
         // guard test — `attempt.min(32)` before the `1u64 << shift` is what
         // makes this safe; a regression here would panic in debug builds.
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(1), max: Duration::from_secs(1) };
+        let backoff = ReconnectBackoff { initial: Duration::from_millis(1), max: Duration::from_secs(1), jitter: 0.0 };
         assert_eq!(backoff.delay_for_attempt(u32::MAX), backoff.max);
     }
 

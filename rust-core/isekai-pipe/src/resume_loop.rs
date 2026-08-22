@@ -25,10 +25,14 @@ use crate::RelayTransportKind;
 use crate::DEFAULT_RESUME_WINDOW;
 
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+/// `jitter: 0.25`(±25%、ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4): スリープ
+/// 復帰やネットワーク瞬断は「複数タブが同時に同じイベントを見る」典型例
+/// であり、ジッター無しの純粋な指数バックオフでは全タブが同一グリッド上で
+/// 同期再試行し、サーバー側のresume競合(D-2)を確実に踏みにいく。
 const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
     initial: Duration::from_millis(500),
     max: Duration::from_secs(10),
-    jitter: 0.0,
+    jitter: 0.25,
 };
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Bounds `replay_and_advance`'s post-resume replay write — same rationale
@@ -48,6 +52,16 @@ const REPLAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// degrading, only that it's already dead, at which point promotion is
 /// already being attempted).
 const WARM_STANDBY_PROBE_INTERVAL: Duration = Duration::from_secs(20);
+/// How many multiples of [`WARM_STANDBY_PROBE_INTERVAL`] the *wall-clock* gap
+/// between two consecutive warm-standby ticks must exceed before it's
+/// treated as a host suspend/resume rather than ordinary scheduling jitter
+/// (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-3) — comfortably above what
+/// `MissedTickBehavior::Delay` coalescing or CPU contention could plausibly
+/// cause on their own, since `tokio::time::interval` ticks on a *monotonic*
+/// clock that (unlike wall-clock) does not count suspended time at all, so a
+/// real suspend shows up here as wall-clock racing far ahead of the
+/// monotonic tick count.
+const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 
 pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
@@ -172,7 +186,7 @@ where
         if !err.signals_busy_other_session() || now >= deadline {
             return Err(err);
         }
-        let delay = RESUME_BACKOFF.base_delay(attempt_no).min(deadline - now);
+        let delay = RESUME_BACKOFF.delay_for_attempt(attempt_no, &mut rand::thread_rng()).min(deadline - now);
         attempt_no = attempt_no.saturating_add(1);
         eprintln!(
             "isekai-pipe connect: remote helper reports BUSY_OTHER_SESSION (likely this client's own prior \
@@ -857,7 +871,7 @@ async fn resume_with_backoff_until_deadline(
             ));
         }
 
-        let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
+        let delay = RESUME_BACKOFF.delay_for_attempt(attempt, &mut rand::thread_rng()).min(deadline - now);
         attempt = attempt.saturating_add(1);
         wait_backoff_or_network_change(
             delay,
@@ -1013,8 +1027,22 @@ pub(crate) async fn run_resume_loop(
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(WARM_STANDBY_PROBE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Wall-clock (not monotonic — see `WARM_STANDBY_SUSPEND_JUMP_FACTOR`'s
+            // docs) timestamp of the previous tick, to detect a host suspend/
+            // resume spanning this interval.
+            let mut last_wall = std::time::SystemTime::now();
             loop {
                 interval.tick().await;
+                let now = std::time::SystemTime::now();
+                if now.duration_since(last_wall).map(|elapsed| elapsed > WARM_STANDBY_PROBE_INTERVAL * WARM_STANDBY_SUSPEND_JUMP_FACTOR).unwrap_or(false) {
+                    log::info!(
+                        "isekai-pipe connect: wall clock jumped further than this warm-standby interval allows for \
+                         (likely a host suspend/resume); discarding the standby connection rather than trusting its \
+                         own probe (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-3)"
+                    );
+                    ws.invalidate().await;
+                }
+                last_wall = now;
                 if let Err(e) = ws.ensure_warm().await {
                     log::warn!("isekai-pipe connect: warm-standby ensure_warm failed: {e:#}");
                 }
