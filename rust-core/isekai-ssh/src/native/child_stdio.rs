@@ -111,7 +111,27 @@ impl ChildStdio {
 
 impl AsyncRead for ChildStdio {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stdout).poll_read(cx, buf)
+        // Diagnostic-only (`ISEKAI_SSH_DEBUG_DUMP_STDOUT`, see
+        // `log_file::dump_stdout_chunk`'s docs): this is the raw byte stream
+        // read from the `isekai-pipe connect --stdio` child's stdout, one
+        // hop *below* `russh` — `russh`'s own SSH transport (encryption,
+        // packet framing, `ChannelMsg` extraction) all happens upstream of
+        // this read, so unlike the other `dump_stdout_chunk` call sites
+        // (which dump post-SSH-decryption terminal bytes), what lands here
+        // is ciphertext and not meant to be eyeballed for escape-sequence
+        // content. It exists to catch a coarser class of bug at the
+        // isekai-pipe/QUIC-tunnel boundary — unexpected truncation,
+        // duplication, or unusual read-boundary chunking of the raw stream
+        // — by comparing byte counts/chunk boundaries here against the
+        // post-decryption dumps further up the stack
+        // (`mux/owner.rs`'s `owner:channel-data` or
+        // `native/connect.rs`'s `single-process:channel-data`).
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.get_mut().stdout).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            crate::log_file::dump_stdout_chunk("child-stdio:raw-from-isekai-pipe", &buf.filled()[before..]);
+        }
+        poll
     }
 }
 

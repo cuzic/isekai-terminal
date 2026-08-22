@@ -1154,7 +1154,7 @@ where
             msg = channel.wait() => {
                 match msg {
                     Some(russh::ChannelMsg::Data { data }) => {
-                        crate::log_file::dump_stdout_chunk(&data);
+                        crate::log_file::dump_stdout_chunk("single-process:channel-data", &data);
                         let _ = stdout.write_all(&data).await;
                         let _ = stdout.flush().await;
                     }

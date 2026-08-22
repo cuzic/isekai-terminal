@@ -328,7 +328,7 @@ where
             frame = frame_rx.recv() => {
                 match frame {
                     Some(Ok(Some(Frame::Stdout(data)))) => {
-                        crate::log_file::dump_stdout_chunk(&data);
+                        crate::log_file::dump_stdout_chunk("mux-client:frame-stdout", &data);
                         let _ = stdout.write_all(&data).await;
                         let _ = stdout.flush().await;
                     }

@@ -158,20 +158,36 @@ pub fn append_verbose_line(line: &str) {
 }
 
 /// Diagnostic-only, opt-in via the `ISEKAI_SSH_DEBUG_DUMP_STDOUT` env var:
-/// hex-dumps every chunk of remote data about to be written to the local
-/// interactive session's stdout into the verbose log. Exists to answer "are
-/// the exact bytes leaving this process already wrong, or does an escape
-/// sequence get lost/altered downstream (ConPTY/Windows Terminal)?" for a
-/// class of bug where certain sequences (private-mode DECSET, `OSC 4;264`)
-/// take effect through plain `ssh` but silently do nothing through
-/// `isekai-ssh`, on Windows Terminal specifically — every relay hop in this
-/// crate was already confirmed byte-preserving by code reading, but nobody
-/// had captured the literal bytes at the point they leave the process (see
-/// the isekai-ssh-tab-color/mouse investigation notes). Checked once per
-/// process via `OnceLock`, so this costs nothing when unset (the default).
+/// hex-dumps every chunk of remote data flowing through a given relay hop
+/// into the verbose log. Exists to answer "are the exact bytes leaving this
+/// process already wrong, or does an escape sequence get lost/altered
+/// downstream (ConPTY/Windows Terminal)?" for a class of bug where certain
+/// sequences (private-mode DECSET, `OSC 4;264`) take effect through plain
+/// `ssh` but silently do nothing through `isekai-ssh`, on Windows Terminal
+/// specifically — every relay hop in this crate was already confirmed
+/// byte-preserving by code reading, but nobody had captured the literal
+/// bytes at each hop boundary (see the isekai-ssh-tab-color/mouse
+/// investigation notes). Checked once per process via `OnceLock`, so this
+/// costs nothing when unset (the default).
+///
+/// A minimal `russh`-only test client (no isekai-ssh layers at all) was
+/// later confirmed to relay `OSC 4;264` correctly end-to-end against the
+/// same real host/tmux config, which rules out `russh` itself and Windows
+/// VT-mode console setup as the cause and narrows the remaining suspects to
+/// this crate's own hops: the mux client/holder named-pipe relay, or the
+/// `isekai-pipe connect --stdio` QUIC tunnel underneath `russh`. `tag`
+/// identifies which of those hops produced a given dump line — call sites
+/// in the *same OS process* as the interactive foreground `isekai-ssh.exe`
+/// (`native/connect.rs`'s single-process fallback) and call sites in the
+/// separate detached mux-owner/holder process (`native/mux/owner.rs`,
+/// `native/child_stdio.rs`) can end up appending to the very same
+/// `--isekai-log-file` path (the holder is re-exec'd with the identical
+/// CLI args, `native/mux/holder.rs::DetachedProcessSpawner::spawn`), so the
+/// tag is the only way to tell which hop a given line came from once lines
+/// from both processes interleave in one file.
 static DUMP_STDOUT_ENABLED: OnceLock<bool> = OnceLock::new();
 
-pub(crate) fn dump_stdout_chunk(data: &[u8]) {
+pub(crate) fn dump_stdout_chunk(tag: &str, data: &[u8]) {
     let enabled = *DUMP_STDOUT_ENABLED.get_or_init(|| std::env::var_os("ISEKAI_SSH_DEBUG_DUMP_STDOUT").is_some());
     if !enabled || data.is_empty() {
         return;
@@ -186,7 +202,7 @@ pub(crate) fn dump_stdout_chunk(data: &[u8]) {
             escaped.push_str(&format!("\\x{b:02x}"));
         }
     }
-    let line = format!("[dump] stdout chunk ({} bytes) hex: {}| escaped: {escaped}", data.len(), hex);
+    let line = format!("[dump:{tag}] chunk ({} bytes) hex: {}| escaped: {escaped}", data.len(), hex);
     dispatch(&line, |l| append_verbose_line(l));
 }
 

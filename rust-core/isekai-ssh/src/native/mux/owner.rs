@@ -500,6 +500,21 @@ where
             msg = channel.wait() => {
                 match msg {
                     Some(russh::ChannelMsg::Data { data }) => {
+                        // One hop earlier than `mux/client.rs`'s
+                        // `mux-client:frame-stdout` dump: this is the owner
+                        // process's own `russh` channel-data receipt, before
+                        // it's wrapped into a `Frame::Stdout` and relayed
+                        // through the named-pipe hop to the client. If bytes
+                        // are already wrong here, the named-pipe hop
+                        // (`local-ipc-mux`) is cleared and the corruption is
+                        // upstream: either `russh` itself (already ruled out
+                        // generically by a standalone russh-only test
+                        // client, but not yet for this exact request_pty/
+                        // channel-open configuration) or the `isekai-pipe
+                        // connect --stdio` QUIC tunnel underneath it
+                        // (`native/child_stdio.rs`'s raw-stdio dump is the
+                        // next hop down for that).
+                        crate::log_file::dump_stdout_chunk("owner:channel-data", &data);
                         write_frame(writer, &Frame::Stdout(data.to_vec())).await?;
                     }
                     Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
