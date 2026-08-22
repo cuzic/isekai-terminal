@@ -328,6 +328,7 @@ where
             frame = frame_rx.recv() => {
                 match frame {
                     Some(Ok(Some(Frame::Stdout(data)))) => {
+                        crate::log_file::dump_stdout_chunk(&data);
                         let _ = stdout.write_all(&data).await;
                         let _ = stdout.flush().await;
                     }

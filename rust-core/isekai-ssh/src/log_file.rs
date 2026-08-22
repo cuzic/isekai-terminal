@@ -157,6 +157,39 @@ pub fn append_verbose_line(line: &str) {
     VERBOSE_LOG_FILE.append_line(line);
 }
 
+/// Diagnostic-only, opt-in via the `ISEKAI_SSH_DEBUG_DUMP_STDOUT` env var:
+/// hex-dumps every chunk of remote data about to be written to the local
+/// interactive session's stdout into the verbose log. Exists to answer "are
+/// the exact bytes leaving this process already wrong, or does an escape
+/// sequence get lost/altered downstream (ConPTY/Windows Terminal)?" for a
+/// class of bug where certain sequences (private-mode DECSET, `OSC 4;264`)
+/// take effect through plain `ssh` but silently do nothing through
+/// `isekai-ssh`, on Windows Terminal specifically — every relay hop in this
+/// crate was already confirmed byte-preserving by code reading, but nobody
+/// had captured the literal bytes at the point they leave the process (see
+/// the isekai-ssh-tab-color/mouse investigation notes). Checked once per
+/// process via `OnceLock`, so this costs nothing when unset (the default).
+static DUMP_STDOUT_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn dump_stdout_chunk(data: &[u8]) {
+    let enabled = *DUMP_STDOUT_ENABLED.get_or_init(|| std::env::var_os("ISEKAI_SSH_DEBUG_DUMP_STDOUT").is_some());
+    if !enabled || data.is_empty() {
+        return;
+    }
+    let mut hex = String::with_capacity(data.len() * 3);
+    let mut escaped = String::with_capacity(data.len());
+    for &b in data {
+        hex.push_str(&format!("{b:02x} "));
+        if (0x20..=0x7e).contains(&b) {
+            escaped.push(b as char);
+        } else {
+            escaped.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    let line = format!("[dump] stdout chunk ({} bytes) hex: {}| escaped: {escaped}", data.len(), hex);
+    dispatch(&line, |l| append_verbose_line(l));
+}
+
 /// Opens (creating if needed, always appending) `path` and installs it as
 /// the process-wide log file. Must be called at most once; `run()` only
 /// calls this when `--isekai-log-file` was actually given.
