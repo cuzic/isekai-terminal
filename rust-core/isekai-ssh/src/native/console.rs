@@ -101,6 +101,33 @@ impl RawModeGuard {
     }
 }
 
+/// Resolves `std_handle` (e.g. `STD_OUTPUT_HANDLE`/`STD_INPUT_HANDLE`) to a
+/// real console character-device handle, or `None` if it's invalid, closed,
+/// or redirected (piped/file) — the common "is this actually an interactive
+/// console, not a redirected/piped stream" gate every Win32-console-mode
+/// function in this crate needs before touching
+/// `GetConsoleMode`/`SetConsoleMode`, factored out so the same
+/// null/`-1`/`GetFileType` check isn't hand-copied at every call site
+/// ([`enable_vt_output_processing`] below, [`RawModeGuard`]'s `Drop`, and
+/// `super::console_stdin::apply_interactive_input_mode`/`try_open_console`).
+#[cfg(windows)]
+pub(crate) fn console_char_handle(std_handle: u32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
+    use windows_sys::Win32::System::Console::GetStdHandle;
+
+    const FILE_TYPE_CHAR: u32 = 0x0002;
+
+    let handle = unsafe { GetStdHandle(std_handle) };
+    if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
+        return None;
+    }
+    if unsafe { GetFileType(handle) } != FILE_TYPE_CHAR {
+        return None;
+    }
+    Some(handle)
+}
+
 /// Enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (plus
 /// `DISABLE_NEWLINE_AUTO_RETURN`, so a bare `\n` doesn't get an implicit
 /// `\r` inserted by the console host on top of whatever cursor positioning
@@ -123,27 +150,25 @@ impl RawModeGuard {
 /// visibly broken by this than a plain shell prompt's occasional color
 /// code, which matches the native-pty-gaps bug report this fixes.
 ///
-/// Best-effort and silent: `GetStdHandle`/`GetConsoleMode`/`SetConsoleMode`
-/// failing (piped/redirected stdout, a handle that isn't a console at all,
-/// or an ancient Windows without VT support) just leaves the mode
-/// unchanged — matches `console_stdin.rs::try_open_console`'s same
+/// Best-effort and silent: [`console_char_handle`]/`GetConsoleMode`/
+/// `SetConsoleMode` failing (piped/redirected stdout, a handle that isn't a
+/// console at all, or an ancient Windows without VT support) just leaves the
+/// mode unchanged — matches `console_stdin.rs::try_open_console`'s same
 /// best-effort convention for the input side. Returns the `(handle,
 /// original_mode)` pairs that were actually changed, for [`RawModeGuard`]'s
 /// `Drop` to restore.
 #[cfg(windows)]
 fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE, u32)> {
-    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        GetConsoleMode, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     let mut saved = Vec::new();
     for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let handle = unsafe { GetStdHandle(std_handle) };
-        if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
+        let Some(handle) = console_char_handle(std_handle) else {
             continue;
-        }
+        };
         let mut mode: u32 = 0;
         if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
             continue;
@@ -168,11 +193,55 @@ impl Drop for RawModeGuard {
         // conhost would otherwise keep translating clicks as VT mouse
         // reports (typed as literal escape-sequence text) into whatever
         // reuses this console window next, which is a worse, more confusing
-        // failure than mouse simply not working. Errors here are ignored:
-        // stdout may already be closed/redirected by the time this runs.
+        // failure than mouse simply not working.
+        //
+        // Accepted trade-off (code-review finding, PR #102): this bundles a
+        // remote-protocol-level reset (DECRST for mouse tracking) into what
+        // is otherwise a purely local Win32-console-mode guard, and it fires
+        // on *every* `RawModeGuard` drop — including the narrowly-scoped
+        // guard `native/mux/mod.rs::wait_or_abort` creates fresh for each
+        // reconnect-backoff wait, where no live tmux mouse session exists
+        // yet. Harmless today (resetting an already-off mode is a no-op, and
+        // this write is now gated on/flushed to a real console same as
+        // everything else here), but if more remote-protocol cleanup ever
+        // gets layered onto this guard, it likely belongs at the mux/session
+        // layer (which actually knows whether mouse tracking was negotiated)
+        // rather than accreting further here.
+        //
+        // Two things this must get right that an earlier version of this
+        // code didn't (code-review finding, PR #102):
+        //
+        // 1. **Gated on stdout actually being a real console.** An `Exec`
+        //    session (`isekai-ssh host -- cmd`) shares this exact
+        //    `RawModeGuard` scope with an interactive `Shell` session (see
+        //    `native/connect.rs`), and its stdout is routinely redirected —
+        //    `isekai-ssh host -- cmd > out.txt` or piped into another
+        //    program. Writing this sequence unconditionally would append 20
+        //    literal bytes to the end of every such capture, silently
+        //    corrupting non-interactive output that has nothing to do with
+        //    an interactive mouse session. [`console_char_handle`] is the
+        //    same "is this a real console, not a redirect" check
+        //    [`enable_vt_output_processing`] already gates on.
+        // 2. **Explicitly flushed.** `std::io::stdout()` is a global,
+        //    internally line-buffered writer; this payload contains no
+        //    `\n`, so `write_all` alone only buffers it. `main.rs`'s `fn
+        //    main` always finishes via `std::process::exit`, which runs no
+        //    destructors *and* flushes no stdio buffers — an unflushed
+        //    write here would sit in that buffer and simply be discarded on
+        //    exit, silently defeating the entire point of this reset
+        //    (this crate's `RawModeGuard` itself *does* still `Drop`
+        //    normally before `std::process::exit` runs, since
+        //    `run(): u8`'s `.await` chain — and this guard's scope within
+        //    it — fully unwinds before `main` ever calls `std::process::exit`;
+        //    it's specifically the stdout *buffer*, not this `Drop`, that
+        //    `std::process::exit` skips past).
         #[cfg(windows)]
         {
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+            if console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some() {
+                let mut stdout = std::io::stdout();
+                let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+                let _ = std::io::Write::flush(&mut stdout);
+            }
         }
         // There's nothing sensible to do if disabling raw mode fails on the
         // way out (e.g. the terminal was already torn down), and panicking
