@@ -386,6 +386,13 @@ class TerminalSession(
         override fun onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {
             pendingFilePreviewRequests.remove(requestId)?.complete(outcome)
         }
+
+        // D-6(Y-R): 前面復帰時のRustの判断(再接続を開始したか/猶予内で接続が
+        // 生きていたか)。Q10: Y-RではAndroid側はログのみに留める(UX活用は
+        // 別follow-up、ADR_IOS_PARITY_IMPLEMENTATION.md §5.1-4/D-6-5参照)。
+        override fun onForegroundResume(didReconnect: Boolean) {
+            RemoteLogger.i("IsekaiTerminalSSH", "onForegroundResume: didReconnect=$didReconnect")
+        }
     }
 
     private val orchestrator: SessionOrchestratorInterface = orchestratorFactory(callback)

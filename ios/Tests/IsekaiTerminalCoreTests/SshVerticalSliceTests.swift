@@ -108,4 +108,5 @@ private actor SshVerticalSliceRecorder: OrchestratorCallback {
     nonisolated func onPromptOutputCopyReady(text: String?) {}
     nonisolated func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
     nonisolated func onNotify(kind: NotifyKind) {}
+    nonisolated func onForegroundResume(didReconnect: Bool) {}
 }
