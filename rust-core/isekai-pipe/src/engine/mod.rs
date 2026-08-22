@@ -69,6 +69,15 @@ const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `handle_resume_stream` waits, after asking an in-flight relay to
+/// yield (`Session::preempt`), for it to actually park the connection
+/// (`Session::reparked`) before giving up and falling back to the ordinary
+/// `UnknownToken` rejection (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2).
+/// Short — this blocks a client that may genuinely be the live one — but
+/// generous enough for a relay loop's current `select!` iteration (at most
+/// one in-flight read/write) to notice `preempt` and return.
+const PREEMPT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct Args {
     target: SocketAddr,
     service_name: String,
@@ -1377,6 +1386,37 @@ async fn handle_resume_stream(
         session.parked_since = None;
         session.parked_tcp.take()
     };
+    let parked = match parked {
+        Some(parked) => Some(parked),
+        None => {
+            // Nothing parked *right now* — but if this session_id is
+            // currently `Established` (i.e. some other connection is
+            // actively relaying it), it may well be a zombie: looks alive
+            // to this server, but the peer never actually receives
+            // anything (the exact scenario ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
+            // documents). Ask it to yield ("preemption", D-2) rather than
+            // immediately rejecting this — likely more recent, more likely
+            // live — resume attempt.
+            let is_established = attach_runtime
+                .established_lease_for(isekai_protocol::SessionId::from_bytes(session_id))
+                .await
+                .is_some();
+            if is_established {
+                let reparked = handle.lock().await.reparked.clone();
+                let notified = reparked.notified();
+                handle.lock().await.preempt.notify_waiters();
+                if tokio::time::timeout(PREEMPT_WAIT_TIMEOUT, notified).await.is_ok() {
+                    let mut session = handle.lock().await;
+                    session.parked_since = None;
+                    session.parked_tcp.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    };
     let Some((tcp_read, tcp_write)) = parked else {
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
         return Err(anyhow!(
@@ -1641,7 +1681,9 @@ async fn finish_or_park_session(
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
+            let reparked = session.reparked.clone();
             drop(session);
+            reparked.notify_waiters();
             // park済み(=parked_sinceがSome)になったので、既存の
             // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
             // 回収可能な状態になった — `table_guard`のDropフォールバックは
@@ -1651,6 +1693,25 @@ async fn finish_or_park_session(
             }
             // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
             // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
+        }
+        RelayOutcome::Preempted {
+            tcp_read,
+            tcp_write,
+        } => {
+            log::info!(
+                "session {} preempted by a later resume attempt, parking for it",
+                hex_lower(&id)
+            );
+            lease.keep();
+            let mut session = handle.lock().await;
+            session.parked_tcp = Some((tcp_read, tcp_write));
+            session.parked_since = Some(std::time::Instant::now());
+            let reparked = session.reparked.clone();
+            drop(session);
+            reparked.notify_waiters();
+            if let Some(table_guard) = table_guard {
+                table_guard.disarm();
+            }
         }
     }
 }
@@ -1726,6 +1787,14 @@ enum RelayOutcome {
         tcp_read: tokio::net::tcp::OwnedReadHalf,
         tcp_write: tokio::net::tcp::OwnedWriteHalf,
     },
+    /// 同一 session_id への新しい RESUME 要求が「後着優先」で明け渡しを
+    /// 要求した（`Session::preempt`、ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2）。
+    /// `DataStreamDied`と全く同じ扱い（park して resume を待つ）だが、
+    /// 呼び出し側が`Session::reparked`を通知する点だけが異なる。
+    Preempted {
+        tcp_read: tokio::net::tcp::OwnedReadHalf,
+        tcp_write: tokio::net::tcp::OwnedWriteHalf,
+    },
 }
 
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
@@ -1751,6 +1820,7 @@ async fn relay_buffered(
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
     let output_space_available = session.lock().await.output_space_available.clone();
+    let preempt = session.lock().await.preempt.clone();
 
     loop {
         let s2c_read_len = {
@@ -1790,6 +1860,17 @@ async fn relay_buffered(
             }
             _ = tokio::time::sleep(Duration::from_millis(50)), if s2c_read_len == 0 => {
                 continue;
+            }
+            // A later RESUME for this same session_id wants this connection
+            // to yield (`Session::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
+            // D-2) — most likely because this connection is a zombie (looks
+            // established here but the peer never actually receives
+            // anything) and the later attempt is the real live one. Give up
+            // the TCP connection the same way a dead data stream would, so
+            // `handle_resume_stream`'s waiting preemptor can grab it.
+            _ = preempt.notified() => {
+                log::info!("relay to {target}: preempted by a later RESUME for the same session; parking for it");
+                return RelayOutcome::Preempted { tcp_read, tcp_write };
             }
             result = tcp_read.read(&mut s2c_buf[..s2c_read_len]), if s2c_read_len > 0 => {
                 match result {

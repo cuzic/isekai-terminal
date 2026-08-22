@@ -69,6 +69,7 @@ fn encode_quicmux_resume_frame(session_id: &[u8], resume_proof: &[u8], client_se
     frame
 }
 
+#[derive(Debug)]
 enum QuicmuxResumeResponse {
     Ack { committed_offset: u64, sent_offset: u64 },
     Reject(u8),
@@ -694,6 +695,104 @@ async fn resume_after_connection_loss_replays_and_continues() {
         .expect("timed out waiting for post-resume echo")
         .unwrap();
     assert_eq!(&more_echo[..], more, "resume 後も中継が継続するはず");
+
+    send2.finish().unwrap();
+}
+
+/// ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2: a `RESUME` for a session_id that
+/// the server still considers `Established` (no parked TCP — some other
+/// connection is, as far as the server knows, actively relaying it) must not
+/// be rejected outright. In production this is exactly the zombie-connection
+/// scenario the ADR documents (a connection that looks alive to the server
+/// but whose peer never actually receives anything, e.g. after a suspend/
+/// resume) blocking a later, genuinely live resume attempt for up to a full
+/// QUIC idle timeout. This test drives the same shape without needing a real
+/// zombie: `conn1` is left open (never closed, never read from again) while
+/// a second connection sends `RESUME` for the same session_id — the server
+/// must preempt `conn1`'s in-flight relay (`Session::preempt`) and let the
+/// second, later attempt succeed within a few seconds rather than being
+/// rejected.
+#[tokio::test]
+async fn resume_preempts_a_still_established_connection() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &[]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    // 1本目の connection: 通常どおり attach してセッションを確立するが、
+    // 明示的には閉じない(=サーバーからは今もEstablishedに見える、生きて
+    // いるが実際には誰も読み書きしていない「ゾンビ」の代わり)。
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, _recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+    let session_id = cack1[1..17].to_vec();
+
+    let payload = b"still-established";
+    send1.write_all(payload).await.unwrap();
+    // conn1 はここから先、一切読み書きしない(=ゾンビ)。閉じもしない —
+    // サーバーからは"Established"のまま見え続けるはず。
+
+    // 2本目の connection から、conn1 をまだ一切閉じていない状態で RESUME する。
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+
+    let mut exporter2 = [0u8; 32];
+    conn2
+        .export_keying_material(&mut exporter2, EXPORTER_LABEL, b"")
+        .unwrap();
+    let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
+    mac.update(&exporter2);
+    mac.update(&session_id);
+    let resume_proof = mac.finalize().into_bytes();
+
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, 0, 0);
+    send2.write_all(&resume_frame).await.unwrap();
+
+    // `PREEMPT_WAIT_TIMEOUT`(サーバー側、2秒)+ 猶予。プリエンプションが
+    // 効いていなければ、この応答はタイムアウトするか
+    // `ResumeRejectReason::UnknownToken`で拒否される。
+    let ack = tokio::time::timeout(Duration::from_secs(5), read_quicmux_resume_response(&mut recv2))
+        .await
+        .expect("timed out waiting for a resume response — preemption did not free the session in time");
+    let QuicmuxResumeResponse::Ack { .. } = ack else {
+        panic!("expected RESUME_ACK via preemption, got {ack:?}");
+    };
+
+    // 明け渡された TCP 接続の上で、確かに中継が継続していることを確認する。
+    let more = b"after-preemption";
+    send2.write_all(more).await.unwrap();
+    let mut more_echo = vec![0u8; more.len()];
+    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut more_echo))
+        .await
+        .expect("timed out waiting for post-preemption echo")
+        .unwrap();
+    assert_eq!(&more_echo[..], more, "preemption 後も中継が継続するはず");
 
     send2.finish().unwrap();
 }
