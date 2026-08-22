@@ -69,6 +69,19 @@ pub struct Session {
     /// `--resume-window`が伸びるたびに)無条件でそれより長く保持し続けるのは、
     /// クライアントへの約束を破っている(Fableレビュー指摘)。
     pub negotiated_resume_grace_secs: Option<u32>,
+    /// 「後着優先」プリエンプション用のシグナル(ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
+    /// D-2)。新しいRESUME要求がこのsession_idに来たが`parked_tcp`が既に
+    /// `None`(=別の接続が現在アクティブにリレー中)だった場合、その要求は
+    /// このNotifyを`notify_waiters()`して現在の`relay_buffered`ループに
+    /// 「明け渡せ」と伝える。ゾンビ接続(サーバーからは生きて見えるが実際には
+    /// パケットが届いていないQUIC接続)がparkを握ったまま健全な再接続を
+    /// ブロックし続ける窓を、QUICのidle timeout(15〜30秒)より大幅に短く
+    /// 縮めるためのもの。
+    pub preempt: Arc<Notify>,
+    /// `parked_tcp`が`Some`になった(parkされた)ことを伝えるシグナル。
+    /// `preempt`を送った側はこれを待つことで、ポーリングせずに
+    /// 「明け渡し完了」を知ることができる。
+    pub reparked: Arc<Notify>,
 }
 
 impl Session {
@@ -80,6 +93,8 @@ impl Session {
             parked_since: None,
             output_space_available: Arc::new(Notify::new()),
             negotiated_resume_grace_secs: None,
+            preempt: Arc::new(Notify::new()),
+            reparked: Arc::new(Notify::new()),
         }
     }
 }
