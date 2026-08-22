@@ -70,6 +70,16 @@ const IDLE_GRACE: Duration = Duration::from_secs(10);
 /// little headroom under load. 10s gives 5x that legitimate worst case.
 const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often [`handle_died`] polls [`client::Handle::is_closed`] for the
+/// shared SSH connection dying out from under this holder (a sleep resume,
+/// a network drop that finally tears down the underlying transport, etc.) —
+/// see [`serve_clients`]'s new third `select!` branch. Short enough that a
+/// dead holder disappears in about a second rather than lingering for the
+/// full [`IDLE_GRACE`] (or longer — see the "always-connects.md" incident
+/// this const exists to fix), long enough not to burn a whole task purely
+/// spinning on a lock.
+const HANDLE_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How long [`relay_loop`] waits, after forwarding the client's local stdin
 /// EOF to the remote as a channel EOF (`Frame::Shutdown` → `channel.eof()`),
 /// for the remote to actually confirm the channel is done
@@ -141,6 +151,14 @@ where
     // know which transitions the waiter cares about.
     let count_changed = Arc::new(Notify::new());
     let mut ever_served_a_client = false;
+    // Signaled by a client task the moment it learns the shared handle
+    // itself is unusable (a channel-open failure — see `relay_client`'s
+    // `Err(e)` arm below) — a much faster, more direct signal than waiting
+    // for `handle_died`'s own `is_closed()` poll to catch up, since
+    // `is_closed()` only flips once russh's own session task has actually
+    // wound down, which a hung (not yet closed) transport may delay well
+    // past this.
+    let shutdown = Arc::new(Notify::new());
 
     loop {
         let grace = if ever_served_a_client { IDLE_GRACE } else { WARMUP_GRACE };
@@ -171,9 +189,10 @@ where
                 let ctl_routes = ctl_routes.clone();
                 let active_clients = active_clients.clone();
                 let count_changed = count_changed.clone();
+                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref(), tab_idle_color, tab_attention_color)
+                        relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref(), tab_idle_color, tab_attention_color, &shutdown)
                             .await
                     {
                         // One client's session ending badly must not disturb the
@@ -184,11 +203,55 @@ where
                     count_changed.notify_one();
                 });
             }
+            // The shared SSH connection died out from under this holder
+            // (`always-connects.md`: a dead holder that keeps its exclusive
+            // claim on the local IPC channel is exactly the "server-side
+            // state leak the client's own retries can't fix" pattern that
+            // rule calls out — every tab retrying against this holder just
+            // gets `Rejected` and falls back to an unmultiplexed direct
+            // connect, one per tab, until this holder's own `IDLE_GRACE`
+            // eventually elapses). Exiting immediately here — rather than
+            // waiting out that grace — lets the very next tab's `dispatch`
+            // see `ConnectError::NotFound` and spawn a fresh holder instead.
+            _ = handle_died(&handle) => {
+                log_line!(
+                    "isekai-ssh mux owner: the shared SSH connection is gone; exiting immediately \
+                     so the next tab spawns a fresh holder"
+                );
+                return Ok(());
+            }
+            // A client's own channel-open just failed against the shared
+            // handle (see `relay_client`) — treated as proof the handle is
+            // dead, same conclusion as `handle_died` above but reached
+            // faster (it doesn't wait for russh's own session task to
+            // notice and flip `is_closed()`).
+            _ = shutdown.notified() => {
+                log_line!(
+                    "isekai-ssh mux owner: a client's channel open failed against the shared SSH connection; \
+                     treating it as dead and exiting immediately so the next tab spawns a fresh holder"
+                );
+                return Ok(());
+            }
             _ = wait_for_idle_exit(&active_clients, &count_changed, grace) => {
                 log_line!("isekai-ssh mux owner: no clients for {grace:?}; exiting (ControlPersist-equivalent idle-exit)");
                 return Ok(());
             }
         }
+    }
+}
+
+/// Resolves once the shared handle's underlying russh session task has
+/// actually wound down (`client::Handle::is_closed()` —
+/// `russh-0.48.2/src/client/mod.rs:236`, previously unused anywhere in this
+/// crate). Polls rather than subscribing to some push signal because
+/// `russh::client::Handle` exposes none; `HANDLE_HEALTH_POLL_INTERVAL` keeps
+/// the cost of that negligible.
+async fn handle_died<H: client::Handler>(handle: &Mutex<client::Handle<H>>) {
+    loop {
+        if handle.lock().await.is_closed() {
+            return;
+        }
+        tokio::time::sleep(HANDLE_HEALTH_POLL_INTERVAL).await;
     }
 }
 
@@ -244,6 +307,7 @@ pub(crate) async fn relay_client<Conn, H>(
     ctl_routes: Option<&ForwardRoutes>,
     tab_idle_color: Option<(u8, u8, u8)>,
     tab_attention_color: Option<(u8, u8, u8)>,
+    shutdown: &Notify,
 ) -> Result<()>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -341,6 +405,12 @@ where
                 ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
             }
             let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
+            // A failed *channel open* (as opposed to a protocol
+            // version/token mismatch, both handled earlier and never
+            // reaching here) is evidence the shared handle itself is dead,
+            // not just this one client — see `serve_clients`'s `shutdown`
+            // branch and `handle_died`'s doc comment.
+            shutdown.notify_waiters();
             return Err(e);
         }
     };
@@ -794,6 +864,58 @@ mod tests {
         handle
     }
 
+    // -- handle_died / D-1 shared-handle health check -----------------------
+
+    /// `handle_died` must not resolve while the shared handle's underlying
+    /// session task is still alive.
+    #[tokio::test]
+    async fn handle_died_does_not_resolve_while_the_handle_is_alive() {
+        let handle = Mutex::new(authed_test_handle().await);
+        let result = tokio::time::timeout(Duration::from_secs(2), handle_died(&handle)).await;
+        assert!(result.is_err(), "handle_died must not resolve for a still-live handle");
+    }
+
+    /// Once the shared handle disconnects (the real-world equivalent of a
+    /// sleep/resume or network drop finally tearing down the underlying
+    /// transport — see `ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md`), `is_closed()`
+    /// eventually flips and `handle_died` must resolve promptly rather than
+    /// leaving a zombie holder to linger for `IDLE_GRACE` or longer.
+    #[tokio::test]
+    async fn handle_died_resolves_once_the_shared_handle_disconnects() {
+        let inner = authed_test_handle().await;
+        inner.disconnect(russh::Disconnect::ByApplication, "test teardown", "en").await.unwrap();
+        let handle = Mutex::new(inner);
+        let result = tokio::time::timeout(Duration::from_secs(5), handle_died(&handle)).await;
+        assert!(result.is_ok(), "handle_died must resolve once the shared handle's session task ends");
+    }
+
+    /// End-to-end companion to the two `handle_died` unit tests above:
+    /// `serve_clients` itself must exit (`Ok(())`) once the shared handle
+    /// dies, well before either `WARMUP_GRACE` or `IDLE_GRACE` would
+    /// otherwise elapse — this is the actual fix for the zombie-holder
+    /// pattern `ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md` documents (a holder
+    /// that keeps its exclusive local-IPC claim after its shared SSH
+    /// connection has died, forcing every subsequent tab to fall back to an
+    /// unmultiplexed direct connect until `IDLE_GRACE` finally elapses).
+    #[tokio::test]
+    async fn serve_clients_exits_promptly_once_the_shared_handle_dies_no_clients_ever_connected() {
+        let name = "isekai-ssh-mux-handle-died-no-clients-test";
+        let token = Arc::new(b"tok".to_vec());
+        let inner = authed_test_handle().await;
+        inner.disconnect(russh::Disconnect::ByApplication, "test teardown", "en").await.unwrap();
+        let handle = Arc::new(Mutex::new(inner));
+
+        let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None, None, None));
+
+        // No real time advance needed — `handle_died` must catch this well
+        // under `WARMUP_GRACE` (30s), so a short real-time timeout suffices
+        // and keeps this test fast.
+        let result = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+        assert!(result.is_ok(), "serve_clients must exit promptly once the shared handle is dead, not wait out WARMUP_GRACE/IDLE_GRACE");
+        assert!(result.unwrap().unwrap().is_ok(), "a dead-handle exit is a clean Ok(()), not an error");
+    }
+
     /// End-to-end: `serve_clients` must exit on its own (`Ok(())`) once a
     /// client has connected and then fully disconnected and the idle grace
     /// has elapsed — the `ControlPersist`-equivalent lifetime policy the
@@ -1021,7 +1143,7 @@ mod tests {
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         // Client sends Hello, then some stdin, then Shutdown.
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"correct-horse-battery-staple".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
@@ -1110,7 +1232,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         write_frame(
             &mut client,
@@ -1177,7 +1299,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         write_frame(
             &mut client,
@@ -1235,7 +1357,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION + 1, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
 
@@ -1253,7 +1375,7 @@ mod tests {
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"a-wrong-token".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
 
@@ -1273,7 +1395,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");
@@ -1294,7 +1416,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (_client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
         // `tokio::spawn` doesn't poll the task inline, and `tokio::time::advance`
         // moves the clock *before* its own internal yield (Opus review,
         // 2026-07-31) — without this yield, `relay`'s `timeout(HELLO_READ_TIMEOUT, ..)`
@@ -1386,7 +1508,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
@@ -1453,7 +1575,7 @@ mod tests {
         // `Some(&routes)`: ctl-socket *is* on for this connection — the skip
         // being tested is specific to this one Hello carrying a
         // remote_command, not the forward being unavailable altogether.
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None, &Notify::new()).await });
 
         write_frame(
             &mut client,
@@ -1574,7 +1696,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
@@ -1761,7 +1883,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
@@ -1900,7 +2022,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes), None, None, &Notify::new()).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
             .await
