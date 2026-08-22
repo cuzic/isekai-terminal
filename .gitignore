@@ -13,6 +13,11 @@
 /rust-core/noq-multipath-spike/target/
 # cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
 /android/src/main/jniLibs/
+# 手元ビルドをリポジトリCWD直下に手置きしてWindows実機へ配置する運用
+# (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md RC-1/D-6)向け。誤ってgit管理に
+# 紛れ込まないようにする — CI(release-build.yml)成果物が正規の配布元。
+/isekai-ssh.exe
+/isekai-pipe.exe
 # build-ios-xcframework.sh regenerates this; do not commit prebuilt binaries.
 /ios/Frameworks/
 # Xcode per-user state / SwiftPM local caches (not shared project config).

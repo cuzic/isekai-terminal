@@ -112,16 +112,34 @@ impl Sink {
         let _ = file.flush();
     }
 
-    /// Appends one already-formatted line (a trailing `\n` is always added,
-    /// whether or not `line` has one). Checks [`is_enabled`](Self::is_enabled)
-    /// itself first so a disabled sink skips building the `String` buffer
-    /// entirely, rather than relying solely on [`append_bytes`](Self::append_bytes)'s
-    /// own (otherwise-sufficient) no-op check.
+    /// Appends one already-formatted line, prefixed with a UTC RFC 3339
+    /// timestamp (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-5) — a trailing `\n`
+    /// is always added, whether or not `line` has one. Checks
+    /// [`is_enabled`](Self::is_enabled) itself first so a disabled sink skips
+    /// building the `String` buffer entirely, rather than relying solely on
+    /// [`append_bytes`](Self::append_bytes)'s own (otherwise-sufficient)
+    /// no-op check.
+    ///
+    /// UTC, not local time: `isekai_trust::now_rfc3339()` (already a
+    /// dependency of this crate, reused here rather than adding a new one)
+    /// only ever formats UTC — getting the local offset portably (this
+    /// module runs on Linux/macOS/Windows) would need a real timezone
+    /// dependency this codebase has deliberately avoided so far. Every line
+    /// this module ever writes is diagnostic-only, never parsed back, so a
+    /// reader mentally converting UTC once is a small cost against a real
+    /// diagnostic gap: before this, nothing in either log file (this crate's
+    /// own `--isekai-log-file`, or the always-on default verbose sink) could
+    /// answer "when did this happen" at all, which stalled a real
+    /// investigation (see that ADR's Q-1).
     fn append_line(&self, line: &str) {
         if !self.is_enabled() {
             return;
         }
-        let mut buf = String::with_capacity(line.len() + 1);
+        let timestamp = isekai_trust::now_rfc3339();
+        let mut buf = String::with_capacity(timestamp.len() + 3 + line.len() + 1);
+        buf.push('[');
+        buf.push_str(&timestamp);
+        buf.push_str("] ");
         buf.push_str(line);
         buf.push('\n');
         self.append_bytes(buf.as_bytes());
