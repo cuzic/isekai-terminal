@@ -160,8 +160,17 @@ const OWNED_INPUT_BITS: u32 = {
 /// and clearing `ENABLE_QUICK_EDIT_MODE` (which requires `ENABLE_EXTENDED_FLAGS`
 /// to take effect). Returns the *pre-existing* mode alongside the handle, for
 /// [`restore_input_mode`] to restore later; returns `None` (nothing to
-/// restore) if this isn't a real console handle, matching [`try_open_console`]'s
-/// own `FILE_TYPE_CHAR` gate.
+/// restore, and nothing changed) if this isn't a real console handle, or if
+/// `SetConsoleMode` rejects the combined flag set outright (this crate's
+/// `ReadConsoleW`-based reader below only ever receives mouse events via VT
+/// input's own escape-sequence translation — see the module docs — so on a
+/// hypothetical Windows old enough to reject `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+/// there is no partial mode this function could apply that would make mouse
+/// reporting work anyway; retrying with a reduced flag set would only
+/// silently change the user's QuickEdit setting for no actual benefit, so
+/// this deliberately does not retry — see PR #102's review for why an
+/// earlier version of this function's "retry without VT input" fallback was
+/// wrong).
 ///
 /// Called from `native::console::RawModeGuard::enable`, not from this
 /// module's own [`ensure_stdin_reader`] singleton setup — see the module docs
@@ -169,22 +178,12 @@ const OWNED_INPUT_BITS: u32 = {
 /// lifecycle rather than being applied once, permanently, for the process.
 #[cfg(windows)]
 pub(crate) fn apply_interactive_input_mode() -> Option<(windows_sys::Win32::Foundation::HANDLE, u32)> {
-    use windows_sys::Win32::Storage::FileSystem::GetFileType;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT,
-        ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
+        GetConsoleMode, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
     };
-    use windows_sys::Win32::Foundation::HANDLE;
 
-    const FILE_TYPE_CHAR: u32 = 0x0002;
-
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
-        return None;
-    }
-    if unsafe { GetFileType(handle) } != FILE_TYPE_CHAR {
-        return None;
-    }
+    let handle = super::console::console_char_handle(STD_INPUT_HANDLE)?;
 
     let mut mode: u32 = 0;
     if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
@@ -194,16 +193,7 @@ pub(crate) fn apply_interactive_input_mode() -> Option<(windows_sys::Win32::Foun
     let new_mode = (mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS)
         & !ENABLE_QUICK_EDIT_MODE;
     if unsafe { SetConsoleMode(handle, new_mode) } == 0 {
-        // `SetConsoleMode` is all-or-nothing: a single flag the running
-        // Windows build rejects (e.g. `ENABLE_VIRTUAL_TERMINAL_INPUT` on
-        // pre-Anniversary-Update Windows) fails the *whole* call, which would
-        // otherwise silently drop the mouse-input/QuickEdit fix too. Retry
-        // without VT input so mouse reporting still works even where VT
-        // input's own escape-sequence translation for special keys doesn't.
-        let fallback = (mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE;
-        if unsafe { SetConsoleMode(handle, fallback) } == 0 {
-            return None;
-        }
+        return None;
     }
 
     Some((handle, mode))
@@ -211,7 +201,10 @@ pub(crate) fn apply_interactive_input_mode() -> Option<(windows_sys::Win32::Foun
 
 /// Restores the bits [`apply_interactive_input_mode`] changed, without
 /// touching anything else — in particular without touching
-/// `ENABLE_LINE_INPUT`/`ENABLE_ECHO_INPUT`/`ENABLE_PROCESSED_INPUT`.
+/// `ENABLE_LINE_INPUT`/`ENABLE_ECHO_INPUT`/`ENABLE_PROCESSED_INPUT`, and
+/// (unlike an earlier version of this function — PR #102's review) without
+/// leaving `ENABLE_EXTENDED_FLAGS` permanently set on a console that never
+/// had it.
 ///
 /// This must be a **bit-selective** read-modify-write, not
 /// `SetConsoleMode(handle, original)`: `RawModeGuard::drop` calls
@@ -231,39 +224,40 @@ pub(crate) fn restore_input_mode(handle: windows_sys::Win32::Foundation::HANDLE,
     if unsafe { GetConsoleMode(handle, &mut current) } == 0 {
         return;
     }
-    // Keep every bit `disable_raw_mode` (or anything else) has touched since
-    // `apply_interactive_input_mode` ran, except the ones this module owns —
-    // restore exactly those to their pre-existing values. `ENABLE_EXTENDED_FLAGS`
-    // itself is left set: it has no visible effect on its own (it only gates
-    // whether `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE` writes take
-    // effect), and leaving it on is what makes this restore fully take effect
-    // in the same call.
+    // Step 1: restore `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE` (the bits
+    // in `OWNED_INPUT_BITS` besides VT input/mouse input) to their
+    // pre-existing values. `ENABLE_EXTENDED_FLAGS` must be part of *this*
+    // call for that write to take effect at all, regardless of whether the
+    // original mode had it set — see `SetConsoleMode`'s documented flag
+    // semantics.
     let restored = (current & !OWNED_INPUT_BITS) | (original & OWNED_INPUT_BITS) | ENABLE_EXTENDED_FLAGS;
-    unsafe { SetConsoleMode(handle, restored) };
+    if unsafe { SetConsoleMode(handle, restored) } == 0 {
+        return;
+    }
+    // Step 2: if the console never had `ENABLE_EXTENDED_FLAGS` set before
+    // [`apply_interactive_input_mode`] turned it on, clear it back off now —
+    // as its own, separate call, since *un*-setting `ENABLE_EXTENDED_FLAGS`
+    // is not itself gated by `ENABLE_EXTENDED_FLAGS` being present in the
+    // same call (only changes to `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE`
+    // are, and step 1 already applied those). This is what makes the restore
+    // byte-exact rather than leaving a mode bit permanently flipped that
+    // `apply_interactive_input_mode` was the only reason it was ever on.
+    if original & ENABLE_EXTENDED_FLAGS == 0 {
+        unsafe { SetConsoleMode(handle, restored & !ENABLE_EXTENDED_FLAGS) };
+    }
 }
 
 #[cfg(windows)]
 fn try_open_console() -> Option<UnboundedReceiver<Vec<u8>>> {
-    use windows_sys::Win32::Storage::FileSystem::GetFileType;
-    use windows_sys::Win32::System::Console::{GetStdHandle, ReadConsoleW, STD_INPUT_HANDLE};
+    use windows_sys::Win32::System::Console::{ReadConsoleW, STD_INPUT_HANDLE};
     use windows_sys::Win32::Foundation::HANDLE;
 
-    const FILE_TYPE_CHAR: u32 = 0x0002;
-
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
-        return None;
-    }
-
-    // Only read via `ReadConsoleW` for character devices (real consoles) —
-    // the mode itself (VT input, mouse input, QuickEdit) is applied by
+    // The mode itself (VT input, mouse input, QuickEdit) is applied by
     // `native::console::RawModeGuard::enable` via
     // [`apply_interactive_input_mode`] before this function ever runs (every
     // call site opens `ConsoleStdin` right after enabling a `RawModeGuard` in
     // the same function), not here — see the module docs.
-    if unsafe { GetFileType(handle) } != FILE_TYPE_CHAR {
-        return None;
-    }
+    let handle = super::console::console_char_handle(STD_INPUT_HANDLE)?;
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
