@@ -7588,6 +7588,21 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) 
     
+    /**
+     * #9(iOS)/D-6: 前面復帰時にRustが下した「再接続を開始したか / 猶予内で
+     * 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
+     * (`orchestrator.rs::notify_will_enter_foreground`から発火)。
+     * `did_reconnect`は「再接続を開始した」であって「成功した」ではない
+     * (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+     * `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
+     * 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
+     * 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し
+     * (および同期失敗時の`on_connection_state_changed(Disconnected)`)より
+     * **前**に発火する(round-3 レビュー S1)——順序を逆にすると「Disconnected
+     * 直後に『再接続しています』」という矛盾した一過性表示になる。
+     */
+    func onForegroundResume(didReconnect: Bool) 
+    
 }
 
 
@@ -8036,6 +8051,30 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 return uniffiObj.onFilePreviewResult(
                      requestId: try FfiConverterString.lift(requestId),
                      outcome: try FfiConverterTypeFilePreviewOutcome_lift(outcome)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onForegroundResume: { (
+            uniffiHandle: UInt64,
+            didReconnect: Int8,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onForegroundResume(
+                     didReconnect: try FfiConverterBool.lift(didReconnect)
                 )
             }
 
@@ -9253,6 +9292,21 @@ public func reattachRecordIsFresh(savedAtUnixSecs: UInt64, nowUnixSecs: UInt64) 
     )
 })
 }
+public func releaseTmuxWindowClaim(profileIdentity: String, ownerId: String)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_release_tmux_window_claim(
+        FfiConverterString.lower(profileIdentity),
+        FfiConverterString.lower(ownerId),$0
+    )
+}
+}
+public func tryClaimTmuxWindow(profileIdentity: String, ownerId: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_try_claim_tmux_window(
+        FfiConverterString.lower(profileIdentity),
+        FfiConverterString.lower(ownerId),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -9327,6 +9381,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh() != 47307) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_release_tmux_window_claim() != 7950) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_try_claim_tmux_window() != 2123) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
@@ -9522,6 +9582,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 797) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 33882) {
         return InitializationResult.apiChecksumMismatch
     }
 
