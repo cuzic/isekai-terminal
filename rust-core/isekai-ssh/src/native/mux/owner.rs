@@ -440,6 +440,7 @@ where
             frame = frame_rx.recv() => {
                 match frame {
                     Some(Ok(Some(Frame::Stdin(data)))) if !stdin_done => {
+                        crate::log_file::dump_stdout_chunk("owner:frame-stdin", &data);
                         if channel.data(&data[..]).await.is_err() {
                             break;
                         }

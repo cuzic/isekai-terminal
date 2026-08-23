@@ -137,7 +137,20 @@ impl AsyncRead for ChildStdio {
 
 impl AsyncWrite for ChildStdio {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stdin).poll_write(cx, buf)
+        // Diagnostic-only (see `poll_read`'s docs above for the full
+        // rationale): the input-direction counterpart — raw bytes about to
+        // be written into `isekai-pipe connect --stdio`'s stdin, one hop
+        // *below* `russh`'s own channel-data write. Also ciphertext at this
+        // point; exists to compare byte counts/chunking against the
+        // pre-encryption dumps further up the stack (`owner:frame-stdin` /
+        // `single-process:stdin-read`) for the reverse (local→remote)
+        // direction, which — unlike the remote→local direction — had never
+        // been instrumented at any hop before.
+        let poll = Pin::new(&mut self.get_mut().stdin).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            crate::log_file::dump_stdout_chunk("child-stdio:write-to-isekai-pipe", &buf[..*n]);
+        }
+        poll
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

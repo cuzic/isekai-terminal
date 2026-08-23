@@ -295,6 +295,7 @@ fn try_open_console() -> Option<UnboundedReceiver<Vec<u8>>> {
             // than simply absent.
             let utf16: Vec<u16> = wbuf[..nread as usize].to_vec();
             let utf8: Vec<u8> = String::from_utf16_lossy(&utf16).into_bytes();
+            crate::log_file::dump_stdout_chunk("console-stdin:read-console-w", &utf8);
             if tx.send(utf8).is_err() {
                 break;
             }

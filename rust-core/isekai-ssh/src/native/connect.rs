@@ -1111,6 +1111,7 @@ where
                         let _ = channel.eof().await;
                     }
                     Ok(n) => {
+                        crate::log_file::dump_stdout_chunk("single-process:stdin-read", &buf[..n]);
                         let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
                         if !to_send.is_empty() {
                             if channel.data(&to_send[..]).await.is_err() {

@@ -292,6 +292,7 @@ where
                         let _ = write_frame(conn_write, &Frame::Shutdown).await;
                     }
                     Ok(n) => {
+                        crate::log_file::dump_stdout_chunk("mux-client:stdin-read", &buf[..n]);
                         if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
                             abort_active(&mut active_build).await;
                             return Ok(ClientOutcome::OwnerLost);
