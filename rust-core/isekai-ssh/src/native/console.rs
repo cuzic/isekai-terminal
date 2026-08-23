@@ -236,12 +236,44 @@ fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE,
 ///    stdio buffers — an unflushed write here would sit in that buffer and
 ///    simply be discarded on exit, silently defeating the entire point of
 ///    this reset.
+/// 3. **Scope-enables VT output processing for the duration of this one
+///    write, then restores whatever mode it found.** Because this function
+///    is called *after* every `RawModeGuard` for the session has already
+///    dropped (that's the whole point — see above), it cannot assume
+///    [`enable_vt_output_processing`] is still in effect; by the time this
+///    runs, the last guard's own `Drop` has already restored stdout's
+///    *pre-existing* mode. On a legacy conhost window where VT output
+///    processing was off to begin with — precisely the audience
+///    `ISEKAI_SSH_CONSOLE_MOUSE` exists for — skipping this would print the
+///    DECRST bytes below as literal garbage instead of having conhost
+///    interpret them, and would fail to actually reset mouse tracking at
+///    all (a real regression an earlier version of this function had: it
+///    relied on running while a still-live `RawModeGuard`'s VT-processing
+///    mode was in effect, which stopped being true once the reset moved out
+///    of `Drop` and into this standalone, later-called function).
 #[cfg(windows)]
 pub(crate) fn reset_mouse_tracking() {
-    if console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some() {
-        let mut stdout = std::io::stdout();
-        let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
-        let _ = std::io::Write::flush(&mut stdout);
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+
+    let Some(handle) = console_char_handle(STD_OUTPUT_HANDLE) else {
+        return;
+    };
+
+    let mut mode: u32 = 0;
+    let had_mode = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
+    if had_mode {
+        unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN) };
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    let _ = std::io::Write::flush(&mut stdout);
+
+    if had_mode {
+        unsafe { SetConsoleMode(handle, mode) };
     }
 }
 

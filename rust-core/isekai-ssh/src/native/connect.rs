@@ -215,12 +215,17 @@ pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation)
     Ok(Prepared { plan, resolution, host_config, intent, runtime_dir })
 }
 
-/// `isekai-ssh <destination>` entrypoint for the native path — the
-/// `cfg(windows)`-gated alternative `main.rs` dispatches to instead of
-/// `wrapper::run`. Takes the same raw argv `wrapper::run` does. The mux
-/// dispatch ([`super::mux::run`]) is what `main.rs` actually calls on Windows;
-/// this remains the single-process path it falls back to (and the only path
-/// exercised on non-Windows unit tests).
+/// A single-process (non-mux) `isekai-ssh <destination>` entrypoint: resolve,
+/// then run one connection attempt to completion. **Currently unreferenced**
+/// — `main.rs` only ever calls [`super::mux::run`] or
+/// `super::mux::run_as_holder_entrypoint` on Windows (never this function
+/// directly), and the mux dispatch's own single-process fallback goes
+/// straight to [`run_prepared`] (skipping [`prepare`] here, since it already
+/// has a [`Prepared`] value in hand), not through this wrapper. Kept for
+/// symmetry with `wrapper::run`'s shape and as a minimal integration point
+/// were a real non-mux entrypoint ever needed again — verify it's still
+/// unreferenced before assuming its behavior (including the reset below)
+/// actually runs in production.
 ///
 /// Resets remote mouse-tracking state (see
 /// [`console::reset_mouse_tracking`]'s docs) once, unconditionally, when
