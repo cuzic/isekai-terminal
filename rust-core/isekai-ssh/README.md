@@ -430,10 +430,17 @@ $env:ISEKAI_SSH_CONSOLE_MOUSE = "1"
 isekai-ssh <host>
 ```
 
-`ISEKAI_SSH_CONSOLE_MOUSE` は `1` / `true` / `yes` のみを opt-in として扱う。ConPTY 判定の
-自動化は行わない: `GetConsoleWindow() == NULL` は pseudoconsole-hosted app に hidden な
-非 NULL HWND が渡るため判定にならず、`WT_SESSION` は VS Code / WezTerm / Alacritty /
-ConEmu の ConPTY mode / `runas` 等で欠けるため、危険側に誤判定し得る。
+`ISEKAI_SSH_CONSOLE_MOUSE` は `1` / `true` / `yes`(前後の空白を除去し大文字小文字を
+区別しない)を opt-in として扱う。`$env:ISEKAI_SSH_CONSOLE_MOUSE = $true` の
+PowerShell 側の文字列化(`"True"`)も受け付ける。ConPTY 判定の自動化は行わない:
+`GetConsoleWindow() == NULL` は pseudoconsole-hosted app に hidden な非 NULL HWND が
+渡るため判定にならず、`WT_SESSION` は VS Code / WezTerm / Alacritty / ConEmu の
+ConPTY mode / `runas` 等で欠けるため、危険側に誤判定し得る。
+
+opt-in 時の既知の制限: 再接続バックオフ待機(`native/mux/mod.rs::wait_or_abort`)も
+同じ raw mode ガードを短時間だけ有効化するため、opt-in している間はネットワーク瞬断で
+再接続が起きるたびに、このマウス/QuickEdit トリオが適用・復元され直す
+(conhost のモード遷移も再度起きうる)。既定(opt-in なし)の場合は影響しない。
 
 ### マルチプレクサ(ControlMaster/ControlPersist 相当)
 

@@ -94,9 +94,20 @@ const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// on [`DispatchOutcome::OwnerLost`] (see [`run_with_reconnect`]). Swapping in
 /// a different [`ExclusiveChannel`] implementation later (e.g. a Unix one) is
 /// the single concrete type here.
+///
+/// Resets remote mouse-tracking state (see
+/// [`console::reset_mouse_tracking`](crate::native::console::reset_mouse_tracking)'s
+/// docs) exactly once, unconditionally, after [`run_with_reconnect`] returns
+/// by any path (success, error, or a give-up) — this is the actual boundary
+/// of "the whole session/reconnect loop, not just one attempt within it, is
+/// over", which is the only place this reset may safely run.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
+    let result =
+        run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase)
+            .await;
+    crate::native::console::reset_mouse_tracking();
+    result
 }
 
 /// How long a `EXIT_MUX_OWNER_LOST` (the mux holder this process was
@@ -390,15 +401,12 @@ enum WaitOutcome {
 /// raw mode can't be enabled (non-interactive stdio), the wait still runs,
 /// it just can't recognize Ctrl+C as an early-abort signal.
 ///
-/// This deliberately uses the raw-mode variant that skips the mouse-tracking
-/// DECRST write on drop. A reconnect wait is a local transport-backoff gap,
-/// not the lifetime boundary of the remote shell: if the remote `tmux`
-/// session survived the hiccup, it will not re-negotiate mouse mode, so a
-/// short-lived local guard must not reset it out from under the still-live
-/// session.
+/// Plain [`console::RawModeGuard::enable`] — no remote-protocol cleanup runs
+/// on its drop (see [`console::reset_mouse_tracking`]'s docs for why that's
+/// deliberately *not* tied to every short-lived per-attempt guard, this one
+/// included).
 async fn wait_or_abort(delay: Duration) -> WaitOutcome {
-    let _raw_mode = crate::native::console::RawModeGuard::enable_without_mouse_tracking_reset()
-        .ok();
+    let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
     wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await
 }
 

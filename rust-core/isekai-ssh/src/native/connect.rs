@@ -221,9 +221,20 @@ pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation)
 /// dispatch ([`super::mux::run`]) is what `main.rs` actually calls on Windows;
 /// this remains the single-process path it falls back to (and the only path
 /// exercised on non-Windows unit tests).
+///
+/// Resets remote mouse-tracking state (see
+/// [`console::reset_mouse_tracking`]'s docs) once, unconditionally, when
+/// [`run_prepared`] returns by any path — this function makes exactly one
+/// connection attempt with no reconnect loop of its own, so its own return is
+/// always the true end of the session (unlike [`super::mux::run`]'s
+/// reconnect loop, which needs the reset at the *loop's* exit rather than at
+/// every individual attempt).
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     let prepared = prepare(args).await?;
-    run_prepared(prepared, None, HandoffCredentials::default()).await
+    let result = run_prepared(prepared, None, HandoffCredentials::default()).await;
+    #[cfg(windows)]
+    console::reset_mouse_tracking();
+    result
 }
 
 /// Drives a [`Prepared`] connection through the always-connects recovery.
