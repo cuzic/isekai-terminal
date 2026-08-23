@@ -96,18 +96,17 @@ const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// the single concrete type here.
 ///
 /// Resets remote mouse-tracking state (see
-/// [`console::reset_mouse_tracking`](crate::native::console::reset_mouse_tracking)'s
-/// docs) exactly once, unconditionally, after [`run_with_reconnect`] returns
-/// by any path (success, error, or a give-up) — this is the actual boundary
-/// of "the whole session/reconnect loop, not just one attempt within it, is
-/// over", which is the only place this reset may safely run.
+/// [`console::MouseTrackingResetGuard`](crate::native::console::MouseTrackingResetGuard)'s
+/// docs) exactly once, when this whole call — [`run_with_reconnect`] itself,
+/// not just one attempt within it — ends, by any path (a normal return,
+/// `?`-propagated error, or a panic unwind). This is the actual boundary of
+/// "the whole session/reconnect loop is over", which is the only place this
+/// reset may safely run — held via an RAII guard, not a plain post-`.await`
+/// call, specifically so a panic mid-loop still triggers it.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let result =
-        run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase)
-            .await;
-    crate::native::console::reset_mouse_tracking();
-    result
+    let _reset_mouse_tracking_on_exit = crate::native::console::MouseTrackingResetGuard;
+    run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
 }
 
 /// How long a `EXIT_MUX_OWNER_LOST` (the mux holder this process was

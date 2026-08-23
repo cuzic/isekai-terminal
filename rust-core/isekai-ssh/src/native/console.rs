@@ -263,17 +263,67 @@ pub(crate) fn reset_mouse_tracking() {
     };
 
     let mut mode: u32 = 0;
-    let had_mode = unsafe { GetConsoleMode(handle, &mut mode) } != 0;
-    if had_mode {
-        unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN) };
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return;
+    }
+
+    // Only touch the mode if VT output processing isn't already on (the
+    // common case on a ConPTY host, where nothing needs enabling at all) —
+    // and, unlike an earlier version of this function, actually check that
+    // the enabling `SetConsoleMode` call succeeded before trusting it and
+    // writing the DECRST bytes below. Code-review finding: writing them
+    // unconditionally after only *attempting* to enable VT processing
+    // reintroduces the same "garbage instead of an interpreted reset"
+    // failure mode this scope-enable exists to prevent, just moved to a
+    // rarer trigger (the enable call itself failing) instead of "no attempt
+    // was ever made" — matches `enable_vt_output_processing`'s own
+    // convention in this same file of only trusting a mode as changed once
+    // `SetConsoleMode` reports success.
+    let vt_already_on = mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0;
+    if !vt_already_on {
+        let enabled = unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN) } != 0;
+        if !enabled {
+            // Can't be sure conhost will interpret the bytes below rather
+            // than print them literally — better to skip the reset entirely
+            // (mouse tracking stays on, the original problem) than to
+            // guarantee garbage on this console.
+            return;
+        }
     }
 
     let mut stdout = std::io::stdout();
     let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     let _ = std::io::Write::flush(&mut stdout);
 
-    if had_mode {
+    if !vt_already_on {
         unsafe { SetConsoleMode(handle, mode) };
+    }
+}
+
+/// RAII wrapper around [`reset_mouse_tracking`]: fires it from [`Drop`]
+/// rather than as a plain statement after an `.await`, so it still runs when
+/// the guarded scope unwinds from a panic. This crate keeps `panic =
+/// "unwind"` (not `"abort"`) in `Cargo.toml` specifically because rare
+/// panics are an expected event in production, not something that should
+/// take the whole process down — but `let result = fut.await;
+/// reset_mouse_tracking(); result` skips straight past that second statement
+/// if `fut` itself panics, since a panicking `.await` unwinds immediately
+/// rather than returning normally. A `Drop` impl runs during an unwind the
+/// same way it does on a normal return, so wrapping the reset in a value
+/// whose only job is to `Drop` it restores the panic-safety this reset had
+/// back when it lived inside [`RawModeGuard`]'s own `Drop`.
+///
+/// Construct one at the top of whatever scope represents a whole
+/// session/reconnect loop, not per attempt within it — see
+/// [`reset_mouse_tracking`]'s own docs for why a per-attempt guard drop is
+/// the wrong scope for this reset.
+#[cfg(windows)]
+pub(crate) struct MouseTrackingResetGuard;
+
+#[cfg(windows)]
+impl Drop for MouseTrackingResetGuard {
+    fn drop(&mut self) {
+        reset_mouse_tracking();
     }
 }
 

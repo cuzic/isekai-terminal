@@ -228,18 +228,19 @@ pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation)
 /// actually runs in production.
 ///
 /// Resets remote mouse-tracking state (see
-/// [`console::reset_mouse_tracking`]'s docs) once, unconditionally, when
-/// [`run_prepared`] returns by any path — this function makes exactly one
-/// connection attempt with no reconnect loop of its own, so its own return is
-/// always the true end of the session (unlike [`super::mux::run`]'s
-/// reconnect loop, which needs the reset at the *loop's* exit rather than at
-/// every individual attempt).
+/// [`console::MouseTrackingResetGuard`]'s docs) once, when this whole call
+/// ends by any path (normal return, `?`-propagated error, or a panic
+/// unwind) — this function makes exactly one connection attempt with no
+/// reconnect loop of its own, so its own end is always the true end of the
+/// session (unlike [`super::mux::run`]'s reconnect loop, which needs the
+/// reset at the *loop's* exit rather than at every individual attempt). Held
+/// via an RAII guard, not a plain post-`.await` call, so a panic mid-session
+/// still triggers it.
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let prepared = prepare(args).await?;
-    let result = run_prepared(prepared, None, HandoffCredentials::default()).await;
     #[cfg(windows)]
-    console::reset_mouse_tracking();
-    result
+    let _reset_mouse_tracking_on_exit = console::MouseTrackingResetGuard;
+    let prepared = prepare(args).await?;
+    run_prepared(prepared, None, HandoffCredentials::default()).await
 }
 
 /// Drives a [`Prepared`] connection through the always-connects recovery.
