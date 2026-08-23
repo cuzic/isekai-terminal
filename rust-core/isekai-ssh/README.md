@@ -404,6 +404,37 @@ Windows ネイティブ経路は `isekai-ssh <host>` の**対話的接続に特�
   (`native/connect.rs`が`plan.remote_command()`の有無で`SessionKind::Exec`/`Shell`を
   切り替える。`-t`指定時はPTY+exec)。
 
+### Windows コンソールのマウス入力
+
+対話セッションでは、Windows の console stdin に `ENABLE_VIRTUAL_TERMINAL_INPUT` を
+有効化する。これにより矢印キー等の特殊キーと VT 形式の入力が `ReadConsoleW` 経由で
+リモートへ届く。Windows Terminal / VS Code integrated terminal / WezTerm などの ConPTY
+ホストでは、リモートの `tmux` 等が要求したマウス click/drag/scroll もこの既定設定だけで
+動作するため、`ENABLE_MOUSE_INPUT` / `ENABLE_EXTENDED_FLAGS` / QuickEdit 無効化は**既定では
+行わない**。
+
+理由: Microsoft conhost の `SetConsoleInputModeImpl` は ConPTY セッションで input mode が
+「mouse on かつ QuickEdit off」へ遷移すると、リモート側の DECSET 要求とは独立に
+`ESC[?1003;1006h`(xterm all-motion + SGR mouse)を hosting terminal へ送る。実機 A/B
+テストでは、この状態になると Windows Terminal がマウス移動ごとの
+`ESC[<35;col;rowM` 形式の生バイトを `isekai-ssh` の stdin へ流し、リモート shell の
+プロンプトへ文字化けとして入力される。一方、PR #102 前の「VT input だけ」の挙動では
+ConPTY 上の remote `tmux` のマウス操作は正常に動き、文字化けも発生しない。
+
+古い実 conhost ウィンドウ(Windows Terminal 等ではない plain `cmd.exe`/PowerShell console
+host)では、QuickEdit がマウスクリックをローカル選択 UI として横取りし、リモートへ届かない
+ことがある。その環境で従来の PR #102 相当の挙動が必要な場合だけ、起動前に次を設定する:
+
+```powershell
+$env:ISEKAI_SSH_CONSOLE_MOUSE = "1"
+isekai-ssh <host>
+```
+
+`ISEKAI_SSH_CONSOLE_MOUSE` は `1` / `true` / `yes` のみを opt-in として扱う。ConPTY 判定の
+自動化は行わない: `GetConsoleWindow() == NULL` は pseudoconsole-hosted app に hidden な
+非 NULL HWND が渡るため判定にならず、`WT_SESSION` は VS Code / WezTerm / Alacritty /
+ConEmu の ConPTY mode / `runas` 等で欠けるため、危険側に誤判定し得る。
+
 ### マルチプレクサ(ControlMaster/ControlPersist 相当)
 
 複数のタブが**同じ接続設定**(host / port / user / identity / agent forward / route
