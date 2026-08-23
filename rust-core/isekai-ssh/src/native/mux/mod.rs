@@ -94,8 +94,18 @@ const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// on [`DispatchOutcome::OwnerLost`] (see [`run_with_reconnect`]). Swapping in
 /// a different [`ExclusiveChannel`] implementation later (e.g. a Unix one) is
 /// the single concrete type here.
+///
+/// Resets remote mouse-tracking state (see
+/// [`console::MouseTrackingResetGuard`](crate::native::console::MouseTrackingResetGuard)'s
+/// docs) exactly once, when this whole call — [`run_with_reconnect`] itself,
+/// not just one attempt within it — ends, by any path (a normal return,
+/// `?`-propagated error, or a panic unwind). This is the actual boundary of
+/// "the whole session/reconnect loop is over", which is the only place this
+/// reset may safely run — held via an RAII guard, not a plain post-`.await`
+/// call, specifically so a panic mid-loop still triggers it.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
+    let _reset_mouse_tracking_on_exit = crate::native::console::MouseTrackingResetGuard;
     run_with_reconnect::<local_ipc_mux::WindowsNamedPipeChannel, _>(args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
 }
 
@@ -389,6 +399,11 @@ enum WaitOutcome {
 /// turn into a clean [`crate::EXIT_USER_CANCELED`] exit. Best-effort: if
 /// raw mode can't be enabled (non-interactive stdio), the wait still runs,
 /// it just can't recognize Ctrl+C as an early-abort signal.
+///
+/// Plain [`console::RawModeGuard::enable`] — no remote-protocol cleanup runs
+/// on its drop (see [`console::reset_mouse_tracking`]'s docs for why that's
+/// deliberately *not* tied to every short-lived per-attempt guard, this one
+/// included).
 async fn wait_or_abort(delay: Duration) -> WaitOutcome {
     let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
     wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await

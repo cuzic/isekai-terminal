@@ -75,10 +75,17 @@ pub(crate) struct RawModeGuard {
     /// (nothing to restore — this crate never touches input console modes
     /// outside the Windows-native path).
     #[cfg(windows)]
-    saved_input_mode: Option<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+    saved_input_mode: Option<super::console_stdin::InputModeRestore>,
 }
 
 impl RawModeGuard {
+    /// Enables raw mode for the duration of one local console-facing scope.
+    /// Purely a local Win32-console-mode guard: it does **not** know or care
+    /// about remote-protocol state (e.g. whether the remote negotiated
+    /// mouse-tracking DECSET) — that's owned by [`reset_mouse_tracking`],
+    /// called explicitly wherever a session (not just one reconnect attempt)
+    /// actually ends. See that function's docs for why this guard used to
+    /// bundle that reset into its own `Drop` and why that was wrong.
     pub(crate) fn enable() -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw terminal mode")?;
         #[cfg(windows)]
@@ -181,68 +188,147 @@ fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE,
     saved
 }
 
+/// Best-effort resets any mouse-tracking mode (`?1000`/`?1002`/`?1003`/
+/// `?1006`) the *remote* side (e.g. `tmux`) turned on via DECSET, by writing
+/// the matching DECRST sequence to the local console. Must be called
+/// explicitly by whoever knows a whole remote session (not just one
+/// reconnect attempt within it) is actually ending — see the call sites in
+/// `native/connect.rs` and `native/mux/mod.rs`'s reconnect-loop exit points.
+///
+/// **Not** part of [`RawModeGuard`]'s `Drop`, on purpose (an earlier version
+/// of this code put it there — see PR #102's history — which was itself a
+/// real bug: `native/mux/mod.rs::wait_or_abort` creates a fresh
+/// `RawModeGuard`, scoped to just one reconnect-backoff wait, for *every*
+/// retry attempt. That guard drops — and used to fire this reset — the
+/// moment a single attempt ends, which includes an ordinary transport-level
+/// reconnect blip where the remote `tmux` session never detached and has no
+/// reason to re-send its own DECSET. Resetting mouse tracking from a
+/// per-attempt guard therefore silently killed mouse reporting for the rest
+/// of an otherwise still-live session after the very first blip.
+/// `RawModeGuard` itself has no way to know "is this attempt's end also the
+/// session's end" — only the reconnect loop does — so this reset must live
+/// at that loop's own true exit points instead of piggybacking on every
+/// guard drop.)
+///
+/// Without ever calling this at all, an abnormal disconnect never delivers
+/// the remote's own mouse-tracking-off sequence, and conhost would otherwise
+/// keep translating clicks as VT mouse reports (typed as literal
+/// escape-sequence text) into whatever reuses this console window next —
+/// worse and more confusing than mouse simply not working.
+///
+/// Two things this must get right that an earlier version of this code
+/// didn't (code-review finding, PR #102):
+///
+/// 1. **Gated on stdout actually being a real console.** An `Exec` session
+///    (`isekai-ssh host -- cmd`) shares its `RawModeGuard` scope with an
+///    interactive `Shell` session (see `native/connect.rs`), and its stdout
+///    is routinely redirected — `isekai-ssh host -- cmd > out.txt` or piped
+///    into another program. Writing this sequence unconditionally would
+///    append 20 literal bytes to the end of every such capture, silently
+///    corrupting non-interactive output that has nothing to do with an
+///    interactive mouse session. [`console_char_handle`] is the same "is
+///    this a real console, not a redirect" check [`enable_vt_output_processing`]
+///    already gates on.
+/// 2. **Explicitly flushed.** `std::io::stdout()` is a global, internally
+///    line-buffered writer; this payload contains no `\n`, so `write_all`
+///    alone only buffers it. `main.rs`'s `fn main` always finishes via
+///    `std::process::exit`, which runs no destructors *and* flushes no
+///    stdio buffers — an unflushed write here would sit in that buffer and
+///    simply be discarded on exit, silently defeating the entire point of
+///    this reset.
+/// 3. **Scope-enables VT output processing for the duration of this one
+///    write, then restores whatever mode it found.** Because this function
+///    is called *after* every `RawModeGuard` for the session has already
+///    dropped (that's the whole point — see above), it cannot assume
+///    [`enable_vt_output_processing`] is still in effect; by the time this
+///    runs, the last guard's own `Drop` has already restored stdout's
+///    *pre-existing* mode. On a legacy conhost window where VT output
+///    processing was off to begin with — precisely the audience
+///    `ISEKAI_SSH_CONSOLE_MOUSE` exists for — skipping this would print the
+///    DECRST bytes below as literal garbage instead of having conhost
+///    interpret them, and would fail to actually reset mouse tracking at
+///    all (a real regression an earlier version of this function had: it
+///    relied on running while a still-live `RawModeGuard`'s VT-processing
+///    mode was in effect, which stopped being true once the reset moved out
+///    of `Drop` and into this standalone, later-called function).
+#[cfg(windows)]
+pub(crate) fn reset_mouse_tracking() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+
+    let Some(handle) = console_char_handle(STD_OUTPUT_HANDLE) else {
+        return;
+    };
+
+    let mut mode: u32 = 0;
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return;
+    }
+
+    // Only touch the mode if VT output processing isn't already on (the
+    // common case on a ConPTY host, where nothing needs enabling at all) —
+    // and, unlike an earlier version of this function, actually check that
+    // the enabling `SetConsoleMode` call succeeded before trusting it and
+    // writing the DECRST bytes below. Code-review finding: writing them
+    // unconditionally after only *attempting* to enable VT processing
+    // reintroduces the same "garbage instead of an interpreted reset"
+    // failure mode this scope-enable exists to prevent, just moved to a
+    // rarer trigger (the enable call itself failing) instead of "no attempt
+    // was ever made" — matches `enable_vt_output_processing`'s own
+    // convention in this same file of only trusting a mode as changed once
+    // `SetConsoleMode` reports success.
+    let vt_already_on = mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0;
+    if !vt_already_on {
+        let enabled = unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN) } != 0;
+        if !enabled {
+            // Can't be sure conhost will interpret the bytes below rather
+            // than print them literally — better to skip the reset entirely
+            // (mouse tracking stays on, the original problem) than to
+            // guarantee garbage on this console.
+            return;
+        }
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    let _ = std::io::Write::flush(&mut stdout);
+
+    if !vt_already_on {
+        unsafe { SetConsoleMode(handle, mode) };
+    }
+}
+
+/// RAII wrapper around [`reset_mouse_tracking`]: fires it from [`Drop`]
+/// rather than as a plain statement after an `.await`, so it still runs when
+/// the guarded scope unwinds from a panic. This crate keeps `panic =
+/// "unwind"` (not `"abort"`) in `Cargo.toml` specifically because rare
+/// panics are an expected event in production, not something that should
+/// take the whole process down — but `let result = fut.await;
+/// reset_mouse_tracking(); result` skips straight past that second statement
+/// if `fut` itself panics, since a panicking `.await` unwinds immediately
+/// rather than returning normally. A `Drop` impl runs during an unwind the
+/// same way it does on a normal return, so wrapping the reset in a value
+/// whose only job is to `Drop` it restores the panic-safety this reset had
+/// back when it lived inside [`RawModeGuard`]'s own `Drop`.
+///
+/// Construct one at the top of whatever scope represents a whole
+/// session/reconnect loop, not per attempt within it — see
+/// [`reset_mouse_tracking`]'s own docs for why a per-attempt guard drop is
+/// the wrong scope for this reset.
+#[cfg(windows)]
+pub(crate) struct MouseTrackingResetGuard;
+
+#[cfg(windows)]
+impl Drop for MouseTrackingResetGuard {
+    fn drop(&mut self) {
+        reset_mouse_tracking();
+    }
+}
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // Best-effort, and in this specific order: reset any mouse-tracking
-        // mode (`?1000`/`?1002`/`?1003`/`?1006`) the *remote* side (e.g.
-        // `tmux`) turned on via DECSET, while VT output processing is still
-        // enabled so conhost actually interprets these bytes rather than
-        // printing them literally. Without this, an abnormal disconnect
-        // never delivers the remote's own mouse-tracking-off sequence, and
-        // — combined with `saved_input_mode` being restored below —
-        // conhost would otherwise keep translating clicks as VT mouse
-        // reports (typed as literal escape-sequence text) into whatever
-        // reuses this console window next, which is a worse, more confusing
-        // failure than mouse simply not working.
-        //
-        // Accepted trade-off (code-review finding, PR #102): this bundles a
-        // remote-protocol-level reset (DECRST for mouse tracking) into what
-        // is otherwise a purely local Win32-console-mode guard, and it fires
-        // on *every* `RawModeGuard` drop — including the narrowly-scoped
-        // guard `native/mux/mod.rs::wait_or_abort` creates fresh for each
-        // reconnect-backoff wait, where no live tmux mouse session exists
-        // yet. Harmless today (resetting an already-off mode is a no-op, and
-        // this write is now gated on/flushed to a real console same as
-        // everything else here), but if more remote-protocol cleanup ever
-        // gets layered onto this guard, it likely belongs at the mux/session
-        // layer (which actually knows whether mouse tracking was negotiated)
-        // rather than accreting further here.
-        //
-        // Two things this must get right that an earlier version of this
-        // code didn't (code-review finding, PR #102):
-        //
-        // 1. **Gated on stdout actually being a real console.** An `Exec`
-        //    session (`isekai-ssh host -- cmd`) shares this exact
-        //    `RawModeGuard` scope with an interactive `Shell` session (see
-        //    `native/connect.rs`), and its stdout is routinely redirected —
-        //    `isekai-ssh host -- cmd > out.txt` or piped into another
-        //    program. Writing this sequence unconditionally would append 20
-        //    literal bytes to the end of every such capture, silently
-        //    corrupting non-interactive output that has nothing to do with
-        //    an interactive mouse session. [`console_char_handle`] is the
-        //    same "is this a real console, not a redirect" check
-        //    [`enable_vt_output_processing`] already gates on.
-        // 2. **Explicitly flushed.** `std::io::stdout()` is a global,
-        //    internally line-buffered writer; this payload contains no
-        //    `\n`, so `write_all` alone only buffers it. `main.rs`'s `fn
-        //    main` always finishes via `std::process::exit`, which runs no
-        //    destructors *and* flushes no stdio buffers — an unflushed
-        //    write here would sit in that buffer and simply be discarded on
-        //    exit, silently defeating the entire point of this reset
-        //    (this crate's `RawModeGuard` itself *does* still `Drop`
-        //    normally before `std::process::exit` runs, since
-        //    `run(): u8`'s `.await` chain — and this guard's scope within
-        //    it — fully unwinds before `main` ever calls `std::process::exit`;
-        //    it's specifically the stdout *buffer*, not this `Drop`, that
-        //    `std::process::exit` skips past).
-        #[cfg(windows)]
-        {
-            if console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some() {
-                let mut stdout = std::io::stdout();
-                let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
-                let _ = std::io::Write::flush(&mut stdout);
-            }
-        }
         // There's nothing sensible to do if disabling raw mode fails on the
         // way out (e.g. the terminal was already torn down), and panicking
         // from a `Drop` impl is its own hazard.
@@ -263,8 +349,8 @@ impl Drop for RawModeGuard {
             // `console_stdin::restore_input_mode`'s doc for the full
             // reasoning; that function is itself bit-selective so this
             // ordering is the only thing this call site needs to get right.
-            if let Some((handle, original_mode)) = self.saved_input_mode {
-                super::console_stdin::restore_input_mode(handle, original_mode);
+            if let Some(saved) = self.saved_input_mode.take() {
+                super::console_stdin::restore_input_mode(saved);
             }
         }
     }

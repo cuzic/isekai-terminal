@@ -215,13 +215,30 @@ pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation)
     Ok(Prepared { plan, resolution, host_config, intent, runtime_dir })
 }
 
-/// `isekai-ssh <destination>` entrypoint for the native path — the
-/// `cfg(windows)`-gated alternative `main.rs` dispatches to instead of
-/// `wrapper::run`. Takes the same raw argv `wrapper::run` does. The mux
-/// dispatch ([`super::mux::run`]) is what `main.rs` actually calls on Windows;
-/// this remains the single-process path it falls back to (and the only path
-/// exercised on non-Windows unit tests).
+/// A single-process (non-mux) `isekai-ssh <destination>` entrypoint: resolve,
+/// then run one connection attempt to completion. **Currently unreferenced**
+/// — `main.rs` only ever calls [`super::mux::run`] or
+/// `super::mux::run_as_holder_entrypoint` on Windows (never this function
+/// directly), and the mux dispatch's own single-process fallback goes
+/// straight to [`run_prepared`] (skipping [`prepare`] here, since it already
+/// has a [`Prepared`] value in hand), not through this wrapper. Kept for
+/// symmetry with `wrapper::run`'s shape and as a minimal integration point
+/// were a real non-mux entrypoint ever needed again — verify it's still
+/// unreferenced before assuming its behavior (including the reset below)
+/// actually runs in production.
+///
+/// Resets remote mouse-tracking state (see
+/// [`console::MouseTrackingResetGuard`]'s docs) once, when this whole call
+/// ends by any path (normal return, `?`-propagated error, or a panic
+/// unwind) — this function makes exactly one connection attempt with no
+/// reconnect loop of its own, so its own end is always the true end of the
+/// session (unlike [`super::mux::run`]'s reconnect loop, which needs the
+/// reset at the *loop's* exit rather than at every individual attempt). Held
+/// via an RAII guard, not a plain post-`.await` call, so a panic mid-session
+/// still triggers it.
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
+    #[cfg(windows)]
+    let _reset_mouse_tracking_on_exit = console::MouseTrackingResetGuard;
     let prepared = prepare(args).await?;
     run_prepared(prepared, None, HandoffCredentials::default()).await
 }
