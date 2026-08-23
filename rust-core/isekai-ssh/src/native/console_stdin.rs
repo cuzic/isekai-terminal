@@ -177,20 +177,42 @@ fn spawn_pipe_reader() -> UnboundedReceiver<Vec<u8>> {
     rx
 }
 
-fn legacy_console_mouse_bits() -> u32 {
+/// Bits the opt-in legacy path owns for restore purposes: `ENABLE_MOUSE_INPUT`
+/// and `ENABLE_QUICK_EDIT_MODE` (the two [`interactive_input_mode`] actually
+/// applies for this path) plus `ENABLE_INSERT_MODE`, which
+/// [`interactive_input_mode`] never sets or clears itself but which must
+/// still round-trip through the same restore group: like
+/// `ENABLE_QUICK_EDIT_MODE`, `ENABLE_INSERT_MODE`'s meaning is only defined
+/// while `ENABLE_EXTENDED_FLAGS` is set (see `SetConsoleMode`'s documented
+/// flag semantics), and this restore path is the only place in this module
+/// that ever turns `ENABLE_EXTENDED_FLAGS` on — so it's bundled in
+/// defensively, the same "owned while extended flags are on" reasoning that
+/// applied when this lived in the old `OWNED_INPUT_BITS` constant.
+fn legacy_console_owned_bits() -> u32 {
     ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE
 }
 
 fn owned_input_bits(apply_mouse_bits: bool) -> u32 {
     if apply_mouse_bits {
-        ENABLE_VIRTUAL_TERMINAL_INPUT | legacy_console_mouse_bits()
+        ENABLE_VIRTUAL_TERMINAL_INPUT | legacy_console_owned_bits()
     } else {
         ENABLE_VIRTUAL_TERMINAL_INPUT
     }
 }
 
+/// Whether `ISEKAI_SSH_CONSOLE_MOUSE`'s value (if set at all) opts into the
+/// legacy conhost mouse/QuickEdit trio — trimmed and matched
+/// case-insensitively against `1`/`true`/`yes` so a realistic PowerShell
+/// invocation (`$env:ISEKAI_SSH_CONSOLE_MOUSE = $true`, which stringifies to
+/// the literal text `"True"`) isn't silently rejected. This is an escape
+/// hatch reached for by someone whose mouse input is already broken —
+/// failing closed on an unrecognized-but-clearly-intended value would be a
+/// bad failure mode for it.
 pub(crate) fn wants_legacy_console_mouse_bits(opt_in: Option<&str>) -> bool {
-    matches!(opt_in, Some("1" | "true" | "yes"))
+    match opt_in.map(str::trim) {
+        Some(value) => value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes"),
+        None => false,
+    }
 }
 
 fn interactive_input_mode(current: u32, apply_mouse_bits: bool) -> u32 {
@@ -206,11 +228,50 @@ fn restore_owned_input_mode(current: u32, original: u32, owned_bits: u32) -> u32
     (current & !owned_bits) | (original & owned_bits)
 }
 
+/// The `SetConsoleMode` write(s) [`restore_input_mode`] should perform,
+/// planned as pure data (no I/O) so the logic — in particular the two-step
+/// `ENABLE_EXTENDED_FLAGS` dance the opt-in path needs — can be exercised by
+/// a unit test without a real console handle. See [`restore_input_mode`]'s
+/// own docs for why the dance is necessary at all.
+#[derive(Debug, PartialEq, Eq)]
+enum RestorePlan {
+    /// The default (non-opt-in) path: nothing here is gated by
+    /// `ENABLE_EXTENDED_FLAGS` (the default path never sets it), so one
+    /// plain write restores everything this call owns.
+    Simple(u32),
+    /// The opt-in path: `first` restores `ENABLE_QUICK_EDIT_MODE`/
+    /// `ENABLE_INSERT_MODE` with `ENABLE_EXTENDED_FLAGS` forced on (required
+    /// for that restore to take effect at all); `second`, if present, is a
+    /// follow-up write clearing `ENABLE_EXTENDED_FLAGS` back off because the
+    /// console never had it set before `apply_interactive_input_mode` turned
+    /// it on.
+    ExtendedFlags { first: u32, second: Option<u32> },
+}
+
+fn plan_restore(current: u32, original: u32, owned_bits: u32, applied_mouse_bits: bool) -> RestorePlan {
+    let restored = restore_owned_input_mode(current, original, owned_bits);
+    if !applied_mouse_bits {
+        return RestorePlan::Simple(restored);
+    }
+    let first = restored | ENABLE_EXTENDED_FLAGS;
+    let second = (original & ENABLE_EXTENDED_FLAGS == 0).then(|| first & !ENABLE_EXTENDED_FLAGS);
+    RestorePlan::ExtendedFlags { first, second }
+}
+
 #[cfg(windows)]
 pub(crate) struct InputModeRestore {
     handle: windows_sys::Win32::Foundation::HANDLE,
     original_mode: u32,
     owned_bits: u32,
+    /// Whether [`apply_interactive_input_mode`] applied the legacy
+    /// mouse/QuickEdit/extended-flags trio for this session — threaded
+    /// through explicitly rather than re-derived from `owned_bits` (an
+    /// earlier version of this struct branched on
+    /// `owned_bits == ENABLE_VIRTUAL_TERMINAL_INPUT` in
+    /// [`restore_input_mode`], which is correct today but silently stops
+    /// meaning "was this the default path?" the moment [`owned_input_bits`]
+    /// ever changes shape).
+    applied_mouse_bits: bool,
 }
 
 /// Applies the interactive-session console *input* modes stdin needs. By
@@ -260,6 +321,7 @@ pub(crate) fn apply_interactive_input_mode() -> Option<InputModeRestore> {
         handle,
         original_mode: mode,
         owned_bits: owned_input_bits(apply_mouse_bits),
+        applied_mouse_bits: apply_mouse_bits,
     })
 }
 
@@ -288,32 +350,37 @@ pub(crate) fn restore_input_mode(saved: InputModeRestore) {
     if unsafe { GetConsoleMode(saved.handle, &mut current) } == 0 {
         return;
     }
-    if saved.owned_bits == ENABLE_VIRTUAL_TERMINAL_INPUT {
-        let restored = restore_owned_input_mode(current, saved.original_mode, saved.owned_bits);
-        unsafe { SetConsoleMode(saved.handle, restored) };
-        return;
-    }
-    // Step 1: restore `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE` (the bits
-    // in `saved.owned_bits` besides VT input/mouse input) to their
-    // pre-existing values. `ENABLE_EXTENDED_FLAGS` must be part of *this*
-    // call for that write to take effect at all, regardless of whether the
-    // original mode had it set — see `SetConsoleMode`'s documented flag
-    // semantics.
-    let restored = restore_owned_input_mode(current, saved.original_mode, saved.owned_bits)
-        | ENABLE_EXTENDED_FLAGS;
-    if unsafe { SetConsoleMode(saved.handle, restored) } == 0 {
-        return;
-    }
-    // Step 2: if the console never had `ENABLE_EXTENDED_FLAGS` set before
-    // [`apply_interactive_input_mode`] turned it on, clear it back off now —
-    // as its own, separate call, since *un*-setting `ENABLE_EXTENDED_FLAGS`
-    // is not itself gated by `ENABLE_EXTENDED_FLAGS` being present in the
-    // same call (only changes to `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE`
-    // are, and step 1 already applied those). This is what makes the restore
-    // byte-exact rather than leaving a mode bit permanently flipped that
-    // `apply_interactive_input_mode` was the only reason it was ever on.
-    if saved.original_mode & ENABLE_EXTENDED_FLAGS == 0 {
-        unsafe { SetConsoleMode(saved.handle, restored & !ENABLE_EXTENDED_FLAGS) };
+    match plan_restore(current, saved.original_mode, saved.owned_bits, saved.applied_mouse_bits) {
+        RestorePlan::Simple(mode) => {
+            // Only VT input was ever owned — no bit here is gated by
+            // `ENABLE_EXTENDED_FLAGS`, so a single plain write is enough.
+            let _ = unsafe { SetConsoleMode(saved.handle, mode) };
+        }
+        RestorePlan::ExtendedFlags { first, second } => {
+            // Step 1: restore `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE`
+            // to their pre-existing values, with `ENABLE_EXTENDED_FLAGS`
+            // forced on for this call (required for that write to take
+            // effect at all, regardless of whether the original mode had it
+            // set — see `SetConsoleMode`'s documented flag semantics). If
+            // this write itself fails, there's nothing sensible left to do,
+            // so step 2 (which depends on it) is skipped too.
+            if unsafe { SetConsoleMode(saved.handle, first) } == 0 {
+                return;
+            }
+            // Step 2: if the console never had `ENABLE_EXTENDED_FLAGS` set
+            // before `apply_interactive_input_mode` turned it on, clear it
+            // back off now — as its own, separate call, since *un*-setting
+            // `ENABLE_EXTENDED_FLAGS` is not itself gated by
+            // `ENABLE_EXTENDED_FLAGS` being present in the same call (only
+            // changes to `ENABLE_QUICK_EDIT_MODE`/`ENABLE_INSERT_MODE` are,
+            // and step 1 already applied those). This is what makes the
+            // restore byte-exact rather than leaving a mode bit permanently
+            // flipped that `apply_interactive_input_mode` was the only
+            // reason it was ever on.
+            if let Some(second) = second {
+                let _ = unsafe { SetConsoleMode(saved.handle, second) };
+            }
+        }
     }
 }
 
@@ -424,15 +491,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_console_mouse_bits_opt_in_accepts_only_documented_values() {
+    fn legacy_console_mouse_bits_opt_in_accepts_documented_values_trimmed_and_case_insensitive() {
         assert!(wants_legacy_console_mouse_bits(Some("1")));
         assert!(wants_legacy_console_mouse_bits(Some("true")));
         assert!(wants_legacy_console_mouse_bits(Some("yes")));
+        // PowerShell's `$env:ISEKAI_SSH_CONSOLE_MOUSE = $true` stringifies to
+        // "True" — a realistic opt-in attempt this must not silently reject.
+        assert!(wants_legacy_console_mouse_bits(Some("True")));
+        assert!(wants_legacy_console_mouse_bits(Some("TRUE")));
+        assert!(wants_legacy_console_mouse_bits(Some(" 1 ")));
+        assert!(wants_legacy_console_mouse_bits(Some("\tyes\n")));
         assert!(!wants_legacy_console_mouse_bits(None));
         assert!(!wants_legacy_console_mouse_bits(Some("")));
         assert!(!wants_legacy_console_mouse_bits(Some("0")));
         assert!(!wants_legacy_console_mouse_bits(Some("false")));
-        assert!(!wants_legacy_console_mouse_bits(Some("TRUE")));
     }
 
     #[test]
@@ -506,5 +578,53 @@ mod tests {
         assert_eq!(restored & ENABLE_MOUSE_INPUT, 0);
         assert_ne!(restored & ENABLE_QUICK_EDIT_MODE, 0);
         assert_ne!(restored & ENABLE_INSERT_MODE, 0);
+    }
+
+    // `plan_restore`/`RestorePlan` tests below exercise `restore_input_mode`'s
+    // actual `SetConsoleMode` write sequence as pure data — this is the
+    // riskiest logic in this module (the two-step `ENABLE_EXTENDED_FLAGS`
+    // dance PR #102's review found two real bugs in) and, unlike the
+    // `#[cfg(windows)]` function that executes it, runs on every platform
+    // this crate's CI actually gates merges on.
+
+    #[test]
+    fn default_path_plans_a_single_write_that_never_touches_extended_flags() {
+        let current = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE;
+        let original = ENABLE_QUICK_EDIT_MODE;
+        let plan = plan_restore(current, original, owned_input_bits(false), false);
+        let RestorePlan::Simple(mode) = plan else {
+            panic!("default (non-opt-in) path must plan RestorePlan::Simple, got {plan:?}");
+        };
+        assert_eq!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0, "VT input is the only owned bit and must be cleared");
+        assert_eq!(mode & ENABLE_EXTENDED_FLAGS, current & ENABLE_EXTENDED_FLAGS, "must not touch EXTENDED_FLAGS at all");
+        assert_eq!(mode & ENABLE_MOUSE_INPUT, current & ENABLE_MOUSE_INPUT, "mouse bit isn't owned by this path, must pass through");
+    }
+
+    #[test]
+    fn opt_in_path_plans_the_documented_two_step_sequence_when_extended_flags_started_off() {
+        let current = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+        let original = ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE; // no ENABLE_EXTENDED_FLAGS
+        let plan = plan_restore(current, original, owned_input_bits(true), true);
+        let RestorePlan::ExtendedFlags { first, second } = plan else {
+            panic!("opt-in path must plan RestorePlan::ExtendedFlags, got {plan:?}");
+        };
+        assert_ne!(first & ENABLE_EXTENDED_FLAGS, 0, "step 1 must force EXTENDED_FLAGS on for the write to take effect");
+        assert_ne!(first & ENABLE_QUICK_EDIT_MODE, 0, "step 1 must restore QuickEdit to its pre-existing value");
+        assert_ne!(first & ENABLE_INSERT_MODE, 0, "step 1 must restore Insert mode to its pre-existing value");
+        let second = second.expect("a second write must be planned when EXTENDED_FLAGS started off");
+        assert_eq!(second & ENABLE_EXTENDED_FLAGS, 0, "step 2 must clear EXTENDED_FLAGS back off");
+        assert_eq!(second & ENABLE_QUICK_EDIT_MODE, first & ENABLE_QUICK_EDIT_MODE, "step 2 must not disturb what step 1 just restored");
+    }
+
+    #[test]
+    fn opt_in_path_plans_no_second_write_when_extended_flags_started_on() {
+        let current = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+        let original = ENABLE_EXTENDED_FLAGS; // console already had it set before we ever ran
+        let plan = plan_restore(current, original, owned_input_bits(true), true);
+        let RestorePlan::ExtendedFlags { first, second } = plan else {
+            panic!("opt-in path must plan RestorePlan::ExtendedFlags, got {plan:?}");
+        };
+        assert_ne!(first & ENABLE_EXTENDED_FLAGS, 0);
+        assert_eq!(second, None, "must not plan a step-2 write when the console already had EXTENDED_FLAGS set");
     }
 }
