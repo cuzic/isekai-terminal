@@ -389,8 +389,16 @@ enum WaitOutcome {
 /// turn into a clean [`crate::EXIT_USER_CANCELED`] exit. Best-effort: if
 /// raw mode can't be enabled (non-interactive stdio), the wait still runs,
 /// it just can't recognize Ctrl+C as an early-abort signal.
+///
+/// This deliberately uses the raw-mode variant that skips the mouse-tracking
+/// DECRST write on drop. A reconnect wait is a local transport-backoff gap,
+/// not the lifetime boundary of the remote shell: if the remote `tmux`
+/// session survived the hiccup, it will not re-negotiate mouse mode, so a
+/// short-lived local guard must not reset it out from under the still-live
+/// session.
 async fn wait_or_abort(delay: Duration) -> WaitOutcome {
-    let _raw_mode = crate::native::console::RawModeGuard::enable().ok();
+    let _raw_mode = crate::native::console::RawModeGuard::enable_without_mouse_tracking_reset()
+        .ok();
     wait_or_abort_over(delay, &mut crate::native::console_stdin::ConsoleStdin::open()).await
 }
 

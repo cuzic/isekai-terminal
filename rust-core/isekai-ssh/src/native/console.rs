@@ -75,11 +75,29 @@ pub(crate) struct RawModeGuard {
     /// (nothing to restore — this crate never touches input console modes
     /// outside the Windows-native path).
     #[cfg(windows)]
-    saved_input_mode: Option<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+    saved_input_mode: Option<super::console_stdin::InputModeRestore>,
+    reset_mouse_tracking_on_drop: bool,
 }
 
 impl RawModeGuard {
     pub(crate) fn enable() -> Result<Self> {
+        Self::enable_with_mouse_tracking_reset(true)
+    }
+
+    /// Enables raw mode for short local waits that are part of reconnect
+    /// bookkeeping rather than the lifetime of a live remote shell. This
+    /// keeps the local console in raw mode so a typed Ctrl+C arrives as the
+    /// `0x03` byte the caller is polling for, but skips the DECRST
+    /// mouse-tracking cleanup in [`Drop`]. During a transport-level reconnect
+    /// blip the remote `tmux` session has not detached and has no reason to
+    /// re-send its own DECSET mouse-tracking request; resetting it from this
+    /// temporary guard would silently turn mouse reporting off for the rest
+    /// of the still-live session.
+    pub(crate) fn enable_without_mouse_tracking_reset() -> Result<Self> {
+        Self::enable_with_mouse_tracking_reset(false)
+    }
+
+    fn enable_with_mouse_tracking_reset(reset_mouse_tracking_on_drop: bool) -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw terminal mode")?;
         #[cfg(windows)]
         let saved_output_modes = enable_vt_output_processing();
@@ -97,6 +115,7 @@ impl RawModeGuard {
             saved_output_modes,
             #[cfg(windows)]
             saved_input_mode,
+            reset_mouse_tracking_on_drop,
         })
     }
 }
@@ -183,7 +202,8 @@ fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE,
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // Best-effort, and in this specific order: reset any mouse-tracking
+        // Best-effort, and in this specific order when this guard owns a
+        // whole live interactive session: reset any mouse-tracking
         // mode (`?1000`/`?1002`/`?1003`/`?1006`) the *remote* side (e.g.
         // `tmux`) turned on via DECSET, while VT output processing is still
         // enabled so conhost actually interprets these bytes rather than
@@ -195,18 +215,16 @@ impl Drop for RawModeGuard {
         // reuses this console window next, which is a worse, more confusing
         // failure than mouse simply not working.
         //
-        // Accepted trade-off (code-review finding, PR #102): this bundles a
-        // remote-protocol-level reset (DECRST for mouse tracking) into what
-        // is otherwise a purely local Win32-console-mode guard, and it fires
-        // on *every* `RawModeGuard` drop — including the narrowly-scoped
-        // guard `native/mux/mod.rs::wait_or_abort` creates fresh for each
-        // reconnect-backoff wait, where no live tmux mouse session exists
-        // yet. Harmless today (resetting an already-off mode is a no-op, and
-        // this write is now gated on/flushed to a real console same as
-        // everything else here), but if more remote-protocol cleanup ever
-        // gets layered onto this guard, it likely belongs at the mux/session
-        // layer (which actually knows whether mouse tracking was negotiated)
-        // rather than accreting further here.
+        // This does **not** run for the narrowly-scoped guard
+        // `native/mux/mod.rs::wait_or_abort` creates fresh for each
+        // reconnect-backoff wait. That wait happens after the local
+        // transport/client link was lost, but not necessarily after the
+        // remote shell/tmux session was torn down; sending DECRST from that
+        // short guard would turn local mouse tracking off while the remote
+        // app still believes it is on, and there may be no later remote
+        // DECSET to turn it back on. Keep any further remote-protocol cleanup
+        // tied to guards that scope a real interactive session, or move it
+        // to a layer that knows the remote protocol state explicitly.
         //
         // Two things this must get right that an earlier version of this
         // code didn't (code-review finding, PR #102):
@@ -237,7 +255,9 @@ impl Drop for RawModeGuard {
         //    `std::process::exit` skips past).
         #[cfg(windows)]
         {
-            if console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some() {
+            if self.reset_mouse_tracking_on_drop
+                && console_char_handle(windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE).is_some()
+            {
                 let mut stdout = std::io::stdout();
                 let _ = std::io::Write::write_all(&mut stdout, b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
                 let _ = std::io::Write::flush(&mut stdout);
@@ -263,8 +283,8 @@ impl Drop for RawModeGuard {
             // `console_stdin::restore_input_mode`'s doc for the full
             // reasoning; that function is itself bit-selective so this
             // ordering is the only thing this call site needs to get right.
-            if let Some((handle, original_mode)) = self.saved_input_mode {
-                super::console_stdin::restore_input_mode(handle, original_mode);
+            if let Some(saved) = self.saved_input_mode.take() {
+                super::console_stdin::restore_input_mode(saved);
             }
         }
     }
