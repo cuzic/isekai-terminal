@@ -57,25 +57,20 @@ final class AppLaunchUITests: XCTestCase {
         return row
     }
 
-    /// SwiftUIの`Toggle`はシート表示直後の遷移アニメーションが収束しきる前に
-    /// タップすると、ヒットテスト領域がまだ最終位置に無く取りこぼされることがある
-    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで2回、それぞれ
-    /// 別のタップ回目・別の症状[アサート単体の失敗/タップ自体の空振り]で不安定に
-    /// 落ちた)。1回のタップで反映されなければ、値が変わるまで複数回タップし直す
-    /// (既に期待値ならタップ自体をスキップするため冪等)。
-    @discardableResult
-    private func tapToggleUntilValue(_ toggle: XCUIElement, isOn: Bool, attempts: Int = 5, perAttemptTimeout: TimeInterval = 2) -> Bool {
-        let expected = isOn ? "1" : "0"
-        for _ in 0..<attempts {
-            if (toggle.value as? String) == expected { return true }
-            toggle.tap()
-            let deadline = Date().addingTimeInterval(perAttemptTimeout)
-            while Date() < deadline {
-                if (toggle.value as? String) == expected { return true }
-                usleep(100_000)
-            }
+    /// `XCUIElement.value`(Switch)の文字列表現("0"/"1"を想定していたが、実機/CI上の
+    /// Xcodeバージョンでは異なる表現を返す可能性がある)を決め打ちで比較すると、
+    /// 実際にタップが反映されていても恒久的に不一致判定になり得る
+    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで、5回タップを
+    /// 繰り返しても一度も"1"/"0"どちらとも一致しないまま失敗した——アニメーション
+    /// レースではなく値フォーマットの想定違いが濃厚)。そのためタップ前後の値を
+    /// 文字列として比較するだけにとどめ、具体的な表現は決め打ちしない。
+    private func waitForToggleValueChange(_ toggle: XCUIElement, from previous: String?, timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (toggle.value as? String) != previous { return true }
+            usleep(100_000)
         }
-        return (toggle.value as? String) == expected
+        return (toggle.value as? String) != previous
     }
 
     func testAppLaunchesToProfileList() throws {
@@ -274,9 +269,7 @@ final class AppLaunchUITests: XCTestCase {
         app.buttons["settingsMenuItem"].tap()
 
         XCTAssertTrue(app.collectionViews["settingsView"].waitForExistence(timeout: 10))
-        // シート表示の遷移アニメーションが収束しきるのを待ってから操作を始める
-        // (収束前のタップ取りこぼしの主因と考えられるため、上記ヘルパーの再試行と
-        // 合わせた二重の対策)。
+        // シート表示の遷移アニメーションが収束しきるのを待ってから操作を始める。
         usleep(500_000)
 
         let toggleIdentifiers = [
@@ -289,12 +282,16 @@ final class AppLaunchUITests: XCTestCase {
         for identifier in toggleIdentifiers {
             let toggle = app.switches[identifier]
             XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-            let initiallyOn = toggle.value as? String == "1"
+            let original = toggle.value as? String
 
-            XCTAssertTrue(tapToggleUntilValue(toggle, isOn: !initiallyOn), "\(identifier) did not flip after tap retries")
+            toggle.tap()
+            XCTAssertTrue(waitForToggleValueChange(toggle, from: original), "\(identifier) value did not change after first tap")
+            let afterFirstTap = toggle.value as? String
 
             // 次のトグルの検証に影響しないよう、必ず元の状態へ戻す。
-            XCTAssertTrue(tapToggleUntilValue(toggle, isOn: initiallyOn), "\(identifier) did not revert after tap retries")
+            toggle.tap()
+            XCTAssertTrue(waitForToggleValueChange(toggle, from: afterFirstTap), "\(identifier) value did not change after second tap")
+            XCTAssertEqual(toggle.value as? String, original, "\(identifier) did not revert to its original value")
         }
 
         app.buttons["settingsDoneButton"].tap()
