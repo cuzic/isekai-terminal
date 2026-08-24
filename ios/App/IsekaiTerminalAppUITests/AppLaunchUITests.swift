@@ -57,17 +57,23 @@ final class AppLaunchUITests: XCTestCase {
         return row
     }
 
-    /// SwiftUIの`Toggle`は`.tap()`が返った時点でまだアニメーション/再描画が完了して
-    /// いないことがあり、直後に`.value`を同期的に読むと古い値を掴むレースになり得る
-    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで1回踏んだ失敗、
-    /// 2回目のトグルタップ後のアサートだけが不安定に落ちた)。短いポーリングで確認する。
+    /// SwiftUIの`Toggle`はシート表示直後の遷移アニメーションが収束しきる前に
+    /// タップすると、ヒットテスト領域がまだ最終位置に無く取りこぼされることがある
+    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで2回、それぞれ
+    /// 別のタップ回目・別の症状[アサート単体の失敗/タップ自体の空振り]で不安定に
+    /// 落ちた)。1回のタップで反映されなければ、値が変わるまで複数回タップし直す
+    /// (既に期待値ならタップ自体をスキップするため冪等)。
     @discardableResult
-    private func waitForToggleValue(_ toggle: XCUIElement, isOn: Bool, timeout: TimeInterval = 5) -> Bool {
+    private func tapToggleUntilValue(_ toggle: XCUIElement, isOn: Bool, attempts: Int = 5, perAttemptTimeout: TimeInterval = 2) -> Bool {
         let expected = isOn ? "1" : "0"
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        for _ in 0..<attempts {
             if (toggle.value as? String) == expected { return true }
-            usleep(100_000)
+            toggle.tap()
+            let deadline = Date().addingTimeInterval(perAttemptTimeout)
+            while Date() < deadline {
+                if (toggle.value as? String) == expected { return true }
+                usleep(100_000)
+            }
         }
         return (toggle.value as? String) == expected
     }
@@ -268,6 +274,10 @@ final class AppLaunchUITests: XCTestCase {
         app.buttons["settingsMenuItem"].tap()
 
         XCTAssertTrue(app.collectionViews["settingsView"].waitForExistence(timeout: 10))
+        // シート表示の遷移アニメーションが収束しきるのを待ってから操作を始める
+        // (収束前のタップ取りこぼしの主因と考えられるため、上記ヘルパーの再試行と
+        // 合わせた二重の対策)。
+        usleep(500_000)
 
         let toggleIdentifiers = [
             "screenProtectionToggle",
@@ -281,12 +291,10 @@ final class AppLaunchUITests: XCTestCase {
             XCTAssertTrue(toggle.waitForExistence(timeout: 5))
             let initiallyOn = toggle.value as? String == "1"
 
-            toggle.tap()
-            XCTAssertTrue(waitForToggleValue(toggle, isOn: !initiallyOn), "\(identifier) did not flip after first tap")
+            XCTAssertTrue(tapToggleUntilValue(toggle, isOn: !initiallyOn), "\(identifier) did not flip after tap retries")
 
             // 次のトグルの検証に影響しないよう、必ず元の状態へ戻す。
-            toggle.tap()
-            XCTAssertTrue(waitForToggleValue(toggle, isOn: initiallyOn), "\(identifier) did not revert after second tap")
+            XCTAssertTrue(tapToggleUntilValue(toggle, isOn: initiallyOn), "\(identifier) did not revert after tap retries")
         }
 
         app.buttons["settingsDoneButton"].tap()
