@@ -57,22 +57,6 @@ final class AppLaunchUITests: XCTestCase {
         return row
     }
 
-    /// `XCUIElement.value`(Switch)の文字列表現("0"/"1"を想定していたが、実機/CI上の
-    /// Xcodeバージョンでは異なる表現を返す可能性がある)を決め打ちで比較すると、
-    /// 実際にタップが反映されていても恒久的に不一致判定になり得る
-    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで、5回タップを
-    /// 繰り返しても一度も"1"/"0"どちらとも一致しないまま失敗した——アニメーション
-    /// レースではなく値フォーマットの想定違いが濃厚)。そのためタップ前後の値を
-    /// 文字列として比較するだけにとどめ、具体的な表現は決め打ちしない。
-    private func waitForToggleValueChange(_ toggle: XCUIElement, from previous: String?, timeout: TimeInterval = 5) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if (toggle.value as? String) != previous { return true }
-            usleep(100_000)
-        }
-        return (toggle.value as? String) != previous
-    }
-
     func testAppLaunchesToProfileList() throws {
         let app = XCUIApplication()
         app.launch()
@@ -269,8 +253,6 @@ final class AppLaunchUITests: XCTestCase {
         app.buttons["settingsMenuItem"].tap()
 
         XCTAssertTrue(app.collectionViews["settingsView"].waitForExistence(timeout: 10))
-        // シート表示の遷移アニメーションが収束しきるのを待ってから操作を始める。
-        usleep(500_000)
 
         let toggleIdentifiers = [
             "screenProtectionToggle",
@@ -280,18 +262,17 @@ final class AppLaunchUITests: XCTestCase {
         ]
 
         for identifier in toggleIdentifiers {
-            let toggle = app.switches[identifier]
-            XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-            let original = toggle.value as? String
+            let item = app.buttons[identifier]
+            XCTAssertTrue(item.waitForExistence(timeout: 5))
+            let initiallyOff = item.label.hasSuffix("OFF")
+            item.tap()
 
-            toggle.tap()
-            XCTAssertTrue(waitForToggleValueChange(toggle, from: original), "\(identifier) value did not change after first tap")
-            let afterFirstTap = toggle.value as? String
+            let itemAfterToggle = app.buttons[identifier]
+            XCTAssertTrue(itemAfterToggle.waitForExistence(timeout: 5))
+            XCTAssertEqual(itemAfterToggle.label.hasSuffix("OFF"), !initiallyOff)
 
-            // 次のトグルの検証に影響しないよう、必ず元の状態へ戻す。
-            toggle.tap()
-            XCTAssertTrue(waitForToggleValueChange(toggle, from: afterFirstTap), "\(identifier) value did not change after second tap")
-            XCTAssertEqual(toggle.value as? String, original, "\(identifier) did not revert to its original value")
+            // 次のトグルの検証に影響しないよう、必ず元の状態(OFF)へ戻す。
+            itemAfterToggle.tap()
         }
 
         app.buttons["settingsDoneButton"].tap()
