@@ -57,6 +57,21 @@ final class AppLaunchUITests: XCTestCase {
         return row
     }
 
+    /// SwiftUIの`Toggle`は`.tap()`が返った時点でまだアニメーション/再描画が完了して
+    /// いないことがあり、直後に`.value`を同期的に読むと古い値を掴むレースになり得る
+    /// (`testOptInSettingsMenuItemsToggleBetweenOnAndOff`が実際にCIで1回踏んだ失敗、
+    /// 2回目のトグルタップ後のアサートだけが不安定に落ちた)。短いポーリングで確認する。
+    @discardableResult
+    private func waitForToggleValue(_ toggle: XCUIElement, isOn: Bool, timeout: TimeInterval = 5) -> Bool {
+        let expected = isOn ? "1" : "0"
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (toggle.value as? String) == expected { return true }
+            usleep(100_000)
+        }
+        return (toggle.value as? String) == expected
+    }
+
     func testAppLaunchesToProfileList() throws {
         let app = XCUIApplication()
         app.launch()
@@ -264,13 +279,14 @@ final class AppLaunchUITests: XCTestCase {
         for identifier in toggleIdentifiers {
             let toggle = app.switches[identifier]
             XCTAssertTrue(toggle.waitForExistence(timeout: 5))
-            let initiallyOff = toggle.value as? String == "0"
-            toggle.tap()
-            XCTAssertEqual(toggle.value as? String == "0", !initiallyOff)
+            let initiallyOn = toggle.value as? String == "1"
 
-            // 次のトグルの検証に影響しないよう、必ず元の状態(OFF)へ戻す。
             toggle.tap()
-            XCTAssertEqual(toggle.value as? String == "0", initiallyOff)
+            XCTAssertTrue(waitForToggleValue(toggle, isOn: !initiallyOn), "\(identifier) did not flip after first tap")
+
+            // 次のトグルの検証に影響しないよう、必ず元の状態へ戻す。
+            toggle.tap()
+            XCTAssertTrue(waitForToggleValue(toggle, isOn: initiallyOn), "\(identifier) did not revert after second tap")
         }
 
         app.buttons["settingsDoneButton"].tap()
