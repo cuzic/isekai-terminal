@@ -90,6 +90,89 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
     }
 
+    /// Y-P1(#7): `autoTrustNewHostKeys`をONにすると、未知ホストが確認プロンプト無しで
+    /// 即座に信頼される(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.4)。
+    func testAutoTrustNewHostKeysAcceptsUnknownHostWithoutPrompt() throws {
+        let (controller, trustStore) = try makeController()
+        UserDefaults.standard.set(true, forKey: AppSettingsKeys.autoTrustNewHostKeys)
+        defer { UserDefaults.standard.removeObject(forKey: AppSettingsKeys.autoTrustNewHostKeys) }
+
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
+
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertEqual(trustStore.record(for: identifier)?.fingerprint, "SHA256:aaaa")
+    }
+
+    /// Y-P1(#7): この項目で最も回帰させてはいけない性質。`autoTrustNewHostKeys`がONでも、
+    /// 既知ホストのfingerprint不一致は常に拒否される(MITMと正当な再デプロイを機械的に
+    /// 区別できないため、この設定の対象は「初回確認を省略するか」だけ。
+    /// `.claude/rules/always-connects.md`参照)。
+    func testAutoTrustNewHostKeysDoesNotBypassFingerprintMismatch() throws {
+        let (controller, _) = try makeController()
+        UserDefaults.standard.set(true, forKey: AppSettingsKeys.autoTrustNewHostKeys)
+        defer { UserDefaults.standard.removeObject(forKey: AppSettingsKeys.autoTrustNewHostKeys) }
+
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:bbbb"))
+    }
+
+    /// Y-P1(#5): `onPromptJump`受信で`uiState.promptJumpResult`が更新され、`seq`が
+    /// 単調増加すること(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.1)。
+    func testOnPromptJumpUpdatesUiStateAndIncrementsSeq() async throws {
+        let (controller, _) = try makeController()
+        XCTAssertEqual(controller.uiState.promptJumpResult.seq, 0)
+
+        let target = PromptJumpTarget(scrollOffset: 5, isLive: false)
+        controller.onPromptJump(target: target)
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.promptJumpResult.seq == 1
+        }
+        XCTAssertEqual(controller.uiState.promptJumpResult.target, target)
+
+        // 同じtargetでも(既に最古のプロンプト等)seqは必ず増える。
+        controller.onPromptJump(target: target)
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.promptJumpResult.seq == 2
+        }
+
+        controller.onPromptJump(target: nil)
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.promptJumpResult.seq == 3
+        }
+        XCTAssertNil(controller.uiState.promptJumpResult.target)
+    }
+
+    /// Y-P1(#5): `onPromptOutputCopyReady`受信で`uiState.promptOutputCopyResult`が
+    /// 更新されること。
+    func testOnPromptOutputCopyReadyUpdatesUiState() async throws {
+        let (controller, _) = try makeController()
+
+        controller.onPromptOutputCopyReady(text: "hello world")
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.promptOutputCopyResult.seq == 1
+        }
+        XCTAssertEqual(controller.uiState.promptOutputCopyResult.text, "hello world")
+    }
+
+    /// Y-P1(#2): `submitAiPanelForm`はパネルを閉じる(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.2)。
+    /// 実際に送信されるバイト列の内容(組み立てロジック自体)は`AiPanelFormSubmissionTests`
+    /// (Logic層、全境界ケース)で検証済み。ここでは未接続の`orchestrator`(`init`で常に
+    /// 非nil、`.claude/rules/always-connects.md`と同じ「セッション未確立時は安全にno-op」
+    /// 方針)に対して呼んでもクラッシュせず、`uiState.aiPanel`が確実にクリアされることを
+    /// 確認する(実接続を伴う`send`の実配線確認は🔴実機/Simulator手動確認に委ねる)。
+    func testSubmitAiPanelFormDismissesPanel() throws {
+        let (controller, _) = try makeController()
+        controller.uiState.aiPanel = AiPanelUiState(
+            kind: .form, title: "t", markdown: "",
+            fields: [PanelField(id: "name", label: "Name", kind: .text, options: [])]
+        )
+
+        controller.submitAiPanelForm(values: ["name": "Alice"])
+
+        XCTAssertNil(controller.uiState.aiPanel)
+    }
+
     // 実sshd接続+CredentialVault(Keychain)を伴うE2Eテストは、素のSwiftPM
     // テストバンドルではKeychainがerrSecMissingEntitlement(-34018)で失敗するため
     // (`CredentialVaultTests.swift`のコメント参照)、アプリホスト型の

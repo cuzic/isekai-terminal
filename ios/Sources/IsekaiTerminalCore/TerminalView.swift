@@ -43,6 +43,10 @@ public struct TerminalView: View {
     /// できるようにする(`scrollOffset`と同じく`TerminalScreenView`との双方向バインディング、
     /// Android版`TerminalScreen.kt`の`showingScrollback`と対称)。
     @State private var showingScrollback = false
+    /// Y-P1(#5): プロンプトジャンプ先が見つからなかった場合の軽い案内文言
+    /// (`PromptNavigation.notFoundMessage`参照、「UI表示だけに閉じた状態」)。次の
+    /// ジャンプ操作で上書き/クリアされる(タイマーによる自動消去はしない)。
+    @State private var promptJumpNotFoundMessage: String?
     /// タスク#52: タップされたOSC 8リンクの確認待ちURL。「UI表示だけに閉じた状態」
     /// (`.claude/rules/rust-ssot.md`の例外)として`selection`/`scrollOffset`と同じく
     /// SwiftUI側の`@State`で保持する(Android版`pendingHyperlinkUrl`と対称)。
@@ -140,7 +144,13 @@ public struct TerminalView: View {
                     reloadKeySequenceSheetContent()
                     showKeySequenceSheet = true
                 },
-                onShowSearch: { showSearchBar = true }
+                onShowSearch: { showSearchBar = true },
+                // Y-P1(#5): 現在の(scrollOffset, showingScrollback)をそのまま渡し、
+                // 判断はRust側(`Terminal::prompt_jump_target`)に委ねる(Android版
+                // `CtrlBtn("前のプロンプト") { actions.onJumpToPreviousPrompt(...) }`と対称)。
+                onJumpToPreviousPrompt: { controller.jumpToPreviousPrompt(fromScrollOffset: scrollOffset, fromShowingScrollback: showingScrollback) },
+                onJumpToNextPrompt: { controller.jumpToNextPrompt(fromScrollOffset: scrollOffset, fromShowingScrollback: showingScrollback) },
+                onCopyLastCommandOutput: { controller.copyLastCommandOutput() }
             )
                 .frame(width: 1, height: 1)
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
@@ -164,6 +174,21 @@ public struct TerminalView: View {
                 backToLiveButton
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 8)
+            }
+
+            // Y-P1(#5): プロンプトジャンプ先が見つからなかった場合の案内(タイマー無し、
+            // 次のジャンプ操作で上書き/クリアされる。`PromptNavigation.notFoundMessage`参照)。
+            if let promptJumpNotFoundMessage {
+                Text(promptJumpNotFoundMessage)
+                    .font(.caption)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.8))
+                    .foregroundStyle(.white)
+                    .clipShape(Capsule())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, scrollOffset > 0 || showingScrollback ? 44 : 8)
+                    .accessibilityIdentifier("promptJumpNotFoundMessage")
             }
 
             // Phase 9-6(#16): セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
@@ -192,6 +217,24 @@ public struct TerminalView: View {
         .onChange(of: isActive) { newValue in
             controller.notifyFocusChange(focused: newValue)
         }
+        // Y-P1(#5、旧タスク#13 OSC 133)「前/次のプロンプトへジャンプ」の結果を反映する。
+        // `PromptJumpResult.seq`が変化するたびに1回だけ実行される(Android版
+        // `LaunchedEffect(uiState.promptJumpResult.seq)`と対称)。実際のscrollOffset/
+        // showingScrollback計算は`PromptNavigation.scrollTarget`(Logic層、テスト済み)に
+        // 委譲し、ここでは反映するだけ。
+        .onChange(of: uiState.promptJumpResult.seq) { _ in
+            if let scrollTarget = PromptNavigation.scrollTarget(for: uiState.promptJumpResult.target) {
+                scrollOffset = scrollTarget.scrollOffset
+                showingScrollback = scrollTarget.showingScrollback
+            }
+            promptJumpNotFoundMessage = PromptNavigation.notFoundMessage(for: uiState.promptJumpResult.target)
+        }
+        // Y-P1(#5)「直前コマンドの出力だけをコピー」の結果をクリップボードへ書く
+        // (選択範囲コピーと同じ`UIPasteboard`経路)。
+        .onChange(of: uiState.promptOutputCopyResult.seq) { _ in
+            guard let text = uiState.promptOutputCopyResult.text, !text.isEmpty else { return }
+            UIPasteboard.general.string = text
+        }
         .onDisappear { controller.disconnect() }
         .sheet(isPresented: $showSnippetSheet) {
             SnippetPickerSheet(
@@ -211,6 +254,20 @@ public struct TerminalView: View {
                     showKeySequenceSheet = false
                 }
             )
+        }
+        // Y-P1(#2): `AI_INTEGRATION_DESIGN.md` §6のAI/リッチパネル(presentDocument/
+        // presentForm)。データは既に`uiState.aiPanel`へ届いている(`onScreenUpdate`参照)。
+        .sheet(isPresented: Binding(
+            get: { uiState.aiPanel != nil },
+            set: { if !$0 { controller.dismissAiPanel() } }
+        )) {
+            if let panel = uiState.aiPanel {
+                AiPanelSheet(
+                    panel: panel,
+                    onSubmit: { values in controller.submitAiPanelForm(values: values) },
+                    onDismiss: { controller.dismissAiPanel() }
+                )
+            }
         }
         .alert(
             "Agent署名要求",
@@ -667,6 +724,11 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
     let onShowKeySequences: () -> Void
     /// タスク#67: アクセサリバーの「検索」ボタンから検索バーを開く(`TerminalView`が保持)。
     let onShowSearch: () -> Void
+    /// Y-P1(#5): OSC 133「前/次のプロンプトへジャンプ」・「直前コマンドの出力だけをコピー」
+    /// (`TerminalView`が現在の`scrollOffset`/`showingScrollback`を捕捉した状態で保持)。
+    let onJumpToPreviousPrompt: () -> Void
+    let onJumpToNextPrompt: () -> Void
+    let onCopyLastCommandOutput: () -> Void
 
     func makeUIView(context: Context) -> TerminalIMEInputView {
         let view = TerminalIMEInputView()
@@ -674,7 +736,9 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
         view.inputAccessoryView = TerminalAccessoryBar(
             controller: controller, inputView: view,
             onShowSnippets: onShowSnippets, onShowKeySequences: onShowKeySequences,
-            onShowSearch: onShowSearch
+            onShowSearch: onShowSearch,
+            onJumpToPreviousPrompt: onJumpToPreviousPrompt, onJumpToNextPrompt: onJumpToNextPrompt,
+            onCopyLastCommandOutput: onCopyLastCommandOutput
         )
         if isActive {
             DispatchQueue.main.async {
@@ -728,6 +792,11 @@ private final class TerminalAccessoryBar: UIView {
     private let onShowKeySequences: () -> Void
     /// タスク#67: 検索バーを開く(SwiftUI側、`TerminalView`が保持する)。
     private let onShowSearch: () -> Void
+    /// Y-P1(#5、旧タスク#13 OSC 133): 前/次のプロンプトへジャンプ・直前コマンドの
+    /// 出力だけをコピー(SwiftUI側、`TerminalView`が保持する)。
+    private let onJumpToPreviousPrompt: () -> Void
+    private let onJumpToNextPrompt: () -> Void
+    private let onCopyLastCommandOutput: () -> Void
 
     /// Phase 1F-5(#52): ^C/^D/^Zの制御バイト直接送信ボタン。Android版`TerminalScreen.kt`の
     /// `CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }`等と同じ(トグル式の「Ctrl」
@@ -741,13 +810,19 @@ private final class TerminalAccessoryBar: UIView {
         inputView: TerminalIMEInputView,
         onShowSnippets: @escaping () -> Void = {},
         onShowKeySequences: @escaping () -> Void = {},
-        onShowSearch: @escaping () -> Void = {}
+        onShowSearch: @escaping () -> Void = {},
+        onJumpToPreviousPrompt: @escaping () -> Void = {},
+        onJumpToNextPrompt: @escaping () -> Void = {},
+        onCopyLastCommandOutput: @escaping () -> Void = {}
     ) {
         self.controller = controller
         self.imeInputView = inputView
         self.onShowSnippets = onShowSnippets
         self.onShowKeySequences = onShowKeySequences
         self.onShowSearch = onShowSearch
+        self.onJumpToPreviousPrompt = onJumpToPreviousPrompt
+        self.onJumpToNextPrompt = onJumpToNextPrompt
+        self.onCopyLastCommandOutput = onCopyLastCommandOutput
         super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
         backgroundColor = .secondarySystemBackground
         autoresizingMask = [.flexibleWidth]
@@ -768,6 +843,15 @@ private final class TerminalAccessoryBar: UIView {
         // タスク#67: スクロールバック検索バーを開く。
         let search = makeButton(title: "検索", tag: -5)
         search.addTarget(self, action: #selector(handleSearchTap), for: .touchUpInside)
+
+        // Y-P1(#5、旧タスク#13 OSC 133): 前/次のプロンプトへジャンプ。物理キーボードの
+        // 無いiOSでコマンド履歴を辿る手段として特に価値が高い(Android版と同じ理由)。
+        let promptPrev = makeButton(title: "前へ", tag: -6)
+        promptPrev.addTarget(self, action: #selector(handlePromptPreviousTap), for: .touchUpInside)
+        let promptNext = makeButton(title: "次へ", tag: -7)
+        promptNext.addTarget(self, action: #selector(handlePromptNextTap), for: .touchUpInside)
+        let promptCopy = makeButton(title: "出力コピー", tag: -8)
+        promptCopy.addTarget(self, action: #selector(handleCopyLastCommandOutputTap), for: .touchUpInside)
 
         let controlButtons = controlByteButtons.enumerated().map { index, item in
             let button = makeButton(title: item.title, tag: -10 - index)
@@ -790,7 +874,7 @@ private final class TerminalAccessoryBar: UIView {
         self.keys = labels.map { $0.1 }
 
         let keyButtons = labels.enumerated().map { index, item in makeButton(title: item.0, tag: index) }
-        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets, keySequences, search] + keyButtons)
+        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets, keySequences, search, promptPrev, promptNext, promptCopy] + keyButtons)
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -873,6 +957,22 @@ private final class TerminalAccessoryBar: UIView {
     /// タスク#67: 検索バーを開く(SwiftUI側、`TerminalView`が保持する)。
     @objc private func handleSearchTap() {
         onShowSearch()
+    }
+
+    /// Y-P1(#5、旧タスク#13 OSC 133): 前のプロンプトへジャンプ(SwiftUI側、
+    /// `TerminalView`が保持する)。
+    @objc private func handlePromptPreviousTap() {
+        onJumpToPreviousPrompt()
+    }
+
+    /// `handlePromptPreviousTap`の「次」版。
+    @objc private func handlePromptNextTap() {
+        onJumpToNextPrompt()
+    }
+
+    /// Y-P1(#5): 直前コマンドの出力だけをコピー(SwiftUI側、`TerminalView`が保持する)。
+    @objc private func handleCopyLastCommandOutputTap() {
+        onCopyLastCommandOutput()
     }
 }
 

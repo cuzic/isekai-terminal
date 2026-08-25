@@ -1,5 +1,6 @@
 import SwiftUI
 import IsekaiTerminalCore
+import IsekaiTerminalCoreLogic
 
 @main
 struct IsekaiTerminalApp: App {
@@ -93,7 +94,16 @@ struct AppRootView: View {
                     SnippetListView(
                         model: SnippetListModel(),
                         onAddSnippet: { path.append(.snippetEdit(nil)) },
-                        onEditSnippet: { snippet in path.append(.snippetEdit(snippet)) }
+                        onEditSnippet: { snippet in path.append(.snippetEdit(snippet)) },
+                        onAddFromTemplate: { template in
+                            // id == nilの未保存Snippetとして渡す(`SnippetEditModel.save()`は
+                            // existingId(=id)がnilならinsertするため、既存を上書きしない)。
+                            path.append(.snippetEdit(Snippet(
+                                label: template.label,
+                                command: template.command,
+                                appendNewline: template.appendNewline
+                            )))
+                        }
                     )
                 case .snippetEdit(let snippet):
                     SnippetEditView(
