@@ -12,4 +12,9 @@ public enum AppSettingsKeys {
     public static let allowRemoteClipboardPull = "allow_remote_clipboard_pull"
     /// tmux迂回control-plane(`CtlSocketForwardSettings`参照)を有効にするか。既定OFF。
     public static let enableCtlSocketForward = "enable_ctl_socket_forward"
+    /// Y-P1(#7): 新規(未知)ホスト鍵を確認ダイアログ無しで自動信頼するか
+    /// (`ssh -o StrictHostKeyChecking=accept-new`相当、`TerminalSessionController.onHostKey`参照)。
+    /// 既知ホストのfingerprint不一致はこの設定に関わらず常に拒否する(`always-connects.md`)。
+    /// 既定OFF。Android版`HostKeySettings`の`auto_trust_new_host_keys`と同じ意味。
+    public static let autoTrustNewHostKeys = "auto_trust_new_host_keys"
 }

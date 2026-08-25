@@ -1,5 +1,6 @@
 import XCTest
 @testable import IsekaiTerminalCore
+import IsekaiTerminalCoreLogic
 
 /// Phase 1G-1(#53): `SnippetEditModel`(Android版`SnippetEditViewModel`相当)の検証。
 @MainActor
@@ -37,6 +38,23 @@ final class SnippetEditModelTests: XCTestCase {
         XCTAssertEqual(saved.first?.command, "ls -la")
         XCTAssertTrue(saved.first?.appendNewline ?? false)
         XCTAssertNil(saved.first?.profileId)
+    }
+
+    /// Y-P1(#8): テンプレートから追加(`IsekaiTerminalApp.swift`の`onAddFromTemplate`は
+    /// `id == nil`の下書き`Snippet`を渡す)しても、通常の新規スニペットと同じ経路で
+    /// 永続化されること(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+    func testSaveFromTemplateDraftInsertsNewSnippetLikeAnyOther() throws {
+        let db = try ProfileDatabase.inMemory()
+        let template = SnippetTemplates.tmuxSessionPicker
+        let draft = Snippet(label: template.label, command: template.command, appendNewline: template.appendNewline)
+        let model = SnippetEditModel(snippet: draft, db: db)
+
+        XCTAssertTrue(model.save())
+
+        let saved = try db.fetchAllSnippets()
+        XCTAssertEqual(saved.count, 1)
+        XCTAssertEqual(saved.first?.label, template.label)
+        XCTAssertEqual(saved.first?.command, template.command)
     }
 
     func testSaveWithProfileIdPersistsScope() throws {

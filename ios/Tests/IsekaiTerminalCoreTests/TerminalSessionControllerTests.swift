@@ -90,6 +90,33 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
     }
 
+    /// Y-P1(#7): `autoTrustNewHostKeys`をONにすると、未知ホストが確認プロンプト無しで
+    /// 即座に信頼される(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.4)。
+    func testAutoTrustNewHostKeysAcceptsUnknownHostWithoutPrompt() throws {
+        let (controller, trustStore) = try makeController()
+        UserDefaults.standard.set(true, forKey: AppSettingsKeys.autoTrustNewHostKeys)
+        defer { UserDefaults.standard.removeObject(forKey: AppSettingsKeys.autoTrustNewHostKeys) }
+
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
+
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertEqual(trustStore.record(for: identifier)?.fingerprint, "SHA256:aaaa")
+    }
+
+    /// Y-P1(#7): この項目で最も回帰させてはいけない性質。`autoTrustNewHostKeys`がONでも、
+    /// 既知ホストのfingerprint不一致は常に拒否される(MITMと正当な再デプロイを機械的に
+    /// 区別できないため、この設定の対象は「初回確認を省略するか」だけ。
+    /// `.claude/rules/always-connects.md`参照)。
+    func testAutoTrustNewHostKeysDoesNotBypassFingerprintMismatch() throws {
+        let (controller, _) = try makeController()
+        UserDefaults.standard.set(true, forKey: AppSettingsKeys.autoTrustNewHostKeys)
+        defer { UserDefaults.standard.removeObject(forKey: AppSettingsKeys.autoTrustNewHostKeys) }
+
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:bbbb"))
+    }
+
     // 実sshd接続+CredentialVault(Keychain)を伴うE2Eテストは、素のSwiftPM
     // テストバンドルではKeychainがerrSecMissingEntitlement(-34018)で失敗するため
     // (`CredentialVaultTests.swift`のコメント参照)、アプリホスト型の

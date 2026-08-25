@@ -811,12 +811,23 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// 渡された`host`/`port`をそのまま使う(`profile.host`ではなく)ことで、踏み台経由接続で
     /// ホップ先のホスト鍵が届いた場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
     /// `onHostKey(host, port, fingerprint)`と同じ方針)。
+    ///
+    /// Y-P1(#7): `AppSettingsKeys.autoTrustNewHostKeys`がONの場合のみ、未知ホストを
+    /// 確認ダイアログ無しで即座に信頼する(`ssh -o StrictHostKeyChecking=accept-new`相当、
+    /// Android版`RealHostKeyChecker.check`の`HostKeyStatus.Unknown`分岐と対称)。
+    /// **既知ホストのfingerprint不一致(`.mismatch`)はこの設定に関わらず常に拒否する**——
+    /// MITMと正当な再デプロイを機械的に区別できないための意図的な設計であり、この設定の
+    /// 対象は「初回確認を省略するか」だけ(`.claude/rules/always-connects.md`参照)。
     public func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool {
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: host, port: port)
         switch trustStore.verify(identifier: identifier, keyType: "ssh", fingerprint: fingerprint) {
         case .trustedMatch:
             return true
         case .unknownHost:
+            if UserDefaults.standard.bool(forKey: AppSettingsKeys.autoTrustNewHostKeys) {
+                try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: fingerprint)
+                return true
+            }
             Task { @MainActor in
                 self.uiState.newHostKeyPrompt = NewHostKeyPrompt(host: host, port: port, fingerprint: fingerprint)
             }

@@ -1,4 +1,5 @@
 import SwiftUI
+import IsekaiTerminalCoreLogic
 
 /// Phase 1G-1(#53): Android版`SnippetListScreen.kt`/`SnippetListViewModel.kt`の移植。
 @MainActor
@@ -31,15 +32,22 @@ public struct SnippetListView: View {
     @StateObject private var model: SnippetListModel
     private let onAddSnippet: () -> Void
     private let onEditSnippet: (Snippet) -> Void
+    /// Y-P1(#8): テンプレートを選ぶと、そのラベル/コマンドを引き継いだ未保存の
+    /// `Snippet`(`id == nil`)を編集画面へ渡す(Android版`onAddFromTemplate`と対称、
+    /// `ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+    private let onAddFromTemplate: (SnippetTemplate) -> Void
+    @State private var showTemplatePicker = false
 
     public init(
         model: SnippetListModel,
         onAddSnippet: @escaping () -> Void,
-        onEditSnippet: @escaping (Snippet) -> Void
+        onEditSnippet: @escaping (Snippet) -> Void,
+        onAddFromTemplate: @escaping (SnippetTemplate) -> Void = { _ in }
     ) {
         _model = StateObject(wrappedValue: model)
         self.onAddSnippet = onAddSnippet
         self.onEditSnippet = onEditSnippet
+        self.onAddFromTemplate = onAddFromTemplate
     }
 
     public var body: some View {
@@ -69,8 +77,18 @@ public struct SnippetListView: View {
                 }
                 .accessibilityIdentifier("addSnippetButton")
             }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("テンプレート") { showTemplatePicker = true }
+                    .accessibilityIdentifier("addFromTemplateButton")
+            }
         }
         .onAppear { model.load() }
+        .sheet(isPresented: $showTemplatePicker) {
+            SnippetTemplatePickerView(onPick: { template in
+                showTemplatePicker = false
+                onAddFromTemplate(template)
+            })
+        }
         .alert(
             "削除確認",
             isPresented: Binding(
@@ -104,5 +122,27 @@ private struct SnippetRow: View {
                 .foregroundStyle(.tint)
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// Y-P1(#8): テンプレート選択シート。Android版`SnippetListScreen.kt`の
+/// `showTemplatePicker`ダイアログと対称(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+private struct SnippetTemplatePickerView: View {
+    let onPick: (SnippetTemplate) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(SnippetTemplates.all, id: \.label) { template in
+                Button(template.label) { onPick(template) }
+                    .accessibilityIdentifier("snippetTemplate_\(template.label)")
+            }
+            .navigationTitle("テンプレートから追加")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("キャンセル") { dismiss() }
+                }
+            }
+        }
     }
 }
