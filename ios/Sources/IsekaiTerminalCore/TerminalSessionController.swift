@@ -21,6 +21,41 @@ public struct NewHostKeyPrompt: Equatable, Sendable {
     public let fingerprint: String
 }
 
+/// Y-P1(#5): OSC 133(タスク#13)「前/次のプロンプトへジャンプ」の直近の結果。
+/// Android版`UiState.kt`の`PromptJumpResult`と対称。`seq`を持つ理由: `target`の値が
+/// 前回と同じ(例: 既に一番古いプロンプトで「前へ」を連打)でもSwiftUIの`.onChange(of:)`は
+/// 値の変化でのみ発火するため、`@Published`の再割り当てだけでは同じ操作の2回目以降が
+/// 反映されない。`seq`を単調増加させることで、`target`の内容に関わらず操作ごとに
+/// 確実に`.onChange`を発火させる(Android版`LaunchedEffect(uiState.promptJumpResult.seq)`
+/// と同じ理由付け)。
+public struct PromptJumpResult: Equatable, Sendable {
+    public var target: PromptJumpTarget?
+    public var seq: UInt64 = 0
+}
+
+/// Y-P1(#5)「直前コマンドの出力だけをコピー」の直近の結果。`PromptJumpResult`と
+/// 同じ理由で`seq`を持つ。
+public struct PromptOutputCopyResult: Equatable, Sendable {
+    public var text: String?
+    public var seq: UInt64 = 0
+}
+
+/// Y-P1(#2): `AI_INTEGRATION_DESIGN.md` §6にあるリモートAPC経由の構造化パネル
+/// (`presentDocument`/`presentForm`)のUI表示用スナップショット。Android版
+/// `UiState.kt`の`AiPanelUiState`と対称。`kind == .document`の時は`markdown`、
+/// `kind == .form`の時は`fields`のみが意味を持つ。
+///
+/// **信頼境界**: 内容(title/markdown/fields)はリモートの任意プロセスが偽造できる
+/// PTY上のin-bandデータであり、表示専用テキストとしてしか扱わない——自動実行・
+/// シェルコマンド化・クリップボード自動書き込み等の副作用を一切引き起こさない
+/// (`ai_panel.rs`のモジュールdoc、Android版`AiPanelDialog.kt`と同じ方針)。
+public struct AiPanelUiState: Equatable, Sendable {
+    public let kind: PanelKind
+    public let title: String
+    public let markdown: String
+    public let fields: [PanelField]
+}
+
 /// Phase 1D: ターミナル本画面のSSH接続状態。UI(`TerminalView`)はこれだけを見て
 /// 表示を切り替える(Rust SSOT原則: 接続状態の判断はここに集約し、UI側で
 /// 独自のミラー状態を作らない)。
@@ -66,6 +101,17 @@ public final class TerminalUIState: ObservableObject {
     /// 素通しであり、Swift側で解釈・分岐はしない。まだ解決前(接続直後やopportunisticな
     /// 失敗時)はnilのままで、その場合はタブラベルに何も追加しない。
     @Published public internal(set) var tmuxWindowLabel: String?
+    /// Y-P1(#5): OSC 133「前/次のプロンプトへジャンプ」の直近の結果。
+    @Published public internal(set) var promptJumpResult = PromptJumpResult()
+    /// Y-P1(#5): OSC 133「直前コマンドの出力だけをコピー」の直近の結果。
+    @Published public internal(set) var promptOutputCopyResult = PromptOutputCopyResult()
+    /// Y-P1(#2): 現在表示中のAI/リッチパネル。非nilの間、シートを表示する。
+    @Published public internal(set) var aiPanel: AiPanelUiState?
+    /// Y-P1(#2): 直近適用済みの`ScreenUpdate.panelGeneration`。`bellGeneration`と同じ
+    /// dedup規約(`lastFiredBellGeneration`参照) — ユーザーが明示的に閉じた後、
+    /// 同じ世代のパネルが無関係な後続`ScreenUpdate`で再表示されないようにするための
+    /// 記憶であり、`dismissAiPanel()`はこの値を戻さない。
+    public internal(set) var lastAppliedPanelGeneration: UInt64 = 0
     /// タスク#26: 直近フィードバック(触覚)を発火した`ScreenUpdate.bellGeneration`。
     /// `bell_generation`はTerminalごとに(rust-core `Terminal`)0始まりで単調増加する
     /// カウンタ(#24)なので、これより大きい値を受け取った時だけ1回発火させる
@@ -567,6 +613,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             // 競合を作りかねない(Codexレビュー指摘)。ここで`uiState.latestScreenUpdate = nil`
             // と同じ@MainActor同期文脈でリセットすることで、そのような競合を作らない。
             uiState.lastFiredBellGeneration = 0
+            // Y-P1(#2): 新しい論理セッションでは前回接続のパネル世代・表示中パネルを
+            // 引き継がない(`lastFiredBellGeneration`と同じ理由、Android版`reconnect()`と対称)。
+            uiState.lastAppliedPanelGeneration = 0
+            uiState.aiPanel = nil
             connect(cols: lastCols, rows: lastRows)
         }
     }
@@ -613,11 +663,51 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.searchScrollback(query: query, caseSensitive: caseSensitive)
     }
 
+    /// Y-P1(#5): OSC 133「前のプロンプトへジャンプ」。既存のスクロールバック検索
+    /// (`searchScrollback`)とは独立した機能。`fromScrollOffset`/`fromShowingScrollback`は
+    /// 呼び出し時点でView側が表示している位置をそのまま渡す。結果は`uiState.promptJumpResult`
+    /// で非同期に届く(Android版`TerminalSession.jumpToPreviousPrompt`と対称)。
+    public func jumpToPreviousPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) {
+        orchestrator.jumpToPreviousPrompt(fromScrollOffset: fromScrollOffset, fromShowingScrollback: fromShowingScrollback)
+    }
+
+    /// `jumpToPreviousPrompt`の「次」版。
+    public func jumpToNextPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) {
+        orchestrator.jumpToNextPrompt(fromScrollOffset: fromScrollOffset, fromShowingScrollback: fromShowingScrollback)
+    }
+
+    /// Y-P1(#5): OSC 133「直前コマンドの出力だけをコピー」。結果は
+    /// `uiState.promptOutputCopyResult`で非同期に届く。
+    public func copyLastCommandOutput() {
+        orchestrator.copyLastCommandOutput()
+    }
+
     /// 保留中のagent署名要求に応答する(UI、MainActorから呼ぶ)。
     @MainActor
     public func respondToAgentSignRequest(approved: Bool) {
         uiState.pendingAgentSignRequest?.respond(approved)
         uiState.pendingAgentSignRequest = nil
+    }
+
+    // MARK: - AIパネル(Y-P1 #2)
+
+    /// ユーザーがパネルを閉じた(送信せずに閉じた、または送信後の後始末)。
+    /// `lastAppliedPanelGeneration`はリセットしない(`uiState.aiPanel`のdocコメント参照
+    /// ——同じ世代のパネルが無関係な後続`ScreenUpdate`で再表示されないようにするため)。
+    @MainActor
+    public func dismissAiPanel() {
+        uiState.aiPanel = nil
+    }
+
+    /// `presentForm`パネルの送信。`values`のキーは`PanelField.id`。実際のバイト列組み立ては
+    /// `AiPanelFormSubmission.bytes`(Logic層、テスト済み)に委譲し、キー順は表示中パネルの
+    /// `fields`宣言順に揃える(未入力のフィールドは空文字列として送る)。
+    @MainActor
+    public func submitAiPanelForm(values: [String: String]) {
+        guard let panel = uiState.aiPanel else { return }
+        let ordered = panel.fields.map { (key: $0.id, value: values[$0.id] ?? "") }
+        send(AiPanelFormSubmission.bytes(orderedValues: ordered))
+        dismissAiPanel()
     }
 
     // MARK: - trzsz(#25)
@@ -784,6 +874,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             if update.bellGeneration > self.uiState.lastFiredBellGeneration {
                 self.uiState.lastFiredBellGeneration = update.bellGeneration
                 Self.fireBellFeedback()
+            }
+            // Y-P1(#2): `panelGeneration`が直近適用済みの値より進んでいれば表示中パネルを
+            // 更新する。`PanelKind.none`(未提示)の間は何もしない
+            // (Android版`maybeApplyPanel`と対称)。
+            if update.panelGeneration > self.uiState.lastAppliedPanelGeneration, update.panelKind != .none {
+                self.uiState.lastAppliedPanelGeneration = update.panelGeneration
+                self.uiState.aiPanel = AiPanelUiState(
+                    kind: update.panelKind, title: update.panelTitle,
+                    markdown: update.panelMarkdown, fields: update.panelFields
+                )
             }
         }
     }
@@ -976,15 +1076,22 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         Task { @MainActor in self.uiState.rebindState = state }
     }
 
-    // タスク#13(OSC 133): 「前/次のプロンプトへジャンプ」・「直前コマンドの出力だけを
-    // コピー」はAndroid版(`TerminalSession.kt`)でのみUI実装済みで、iOS側にはまだ対応する
-    // UIが無い(`onNoViablePath`/`onData`と同じくno-op)。`OrchestratorCallback`はKotlin/iOS
-    // 共有のプロトコルのため、UI未実装でも準拠のためのメソッド自体は必要。iOS側にUIを
-    // 追加する際はAndroid版と同じくRust側(`Terminal::prompt_jump_target`/
-    // `last_command_output_text`)の判断結果をそのまま反映するだけでよい。
-    public func onPromptJump(target: PromptJumpTarget?) {}
+    // Y-P1(#5、旧タスク#13 OSC 133): 「前/次のプロンプトへジャンプ」・「直前コマンドの
+    // 出力だけをコピー」。Rust側(`Terminal::prompt_jump_target`/`last_command_output_text`)
+    // の判断結果をそのまま反映するだけ(rust-ssot)。実際のscrollOffset/showingScrollback
+    // 更新はView側(`TerminalView.swift`、`PromptNavigation.scrollTarget`参照)が
+    // `promptJumpResult`の変化を見て行う。
+    public func onPromptJump(target: PromptJumpTarget?) {
+        Task { @MainActor in
+            self.uiState.promptJumpResult = PromptJumpResult(target: target, seq: self.uiState.promptJumpResult.seq &+ 1)
+        }
+    }
 
-    public func onPromptOutputCopyReady(text: String?) {}
+    public func onPromptOutputCopyReady(text: String?) {
+        Task { @MainActor in
+            self.uiState.promptOutputCopyResult = PromptOutputCopyResult(text: text, seq: self.uiState.promptOutputCopyResult.seq &+ 1)
+        }
+    }
 
     // タスク#17(ファイルプレビュー機能): Android版(`TerminalSession.kt`の
     // `filePreviewRequest`/`onFilePreviewResult`)でのみUI実装済みで、iOS側にはまだ
