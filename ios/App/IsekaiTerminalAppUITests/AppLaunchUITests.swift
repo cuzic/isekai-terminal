@@ -238,37 +238,43 @@ final class AppLaunchUITests: XCTestCase {
     }
 
     /// Epic M以降に追加された4つのオプトイン設定トグル(画面の保護/リモートクリップボード
-    /// 書込・送信許可/tmux迂回control-plane)が、メニューから実際にON/OFFを切り替えられる
-    /// ことを確認する(`ScreenProtectionOverlay`/`RemoteClipboardBridge`/
-    /// `CtlSocketForwardSettings`が読む`@AppStorage`との配線確認)。
+    /// 書込・送信許可/tmux迂回control-plane)が、設定画面(`SettingsView`)から実際に
+    /// ON/OFFを切り替えられることを確認する(`ScreenProtectionOverlay`/
+    /// `RemoteClipboardBridge`/`CtlSocketForwardSettings`が読む`@AppStorage`との配線確認)。
+    /// Y-P0(a)でメニュー直下のトグルから独立した設定画面へ移設された
+    /// (`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(a))。
     func testOptInSettingsMenuItemsToggleBetweenOnAndOff() throws {
         let app = XCUIApplication()
         app.launch()
 
-        let menuItems = [
-            "screenProtectionMenuItem",
-            "remoteClipboardWriteMenuItem",
-            "remoteClipboardPullMenuItem",
-            "ctlSocketForwardMenuItem",
+        XCTAssertTrue(app.buttons["profileListMenu"].waitForExistence(timeout: 10))
+        app.buttons["profileListMenu"].tap()
+        XCTAssertTrue(app.buttons["settingsMenuItem"].waitForExistence(timeout: 5))
+        app.buttons["settingsMenuItem"].tap()
+
+        XCTAssertTrue(app.collectionViews["settingsView"].waitForExistence(timeout: 10))
+
+        let toggleIdentifiers = [
+            "screenProtectionToggle",
+            "remoteClipboardWriteToggle",
+            "remoteClipboardPullToggle",
+            "ctlSocketForwardToggle",
         ]
 
-        for identifier in menuItems {
-            XCTAssertTrue(app.buttons["profileListMenu"].waitForExistence(timeout: 10))
-            app.buttons["profileListMenu"].tap()
-
+        for identifier in toggleIdentifiers {
             let item = app.buttons[identifier]
             XCTAssertTrue(item.waitForExistence(timeout: 5))
             let initiallyOff = item.label.hasSuffix("OFF")
             item.tap()
 
-            app.buttons["profileListMenu"].tap()
             let itemAfterToggle = app.buttons[identifier]
             XCTAssertTrue(itemAfterToggle.waitForExistence(timeout: 5))
             XCTAssertEqual(itemAfterToggle.label.hasSuffix("OFF"), !initiallyOff)
 
-            // 次のトグルの検証に影響しないよう、必ず元の状態(OFF)へ戻す
-            // (これによりメニューも閉じるので、次のループ先頭のtapで開き直す)。
+            // 次のトグルの検証に影響しないよう、必ず元の状態(OFF)へ戻す。
             itemAfterToggle.tap()
         }
+
+        app.buttons["settingsDoneButton"].tap()
     }
 }

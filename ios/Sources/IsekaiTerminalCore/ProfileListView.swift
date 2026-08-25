@@ -48,14 +48,10 @@ public struct ProfileListView: View {
     @AppStorage(TerminalThemes.prefKey) private var currentThemeName: String = TerminalThemes.defaultDark.name
     @State private var showThemePicker = false
 
-    /// Epic M以降にAndroid版`ProfileListScreen.kt`のメニューへ追加された4つの
-    /// オプトイン設定(既定OFF)。`@AppStorage`は`ScreenProtectionOverlay`/
-    /// `RemoteClipboardBridge`が読む`UserDefaults`キーと同じものを直接束縛するため、
-    /// ここでのトグルが即座にそれらへ反映される。
-    @AppStorage(AppSettingsKeys.screenProtectionEnabled) private var screenProtectionEnabled = false
-    @AppStorage(AppSettingsKeys.allowRemoteClipboardWrite) private var remoteClipboardWriteEnabled = false
-    @AppStorage(AppSettingsKeys.allowRemoteClipboardPull) private var remoteClipboardPullEnabled = false
-    @AppStorage(AppSettingsKeys.enableCtlSocketForward) private var ctlSocketForwardEnabled = false
+    /// Y-P0(a): 従来ここに直接`@AppStorage`でインラインされていた4つのオプトイン設定
+    /// (画面の保護/リモートクリップボード書込・送信許可/tmux迂回control-plane)は
+    /// `SettingsView.swift`へ抽出した(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(a))。
+    @State private var showSettings = false
 
     // `model`にデフォルト値を持たせると、そのデフォルト式`ProfileListModel()`は
     // (SwiftのStateObject(wrappedValue:)のautoclosureとは違い)呼び出し側の
@@ -131,23 +127,8 @@ public struct ProfileListView: View {
                             .accessibilityIdentifier("diagnosticsMenuItem")
                     }
                     Divider()
-                    Button(screenProtectionEnabled ? "画面の保護: ON" : "画面の保護: OFF") {
-                        screenProtectionEnabled.toggle()
-                    }
-                    .accessibilityIdentifier("screenProtectionMenuItem")
-                    Button(remoteClipboardWriteEnabled ? "リモートからのクリップボード書込: ON" : "リモートからのクリップボード書込: OFF") {
-                        remoteClipboardWriteEnabled.toggle()
-                    }
-                    .accessibilityIdentifier("remoteClipboardWriteMenuItem")
-                    Button(remoteClipboardPullEnabled ? "リモートへのクリップボード送信: ON" : "リモートへのクリップボード送信: OFF") {
-                        remoteClipboardPullEnabled.toggle()
-                    }
-                    .accessibilityIdentifier("remoteClipboardPullMenuItem")
-                    Button(ctlSocketForwardEnabled ? "tmux迂回control-plane: ON" : "tmux迂回control-plane: OFF") {
-                        ctlSocketForwardEnabled.toggle()
-                        CtlSocketForwardSettings.restore()
-                    }
-                    .accessibilityIdentifier("ctlSocketForwardMenuItem")
+                    Button("設定") { showSettings = true }
+                        .accessibilityIdentifier("settingsMenuItem")
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -196,6 +177,9 @@ public struct ProfileListView: View {
         }
         .sheet(isPresented: $showThemePicker) {
             TerminalThemePickerView(selectedName: $currentThemeName)
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
         }
     }
 }

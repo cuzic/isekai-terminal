@@ -1,0 +1,37 @@
+name: GRDB migration consistency check
+
+# GRDB(ProfileDatabase)のマイグレーション番号の整合性をチェックする。Android版
+# room-migration-check.ymlの1:1移植(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(b) / D-4)。
+# 複数の並行作業(worktree/エージェント)が同時に新しいマイグレーションを追加すると、
+# 同じ版数を奪い合って後から再採番が必要になる問題を早期に検出するためのゲート。
+# 詳細は ios/migration_registry.toml と scripts/check-grdb-migrations.sh を参照。
+#
+# room-migration(required check)と違い、こちらは required にしない
+# (iOS系ジョブをrequiredへ昇格する判断自体が本ADRのスコープ外、
+# `.claude/rules/main-branch-protection.md`参照)。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ios/Sources/IsekaiTerminalCore/ProfileDatabase.swift"
+      - "ios/migration_registry.toml"
+      - "scripts/check-grdb-migrations.sh"
+  pull_request:
+    paths:
+      - "ios/Sources/IsekaiTerminalCore/ProfileDatabase.swift"
+      - "ios/migration_registry.toml"
+      - "scripts/check-grdb-migrations.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: grdb-migration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check GRDB migration chain and registry consistency
+        run: scripts/check-grdb-migrations.sh

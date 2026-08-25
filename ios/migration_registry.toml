@@ -1,0 +1,36 @@
+# GRDB(ProfileDatabase)のマイグレーション版数予約台帳。
+#
+# 背景: Android版`android/migration_registry.toml`と同じ問題(複数の並行作業
+# [worktree/エージェント]が同時に新しいマイグレーションを追加すると、同じ版数を
+# 奪い合い、後から手動で再採番するfixupコミットが必要になる)がiOS版のGRDBでも
+# 起こり得るため、実証済みのRoom側の予約台帳パターンをそのまま移植したもの
+# (`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(b) / D-4)。
+#
+# ルール:
+# 1. 新しい GRDB migration を書き始める前に、
+#    `scripts/reserve-grdb-migration.sh <owner-slug>` を実行してバージョン番号を予約する
+#    (このファイルに [[reserved]] エントリが追記される)。
+# 2. 予約された番号で `ProfileDatabase.swift` の `migrator` に
+#    `migrator.registerMigration("v<N>_<description>") { db in ... }` を追加する
+#    (Android版の`MIGRATION_X_Y`と違い、GRDBは`from`版数を引数に取らない文字列名の
+#    連番方式。既存の`v1_create_key_entry_and_connection_profile`〜
+#    `v6_create_tmux_tab_locators`が前例)。
+# 3. マージしたら、対応する [[reserved]] エントリをこのファイルから削除し、
+#    current を N に更新する。
+# 4. `scripts/check-grdb-migrations.sh`(CI: `.github/workflows/grdb-migration-check.yml`、
+#    required check ではない)が、
+#    - current が `ProfileDatabase.swift` に登録済みの `vN_...` マイグレーション名の
+#      最大 N と一致していること
+#    - `v1`〜current まで連番で重複・欠番が無いこと
+#    - reserved に current 以下の値(＝削除し忘れ)が残っていないこと
+#    を検証する。
+
+current = 6
+
+# 予約中のマイグレーション(未マージ)。マージ後は必ず削除すること。
+# 例:
+# [[reserved]]
+# version = 7
+# owner = "y-p2c-hostkey-autotrust"
+# branch = "feat/ios-hostkey-autotrust"
+# reserved_at = "2026-08-24"
