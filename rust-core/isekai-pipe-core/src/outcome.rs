@@ -61,9 +61,13 @@ pub enum ConnectOutcomeClass {
     /// would otherwise have to turn into a hard error for the entire
     /// `isekai-ssh` invocation — worse than just treating it as "some
     /// outcome was recorded" the way the wrapper already treats `Unreachable`.
-    /// Must be matched like `Unreachable` (not like "no signal at all") by
-    /// `isekai-ssh::wrapper::decide_connect_failure_recovery` — see that
-    /// function's own docs.
+    /// Must be matched like `Unreachable` (not like "no signal at all")
+    /// wherever `ConnectOutcomeClass` is exhaustively matched —
+    /// `isekai-ssh::wrapper::outcome_summary` today (`decide_connect_failure_recovery`
+    /// itself takes a plain `bool`, not this enum, and treats every class
+    /// alike; it needs no update). `log_auto_bootstrap_disabled` also special-
+    /// cases this variant to avoid suggesting `isekai-ssh init` — see its
+    /// own doc comment.
     ///
     /// **Must stay the last variant.** `serde_derive` rejects `#[serde(other)]`
     /// anywhere but the last variant at compile time — a future PR (e.g.

@@ -664,6 +664,20 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
 /// `RebootstrapAndRetry`'s — see [`log_rebootstrap_and_retry_decision`] —
 /// whose trailing clause differs per platform).
 pub(crate) fn log_auto_bootstrap_disabled(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str) {
+    // Epic R PR1 code review: `Unknown` must not get the "run `isekai-ssh
+    // init` manually" imperative — that command re-deploys/re-trusts the
+    // helper, which does nothing for a version-skew schema mismatch between
+    // this `isekai-ssh` build and whatever `isekai-pipe` build wrote the
+    // outcome file. Every other class genuinely can be fixed that way.
+    if matches!(class, isekai_pipe_core::ConnectOutcomeClass::Unknown) {
+        log_line!(
+            "isekai-ssh: {} for {:?} ({}); auto-bootstrap is disabled \
+             (--isekai-no-bootstrap / #@isekai bootstrap-policy never), so no automatic recovery was attempted \
+             for this unrecognized outcome.",
+            outcome_summary(class), profile, detail
+        );
+        return;
+    }
     log_line!(
         "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
          (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
@@ -722,6 +736,18 @@ pub(crate) enum ConnectFailureRecoveryAction {
 /// `isekai-ssh`) are independently invoked and can legitimately be
 /// different builds. `Unknown` now covers the common "new class tag" case;
 /// this stays defensive for whatever `Unknown` doesn't catch.
+///
+/// Deliberately treats every `IntentError` variant the same way, including
+/// `Io` (e.g. a permissions problem or full disk under the runtime dir) —
+/// not just `Json` (an actual deserialize mismatch). This loses the
+/// distinction between "a version-skew schema shape" and "a persistent
+/// local filesystem fault" (code review finding), but that distinction was
+/// already unavailable before this function existed: the original `?`-based
+/// code turned *every* `IntentError` variant into the same hard `Err`
+/// uniformly, with no finer-grained handling either. `log_line!`'s output
+/// (visible on stderr, or in `--isekai-log-file`'s file) is where an `Io`
+/// fault should still show up for anyone debugging it, via `IntentError`'s
+/// own `Display` impl.
 pub(crate) fn resolve_claimed_outcome(
     result: Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError>,
 ) -> Option<isekai_pipe_core::ConnectOutcome> {

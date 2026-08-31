@@ -53,8 +53,8 @@ use super::mux::handoff::HandoffCredentials;
 use crate::log_file::log_line;
 use crate::wrapper::{
     bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery,
-    print_bootstrap_failure_guidance, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation, WrapperPlan,
-    WrapperResolution,
+    print_bootstrap_failure_guidance, resolve_claimed_outcome, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation,
+    WrapperPlan, WrapperResolution,
 };
 
 #[cfg(windows)]
@@ -328,8 +328,15 @@ trait ConnectRecoveryOps {
     /// the documented TOFU exception — but the silent retry is not).
     async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8>;
     /// Claims the `ConnectOutcome` signal `isekai-pipe connect` may have left
-    /// behind for this exact attempt, if any.
-    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>>;
+    /// behind for this exact attempt, if any. Returns the raw
+    /// `isekai_pipe_core::IntentError` (not pre-wrapped into an `anyhow::Error`)
+    /// so callers can feed it straight into `resolve_claimed_outcome` — the
+    /// same degrade-to-no-signal policy `wrapper.rs` uses, shared rather
+    /// than reimplemented here (Epic R PR1 code review: an earlier version
+    /// of this method pre-wrapped the error with its own message, which
+    /// then got wrapped *again* by the caller's own degrade-logging,
+    /// producing a doubled, confusing log line).
+    fn claim_outcome(&self, intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError>;
     /// Whether auto-bootstrap is currently allowed (`--isekai-no-bootstrap` /
     /// `#@isekai bootstrap-policy never` turn it off).
     fn should_bootstrap(&self) -> bool;
@@ -349,18 +356,14 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         Err(e) => e,
     };
 
-    // Epic R PR1 (S4, mirroring wrapper.rs::run_ssh_with_connect_failure_recovery):
-    // a deserialize failure here must degrade to "no signal", not fail this
-    // whole invocation — and must not discard `first_error` (the actual
-    // connect failure reason) in favor of the claim-check error, which the
-    // old `?` here did.
-    let outcome = match ops.claim_outcome(&intent.intent_id) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            log_line!("isekai-ssh: could not read a connect-failure signal ({e:#}); treating this as no signal");
-            None
-        }
-    };
+    // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome` rather
+    // than reimplementing the degrade-to-no-signal policy here — the two
+    // used to drift (different error type, different format flag, and a
+    // doubled log message from `claim_outcome` pre-wrapping its error before
+    // this call wrapped it again). Also, critically, does not discard
+    // `first_error` (the actual connect failure reason) in favor of the
+    // claim-check error, which the original `?` here did.
+    let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
 
     match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
@@ -413,9 +416,8 @@ impl ConnectRecoveryOps for NativeConnectOps<'_> {
         connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, &self.handoff, silent).await
     }
 
-    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+    fn claim_outcome(&self, intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError> {
         claim_connect_outcome(self.runtime_dir, intent_id)
-            .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))
     }
 
     fn should_bootstrap(&self) -> bool {
@@ -2256,9 +2258,9 @@ mod tests {
                 Err(msg) => Err(anyhow!(msg)),
             }
         }
-        fn claim_outcome(&self, _intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+        fn claim_outcome(&self, _intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError> {
             if self.claim_outcome_err {
-                return Err(anyhow!("simulated corrupt/unreadable outcome file"));
+                return Err(isekai_pipe_core::IntentError::InvalidIntentId);
             }
             Ok(self.outcome.clone())
         }
