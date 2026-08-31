@@ -5,6 +5,7 @@
 //! production`, is treated as an OpenSSH invocation with an injected
 //! `ProxyCommand` that delegates the byte stream to `isekai-pipe connect`.
 
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -618,6 +619,61 @@ const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
 /// Only reachable *after* `build_connection_intent` already succeeded once
 /// in `run()` — a brand-new (never-registered) profile's own, separately
 /// prompted bootstrap path is untouched by this function entirely.
+/// Live process-level reconnect status line (Epic R PR2, Task 2.13) — the
+/// `run_ssh_with_connect_failure_recovery` loop's counterpart to
+/// `isekai-pipe/src/resume_loop.rs`'s `format_reconnect_status`/
+/// `print_reconnect_status` for its own (session-level QUIC resume)
+/// reconnects. Deliberately worded differently ("isekai-ssh" + "attempt
+/// {n}" rather than "isekai-pipe connect" + an elapsed/total countdown):
+/// this loop restarts the whole `ssh(1)` process rather than resuming one
+/// live QUIC connection, and has no fixed total-window countdown to show
+/// (`reconnect_backoff::RECONNECT_BUDGET` is 24h, not a useful "X/Y"
+/// display). Pure so it's unit-testable without touching stderr, mirroring
+/// that module's own split.
+fn format_process_reconnect_status(is_tty: bool, attempt: u32) -> String {
+    if is_tty {
+        format!("\r\x1b[0;33misekai-ssh: connection lost, reconnecting... (attempt {attempt})\x1b[0m\x1b[K")
+    } else {
+        format!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})")
+    }
+}
+
+/// Counterpart to [`format_process_reconnect_status`] for a lightweight
+/// retry that succeeded — only ever printed when `attempt > 0` (i.e. after
+/// at least one visible "reconnecting..." line), so a normal first-try
+/// connection never gets an unsolicited "reconnected" message.
+fn format_process_reconnect_success(is_tty: bool) -> String {
+    if is_tty {
+        "\r\x1b[0;32misekai-ssh: reconnected.\x1b[0m\x1b[K".to_string()
+    } else {
+        "isekai-ssh: reconnected.".to_string()
+    }
+}
+
+/// Prints [`format_process_reconnect_status`]/[`format_process_reconnect_success`]
+/// to stderr — `\r`-redrawn in place when `is_tty` (no trailing newline, so
+/// the next print overwrites it), one plain `log_line!`-routed line
+/// otherwise (so `--isekai-log-file` output stays free of `\r`/ANSI bytes,
+/// same reasoning as `resume_loop.rs`'s own `is_terminal()` gate).
+fn print_process_reconnect_status(is_tty: bool, attempt: u32) {
+    let msg = format_process_reconnect_status(is_tty, attempt);
+    if is_tty {
+        eprint!("{msg}");
+        let _ = std::io::stderr().flush();
+    } else {
+        log_line!("{msg}");
+    }
+}
+
+fn print_process_reconnect_success(is_tty: bool) {
+    let msg = format_process_reconnect_success(is_tty);
+    if is_tty {
+        eprintln!("{msg}");
+    } else {
+        log_line!("{msg}");
+    }
+}
+
 async fn run_ssh_with_connect_failure_recovery(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
@@ -628,11 +684,20 @@ async fn run_ssh_with_connect_failure_recovery(
     let mut attempt: u32 = 0;
     let mut lost_since: Option<tokio::time::Instant> = None;
     let mut lightweight_retries: u32 = 0;
+    // Task 2.13: computed once — `--isekai-log-file` redirects stderr away
+    // from the terminal for the *ssh child's* stderr (`run_ssh_once`), but
+    // this process's own stderr (what `is_terminal()` here actually checks)
+    // is unaffected by that; the `!log_file::is_enabled()` half of this
+    // check is what keeps `\r`/ANSI bytes out of the log file specifically.
+    let is_tty = std::io::stderr().is_terminal() && !crate::log_file::is_enabled();
 
     loop {
         let attempt_started = tokio::time::Instant::now();
         let (status, intent_id) = run_ssh_once(plan, resolution, &intent, &runtime_dir).await?;
         if status.success() {
+            if attempt > 0 {
+                print_process_reconnect_success(is_tty);
+            }
             return Ok(0);
         }
         let exit_code = status.code().unwrap_or(1) as u8;
@@ -676,7 +741,7 @@ async fn run_ssh_with_connect_failure_recovery(
                 reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since);
                 match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
                     reconnect_backoff::ReconnectDecision::Retry => {
-                        log_line!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})");
+                        print_process_reconnect_status(is_tty, attempt);
                         intent = build_connection_intent(resolution).context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
                         continue;
                     }
@@ -2467,6 +2532,30 @@ mod tests {
             decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unknown), false),
             ConnectFailureRecoveryAction::AutoBootstrapDisabled
         );
+    }
+
+    // Epic R PR2, Task 2.13: live reconnect status formatting.
+
+    #[test]
+    fn format_process_reconnect_status_redraws_in_place_on_a_tty() {
+        let msg = format_process_reconnect_status(true, 3);
+        assert!(msg.starts_with('\r'), "TTY display must redraw in place (start with \\r): {msg:?}");
+        assert!(msg.contains("attempt 3"), "{msg:?}");
+    }
+
+    #[test]
+    fn format_process_reconnect_status_is_plain_text_off_a_tty() {
+        let msg = format_process_reconnect_status(false, 3);
+        assert!(!msg.contains('\r'), "non-TTY output must not contain \\r (would corrupt --isekai-log-file): {msg:?}");
+        assert!(!msg.contains('\x1b'), "non-TTY output must not contain ANSI escapes: {msg:?}");
+        assert!(msg.contains("attempt 3"), "{msg:?}");
+    }
+
+    #[test]
+    fn format_process_reconnect_success_is_plain_text_off_a_tty() {
+        let msg = format_process_reconnect_success(false);
+        assert!(!msg.contains('\r') && !msg.contains('\x1b'), "{msg:?}");
+        assert!(msg.contains("reconnected"), "{msg:?}");
     }
 
     #[tokio::test]
