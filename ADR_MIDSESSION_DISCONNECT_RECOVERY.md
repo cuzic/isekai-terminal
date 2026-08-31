@@ -1,0 +1,1020 @@
+# ADR: セッション確立後のネットワーク切断からの自動リカバリ（`isekai-ssh` Epic R）
+
+- **Status**: **Accepted**（2026-08-31起草、round 3改訂でADR設計に
+  ついてopus-critic-a・opus-critic-bの両者が収束。round 4は
+  `TASKS_MIDSESSION_DISCONNECT_RECOVERY.md`への実装タスク分解の
+  過程でopus-task-reviewが発見した、コード構造レベルの矛盾4件を
+  反映した設計修正——ADRの意思決定そのものが変わったわけではないが、
+  §2.2.1・§2.3の実装詳細を訂正している）
+- **ユーザー決定事項**（2026-08-31）:
+  1. **PR構成は3分割**（PR1: 独立した安全な修正のみ / PR2: リトライループ本体
+     / PR3: STUN P2Pの真resume）。各PRが個別にCI green→マージ可能な単位。
+  2. **STUN P2Pの真のバイトレベルresume（旧Tier 2）を今回のスコープに含める**
+     （B7でコストが当初想定より小さいと判明したため。§2.1参照）。
+- **対象**: `rust-core/isekai-pipe`（`connect.rs`/`resume_loop.rs`/`main.rs`）、
+  `rust-core/isekai-pipe-core`（`outcome.rs`）、`rust-core/isekai-ssh`
+  （`wrapper.rs`・`native/connect.rs`・`native/child_stdio.rs`）
+- **入力**: 本セッションでのユーザー報告「`tssh`はすぐ死なないが`isekai-ssh`は通信断で
+  すぐ死ぬ。Windows の russh 経由でも同様」の調査結果（本ドキュメント §1）
+- **拘束される既存ルール**: `CLAUDE.md`、`.claude/rules/always-connects.md`（本ADRが
+  対処するギャップの上位原則）、`.claude/rules/rust-ssot.md`（本ADRのスコープは
+  Android/iOSと無関係な独立クレートなので直接の抵触は無いが、状態機械をRust側に
+  閉じる設計思想は踏襲する）、`.claude/rules/prefer-gh-actions-over-local-cargo.md`
+  （ローカル`cargo build`/`test`全面禁止、実装・検証はすべてCI経由）、
+  `.claude/rules/main-branch-protection.md`（PRの5 required checksが緑になって
+  初めてマージ対象）
+- **UniFFIへの影響**: なし。`isekai-ssh`/`isekai-pipe`は`isekai-terminal-core`
+  （Android/iOSが依存するUniFFI公開crate）とは独立したcrate群であり
+  （`CLAUDE.md`のディレクトリ構成節）、本ADRのスコープはこれらの中で完結する。
+  `.claude/rules/uniffi-binding-regeneration.md`の手順は不要。
+
+---
+
+## 0. 改訂履歴
+
+### Round 4（2026-08-31）— タスク分解時にopus-task-reviewが発見した
+    コード構造レベルの矛盾への対応
+
+`TASKS_MIDSESSION_DISCONNECT_RECOVERY.md`を実装可能な粒度へ分解する
+過程で、ADR設計そのものに残っていた4件のblocking矛盾が判明した
+（ADRレベルのround 1〜3レビューは設計方針の妥当性を検証したが、
+実際のbreak地点の網羅性やクレート境界のような実装細部までは
+掘り下げていなかった）。
+
+| 変更 | 由来 |
+|---|---|
+| **`remote_reported_exit: bool`を`BreakReason`列挙型に置き換え**。`relay_loop`のbreakは`RemoteExitReported`/`ClientGone`/`TransportDead`/`CloseDeadline`の最低4系統あり、`bool`1個では「クライアント側が先に切断した」ケースを「transport死」と誤判定し、同じholderを共有する他タブを巻き添えにする。`native/connect.rs`の`~.`エスケープ切断も同じ問題を持つ | B1・B2 |
+| **PR3後のマーカー付与方針を明確化**: STUN経路は`run_resume_loop`の`give_up`にマーカーを付ける方針で確定し、relay経路（付けない）とは意図的に非対称にする。理由はSTUNのresume上限がrelayより低い（§1.5）ため、resume使い切り後も「再展開」より「もう一度確立し直す」方が有効な場合がある。PR2のUnix軽量リトライ機構がPR3後も無意味化(dead code化)しないようにする | B3 |
+| **`retry_while_busy_other_session`の配置を訂正**: この関数は`isekai-pipe`crateのprivate関数であり、別バイナリの`isekai-ssh`（wrapper.rs）からは呼べない。「wrapper.rsのループでSTUN connectをこれで包む」という記述を削除し、STUN試行回数の抑制は(a) `isekai-pipe`内部の`retry_while_busy_other_session`適用（Task 2.10、既存スコープ通り）と(b) wrapper.rs側の`RetryConnectLightweight`総試行回数上限、の2つの独立した層に分離する | B4 |
+| `shutdown.notify_waiters()`の発火条件を「`BreakReason::TransportDead`と分類され、かつ共有handleの生存確認（既存`handle_died`相当のチェック）でhandle自体が死んでいると確認できた場合のみ」に絞る。チャネル単体の異常閉鎖（handleは生きている）で他タブを巻き添えにしない | S9 |
+| **孫プロセス実測手順を具体化**: 経路によって「正解」が逆になる（STUN=15秒で自然に落ちるのが正常、Relay=最大10日残るのが正常＝resume中）ため、実測は明示的にSTUN P2P経路を選んで行い、Relay経路での残存は対策対象外と明記する | S10 |
+
+### Round 3（2026-08-31）— opus-critic-aのround 2再レビューへの対応
+
+opus-critic-bはround 2で収束（「収束、blocking/significantなし」）。
+opus-critic-aは同じround 2 draftにsignificant 1件・minor 3件を発見
+（blockingなし。詳細:
+[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND2.md`]の末尾に
+round 3分も追記）。
+
+| 変更 | 由来 |
+|---|---|
+| **§2.2.1のWindows mux判定方法を訂正**: `exit_code.is_some()`だけでは`ChannelMsg::ExitSignal`（シグナル終了）を`exit_code = None`のtransport死と誤判定してしまう。`remote_reported_exit: bool`という別変数を判別子にし、`ExitStatus`/`ExitSignal`のどちらでも`true`にする方式へ変更 | R2-S1 |
+| **`outcome_summary`（`wrapper.rs:648-653`）への新variantアーム追加をPR1・PR2双方の作業項目に明記**。`.claude/rules/always-connects.md`の既存ルール。`Unknown`には`Unreachable`用文言をそのまま流用せず専用の中立的文言を用意する | R2-M1 |
+| §2.2.2の孫プロセス対応（`prev_child_pid`/`ensure_process_terminated`）を、擬似コード・§4.2・§5の3箇所すべてで「実測で孫が残った場合のみ」の条件付きに統一 | R2-M2 |
+| Windows mux経路でSTUN試行回数を数える状態をどこに置くか（プロセスごとに再spawnされるため）をPR2実装時の決定事項として明記 | R2-M3 |
+
+### Round 1（2026-08-31）— opus 2体独立並行レビューへの対応
+
+opus-critic-a・opus-critic-bの2エージェントに、互いの指摘を見せずに
+round 0 draftを実コード裏取り込みでレビューさせた（詳細:
+[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND1.md`]）。**両者が独立に
+同じblocking項目に収束した**ことに加え、opus-critic-bへの追加深掘り依頼で
+Windows mux機構の重大な発見（owner側がtransport死を`Frame::Exit(255)`に
+「洗浄」しており、既存の`native::mux::run_with_reconnect`が判定材料の
+到達前に無力化されている）を得た。round 0からの主な変更:
+
+| 変更 | 由来 |
+|---|---|
+| **§1.3の根本原因説明を全面書き直し**。「両OSで理論上は既に1回だけ自動リカバリが走っている」はUnix限定の事実で、Windowsではゼロ回だったと訂正。line引用の誤りを修正（`resume_loop.rs:242-247`等） | B1・S2(引用) |
+| **Windows mux経路の詳解を新設**。owner側の`Frame::Exit`洗浄が根本原因であり、修正はプロトコル変更ゼロで`run_with_reconnect`を素通しさせるだけで足りる可能性が高いと判明 | B3(深掘り) |
+| **`err.chain()`によるdowncastの提案を撤回**。anyhowの`downcast_ref`は既にchainを辿るため、既存の`StaleTrustSignal`と同じ裸の形で十分 | B2 |
+| **`recover_via_cross_family_fallback`との衝突を新設のB4として明記**し、mid-sessionマーカー検出時は即bailする設計に変更 | B4 |
+| **非idempotentなリモートコマンドの再実行防止ガードを必須化**。`native/mux/mod.rs`に既存の同種ガード（`remote_command().is_none()`）を発見、流用する | B5 |
+| **`give_up`のstdout close→outcome書き込みのレース(B6)を新設**。書き込み順序を不変条件として明記 | B6 |
+| **Tier 1/Tier 2のコスト見積もりを訂正(B7)**。STUN P2Pの真resumeは`crate::resume::reconnect_and_resume`の既存流用で狭く実装できると判明。ユーザー判断によりTier 2を今回のスコープ(PR3)に格上げ | B7 |
+| `run_resume_loop`へのマーカー付与を撤回（10日resumeを使い切った後の失敗は現行の`RebootstrapAndRetry`が正しい） | S1(旧) |
+| STUN P2P経路のサーバー側セッションスロット消費・`retry_while_busy_other_session`未適用を新設(S2)。試行回数を3〜5回に制限する設計に変更 | S2 |
+| `isekai-pipe connect`孫プロセスの孤児化リスクを新設(S1)。リトライ前に前回試行のプロセスを確実に終了させる設計を追加 | S1 |
+| ctl-socket forwardの反復ごとのリークを新設(S3) | S3 |
+| `ConnectOutcomeClass`のschema対応方針を訂正: bump不要は変わらないが、根拠を「サーバー側sha256一致」から「ローカル異ビルド間のdeserialize耐性」に訂正し、`#[serde(other)] Unknown`の追加を必須化 | S4 |
+| **PR構成を3分割に変更**（PR1: 独立した安全な修正のみ、PR2: リトライループ本体、PR3: STUN P2P真resume）。ユーザーが2026-08-31に決定 | opus-critic-b提案 + ユーザー決定 |
+| §7 Open Questionsの大半をレビューで解決済みとしてクローズし、round 2向けの残課題のみ残す | 全般 |
+
+### Round 2（2026-08-31）— opus-critic-aのround 1再レビューへの対応
+
+opus-critic-bはround 1で収束（「収束、blocking/significantなし」）。
+opus-critic-aは同じround 1 draftに新規blocking 2件・significant 5件を
+発見した——round 1で導入した設計自体（PR分割・新enum・Windows修正案）
+に対する二次的な指摘であり、round 0→round 1の訂正が新たに生んだ
+矛盾を突いている。
+
+| 変更 | 由来 |
+|---|---|
+| **`ConnectOutcomeClass::Unknown`の扱いを訂正**: `NoRecoverableSignal`（復旧を諦める）ではなく`Unreachable`相当（`should_bootstrap`に応じてRebootstrapAndRetry/AutoBootstrapDisabled）に変更。round 1案は`always-connects.md`原則に対し現状より後退していた | R1-B1 |
+| **PR1/PR2の境界を再設定**: `MidSessionDisconnectSignal`マーカー自体・そのSTUN 2箇所への付与・`ConnectOutcomeClass::MidSessionDisconnect`variant・B4のbail-out・Windows `Ok`経路でのoutcome claim修正を、すべてPR1からPR2へ移動。round 1案のままPR1だけ実装すると、mid-session切断が`Unreachable`に誤分類され「通信断のたびにサイレント再展開+見覚えのない2つ目のセッション」という**現状より悪い**退行を生むと判明したため | R1-B2 |
+| **Windows mux修正の判定方法を具体化**: `owner.rs`が既に持つ`exit_code: Option<u8>`（`ChannelMsg::ExitStatus`受信時のみ`Some`）をそのまま判別子に使う設計へ変更。子プロセスの終了コード/シグナルを覗く必要はない | R1のOpen Question 2への具体案 |
+| **client再接続とholder退場のレース対策を追加**: `RECONNECT_BACKOFF.initial`(500ms±jitter)が`HANDLE_HEALTH_POLL_INTERVAL`(1秒)より短く、生きている死にかけholderに当たり多重化なしdirect connectへ静かに劣化しうる。`relay_loop`がtransport死でbreakする際に`shutdown.notify_waiters()`を呼ぶ（`owner.rs:413`の既存パターンと同型）よう追加 | R1-S1 |
+| **STUN経路の試行回数上限(3〜5回)をWindows muxの`RECONNECT_BUDGET`(24h)側にも適用**。round 1案のままだと非対称で、Windows側でこそセッションスロット枯渇が深刻になりうる | R1-S2 |
+| **`#[serde(other)]`が`#[serde(flatten)]`越しでも機能するかをPR1で実証必須に**。`ConnectOutcome`は`#[serde(flatten)] class: ConnectOutcomeClass`であり、単体enumのテストでは不十分。動かない場合`class: String`+変換関数へフォールバック | R1-S3 |
+| 行番号の誤りを修正（`wrapper.rs:618-619`、`wrapper.rs:719-725`） | R1-S4 |
+| **孫プロセス孤児化(S1)の扱いを「断定」から「実測してから決める」に変更**。`.status()`が孫を待たないことと孫が実際に生き残ることは別問題（`ssh(1)`自体がProxyCommandをkillする可能性がある）。実装時にまず`pgrep`で実測し、残らなければ§2.2.2の`ensure_process_terminated`機構ごと不要という判断を許容する | R1-S5 |
+| PR3の受け入れ条件に「STUN経路もrelayと同じくresume使い切り後は`RebootstrapAndRetry`（マーカー無し）」を明記し、Open Questionから格上げ | M-1 |
+| §4.1の文言を訂正: relay経路は元々10日resumeでカバーされ「即死」ではなかったため、本ADRが改善するのは主にSTUN P2PとWindows mux経路である | M-2 |
+| 改訂履歴表とpseudocode内のコメントで「B2」/「B5」采番が食い違っていたのを統一 | M-3 |
+
+### Round 0（2026-08-31）— 初稿
+
+本セッションでのユーザー報告の調査結果に基づく初稿。
+
+---
+
+## 1. Context
+
+### 1.1 報告された症状
+
+`isekai-ssh <host>`で対話セッションを開いた後、Wi-Fi切断・スリープ復帰・
+セルラー⇔Wi-Fi切り替えのような**セッション確立後の**ネットワーク瞬断が起きると、
+セッション全体が即座に終了し、ローカルのシェルへ戻される。ユーザーは
+`isekai-ssh <host>`を手動で再実行する必要がある。同じ状況で比較対象の`tssh`
+（trzsz-ssh）はセッションを終了させず、黙って再接続してセッションを継続する。
+Unix（`ssh(1)` ProxyCommand経由）・Windows（`russh`ネイティブ経由）の両方で
+同じ症状が再現する。
+
+### 1.2 なぜ両OSで同じ症状が起きるか
+
+`isekai-ssh`のWindowsネイティブ経路は独自にQUIC接続を張っているわけではない。
+`isekai-ssh/src/native/child_stdio.rs`冒頭のコメントが明記する通り、Unix版の
+`ssh(1)` ProxyCommandが起動するのと**全く同じ`isekai-pipe connect`バイナリ**を
+子プロセスとして起動し、そのstdin/stdoutを`russh_stream_session`に生ソケット
+代わりに渡しているだけである:
+
+> `isekai-pipe connect`'s own route selection, resume-on-disconnect, and
+> `ConnectOutcome` bookkeeping are completely unchanged — the native path
+> just runs the same binary as a child process instead of leaving that job
+> to a real `ssh(1)`.
+
+したがって本ADRが対象とする根本原因は`isekai-pipe connect`という単一の
+中継プロセスの挙動であり、修正は1箇所で両OSに効く。
+
+### 1.3 根本原因（コード上の裏付け、round 1で訂正済み）
+
+問題は独立した複数の設計判断・実装上の見落としが重なって生じている。
+round 0では「3つの設計判断」としていたが、round 1レビューでUnixと
+Windowsは**別の理由で**症状が起きていることが判明したため、まずOS別に
+分けて説明する。
+
+#### (a) STUN P2P経路にはセッション確立後の再接続機構が一切ない（両OS共通）
+
+`isekai-pipe/src/resume_loop.rs:242-247`に明記の通り（round 0はこれを
+誤って`connect.rs:640-648`と引用していた）:
+
+> STUN P2P has no resume/control-stream concept ... there is no
+> `run_resume_loop` step here: the winning candidate's stream goes straight
+> into `relay_stdio`, exactly like the legacy single-candidate path already
+> does.
+
+`relay_stdio`（`isekai-pipe/src/resume_loop.rs:66`）は読み書きが1回失敗したら
+即座に`Err`を返すだけの単純な双方向パイプで、リトライも再接続もない。
+QUICクライアント側の`max_idle_timeout`は15秒（`isekai-transport/src/system.rs:24`）
+なので、通信不能になってから最大15秒でこの`Err`が発生する。呼び出し元は
+`run_stun_p2p_with_fallback`（`resume_loop.rs:247`、呼び出しは`connect.rs:624`）
+と、単一candidate経路の`CandidateRoute::StunP2p`アーム（`connect.rs:680`）
+の2箇所。
+
+一方、Relay経由（Tailscale等）は`run_resume_loop`
+（`isekai-pipe/src/resume_loop.rs:986`）が切断検知→バックオフ付き再接続
+（`reconnect_and_resume`）→replay bufferによるバイト単位の継続、という
+本格的なresumeを、最大`DEFAULT_RESUME_GRACE_SECS`=864,000秒=**10日**
+（`isekai-pipe-core/src/lib.rs:70`）にわたり持つ。同ループのコメント
+「tssh風のライブ再接続表示」（`resume_loop.rs:1006`）が示す通り、この設計は
+まさに`tssh`の体験を再現するために作られたものであり、**STUN P2Pはそこから
+意図的に除外されている**（`isekai_transport::stun_p2p`のモジュールdoc:
+"resume support lands in S-4a onward" — 着手されていないのは事実だが、
+round 1で判明した通り、実は必要な部品の大半が既に別の形で存在している。
+§1.6参照）。
+
+#### (b) Unix（`ssh(1)` ProxyCommand経由）: 既存のリカバリ機構は理論上1回だけ
+    走るが、遅延なしの再展開という誤った対応をする
+
+`isekai-pipe-core/src/outcome.rs`の`ConnectOutcome`は、`isekai-ssh`のwrapper
+プロセスが`ssh`終了後に読む唯一のサイドチャネルである。そのモジュールdocは
+次のように明言する:
+
+> a `run_connect` failure only ever happens before any SSH byte ever flows
+> (this is `ssh`'s `ProxyCommand`; a remote shell command that ran and
+> exited non-zero never touches this path at all)
+
+しかし実際のコードでは、この前提は**すでに成立していない**。
+`isekai-pipe/src/connect.rs:439-459`の`connect_command`は、
+`run_connect(launch).await`が`Err`を返した場合、それがハンドシェイク前の
+失敗かセッション確立後（pump段階）の失敗かを一切区別せず、無条件で
+`write_connect_outcome_for_wrapper`を呼ぶ。`run_stun_p2p_with_fallback`は
+`relay_stdio(connection.stream).await`の`Result`をそのまま`run_connect`の
+戻り値として伝播させているため、**STUN P2Pのmid-session切断も
+`ConnectOutcome`ファイルを書く**——`Unreachable`として分類される
+（`write_connect_outcome_for_wrapper`の分岐: `StaleTrustSignal`以外は
+すべて`Unreachable`）。
+
+つまりUnixの`isekai-ssh`のwrapper（`wrapper.rs::run_ssh_with_connect_failure_recovery`）
+は、ssh(1)がProxyCommandの異常終了を255で終了として伝えてくれる
+（`status.success()`がfalseになる）おかげで、mid-session切断についても
+一応「シグナルあり」と判定し、`ConnectFailureRecoveryAction::RebootstrapAndRetry`
+（`wrapper.rs:709-717`）を選ぶ。**理論上は既に1回だけ自動リカバリが走る
+——ただしUnixに限る**（Windowsについては(c)で後述する通り、これは成立しない）。
+ではUnixでもなぜ「即死」に見えるのか——(d)がその理由。
+
+#### (c) Windows: 転送層の死が正常終了として「洗浄」され、復旧判断に
+    一度も到達しない
+
+Windowsの`isekai-ssh <host>`は**既定で常に**マルチプレクスclient
+として動く（`main.rs:225-229`、opt-inフラグなし。単一プロセス直結に
+落ちるのはholder起動失敗など例外ケースのみ）。この経路でmid-session
+切断が起きたときの実際の流れ:
+
+1. holder配下の`isekai-pipe connect`が死ぬ（STUN P2Pなら15秒のQUIC
+   idle timeout）
+2. owner側`native/mux/owner.rs:585-588`: `channel.wait()`が
+   `Close`/`None`を返し`break`
+3. **`native/mux/owner.rs:703-708`**:
+   `let final_code = exit_code.unwrap_or(255); write_frame(writer,
+   &Frame::Exit(final_code))` — 転送層の死を「リモートシェルが
+   exit status 255で正常終了した」体裁のExitフレームに**変換して
+   clientへ送ってしまう**
+4. client側`native/mux/client.rs:385-388`: `Frame::Exit(255)`受信 →
+   `ClientOutcome::Exited(255)` → `DispatchOutcome::Done(255)`
+5. **`native/mux/mod.rs:308`**: `DispatchOutcome::Done(code) => return
+   Ok(code)` で即return
+6. 単一プロセス直結側でも同型の問題がある: `run_shell_io_loop_inner`
+   が接続断を`Some(ChannelMsg::Close) | None => break`
+   （`native/connect.rs:1195`）として扱い、`Ok(NO_EXIT_STATUS_RECEIVED
+   /* 255 */)`（`:1110`,`:1204`）を返す
+
+`native/connect.rs:346-348`の`drive_connect_recovery`は`ops.attempt()`が
+`Ok(exit_code)`を返した時点で即returnし、`claim_outcome`（＝`ConnectOutcome`
+ファイルの確認）を呼ぶのは`Err`のときだけである。**上記いずれの経路でも
+戻り値は`Ok(255)`であって`Err`ではない**ため、Windowsでは復旧判断の
+入口にすら到達しない——(b)で述べたUnixの「理論上1回は走る」自動リカバリは
+Windowsでは**実質ゼロ回**である。副作用として、`ConnectOutcome`ファイルは
+claimされないままruntime_dirに溜まり続ける。
+
+重要な事実: Windowsのmux経路には、mux holder自体が死んだ場合の復旧機構
+（`native::mux::run_with_reconnect`、`native/mux/mod.rs:248-341`）が
+**既に実装済み**である——24時間のリトライ予算(`RECONNECT_BUDGET`)、
+ジッター付き指数バックオフ、安定接続後の予算リセット
+(`RECONNECT_STABLE_THRESHOLD`)、Ctrl-Cでの中断、そして非idempotentな
+リモートコマンドの再実行を防ぐガード(`has_remote_command`)まで揃って
+いる。しかしこの機構は「ownerプロセス自体が異常死してExitフレームを
+送れなかった場合」の`OwnerLost`だけを検知対象にしており、上記3の通り
+transportの死は**行儀よくExitフレームへ変換されてから**ownerが退場する
+ため、`OwnerLost`分岐には一度も到達しない。**つまりこの既存の復旧機構は
+バイパスされているのではなく、判定材料が届く前に握りつぶされている。**
+（§2.2で詳述する通り、Windowsの修正はこの「握りつぶし」を止めるだけで
+足り、新しいリトライループを別途書く必要が無い可能性が高い。）
+
+#### (d) 既存のリカバリは「古いデプロイの再展開」専用に設計されており、一過性の
+    ネットワーク瞬断には構造的に不向き（Unixで一応走る1回のリカバリの中身）
+
+`RebootstrapAndRetry`の実装（`wrapper.rs:628-638`）は:
+
+1. 遅延なし・即座に`bootstrap_and_register(plan, resolution,
+   TofuConfirmation::Silent)`を呼ぶ——これは対象ホストへ**別のSSH接続**
+   （鍵/パスワード認証)を張り直し、`isekai-pipe serve`を**再展開**する
+   重い操作である。
+2. ネットワークがまだ復旧していない場合、この再展開用SSH接続自体が
+   即座に失敗し、`print_bootstrap_failure_guidance`を出して
+   `Err`のまま関数全体が終了する（バックオフも再試行もなし）。
+3. 仮に再展開が成功しても、リトライは**1回きり**（ループではない）。
+   同じ関数呼び出しの中で`run_ssh_once`をもう一度呼ぶだけなので、
+   2回目の切断にはもう対処できない。
+4. どの分岐でも、ユーザーが見ていた対話ターミナル（1回目の`ssh(1)`/
+   `russh`セッション）は**既に終了済み**であり、リカバリが成功しても
+   全く新しい対話セッションが（`isekai-ssh`プロセスの中で）改めて
+   起動されるだけである。
+
+この設計は本来「キャッシュ済みデプロイ情報が古い/死んでいる」ケース
+（`.claude/rules/always-connects.md`が定義する主眼、`ISEKAI_PIPE_DESIGN.md`
+§8 Epic N/N-2）向けに作られたものであり、**再展開そのものは正しい判断
+だが、それを一過性のネットワーク瞬断（サーバー側の`isekai-pipe serve`は
+生きたまま、クライアント側の経路が一時的に切れただけ）に対して
+遅延なしで即座に適用する**ため、ネットワークがまだ死んでいる間に
+飛んできたこのリトライも当然失敗し、結果として「即死」に見える。
+再展開自体は本質的に不要な処理でもある——サーバー側のヘルパーは
+生きているので、STUN P2Pなら同じ`peer_addr`へ、Relayなら同じ
+`RelayTarget`へ、単に再ダイヤルするだけで十分なことが多い
+（§2.3で詳述）。
+
+### 1.4 「セッション確立後」であることをどう検出しているか（現状は検出していない）
+
+`ConnectOutcomeClass`は現在`StaleTrust`/`Unreachable`の2値しかなく、
+「SSHバイトが実際に流れた後の失敗か」を区別する情報がそもそも存在しない。
+本ADRの核心はこの区別を導入することである（§2.2）。ただしこれは**Unix側の
+入口**を直す話であり、Windows側は(c)で述べた「洗浄」そのものを止める方が
+先に必要になる。
+
+### 1.5 なぜSTUN P2Pの「フルre-dial」は多くの場合で機能すると考えられるか
+    （前提条件付き、round 1で補正）
+
+`isekai_transport::stun_p2p`のモジュールdocによれば、STUN P2P接続確立は
+「毎回そのソケットで新たにSTUNへ自分の観測アドレスを問い合わせる」処理を
+含む（キャッシュしない）。つまり、クライアント側のネットワークが変わっても
+（Wi-Fi再接続でNATマッピングが変わった、Wi-Fi⇔セルラー切替など）、
+確立処理をそのまま最初からやり直すだけで新しい観測アドレスが自動的に
+反映される。
+
+**ただし前提条件がある**（round 1で追加）: `our_observed_addr`は相手に
+帯域外で伝わらない（モジュールdocが「out-of-band exchangeはこの層の
+対象外」と明記）ため、再ダイヤル先の`target.peer_addr`は
+`PersistentProfile`にキャッシュされた**古い**アドレスのままである。
+フルre-dialが効くのは「サーバー側が安定した/公開アドレスで待ち受けて
+おり、クライアント側からのpunchだけで足りる」構成に限られ、対象ホスト
+（サーバー）側のアドレスも同時に変わった場合（対称NAT越しの相互punchが
+要る構成）には効かない。この場合のみ、真の再ランデブー（帯域外
+シグナリングのやり直し）が必要になる——後述§1.6・§2.4のPR3のスコープ外。
+
+### 1.6 round 1での訂正: STUN P2Pの「真のバイトレベルresume」は、
+    当初の見積もりより遥かに狭い変更で実現できる
+
+round 0では、STUN P2Pへの真resumeの実装を「Relay向けのresumeプロトコル
+一式をP2P間で再ランデブー込みで再現する規模」と見積もり、Tier 2として
+先送りしていた。round 1レビューでこの見積もりは誤りだったと判明した。
+
+`isekai-transport/src/stun_p2p.rs:129-133`のモジュールdocが明記する通り:
+
+> Resume support for a connection established this way still goes
+> through the plain `crate::resume::reconnect_and_resume` against a
+> synthesized `RelayTarget{helper_addr: target.peer_addr, ..}` — see
+> that Android transport's own module docs for why a bare redial (no
+> re-STUN/re-punch) is this mode's accepted resume-capability ceiling.
+
+**Androidの`isekai-terminal-core`は、STUN P2Pで確立した接続に対して
+既にこの機構でresumeを行っている。** CLI（`isekai-pipe`）側で欠けて
+いるのは次の狭い範囲だけである:
+
+1. `connect_stun_p2p_with_round`が`resume_grace`を`0`にハードコードし
+   `_conn`（`AnyMuxConnection`）を捨てている（`stun_p2p.rs:290-292`、
+   コメント "No resume support on this path (module docs), so there is
+   no grace period to request"）。
+2. `run_stun_p2p_with_fallback`（`resume_loop.rs:247-252`）が
+   `run_resume_loop`ではなく単純な`relay_stdio`を呼んでいる。
+
+この2点を直し、STUN P2P確立後に`RelayTarget{helper_addr: target.peer_addr,
+..}`を合成して`run_resume_loop`（既存のRelay向けループ）に渡せば、
+Androidと同じ「バイトレベルresume（scrollback/未確認バイトの継続）」が
+CLIでも実現できる可能性が高い。ユーザー判断により、これを**PR3として
+今回のスコープに含める**（§2.4）。ただし§1.5の前提条件（サーバー側
+アドレスが安定していること）を超える真の再ランデブーは、引き続き
+本ADRのスコープ外とする。
+
+---
+
+## 2. Decision（提案する設計、round 1: PR1/PR2/PR3の3段構成）
+
+ユーザー判断（2026-08-31）により、以下をそれぞれ独立にCI green→
+マージ可能な3本のPRとして実装する。PR2はPR1の上に、PR3はPR2の上に
+積む（依存順）。
+
+### 2.1 PR1: 独立した安全性の修正（リトライループなし、新enum/マーカーなし）
+
+新しいリトライ機構・新しい`ConnectOutcomeClass` variant・新しい
+マーカー型を一切導入せず、既存の`RebootstrapAndRetry`機構自体の
+信頼性を上げる、リスクの低い修正群に厳密に限定する。**round 2で
+R1-B2により範囲を訂正**: round 1案は「B4のbail-out」「Windowsの
+`Ok`経路でのoutcome claim」もPR1に含めていたが、どちらも
+`MidSessionDisconnect`の存在を前提にした修正であり、そのvariantが
+まだ無いPR1単独でclaim側だけ先行させると、mid-session切断が
+`Unreachable`に誤分類され「通信断のたびにサイレント再展開SSH+
+見覚えのない2つ目の対話セッション」という**現状より悪い**退行を
+生む。両方をPR2へ移した。PR1に残るのは以下の2点のみ:
+
+1. **B6: `give_up`の書き込み順序を修正**（`resume_loop.rs:812-829`）。
+   `stdout.shutdown()`を`ConnectOutcome`ファイル書き込み完了後に
+   遅らせる（またはoutcome書き込み自体を`give_up`内へ前倒しする）。
+   「outcomeを書く」が「stdoutを閉じる」より必ず先、という不変条件を
+   コメントで明記する。Windowsの`native/connect.rs:452-462`が同じ
+   問題に対し1秒のgraceで対症療法していることも合わせて記録し、
+   Unix側にも将来同種の保護が要るかを検討する。
+2. **S4: `ConnectOutcomeClass`のdeserialize耐性**。`#[serde(other)]
+   Unknown`variant相当を追加し、`claim_connect_outcome`が未知タグに
+   対して`Err`で invocation 全体を殺さないようにする
+   （`wrapper.rs:618-619`——round 1は`:574-575`と誤記していた——の
+   `?`を見直す）。理由は「サーバー側sha256一致」ではなく、
+   「ローカルの`isekai-pipe`（`--isekai-pipe-path`で差し替え可能）と
+   `isekai-ssh`が異なるビルドになりうるため」（S4、round 0の誤った
+   根拠付けを訂正）。**round 2で追加(R1-S3)**: `ConnectOutcome`は
+   `#[serde(flatten)] pub class: ConnectOutcomeClass`（`outcome.rs:60-61`）
+   であり、flatten越しの内部タグ付きenumは`FlatMapDeserializer`を
+   経由する——単体enumで`#[serde(other)]`が動くことと、flatten越しで
+   動くことは別問題。**`ConnectOutcome`構造体全体を通した「未知タグ→
+   `Unknown`」ラウンドトリップの単体テストをPR1に必須で追加し、
+   CIで実証する。動作しない場合は`class: String`+手動変換関数へ
+   フォールバックする**（この判断はPR1実装時にCIで確定させ、ADRの
+   再改訂は不要）。
+3. **R2-M1: `outcome_summary`（`wrapper.rs:648-653`）への`Unknown`
+   アーム追加**。`.claude/rules/always-connects.md`が「新しい
+   `ConnectOutcomeClass`を追加する場合は`wrapper.rs::outcome_summary`
+   にもメッセージを足すこと」と明示的に要求している既存ルール。
+   `Unknown`に既存の`Unreachable`用文言（"the cached deployment
+   could not be reached … run `isekai-ssh init` manually"）を
+   そのまま流用すると誤誘導になるため、専用の中立的な文言
+   （例: "isekai-pipe connect reported an outcome this isekai-ssh
+   build doesn't recognize"）を追加する。
+
+### 2.2 PR2: リトライループ本体
+
+#### 2.2.1 Windows: 新ループではなく、既存`run_with_reconnect`への
+    素通しを実現する（B3、round 2でR1-S1の判定方法・レース対策を追加）
+
+Windowsのmux経路（既定）では、**新しいリトライループを書かない**。
+根本原因は`native/mux/owner.rs:703-708`が転送層の死を
+`Frame::Exit(255)`に「洗浄」していることであり（§1.3(c)）、
+修正はここ1箇所。
+
+**判定方法（round 2→3→4で段階的に修正）**: round 2は
+`exit_code: Option<u8>`をそのまま判別子にし、round 3は
+`ChannelMsg::ExitSignal`の見落とし（シグナル終了が`exit_code=None`に
+落ちてしまう）を修正するため`remote_reported_exit: bool`に変えた。
+**round 4でさらに訂正**: `relay_loop`のbreakは実際には最低4系統
+あり、`bool`1個では区別しきれない:
+
+- **`RemoteExitReported`**: `ChannelMsg::ExitStatus`または
+  `ChannelMsg::ExitSignal`を受信——リモートが終了理由を喋った。
+- **`ClientGone`**: このclient接続がリモートchannelより先に終わった
+  （`Some(Ok(None)) | None`、`owner.rs:560`付近）、またはctl arm側の
+  `write_frame(...)`が失敗した（`owner.rs`の該当2箇所）——**このclient
+  自身が先に消えただけ**であり、holderやtransportは無関係に生きて
+  いる可能性が高い。
+- **`TransportDead`**: 上記いずれでもなく`Close | None`でbreak
+  （`owner.rs:583`付近）——本当に転送層が死んだ可能性が高いケース。
+- **`CloseDeadline`**: `shutdown_close_deadline`分岐（`owner.rs:693-698`、
+  ローカルEOF後にリモートがcloseを確認しなかった＝ユーザーが意図的に
+  終了した文脈）。
+
+`BreakReason`列挙型を導入し、各break地点に正しい理由を割り当てる
+（この列挙自体の導入は`native/connect.rs::run_shell_io_loop_inner`
+とも共有される概念だが、break地点の集合はowner側と単一プロセス側で
+異なる——単一プロセス側には`~.`エスケープ切断やstdin書き込みエラーが
+別途ある。詳細は実装タスク側の先行タスクとして切り出す）。
+
+最終的な判定:
+
+- `RemoteExitReported` → 従来通り`Frame::Exit(code)`を送る
+  （`ExitSignal`の場合はssh(1)の慣習に合わせ`exit_code`を255扱いに
+  する）。
+- `TransportDead` → `Frame::Exit`を送らず、後述のレース対策
+  （ただし共有handleの生存確認込み、下記参照）を行った上で
+  `Ok(())`を返す。
+- `ClientGone`・`CloseDeadline` → 従来通り`Frame::Exit`を送る側に
+  倒す（`ClientGone`をtransport死扱いにすると、このclientが単に
+  先に終了しただけのケースで、同じholderを共有する**他タブまで
+  巻き添え**にする。`CloseDeadline`をtransport死扱いにすると、
+  正常な`exit`の後に無駄な再接続が走る）。
+
+単一プロセスfallback側（`native/connect.rs`の`run_shell_io_loop_inner`、
+`:1195`付近、`~.`エスケープ切断・stdin書き込みエラーを含む）にも
+同じ`BreakReason`方式の手当てが必要。
+
+これにより`client.rs`の既存`OwnerLost`分岐が設計通り発火し、
+`run_with_reconnect`（`native/mux/mod.rs:248-341`）の
+`RECONNECT_BUDGET`(24h)・`RECONNECT_BACKOFF`・
+`RECONNECT_STABLE_THRESHOLD`・`wait_or_abort`（Ctrl-C）・
+`has_remote_command`ガードが**すべてタダで働く**。
+
+**レース対策（round 2で追加、round 4でS9により発火条件を絞った）**:
+`RECONNECT_BACKOFF.initial`=500ms（jitter込み375〜625ms、`mod.rs:142`）
+は`HANDLE_HEALTH_POLL_INTERVAL`=1秒（`owner.rs:81`）より短い。
+`Frame::Exit`送出をやめるだけだと、clientが最短375msで再dispatchする
+一方、holderが自身の死（共有handleの死）を検知して実際に退場するのは
+最大1秒後になりうるため、その隙間で再接続したclientが「生きている
+死にかけholder」に`Rejected`され、`client.rs:254`のコメント通り
+多重化なしのdirect connectへ静かにフォールバックしてしまう（＝再接続
+には成功するがmux機能が黙って失われる）。
+
+対策として`shutdown.notify_waiters()`を呼ぶが、**発火条件を
+`BreakReason::TransportDead`と分類されたことだけに置いてはいけない
+（S9）**: チャネル1本だけが（例えばsshdのチャネル数上限や個別
+ポリシーで）異常閉鎖しても共有handle自体は生きている場合があり、
+この場合に`notify_waiters()`を呼ぶと、無関係な他タブまで巻き添えで
+`OwnerLost`扱いにしてしまう。`owner.rs:413`の既存パターン
+（channel open失敗）は「共有handleが死んでいる証拠」という明示的な
+根拠を伴っていたのに対し、mid-sessionのchannel closeにはその根拠が
+無い。**`BreakReason::TransportDead`と分類され、かつ既存の
+`handle_died`（`owner.rs:216-225`）相当の生存確認で共有handle自体が
+死んでいると確認できた場合にのみ**`shutdown.notify_waiters()`を
+呼ぶ——これにより`owner.rs:228-234`のhandle死亡検知分岐が即座に
+発火し、holderが健康ポーリングを待たずに退場する。handleが生きている
+場合は、このチャネル単体のエラーとしてこのclientにだけ報告する
+（holder全体には影響させない）。
+
+プロトコル（`Frame`列挙体）へのフィールド追加は行わない——holderは
+常駐プロセスであり、新しい`isekai-ssh`バイナリと古いholderが
+共存しうるため、プロトコル変更は互換性リスクを持つ
+（`mod.rs`のmodule docsが言う "a small versioned frame protocol"）。
+上記の修正は`relay_loop`内のbreak理由の分岐と`shutdown.notify_waiters()`
+の追加呼び出しだけで済み、`Frame`にも`client.rs`にも一切触れないため、
+この互換性リスクを回避できる。
+
+単一プロセス直結にfallbackした場合（`native/connect.rs`）は、
+`run_shell_io_loop_inner`の`Some(ChannelMsg::Close) | None => break`
+（`:1195`）も同様に、transport死を示す情報を`Ok(255)`に潰さず、
+`connect_attempt`まで伝播させ、PR2で追加する`claim_outcome`の
+`Ok`経路対応（後述）と組み合わせて、Unixと同じ
+`decide_connect_failure_recovery`ベースの経路へ合流させる。
+
+**STUN経路の試行回数上限をWindows muxにも適用（round 2で新規、R1-S2）**:
+`run_with_reconnect`の`RECONNECT_BUDGET`(24h)をそのまま使うと、
+STUN P2P経由のholderが繰り返し死ぬ状況では最悪8000回超の再接続が
+起こりうる——`OwnerLost`のたびに新しいholder→新しい`isekai-pipe
+connect`→新しい`random_session_id()`が生まれるため、後述§2.2.2の
+S2（サーバー側セッションスロット枯渇・他タブへの巻き添え立ち退き）は
+Windows mux経路でこそ深刻になる。§2.2.2で導入する「STUN P2Pの
+connectは試行回数を3〜5回で頭打ちにし`retry_while_busy_other_session`
+で包む」対策を、Windows mux経由で`isekai-pipe connect`を再spawnする
+際にも同様に適用する（`run_with_reconnect`の24hバジェット自体は
+そのまま——OwnerLostの再接続試行回数を制限するのではなく、その中で
+`isekai-pipe connect`がSTUN P2Pをダイヤルする回数を制限する）。
+
+**PR2実装時に決める点（round 3で追加、R2-M3）**: Windows mux経路では
+`isekai-pipe connect`が`OwnerLost`のたびに**新しいプロセス**として
+起動されるため、試行回数を数える状態をプロセス内カウンタに置いても
+常に1から始まってしまい機能しない。`run_with_reconnect`側の
+`attempt`カウンタを環境変数等で子プロセスへ渡すか、あるいは
+`isekai-pipe connect`内の`retry_while_busy_other_session`
+（180秒バックオフ）だけで実用上十分と割り切るかを、PR2実装時に
+決定する。
+
+#### 2.2.2 Unix・Windows単一プロセスfallback: 新しいシグナルと
+    リトライループ
+
+**round 2で範囲を明確化(R1-B2)**: 以下の新シグナル定義に加え、
+§2.1で述べた通りB4（`recover_via_cross_family_fallback`のbail-out）と
+Windows `native/connect.rs:346-348`の`drive_connect_recovery`の
+`Ok`経路でも`ConnectOutcome`をclaimする修正は、両方とも本PR2に含む
+（round 1はどちらもPR1に置いていたが、`MidSessionDisconnect`が
+存在しないPR1単独では実装不能、または実装すると悪化するため移動した）。
+
+**新シグナル**: `isekai-pipe-core/src/outcome.rs`の
+`ConnectOutcomeClass`に3つ目のvariantを追加する:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "kebab-case")]
+pub enum ConnectOutcomeClass {
+    StaleTrust,
+    Unreachable,
+    MidSessionDisconnect,
+    #[serde(other)]
+    Unknown, // PR1のS4対応。デシリアライズ時の未知タグをここへ吸収する
+}
+```
+
+**検出方法**（round 1でB2により修正——`err.chain()`は不要）:
+既存の`StaleTrustSignal`マーカー型パターン（`connect.rs`の
+`StaleTrustSignalSource`/`attach_stale_trust_signal`、**裸の**
+`err.downcast_ref::<T>()`——anyhowの`downcast_ref`は`.context(...)`で
+包まれたchainを内部で自動的に辿るため、chainを手動で辿る必要はない）
+をそのまま踏襲する。新しいゼロサイズマーカー型
+`pub(crate) struct MidSessionDisconnectSignal;`を定義し、以下の
+**STUN P2Pの2箇所のみ**に`.map_err(|e| e.context(MidSessionDisconnectSignal))`
+を挟む（round 1でS1(旧)により訂正——`run_resume_loop`には付けない。
+理由は次段落）:
+
+- `run_stun_p2p_with_fallback`（`resume_loop.rs:247`）の`relay_stdio(...)`
+- 単一candidate経路の`CandidateRoute::StunP2p`アーム
+  （`connect.rs:680`）の`relay_stdio(...)`
+
+`run_relay_resumable`/`run_relay_resumable_with_fallback`が呼ぶ
+`run_resume_loop`の`give_up`には**マーカーを付けない**。理由
+（S1(旧)）: relay経路は`run_resume_loop`内部で既に最大10日
+（`DEFAULT_RESUME_GRACE_SECS`）resumeを試みており、そこから漏れて
+きたエラーは本質的に terminal（helper再起動によるUnknownSession確定
+等）である——このケースでは現行の即時`RebootstrapAndRetry`（再展開）
+が引き続き正しい。
+
+`write_connect_outcome_for_wrapper`の分類ロジック:
+
+```rust
+let class = if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
+    ConnectOutcomeClass::StaleTrust
+} else if err.downcast_ref::<MidSessionDisconnectSignal>().is_some() {
+    ConnectOutcomeClass::MidSessionDisconnect
+} else {
+    ConnectOutcomeClass::Unreachable
+};
+```
+
+`outcome.rs`のモジュールdocコメント（「a `run_connect` failure only
+ever happens before any SSH byte ever flows」という誤った前提）を、
+新しい2分類（pre-handshake failure / mid-session disconnect）を
+正しく説明する記述へ書き換える。
+
+**R2-M1（PR1と同じ規律をPR2にも適用）**: `outcome_summary`
+（`wrapper.rs:648-653`）に`MidSessionDisconnect`用のアームも追加する
+（`.claude/rules/always-connects.md`の既存ルール）。
+
+**リカバリの意思決定**: `decide_connect_failure_recovery`を
+`Option<&ConnectOutcomeClass>`ベースへ変更する:
+
+```rust
+pub(crate) enum ConnectFailureRecoveryAction {
+    NoRecoverableSignal,
+    AutoBootstrapDisabled,
+    RebootstrapAndRetry,
+    RetryConnectLightweight, // 新設。round 1でM3により単純化
+                             //（段階的降格ロジックは削除、下記参照）
+}
+
+pub(crate) fn decide_connect_failure_recovery(
+    outcome_class: Option<&ConnectOutcomeClass>,
+    should_bootstrap: bool,
+) -> ConnectFailureRecoveryAction {
+    match outcome_class {
+        None => ConnectFailureRecoveryAction::NoRecoverableSignal,
+        Some(ConnectOutcomeClass::MidSessionDisconnect) => ConnectFailureRecoveryAction::RetryConnectLightweight,
+        // Unknown(将来isekai-pipeが追加する未知のクラス)もUnreachableと同じ
+        // 扱いにする — round 2でR1-B1により訂正。「未知タグでハードエラーに
+        // しない」(S4)の意図は「未知タグでも復旧を試みる」であって「未知タグ
+        // では復旧を諦める」ではない。旧来のwrapper.rs:621は
+        // `outcome.is_some()`だけで復旧を試みており、outcomeファイルが
+        // 存在する(=何かがrun_connectを失敗させた)という事実だけで
+        // 十分だった。round 1案のNoRecoverableSignalは
+        // .claude/rules/always-connects.mdに対して現状より後退していた。
+        Some(_) if !should_bootstrap => ConnectFailureRecoveryAction::AutoBootstrapDisabled,
+        Some(_) => ConnectFailureRecoveryAction::RebootstrapAndRetry,
+    }
+}
+```
+
+（round 1のM3指摘により、round 0にあった「軽量リトライを何回か試して
+ダメなら`RebootstrapAndRetry`に降格する」という時間ベースの分岐を
+削除した。理由: 軽量リトライで再ダイヤルした2回目の試行がハンドシェイク
+前に失敗すれば、それは通常の`Unreachable`として分類され、次の
+`run_ssh_once`呼び出しで自然に`RebootstrapAndRetry`が選ばれる。クラス
+遷移そのものが既にエスカレーション機構であり、別途window変数を持つ
+必要が無い。）
+
+**`should_bootstrap`との関係（Q2で確定）**: `MidSessionDisconnect`の
+場合、`should_bootstrap`の値に関わらず軽量リトライは常に試みる
+（既存の`--isekai-no-bootstrap`は「勝手にSSH再展開しない」契約であり、
+「既知のtargetへ黙って再ダイヤルする」ことまでは禁止しないと解釈する
+——両レビュアーが支持。新フラグは不要）。
+
+**リトライループの骨格**（`run_ssh_with_connect_failure_recovery`・
+Windows単一プロセスfallback側の対応する関数を、単発呼び出しから
+ループへ拡張）:
+
+```
+let mut attempt = 0u32;
+let mut lost_since: Option<Instant> = None; // native/mux/mod.rsのlost_sinceと同じ役割
+// S1: 孫プロセスの孤児化対策。round 3(R2-M2)で明記した通り、これは
+// 「§2.2.2のS1実測で孫が実際に残ると判明した場合のみ」必要になる
+// 条件付きの機構——以下は残った場合の実装イメージ。
+let mut prev_child_pid: Option<Pid> = None; // 実測で不要と判明したら丸ごと削除
+
+loop {
+    if let Some(pid) = prev_child_pid.take() {
+        // S1(残る場合のみ): 前回試行のisekai-pipe connect(孫)プロセスが
+        // 生きていれば確実に終了させてからでないと、新しいセッションの
+        // ダイヤルがBUSY_OTHER_SESSION(180秒しか耐性が無い)に当たりうる。
+        ensure_process_terminated(pid);
+    }
+    (status, child_pid) = run_ssh_once(plan, resolution, intent, runtime_dir)
+    prev_child_pid = Some(child_pid)
+    if status.success(): return Ok(0)
+
+    // B5: 非idempotentなリモートコマンドは絶対に再実行しない
+    // (native/mux/mod.rsの既存has_remote_commandガードと同じ規律)。
+    let has_remote_command = plan.remote_command().is_some();
+
+    outcome = claim_connect_outcome(...)
+    action = decide_connect_failure_recovery(outcome.class, should_bootstrap)
+    match action {
+        NoRecoverableSignal | AutoBootstrapDisabled => return Ok(exit_code)
+        RetryConnectLightweight if has_remote_command => {
+            // native/mux/mod.rs:311-330と同じ理由・同じ挙動
+            log("connection lost while running a remote command; not auto-retrying")
+            return Ok(exit_code)
+        }
+        RetryConnectLightweight => {
+            // native/mux/mod.rsのRECONNECT_BUDGET/RECONNECT_STABLE_THRESHOLDと
+            // 同じ設計をそのまま流用する(新規定数を発明しない、B3)。
+            match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since) {
+                Retry => {
+                    // S2: STUN経路はサーバー側セッションスロットを消費する
+                    // (AttachArbiter、--max-sessions既定16)。ここでの
+                    // attempt上限(3〜5回)はwrapper.rsレベルの総試行回数の
+                    // 話であり、isekai-pipe内部のBUSY_OTHER_SESSION対策
+                    // (retry_while_busy_other_session、Task 2.10)とは別層
+                    // (round 4のB4で訂正——wrapper.rsから
+                    // retry_while_busy_other_sessionを直接呼ぶことはできない。
+                    // それはisekai-pipe crateのprivate関数であり、
+                    // isekai-sshは別バイナリとしてisekai-pipeをspawnするだけ)。
+                    intent = build_connection_intent(resolution)?  // 新しいintent_id
+                    continue
+                }
+                GiveUp(code) => return Ok(code)
+            }
+        }
+        RebootstrapAndRetry => (既存の1回きりの再展開+再試行、変更なし)
+    }
+}
+```
+
+**バックオフ・上限（Q1で確定）**: `native::mux::run_with_reconnect`が
+既に確立している設計（`RECONNECT_BUDGET`=24時間、`RECONNECT_BACKOFF`
+=`initial: 500ms, max: 10s, jitter: 0.25`、`RECONNECT_STABLE_THRESHOLD`
+=60秒で予算リセット）をそのまま流用する。新規に`MID_SESSION_RETRY_WINDOW`
+を発明しない（B3、旧採番。round 4のB4も参照）。ただしSTUN P2P経路
+固有の対策として（S2）、サーバー側`--max-sessions`（既定16）に
+当たる前に軽量リトライの試行回数を3〜5回程度で頭打ちにし、以降は
+自然な`Unreachable`へのクラス遷移によるエスカレーションに委ねる
+——**これはwrapper.rsレベル（`isekai-ssh`プロセスが`run_ssh_once`を
+再試行する回数）の上限であり、isekai-pipe crate内部の
+`retry_while_busy_other_session`（180秒バックオフ、Task 2.10、
+`isekai-pipe`のconnect.rsにのみ実装可能——`isekai-ssh`は別バイナリと
+して`isekai-pipe`をspawnするだけで、その内部関数を直接呼べない）
+とは異なる層の対策である（round 4のB4で訂正、既存のround 1〜3の
+記述はこの2層を混同していた）**。
+
+**孫プロセスの後始末（S1、round 2でR1-S5により「断定」を撤回し
+実測ベースの方針へ変更）**: `run_ssh_once`の`child.wait()`は
+`std::process::Command::status()`の性質としてssh(1)自身のみを待ち、
+`ProxyCommand`孫プロセス（`isekai-pipe connect`）を待たない。ただし
+——round 1では`wrapper.rs:769-772`（正しくは`:719-725`）のdoc
+コメント「`.status()`はProxyCommand孫を含むプロセスツリー全体の
+終了までブロックする」を「事実に反すると判明」と断定したが、これは
+早計だった。`.status()`自体がそうしないことと、`ssh(1)`が自分の
+`ProxyCommand`を終了時にkillするか（＝結果的に孫が残らないか）は
+別問題であり、後者はOpenSSH側の経験的な挙動でありコードからは
+決まらない。
+
+**実装時にまず1回実測する**（ローカル`cargo`を使わないため
+`prefer-gh-actions-over-local-cargo`に抵触しない）。**round 4で
+手順を厳密化(S10)**: この実測は**経路によって「正解」が逆になる**
+——STUN P2Pなら孫はQUICの`max_idle_timeout`(15秒)で自然に落ちる
+のが正常動作だが、Relayなら`run_resume_loop`が最大10日
+（`DEFAULT_RESUME_GRACE_SECS`）resumeを試み続けるため**孫が残るのが
+正常動作（バグではない）**。経路を固定せず測ると、Relay経由の
+セッションで「孫が残った」という観測から誤って
+`ensure_process_terminated`機構を作り込み、それがRelay経路の10日
+resumeそのものを破壊しかねない。したがって実測は必ず**明示的に
+STUN P2P経路を使うホスト**（`#@isekai stun`設定済み、Relay
+fallbackが働かない構成）に対して行い、切断から**20〜30秒後**
+（QUIC idle timeoutの15秒に余裕を見た時間）に`pgrep -f
+'isekai-pipe connect'`が残るかを確認する。Relay経由での孫の残存は
+この対策の対象外であることを明記する。
+
+- **残らない場合（STUN経路で）**: `ensure_process_terminated`機構・
+  関連する§5のテスト・旧Open Question「孫プロセス終了策の実装方法」は
+  丸ごと不要。`wrapper.rs:719-725`のdocコメントは「`.status()`自体は
+  直接の子だけを待つが、`ssh(1)`が自分のProxyCommandを終了させるため
+  結果として孫も残らない」と理由を正確にする訂正のみ行う。
+- **残る場合（STUN経路で、かつ15秒のQUIC idle timeoutを超えても
+  残る場合）**: pid単発の`kill`では不十分（孫がSTUN経路であっても
+  何らかの理由で残り続ける可能性がある）。`ssh(1)`を独自の
+  プロセスグループで起動し（`setsid`/`process_group(0)`）、
+  グループ全体に`SIGTERM`→猶予後`SIGKILL`を送る設計にする。
+
+**ctl-socket forwardの後始末（S3）**: `apply_ctl_socket_forward`/
+`spawn_ctl_listener`（`wrapper.rs:743-751`）が反復ごとにbindする
+UNIXソケット・spawnするlistenerタスクを、次の反復に入る前か
+ループ終了時に明示的にteardownする。
+
+#### 2.2.3 UX: ライブ再接続表示
+
+`resume_loop.rs`が既に持つ「tssh風のライブ再接続表示」と一貫した
+スタイルで、wrapperループ側にも同種の1行ステータス表示を実装する。
+`resume_loop`側（セッション内のQUIC再接続）と`isekai-ssh`側
+（プロセス全体の再起動）は文言で区別する（例:
+「reconnecting (quic)...」 vs 「isekai-ssh: connection lost,
+reconnecting...」）。M2指摘により、`resume_loop.rs`と同じ
+`stderr.is_terminal()`ゲートを入れ、`--isekai-log-file`実行時に
+ログが`\r`で汚れないようにする。
+
+### 2.3 PR3: STUN P2Pへの真のバイトレベルresume
+
+§1.6で述べた通り、round 1レビューでコストの見積もりが訂正された
+ため、ユーザー判断により今回のスコープに含める。
+
+1. `connect_stun_p2p_with_round`が`resume_grace`に`0`をハードコード
+   している箇所（`isekai-transport/src/stun_p2p.rs:290-292`）を、
+   呼び出し元から渡された`requested_resume_grace_secs`を使うよう
+   変更し、`_conn`（`AnyMuxConnection`）を破棄せず呼び出し元へ返す。
+2. `run_stun_p2p_with_fallback`（`resume_loop.rs:247-252`）を、
+   確立後に`RelayTarget{helper_addr: target.peer_addr, server_name,
+   cert_sha256_hex, session_secret, ..}`を合成し、Androidの
+   `isekai-terminal-core`と同じ形で`crate::resume::reconnect_and_resume`
+   経由の`run_resume_loop`へ渡すよう変更する。
+3. §1.5の前提条件（サーバー側アドレスが安定していること）を超える
+   真の再ランデブー（クライアント・サーバー双方のアドレスが同時に
+   変わるケース）は、引き続きこのPRのスコープ外とする——
+   `isekai_transport::stun_p2p`のモジュールdocの
+   "resume support lands in S-4a onward" が指す本当に難しい部分は
+   ここに残る。
+4. **受け入れ条件（round 2でM-1によりOpen Questionから格上げ、
+   round 4のB3で最終決定を反転）**: PR2で導入した
+   `MidSessionDisconnectSignal`は、PR3実装後はTask 2.1が付与して
+   いたSTUN P2Pの`relay_stdio`直接呼び出し2箇所が消滅する
+   （Task 3.2でSTUNが`run_resume_loop`経由になるため）。round 2案
+   は「relayと同じくgive_upにマーカーを付けない」で統一する
+   としていたが、これだとPR3後にマーカーの付与箇所がゼロになり、
+   `ConnectOutcomeClass::MidSessionDisconnect`・
+   `RetryConnectLightweight`・PR2のUnixループ全体が誰にも到達
+   されない状態になってしまう（opus-task-reviewが発見、B3）。
+
+   **決定**: STUN経路は**relayとは意図的に非対称に**し、STUN P2P用の
+   `run_resume_loop`の`give_up`には**マーカーを付ける**
+   （`MidSessionDisconnectSignal`をこの`give_up`呼び出しへ移す）。
+   relay経路のgive_upには引き続き付けない（S1(旧)の理由は変わらず
+   有効）。この非対称の根拠は§1.5で述べた通りSTUNのresume上限が
+   relayより本質的に低い（サーバー側アドレスが安定していないと
+   そもそも効かない）ことにあり、STUNのresume使い切りは「redeploy
+   すべき」よりも「もう一度確立し直せば直るかもしれない」に近い
+   ケースが多い。これによりPR2のUnix軽量リトライ機構はPR3後も
+   STUN経路の最終防衛線として生き続ける——ただしPR3導入後は
+   `run_resume_loop`自身が最大10日粘るため、この機構が実際に
+   発火する頻度はPR2時点よりずっと低くなる（意図した通りの
+   フェーズ的な役割低下であり、「無意味化」ではない）。
+
+### 2.4 3 PR共通: Unix/Windows単一プロセスfallbackの実装配置
+
+`decide_connect_failure_recovery`・バックオフ定数・ループの骨格は
+`isekai-ssh`クレート内のプラットフォーム非依存モジュールに置き、
+Unix版（`wrapper.rs::run_ssh_with_connect_failure_recovery`）と
+Windows単一プロセスfallback版（`native/connect.rs`の対応する関数、
+`ConnectRecoveryOps`トレイト経由でテスト用モックと実装を差し替え
+可能な既存設計を踏襲）の両方から呼ぶ。Windowsのmux経路（既定）は
+§2.2.1の通り新ループを持たず、既存`run_with_reconnect`をそのまま
+使う——ループを共有するのはUnixとWindowsの「単一プロセスfallback」
+経路の間だけである。
+
+---
+
+## 3. 検討した代替案
+
+### 3.1 STUN P2Pにフルバイトレベルresumeを実装する（round 1: 採用、PR3）
+
+round 0では「Relay向けのresumeプロトコル一式をP2P間で再ランデブー
+込みで再現する規模」と見積もり却下していたが、round 1レビュー(B7)で
+`crate::resume::reconnect_and_resume`の既存流用（Androidが既に
+使っている）により狭いコストで実現できると判明したため、§2.3(PR3)
+として採用した。却下ではなく採用に転じた稀な例として記録しておく
+——見積もりの誤りは、STUN P2Pの実装（`stun_p2p.rs`）ではなく
+Androidのtransport層（`isekai-terminal-core`側）を読んでいなかった
+ことに起因する。
+
+### 3.2 `ProxyCommand`自体を永続プロキシ化し、`ssh(1)`からは1本のTCPに見せかける
+
+`ssh(1)`に「切断が起きたことを気付かせない」ため、`isekai-pipe
+connect`を`ssh`のライフタイムより長く生存する常駐プロセス
+（例えば`isekai-pipe agent`のようなデーモン）にし、`ProxyCommand`は
+そのデーモンへの単なるUNIXドメインソケット接続にする案。
+デーモン側でQUIC再接続を隠蔽できれば、`ssh(1)`自身は何も知らずに
+済み、真の意味で"never dies"になる。**却下理由**: (1)
+既存のセッション/プロファイル/ランタイムディレクトリのモデルを
+プロセスモデルごと作り直す必要があり、本ADRが対処したい
+「即死」バグの修正としては過大な変更、(2) デーモン常駐は
+Windows側の`child_stdio.rs`が明示的に避けている設計
+（"the native path just runs the same binary as a child process
+instead of leaving that job to a real `ssh(1)`" — 単純さを優先する
+既存方針）と衝突する、(3) それでも`ssh(1)`自身のバイトストリームは
+QUIC再接続の間止まる（デーモンが内部でRESUMEするまでバッファ
+するだけ）ので、結局PR3が扱う「サーバー側アドレスが安定していない
+場合の再ランデブー」という核心課題は解決しない。将来この課題に
+着手する際の選択肢の1つとして記録だけしておく。
+
+### 3.3 `ssh(1)`の`ServerAliveInterval`/`ServerAliveCountMax`だけで解決する
+
+却下理由: 今回の根本原因は`ssh(1)`自身のTCPレベルの生存確認では
+なく、その手前にいる`ProxyCommand`子プロセス（`isekai-pipe
+connect`）がQUICの`max_idle_timeout`で先に死んで`ssh(1)`にEOFを
+返してしまうことにある。`ssh(1)`側の設定をいくら調整しても、
+`ProxyCommand`が先に落ちる限り無関係。
+
+---
+
+## 4. Consequences
+
+### 4.1 良くなる点（round 2でM-2により文言を訂正）
+
+- Unix・Windows両方で、**STUN P2P経路とWindows mux経路**における
+  セッション確立後のネットワーク瞬断が「即死」ではなく「自動
+  再接続」になる。（round 0/1は「STUN P2P・Relay双方」としていたが
+  誤り——Relay経由は元々`run_resume_loop`が最大10日resumeを
+  試みており、そもそも即死していなかった。本ADRが実際に改善する
+  のはSTUN P2PとWindows mux経路である。）
+- 既存の`RebootstrapAndRetry`（古いデプロイの再展開）はフォール
+  バックとして温存され、退行しない。
+- `outcome.rs`の実態と乖離していたドキュメントコメント、および
+  `wrapper.rs:719-725`の孫プロセスに関するdocコメントが是正される。
+
+### 4.2 リスク・要検討事項（round 1で全面更新）
+
+- **サーバー側セッションスロットの枯渇・他タブへの巻き添え立ち退き**
+  （round 0は「fencing slotの永久リーク」と表現していたが誤り——
+  `release_slot_for`は正しく呼ばれておりEpic N-5で構造的にリーク
+  は解消済み。round 1のS2で訂正）: STUN P2P経路は
+  `retry_while_busy_other_session`の対象外であり、`--max-sessions`
+  （既定16）到達時に他タブ/他ホストのparkedセッションが立ち退かされ
+  うる。§2.2.2の対策（試行回数を3〜5回に制限、STUN connectも
+  `retry_while_busy_other_session`で包む）で軽減する。
+- **`isekai-pipe connect`孫プロセスの孤児化**（S1、round 1で新規発見、
+  round 3(R2-M2)で条件付きに変更）: 実装時に実測し、孫が実際に
+  残ると判明した場合のみ§2.2.2の対策（次の試行前に前回の孫プロセスを
+  確実に終了）を実装する。
+- **`ConnectOutcome`ファイル書き込みとssh終了のレース**（B6、
+  round 1で新規発見）: PR1で修正済みの前提とする。
+- **`should_bootstrap`のセマンティクス変更**: `--isekai-no-bootstrap`
+  が「一切の自動リトライ禁止」ではなく「再展開のみ禁止」に意味が
+  狭まる。round 1レビューで両opusが「既存の契約と整合しており新
+  フラグは不要」と判定（Q2）。
+- **`MidSessionDisconnect`のシグナルがネットワーク以外の原因
+  （例: リモートプロセスのクラッシュ、`isekai-pipe serve`自体の
+  panic）でも発生する**: 再接続を試みること自体は無害（再接続しても
+  すぐ同じ理由で失敗し、24時間予算の上限に達したら諦める）が、
+  メッセージは「connection lost」程度の中立的な表現に留める。
+- **PR3実装後もSTUN P2Pにはscrollback/未確認バイトの継続性の限界が
+  残る**（Q5、両opus指摘）: クライアント・サーバー双方のアドレスが
+  同時に変わる構成（対称NAT越しの相互punchが要る場合）では、PR3の
+  resumeも効かない。この限界は`ISEKAI_PIPE_DESIGN.md`のEpic R要約に
+  明記する（§6）。
+
+---
+
+## 5. テスト戦略
+
+`.claude/rules/prefer-gh-actions-over-local-cargo.md`によりローカル
+`cargo test`は実行できない前提で設計する。
+
+- `decide_connect_failure_recovery`: 既存の3ケースのテストに加え、
+  `MidSessionDisconnect` × `should_bootstrap`の各組み合わせを
+  純粋関数の単体テストとして追加（ネットワーク不要、既存パターン
+  踏襲）。
+- `write_connect_outcome_for_wrapper`相当の分類ロジック: pump段階の
+  `Err`に`MidSessionDisconnectSignal`が正しく載ることを、実ネット
+  ワークなしのユニットテストで検証（`relay_stdio`にモックの
+  `AnyByteStream`を渡し、読み取りエラーを注入する形——
+  `isekai-transport`の`faulty_udp_socket.rs`的なフォールト注入
+  パターンを踏襲できるか確認）。
+- リトライループ自体: `ConnectRecoveryOps`トレイト
+  （`native/connect.rs`に既存）と同種の抽象を介して、実`ssh(1)`/
+  実ネットワークなしにモックで「1回目は`MidSessionDisconnect`で
+  失敗、2回目は成功」というシナリオをテストする。
+- E2Eレベル（`isekai-ssh/tests/*_e2e.rs`の実sshdハーネス）: round 0の
+  「クライアント側`isekai-pipe connect`を`SIGKILL`する」案は、M1
+  指摘の通り`ConnectOutcome`が一切書かれないケース（`PanicOutcomeGuard`
+  はunwindのみカバーしシグナルはカバーしない）を検証してしまうため
+  不採用。代わりに、フォールト注入可能なソケットファクトリで
+  ストリーム読み取りエラーを注入するか、**サーバー側**
+  （`isekai-pipe serve`）を落とす／該当セッションを強制切断する
+  ことで、クライアント側プロセスは正常に`Err`を返す経路を通した
+  「mid-session切断」を模擬する。`isekai-ssh`が自動的に新しい対話
+  セッションを再確立することを確認する（`isekai-ssh-e2e-test-self-containment-convention`
+  のメモリ通り、この種のヘルパーは当該テストファイル内で自己完結
+  させる）。
+- 孫プロセスの後始末（S1、round 3で条件付きに変更）: 実装時の実測で
+  孫プロセスが実際に残ると判明した場合のみ、リトライ2回目の試行が
+  1回目の`isekai-pipe connect`プロセスを確実に終了させてから新
+  セッションをダイヤルしていることを、プロセス監視付きのテスト
+  （またはモック）で検証する。残らないと判明した場合はこのテスト
+  自体が不要になる。
+- 非idempotentコマンドのガード（B5）: `isekai-ssh host -- cmd`形式の
+  invocationでmid-session切断が起きた場合、自動リトライされない
+  ことを検証する（`native/mux/mod.rs`の既存`has_remote_command`
+  ガードのテストと同型）。
+
+---
+
+## 6. Rollout
+
+- **3本のPRを順に**（PR1→PR2→PR3、各PR依存順）マージする。各PRは
+  独立に`.claude/rules/main-branch-protection.md`の required 5本
+  （`android-unit-test`は本変更では無関係だが形式上走る、
+  `rust-core-test-linux`・`android-uniffi-drift`（no-op）・
+  `lockfile-drift`・`room-migration`（no-op））が緑になることを
+  マージ条件とする。
+- CI: `rust-core-test-linux`（required check）で新規ユニット
+  テストが走る。E2Eテストは required 5本には含まれない重量級
+  テストなので、既存の`isekai-ssh/tests/*_e2e.rs`群と同じ
+  非required扱いで追加する。
+- UniFFI再生成: 不要（本ADR冒頭に明記の通り、対象crateは
+  Android/iOS非依存）。
+- ドキュメント更新: `ISEKAI_PIPE_DESIGN.md`に「Epic R:
+  セッション確立後の切断からの自動リカバリ」として本ADRの要約を
+  PR3完了後にまとめて追記する。§4.2で述べた「PR3後もSTUN P2Pには
+  scrollback継続性の限界が残る」ことを明記する。
+
+---
+
+## 7. Open Questions
+
+round 1〜2のレビューで、round 0の6項目・round 1で新規発見された
+指摘の大半は解決済み（詳細:
+[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND1.md`]、および
+本ドキュメント各所に反映済み）。round 1で残っていたOpen Question 2
+（Windows mux修正の判定方法）はround 2でopus-critic-a自身の具体案
+（`exit_code: Option<u8>`を判別子に使う、§2.2.1）を採用して解決した。
+round 3レビューで検証してほしい残課題:
+
+1. **§2.2.2のS1対応**（孫プロセスの後始末）は、round 2で「実装時に
+   まず実測してから機構の要否を決める」という方針に変更した
+   （§2.2.2参照）。この「実測してから決める」という進め方自体に
+   異論がないか。
+2. **PR3のスコープ境界**: §2.3の3で「対称NAT越しの相互punchが
+   要る構成はPR3の対象外」としたが、この構成をどう検知して
+   ユーザーに伝えるか（サイレントに「再接続してもscrollbackが
+   失われる」で済ませるか、明示的なログを出すか）。
+3. 他に見落としている失敗モード・設計の抜けはあるか（特に
+   round 2で新規に追加した§2.2.1のレース対策・§2.2.1のWindows mux
+   試行回数上限の適用方法・§2.1で narrowed したPR1スコープに、
+   さらなる見落としがないか）。
