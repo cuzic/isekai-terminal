@@ -485,6 +485,12 @@ fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
     };
     let class = if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+    } else if err.downcast_ref::<crate::resume_loop::MidSessionDisconnectSignal>().is_some() {
+        // Epic R PR2, Task 2.5: a bare downcast finds this even through the
+        // outer `.context("isekai-pipe connect: ... failed")` wrap each
+        // `run_connect` call site adds — `anyhow::Error::downcast_ref`
+        // already walks the `ContextError` chain itself.
+        isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect
     } else {
         isekai_pipe_core::ConnectOutcomeClass::Unreachable
     };
@@ -677,7 +683,19 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             .await
             .map(|conn| conn.stream);
             match stun_result {
-                Ok(stream) => relay_stdio(stream).await,
+                // Epic R PR2, Task 2.4: the handshake above already
+                // succeeded, so a `relay_stdio` failure here is a
+                // mid-session disconnect, not a connect-time failure —
+                // mark it so `write_connect_outcome_for_wrapper`
+                // classifies it as `ConnectOutcomeClass::MidSessionDisconnect`
+                // instead of `Unreachable`. Deliberately does not go
+                // through `recover_via_cross_family_fallback` below (that
+                // arm only ever sees the *connect*-time `Err(e)` from
+                // `connect_stun_p2p` itself, never a post-success
+                // `relay_stdio` failure — see that function's own call
+                // site one arm up for the `ConnectRoute::StunWithFallback`
+                // case, where this same distinction matters more: Task 2.7).
+                Ok(stream) => relay_stdio(stream).await.map_err(|e| e.context(crate::resume_loop::MidSessionDisconnectSignal)),
                 Err(e) => {
                     recover_via_cross_family_fallback(
                         Err(attach_stale_trust_signal(e)),

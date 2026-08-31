@@ -340,6 +340,19 @@ trait ConnectRecoveryOps {
     /// Whether auto-bootstrap is currently allowed (`--isekai-no-bootstrap` /
     /// `#@isekai bootstrap-policy never` turn it off).
     fn should_bootstrap(&self) -> bool;
+    /// Whether this invocation is running a one-shot remote command
+    /// (`isekai-ssh host -- cmd`) rather than an interactive shell (Epic R
+    /// PR2, B5). A `MidSessionDisconnect` must never auto-retry when this
+    /// is `true` — rerunning a remote command from scratch after it was
+    /// interrupted mid-execution could repeat a non-idempotent action,
+    /// mirroring `native::mux::mod::run_with_reconnect`'s identical guard
+    /// on its own `OwnerLost` reconnect.
+    fn has_remote_command(&self) -> bool;
+    /// Rebuilds the connection intent from already-trusted material,
+    /// without re-deploying anything over SSH (Epic R PR2) — the
+    /// lightweight counterpart to `rebootstrap_and_rebuild_intent` below,
+    /// used for `ConnectFailureRecoveryAction::RetryConnectLightweight`.
+    fn build_intent(&self) -> Result<ConnectionIntent>;
     /// Re-deploys the helper for the already-trusted profile (no `[y/N]` trust
     /// confirmation — see [`run_native_connect_with_recovery`]'s docs on the
     /// separate host-key TOFU prompt), then rebuilds the intent from the
@@ -347,41 +360,90 @@ trait ConnectRecoveryOps {
     async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent>;
 }
 
+/// How many lightweight (no-rebootstrap) reconnect attempts a
+/// `MidSessionDisconnect` gets before this path falls back to a full
+/// re-deploy — mirrors `wrapper.rs::MAX_LIGHTWEIGHT_RETRIES` (Epic R PR2,
+/// same policy on both platforms, kept as a separate constant rather than a
+/// shared one for the same "same policy, not same Rust item" reason
+/// `reconnect_backoff`'s module doc gives).
+const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
+
 /// Pure sequencing of the "always-connects" recovery, generic over
 /// [`ConnectRecoveryOps`] so the retry path is testable without real I/O.
-/// At most two `attempt`s ever happen (see [`run_native_connect_with_recovery`]).
+/// Unlike PR1, this can now run more than two `attempt`s in a row — a
+/// `MidSessionDisconnect` (Epic R PR2) drives a bounded lightweight-retry
+/// loop with the same backoff/budget policy as `wrapper.rs`'s Unix
+/// equivalent — but a `StaleTrust`/`Unreachable` signal is still handled in
+/// at most one extra rebootstrap-and-retry attempt, matching
+/// [`run_native_connect_with_recovery`]'s original "at most two attempts"
+/// description for that class of failure.
 async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: ConnectionIntent) -> Result<u8> {
-    let first_error = match ops.attempt(&intent, false).await {
-        Ok(exit_code) => return Ok(exit_code),
-        Err(e) => e,
-    };
+    let mut intent = intent;
+    let mut attempt: u32 = 0;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+    let mut lightweight_retries: u32 = 0;
 
-    // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome` rather
-    // than reimplementing the degrade-to-no-signal policy here — the two
-    // used to drift (different error type, different format flag, and a
-    // doubled log message from `claim_outcome` pre-wrapping its error before
-    // this call wrapped it again). Also, critically, does not discard
-    // `first_error` (the actual connect failure reason) in favor of the
-    // claim-check error, which the original `?` here did.
-    let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        let first_error = match ops.attempt(&intent, false).await {
+            Ok(exit_code) => return Ok(exit_code),
+            Err(e) => e,
+        };
 
-    match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
-        ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
-        ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
-            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            crate::wrapper::log_auto_bootstrap_disabled(&outcome.class, &outcome.profile, &outcome.detail);
-            Err(first_error)
-        }
-        ConnectFailureRecoveryAction::RebootstrapAndRetry => {
-            let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            crate::wrapper::log_rebootstrap_and_retry_decision(
-                &outcome.class,
-                &outcome.profile,
-                &outcome.detail,
-                "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
-            );
-            let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
-            ops.attempt(&intent2, true).await
+        // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome`
+        // rather than reimplementing the degrade-to-no-signal policy here —
+        // the two used to drift (different error type, different format
+        // flag, and a doubled log message from `claim_outcome`
+        // pre-wrapping its error before this call wrapped it again). Also,
+        // critically, does not discard `first_error` (the actual connect
+        // failure reason) in favor of the claim-check error, which the
+        // original `?` here did.
+        let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
+
+        match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), ops.should_bootstrap()) {
+            ConnectFailureRecoveryAction::NoRecoverableSignal => return Err(first_error),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
+                let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
+                crate::wrapper::log_auto_bootstrap_disabled(&outcome.class, &outcome.profile, &outcome.detail);
+                return Err(first_error);
+            }
+            ConnectFailureRecoveryAction::RebootstrapAndRetry => {
+                let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
+                crate::wrapper::log_rebootstrap_and_retry_decision(
+                    &outcome.class,
+                    &outcome.profile,
+                    &outcome.detail,
+                    "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
+                );
+                let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
+                return ops.attempt(&intent2, true).await;
+            }
+            ConnectFailureRecoveryAction::RetryConnectLightweight => {
+                if ops.has_remote_command() {
+                    log_line!(
+                        "isekai-ssh: connection lost while running a remote command; not auto-retrying (rerunning it could repeat a non-idempotent action)."
+                    );
+                    return Err(first_error);
+                }
+                lightweight_retries += 1;
+                if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
+                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
+                    if !ops.should_bootstrap() {
+                        return Err(first_error);
+                    }
+                    let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
+                    return ops.attempt(&intent2, true).await;
+                }
+                crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since);
+                match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    crate::reconnect_backoff::ReconnectDecision::Retry => {
+                        log_line!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})");
+                        intent = ops.build_intent().context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
+                        continue;
+                    }
+                    crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(first_error),
+                }
+            }
         }
     }
 }
@@ -422,6 +484,14 @@ impl ConnectRecoveryOps for NativeConnectOps<'_> {
 
     fn should_bootstrap(&self) -> bool {
         should_bootstrap(self.plan, self.resolution)
+    }
+
+    fn has_remote_command(&self) -> bool {
+        self.plan.remote_command().is_some()
+    }
+
+    fn build_intent(&self) -> Result<ConnectionIntent> {
+        build_connection_intent(self.resolution)
     }
 
     async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
@@ -2355,6 +2425,29 @@ mod tests {
         should_bootstrap: bool,
         rebootstrap_calls: usize,
         rebootstrap_ok: bool,
+        /// Epic R PR2: mirrors `WrapperPlan::remote_command().is_some()`.
+        has_remote_command: bool,
+        /// `Cell` because `build_intent` takes `&self` (see its trait doc —
+        /// unlike `rebootstrap_and_rebuild_intent`, it does no I/O of its
+        /// own and doesn't need `&mut`).
+        build_intent_calls: std::cell::Cell<usize>,
+    }
+
+    impl Default for FakeRecoveryOps {
+        fn default() -> Self {
+            FakeRecoveryOps {
+                attempt_results: std::collections::VecDeque::new(),
+                attempt_calls: 0,
+                silent_flags_seen: Vec::new(),
+                outcome: None,
+                claim_outcome_err: false,
+                should_bootstrap: true,
+                rebootstrap_calls: 0,
+                rebootstrap_ok: true,
+                has_remote_command: false,
+                build_intent_calls: std::cell::Cell::new(0),
+            }
+        }
     }
 
     fn fake_outcome(class: isekai_pipe_core::ConnectOutcomeClass) -> isekai_pipe_core::ConnectOutcome {
@@ -2401,6 +2494,13 @@ mod tests {
         fn should_bootstrap(&self) -> bool {
             self.should_bootstrap
         }
+        fn has_remote_command(&self) -> bool {
+            self.has_remote_command
+        }
+        fn build_intent(&self) -> Result<ConnectionIntent> {
+            self.build_intent_calls.set(self.build_intent_calls.get() + 1);
+            Ok(fake_intent())
+        }
         async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
             self.rebootstrap_calls += 1;
             if self.rebootstrap_ok {
@@ -2426,6 +2526,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert_eq!(result.unwrap(), 7, "the retry's exit code must be returned");
@@ -2456,6 +2557,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: false,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "a failed re-bootstrap must surface as an error");
@@ -2476,6 +2578,7 @@ mod tests {
             should_bootstrap: false,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "with auto-bootstrap disabled the original error must propagate");
@@ -2497,6 +2600,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "no signal means the original error propagates");
@@ -2521,6 +2625,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         let err = result.expect_err("a claim_outcome failure must still surface an error (there was no successful attempt)");
@@ -2530,5 +2635,76 @@ mod tests {
         );
         assert_eq!(ops.rebootstrap_calls, 0, "claim_outcome failing must not trigger a re-deploy");
         assert_eq!(ops.attempt_calls, 1, "claim_outcome failing must not trigger a retry");
+    }
+
+    // -----------------------------------------------------------------
+    // Epic R PR2: `MidSessionDisconnect` lightweight-retry loop. Mirrors
+    // `wrapper.rs`'s equivalent tests on the Unix side — see that module's
+    // doc comments for why the decision logic itself
+    // (`decide_connect_failure_recovery`) is unit-tested there rather than
+    // duplicated here; this module only tests the *sequencing* against a
+    // fake, per this file's existing test-module doc comment above.
+    // -----------------------------------------------------------------
+
+    /// A `MidSessionDisconnect` signal drives a no-rebootstrap retry that
+    /// rebuilds the intent via `build_intent` (not
+    /// `rebootstrap_and_rebuild_intent`) and succeeds without ever deploying
+    /// anything.
+    #[tokio::test]
+    async fn recovery_retries_lightweight_on_mid_session_disconnect_without_rebootstrapping() {
+        tokio::time::pause();
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string()), Ok(0)].into_iter().collect(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, 2);
+        assert_eq!(ops.rebootstrap_calls, 0, "a lightweight retry must never re-deploy the helper");
+        assert_eq!(ops.build_intent_calls.get(), 1, "the intent must be rebuilt once for the retry");
+    }
+
+    /// A remote-command invocation (`isekai-ssh host -- cmd`) must never
+    /// auto-retry a `MidSessionDisconnect` — rerunning it could repeat a
+    /// non-idempotent action (mirrors `native::mux::mod::run_with_reconnect`'s
+    /// identical guard).
+    #[tokio::test]
+    async fn recovery_does_not_retry_mid_session_disconnect_for_a_remote_command() {
+        tokio::time::pause();
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string())].into_iter().collect(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            has_remote_command: true,
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert!(result.is_err(), "a remote command must not be silently rerun after a mid-session disconnect");
+        assert_eq!(ops.attempt_calls, 1);
+        assert_eq!(ops.rebootstrap_calls, 0);
+        assert_eq!(ops.build_intent_calls.get(), 0);
+    }
+
+    /// Once the lightweight-retry cap is exceeded, the loop falls back to a
+    /// full re-deploy exactly like a `StaleTrust`/`Unreachable` signal would.
+    #[tokio::test]
+    async fn recovery_falls_back_to_rebootstrap_after_exhausting_lightweight_retries() {
+        tokio::time::pause();
+        // `lightweight_retries` only exceeds `MAX_LIGHTWEIGHT_RETRIES` on the
+        // (MAX_LIGHTWEIGHT_RETRIES + 1)-th failure (it's incremented *after*
+        // each failed attempt and compared with `>`, not `>=`), so that many
+        // failures happen before the rebootstrap fallback kicks in.
+        let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
+            (0..MAX_LIGHTWEIGHT_RETRIES + 1).map(|_| Err("connection lost".to_string())).collect();
+        attempt_results.push_back(Ok(0)); // the post-rebootstrap retry succeeds
+        let mut ops = FakeRecoveryOps {
+            attempt_results,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, MAX_LIGHTWEIGHT_RETRIES as usize + 2);
+        assert_eq!(ops.rebootstrap_calls, 1, "exhausting lightweight retries must fall back to exactly one full re-deploy");
     }
 }

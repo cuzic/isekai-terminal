@@ -63,6 +63,25 @@ const WARM_STANDBY_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 /// monotonic tick count.
 const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 
+/// Marks an `anyhow::Error` as having occurred *after* the STUN P2P
+/// handshake already succeeded — i.e. during the pump phase (`relay_stdio`),
+/// not while dialing (Epic R PR2, Task 2.4). Mirrors
+/// `isekai_transport::StaleTrustSignal`'s attach-at-the-source/
+/// downcast-at-the-top shape (`connect.rs::attach_stale_trust_signal`): a
+/// bare `err.downcast_ref::<MidSessionDisconnectSignal>()` finds this
+/// even through an outer `.context(...)` wrap, since `anyhow`'s own
+/// `downcast_ref` already walks the `ContextError` chain — no manual
+/// `err.chain()` traversal needed (round 1 review, R1-B2/B2, corrected a
+/// wrong assumption in an earlier draft of this fix).
+///
+/// Deliberately **not** attached to `run_resume_loop`'s own `give_up` path
+/// (the Relay — and, before PR3, non-existent-for-STUN — resume loop): that
+/// loop already retries internally for up to `DEFAULT_RESUME_GRACE_SECS`
+/// (10 days) before giving up, so an error escaping it is essentially
+/// terminal and the existing `RebootstrapAndRetry` (full re-deploy) is the
+/// correct response, not a lightweight retry (S1(old) from the ADR review).
+pub(crate) struct MidSessionDisconnectSignal;
+
 pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
     let mut c2h = tokio::spawn(async move {
@@ -248,7 +267,12 @@ pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidate
     let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&system_quic_factory(), target, candidates)
         .await
         .map_err(attach_stale_trust_signal)?;
-    relay_stdio(connection.stream).await
+    // Epic R PR2, Task 2.4: the handshake above already succeeded, so any
+    // error from here on is a mid-session disconnect, not a connect-time
+    // failure — mark it so `write_connect_outcome_for_wrapper` classifies
+    // it as `ConnectOutcomeClass::MidSessionDisconnect` instead of
+    // `Unreachable`.
+    relay_stdio(connection.stream).await.map_err(|e| e.context(MidSessionDisconnectSignal))
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
