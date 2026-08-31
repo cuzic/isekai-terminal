@@ -1479,7 +1479,7 @@ mod tests {
         drop(client);
 
         let (_result, handle) = relay.await.unwrap();
-        assert!(!handle.is_closed(), "a single channel closing must not close the shared handle");
+        assert!(!handle.lock().await.is_closed(), "a single channel closing must not close the shared handle");
     }
 
     /// A mock sshd that only answers `exec` (never `shell_request`) — echoes
