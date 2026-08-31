@@ -50,6 +50,31 @@ pub const CONNECT_OUTCOME_SCHEMA_VERSION: u32 = 1;
 pub enum ConnectOutcomeClass {
     StaleTrust,
     Unreachable,
+    /// Any tag this build doesn't recognize (Epic R PR1). The writer
+    /// (`isekai-pipe`, possibly overridden via `--isekai-pipe-path`) and
+    /// the reader (`isekai-ssh`) are two independently-invoked local
+    /// binaries that can legitimately be different builds — this is *not*
+    /// about server-side helper staleness (that's the sha256 check in
+    /// `always-connects.md`, an unrelated concern). Without this catch-all,
+    /// an internally-tagged enum like this one fails the whole
+    /// deserialization on an unknown `class` value, which `claim_connect_outcome`
+    /// would otherwise have to turn into a hard error for the entire
+    /// `isekai-ssh` invocation — worse than just treating it as "some
+    /// outcome was recorded" the way the wrapper already treats `Unreachable`.
+    /// Must be matched like `Unreachable` (not like "no signal at all")
+    /// wherever `ConnectOutcomeClass` is exhaustively matched —
+    /// `isekai-ssh::wrapper::outcome_summary` today (`decide_connect_failure_recovery`
+    /// itself takes a plain `bool`, not this enum, and treats every class
+    /// alike; it needs no update). `log_auto_bootstrap_disabled` also special-
+    /// cases this variant to avoid suggesting `isekai-ssh init` — see its
+    /// own doc comment.
+    ///
+    /// **Must stay the last variant.** `serde_derive` rejects `#[serde(other)]`
+    /// anywhere but the last variant at compile time — a future PR (e.g.
+    /// Epic R PR2's `MidSessionDisconnect`) must add its variant *above*
+    /// this one, not below it.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +114,74 @@ mod tests {
             class: ConnectOutcomeClass::StaleTrust,
             detail: "cert pin mismatch".to_string(),
         }
+    }
+
+    #[test]
+    fn unknown_class_round_trips_through_the_full_connect_outcome_struct() {
+        // Epic R PR1 (R1-S3): `ConnectOutcome` flattens `ConnectOutcomeClass`
+        // via `#[serde(flatten)]`, which deserializes through serde's
+        // `FlatMapDeserializer` rather than the plain internally-tagged-enum
+        // path — proving `#[serde(other)]` works for `ConnectOutcomeClass`
+        // in isolation would not prove it still works once flattened into
+        // the parent struct. This exercises the actual `ConnectOutcome`
+        // struct end to end, the way `claim_connect_outcome` really reads it.
+        let json = r#"{
+            "schema_version": 1,
+            "intent_id": "abc123",
+            "profile": "production",
+            "class": "some-future-variant-this-build-does-not-know-about",
+            "detail": "whatever a newer isekai-pipe build put here"
+        }"#;
+        let outcome: ConnectOutcome =
+            serde_json::from_str(json).expect("an unrecognized class tag must not fail deserialization of the whole struct");
+        assert_eq!(outcome.class, ConnectOutcomeClass::Unknown);
+        // Prove `#[serde(flatten)]`'s `FlatMapDeserializer` isn't eating
+        // sibling fields while it hunts for the unrecognized `class` tag —
+        // asserting `class` alone would miss that class of corruption.
+        assert_eq!(outcome.schema_version, 1);
+        assert_eq!(outcome.intent_id, "abc123");
+        assert_eq!(outcome.profile, "production");
+        assert_eq!(outcome.detail, "whatever a newer isekai-pipe build put here");
+    }
+
+    #[test]
+    fn unknown_class_tag_written_by_a_newer_isekai_pipe_build_is_readable_via_claim_connect_outcome() {
+        // Unlike `unreachable_class_round_trips_too` etc., this doesn't go
+        // through `write_connect_outcome` (today's `isekai-pipe` never
+        // writes `Unknown` itself — `write_connect_outcome_for_wrapper`
+        // only ever produces `StaleTrust`/`Unreachable`/(after Epic R PR2)
+        // `MidSessionDisconnect`). The actual production scenario `Unknown`
+        // exists for is a *newer* `isekai-pipe` build writing a `class` tag
+        // *this* `isekai-ssh`/`isekai-pipe-core` build predates — simulated
+        // here by placing that raw JSON directly at the on-disk path
+        // `claim_connect_outcome` reads from, bypassing this build's own
+        // (necessarily backwards-only) `Serialize` impl entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let outcomes_dir = dir.path().join("connect-outcomes");
+        fs::create_dir_all(&outcomes_dir).unwrap();
+        fs::write(
+            outcomes_dir.join("future-build-intent.json"),
+            r#"{
+                "schema_version": 1,
+                "intent_id": "future-build-intent",
+                "profile": "production",
+                "class": "helper-crashed-mid-session",
+                "detail": "a variant introduced by a newer isekai-pipe build"
+            }"#,
+        )
+        .unwrap();
+
+        let claimed = claim_connect_outcome(dir.path(), "future-build-intent").unwrap();
+        assert_eq!(
+            claimed,
+            Some(ConnectOutcome {
+                schema_version: 1,
+                intent_id: "future-build-intent".to_string(),
+                profile: "production".to_string(),
+                class: ConnectOutcomeClass::Unknown,
+                detail: "a variant introduced by a newer isekai-pipe build".to_string(),
+            })
+        );
     }
 
     #[test]

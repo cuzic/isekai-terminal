@@ -53,8 +53,8 @@ use super::mux::handoff::HandoffCredentials;
 use crate::log_file::log_line;
 use crate::wrapper::{
     bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery,
-    print_bootstrap_failure_guidance, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation, WrapperPlan,
-    WrapperResolution,
+    print_bootstrap_failure_guidance, resolve_claimed_outcome, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation,
+    WrapperPlan, WrapperResolution,
 };
 
 #[cfg(windows)]
@@ -328,8 +328,15 @@ trait ConnectRecoveryOps {
     /// the documented TOFU exception — but the silent retry is not).
     async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8>;
     /// Claims the `ConnectOutcome` signal `isekai-pipe connect` may have left
-    /// behind for this exact attempt, if any.
-    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>>;
+    /// behind for this exact attempt, if any. Returns the raw
+    /// `isekai_pipe_core::IntentError` (not pre-wrapped into an `anyhow::Error`)
+    /// so callers can feed it straight into `resolve_claimed_outcome` — the
+    /// same degrade-to-no-signal policy `wrapper.rs` uses, shared rather
+    /// than reimplemented here (Epic R PR1 code review: an earlier version
+    /// of this method pre-wrapped the error with its own message, which
+    /// then got wrapped *again* by the caller's own degrade-logging,
+    /// producing a doubled, confusing log line).
+    fn claim_outcome(&self, intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError>;
     /// Whether auto-bootstrap is currently allowed (`--isekai-no-bootstrap` /
     /// `#@isekai bootstrap-policy never` turn it off).
     fn should_bootstrap(&self) -> bool;
@@ -349,7 +356,14 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         Err(e) => e,
     };
 
-    let outcome = ops.claim_outcome(&intent.intent_id)?;
+    // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome` rather
+    // than reimplementing the degrade-to-no-signal policy here — the two
+    // used to drift (different error type, different format flag, and a
+    // doubled log message from `claim_outcome` pre-wrapping its error before
+    // this call wrapped it again). Also, critically, does not discard
+    // `first_error` (the actual connect failure reason) in favor of the
+    // claim-check error, which the original `?` here did.
+    let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
 
     match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
@@ -402,9 +416,8 @@ impl ConnectRecoveryOps for NativeConnectOps<'_> {
         connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, &self.handoff, silent).await
     }
 
-    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+    fn claim_outcome(&self, intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError> {
         claim_connect_outcome(self.runtime_dir, intent_id)
-            .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))
     }
 
     fn should_bootstrap(&self) -> bool {
@@ -2201,6 +2214,10 @@ mod tests {
         /// retry-after-rebootstrap attempt must be `true` (never prompt).
         silent_flags_seen: Vec<bool>,
         outcome: Option<isekai_pipe_core::ConnectOutcome>,
+        /// Epic R PR1 (S1/S4): when `true`, `claim_outcome` returns `Err`
+        /// instead of `Ok(outcome.clone())` — simulating a corrupt/unreadable
+        /// outcome file, independent of whether `outcome` itself is set.
+        claim_outcome_err: bool,
         should_bootstrap: bool,
         rebootstrap_calls: usize,
         rebootstrap_ok: bool,
@@ -2241,7 +2258,10 @@ mod tests {
                 Err(msg) => Err(anyhow!(msg)),
             }
         }
-        fn claim_outcome(&self, _intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+        fn claim_outcome(&self, _intent_id: &str) -> std::result::Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError> {
+            if self.claim_outcome_err {
+                return Err(isekai_pipe_core::IntentError::InvalidIntentId);
+            }
             Ok(self.outcome.clone())
         }
         fn should_bootstrap(&self) -> bool {
@@ -2268,6 +2288,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2297,6 +2318,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::StaleTrust)),
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: false,
@@ -2316,6 +2338,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: false,
             should_bootstrap: false,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2336,6 +2359,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: None,
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2344,5 +2368,33 @@ mod tests {
         assert!(result.is_err(), "no signal means the original error propagates");
         assert_eq!(ops.rebootstrap_calls, 0, "no signal means no re-deploy");
         assert_eq!(ops.attempt_calls, 1, "no signal means no retry");
+    }
+
+    /// Epic R PR1 (S1/S4): `claim_outcome` itself failing (a corrupt/
+    /// unreadable outcome file, or a schema shape this build's `isekai-pipe-core`
+    /// doesn't understand) must degrade to "no signal" — not fail the whole
+    /// invocation with the claim-check error, and critically must not
+    /// *replace* `first_error` (the real connect failure) with that
+    /// claim-check error.
+    #[tokio::test]
+    async fn recovery_propagates_original_error_when_claim_outcome_itself_fails() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
+            attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: true,
+            should_bootstrap: true,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: true,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        let err = result.expect_err("a claim_outcome failure must still surface an error (there was no successful attempt)");
+        assert!(
+            format!("{err:#}").contains("first attempt failed"),
+            "the original connect failure must survive, not be replaced by the claim-check error: {err:#}"
+        );
+        assert_eq!(ops.rebootstrap_calls, 0, "claim_outcome failing must not trigger a re-deploy");
+        assert_eq!(ops.attempt_calls, 1, "claim_outcome failing must not trigger a retry");
     }
 }

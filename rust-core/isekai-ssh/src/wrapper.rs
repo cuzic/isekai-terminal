@@ -615,8 +615,7 @@ async fn run_ssh_with_connect_failure_recovery(
     }
     let exit_code = status.code().unwrap_or(1) as u8;
 
-    let outcome = claim_connect_outcome(&runtime_dir, &intent_id)
-        .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))?;
+    let outcome = resolve_claimed_outcome(claim_connect_outcome(&runtime_dir, &intent_id));
 
     match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
@@ -649,6 +648,12 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
     match class {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
+        // Epic R PR1 (R2-M1): deliberately not the `Unreachable` wording —
+        // "the cached deployment could not be reached ... run `isekai-ssh
+        // init` manually" would misdirect the user for a class this build
+        // simply doesn't recognize (a newer `isekai-pipe` reporting a
+        // variant this `isekai-ssh` predates).
+        isekai_pipe_core::ConnectOutcomeClass::Unknown => "isekai-pipe connect reported an outcome this isekai-ssh build doesn't recognize",
     }
 }
 
@@ -659,6 +664,20 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
 /// `RebootstrapAndRetry`'s — see [`log_rebootstrap_and_retry_decision`] —
 /// whose trailing clause differs per platform).
 pub(crate) fn log_auto_bootstrap_disabled(class: &isekai_pipe_core::ConnectOutcomeClass, profile: &str, detail: &str) {
+    // Epic R PR1 code review: `Unknown` must not get the "run `isekai-ssh
+    // init` manually" imperative — that command re-deploys/re-trusts the
+    // helper, which does nothing for a version-skew schema mismatch between
+    // this `isekai-ssh` build and whatever `isekai-pipe` build wrote the
+    // outcome file. Every other class genuinely can be fixed that way.
+    if matches!(class, isekai_pipe_core::ConnectOutcomeClass::Unknown) {
+        log_line!(
+            "isekai-ssh: {} for {:?} ({}); auto-bootstrap is disabled \
+             (--isekai-no-bootstrap / #@isekai bootstrap-policy never), so no automatic recovery was attempted \
+             for this unrecognized outcome.",
+            outcome_summary(class), profile, detail
+        );
+        return;
+    }
     log_line!(
         "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
          (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
@@ -704,6 +723,41 @@ pub(crate) enum ConnectFailureRecoveryAction {
     /// A signal was found and auto-bootstrap is allowed — attempt a silent
     /// re-bootstrap and retry `ssh` exactly once more.
     RebootstrapAndRetry,
+}
+
+/// Turns `claim_connect_outcome`'s `Result` into the `Option` the rest of
+/// `run_ssh_with_connect_failure_recovery` works with, degrading a claim
+/// failure to "no signal" (Epic R PR1, S4) instead of failing the whole
+/// invocation. A deserialize failure here means either a genuinely corrupt
+/// outcome file, or a schema shape `ConnectOutcomeClass::Unknown`'s
+/// `#[serde(other)]` catch-all doesn't cover (e.g. a missing required field
+/// from a much newer/older `isekai-pipe` build) — the two local binaries
+/// (`isekai-pipe`, possibly overridden via `--isekai-pipe-path`, and this
+/// `isekai-ssh`) are independently invoked and can legitimately be
+/// different builds. `Unknown` now covers the common "new class tag" case;
+/// this stays defensive for whatever `Unknown` doesn't catch.
+///
+/// Deliberately treats every `IntentError` variant the same way, including
+/// `Io` (e.g. a permissions problem or full disk under the runtime dir) —
+/// not just `Json` (an actual deserialize mismatch). This loses the
+/// distinction between "a version-skew schema shape" and "a persistent
+/// local filesystem fault" (code review finding), but that distinction was
+/// already unavailable before this function existed: the original `?`-based
+/// code turned *every* `IntentError` variant into the same hard `Err`
+/// uniformly, with no finer-grained handling either. `log_line!`'s output
+/// (visible on stderr, or in `--isekai-log-file`'s file) is where an `Io`
+/// fault should still show up for anyone debugging it, via `IntentError`'s
+/// own `Display` impl.
+pub(crate) fn resolve_claimed_outcome(
+    result: Result<Option<isekai_pipe_core::ConnectOutcome>, isekai_pipe_core::IntentError>,
+) -> Option<isekai_pipe_core::ConnectOutcome> {
+    match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            log_line!("isekai-ssh: could not read a connect-failure signal ({e}); treating this as no signal");
+            None
+        }
+    }
 }
 
 pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
@@ -2202,6 +2256,30 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_claimed_outcome_passes_through_ok_results() {
+        assert_eq!(resolve_claimed_outcome(Ok(None)), None);
+        let outcome = isekai_pipe_core::ConnectOutcome {
+            schema_version: 1,
+            intent_id: "abc".to_string(),
+            profile: "prod".to_string(),
+            class: isekai_pipe_core::ConnectOutcomeClass::Unreachable,
+            detail: "idle timeout".to_string(),
+        };
+        assert_eq!(resolve_claimed_outcome(Ok(Some(outcome.clone()))), Some(outcome));
+    }
+
+    /// Epic R PR1 (S4): a `claim_connect_outcome` failure (a corrupt outcome
+    /// file, or a schema shape too different for `ConnectOutcomeClass::Unknown`
+    /// to absorb) must degrade to "no signal" rather than propagate — this is
+    /// the regression this whole function exists to prevent (before it, the
+    /// `?` at the call site turned this into a hard `Err` for the entire
+    /// `isekai-ssh` invocation).
+    #[test]
+    fn resolve_claimed_outcome_degrades_a_claim_failure_to_no_signal() {
+        assert_eq!(resolve_claimed_outcome(Err(isekai_pipe_core::IntentError::InvalidIntentId)), None);
     }
 
     #[test]
