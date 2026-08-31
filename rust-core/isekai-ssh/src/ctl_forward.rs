@@ -114,6 +114,7 @@ pub(crate) struct CtlForward {
     pub(crate) listener_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl CtlForward {
     /// Aborts this attempt's listener task (if it was ever started) and
     /// best-effort removes its local socket file — called once per
