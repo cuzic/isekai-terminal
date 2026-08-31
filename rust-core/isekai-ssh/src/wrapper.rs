@@ -878,13 +878,22 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe
 /// disabling the other. Unix-only — this is the `ssh(1)` ProxyCommand path;
 /// the Windows-native path handles both on its own `russh` handle
 /// (`native/mux/ctl_forward.rs`).
+///
+/// Returns the [`crate::ctl_forward::CtlForward`] it prepared (if any) so
+/// the caller (`run_ssh_once`) can keep its background listener task alive
+/// for exactly this attempt's `ssh` child and tear it down right after —
+/// Epic R PR2, Task 2.10: this function itself must not drop it, since
+/// dropping a plain struct does nothing to the already-detached listener
+/// task `spawn_ctl_listener` started (see `CtlForward::listener_task`'s
+/// docs for why that matters now that `run_ssh_once` can run many times per
+/// invocation).
 #[cfg(unix)]
 async fn apply_ctl_socket_forward(
     command: &mut Command,
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
     runtime_dir: &Path,
-) {
+) -> Option<crate::ctl_forward::CtlForward> {
     let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
         resolution.isekai.ctl_socket_enabled,
         plan.ssh_args.len(),
@@ -938,6 +947,7 @@ async fn apply_ctl_socket_forward(
             tty_exec.as_deref(),
         ));
     }
+    ctl_forward
 }
 
 async fn run_ssh_once(
@@ -975,7 +985,7 @@ async fn run_ssh_once(
     // forwards streamlocal in-process (see `ctl_forward.rs`'s module docs and
     // `native/mux/ctl_forward.rs`).
     #[cfg(unix)]
-    apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
+    let ctl_forward = apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
     #[cfg(not(unix))]
     command.args(&plan.ssh_args);
     // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
@@ -992,20 +1002,43 @@ async fn run_ssh_once(
         command.stderr(Stdio::inherit());
     }
 
-    let mut child = command.spawn().map_err(|e| {
-        anyhow!(
-            "isekai-ssh: failed to execute OpenSSH at {}: {e}",
-            plan.openssh_path.display()
-        )
-    })?;
+    let spawn_result = command.spawn();
+    // Epic R PR2, Task 2.10: tear down this attempt's ctl-socket listener
+    // (if any) on every exit from this function — spawn failure, wait
+    // failure, or a normal exit — not just the happy path, so a long
+    // `MidSessionDisconnect` lightweight-retry loop (`run_ssh_once` can now
+    // run many times per invocation) never accumulates one leaked listener
+    // task + local socket file per failed/completed attempt.
+    #[cfg(unix)]
+    let teardown = |result| {
+        if let Some(forward) = ctl_forward {
+            forward.teardown();
+        }
+        result
+    };
+    #[cfg(not(unix))]
+    let teardown = |result| result;
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(e) => {
+            return teardown(Err(anyhow!(
+                "isekai-ssh: failed to execute OpenSSH at {}: {e}",
+                plan.openssh_path.display()
+            )));
+        }
+    };
     let stderr_redirect = child.stderr.take().map(|stderr| tokio::spawn(crate::log_file::redirect_child_stderr(stderr)));
 
-    let status = child.wait().await.map_err(|e| {
-        anyhow!(
-            "isekai-ssh: failed while waiting for OpenSSH at {}: {e}",
-            plan.openssh_path.display()
-        )
-    })?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            return teardown(Err(anyhow!(
+                "isekai-ssh: failed while waiting for OpenSSH at {}: {e}",
+                plan.openssh_path.display()
+            )));
+        }
+    };
     // ssh(1) exiting closes its stderr, which ends `redirect_child_stderr`'s
     // read loop on its own — this just makes sure that last batch of bytes
     // has actually landed before returning (so a caller inspecting the log
@@ -1013,7 +1046,7 @@ async fn run_ssh_once(
     if let Some(handle) = stderr_redirect {
         let _ = handle.await;
     }
-    Ok((status, intent.intent_id.clone()))
+    teardown(Ok((status, intent.intent_id.clone())))
 }
 
 async fn run_openssh_direct(plan: &WrapperPlan) -> Result<u8> {

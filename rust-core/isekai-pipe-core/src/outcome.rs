@@ -39,7 +39,6 @@
 //! gets its own outcome file rather than risking a read of a stale leftover
 //! from an earlier, unrelated invocation.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

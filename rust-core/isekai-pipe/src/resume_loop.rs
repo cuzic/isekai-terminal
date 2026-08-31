@@ -80,7 +80,16 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// (10 days) before giving up, so an error escaping it is essentially
 /// terminal and the existing `RebootstrapAndRetry` (full re-deploy) is the
 /// correct response, not a lightweight retry (S1(old) from the ADR review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
+
+impl std::fmt::Display for MidSessionDisconnectSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the connection was lost mid-session, after it was already established")
+    }
+}
+
+impl std::error::Error for MidSessionDisconnectSignal {}
 
 pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
@@ -139,7 +148,7 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
 /// `TransportError`/`SequentialConnectError::is_busy_other_session` inherent
 /// methods it delegates to, so calling `self.is_busy_other_session()` inside
 /// each impl unambiguously reaches the inherent one rather than recursing.
-trait BusyOtherSessionSignal {
+pub(crate) trait BusyOtherSessionSignal {
     fn signals_busy_other_session(&self) -> bool;
 }
 
