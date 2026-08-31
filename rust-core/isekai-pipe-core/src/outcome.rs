@@ -50,6 +50,22 @@ pub const CONNECT_OUTCOME_SCHEMA_VERSION: u32 = 1;
 pub enum ConnectOutcomeClass {
     StaleTrust,
     Unreachable,
+    /// Any tag this build doesn't recognize (Epic R PR1). The writer
+    /// (`isekai-pipe`, possibly overridden via `--isekai-pipe-path`) and
+    /// the reader (`isekai-ssh`) are two independently-invoked local
+    /// binaries that can legitimately be different builds — this is *not*
+    /// about server-side helper staleness (that's the sha256 check in
+    /// `always-connects.md`, an unrelated concern). Without this catch-all,
+    /// an internally-tagged enum like this one fails the whole
+    /// deserialization on an unknown `class` value, which `claim_connect_outcome`
+    /// would otherwise have to turn into a hard error for the entire
+    /// `isekai-ssh` invocation — worse than just treating it as "some
+    /// outcome was recorded" the way the wrapper already treats `Unreachable`.
+    /// Must be matched like `Unreachable` (not like "no signal at all") by
+    /// `isekai-ssh::wrapper::decide_connect_failure_recovery` — see that
+    /// function's own docs.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +105,44 @@ mod tests {
             class: ConnectOutcomeClass::StaleTrust,
             detail: "cert pin mismatch".to_string(),
         }
+    }
+
+    #[test]
+    fn unknown_class_round_trips_through_the_full_connect_outcome_struct() {
+        // Epic R PR1 (R1-S3): `ConnectOutcome` flattens `ConnectOutcomeClass`
+        // via `#[serde(flatten)]`, which deserializes through serde's
+        // `FlatMapDeserializer` rather than the plain internally-tagged-enum
+        // path — proving `#[serde(other)]` works for `ConnectOutcomeClass`
+        // in isolation would not prove it still works once flattened into
+        // the parent struct. This exercises the actual `ConnectOutcome`
+        // struct end to end, the way `claim_connect_outcome` really reads it.
+        let json = r#"{
+            "schema_version": 1,
+            "intent_id": "abc123",
+            "profile": "production",
+            "class": "some-future-variant-this-build-does-not-know-about",
+            "detail": "whatever a newer isekai-pipe build put here"
+        }"#;
+        let outcome: ConnectOutcome =
+            serde_json::from_str(json).expect("an unrecognized class tag must not fail deserialization of the whole struct");
+        assert_eq!(outcome.class, ConnectOutcomeClass::Unknown);
+    }
+
+    #[test]
+    fn unknown_class_write_then_claim_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = sample_outcome();
+        outcome.intent_id = "unknown-variant".to_string();
+        outcome.class = ConnectOutcomeClass::Unknown;
+        write_connect_outcome(dir.path(), &outcome).unwrap();
+
+        // `Unknown` itself serializes back out as its own kebab-case tag
+        // (serde's `#[serde(other)]` variant round-trips through its own
+        // name on the write side — it's only the *read* side that accepts
+        // arbitrary unrecognized tags), so writing then claiming an
+        // `Unknown`-classed outcome must still work end to end.
+        let claimed = claim_connect_outcome(dir.path(), &outcome.intent_id).unwrap();
+        assert_eq!(claimed, Some(outcome));
     }
 
     #[test]

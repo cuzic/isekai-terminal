@@ -615,8 +615,24 @@ async fn run_ssh_with_connect_failure_recovery(
     }
     let exit_code = status.code().unwrap_or(1) as u8;
 
-    let outcome = claim_connect_outcome(&runtime_dir, &intent_id)
-        .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))?;
+    // Epic R PR1 (S4): a deserialize failure here (a genuinely corrupt
+    // outcome file, or a schema shape the `#[serde(other)] Unknown`
+    // catch-all doesn't cover — e.g. a missing required field from a much
+    // newer/older `isekai-pipe` build) must degrade to "no signal", not
+    // fail this whole invocation with a hard `Err`. The two local binaries
+    // (`isekai-pipe`, possibly overridden via `--isekai-pipe-path`, and
+    // this `isekai-ssh`) are independently invoked and can legitimately be
+    // different builds. Before `ConnectOutcomeClass::Unknown` existed this
+    // `?` was the only thing standing between an unrecognized `class` tag
+    // and a hard failure; `Unknown` now covers the common case, but this
+    // stays defensive for anything `Unknown` doesn't catch.
+    let outcome = match claim_connect_outcome(&runtime_dir, &intent_id) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            log_line!("isekai-ssh: could not read a connect-failure signal ({e}); treating this as no signal");
+            None
+        }
+    };
 
     match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
@@ -649,6 +665,12 @@ pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> 
     match class {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
+        // Epic R PR1 (R2-M1): deliberately not the `Unreachable` wording —
+        // "the cached deployment could not be reached ... run `isekai-ssh
+        // init` manually" would misdirect the user for a class this build
+        // simply doesn't recognize (a newer `isekai-pipe` reporting a
+        // variant this `isekai-ssh` predates).
+        isekai_pipe_core::ConnectOutcomeClass::Unknown => "isekai-pipe connect reported an outcome this isekai-ssh build doesn't recognize",
     }
 }
 
