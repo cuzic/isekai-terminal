@@ -349,7 +349,18 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         Err(e) => e,
     };
 
-    let outcome = ops.claim_outcome(&intent.intent_id)?;
+    // Epic R PR1 (S4, mirroring wrapper.rs::run_ssh_with_connect_failure_recovery):
+    // a deserialize failure here must degrade to "no signal", not fail this
+    // whole invocation — and must not discard `first_error` (the actual
+    // connect failure reason) in favor of the claim-check error, which the
+    // old `?` here did.
+    let outcome = match ops.claim_outcome(&intent.intent_id) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            log_line!("isekai-ssh: could not read a connect-failure signal ({e:#}); treating this as no signal");
+            None
+        }
+    };
 
     match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
@@ -2201,6 +2212,10 @@ mod tests {
         /// retry-after-rebootstrap attempt must be `true` (never prompt).
         silent_flags_seen: Vec<bool>,
         outcome: Option<isekai_pipe_core::ConnectOutcome>,
+        /// Epic R PR1 (S1/S4): when `true`, `claim_outcome` returns `Err`
+        /// instead of `Ok(outcome.clone())` — simulating a corrupt/unreadable
+        /// outcome file, independent of whether `outcome` itself is set.
+        claim_outcome_err: bool,
         should_bootstrap: bool,
         rebootstrap_calls: usize,
         rebootstrap_ok: bool,
@@ -2242,6 +2257,9 @@ mod tests {
             }
         }
         fn claim_outcome(&self, _intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+            if self.claim_outcome_err {
+                return Err(anyhow!("simulated corrupt/unreadable outcome file"));
+            }
             Ok(self.outcome.clone())
         }
         fn should_bootstrap(&self) -> bool {
@@ -2268,6 +2286,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2297,6 +2316,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::StaleTrust)),
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: false,
@@ -2316,6 +2336,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: false,
             should_bootstrap: false,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2336,6 +2357,7 @@ mod tests {
             attempt_calls: 0,
             silent_flags_seen: Vec::new(),
             outcome: None,
+            claim_outcome_err: false,
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
@@ -2344,5 +2366,33 @@ mod tests {
         assert!(result.is_err(), "no signal means the original error propagates");
         assert_eq!(ops.rebootstrap_calls, 0, "no signal means no re-deploy");
         assert_eq!(ops.attempt_calls, 1, "no signal means no retry");
+    }
+
+    /// Epic R PR1 (S1/S4): `claim_outcome` itself failing (a corrupt/
+    /// unreadable outcome file, or a schema shape this build's `isekai-pipe-core`
+    /// doesn't understand) must degrade to "no signal" — not fail the whole
+    /// invocation with the claim-check error, and critically must not
+    /// *replace* `first_error` (the real connect failure) with that
+    /// claim-check error.
+    #[tokio::test]
+    async fn recovery_propagates_original_error_when_claim_outcome_itself_fails() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
+            attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            claim_outcome_err: true,
+            should_bootstrap: true,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: true,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        let err = result.expect_err("a claim_outcome failure must still surface an error (there was no successful attempt)");
+        assert!(
+            format!("{err:#}").contains("first attempt failed"),
+            "the original connect failure must survive, not be replaced by the claim-check error: {err:#}"
+        );
+        assert_eq!(ops.rebootstrap_calls, 0, "claim_outcome failing must not trigger a re-deploy");
+        assert_eq!(ops.attempt_calls, 1, "claim_outcome failing must not trigger a retry");
     }
 }

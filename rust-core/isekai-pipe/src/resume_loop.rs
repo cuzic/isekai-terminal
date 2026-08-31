@@ -716,8 +716,10 @@ async fn promote_warm_standby_once(
 /// attempt succeeds or `deadline` passes. Returns `Ok(stream)` on success
 /// (having also re-established the control stream and updated
 /// `state.network_rebinder`); returns `Err` once `deadline` has passed,
-/// having already closed `stdout` and aborted `warm_standby_task` — the
-/// caller propagates this `Err` (e.g. via `?`) so it eventually reaches
+/// having printed a final give-up message and aborted `warm_standby_task`
+/// (Epic R PR1, B6: no longer closes `stdout` itself — see `give_up`'s own
+/// docs for why) — the caller propagates this `Err` (e.g. via `?`) so it
+/// eventually reaches
 /// `connect_command`'s `Err` arm and `write_connect_outcome_for_wrapper`
 /// classifies it as `ConnectOutcomeClass::Unreachable`, letting `isekai-ssh`'s
 /// wrapper auto-retry (`.claude/rules/always-connects.md`) instead of the
@@ -821,7 +823,16 @@ fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool,
 /// `NoRecoverableSignal`. The invariant this relies on — "the outcome file
 /// is written before stdout is ever closed" — must keep holding; don't
 /// reintroduce an explicit close here without re-verifying it.
-async fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>, message: &str) {
+///
+/// The Windows-native connect path (`native/connect.rs`, `connect_attempt`)
+/// has an analogous but distinct race: it guards against dropping its
+/// `isekai-pipe connect` `Child` (whose `kill_on_drop` would then kill the
+/// child) before that child finishes writing its own outcome file, via a
+/// short (~1s) `tokio::time::timeout` grace period on `child.wait()` rather
+/// than by reordering writes-vs-closes the way this function does. Different
+/// mechanism, same underlying concern — don't assume fixing one side fixes
+/// the other.
+fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>, message: &str) {
     if is_tty {
         // その場書き換え中だったライブ表示行をクリアしてから
         // ギブアップメッセージを改行付きで出す。
@@ -861,10 +872,9 @@ async fn resume_with_backoff_until_deadline(
                 &format!(
                     "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
                      the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
-                     Closing stdin/stdout; ssh will treat this as a lost connection.",
+                     Ending this connect attempt; ssh will treat this as a lost connection.",
                 ),
-            )
-            .await;
+            );
             notify_os(
                 "isekai-pipe connect",
                 &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
@@ -955,11 +965,10 @@ async fn resume_with_backoff_until_deadline(
                             "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
                              the server no longer knows this session ({UNKNOWN_SESSION_CONFIRM_THRESHOLD} \
                              consecutive UnknownSession rejections; reclaimed, or the server itself \
-                             restarted), retrying would never succeed. Closing stdin/stdout; ssh will \
-                             treat this as a lost connection.",
+                             restarted), retrying would never succeed. Ending this connect attempt; \
+                             ssh will treat this as a lost connection.",
                         ),
-                    )
-                    .await;
+                    );
                     notify_os(
                         "isekai-pipe connect",
                         &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
