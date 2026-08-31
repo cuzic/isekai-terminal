@@ -1068,15 +1068,41 @@ async fn try_agent_auth<H: client::Handler>(
     Ok(false)
 }
 
+/// Why [`run_shell_io_loop_inner`]'s main loop ended (Epic R PR2, B1/B2).
+/// Mirrors `native/mux/owner.rs`'s own `BreakReason` (same distinction,
+/// applied to this single-process path's break sites, which differ from
+/// the mux owner's — there is no separate "client connection" here, so
+/// what plays the `ClientGone` role is *this side* ending things on
+/// purpose, not a remote/transport failure).
+enum BreakReason {
+    /// The remote sent `ChannelMsg::ExitStatus` or `ChannelMsg::ExitSignal`
+    /// before the channel closed — a normal, informative end.
+    RemoteExitReported,
+    /// The user ended the session on purpose (the `~.` escape sequence) —
+    /// nothing wrong with the connection.
+    UserDisconnected,
+    /// The channel closed, or a write to it failed, without ever reporting
+    /// why — a genuine transport failure (Epic R, B1). Previously collapsed
+    /// into `Ok(255)` indistinguishably from every other ending, which hid
+    /// the failure from `drive_connect_recovery`'s `Err`-only recovery path
+    /// (see `run_shell_io_loop_inner`'s return value docs).
+    TransportDead,
+}
+
 /// Relays bytes between the local terminal (raw mode, already enabled by
 /// the caller) and the remote shell channel until the channel closes,
 /// returning the remote exit status as this process's own exit code (`ssh(1)`'s
-/// own convention) — or **255** if the channel closed without ever sending
-/// one (Codex review finding: an abnormal disconnect — network loss, the
-/// `isekai-pipe connect` child dying — must not be reported as a successful
-/// exit just because `exit_code`'s initial value happened to be `0`; `255`
-/// matches real `ssh(1)`'s own exit code for "connection lost/could not
-/// execute command"). Local stdin EOF (Ctrl-D redirected from a non-tty, or
+/// own convention) — or `Err` if the channel died without ever reporting why
+/// (Epic R PR2, B1: previously **255** — Codex review finding: an abnormal
+/// disconnect — network loss, the `isekai-pipe connect` child dying — must
+/// not be reported as a successful exit just because `exit_code`'s initial
+/// value happened to be `0`; the *value* 255 was right, matching real
+/// `ssh(1)`'s own exit code for "connection lost/could not execute command",
+/// but folding it into `Ok` made it indistinguishable from every other
+/// ending — including a genuine remote command that itself exited 255 — to
+/// `drive_connect_recovery`, whose auto-recovery is keyed on `Err`). A
+/// user-initiated `~.` disconnect or a normal remote exit still return `Ok`.
+/// Local stdin EOF (Ctrl-D redirected from a non-tty, or
 /// a real EOF) sends a channel EOF rather than closing the channel outright,
 /// so any buffered remote output still in flight is not lost.
 ///
@@ -1118,13 +1144,19 @@ where
     E: tokio::io::AsyncWrite + Unpin,
 {
     /// `ssh(1)`'s own exit code for "the connection was lost, or the remote
-    /// command couldn't be run" — used here when the channel closes without
-    /// ever delivering a `ChannelMsg::ExitStatus`.
+    /// command couldn't be run" — used for `BreakReason::TransportDead`
+    /// (Epic R PR2) and for an `ExitSignal`, matching `ssh(1)`'s own
+    /// convention for a signal-terminated remote command.
     const NO_EXIT_STATUS_RECEIVED: u8 = 255;
 
     let mut buf = [0u8; 8192];
     let mut exit_code: Option<u8> = None;
     let mut stdin_open = true;
+    // Epic R PR2 (B1/B2): see `BreakReason`'s own docs. Defaults to the
+    // most conservative option — if some future break site is added
+    // without updating this variable, failing the whole attempt (allowing
+    // a retry) is a much safer failure mode than silently reporting success.
+    let mut break_reason = BreakReason::TransportDead;
 
     // Escape sequence state: `ssh(1)`-style `~` commands only at the start of
     // a line (after `\r` or `\n`). `pending_escape` means the previous byte
@@ -1144,11 +1176,18 @@ where
                         let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
                         if !to_send.is_empty() {
                             if channel.data(&to_send[..]).await.is_err() {
+                                // Local stdin just produced real bytes, so
+                                // this side is fine — a write failure here
+                                // is the remote channel's, not ours.
+                                break_reason = BreakReason::TransportDead;
                                 break;
                             }
                         }
                         match action {
-                            EscapeAction::Disconnect => break,
+                            EscapeAction::Disconnect => {
+                                break_reason = BreakReason::UserDisconnected;
+                                break;
+                            }
                             EscapeAction::Suspend => {
                                 #[cfg(unix)]
                                 {
@@ -1194,6 +1233,17 @@ where
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as u8);
                     }
+                    // Epic R PR2 (R2-S1): the remote can end a command via
+                    // an SSH-level signal instead of an exit status (RFC
+                    // 4254 §6.10) — previously fell into the `_ => {}`
+                    // catch-all below, leaving `exit_code` at `None` and
+                    // making this indistinguishable from a genuine
+                    // transport death. `NO_EXIT_STATUS_RECEIVED` (255)
+                    // matches `ssh(1)`'s own convention for reporting a
+                    // signal-terminated remote command.
+                    Some(russh::ChannelMsg::ExitSignal { .. }) => {
+                        exit_code = Some(NO_EXIT_STATUS_RECEIVED);
+                    }
                     // A server may legally send `CHANNEL_EOF` *before* the
                     // `exit-status` channel request — RFC 4254 doesn't mandate
                     // the order (Codex review finding). Breaking on `Eof` here
@@ -1202,7 +1252,10 @@ where
                     // catch-all below): data never arrives after it, but
                     // `ExitStatus` still can. Only `Close`/`None` — the channel
                     // truly ending — break the loop.
-                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(russh::ChannelMsg::Close) | None => {
+                        break_reason = if exit_code.is_some() { BreakReason::RemoteExitReported } else { BreakReason::TransportDead };
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -1214,7 +1267,17 @@ where
         }
     }
 
-    Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED))
+    match break_reason {
+        BreakReason::RemoteExitReported | BreakReason::UserDisconnected => Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED)),
+        // Epic R PR2 (B1): propagate as `Err` rather than folding into
+        // `Ok(255)` — the caller (`run_authenticated_session`) already
+        // `?`-propagates this up to `connect_attempt`, whose `Err` is what
+        // `drive_connect_recovery` actually keys its auto-recovery on (via
+        // `resolve_claimed_outcome`/`claim_outcome`). An `Ok(255)` here used
+        // to be indistinguishable from a remote command that itself legally
+        // exited 255, silently defeating that recovery.
+        BreakReason::TransportDead => Err(anyhow!("isekai-ssh: remote channel closed without reporting why (transport lost)")),
+    }
 }
 
 #[cfg(test)]
@@ -1584,6 +1647,43 @@ mod tests {
         }
     }
 
+    /// Ends the remote command via `exit-signal` (RFC 4254 §6.10) instead of
+    /// `exit-status`, then closes the channel — standing in for a remote
+    /// process killed by a signal rather than exiting normally.
+    #[derive(Clone)]
+    struct ExitSignalServer;
+
+    impl server::Server for ExitSignalServer {
+        type Handler = ExitSignalHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> ExitSignalHandler {
+            ExitSignalHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExitSignalHandler;
+
+    #[async_trait]
+    impl server::Handler for ExitSignalHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.exit_signal_request(channel, russh::Sig::TERM, false, "killed by signal", "en")?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
     /// Accepts any password and any channel open, then closes the channel
     /// the moment a shell is requested — without ever sending
     /// `ChannelMsg::ExitStatus` first — standing in for an abnormal
@@ -1733,15 +1833,21 @@ mod tests {
         );
     }
 
-    /// Codex review finding: `run_shell_io_loop` used to initialize
-    /// `exit_code` to `0` and only ever overwrite it on
+    /// Codex review finding (original version): `run_shell_io_loop` used to
+    /// initialize `exit_code` to `0` and only ever overwrite it on
     /// `ChannelMsg::ExitStatus` — a channel that closes abnormally (network
     /// loss, the `isekai-pipe connect` child dying) without ever sending one
     /// would silently report success. `CloseWithoutExitStatusServer` closes
     /// the channel immediately after opening it, before any exit status is
     /// ever sent, standing in for exactly that scenario.
+    ///
+    /// Epic R PR2 (B1) updated the fix itself: `Ok(255)` was already an
+    /// improvement over `Ok(0)`, but it was still `Ok` — indistinguishable
+    /// from a remote command that legitimately exited 255, and therefore
+    /// invisible to `drive_connect_recovery`'s `Err`-keyed auto-recovery.
+    /// This scenario must now propagate as `Err`, not `Ok(255)`.
     #[tokio::test]
-    async fn run_shell_io_loop_reports_255_when_the_channel_closes_without_an_exit_status() {
+    async fn run_shell_io_loop_returns_err_when_the_channel_closes_without_an_exit_status() {
         let addr = spawn_server(CloseWithoutExitStatusServer, 202).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1757,8 +1863,36 @@ mod tests {
             .await
             .unwrap();
 
+        let result = run_shell_io_loop(&mut channel).await;
+        assert!(result.is_err(), "an abnormal disconnect must propagate as Err, not a successful-looking exit code");
+    }
+
+    /// Epic R PR2 (R2-S1): `ChannelMsg::ExitSignal` must be treated the same
+    /// as `ChannelMsg::ExitStatus` — reported as a successful `Ok(255)` exit
+    /// code, matching `ssh(1)`'s own convention — not misclassified as
+    /// `BreakReason::TransportDead` (which would turn a normal
+    /// signal-terminated command into an `Err`, wrongly triggering
+    /// `drive_connect_recovery`'s auto-recovery for a completely ordinary
+    /// remote command ending).
+    #[tokio::test]
+    async fn run_shell_io_loop_reports_255_when_the_remote_sends_exit_signal_instead_of_exit_status() {
+        let addr = spawn_server(ExitSignalServer, 205).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let handler = verifying_handler(&verifier);
+        let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string()))
+            .await
+            .unwrap();
+        assert!(authed, "ExitSignalServer accepts any password");
+
+        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![], command: None })
+            .await
+            .unwrap();
+
         let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
-        assert_eq!(exit_code, 255, "an abnormal disconnect must not be reported as a successful (0) exit");
+        assert_eq!(exit_code, 255, "an ExitSignal must be reported as 255, matching ssh(1)'s own convention, and as Ok (not Err)");
     }
 
     /// Connects to `addr`, accepts its host key, authenticates with a
