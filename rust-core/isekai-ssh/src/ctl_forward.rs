@@ -65,6 +65,8 @@ use std::path::PathBuf;
 
 #[cfg(unix)]
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use crate::log_file::log_line_verbose;
 use isekai_protocol::{CtlMessage, NotifyKind};
 #[cfg(test)]
 use isekai_protocol::ClipboardMime;
