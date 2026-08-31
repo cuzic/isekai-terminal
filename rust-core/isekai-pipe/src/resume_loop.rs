@@ -807,21 +807,27 @@ fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool,
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
 /// terminal paths (deadline exceeded, or a definitive `UnknownSession`
 /// rejection): clears the live TTY status line, prints one final message,
-/// closes stdout so `ssh` treats this as a lost connection, and stops the
-/// warm-standby probe task.
-async fn give_up(
-    is_tty: bool,
-    stdout: &mut tokio::io::Stdout,
-    warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
-    message: &str,
-) {
+/// and stops the warm-standby probe task.
+///
+/// Deliberately does **not** close `stdout` itself (Epic R PR1, B6): this
+/// function returns into an `Err` that propagates all the way up through
+/// `run_connect` to `connect_command`, which writes the `ConnectOutcome`
+/// side-channel file (`write_connect_outcome_for_wrapper`) *before* the
+/// process exits — and only the process exiting closes `stdout`, well
+/// after that write. An explicit `stdout.shutdown()` here used to race
+/// that write: `ssh(1)` sees EOF and can exit, and the wrapper's
+/// `claim_connect_outcome` can run, before the outcome file has actually
+/// landed on disk, silently downgrading a recoverable failure into
+/// `NoRecoverableSignal`. The invariant this relies on — "the outcome file
+/// is written before stdout is ever closed" — must keep holding; don't
+/// reintroduce an explicit close here without re-verifying it.
+async fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>, message: &str) {
     if is_tty {
         // その場書き換え中だったライブ表示行をクリアしてから
         // ギブアップメッセージを改行付きで出す。
         eprint!("\r\x1b[K");
     }
     eprintln!("{message}");
-    let _ = stdout.shutdown().await;
     if let Some(t) = warm_standby_task {
         t.abort();
     }
@@ -835,7 +841,6 @@ async fn resume_with_backoff_until_deadline(
     disconnected_at: Instant,
     deadline: Instant,
     state: &mut ResumeLoopState,
-    stdout: &mut tokio::io::Stdout,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
 ) -> Result<AnyByteStream> {
@@ -852,7 +857,6 @@ async fn resume_with_backoff_until_deadline(
             let session_id = state.session_id;
             give_up(
                 state.is_tty,
-                stdout,
                 warm_standby_task,
                 &format!(
                     "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
@@ -946,7 +950,6 @@ async fn resume_with_backoff_until_deadline(
                     let session_id = state.session_id;
                     give_up(
                         state.is_tty,
-                        stdout,
                         warm_standby_task,
                         &format!(
                             "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
@@ -1131,7 +1134,6 @@ pub(crate) async fn run_resume_loop(
                     disconnected_at,
                     deadline,
                     &mut state,
-                    &mut stdout,
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
                 )
@@ -1732,7 +1734,6 @@ mod tests {
                 last_resume_error: Some("connection refused".to_string()),
                 consecutive_unknown_session: 0,
             };
-            let mut stdout = tokio::io::stdout();
             let now = Instant::now();
             let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
 
@@ -1744,7 +1745,6 @@ mod tests {
                 now,
                 now, // deadline already reached: must give up on the first check
                 &mut state,
-                &mut stdout,
                 &None,
                 &mut monitor,
             )
