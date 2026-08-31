@@ -174,7 +174,7 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
 /// this window is never the limiting factor in the common case; against one
 /// that doesn't, it turns what would otherwise be a silent multi-day hang
 /// into a fast, visible failure instead.
-const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
+pub(crate) const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 
 /// Retries `attempt` while — and only while — it fails with
 /// `BUSY_OTHER_SESSION`, for up to `window` (production call sites always
@@ -187,8 +187,13 @@ const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 /// `isekai-pipe connect` process (a brand new `session_id` every time,
 /// since neither `connect_via_relay_resumable` nor `_with_fallback` persist
 /// one across invocations) would otherwise fail outright instead of waiting
-/// the same window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
+/// the same window a same-process resume would have. `pub(crate)` (Epic R
+/// PR2, Task 2.11) so `connect.rs`'s single-candidate STUN P2P path can
+/// reuse it too — STUN P2P has no resume/control-stream concept of its own
+/// (`run_stun_p2p_with_fallback`'s docs), but a fresh reconnect attempt
+/// racing this same client's own not-yet-expired parked session is exactly
+/// as possible there as it is for relay.
+pub(crate) async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
@@ -264,9 +269,18 @@ pub(crate) async fn run_relay_resumable_with_fallback(
 /// straight into `relay_stdio`, exactly like the legacy single-candidate path
 /// already does.
 pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
-    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&system_quic_factory(), target, candidates)
-        .await
-        .map_err(attach_stale_trust_signal)?;
+    let factory = system_quic_factory();
+    // Epic R PR2, Task 2.11: STUN P2P used to skip the same
+    // `BUSY_OTHER_SESSION` retry the relay paths already get above — a
+    // fresh `isekai-pipe connect` process reconnecting right after a
+    // mid-session disconnect (this module's whole reason for existing) is
+    // exactly the case `retry_while_busy_other_session`'s docs describe:
+    // this same client's own prior session still parked on the remote
+    // helper, not a real conflicting session.
+    let (connection, _winning_stun_server) =
+        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p_with_fallback(&factory, target, candidates))
+            .await
+            .map_err(attach_stale_trust_signal)?;
     // Epic R PR2, Task 2.4: the handshake above already succeeded, so any
     // error from here on is a mid-session disconnect, not a connect-time
     // failure — mark it so `write_connect_outcome_for_wrapper` classifies
