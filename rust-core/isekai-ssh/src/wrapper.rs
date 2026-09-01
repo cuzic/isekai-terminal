@@ -730,6 +730,12 @@ async fn run_ssh_with_connect_failure_recovery(
                     );
                     return Ok(exit_code);
                 }
+                // Reset *before* checking the cap below: a `lightweight_retries`
+                // that's already at the cap from an earlier, long-since-stable
+                // storm must not immediately trip the cap for what is really
+                // the first failure of a brand-new one (round 2 review finding
+                // — see `reset_budget_if_stable`'s own docs).
+                reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
                     log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
@@ -738,7 +744,6 @@ async fn run_ssh_with_connect_failure_recovery(
                     }
                     return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
                 }
-                reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since);
                 match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
                     reconnect_backoff::ReconnectDecision::Retry => {
                         print_process_reconnect_status(is_tty, attempt);

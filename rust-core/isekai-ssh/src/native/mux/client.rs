@@ -234,7 +234,11 @@ where
     .await
     .map_err(|e| anyhow!("isekai-ssh: failed to send Hello to the owner: {e}"))?;
 
-    let mut frame_rx = spawn_frame_reader(conn_read);
+    // The client side never needs to force-abort its own reader task (that's
+    // an owner-side-only concern — see `spawn_frame_reader`'s doc comment on
+    // why the owner needs it for its `TransportDead` handling); the client
+    // simply lets it run until the owner's connection naturally ends.
+    let (mut frame_rx, _frame_reader_task) = spawn_frame_reader(conn_read);
 
     match tokio::time::timeout(HELLO_ACK_TIMEOUT, frame_rx.recv()).await {
         Ok(Some(Ok(Some(Frame::HelloAck { version })))) => {

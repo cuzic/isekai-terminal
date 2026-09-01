@@ -425,6 +425,12 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     );
                     return Err(first_error);
                 }
+                // Reset *before* checking the cap below: a `lightweight_retries`
+                // that's already at the cap from an earlier, long-since-stable
+                // storm must not immediately trip the cap for what is really
+                // the first failure of a brand-new one (round 2 review finding
+                // — see `reset_budget_if_stable`'s own docs).
+                crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
                     log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
@@ -434,7 +440,6 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
                     return ops.attempt(&intent2, true).await;
                 }
-                crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since);
                 match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
                     crate::reconnect_backoff::ReconnectDecision::Retry => {
                         log_line!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})");
@@ -2431,6 +2436,12 @@ mod tests {
         /// unlike `rebootstrap_and_rebuild_intent`, it does no I/O of its
         /// own and doesn't need `&mut`).
         build_intent_calls: std::cell::Cell<usize>,
+        /// If set, `attempt` advances the (paused) tokio clock by this much
+        /// before returning its queued result — lets a test simulate "this
+        /// attempt stayed connected for a while before failing again"
+        /// without needing a real wall-clock wait, for exercising
+        /// `reset_budget_if_stable`'s effect on `lightweight_retries`.
+        advance_before_attempt: Option<std::time::Duration>,
     }
 
     impl Default for FakeRecoveryOps {
@@ -2443,6 +2454,7 @@ mod tests {
                 claim_outcome_err: false,
                 should_bootstrap: true,
                 rebootstrap_calls: 0,
+                advance_before_attempt: None,
                 rebootstrap_ok: true,
                 has_remote_command: false,
                 build_intent_calls: std::cell::Cell::new(0),
@@ -2480,6 +2492,9 @@ mod tests {
         async fn attempt(&mut self, _intent: &ConnectionIntent, silent: bool) -> Result<u8> {
             self.attempt_calls += 1;
             self.silent_flags_seen.push(silent);
+            if let Some(duration) = self.advance_before_attempt {
+                tokio::time::advance(duration).await;
+            }
             match self.attempt_results.pop_front().expect("attempt called more times than the test queued results for") {
                 Ok(code) => Ok(code),
                 Err(msg) => Err(anyhow!(msg)),
@@ -2706,5 +2721,38 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
         assert_eq!(ops.attempt_calls, MAX_LIGHTWEIGHT_RETRIES as usize + 2);
         assert_eq!(ops.rebootstrap_calls, 1, "exhausting lightweight retries must fall back to exactly one full re-deploy");
+    }
+
+    /// Epic R PR2 round 2 review finding: `lightweight_retries` must reset
+    /// on a stable-enough attempt, the same way `attempt`/`lost_since` do —
+    /// otherwise it's a per-process-lifetime cap rather than a per-storm
+    /// one, and a long-lived session that reconnects successfully many
+    /// separate times (each stable for a while in between) would eventually
+    /// trip an unwarranted full re-deploy on a totally unrelated, later
+    /// blip. Here, every attempt "stays connected" for longer than
+    /// `RECONNECT_STABLE_THRESHOLD` before failing again — far more than
+    /// `MAX_LIGHTWEIGHT_RETRIES` failures must all still retry lightweight,
+    /// never falling back to rebootstrap.
+    #[tokio::test]
+    async fn recovery_resets_lightweight_retries_after_a_stable_attempt() {
+        tokio::time::pause();
+        let stable_duration = crate::reconnect_backoff::RECONNECT_STABLE_THRESHOLD + std::time::Duration::from_secs(1);
+        let total_failures = (MAX_LIGHTWEIGHT_RETRIES as usize) * 3;
+        let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
+            (0..total_failures).map(|_| Err("connection lost".to_string())).collect();
+        attempt_results.push_back(Ok(0));
+        let mut ops = FakeRecoveryOps {
+            attempt_results,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            advance_before_attempt: Some(stable_duration),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, total_failures + 1);
+        assert_eq!(
+            ops.rebootstrap_calls, 0,
+            "far more than MAX_LIGHTWEIGHT_RETRIES failures, each separated by a stable connection, must never trip the rebootstrap fallback"
+        );
     }
 }

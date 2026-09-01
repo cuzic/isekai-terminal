@@ -94,14 +94,29 @@ pub(crate) async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: 
     ReconnectDecision::Retry
 }
 
-/// `attempt`/`lost_since` reset helper — see `RECONNECT_STABLE_THRESHOLD`'s
-/// own docs for why a stable-enough interval since the last reconnect
-/// resets the budget rather than letting `lost_since` stay pinned to the
-/// first-ever failure for the process's whole remaining lifetime.
-pub(crate) fn reset_budget_if_stable(attempt_started: tokio::time::Instant, attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>) {
+/// `attempt`/`lost_since`/`lightweight_retries` reset helper — see
+/// `RECONNECT_STABLE_THRESHOLD`'s own docs for why a stable-enough interval
+/// since the last reconnect resets the budget rather than letting
+/// `lost_since` stay pinned to the first-ever failure for the process's
+/// whole remaining lifetime.
+///
+/// `lightweight_retries` resets alongside `attempt`/`lost_since` (Epic R PR2
+/// round 2 review finding): without this, it was a *per-process-lifetime*
+/// cap rather than a per-storm one — a long-lived session (a `tmux` pane
+/// left open for days over a flaky link) that reconnects successfully five
+/// separate times, each stable for hours in between, would still hit
+/// `MAX_LIGHTWEIGHT_RETRIES` on the sixth *unrelated* blip and fall back to
+/// a full re-deploy (or, with auto-bootstrap disabled, simply stop
+/// retrying) even though every previous reconnect had nothing wrong with
+/// it. Resetting it on the same "was the last attempt stable" signal that
+/// already resets the backoff budget keeps both counters describing the
+/// same thing: how bad *this* reconnect storm has been, not how many
+/// reconnects have ever happened.
+pub(crate) fn reset_budget_if_stable(attempt_started: tokio::time::Instant, attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>, lightweight_retries: &mut u32) {
     if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
         *attempt = 0;
         *lost_since = None;
+        *lightweight_retries = 0;
     }
 }
 
@@ -134,19 +149,23 @@ mod tests {
     fn reset_budget_if_stable_resets_only_past_the_threshold() {
         let mut attempt = 5u32;
         let mut lost_since = Some(tokio::time::Instant::now());
+        let mut lightweight_retries = 5u32;
         let started_long_ago = tokio::time::Instant::now() - (RECONNECT_STABLE_THRESHOLD + Duration::from_secs(1));
-        reset_budget_if_stable(started_long_ago, &mut attempt, &mut lost_since);
+        reset_budget_if_stable(started_long_ago, &mut attempt, &mut lost_since, &mut lightweight_retries);
         assert_eq!(attempt, 0);
         assert!(lost_since.is_none());
+        assert_eq!(lightweight_retries, 0, "a stable-enough attempt must also reset the lightweight-retry cap, not just the backoff budget (round 2 review: it used to be a per-process-lifetime cap)");
     }
 
     #[test]
     fn reset_budget_if_stable_does_not_reset_a_short_lived_attempt() {
         let mut attempt = 5u32;
         let mut lost_since = Some(tokio::time::Instant::now());
+        let mut lightweight_retries = 5u32;
         let started_recently = tokio::time::Instant::now();
-        reset_budget_if_stable(started_recently, &mut attempt, &mut lost_since);
+        reset_budget_if_stable(started_recently, &mut attempt, &mut lost_since, &mut lightweight_retries);
         assert_eq!(attempt, 5, "an attempt shorter than RECONNECT_STABLE_THRESHOLD must not reset the budget");
         assert!(lost_since.is_some());
+        assert_eq!(lightweight_retries, 5, "a short-lived attempt must not reset the lightweight-retry cap either");
     }
 }

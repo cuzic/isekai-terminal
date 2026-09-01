@@ -508,7 +508,7 @@ where
     W: AsyncWrite + Unpin,
     H: client::Handler,
 {
-    let mut frame_rx = spawn_frame_reader(reader);
+    let (mut frame_rx, frame_reader_task) = spawn_frame_reader(reader);
     let mut exit_code: Option<u8> = None;
     // Epic R PR2 (B1/B2, task 2.1): why this loop's `break` happened —
     // determines whether `Frame::Exit` is sent to the client at all, and
@@ -794,20 +794,40 @@ where
             // that lets it reconnect (to this same holder, if only this one
             // channel died, or to a fresh one, if the whole handle is gone).
             log_line!("isekai-ssh mux owner: remote channel died without reporting why; not sending Frame::Exit so the client treats this as OwnerLost");
-            // Explicitly half-close the write side so the client's read
-            // actually observes EOF and can tell the connection is over.
-            // Without this, simply returning and letting `writer` drop is
-            // *not* enough: `tokio::io::split`'s read/write halves share the
-            // underlying connection via an internal `Arc`, and the read half
-            // is owned by `spawn_frame_reader`'s own detached task — which
-            // stays blocked (and therefore keeps that `Arc` reference alive)
-            // for as long as the client itself neither sends nor closes
-            // anything, exactly the state a client waiting to detect
-            // `OwnerLost` is in. A real integration test that waits for the
-            // client side to observe `None` from `read_frame` here hung for
-            // the CI job's full 30-minute timeout before this `shutdown()`
-            // was added (Epic R PR2 round 2 review finding, caught by CI
-            // rather than by the review itself).
+            // Force this connection closed from the owner's side so the
+            // client's read actually observes EOF and can tell the
+            // connection is over. Neither half of this alone is enough:
+            //
+            // - `writer.shutdown().await` half-closes the *write* direction
+            //   for real stream transports (TCP/Unix sockets), but is a
+            //   no-op on the Windows named-pipe transport this module
+            //   actually runs on in production (`tokio::net::windows::
+            //   named_pipe::NamedPipeServer::poll_shutdown` is just
+            //   `poll_flush`, which itself does nothing) — kept anyway
+            //   because it's correct and harmless for stream transports,
+            //   but it cannot be relied on by itself here.
+            // - Simply letting `writer` drop when this function returns
+            //   isn't enough either: `tokio::io::split`'s read/write halves
+            //   share the underlying connection via an internal `Arc`, and
+            //   the read half is owned by `spawn_frame_reader`'s own
+            //   spawned task — which, unless force-aborted, stays blocked
+            //   inside its own `read_frame` call (and therefore keeps that
+            //   `Arc` reference alive) for as long as the client itself
+            //   neither sends nor closes anything, which is exactly the
+            //   state a client waiting to detect `OwnerLost` is in.
+            //
+            // Aborting `frame_reader_task` drops its in-progress read (and
+            // therefore its `ReadHalf`) immediately, regardless of what the
+            // underlying transport is or whether the client ever sends
+            // anything — dropping the last reference to the shared
+            // connection is what actually makes the OS tear it down and the
+            // peer observe EOF. (Epic R PR2 round 2 review: a `duplex()`-based
+            // test caught the symptom — a 30-minute CI hang — but its
+            // `DuplexStream::poll_shutdown` doesn't share `NamedPipeServer`'s
+            // no-op semantics, so it didn't prove this fix actually works on
+            // the one transport this code runs on; round 3 review caught
+            // that gap.)
+            frame_reader_task.abort();
             let _ = writer.shutdown().await;
             // Best-effort optimization, not required for correctness: if
             // the *shared* handle itself is confirmed dead, proactively
