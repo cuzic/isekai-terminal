@@ -688,19 +688,21 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 .await
                 .map(|conn| conn.stream);
             match stun_result {
-                // Epic R PR2, Task 2.4: the handshake above already
-                // succeeded, so a `relay_stdio` failure here is a
-                // mid-session disconnect, not a connect-time failure —
-                // mark it so `write_connect_outcome_for_wrapper`
+                // Epic R PR2, Task 2.4 (round 2 review: `relay_stdio` now
+                // attaches `MidSessionDisconnectSignal` itself, scoped to
+                // just its remote-stream I/O sites — see that marker's own
+                // doc comment): the handshake above already succeeded, so a
+                // `relay_stdio` failure here is a mid-session disconnect,
+                // not a connect-time failure — `write_connect_outcome_for_wrapper`
                 // classifies it as `ConnectOutcomeClass::MidSessionDisconnect`
-                // instead of `Unreachable`. Deliberately does not go
-                // through `recover_via_cross_family_fallback` below (that
+                // instead of `Unreachable` accordingly. Deliberately does not
+                // go through `recover_via_cross_family_fallback` below (that
                 // arm only ever sees the *connect*-time `Err(e)` from
                 // `connect_stun_p2p` itself, never a post-success
                 // `relay_stdio` failure — see that function's own call
                 // site one arm up for the `ConnectRoute::StunWithFallback`
                 // case, where this same distinction matters more: Task 2.7).
-                Ok(stream) => relay_stdio(stream).await.map_err(|e| e.context(crate::resume_loop::MidSessionDisconnectSignal)),
+                Ok(stream) => relay_stdio(stream).await,
                 Err(e) => {
                     recover_via_cross_family_fallback(
                         Err(attach_stale_trust_signal(e)),

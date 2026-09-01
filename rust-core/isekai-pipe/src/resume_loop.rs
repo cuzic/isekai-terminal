@@ -80,6 +80,21 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// (10 days) before giving up, so an error escaping it is essentially
 /// terminal and the existing `RebootstrapAndRetry` (full re-deploy) is the
 /// correct response, not a lightweight retry (S1(old) from the ADR review).
+///
+/// Attached at the source, inside [`relay_stdio`] itself, to only its two
+/// *remote*-stream I/O failures ("reading remote stream failed"/"writing to
+/// remote stream failed") — **not** its local stdin/stdout ones (round 2
+/// review finding). `relay_stdio`'s callers used to blanket-wrap its entire
+/// `Result` with this marker, which meant a local-side failure (e.g. `ssh(1)`
+/// itself already exited and closed the pipe this process's stdout writes
+/// into, so `stdout.write_all`/`flush` fails with a broken-pipe error) could
+/// get misclassified as a network disconnection and trigger an unwanted
+/// extra reconnect — even though nothing about the actual network or remote
+/// session was at fault. `isekai-pipe/src/engine/mod.rs`'s graceful
+/// `send.shutdown()` on a clean server-side close makes this a narrow race
+/// rather than a systematic misclassification, but there's no reason to
+/// accept it when scoping the marker to the two sites that can actually mean
+/// "the network died" avoids it entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
 
@@ -105,7 +120,8 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
             quic_write
                 .write_all(&buf[..n])
                 .await
-                .context("writing to remote stream failed")?;
+                .context("writing to remote stream failed")
+                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
         }
     });
     let mut h2c = tokio::spawn(async move {
@@ -115,7 +131,8 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
             let n = quic_read
                 .read(&mut buf)
                 .await
-                .context("reading remote stream failed")?;
+                .context("reading remote stream failed")
+                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
             if n == 0 {
                 return Ok::<_, anyhow::Error>(());
             }
@@ -290,12 +307,15 @@ pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidate
         retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p_with_fallback(&factory, target, candidates))
             .await
             .map_err(attach_stale_trust_signal)?;
-    // Epic R PR2, Task 2.4: the handshake above already succeeded, so any
-    // error from here on is a mid-session disconnect, not a connect-time
-    // failure — mark it so `write_connect_outcome_for_wrapper` classifies
-    // it as `ConnectOutcomeClass::MidSessionDisconnect` instead of
-    // `Unreachable`.
-    relay_stdio(connection.stream).await.map_err(|e| e.context(MidSessionDisconnectSignal))
+    // Epic R PR2, Task 2.4 (round 2 review: scope narrowed to `relay_stdio`'s
+    // own remote-stream I/O sites, not blanket-applied here anymore — see
+    // `MidSessionDisconnectSignal`'s doc comment): a `relay_stdio` failure
+    // here means the STUN P2P handshake above already succeeded, so a
+    // *remote*-stream failure is a mid-session disconnect, not a
+    // connect-time one — `write_connect_outcome_for_wrapper` classifies it
+    // as `ConnectOutcomeClass::MidSessionDisconnect` instead of
+    // `Unreachable` accordingly.
+    relay_stdio(connection.stream).await
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via

@@ -440,9 +440,15 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
                     return ops.attempt(&intent2, true).await;
                 }
+                // Printed *before* the backoff wait below (round 2 review
+                // finding, mirroring the same fix in `wrapper.rs`): it used
+                // to print only after already sleeping out the whole delay.
+                // `attempt + 1` is the attempt number
+                // `reconnect_backoff_or_give_up` is about to record, since it
+                // increments `attempt` itself on `Retry`.
+                log_line!("isekai-ssh: connection lost, reconnecting... (attempt {})", attempt + 1);
                 match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
                     crate::reconnect_backoff::ReconnectDecision::Retry => {
-                        log_line!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})");
                         intent = ops.build_intent().context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
                         continue;
                     }

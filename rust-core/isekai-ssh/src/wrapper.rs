@@ -630,48 +630,32 @@ const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
 /// (`reconnect_backoff::RECONNECT_BUDGET` is 24h, not a useful "X/Y"
 /// display). Pure so it's unit-testable without touching stderr, mirroring
 /// that module's own split.
+///
+/// Deliberately **not** an in-place `\r`-redrawn line the way
+/// `resume_loop.rs`'s countdown is (round 2 review finding, self-corrected
+/// before merge): unlike that module's tight per-second countdown loop
+/// inside one continuous process, this function has no way to detect the
+/// *moment* a retry actually succeeds — `run_ssh_once`'s `.wait()` only
+/// returns once the whole `ssh(1)` session ends (i.e. potentially hours
+/// later, when the user types `exit`), so there is no matching "reconnected"
+/// event to redraw over this line with. A one-shot, newline-terminated line
+/// per attempt avoids needing to clear anything before the reconnected
+/// session's own terminal output resumes.
 fn format_process_reconnect_status(is_tty: bool, attempt: u32) -> String {
     if is_tty {
-        format!("\r\x1b[0;33misekai-ssh: connection lost, reconnecting... (attempt {attempt})\x1b[0m\x1b[K")
+        format!("\x1b[0;33misekai-ssh: connection lost, reconnecting... (attempt {attempt})\x1b[0m")
     } else {
         format!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})")
     }
 }
 
-/// Counterpart to [`format_process_reconnect_status`] for a lightweight
-/// retry that succeeded — only ever printed when `attempt > 0` (i.e. after
-/// at least one visible "reconnecting..." line), so a normal first-try
-/// connection never gets an unsolicited "reconnected" message.
-fn format_process_reconnect_success(is_tty: bool) -> String {
-    if is_tty {
-        "\r\x1b[0;32misekai-ssh: reconnected.\x1b[0m\x1b[K".to_string()
-    } else {
-        "isekai-ssh: reconnected.".to_string()
-    }
-}
-
-/// Prints [`format_process_reconnect_status`]/[`format_process_reconnect_success`]
-/// to stderr — `\r`-redrawn in place when `is_tty` (no trailing newline, so
-/// the next print overwrites it), one plain `log_line!`-routed line
-/// otherwise (so `--isekai-log-file` output stays free of `\r`/ANSI bytes,
-/// same reasoning as `resume_loop.rs`'s own `is_terminal()` gate).
+/// Prints [`format_process_reconnect_status`] to stderr, one newline-terminated
+/// line per attempt via `log_line!` (so `--isekai-log-file` output stays free
+/// of ANSI color bytes, same reasoning as `resume_loop.rs`'s own
+/// `is_terminal()` gate) — called *before* the backoff wait so the user sees
+/// it promptly rather than only once the wait has already elapsed.
 fn print_process_reconnect_status(is_tty: bool, attempt: u32) {
-    let msg = format_process_reconnect_status(is_tty, attempt);
-    if is_tty {
-        eprint!("{msg}");
-        let _ = std::io::stderr().flush();
-    } else {
-        log_line!("{msg}");
-    }
-}
-
-fn print_process_reconnect_success(is_tty: bool) {
-    let msg = format_process_reconnect_success(is_tty);
-    if is_tty {
-        eprintln!("{msg}");
-    } else {
-        log_line!("{msg}");
-    }
+    log_line!("{}", format_process_reconnect_status(is_tty, attempt));
 }
 
 async fn run_ssh_with_connect_failure_recovery(
@@ -695,9 +679,13 @@ async fn run_ssh_with_connect_failure_recovery(
         let attempt_started = tokio::time::Instant::now();
         let (status, intent_id) = run_ssh_once(plan, resolution, &intent, &runtime_dir).await?;
         if status.success() {
-            if attempt > 0 {
-                print_process_reconnect_success(is_tty);
-            }
+            // Deliberately no "reconnected" message here (round 2 review
+            // finding, self-corrected before merge): `run_ssh_once` only
+            // returns once the whole `ssh(1)` session has *ended*, which for
+            // a successful reconnect is whenever the user eventually types
+            // `exit` — often much later, and unrelated to the reconnect
+            // itself. There is no event at this layer that actually means
+            // "the retry just succeeded".
             return Ok(0);
         }
         let exit_code = status.code().unwrap_or(1) as u8;
@@ -744,9 +732,15 @@ async fn run_ssh_with_connect_failure_recovery(
                     }
                     return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
                 }
+                // Printed *before* the backoff wait below (round 2 review
+                // finding: it used to print only after already sleeping out
+                // the whole delay, so the terminal stayed silent for up to
+                // 10s before the user saw anything). `attempt + 1` is the
+                // attempt number `reconnect_backoff_or_give_up` is about to
+                // record, since it increments `attempt` itself on `Retry`.
+                print_process_reconnect_status(is_tty, attempt + 1);
                 match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
                     reconnect_backoff::ReconnectDecision::Retry => {
-                        print_process_reconnect_status(is_tty, attempt);
                         intent = build_connection_intent(resolution).context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
                         continue;
                     }
@@ -2542,9 +2536,10 @@ mod tests {
     // Epic R PR2, Task 2.13: live reconnect status formatting.
 
     #[test]
-    fn format_process_reconnect_status_redraws_in_place_on_a_tty() {
+    fn format_process_reconnect_status_colors_on_a_tty_but_stays_a_single_newline_terminated_line() {
         let msg = format_process_reconnect_status(true, 3);
-        assert!(msg.starts_with('\r'), "TTY display must redraw in place (start with \\r): {msg:?}");
+        assert!(msg.contains("\x1b["), "TTY display should still be colored: {msg:?}");
+        assert!(!msg.contains('\r'), "must not be an in-place \\r redraw (round 2 review: there's no matching 'reconnected' event to redraw over at this layer): {msg:?}");
         assert!(msg.contains("attempt 3"), "{msg:?}");
     }
 
@@ -2554,13 +2549,6 @@ mod tests {
         assert!(!msg.contains('\r'), "non-TTY output must not contain \\r (would corrupt --isekai-log-file): {msg:?}");
         assert!(!msg.contains('\x1b'), "non-TTY output must not contain ANSI escapes: {msg:?}");
         assert!(msg.contains("attempt 3"), "{msg:?}");
-    }
-
-    #[test]
-    fn format_process_reconnect_success_is_plain_text_off_a_tty() {
-        let msg = format_process_reconnect_success(false);
-        assert!(!msg.contains('\r') && !msg.contains('\x1b'), "{msg:?}");
-        assert!(msg.contains("reconnected"), "{msg:?}");
     }
 
     #[tokio::test]
