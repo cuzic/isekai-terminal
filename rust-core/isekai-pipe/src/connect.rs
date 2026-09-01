@@ -683,7 +683,17 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             // relay paths and `run_stun_p2p_with_fallback` already get — a
             // fresh reconnect racing this same client's own not-yet-expired
             // parked session is just as possible on the single-candidate
-            // STUN path.
+            // STUN path. Deliberately delays the `Err(e)` arm below (and
+            // therefore `recover_via_cross_family_fallback`'s relay fallback)
+            // by up to `BUSY_OTHER_SESSION_RETRY_WINDOW` on this specific
+            // rejection, even though a working relay fallback used to be
+            // reachable within milliseconds (round 2 review, finding #7):
+            // the conflict lives in the remote helper's shared session
+            // table, so the fallback would very likely hit the exact same
+            // rejection anyway, and this keeps the shape symmetric with
+            // `run_relay_resumable`/`run_relay_resumable_with_fallback`
+            // (`resume_loop.rs`), which have always retried their primary
+            // before propagating to their own caller.
             let stun_result = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p(&factory, *stun_server, &target, identity))
                 .await
                 .map(|conn| conn.stream);
