@@ -116,10 +116,16 @@
   - `shutdown_close_deadline`分岐（`:693-698`） → `CloseDeadline`。
 - **`native/connect.rs::run_shell_io_loop_inner`側のマッピング**:
   - `ChannelMsg::ExitStatus`/`ExitSignal`受信 → `RemoteExitReported`。
-  - `~.`エスケープ切断（`EscapeAction::Disconnect`、`:1136`付近）、
-    `channel.data(...)`書き込みエラー（`:1134`付近） →
-    `ClientGone`（ユーザー自身が切断した、またはローカル入力経路が
-    死んだだけ）。
+  - `~.`エスケープ切断（`EscapeAction::Disconnect`、`:1136`付近） →
+    `ClientGone`（ユーザー自身が切断しただけ）。
+  - `channel.data(...)`書き込みエラー（`:1134`付近） →
+    **`TransportDead`**（実装時に訂正、opus-code-review-pr2の指摘#8で
+    ドキュメントとの不一致が発覚。単一プロセス経路ではローカル標準入力の
+    読み取り自体は既に成功しており、`channel.data()`が書き込む先は
+    *リモート*チャネルなので、その失敗はリモート側の異常であって
+    `ClientGone`が指す「ローカル入力経路が死んだ」ケースではない——
+    `owner.rs`の同種の書き込み失敗が`TransportDead`に分類されるのと
+    一貫させた）。
   - それ以外の`Some(ChannelMsg::Close) | None`（`:1195`付近） →
     `TransportDead`。
 - **検証**: 各break地点について、意図した`BreakReason`が実際に
