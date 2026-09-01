@@ -106,6 +106,16 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 
 impl std::error::Error for MidSessionDisconnectSignal {}
 
+/// Invariant (round 3 review, N1): only STUN P2P call sites
+/// (`connect.rs`'s single-candidate arm and [`run_stun_p2p_with_fallback`])
+/// may call this. It unconditionally attaches [`MidSessionDisconnectSignal`]
+/// to its two remote-stream I/O failures, and that marker is specifically
+/// the ADR's STUN-only `RetryConnectLightweight` signal — a relay-route
+/// caller must **not** inherit it (relay's own resume loop already retries
+/// internally for up to `DEFAULT_RESUME_GRACE_SECS`, so an error escaping
+/// *that* loop is terminal, and a lightweight redial would be the wrong
+/// response to it). Generic over `AnyByteStream` for STUN P2P's own sake,
+/// not as an invitation for a relay-side caller to reuse it.
 pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
     let mut c2h = tokio::spawn(async move {
