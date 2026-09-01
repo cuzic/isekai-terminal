@@ -35,7 +35,7 @@ use russh_stream_session::{open_channel, ForwardRoutes};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::log_file::log_line;
@@ -794,6 +794,21 @@ where
             // that lets it reconnect (to this same holder, if only this one
             // channel died, or to a fresh one, if the whole handle is gone).
             log_line!("isekai-ssh mux owner: remote channel died without reporting why; not sending Frame::Exit so the client treats this as OwnerLost");
+            // Explicitly half-close the write side so the client's read
+            // actually observes EOF and can tell the connection is over.
+            // Without this, simply returning and letting `writer` drop is
+            // *not* enough: `tokio::io::split`'s read/write halves share the
+            // underlying connection via an internal `Arc`, and the read half
+            // is owned by `spawn_frame_reader`'s own detached task — which
+            // stays blocked (and therefore keeps that `Arc` reference alive)
+            // for as long as the client itself neither sends nor closes
+            // anything, exactly the state a client waiting to detect
+            // `OwnerLost` is in. A real integration test that waits for the
+            // client side to observe `None` from `read_frame` here hung for
+            // the CI job's full 30-minute timeout before this `shutdown()`
+            // was added (Epic R PR2 round 2 review finding, caught by CI
+            // rather than by the review itself).
+            let _ = writer.shutdown().await;
             // Best-effort optimization, not required for correctness: if
             // the *shared* handle itself is confirmed dead, proactively
             // wake `serve_clients`'s `shutdown` branch so the whole holder
