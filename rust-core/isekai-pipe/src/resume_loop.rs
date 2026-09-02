@@ -89,27 +89,30 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// STUN establishment rather than silently wait for the much longer server
 /// resume-grace.
 ///
-/// Attached to a *resume-exhaustion* error, not to a pump error: by the time
-/// `run_resume_loop` returns `Err`, its own pump result has already been
-/// discarded (only `is_ok()` is tested) and the error being wrapped was
-/// manufactured by `resume_with_backoff_until_deadline`'s give-up. So the
-/// round-2 concern about misclassifying a local-side failure (`ssh(1)` exited
-/// and closed the pipe this process writes stdout into) as a network
-/// disconnection does not apply to this placement the way it did to
-/// `relay_stdio`, where local and remote I/O errors both propagated directly
-/// out as the returned `Err` and marker scoping was the only discriminator: a
-/// local-side failure can only reach this marker by *also* failing every
-/// resume attempt for the full window, by which point the network genuinely
-/// is down and `MidSessionDisconnect` is the correct classification anyway.
+/// Attached to whatever `run_resume_loop` returns as `Err`, which since
+/// `PumpFailure` (Task 2.9 / issue #111 fix, 2026-09) is one of two shapes:
+/// a *resume-exhaustion* error (`resume_with_backoff_until_deadline`'s
+/// give-up, after a `Remote`-classified pump failure or network change), or
+/// a `PumpFailure::Local` error returned immediately, without ever entering
+/// the resume loop. Both are correctly `MidSessionDisconnect` from the
+/// wrapper's point of view: a `Local` failure most often means `ssh(1)`
+/// itself already exited and closed this process's stdin/stdout (confirmed
+/// 2026-09-02 by direct experiment — see `PumpFailure`'s docs), in which
+/// case the wrapper has already reacted to `ssh(1)`'s own exit and this
+/// process's outcome write is moot; on the rarer path where the local pipe
+/// breaks while `ssh(1)` is still alive, a lightweight retry (spawning a
+/// fresh `isekai-pipe connect`) is exactly the right response.
 ///
-/// What a local-side failure with a *healthy* network produces instead is a
-/// reconnect loop — the pump fails, the resume succeeds, `disconnected_since`
-/// resets so the give-up clock never accumulates, and the helper replays the
-/// same bytes that failed the stdout write. That behavior lives in
-/// `run_resume_loop` itself and is shared verbatim with the relay route (it
-/// predates Epic R); its lifetime is bounded only by whether `ssh(1)` reaps
-/// its `ProxyCommand` child, which is Task 2.9's still-open orphaning
-/// question. See <https://github.com/cuzic/isekai-terminal/issues/111>.
+/// Before this fix, a local-side failure with a *healthy* network produced
+/// an unbounded reconnect loop instead — the pump fails, the resume
+/// succeeds, `disconnected_since` resets so the give-up clock never
+/// accumulates, and the helper replays the same bytes that failed the
+/// stdout write, forever, since nothing distinguished a `Local` failure
+/// (which will fail identically on the very next pump too) from a `Remote`
+/// one worth resuming past. Whether that loop ever terminated depended
+/// entirely on whether `ssh(1)` reaps its `ProxyCommand` child — it does
+/// not reliably (see `PumpFailure`'s docs) — which is exactly why this type
+/// distinction exists now instead of relying on that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
 
@@ -120,6 +123,28 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 }
 
 impl std::error::Error for MidSessionDisconnectSignal {}
+
+/// `run_data_pump`'s failure, classified by which side of the pipe broke.
+///
+/// The distinction exists to fix the exact hang `MidSessionDisconnectSignal`'s
+/// own doc comment above describes (Task 2.9 / issue #111): a `Local` failure
+/// means the process's own stdin/stdout — the pipe `ssh(1)`'s `ProxyCommand`
+/// gave this process — is gone, most often because `ssh(1)` itself already
+/// exited. Confirmed 2026-09-02 by direct experiment (synthetic
+/// `ProxyCommand`, real OpenSSH `ssh(1)`): `ssh(1)` reaps this child when
+/// *it* decides to exit (e.g. `ConnectTimeout`), but does **not** when
+/// something else kills `ssh(1)` itself (`SIGTERM`/`SIGKILL`) — the child is
+/// simply reparented to init and keeps running. Entering the resume-with-
+/// backoff loop on a `Local` failure would wait out `resume_window` (or,
+/// with a healthy network, loop forever — see the doc comment above) with no
+/// reader left on the other end. A `Remote` failure (the QUIC stream itself,
+/// or an OS-reported network change) is exactly the case the resume loop
+/// exists for and is handled unchanged.
+#[derive(Debug)]
+enum PumpFailure {
+    Local(anyhow::Error),
+    Remote(anyhow::Error),
+}
 
 /// Narrow signal a retried-connect error type must expose for
 /// [`retry_while_busy_other_session`] — named distinctly from the underlying
@@ -1188,21 +1213,42 @@ pub(crate) async fn run_resume_loop(
         let outcome = tokio::select! {
             outcome = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters) => outcome,
             Some(()) = reconnect_signal_rx.recv() => {
-                Err(anyhow::anyhow!("network change detected, reconnecting"))
+                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting")))
             }
         };
         reconnect_signal_task.abort();
         state.app_ack_tasks.abort();
 
-        if outcome.is_ok() {
-            if let Some(t) = &warm_standby_task {
-                t.abort();
+        match outcome {
+            Ok(()) => {
+                if let Some(t) = &warm_standby_task {
+                    t.abort();
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(PumpFailure::Local(e)) => {
+                // The stream is already unusable to us; still reset it so the
+                // server parks/releases this session promptly instead of
+                // waiting out its own idle timeout (same rationale as the
+                // unconditional reset below), then give up immediately
+                // rather than entering the resume loop — see `PumpFailure`'s
+                // doc comment for why.
+                quic_write.reset(0);
+                if let Some(t) = &warm_standby_task {
+                    t.abort();
+                }
+                return Err(e.context(
+                    "isekai-pipe connect: local stdin/stdout I/O failed (the process on the \
+                     other end of this pipe, most likely ssh(1), is already gone); not \
+                     attempting resume",
+                ));
+            }
+            Err(PumpFailure::Remote(_)) => {}
         }
 
         // Abandoning this connection (network change, or run_data_pump's own
-        // I/O failure) — explicitly reset the send side instead of letting
+        // remote-side I/O failure — a local-side one already returned above)
+        // — explicitly reset the send side instead of letting
         // it drop gracefully. `noq`/`qmux`'s `Drop` for a send stream calls
         // `finish()` (a clean FIN) by default, which `isekai-pipe serve`'s
         // `relay_buffered` cannot distinguish from a legitimate half-close
@@ -1270,7 +1316,7 @@ async fn run_data_pump(
     quic_write: &mut AnyByteStreamWriteHalf,
     replay: &Arc<Mutex<C2hReplayBuffer>>,
     counters: &Arc<AppAckCounters>,
-) -> Result<()> {
+) -> Result<(), PumpFailure> {
     let c2h_fut = pump_c2h(stdin, quic_write, replay.clone(), counters.clone());
     let h2c_fut = pump_h2c(quic_read, stdout, counters.clone());
     tokio::pin!(c2h_fut);
@@ -1281,11 +1327,11 @@ async fn run_data_pump(
     loop {
         tokio::select! {
             res = &mut c2h_fut, if !c2h_done => {
-                res.context("isekai-pipe connect: C2H pump failed")?;
+                res?;
                 c2h_done = true;
             }
             res = &mut h2c_fut, if !h2c_done => {
-                res.context("isekai-pipe connect: H2C pump failed")?;
+                res?;
                 h2c_done = true;
             }
         }
@@ -1300,7 +1346,7 @@ async fn pump_c2h(
     quic_write: &mut AnyByteStreamWriteHalf,
     replay: Arc<Mutex<C2hReplayBuffer>>,
     counters: Arc<AppAckCounters>,
-) -> Result<()> {
+) -> Result<(), PumpFailure> {
     let mut buf = [0u8; 16 * 1024];
     loop {
         loop {
@@ -1314,10 +1360,14 @@ async fn pump_c2h(
         }
 
         let read_len = buf.len().min(replay.lock().unwrap().remaining_capacity());
+        // Reading our own stdin failing is a local-side failure (see
+        // `PumpFailure`'s docs) — distinct from `write_all`/`append` below,
+        // which fail only on the QUIC/remote side.
         let n = stdin
             .read(&mut buf[..read_len])
             .await
-            .context("reading stdin failed")?;
+            .context("reading stdin failed")
+            .map_err(PumpFailure::Local)?;
         if n == 0 {
             let _ = quic_write.shutdown().await;
             return Ok(());
@@ -1325,19 +1375,21 @@ async fn pump_c2h(
         quic_write
             .write_all(&buf[..n])
             .await
-            .context("writing to remote stream failed")?;
+            .context("writing to remote stream failed")
+            .map_err(PumpFailure::Remote)?;
         // `read_len`が`remaining_capacity()`で頭打ちにしてあり、`advance_start`は
         // 空きを増やすことしかしないため、ここが`false`になることは無い。それでも
         // 握り潰さないのは、もし起きた場合の被害が「replayバッファに載らないまま
         // QUICへ送出済みのバイトができる」=`end_offset()`由来の
         // `client_sent_offset`がhelper側とずれる、というresume不能状態だから
         // (`.claude/rules/always-connects.md`)。接続ごと畳んでしまえば
-        // `run_resume_loop`が再接続からやり直せるので、そちらの方が安全側に倒れる。
+        // `run_resume_loop`が再接続からやり直せるので、そちらの方が安全側に倒れる
+        // (resume自体を試す価値がある失敗なのでRemote扱い)。
         if !replay.lock().unwrap().append(&buf[..n]) {
-            anyhow::bail!(
+            return Err(PumpFailure::Remote(anyhow::anyhow!(
                 "C2H replay buffer had no room after a capacity-bounded read ({n} bytes); \
                  dropping this connection rather than desyncing client_sent_offset"
-            );
+            )));
         }
     }
 }
@@ -1346,21 +1398,26 @@ async fn pump_h2c(
     quic_read: &mut AnyByteStreamReadHalf,
     stdout: &mut (impl AsyncWrite + Unpin),
     counters: Arc<AppAckCounters>,
-) -> Result<()> {
+) -> Result<(), PumpFailure> {
     let mut buf = [0u8; 16 * 1024];
     loop {
         let n = quic_read
             .read(&mut buf)
             .await
-            .context("reading remote stream failed")?;
+            .context("reading remote stream failed")
+            .map_err(PumpFailure::Remote)?;
         if n == 0 {
             return Ok(());
         }
+        // Writing/flushing our own stdout failing is a local-side failure
+        // (see `PumpFailure`'s docs) — most often `ssh(1)` itself already
+        // exited and closed the pipe this process writes into.
         stdout
             .write_all(&buf[..n])
             .await
-            .context("writing stdout failed")?;
-        stdout.flush().await.context("flushing stdout failed")?;
+            .context("writing stdout failed")
+            .map_err(PumpFailure::Local)?;
+        stdout.flush().await.context("flushing stdout failed").map_err(PumpFailure::Local)?;
         counters.advance_h2c_client_delivered_offset(n as u64);
     }
 }
@@ -1803,6 +1860,92 @@ mod tests {
             let tasks = reestablish_control_stream(&conn, b"any-session-secret", &counters).await;
             assert!(tasks.is_ok(), "{:?}", tasks.err());
             tasks.unwrap().abort();
+        }
+
+        /// Minimal `AsyncRead`/`AsyncWrite` fakes that always fail — enough to
+        /// exercise `pump_c2h`/`pump_h2c`'s local-vs-remote classification
+        /// without a real broken pipe. Zero-sized and field-free, so no
+        /// pinning hazard from a plain (non-`pin_project`) `impl AsyncRead`/
+        /// `AsyncWrite`.
+        struct FailingReader;
+        impl tokio::io::AsyncRead for FailingReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic local stdin failure")))
+            }
+        }
+
+        struct FailingWriter;
+        impl tokio::io::AsyncWrite for FailingWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic local stdout failure")))
+            }
+            fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// Regression test for Task 2.9 / issue #111 (2026-09-02): a failed
+        /// `stdin.read()` (this process's own local pipe, most often closed
+        /// because `ssh(1)` itself already exited — see `PumpFailure`'s
+        /// docs) must be classified `Local`, not `Remote`. Before this fix,
+        /// `pump_c2h` had no such distinction and `run_resume_loop` treated
+        /// every pump failure as worth resuming past, which for a `Local`
+        /// failure with a healthy network produced an unbounded reconnect
+        /// loop instead of giving up.
+        #[tokio::test]
+        async fn pump_c2h_classifies_a_stdin_read_failure_as_local() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let stream = conn.open_bi().await.unwrap();
+            let (_recv, mut send) = stream.split();
+
+            let mut stdin = FailingReader;
+            let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(1024)));
+            let counters = Arc::new(AppAckCounters::new());
+
+            let result = pump_c2h(&mut stdin, &mut send, replay, counters).await;
+            assert!(
+                matches!(result, Err(PumpFailure::Local(_))),
+                "a stdin read failure must be classified Local, not Remote: {result:?}"
+            );
+        }
+
+        /// Same regression as above, for `pump_h2c`'s `stdout` side: a
+        /// successful QUIC read followed by a failed `stdout.write_all()`
+        /// must be classified `Local`, not `Remote`. Sends a real
+        /// `CONTROL_HELLO` frame so the fixture listener's `CONTROL_ACK`
+        /// reply gives `pump_h2c` genuine bytes to read before its `stdout`
+        /// write fails — otherwise this would only prove the (already
+        /// separately covered) EOF path, not the write-failure one.
+        #[tokio::test]
+        async fn pump_h2c_classifies_a_stdout_write_failure_as_local() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let stream = conn.open_bi().await.unwrap();
+            let (mut recv, mut send) = stream.split();
+
+            let mut hello = vec![CONTROL_HELLO];
+            hello.extend_from_slice(&[0u8; CONTROL_HELLO_FRAME_LEN - 1]);
+            send.write_all(&hello).await.unwrap();
+
+            let mut stdout = FailingWriter;
+            let counters = Arc::new(AppAckCounters::new());
+            let result = pump_h2c(&mut recv, &mut stdout, counters).await;
+            assert!(
+                matches!(result, Err(PumpFailure::Local(_))),
+                "a stdout write failure must be classified Local, not Remote: {result:?}"
+            );
         }
 
         #[tokio::test]
