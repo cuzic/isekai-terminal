@@ -32,6 +32,115 @@
 
 ## 0. 改訂履歴
 
+### Round 7（2026-09-02）— Round 6の`PumpFailure`分離だけでは不十分と
+    判明し、`parent_watchdog`（ブロッキング`poll()`）で再解決
+
+Round 6実装（`PumpFailure::Local`/`Remote`分離）をPR #112として提出後、
+opus 2体（opus-critic-task29-a/b、それぞれ実験による裏取りを伴う）に
+複数ラウンドの敵対的レビューを依頼し、**Round 6単体では不十分**という
+結論に収束した:
+
+- **F1（blocking）**: `ssh(1)`が死んだ際の支配的なシグナルは`stdin`の
+  **EOF**であってエラーではない。`pump_c2h`の`n == 0`分岐は`Ok(())`を
+  返す既存の「正常終了」経路であり、`PumpFailure::Local`は実質
+  発火しない。
+- **F2（blocking）**: 実際に孤児が長時間残る2シナリオ——(a)
+  resume-with-backoffループの最中に`ssh(1)`が殺される、(b)ネットワーク
+  が既に落ちている状態で`ssh(1)`が死ぬ——はどちらも`Remote`分類に
+  落ち、relay経路ではデフォルト10日のresume windowにそのまま入る。
+  Round 6はこの核心部分を未解決のまま残していた。
+- **F3（significant）**: relay経路（`MidSessionDisconnectSignal`を
+  付与しない）で`Local`失敗が`Unreachable`として素通しされると
+  `RebootstrapAndRetry`（`wrapper.rs::decide_connect_failure_recovery`）
+  に到達しうるが、このアームには非冪等リモートコマンド再実行防止の
+  B5ガード（`RetryConnectLightweight`側にのみ存在）が無い。
+- **F4（significant）**: `Local`分岐の`quic_write.reset(0)`が、
+  「二度とresumeされないセッションをサーバー側に最大10日間park
+  させる」という、コメントの意図と正反対の結果を招いていた。
+
+ユーザー指示「根本原因を考えて非連続な変更を」を受け、`isekai-ssh`が
+`ProxyCommand`文字列に`exec `を前置して`isekai-pipe connect`を
+`ssh(1)`の直接の子に強制し、`prctl(PR_SET_PDEATHSIG)`（Linux）/
+`kqueue`+`EVFILT_PROC`（macOS）でカーネルレベルの親死亡通知を使う案を
+提案したが、**両批評家が独立に実機実験でこれを否定した**:
+`ssh_config(5)`が明記する通り`ssh(1)`は既に`ProxyCommand`を
+`$SHELL -c "exec <cmd>"`として起動しており(「the command string ...
+is executed using the user's shell 'exec' directive to avoid a
+lingering shell process」)、`isekai-pipe connect`は既に`ssh(1)`の
+直接の子である。二重`exec`を追加する提案通りの変更は
+`exec exec <cmd>`となり、dash/bashともに`exec: exec: not found`
+(rc=127)で即座に失敗し、**全てのUnix接続を壊す**ことが実証された
+(この近接ミスの記録として本セクションに残す)。
+
+その後さらに数ラウンドの往復を経て、両批評家が
+「専用スレッドでのブロッキング`poll()`」という、`prctl`/`kqueue`より
+単純かつ正しい方式に収束した。理由: レベルトリガーのためarm時
+レース(`prctl`にはある——親が既に死んでいると通知自体が届かない
+既知の問題、しかもorphanは`systemd --user`のようなchild subreaperへ
+reparentされるため`getppid() == 1`という素朴なguardは静かに機能
+しない、という具体的なバグを両批評家が独立に発見した)が原理上存在
+しない、Linux/macOS/BSDで単一のPOSIX実装で済む、「特定のPIDが
+死んだか」ではなく「stdioの向こう側に誰かまだいるか」という本質的な
+述語を直接検査できる、という3点。`SIGTERM`のデフォルトアクションが
+即座にプロセスを終了させグレースフルシャットダウン(FIN送信)を
+スキップしてしまう(結果としてF4と同じ「サーバー側10日park」を招く)
+という点も、独立にどちらの批評家からも指摘された。
+
+**最終的に実装した設計**(`rust-core/isekai-pipe/src/parent_watchdog.rs`):
+
+- `connect_command`の冒頭で一度だけ、専用OSスレッドが`poll(fd=0, fd=1,
+  events:0)`をタイムアウト無しでブロッキング待機する
+  (`POLLERR`/`POLLHUP`/`POLLNVAL`は要求した`events`に関わらず
+  `revents`に常に現れる)。fd0とfd1は別々のpipe(同一
+  socketpairではない、2026-09-02実機測定で確認——`fd1`側は
+  `POLLHUP`ではなく`POLLERR`で倒れることも判明したため両方を
+  受理する)。`tokio::io::unix::AsyncFd`は使わない
+  (`O_NONBLOCK`はopen file description単位のプロパティであり、
+  fd1に設定すると`pump_h2c`の実際の`stdout`書き込みまで
+  non-blocking化してしまう——素のスレッドならこの問題自体が
+  発生しない)。
+- 検知したら、`connect_command`が`run_connect`全体を
+  この watchdog と`tokio::select!`で競わせているため、負けた側の
+  `run_connect`のfutureがその場でdropされる。これによりネストされた
+  非同期フレーム(`data_stream`/`quic_write`含む)が通常のRust
+  スコープ脱出と同じ順序でdropされ、`quicmux`(内部の`noq`/`qmux`)の
+  送信ストリームのデフォルトDrop実装が自然にclean FIN(`finish()`)を
+  送る——`.reset(0)`を呼ぶコードを一切書かずに、まさにF4が求めていた
+  「今回は二度とresumeしないのでサーバー側をparkさせず即座に
+  teardownさせる」動作が実現される。
+- `resume_loop.rs`側の`PumpFailure::Local`/EOF-latch(下記)は
+  廃止せず、(a) macOS以外でwatchdogが無いプラットフォーム
+  (MSYS2/Cygwin版`ssh.exe`が起動するnative Windowsバイナリの
+  `isekai-pipe connect`——`poll(2)`が使えない)向けのフォールバック、
+  (b) Unix上でも`ssh(1)`自体は生きたままこのpipeだけ壊れる稀な
+  ケース、として維持する。`PumpFailure::Local`到達時も
+  `.reset(0)`を呼ばず自然dropに変更(F4対応)。
+- **EOF-latch**(F2対応の一部): `run_data_pump`が`(Result<(),
+  PumpFailure>, bool)`を返すよう変更し、第2要素で「`pump_c2h`が
+  失敗発生時点で既にclean EOFに達していたか」を呼び出し元へ運ぶ
+  (`c2h_done`という既存のフラグがこの答えを兼ねる——`res?`が
+  ショートサーキットしない限り`true`にならないため追加の記帳が
+  不要)。`run_resume_loop`はこれが`true`の状態で`Remote`失敗を
+  受け取った場合、`Local`と同じ「即座に諦める」経路へ合流させる
+  (ローカル側の送出元が既に終わっている以上、resumeを試みる価値が
+  無いという結論はどちらも同じ)。watchdogの無いプラットフォームで
+  F2(b)の一部を狭く塞ぐ。
+- **F3対応**: `ParentGoneSignal`という新しいマーカーを
+  `resume_loop.rs`に新設し、watchdog起因のエラー・
+  `PumpFailure::Local`起因のエラー・EOF-latch起因のエラーの
+  いずれにも(route/STUN・relay問わず)付与する。
+  `connect::write_connect_outcome_for_wrapper`はこのマーカーを
+  他のどの分類判定よりも先にチェックし、存在すれば**outcomeファイル
+  自体を一切書かない**——relay経路で`Unreachable`
+  →`RebootstrapAndRetry`(B5ガード無し)に化ける経路を根本から断つ。
+
+**Task 2.9自体の結論**: `ensure_process_terminated`
+(`wrapper.rs`側のプロセスグループ管理)は実装しない
+(ジョブコントロール/`SIGHUP`/Ctrl+Cへの副作用が大きく、かつ
+wrapper自身が死ぬケースを覆えないため——両批評家が独立に到達した
+結論)。代わりに`isekai-pipe connect`自身が自分のstdin/stdoutの
+生死を能動的に監視する`parent_watchdog`で解決した。
+
 ### Round 6（2026-09-02）— Task 2.9（孫プロセスの実測）を実施し、
     `ensure_process_terminated`より汎用的な自己終了型の修正で解決
 
