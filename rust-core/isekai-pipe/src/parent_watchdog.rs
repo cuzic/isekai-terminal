@@ -309,6 +309,16 @@ const SPURIOUS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 /// unit-testable, the same way the fd-*direction* axis already was — every
 /// bug this module has shipped so far was a configuration axis (first
 /// direction, now type) no test varied.
+///
+/// **Note for anyone writing a test or tool that spawns `isekai-pipe
+/// connect` as a child process**: if you redirect its stdout to a pipe
+/// (`Stdio::piped()`) and don't keep the read end open for the child's
+/// whole lifetime — e.g. you drop the `ChildStdout` handle early, or never
+/// read it at all — this watchdog will correctly detect that as "the peer
+/// is gone" and fire, which looks like a confusing, unrelated failure
+/// rather than the test's own setup. `std::process::Command::output()` is
+/// safe (it holds the read end open until the child exits); that's the
+/// only reason this module's own e2e tests don't hit this.
 #[cfg(unix)]
 fn watchable_fds(fds: &[(libc::c_int, libc::c_short)]) -> Vec<(libc::c_int, libc::c_short)> {
     fds.iter()
