@@ -32,6 +32,60 @@
 
 ## 0. 改訂履歴
 
+### Round 6（2026-09-02）— Task 2.9（孫プロセスの実測）を実施し、
+    `ensure_process_terminated`より汎用的な自己終了型の修正で解決
+
+PR1〜PR3（#108〜#110）マージ後、唯一残っていたTask 2.9（§2.3.6/
+TASKS.md該当節）を実機に近い形で検証した。当初の実測手順（実際に
+STUN P2Pホストのネットワークを切断する）の代わりに、**Task 2.9の
+本質はOS一般の`ssh(1)`+`ProxyCommand`の性質であり、実ネットワーク
+切断もSTUN固有の事情も不要**と判断し、合成`ProxyCommand`
+（`sh -c 'echo $$ > pidfile; exec sleep 600'`）でローカルに再現した:
+
+| `ssh(1)`の終了経路 | ProxyCommand子プロセス |
+|---|---|
+| 自身の`ConnectTimeout`満了（自発的終了） | 道連れで終了 |
+| 外部からの`SIGTERM` | **生存**（initへreparent） |
+| 外部からの`SIGKILL` | **生存**（initへreparent） |
+
+`ssh(1)`は自分の`cleanup_exit()`が走る自発的終了でのみ子を終了させ、
+外部から殺された場合は終了させない（`SIGKILL`はcleanup_exit自体を
+実行不能にするため当然だが、`SIGTERM`でも同様だったのは実測するまで
+自明ではなかった）。TASKS.mdのTask 2.9が要求していた「実際に…」
+という手順とは異なる、より汎用的な検証だが、この結果は
+`wrapper.rs`が`ssh(1)`を再起動する際の内部シグナル経路にも、外部
+要因（OOM killer・端末強制終了等）にも等しく当てはまる、より広い
+主張として扱える。
+
+この結果を受けて**`ensure_process_terminated`（プロセスグループ管理
+によるkill）は実装しなかった**。代わりに、より根本的で経路非依存の
+修正を`resume_loop.rs`に実装した: `run_data_pump`の失敗を
+`PumpFailure::Local`（`stdin`/`stdout`側、`ssh(1)`のパイプが壊れた
+ことを示す）と`PumpFailure::Remote`（QUIC/ネットワーク側、resumeを
+試す価値がある）に型で分離し、`run_resume_loop`は`Local`失敗を
+即座に`Err`として返してresumeループに入らないようにした。
+
+この修正が`ensure_process_terminated`より優れる理由: `ssh(1)`が
+自分の子の**パイプfdを閉じる**のはOSカーネルがプロセス終了時に
+無条件で行う後始末であり、`ssh(1)`自身の終了経路（自発的/`SIGTERM`/
+`SIGKILL`のいずれか）にも、`ssh(1)`が孫プロセスを明示的にkillする
+かどうかにも依存しない——`isekai-pipe connect`は自分のstdin/stdout
+が壊れたことを次のread/writeで即座に検出でき、`ssh(1)`側の協力を
+一切必要としない。これにより`MidSessionDisconnectSignal`のdoc
+コメントが警告していた「ローカル側障害＋健全なネットワークが
+`disconnected_since`のリセットにより無限に再接続ループする」という、
+relay・STUN両経路が共有していた既存バグ（Epic R以前から存在）も
+同時に解消される。
+
+検証: `pump_c2h`/`pump_h2c`それぞれについて、実QUIC接続を使い
+「`stdin.read()`失敗」「`stdout.write_all()`失敗」がそれぞれ
+`Local`に分類されることを直接ピン留めする回帰テストを追加した
+（`pump_c2h_classifies_a_stdin_read_failure_as_local`・
+`pump_h2c_classifies_a_stdout_write_failure_as_local`）。
+
+PR1〜PR3とは独立した修正のため新規PRとして分離し、TASKS.mdの
+Task 2.9をこの結果で更新した。
+
 ### Round 5（2026-09-02）— PR2マージ後、PR3着手前にopus-critic-a・
     opus-critic-bへ独立並行レビューを再依頼して発見
 

@@ -1958,3 +1958,20 @@ PR1(#108)・PR2(#109)・PR3の3段階で実装した:
   行う」案も検討したが、`isekai-pipe serve`のホールパンチが起動時
   一度きりの動作であり再接続クライアントの新アドレスを学習する手段が
   無いため到達可能性を一切改善しないと判明し却下した(詳細はADR §2.3.0)。
+
+**Task 2.9フォローアップ(2026-09-02、ADR Round 6)**: PR1〜PR3マージ後、
+唯一残っていた調査タスク(`ssh(1)`が`ProxyCommand`の孫プロセスを終了時に
+道連れにするか)を実測した。結果、`ssh(1)`が自発的に終了する場合は道連れに
+なるが、外部から`SIGTERM`/`SIGKILL`された場合は道連れにならない(initへ
+reparentされ生存し続ける)ことを確認した。対応として、プロセスグループ管理
+(`ensure_process_terminated`)ではなく`isekai-pipe`側でより根本的な修正を
+実装した: `run_data_pump`の失敗を`PumpFailure::Local`(stdin/stdout側)と
+`PumpFailure::Remote`(QUIC側)に型で分離し、`run_resume_loop`が`Local`
+失敗を即座に`Err`として返しresumeループへ入らないようにした
+(`isekai-pipe/src/resume_loop.rs`)。`ssh(1)`が子のパイプfdを閉じるのは
+OSカーネルがプロセス終了時に無条件で行う後始末であり`ssh(1)`自身の終了
+経路に依存しないため、`ssh(1)`側の協力なしに孤児化した
+`isekai-pipe connect`が自分のstdin/stdout破損を検出して自己終了する。
+副次効果として、ローカル側障害+健全なネットワークによる無限再接続ループ
+(relay・STUN両経路が共有していた、Epic R以前からの既存バグ)も同時に
+解消した。

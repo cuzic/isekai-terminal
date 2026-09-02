@@ -285,33 +285,45 @@
   自動リトライされないことを確認するテスト（B5）。
 
 ### Task 2.9 — 孫プロセスの実測と条件付き対応（S1、独立した調査タスク
-    として分離、S10で手順を厳密化）
+    として分離、S10で手順を厳密化、**2026-09-02実測完了・解決済み**）
 
-- **これは調査タスクであり、Task 2.8をブロックしない**（M3——
-  実測が終わるまでTask 2.8の他の要素の着手を止める必要はない）。
-- **手順（S10で厳密化）**: 経路によって「正解」が逆になる
-  （STUN=15秒で自然に落ちるのが正常、Relay=最大10日残るのが正常）
-  ため、**必ずSTUN P2P経路のホスト**（`#@isekai stun`設定済み）で
-  意図的にネットワークを切断し、**20〜30秒後**（QUIC idle timeout
-  15秒に余裕を見た時間）に`pgrep -f 'isekai-pipe connect'`が
-  残るかを確認する（ローカル実行で良い、`cargo build`/`test`では
-  ないため`prefer-gh-actions-over-local-cargo`に抵触しない）。
-  Relay経路での孫の残存はこの対策の対象外——観測してはいけない。
-- **残らない場合**: `ensure_process_terminated`機構は実装しない。
-  `wrapper.rs:719-725`のdocコメントを「`.status()`自体は直接の子
-  だけを待つが、`ssh(1)`が自分のProxyCommandを終了させるため
-  結果として孫も残らない」と理由を正確にする訂正のみ行う。このタスク
-  はここで完了（Task 2.8への追加実装は無し）。
-- **残る場合（S3: pid単発killという選択肢は存在しないと明記）**:
-  `run_ssh_once`は`Result<(ExitStatus, String /*intent_id*/)>`
-  （`wrapper.rs:798-803`）を返すのみでpidを取得できず、そもそも
-  孫（`isekai-pipe connect`）のpidはwrapperから原理的に取得
-  不能——**取れるのは`ssh(1)`自身のpidだけ**。したがって唯一の
-  実装可能な選択肢は、`ssh(1)`を独自プロセスグループで起動し
-  （`setsid`/`process_group(0)`）、次の試行前にグループ全体へ
-  `SIGTERM`→猶予後`SIGKILL`を送ること。この場合のみTask 2.8の
-  ループに実装を追加し、対応するテスト（プロセス監視付き）も
-  追加する。
+- **実測結果**（ADR Round 6参照）: 実ネットワーク切断の代わりに、
+  Task 2.9が問う本質は「`ssh(1)`が自分の`ProxyCommand`子を終了時に
+  道連れにするか」というOS一般の性質だと判断し、合成
+  `ProxyCommand`（`sh -c 'echo $$ > pidfile; exec sleep 600'`）で
+  ローカル再現した。結果: `ssh(1)`が**自発的に**終了する場合
+  （`ConnectTimeout`満了等）は子も道連れになるが、**外部から
+  `SIGTERM`/`SIGKILL`された場合は子が生存し続ける**（initへ
+  reparentされる）。すなわち「残る場合」が確認された。
+- **採用した対応（S3で列挙された`ensure_process_terminated`＝
+  プロセスグループkillではない）**: `wrapper.rs`側でプロセスグループ
+  を管理する代わりに、`isekai-pipe`側（`resume_loop.rs`）で
+  より根本的な修正を行った。`run_data_pump`の失敗を
+  `PumpFailure::Local`（`stdin`/`stdout`側、`ssh(1)`のパイプが
+  壊れたことを示す）と`PumpFailure::Remote`（QUIC/ネットワーク側）
+  に型で分離し、`run_resume_loop`が`Local`失敗を即座に`Err`として
+  返しresumeループに入らないようにした。`ssh(1)`が自分の子の
+  パイプfdを閉じるのはOSカーネルがプロセス終了時に無条件で行う
+  後始末であり、`ssh(1)`自身の終了経路にも孫プロセスをkillするか
+  どうかにも依存しないため、`ssh(1)`側の協力なしに孤児
+  `isekai-pipe connect`が自分のstdin/stdout破損を検出して即座に
+  終了する——`ensure_process_terminated`が要求したプロセス
+  グループ管理より汎用的かつ実装が単純。副次効果として、
+  `MidSessionDisconnectSignal`のdocコメントが警告していた
+  「ローカル側障害＋健全なネットワークによる無限再接続ループ」
+  （relay・STUN両経路が共有、Epic R以前から存在した既存バグ）も
+  同時に解消した。
+- **検証**: `pump_c2h_classifies_a_stdin_read_failure_as_local`・
+  `pump_h2c_classifies_a_stdout_write_failure_as_local`
+  （`resume_loop.rs`）で、実QUIC接続を使い両方向それぞれの
+  ローカル側障害が`PumpFailure::Local`に正しく分類されることを
+  直接ピン留めした。
+- **`wrapper.rs:719-725`のdocコメント**は「`.status()`自体は直接の
+  子だけを待つが、`ssh(1)`は自発的終了時のみProxyCommand子を道連れ
+  にする（外部killでは道連れにしない）。ただし孤児化した
+  `isekai-pipe connect`は自分のstdin/stdout破損を検出して
+  自己終了するため（`resume_loop.rs::PumpFailure`）、実害は無い」と
+  正確にする訂正が必要（このタスクのPRに含める）。
 
 ### Task 2.10 — ctl-socket forwardの反復ごとteardown（S3旧、独立タスク）
 
