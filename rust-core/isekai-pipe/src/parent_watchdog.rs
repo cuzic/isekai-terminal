@@ -217,18 +217,24 @@ pub(crate) async fn wait(rx: &mut ParentGoneWatch) {
 #[cfg(unix)]
 pub(crate) fn spawn() -> ParentGoneWatch {
     let (tx, rx) = watch::channel(false);
-    // Leak a clone of `tx` so the channel can never close *without* firing
-    // — both of `watch_loop`'s own give-up paths below (an unexpected
-    // `poll()` error) and this function's own thread-spawn-failure path
-    // drop their copy of `tx` without ever sending `true`, meaning they are
-    // meant to fail *open* ("no additional signal available on this run,
-    // defer to the reactive fallback") — but `wait()` cannot otherwise tell
-    // that apart from a real fire, since `changed()` also returns once
-    // every sender is gone (found by adversarial review, 2026-09-02, N1 /
-    // "Blocking 2": both paths' own comments already said "fail open," but
-    // the actual effect was the opposite — an immediate or spurious
-    // mid-session fire). This leaked clone is exactly the same trick the
-    // non-Unix `spawn` below already used for the same reason.
+    // Leak a clone of `tx` so the channel can never close *without* firing.
+    // Load-bearing for THREE separate give-up paths, all meant to fail
+    // *open* ("no additional signal available on this run, defer to the
+    // reactive fallback") — keep this list in sync if `watch_loop` grows a
+    // fourth:
+    //   1. This function's own thread-spawn-failure path, just below.
+    //   2. `watch_loop`'s unexpected-`poll()`-error path.
+    //   3. `watch_loop`'s empty-watch-set path (`watchable_fds` filtered
+    //      every fd out — e.g. `stdin`/`stdout` redirected from `/dev/null`,
+    //      found via a real CI regression, 2026-09-02).
+    // Every one of them drops its copy of `tx` without ever sending `true`
+    // — but `wait()` cannot otherwise tell that apart from a real fire,
+    // since `changed()` also returns once every sender is gone (found by
+    // adversarial review, 2026-09-02, N1 / "Blocking 2": path 1 and 2's own
+    // comments already said "fail open," but the actual effect was the
+    // opposite — an immediate or spurious mid-session fire). This leaked
+    // clone is exactly the same trick the non-Unix `spawn` below already
+    // used for the same reason.
     std::mem::forget(tx.clone());
     // Deliberately not joined/cancelled anywhere: the process either exits
     // normally (the OS tears down every thread, this one included) or this
@@ -271,7 +277,33 @@ const SPURIOUS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 /// ordinary two-`pipe(2)` `ProxyCommand` this module was designed against)
 /// still gets real watchdog coverage instead of silently degrading to a
 /// no-op — measured directly: a socketpair's closed peer end reports
-/// `POLLIN|POLLHUP`, the same shape a pipe's does.
+/// `POLLIN|POLLHUP`, the same shape a pipe's does. This isn't a hypothetical
+/// hedge: `S_ISFIFO`-only was the first draft of this fix, and only
+/// measuring a socketpair specifically (not just re-deriving from the
+/// already-known pipe behavior) caught that it would have quietly disabled
+/// this whole module for any `ssh(1)` build that happens to use
+/// `ProxyUseFdpass` — a real, plausible case since macOS ships its own
+/// OpenSSH build, distinct from the Debian one this repo's own experiments
+/// were run against.
+///
+/// **Character devices (`S_ISCHR` — `/dev/null`, ttys) are *deliberately*
+/// excluded, not merely uncovered.** A tty genuinely can report `POLLHUP`
+/// on hangup, so this does lose a little coverage for a manual
+/// `isekai-pipe connect` run interactively from a terminal — but that's not
+/// the Task 2.9 scenario (a real `ssh(1)` `ProxyCommand` never gives its
+/// child a tty for stdin/stdout), Darwin's `poll()`-on-tty behavior is
+/// separately known to be unreliable, and the reactive `PumpFailure`/
+/// EOF-latch fallback still covers that case regardless. This module's
+/// failure modes are asymmetric — a false *fire* is catastrophic and silent
+/// (kills a healthy connection/attempt, and `ParentGoneSignal` then
+/// suppresses the very outcome file and log line that would explain why —
+/// exactly how this bug surfaced three layers away, as an unrelated e2e
+/// test's assertion failure, instead of directly), while a false *quiet*
+/// is merely a missed optimization (the reactive fallback bounds it) — so
+/// this function is a positive allowlist of fd types affirmatively known to
+/// behave, not a denylist of the one fd type that happened to cause a
+/// failure. The next fd type someone wants covered should be added only
+/// after being measured the same way `S_ISSOCK` was, not assumed.
 ///
 /// A pure function specifically so the fd-*type* axis is directly
 /// unit-testable, the same way the fd-*direction* axis already was — every
@@ -287,9 +319,17 @@ fn watchable_fds(fds: &[(libc::c_int, libc::c_short)]) -> Vec<(libc::c_int, libc
             // duration of this call; `fstat(2)` only writes through the
             // pointer we give it.
             if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+                log::debug!("isekai-pipe connect: parent-liveness watchdog: fd {fd} failed fstat(), not watching it");
                 return false; // an fd `fstat()` can't even describe isn't watchable either.
             }
-            matches!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK)
+            let watchable = matches!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
+            if !watchable {
+                log::debug!(
+                    "isekai-pipe connect: parent-liveness watchdog: fd {fd} is not a pipe or socket (st_mode={:#x}), not watching it",
+                    stat.st_mode
+                );
+            }
+            watchable
         })
         .collect()
 }
@@ -441,30 +481,48 @@ mod tests {
     fn watchable_fds_keeps_pipes_and_sockets_drops_everything_else() {
         let (pipe_read, pipe_write) = pipe_pair();
         let (sock_a, sock_b) = socketpair();
-        let dev_null = open_path(std::path::Path::new("/dev/null"), libc::O_RDONLY);
-        assert!(dev_null >= 0, "failed to open /dev/null for this test");
+        // Both directions of `/dev/null`, matching production's real stdin
+        // (read-only) and stdout (write-only) shapes exactly.
+        let dev_null_r = open_path(std::path::Path::new("/dev/null"), libc::O_RDONLY);
+        assert!(dev_null_r >= 0, "failed to open /dev/null O_RDONLY for this test");
+        let dev_null_w = open_path(std::path::Path::new("/dev/null"), libc::O_WRONLY);
+        assert!(dev_null_w >= 0, "failed to open /dev/null O_WRONLY for this test");
 
         let tmp = std::env::temp_dir().join(format!("isekai-pipe-watchable-fds-test-{}", std::process::id()));
         std::fs::write(&tmp, b"x").unwrap();
         let real_file = open_path(&tmp, libc::O_RDONLY);
         assert!(real_file >= 0, "failed to open a regular file for this test");
 
+        // An fd number `fstat()` can't describe at all (never opened, or
+        // already closed) — must be dropped, not panic.
+        let invalid_fd: libc::c_int = -1;
+
         let candidates = [
             (pipe_read, libc::POLLIN),
             (pipe_write, libc::POLLOUT),
             (sock_a, libc::POLLIN),
             (sock_b, libc::POLLOUT),
-            (dev_null, libc::POLLIN),
+            (dev_null_r, libc::POLLIN),
+            (dev_null_w, libc::POLLOUT),
             (real_file, libc::POLLIN),
+            (invalid_fd, libc::POLLIN),
         ];
         let kept = watchable_fds(&candidates);
 
-        assert!(kept.contains(&(pipe_read, libc::POLLIN)), "a pipe read end must stay watchable: {kept:?}");
-        assert!(kept.contains(&(pipe_write, libc::POLLOUT)), "a pipe write end must stay watchable: {kept:?}");
-        assert!(kept.contains(&(sock_a, libc::POLLIN)), "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass): {kept:?}");
-        assert!(kept.contains(&(sock_b, libc::POLLOUT)), "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass): {kept:?}");
-        assert!(!kept.contains(&(dev_null, libc::POLLIN)), "/dev/null must be dropped: {kept:?}");
-        assert!(!kept.contains(&(real_file, libc::POLLIN)), "a regular file must be dropped: {kept:?}");
+        assert!(kept.contains(&(pipe_read, libc::POLLIN)), "a pipe read end must stay watchable, with its events preserved: {kept:?}");
+        assert!(kept.contains(&(pipe_write, libc::POLLOUT)), "a pipe write end must stay watchable, with its events preserved: {kept:?}");
+        assert!(
+            kept.contains(&(sock_a, libc::POLLIN)),
+            "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass), with its events preserved: {kept:?}"
+        );
+        assert!(
+            kept.contains(&(sock_b, libc::POLLOUT)),
+            "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass), with its events preserved: {kept:?}"
+        );
+        assert!(!kept.iter().any(|&(fd, _)| fd == dev_null_r), "/dev/null (read) must be dropped: {kept:?}");
+        assert!(!kept.iter().any(|&(fd, _)| fd == dev_null_w), "/dev/null (write) must be dropped: {kept:?}");
+        assert!(!kept.iter().any(|&(fd, _)| fd == real_file), "a regular file must be dropped: {kept:?}");
+        assert!(!kept.iter().any(|&(fd, _)| fd == invalid_fd), "an fd fstat() rejects must be dropped, not panic: {kept:?}");
         assert_eq!(kept.len(), 4, "exactly the 4 pipe/socket entries, nothing else: {kept:?}");
 
         unsafe {
@@ -472,7 +530,8 @@ mod tests {
             libc::close(pipe_write);
             libc::close(sock_a);
             libc::close(sock_b);
-            libc::close(dev_null);
+            libc::close(dev_null_r);
+            libc::close(dev_null_w);
             libc::close(real_file);
         }
         let _ = std::fs::remove_file(&tmp);
@@ -509,6 +568,60 @@ mod tests {
         unsafe {
             libc::close(dev_null);
         }
+    }
+
+    /// The test that matters most long-term for the `S_ISSOCK` inclusion
+    /// (adversarial review, 2026-09-02): without this, nothing would notice
+    /// if a future "simplification" narrowed `watchable_fds` back to
+    /// `S_ISFIFO` alone — which would silently disable this entire module
+    /// for any `ssh(1)` build using the `ProxyUseFdpass` (`socketpair(2)`)
+    /// path, with every other test (all built on `pipe_pair()`) staying
+    /// green. Exercises `watch_loop` end to end, not just `watchable_fds` in
+    /// isolation, against a real socketpair.
+    #[test]
+    fn watch_loop_fires_on_a_socketpair_peer_close() {
+        let (a, b) = socketpair();
+        unsafe {
+            libc::close(b);
+        }
+        let (tx, mut rx) = watch::channel(false);
+        let handle = std::thread::spawn(move || watch_loop(tx, &[(a, libc::POLLIN)]));
+
+        let fired = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move { tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await })
+        })
+        .join()
+        .unwrap();
+        match fired {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire) — S_ISSOCK may have been dropped from watchable_fds"),
+            Err(_) => panic!("the watchdog did not fire on a closed socketpair peer within the timeout"),
+        }
+        handle.join().unwrap();
+        unsafe {
+            libc::close(a);
+        }
+    }
+
+    /// Direct regression test for N1 (adversarial review, 2026-09-02): a
+    /// closed-without-firing channel must make `wait()` pend forever, not
+    /// resolve. Before this fix `wait()` was `let _ = rx.changed().await;`,
+    /// which resolves (incorrectly, as if fired) the instant every sender
+    /// drops — exactly what a `watch_loop` give-up path does. Nothing
+    /// exercised `wait()` itself until now; every other test only exercises
+    /// `watch_loop`'s own `tx.send`/drop behavior via `rx.changed()`
+    /// directly, which can't distinguish `wait()`'s correct filtering logic
+    /// from the bug it fixed.
+    #[tokio::test]
+    async fn wait_never_resolves_when_the_channel_closes_without_firing() {
+        let mut rx = {
+            let (tx, rx) = watch::channel(false);
+            drop(tx); // closes the channel without ever sending `true`.
+            rx
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), wait(&mut rx)).await;
+        assert!(result.is_err(), "wait() must not resolve when the channel closed without firing, got {result:?}");
     }
 
     /// Comfortably longer than [`SPURIOUS_BACKOFF`] (currently 1s) — the
