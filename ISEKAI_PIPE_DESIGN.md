@@ -207,7 +207,9 @@ NAT越え方式を選べる。
 
 - `isekai-ssh` wrapper: `Stdio::inherit()`で`ssh`に丸ごと委譲するだけでstdoutを触らない。
   `--isekai-explain`/`--isekai-dry-run`・エラーは全てstderr。
-- `isekai-pipe connect`: HELLO/proof/ACK成功後の`pump_h2c`/`relay_stdio`だけがstdoutに書き込む。
+- `isekai-pipe connect`: HELLO/proof/ACK成功後の`pump_h2c`（Epic R PR3で`relay_stdio`は
+  削除、STUN P2P経路もrelayと同じ`run_resume_loop`のこの一本に統合された）だけが
+  stdoutに書き込む。
   失敗系(trust store未登録・secret不一致・relay到達不可)はstdoutに一切書かない。
 - `isekai-pipe serve`: stdoutは起動handshake JSON1行のみ。ログは全てstderr。
 

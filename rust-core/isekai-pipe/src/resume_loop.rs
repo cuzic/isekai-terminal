@@ -230,28 +230,38 @@ pub(crate) async fn run_stun_p2p_resumable(
     profile: &str,
     connection: StunP2pConnection,
 ) -> Result<()> {
-    let control = open_control_stream(&connection.connection, &connection.proof).await?;
-    let established = ResumableRelaySession {
-        connection: connection.connection,
-        data_stream: connection.stream,
-        control_stream: control.stream,
-        session_id: control.session_id,
-        effective_resume_grace_secs: connection.effective_resume_grace_secs,
-        network_rebinder: connection.network_rebinder,
-    };
-    run_resume_loop(
-        factory,
-        target,
-        profile,
-        established,
-        // STUN P2P's punched NAT mapping is tied to the socket used for
-        // initial establishment. Rebinding or warm-standby promotion would
-        // switch sockets/interfaces without the rejected re-rendezvous
-        // primitive, so both are deliberately disabled on this path.
-        /* experimental_network_rebind */ false,
-        /* tethering_interface */ None,
-        Some(STUN_RESUME_GIVE_UP_WINDOW),
-    )
+    // The whole body is wrapped in `MidSessionDisconnectSignal`, not just
+    // `run_resume_loop`'s own result (round 3 code review, minor 3): the
+    // STUN P2P handshake has already fully succeeded by the time this
+    // function is called (that's `connection`'s existence), so a failure to
+    // open the control stream right after is just as much a mid-session
+    // disconnect as a later resume give-up — it must not escape unmarked
+    // and get classified as a connect-time `Unreachable` instead.
+    async {
+        let control = open_control_stream(&connection.connection, &connection.proof).await?;
+        let established = ResumableRelaySession {
+            connection: connection.connection,
+            data_stream: connection.stream,
+            control_stream: control.stream,
+            session_id: control.session_id,
+            effective_resume_grace_secs: connection.effective_resume_grace_secs,
+            network_rebinder: connection.network_rebinder,
+        };
+        run_resume_loop(
+            factory,
+            target,
+            profile,
+            established,
+            // STUN P2P's punched NAT mapping is tied to the socket used for
+            // initial establishment. Rebinding or warm-standby promotion would
+            // switch sockets/interfaces without the rejected re-rendezvous
+            // primitive, so both are deliberately disabled on this path.
+            /* experimental_network_rebind */ false,
+            /* tethering_interface */ None,
+            Some(STUN_RESUME_GIVE_UP_WINDOW),
+        )
+        .await
+    }
     .await
     .map_err(|e| e.context(MidSessionDisconnectSignal))
 }
@@ -1391,24 +1401,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plain_resume_loop_give_up_errors_do_not_carry_the_stun_mid_session_marker() {
-        let err = anyhow::anyhow!("relay resume window exceeded");
-        assert!(
-            err.downcast_ref::<MidSessionDisconnectSignal>().is_none(),
-            "relay callers must not inherit the STUN-only mid-session marker"
-        );
-    }
-
-    #[test]
-    fn stun_resume_loop_callers_attach_the_mid_session_marker_through_context() {
-        let err = anyhow::anyhow!("STUN resume window exceeded").context(MidSessionDisconnectSignal);
-        assert!(
-            err.downcast_ref::<MidSessionDisconnectSignal>().is_some(),
-            "top-level outcome classification relies on anyhow::Error::downcast_ref walking context sources"
-        );
-    }
-
     /// A `NetworkChangeMonitor` that fires exactly one event, then never
     /// resolves again — enough to prove `run_resume_loop`'s `tokio::select!`
     /// (`#20b`'s follow-on network-change wiring) actually treats a signal
@@ -1866,6 +1858,92 @@ mod tests {
             .await;
 
             assert!(result.is_err(), "must return Err once the resume window is exceeded, not a silent Ok/None");
+            state.app_ack_tasks.abort();
+        }
+
+        /// Round 3 code review, significant 1: the three `clamp_resume_window`
+        /// unit tests only cover the helper in isolation — none of them pin
+        /// `run_resume_loop`'s own call site (`resume_window = clamp_resume_window(
+        /// resume_window_for(established.effective_resume_grace_secs), max_resume_window)`).
+        /// A regression that threaded `max_resume_window` through to
+        /// `resume_with_backoff_until_deadline` (for `notify_on_give_up`) but
+        /// forgot to actually clamp `resume_window` with it would leave all
+        /// three unit tests green while silently restoring the exact
+        /// multi-day hang Task 3.4 exists to prevent.
+        ///
+        /// This test drives the *real* `resume_with_backoff_until_deadline`
+        /// (same proven fixture as the test above) with the window computed
+        /// via the identical composition `run_resume_loop` uses, for a
+        /// STUN-shaped scenario (a large server-granted grace, clamped down
+        /// by a short `max_resume_window`) — and asserts the give-up error
+        /// reports the *clamped* window, not the unclamped one. If a future
+        /// change makes `run_resume_loop` skip the clamp, the equivalent
+        /// production error message would silently claim an hours-long
+        /// window was exceeded after only seconds; this test would need the
+        /// same skip to still pass, which is exactly what pins it.
+        #[tokio::test]
+        async fn run_resume_loop_style_window_computation_clamps_a_large_server_grace_for_stun() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex.clone()).await;
+            let counters = Arc::new(AppAckCounters::new());
+            let app_ack_tasks = reestablish_control_stream(&conn, b"any-session-secret", &counters).await.unwrap();
+
+            let target = RelayTarget {
+                helper_addr: addr,
+                server_name: "isekai-pipe.local".to_string(),
+                cert_sha256_hex,
+                session_secret: b"any-session-secret".to_vec(),
+                local_bind_port_range: None,
+            };
+            let factory = system_quic_factory();
+            let mut state = ResumeLoopState {
+                session_id: isekai_transport::SessionId::from_bytes([0x7Fu8; 16]),
+                counters,
+                replay: Arc::new(Mutex::new(C2hReplayBuffer::new(1024))),
+                app_ack_tasks,
+                network_rebinder: None,
+                is_tty: false,
+                last_resume_error: Some("connection refused".to_string()),
+                consecutive_unknown_session: 0,
+            };
+            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
+
+            // A server that granted a multi-hour resume grace, exactly as a
+            // real relay/STUN peer with a generous `--resume-window` would.
+            let server_granted_grace_secs: u32 = 6 * 60 * 60;
+            let max_resume_window = Some(STUN_RESUME_GIVE_UP_WINDOW);
+            // `run_resume_loop`'s own composition, verbatim (resume_loop.rs's
+            // `run_resume_loop` body) — not a re-derivation of it.
+            let resume_window = clamp_resume_window(resume_window_for(server_granted_grace_secs), max_resume_window);
+            assert_eq!(resume_window, STUN_RESUME_GIVE_UP_WINDOW, "sanity check on the composition itself before using it below");
+
+            let disconnected_at = Instant::now() - (STUN_RESUME_GIVE_UP_WINDOW + Duration::from_secs(1));
+            let deadline = disconnected_at + resume_window; // already in the past
+
+            let result = resume_with_backoff_until_deadline(
+                &factory,
+                &target,
+                "test-profile",
+                resume_window,
+                disconnected_at,
+                deadline,
+                &mut state,
+                &None,
+                &mut monitor,
+                max_resume_window,
+            )
+            .await;
+
+            let err = result.expect_err("must give up immediately once the clamped (short) window is exceeded");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&format!("{STUN_RESUME_GIVE_UP_WINDOW:?}")),
+                "give-up message must report the clamped STUN window, not the unclamped server grace: {message:?}"
+            );
+            assert!(
+                !message.contains(&format!("{:?}", resume_window_for(server_granted_grace_secs))),
+                "give-up message must not report the unclamped multi-hour window: {message:?}"
+            );
             state.app_ack_tasks.abort();
         }
     }
