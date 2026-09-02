@@ -59,13 +59,11 @@
 //! the actual predicate this process cares about — "is anyone still on the
 //! other end of my stdio" — rather than a proxy for it ("did one specific
 //! PID exit"), so it also catches the rarer case where `ssh(1)` itself is
-//! still alive but this specific pipe broke; it needs exactly one identical
-//! implementation for Linux, macOS, and every BSD (all expose the same
-//! POSIX `poll(2)`); and firing it wakes ordinary async code via a channel,
-//! which can run a normal graceful shutdown instead of fighting
-//! async-signal-safety inside a signal handler.
+//! still alive but this specific pipe broke; and firing it wakes ordinary
+//! async code via a channel, which can run a normal graceful shutdown
+//! instead of fighting async-signal-safety inside a signal handler.
 //!
-//! ## Why fd 0 *and* fd 1, and why `events: 0`
+//! ## Why fd 0 *and* fd 1, why per-fd `events`, and why a sleep-guard
 //!
 //! `ssh(1)` gives its `ProxyCommand` two independent `pipe(2)`s (confirmed
 //! by direct experiment, 2026-09-02: different inodes, not a shared
@@ -76,27 +74,65 @@
 //! platform's `poll()` happens to report for which half:
 //!
 //! - fd 0 (our stdin, `ssh(1)`'s write end): reports `POLLHUP` once `ssh(1)`
-//!   closes its end.
+//!   closes its end (measured on Linux).
 //! - fd 1 (our stdout, `ssh(1)`'s read end): reports `POLLERR` (not
 //!   `POLLHUP`) once `ssh(1)` closes its end — measured directly; a
 //!   watchdog that only checked `POLLHUP` would silently never fire on this
 //!   fd.
 //!
-//! `events: 0` (not `POLLIN`/`POLLOUT`) is requested on both: `POLLERR`/
-//! `POLLHUP`/`POLLNVAL` are always reported in `revents` regardless of the
-//! requested mask, and fd 1 (a pipe write end) is `POLLOUT`-ready almost
-//! continuously while healthy, so requesting `POLLOUT` would make this
-//! thread spin instead of block.
+//! An earlier draft requested `events: 0` on both, reasoning that
+//! `POLLERR`/`POLLHUP`/`POLLNVAL` are always reported in `revents`
+//! regardless of the requested mask. That's true on Linux, but real
+//! `rust-core-test-macos` CI (2026-09-02) found it false on Darwin: Darwin
+//! does not implement `poll(2)` natively — XNU's `poll_nocancel()`
+//! translates each `pollfd` into `kqueue` registrations, registering
+//! `EVFILT_READ` only if `events` asks for a read direction and
+//! `EVFILT_WRITE` only if it asks for a write direction. With `events: 0`,
+//! *neither* filter is registered, so that fd has nothing watching it and
+//! can never produce a `revents` at all — exactly the observed symptom
+//! (both directions timed out, not one).
 //!
-//! ## Why a dedicated thread, not `tokio::io::unix::AsyncFd`
+//! So each fd now requests the direction it actually supports: `POLLIN` for
+//! fd 0, `POLLOUT` for fd 1. Never the other way around — asking Darwin to
+//! register a read filter on fd 1 (a pipe *write* end) is asking for
+//! something that fd cannot do, which is exactly the kind of request that
+//! produces `POLLNVAL` (in `TERMINAL`) rather than being silently ignored,
+//! which would make the watchdog fire immediately and unconditionally at
+//! startup rather than only on a real close.
 //!
-//! `AsyncFd` requires the underlying fd to be `O_NONBLOCK`. Since
-//! `O_NONBLOCK` is a property of the *open file description*, not the fd
-//! number, setting it on fd 1 for this watchdog would make
-//! `resume_loop::pump_h2c`'s real `stdout` writes non-blocking too —
-//! surfacing a transient `WouldBlock` as a spurious `PumpFailure::Local`
-//! and exiting a healthy session on a partial write. A plain blocking
-//! `std::thread` avoids the question entirely.
+//! Requesting a "real" direction reintroduces the spurious-wakeup problem
+//! the `events: 0` draft existed to avoid, from **both** sides now, not just
+//! `POLLOUT`-on-fd-1: `poll()` is level-triggered and this thread never
+//! actually reads fd 0 (`resume_loop::pump_c2h` does, on a different
+//! thread), so `ssh(1)`'s own version banner sitting unread through the
+//! entire dial/handshake/`retry_while_busy_other_session` window — or any
+//! trzsz transfer's sustained inbound flow — would otherwise make `poll()`
+//! return `POLLIN` immediately, over and over, a hot 100%-CPU spin instead
+//! of a block (found by adversarial review, 2026-09-02, before it ever
+//! reached CI). The fix is the same for both directions: whenever `poll()`
+//! returns with no `TERMINAL` bit set, sleep [`SPURIOUS_BACKOFF`] before
+//! polling again, converting a spurious readiness of *either* kind into a
+//! bounded interval-poll at zero CPU between checks, rather than trying to
+//! special-case each direction's own spurious-wakeup source separately.
+//! [`SPURIOUS_BACKOFF`]'s length is a non-issue against the multi-day
+//! orphan window this whole module exists to bound.
+//!
+//! ## Why a dedicated thread, not `tokio::io::unix::AsyncFd`/`mio`
+//!
+//! Rust does have portable epoll/kqueue/IOCP abstractions (`mio`, and
+//! `tokio::io::unix::AsyncFd` built on it) — this module isn't hand-rolling
+//! `poll()` because those don't exist, but because they all require making
+//! the underlying fd `O_NONBLOCK` to register it for readiness
+//! notification, and that's a property of the *open file description*, not
+//! something scoped to just this module's own usage. Fd 1 isn't exclusively
+//! this module's to configure: `resume_loop::pump_h2c` does real, blocking
+//! writes to that same fd for the actual data plane, so registering it with
+//! `AsyncFd` would silently make those writes non-blocking too — surfacing
+//! a transient `WouldBlock` as a spurious `PumpFailure::Local` and exiting a
+//! healthy session on an ordinary partial write. A plain blocking
+//! `std::thread` calling raw `poll(2)` avoids the question entirely, at the
+//! cost of exactly the raw-syscall platform quirks (the Darwin `events: 0`
+//! gap above) a library like `mio` would otherwise have already solved.
 
 use tokio::sync::watch;
 
@@ -154,27 +190,38 @@ pub(crate) fn spawn() -> ParentGoneWatch {
     // normally (the OS tears down every thread, this one included) or this
     // thread itself drives that exit by sending on `tx` — there is no
     // third case where anything still needs to wait on it.
-    let spawned = std::thread::Builder::new().name("parent-watchdog".to_string()).spawn(move || watch_loop(tx, &[0, 1]));
+    let spawned = std::thread::Builder::new()
+        .name("parent-watchdog".to_string())
+        .spawn(move || watch_loop(tx, &[(0, libc::POLLIN), (1, libc::POLLOUT)]));
     if spawned.is_err() {
         log::warn!("isekai-pipe connect: failed to spawn the parent-liveness watchdog thread; falling back to reactive detection only");
     }
     rx
 }
 
-/// The actual `poll()` loop, over `fds` — production always passes `&[0,
-/// 1]` (this process's own stdin/stdout); tests pass a single throwaway
-/// pipe fd instead, so they exercise this exact function (its `TERMINAL`
-/// mask, its `EINTR` retry, its give-up path) rather than a hand-copied
-/// stand-in that could silently drift from it. An earlier draft of this
-/// module's own test did exactly that — reimplemented this loop inline
-/// instead of calling it — and a round of adversarial review flagged it as
-/// the same "test pins a copy, not the real function" mistake `resume_loop.rs`
-/// has already made and fixed once before (`effective_resume_window`,
-/// round 2 review of Epic R PR3).
+/// How long `watch_loop` sleeps after a `poll()` that returned with no
+/// `TERMINAL` bit set (i.e. the fd merely became readable/writable, not
+/// closed) before polling again — see the module doc's "why per-fd `events`,
+/// and why a sleep-guard" section for why this exists at all. Irrelevant
+/// against the multi-day orphan window this module exists to bound.
+const SPURIOUS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The actual `poll()` loop, over `fds` — each entry is `(fd, events)`;
+/// production always passes `&[(0, POLLIN), (1, POLLOUT)]` (this process's
+/// own stdin/stdout, each requesting the direction it actually supports —
+/// see the module doc); tests pass a single throwaway pipe fd instead, so
+/// they exercise this exact function (its `TERMINAL` mask, its `EINTR`
+/// retry, its give-up path, its `SPURIOUS_BACKOFF`) rather than a
+/// hand-copied stand-in that could silently drift from it. An earlier draft
+/// of this module's own test did exactly that — reimplemented this loop
+/// inline instead of calling it — and a round of adversarial review flagged
+/// it as the same "test pins a copy, not the real function" mistake
+/// `resume_loop.rs` has already made and fixed once before
+/// (`effective_resume_window`, round 2 review of Epic R PR3).
 #[cfg(unix)]
-fn watch_loop(tx: watch::Sender<bool>, fds: &[libc::c_int]) {
+fn watch_loop(tx: watch::Sender<bool>, fds: &[(libc::c_int, libc::c_short)]) {
     const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: 0, revents: 0 }).collect();
+    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect();
     loop {
         for pfd in &mut pollfds {
             pfd.revents = 0;
@@ -200,6 +247,13 @@ fn watch_loop(tx: watch::Sender<bool>, fds: &[libc::c_int]) {
             let _ = tx.send(true);
             return;
         }
+        // `ret > 0` here means some fd became ready in the direction we
+        // asked for (`POLLIN` data pending on fd 0, `POLLOUT` space
+        // available on fd 1) without anything terminal — spurious from this
+        // module's point of view. Sleeping instead of immediately polling
+        // again is what keeps this level-triggered loop from spinning; see
+        // the module doc.
+        std::thread::sleep(SPURIOUS_BACKOFF);
     }
 }
 
@@ -226,67 +280,100 @@ mod tests {
         (fds[0], fds[1])
     }
 
-    /// Runs the real `watch_loop` (not a hand-copied stand-in) on `watched`
-    /// in a background thread, and blocks (with a generous timeout) for it
-    /// to fire.
-    fn assert_watch_loop_fires(watched: libc::c_int) {
+    /// Runs the real `watch_loop` (not a hand-copied stand-in) on `watched`,
+    /// requesting `events`, in a background thread. First asserts it stays
+    /// quiet for a short window while `still_alive` is true (this is the
+    /// negative half — without it, a `watch_loop` that fired *unconditionally*
+    /// at startup, e.g. because Darwin turns an unsupported direction into an
+    /// immediate `POLLNVAL`, would make this test pass for the wrong reason;
+    /// found necessary by adversarial review, 2026-09-02, after the
+    /// `events: POLLIN`-on-fd-1 near-miss below), then calls `close_peer` and
+    /// asserts it fires within a generous timeout.
+    fn assert_watch_loop_stays_quiet_then_fires(watched: libc::c_int, events: libc::c_short, close_peer: impl FnOnce() + Send + 'static) {
         let (tx, mut rx) = watch::channel(false);
-        let handle = std::thread::spawn(move || watch_loop(tx, &[watched]));
+        let handle = std::thread::spawn(move || watch_loop(tx, &[(watched, events)]));
 
-        let fired = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await })
+            rt.block_on(async move {
+                let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), rx.changed()).await;
+                assert!(quiet.is_err(), "the watchdog must not fire while the peer is still alive");
+
+                close_peer();
+
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire)"),
+                    Err(_) => panic!("the watchdog did not fire within the timeout after the peer closed"),
+                }
+            });
         })
         .join()
         .unwrap();
-        match fired {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire)"),
-            Err(_) => panic!("the watchdog did not fire within the timeout"),
-        }
         handle.join().unwrap();
     }
 
     /// Regression test for the module's core claim: closing the *far* end
     /// of a pipe this process holds open must make the watchdog fire, even
-    /// though nothing is reading or writing at the time. This is the fd-0
-    /// direction (a pipe read end, whose writer closing raises `POLLHUP`) —
-    /// see the sibling test below for the fd-1 direction (`POLLERR`), which
-    /// is what real `ssh(1)` was actually measured to raise.
+    /// though nothing is reading or writing at the time — but not before.
+    /// This is the fd-0 direction (a pipe read end, requesting `POLLIN` —
+    /// see the sibling test below for the fd-1/`POLLOUT` direction).
     #[test]
     fn watch_loop_fires_on_pollhup_when_the_writer_closes_a_read_ends_peer() {
         let (read_fd, write_fd) = pipe_pair();
         // Closing the write end is what an externally-killed `ssh(1)`
         // effectively does to this process's stdin (fd 0, a pipe read end).
-        unsafe {
+        assert_watch_loop_stays_quiet_then_fires(read_fd, libc::POLLIN, move || unsafe {
             libc::close(write_fd);
-        }
-        assert_watch_loop_fires(read_fd);
+        });
         unsafe {
             libc::close(read_fd);
         }
     }
 
     /// The direction that actually matters in production: fd 1 (this
-    /// process's stdout) is a pipe *write* end, and real `ssh(1)` closing
-    /// its corresponding read end was measured (2026-09-02, real OpenSSH)
-    /// to raise `POLLERR`, **not** `POLLHUP` — a watchdog checking only
-    /// `POLLHUP` would silently never fire on this fd. Without this test,
-    /// nothing pinned that half of `TERMINAL`'s mask; a well-meaning
-    /// "simplification" to just `POLLHUP` would have kept the sibling test
-    /// above green while breaking fd-1 detection entirely (adversarial
-    /// review, 2026-09-02).
+    /// process's stdout) is a pipe *write* end, requesting `POLLOUT` (never
+    /// `POLLIN` — attaching a read filter to a write-only pipe end is
+    /// exactly the kind of request Darwin's `poll()`-via-`kqueue` shim was
+    /// suspected of turning into an immediate, unconditional `POLLNVAL`
+    /// fire — see `assert_watch_loop_stays_quiet_then_fires`'s own docs for
+    /// why the "stays quiet first" half of this test exists specifically to
+    /// catch that).
     #[test]
     fn watch_loop_fires_on_pollerr_when_the_reader_closes_a_write_ends_peer() {
         let (read_fd, write_fd) = pipe_pair();
         // Closing the read end is what an externally-killed `ssh(1)`
         // effectively does to this process's stdout (fd 1, a pipe write end).
-        unsafe {
+        assert_watch_loop_stays_quiet_then_fires(write_fd, libc::POLLOUT, move || unsafe {
             libc::close(read_fd);
-        }
-        assert_watch_loop_fires(write_fd);
+        });
         unsafe {
             libc::close(write_fd);
+        }
+    }
+
+    /// Regression test for the spurious-wakeup fix itself (the module doc's
+    /// "why a sleep-guard" section): `watch_loop` must not spin when its fd
+    /// becomes ready in its requested direction without ever closing. Sends
+    /// one byte into a pipe it's watching for `POLLIN` and confirms the
+    /// watchdog stays quiet well past one `SPURIOUS_BACKOFF` interval —
+    /// proving the loop actually slept and re-polled rather than either
+    /// firing on plain data (which would be wrong) or spinning (which an
+    /// external test can't directly measure as CPU usage, but can catch
+    /// indirectly here: a genuinely spinning loop still wouldn't fire
+    /// early, so this doesn't fully replace manually confirming CPU usage,
+    /// but does pin the "never treats readability alone as terminal" half).
+    #[test]
+    fn watch_loop_does_not_treat_plain_readability_as_terminal() {
+        let (read_fd, write_fd) = pipe_pair();
+        unsafe {
+            assert_eq!(libc::write(write_fd, b"x".as_ptr().cast(), 1), 1);
+        }
+        assert_watch_loop_stays_quiet_then_fires(read_fd, libc::POLLIN, move || unsafe {
+            libc::close(write_fd);
+        });
+        unsafe {
+            libc::close(read_fd);
         }
     }
 }
