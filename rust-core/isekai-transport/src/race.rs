@@ -128,7 +128,13 @@ pub async fn race_direct_and_relay(
 
     let direct_identity = CandidateIdentity { kind: "stun-p2p", source: "race", provider: "race", id: "direct" };
     let direct_fut = async {
-        connect_stun_p2p_with_round(factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity)
+        // `race_direct_and_relay` only keeps the winning candidate's raw
+        // `stream` (below), discarding everything else `StunP2pConnection`
+        // now carries (Epic R PR3) — this race has no resume/control-stream
+        // wiring of its own, so there is no grace period to request here,
+        // matching `connect_stun_p2p_on_socket`'s identical "no resume
+        // support on this path" `0` ("no preference").
+        connect_stun_p2p_with_round(factory, targets.stun_server, &targets.direct, session_id, generation, 0, direct_identity)
             .await
             .map(|conn| conn.stream)
     };

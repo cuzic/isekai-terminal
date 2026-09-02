@@ -51,7 +51,12 @@ struct ConnectLaunch {
     /// falling back to today's "close and RESUME" reconnect. See
     /// `run_resume_loop`'s module-level comment on why this needed a
     /// restructure rather than a one-line addition to the existing
-    /// `select!`.
+    /// `select!`. Has no effect on `--mode stun` (hardcoded to `false` for
+    /// that route, `resume_loop.rs`'s `run_stun_p2p_resumable`) for the same
+    /// reason `tethering_interface` below is forced off there: STUN P2P's
+    /// punched NAT mapping is tied to the exact socket used for
+    /// establishment, and a rebind would silently switch to a different one
+    /// with no re-punch to make it reachable.
     experimental_network_rebind: bool,
     /// `--relay-transport <udp|qmux>` (`#qmux-leg1`, default `Udp`): which
     /// transport this side uses to reach the relay-assigned `isekai-helper`
