@@ -3,6 +3,7 @@ mod ctl_file;
 mod engine;
 mod connect;
 mod inspect;
+mod parent_watchdog;
 mod probe;
 mod resume_loop;
 mod tty;
