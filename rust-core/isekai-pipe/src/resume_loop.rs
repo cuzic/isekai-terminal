@@ -560,6 +560,18 @@ fn clamp_resume_window(resume_window: Duration, max_resume_window: Option<Durati
     max_resume_window.map(|max| resume_window.min(max)).unwrap_or(resume_window)
 }
 
+/// `run_resume_loop`'s own resume-window computation, factored out so it has
+/// exactly one call site in production code and one in its test (round 3
+/// code review, significant finding on the first cut of this test): a test
+/// that merely *re-derived* `clamp_resume_window(resume_window_for(...), ...)`
+/// inline, rather than calling the same function `run_resume_loop` calls,
+/// couldn't actually catch a regression that dropped the clamp from
+/// `run_resume_loop` itself — it would keep passing because it never
+/// exercises that call site at all.
+fn effective_resume_window(effective_resume_grace_secs: u32, max_resume_window: Option<Duration>) -> Duration {
+    clamp_resume_window(resume_window_for(effective_resume_grace_secs), max_resume_window)
+}
+
 // ── tssh風のライブ再接続表示(`run_resume_loop`専用) ──────────────
 //
 // `isekai-pipe connect` は `ssh(1)` の ProxyCommand として起動され、OpenSSH の
@@ -1078,10 +1090,7 @@ pub(crate) async fn run_resume_loop(
     let session_id = established.session_id;
     drop(established.connection);
 
-    let resume_window = clamp_resume_window(
-        resume_window_for(established.effective_resume_grace_secs),
-        max_resume_window,
-    );
+    let resume_window = effective_resume_window(established.effective_resume_grace_secs, max_resume_window);
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1861,28 +1870,21 @@ mod tests {
             state.app_ack_tasks.abort();
         }
 
-        /// Round 3 code review, significant 1: the three `clamp_resume_window`
-        /// unit tests only cover the helper in isolation — none of them pin
-        /// `run_resume_loop`'s own call site (`resume_window = clamp_resume_window(
-        /// resume_window_for(established.effective_resume_grace_secs), max_resume_window)`).
-        /// A regression that threaded `max_resume_window` through to
-        /// `resume_with_backoff_until_deadline` (for `notify_on_give_up`) but
-        /// forgot to actually clamp `resume_window` with it would leave all
-        /// three unit tests green while silently restoring the exact
-        /// multi-day hang Task 3.4 exists to prevent.
-        ///
-        /// This test drives the *real* `resume_with_backoff_until_deadline`
-        /// (same proven fixture as the test above) with the window computed
-        /// via the identical composition `run_resume_loop` uses, for a
+        /// Round 3 code review, significant finding (revised after a second
+        /// round caught that the first cut of this test re-derived the
+        /// composition inline instead of calling `effective_resume_window`
+        /// — the same function `run_resume_loop` calls — which meant it
+        /// couldn't actually catch a regression that dropped the clamp from
+        /// `run_resume_loop` itself). The three `clamp_resume_window` unit
+        /// tests only cover that helper in isolation; this test additionally
+        /// pins `effective_resume_window` (the exact call `run_resume_loop`
+        /// makes) by driving the *real* `resume_with_backoff_until_deadline`
+        /// (same proven fixture as the test above) with its result, for a
         /// STUN-shaped scenario (a large server-granted grace, clamped down
         /// by a short `max_resume_window`) — and asserts the give-up error
-        /// reports the *clamped* window, not the unclamped one. If a future
-        /// change makes `run_resume_loop` skip the clamp, the equivalent
-        /// production error message would silently claim an hours-long
-        /// window was exceeded after only seconds; this test would need the
-        /// same skip to still pass, which is exactly what pins it.
+        /// reports the *clamped* window, not the unclamped one.
         #[tokio::test]
-        async fn run_resume_loop_style_window_computation_clamps_a_large_server_grace_for_stun() {
+        async fn effective_resume_window_clamp_reaches_the_real_give_up_message_for_stun() {
             let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
             let conn = connect(addr, cert_sha256_hex.clone()).await;
             let counters = Arc::new(AppAckCounters::new());
@@ -1912,21 +1914,27 @@ mod tests {
             // real relay/STUN peer with a generous `--resume-window` would.
             let server_granted_grace_secs: u32 = 6 * 60 * 60;
             let max_resume_window = Some(STUN_RESUME_GIVE_UP_WINDOW);
-            // `run_resume_loop`'s own composition, verbatim (resume_loop.rs's
-            // `run_resume_loop` body) — not a re-derivation of it.
-            let resume_window = clamp_resume_window(resume_window_for(server_granted_grace_secs), max_resume_window);
+            // The exact function `run_resume_loop` calls — not a
+            // re-derivation of its composition — so this test actually
+            // fails if a future change drops the clamp from that call site.
+            let resume_window = effective_resume_window(server_granted_grace_secs, max_resume_window);
             assert_eq!(resume_window, STUN_RESUME_GIVE_UP_WINDOW, "sanity check on the composition itself before using it below");
 
-            let disconnected_at = Instant::now() - (STUN_RESUME_GIVE_UP_WINDOW + Duration::from_secs(1));
-            let deadline = disconnected_at + resume_window; // already in the past
+            // `now` for both `disconnected_at` and `deadline`, exactly like
+            // the sibling test above — the give-up branch triggers on
+            // `now >= deadline`, and the message formats the `resume_window`
+            // *parameter* directly, not an elapsed delta, so there's no need
+            // to subtract from `Instant::now()` (which would panic on a host
+            // with under 121s of monotonic uptime).
+            let now = Instant::now();
 
             let result = resume_with_backoff_until_deadline(
                 &factory,
                 &target,
                 "test-profile",
                 resume_window,
-                disconnected_at,
-                deadline,
+                now,
+                now,
                 &mut state,
                 &None,
                 &mut monitor,
@@ -1934,7 +1942,9 @@ mod tests {
             )
             .await;
 
-            let err = result.expect_err("must give up immediately once the clamped (short) window is exceeded");
+            let Err(err) = result else {
+                panic!("must give up immediately once the clamped (short) window is exceeded");
+            };
             let message = format!("{err:#}");
             assert!(
                 message.contains(&format!("{STUN_RESUME_GIVE_UP_WINDOW:?}")),
