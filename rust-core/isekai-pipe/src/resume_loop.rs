@@ -1277,10 +1277,16 @@ pub(crate) async fn run_resume_loop(
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
-        let (outcome, c2h_already_done) = tokio::select! {
-            result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters) => result,
+        // `c2h_already_done` lives *outside* the `select!` (not as part of
+        // `run_data_pump`'s own return value) specifically so it survives
+        // `run_data_pump`'s future being cancelled when the
+        // `reconnect_signal_rx` branch wins instead — see `run_data_pump`'s
+        // docs (N3).
+        let mut c2h_already_done = false;
+        let outcome = tokio::select! {
+            result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters, &mut c2h_already_done) => result,
             Some(()) = reconnect_signal_rx.recv() => {
-                (Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting"))), false)
+                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting")))
             }
         };
         reconnect_signal_task.abort();
@@ -1296,14 +1302,29 @@ pub(crate) async fn run_resume_loop(
             }
             (Err(e), true) => {
                 // Deliberately does *not* reset `quic_write` (contrast the
-                // unconditional reset below) — letting it drop naturally at
-                // the end of this iteration sends a clean FIN via the
-                // underlying transport's own `Drop` impl (`finish()`),
-                // exactly like `pump_c2h`'s own stdin-EOF path already does.
-                // A reset here would make the server park this session for
-                // the full resume grace (`RelayOutcome::DataStreamDied`) for
-                // a connection nothing will ever resume — see
-                // `ParentGoneSignal`'s docs.
+                // unconditional reset below) — an explicit, *awaited*
+                // `shutdown()` instead, exactly like `pump_c2h`'s own
+                // stdin-EOF path, queues *and* gives the runtime a real
+                // poll to actually flush a clean FIN via the underlying
+                // transport. A bare `Drop` (an earlier draft of this fix)
+                // only queues `finish()` — nothing then polls the
+                // connection's driver task again before this function
+                // returns and its caller (`connect_command`) exits, so the
+                // FIN can lose an unsynchronized race against process
+                // teardown and never actually reach the wire (found by
+                // adversarial review, 2026-09-02, N2). A reset here would
+                // make the server park this session for the full resume
+                // grace (`RelayOutcome::DataStreamDied`) for a connection
+                // nothing will ever resume — see `ParentGoneSignal`'s docs.
+                // The short sleep afterward is defense-in-depth against the
+                // same uncertainty `connect_command`'s watchdog-triggered
+                // exit sleeps for: whether an awaited `shutdown()` returning
+                // actually means the FIN reached the wire, or only that it
+                // was accepted into the connection's local send queue,
+                // depends on details of the underlying `noq`/`qmux`
+                // transport this code doesn't rely on either way.
+                let _ = quic_write.shutdown().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 if let Some(t) = &warm_standby_task {
                     t.abort();
                 }
@@ -1383,15 +1404,24 @@ pub(crate) async fn run_resume_loop(
 
 /// Runs both pump directions until either both finish cleanly or one fails.
 ///
-/// The second element of the returned tuple is the **EOF-latch**: whether
-/// `pump_c2h` had already reached a clean stdin EOF (`c2h_done`) at the
-/// moment a failure occurred. `c2h_done` only ever becomes `true` via `res?`
-/// *not* short-circuiting, i.e. via `pump_c2h`'s own `Ok(())` — so it's a
-/// ready-made answer to "was the local producer already finished when this
-/// failed", with no extra bookkeeping needed. See `PumpFailure`'s docs for
-/// why this matters: a `Remote` failure in `pump_h2c` arriving after `pump_c2h`
-/// already cleanly finished means no local producer is left to resume for
-/// either way, the same conclusion a `Local` failure reaches directly.
+/// `c2h_already_done` is the **EOF-latch**'s state: set to `true` the
+/// instant `pump_c2h` itself resolves `Ok` (a clean stdin EOF), and never
+/// otherwise. Deliberately an out-parameter (`&mut bool`), not a second
+/// element of this function's own return value — a round of adversarial
+/// review found that shape (found 2026-09-02, N3) silently discards the
+/// latch: `run_resume_loop`'s outer `select!` also races
+/// `reconnect_signal_rx.recv()` against this whole function, and when
+/// *that* branch wins, this function's future — including whatever it
+/// would have returned — is simply dropped, never producing a value at
+/// all. Writing through `&mut bool` instead means the mutation already
+/// happened, synchronously, at the moment `pump_c2h` finished — regardless
+/// of whether this function's *own* future is later cancelled by the
+/// sibling branch winning the outer race — so the caller's copy of the flag
+/// is correct either way. See `PumpFailure`'s docs for why the latch
+/// matters: a `Remote` failure (from `pump_h2c`, or the network-change
+/// signal) arriving after `pump_c2h` already cleanly finished means no
+/// local producer is left to resume for either way, the same conclusion a
+/// `Local` failure reaches directly.
 async fn run_data_pump(
     stdin: &mut (impl AsyncRead + Unpin),
     stdout: &mut (impl AsyncWrite + Unpin),
@@ -1399,31 +1429,27 @@ async fn run_data_pump(
     quic_write: &mut AnyByteStreamWriteHalf,
     replay: &Arc<Mutex<C2hReplayBuffer>>,
     counters: &Arc<AppAckCounters>,
-) -> (Result<(), PumpFailure>, bool) {
+    c2h_already_done: &mut bool,
+) -> Result<(), PumpFailure> {
     let c2h_fut = pump_c2h(stdin, quic_write, replay.clone(), counters.clone());
     let h2c_fut = pump_h2c(quic_read, stdout, counters.clone());
     tokio::pin!(c2h_fut);
     tokio::pin!(h2c_fut);
 
-    let mut c2h_done = false;
     let mut h2c_done = false;
     loop {
         tokio::select! {
-            res = &mut c2h_fut, if !c2h_done => {
-                if let Err(e) = res {
-                    return (Err(e), c2h_done);
-                }
-                c2h_done = true;
+            res = &mut c2h_fut, if !*c2h_already_done => {
+                res?;
+                *c2h_already_done = true;
             }
             res = &mut h2c_fut, if !h2c_done => {
-                if let Err(e) = res {
-                    return (Err(e), c2h_done);
-                }
+                res?;
                 h2c_done = true;
             }
         }
-        if c2h_done && h2c_done {
-            return (Ok(()), c2h_done);
+        if *c2h_already_done && h2c_done {
+            return Ok(());
         }
     }
 }

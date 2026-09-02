@@ -108,16 +108,30 @@ use tokio::sync::watch;
 /// (the `resume_loop` EOF-latch is the fallback there).
 pub(crate) type ParentGoneWatch = watch::Receiver<bool>;
 
-/// Waits for the watchdog to fire. Exists mainly so callers don't need to
-/// import `tokio::sync::watch` themselves just to write `.changed().await`.
+/// Waits for the watchdog to fire — resolves once `*rx.borrow() == true`,
+/// never before.
+///
+/// Deliberately **not** `let _ = rx.changed().await;` (an earlier, wrong
+/// draft — found by adversarial review, 2026-09-02): `changed()` also
+/// returns (as `Err`) the instant every sender is dropped, which happens on
+/// two reachable paths that mean the *opposite* of "the parent is gone" —
+/// `spawn`'s watchdog thread failing to start at all (fd/memory exhaustion),
+/// and `watch_loop`'s own `poll()` call failing unexpectedly and giving up.
+/// Both drop `tx` without ever sending `true`. Treating that the same as a
+/// real fire made `connect_command`'s `select!` abort the connection
+/// immediately in the first case, and abort a healthy mid-session pump in
+/// the second — exactly backwards from those paths' own "fail open, fall
+/// back to reactive detection" comments. Looping on `changed()` and checking
+/// the actual value, then pending forever once the channel closes without
+/// ever having fired, fixes both: a closed-without-firing channel now
+/// correctly means "no additional signal available," not "parent gone."
 pub(crate) async fn wait(rx: &mut ParentGoneWatch) {
-    // `changed()` only errors if every sender was dropped — the Unix
-    // `spawn`'s watchdog thread holds its sender for the life of the
-    // process (or until it fires), and the non-Unix `spawn` deliberately
-    // leaks its sender (see that function's docs), so this never actually
-    // returns `Err` in practice; treating it the same as a real fire is the
-    // conservative choice.
-    let _ = rx.changed().await;
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
 }
 
 #[cfg(unix)]
@@ -168,16 +182,14 @@ fn watch_loop(tx: watch::Sender<bool>) {
 
 #[cfg(not(unix))]
 pub(crate) fn spawn() -> ParentGoneWatch {
-    let (tx, rx) = watch::channel(false);
     // No `poll()`-equivalent this module implements on non-Unix targets
-    // today (see module docs) — leak the sender so the channel stays open
-    // (an immediately-closed channel would make `wait` return right away,
-    // which would be indistinguishable from a real fire) but never sends.
-    // This is the MSYS2/Cygwin-hosted `ssh.exe` case in practice: the
-    // spawned `isekai-pipe connect` there is a native Windows binary with
-    // no `poll(2)`, so `resume_loop`'s EOF-latch is the only signal
-    // available.
-    std::mem::forget(tx);
+    // today (see module docs) — dropping `tx` immediately closes the
+    // channel, which `wait` now correctly treats as "no signal available,
+    // never fires" rather than a real fire (see `wait`'s docs, N1). This is
+    // the MSYS2/Cygwin-hosted `ssh.exe` case in practice: the spawned
+    // `isekai-pipe connect` there is a native Windows binary with no
+    // `poll(2)`, so `resume_loop`'s EOF-latch is the only signal available.
+    let (_tx, rx) = watch::channel(false);
     rx
 }
 

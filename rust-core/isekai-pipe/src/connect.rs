@@ -459,14 +459,28 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     // why a blocking `poll()` rather than reacting only inside the pump
     // (`resume_loop::PumpFailure`) or a kernel parent-death primitive.
     // Losing this race drops `run_connect`'s future in place, which
-    // recursively drops any live QUIC stream — sending a clean FIN via the
-    // transport's own `Drop` impl, exactly like a normal stdin-EOF exit
-    // (see `resume_loop::ParentGoneSignal`'s docs for why that matters more
-    // than it might look).
+    // recursively drops any live QUIC stream, queuing a clean FIN via the
+    // transport's own `Drop` impl (`finish()`) — but `finish()` only
+    // *queues* it; nothing else here polls the connection's driver task
+    // again before this function returns, so without the grace sleep below,
+    // whether it ever actually reaches the wire would be an unsynchronized
+    // race against this process exiting (found by adversarial review,
+    // 2026-09-02, N2 — see `resume_loop::ParentGoneSignal`'s docs for why a
+    // FIN that never reaches the server matters: it takes the exact same
+    // path as an abrupt kill, parking the session for the full resume grace
+    // instead of tearing it down immediately).
     let mut parent_gone = crate::parent_watchdog::spawn();
     let result = tokio::select! {
         result = run_connect(launch) => result,
         () = crate::parent_watchdog::wait(&mut parent_gone) => {
+            // Give the runtime a real chance to poll the (still-running,
+            // independent of the just-dropped connection object) endpoint
+            // driver task and actually flush the queued FIN before this
+            // process exits. Bounded and best-effort: if the driver hasn't
+            // sent it within this window, giving up is still strictly
+            // better than blocking the whole "local peer is gone" exit
+            // indefinitely on a server round-trip that may never come.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Err(anyhow::anyhow!(
                 "isekai-pipe connect: the local peer (most likely ssh(1)) is gone; giving up \
                  rather than continuing to dial/resume"
