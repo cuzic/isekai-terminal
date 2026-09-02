@@ -27,8 +27,10 @@
 //!   `connect_stun_p2p` must already know `target.peer_addr` by whatever
 //!   means (a future `isekai-bootstrap`/`isekai-ssh` wiring, S-6) — this
 //!   crate does not know how to reach a bootstrap channel.
-//! - `resume_client::ClientResumeState`/`reattach_fn`/the control stream —
-//!   resume support lands in S-4a onward.
+//! - Full re-rendezvous after both peers' observed addresses change. This
+//!   module can resume by redialing the already-known peer address, but it
+//!   still has no bootstrap/signaling channel that would teach the server a
+//!   new client address and make it punch back.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -40,7 +42,7 @@ use isekai_protocol::session_id::SessionId;
 
 use isekai_protocol::hello::Proof;
 
-use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, RemoteSpec};
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, AnyMuxRebinder, RemoteSpec};
 
 use crate::attempt::AttemptFailure;
 use crate::error::TransportError;
@@ -82,13 +84,17 @@ pub struct StunP2pTarget {
 }
 
 /// Result of a successful `connect_stun_p2p` call: the HELLO/ACK'd byte
-/// stream, plus this side's own STUN-observed address — in case the caller
-/// still needs to hand it to a signaling/bootstrap channel. Producing that
-/// value is this crate's job; wiring it anywhere is not
-/// (`archive/ISEKAI_SSH_DESIGN.md` S-6).
+/// stream and resume material, plus this side's own STUN-observed address —
+/// in case the caller still needs to hand it to a signaling/bootstrap
+/// channel. Producing that value is this crate's job; wiring it anywhere is
+/// not (`archive/ISEKAI_SSH_DESIGN.md` S-6).
 pub struct StunP2pConnection {
     pub our_observed_addr: SocketAddr,
+    pub connection: AnyMuxConnection,
     pub stream: AnyByteStream,
+    pub proof: Proof,
+    pub effective_resume_grace_secs: u32,
+    pub network_rebinder: Option<AnyMuxRebinder>,
 }
 
 /// Binds a fresh UDP socket, queries `stun_server` for this socket's own
@@ -107,9 +113,10 @@ pub async fn connect_stun_p2p(
     factory: &AnyMuxFactory,
     stun_server: SocketAddr,
     target: &StunP2pTarget,
+    requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, TransportError> {
-    connect_stun_p2p_with_round(factory, stun_server, target, random_session_id(), ConnectionGeneration::INITIAL, identity)
+    connect_stun_p2p_with_round(factory, stun_server, target, random_session_id(), ConnectionGeneration::INITIAL, requested_resume_grace_secs, identity)
         .await
         .map_err(AttemptFailure::into_source)
 }
@@ -143,7 +150,8 @@ pub async fn connect_stun_p2p_on_socket(
         server_name: target.server_name.clone(),
         cert_sha256_hex: target.cert_sha256_hex.clone(),
     };
-    // No resume support on this path either (module docs) — `0` ("no preference").
+    // Android's on-socket path owns its resume wiring outside this CLI
+    // helper flow; keep the request at `0` ("no preference") here.
     let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
         &endpoint, remote, &target.session_secret, random_session_id(), ConnectionGeneration::INITIAL, 0, identity,
     )
@@ -179,9 +187,8 @@ pub struct SequentialStunCandidate {
 /// [`crate::resume::SequentialConnectError`] itself, reused as-is rather
 /// than duplicated under a STUN-specific enum: `NoCandidates`/
 /// `AllCandidatesFailed`/`StoppedEarly` are the only variants this STUN path
-/// ever constructs (it has no resume/control-stream concept to produce
-/// `AttachedButControlStreamFailed`/`MustResumeButResumeFailed`/
-/// `GaveUpAfterGenerationRetries` from — see that type's own docs), so a
+/// ever constructs (it only performs initial STUN establishment; the caller
+/// wires the returned connection/proof into the resume loop afterward), so a
 /// verbatim-duplicated 3-variant subset (formerly its own
 /// `SequentialStunConnectError` enum here, complete with copy-pasted
 /// `Display`/`is_stale_trust_signal` impls) bought nothing over reusing the
@@ -196,8 +203,8 @@ pub type SequentialStunConnectError = crate::resume::SequentialConnectError;
 /// `resume::connect_via_relay_resumable_with_fallback`'s original (`#12`)
 /// simplicity rather than its later (`#25`) generation-retry/`MustResume`
 /// convergence machinery, since that machinery exists specifically to
-/// recover a relay session via `RESUME`, and STUN P2P has no such resume path
-/// (module docs).
+/// recover after an ambiguous first attach. STUN P2P callers resume only
+/// after this function returns a successfully established connection.
 ///
 /// Every candidate in one call shares the same `session_id`/
 /// `ConnectionGeneration::INITIAL` (`#18-5`'s fencing identity) so the peer
@@ -207,6 +214,7 @@ pub async fn connect_stun_p2p_with_fallback(
     factory: &AnyMuxFactory,
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
+    requested_resume_grace_secs: u32,
 ) -> Result<(StunP2pConnection, SocketAddr), crate::resume::SequentialConnectError> {
     if candidates.is_empty() {
         return Err(crate::resume::SequentialConnectError::NoCandidates);
@@ -223,7 +231,13 @@ pub async fn connect_stun_p2p_with_fallback(
             id: &candidate.candidate_id,
         };
         match connect_stun_p2p_with_round(
-            factory, candidate.stun_server, target, session_id, ConnectionGeneration::INITIAL, identity,
+            factory,
+            candidate.stun_server,
+            target,
+            session_id,
+            ConnectionGeneration::INITIAL,
+            requested_resume_grace_secs,
+            identity,
         )
         .await
         {
@@ -247,6 +261,7 @@ pub(crate) async fn connect_stun_p2p_with_round(
     target: &StunP2pTarget,
     session_id: SessionId,
     generation: ConnectionGeneration,
+    requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, AttemptFailure> {
     let bind_addr = quicmux::BindSpec::any_ipv4().local_addr;
@@ -286,14 +301,24 @@ pub(crate) async fn connect_stun_p2p_with_round(
         server_name: target.server_name.clone(),
         cert_sha256_hex: target.cert_sha256_hex.clone(),
     };
-    // No resume support on this path (module docs), so there is no grace
-    // period to request — `0` ("no preference").
-    let (_conn, stream, _proof, _effective_resume_grace_secs) =
-        connect_and_handshake(&endpoint, remote, &target.session_secret, session_id, generation, 0, identity)
+    let (connection, stream, proof, effective_resume_grace_secs) =
+        connect_and_handshake(&endpoint, remote, &target.session_secret, session_id, generation, requested_resume_grace_secs, identity)
             .await
             .map_err(AttemptFailure::from)?;
 
-    Ok(StunP2pConnection { our_observed_addr, stream })
+    // Taken before `endpoint` goes out of scope, matching
+    // `resume::connect_via_relay_resumable`: the rebinder clones the
+    // endpoint handle it needs to remain usable after this function returns.
+    let network_rebinder = endpoint.rebinder();
+
+    Ok(StunP2pConnection {
+        our_observed_addr,
+        connection,
+        stream,
+        proof,
+        effective_resume_grace_secs,
+        network_rebinder,
+    })
 }
 
 // `is_stale_trust_signal`/`Display` coverage for the `NoCandidates`/

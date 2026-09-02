@@ -61,11 +61,11 @@
 //! - `--via` bootstrap/distribution, and the SSH-bootstrap exchange of STUN
 //!   observed addresses between peers (a separate crate, `isekai-bootstrap`,
 //!   S-0e/S-6).
-//! - Resuming a `--mode stun` (STUN+SSH rendezvous P2P) connection — `resume`
-//!   is currently only wired up for the relay path (`RelayTarget`); STUN
-//!   mode's own known limitation (no recovery from NAT mapping loss) makes
-//!   this lower priority, and is left as a follow-up (see
-//!   `archive/ISEKAI_SSH_DESIGN.md`'s "isekai-sshでのNAT越え方式の既定").
+//! - Full re-rendezvous for `--mode stun` (STUN+SSH rendezvous P2P) after
+//!   both peers' observed addresses change. The CLI can resume by redialing
+//!   the already-known server-side address, but it still has no bootstrap
+//!   signaling channel that would exchange fresh observed addresses and
+//!   cause the server to punch back.
 //!
 //! This crate must never depend on UniFFI, Android-specific types, or
 //! `isekai-terminal-core` itself — see `quicmux`'s own module docs for the
