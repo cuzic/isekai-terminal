@@ -88,6 +88,28 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// reachable; once that boundary is hit, the wrapper should retry a fresh
 /// STUN establishment rather than silently wait for the much longer server
 /// resume-grace.
+///
+/// Attached to a *resume-exhaustion* error, not to a pump error: by the time
+/// `run_resume_loop` returns `Err`, its own pump result has already been
+/// discarded (only `is_ok()` is tested) and the error being wrapped was
+/// manufactured by `resume_with_backoff_until_deadline`'s give-up. So the
+/// round-2 concern about misclassifying a local-side failure (`ssh(1)` exited
+/// and closed the pipe this process writes stdout into) as a network
+/// disconnection does not apply to this placement the way it did to
+/// `relay_stdio`, where local and remote I/O errors both propagated directly
+/// out as the returned `Err` and marker scoping was the only discriminator: a
+/// local-side failure can only reach this marker by *also* failing every
+/// resume attempt for the full window, by which point the network genuinely
+/// is down and `MidSessionDisconnect` is the correct classification anyway.
+///
+/// What a local-side failure with a *healthy* network produces instead is a
+/// reconnect loop — the pump fails, the resume succeeds, `disconnected_since`
+/// resets so the give-up clock never accumulates, and the helper replays the
+/// same bytes that failed the stdout write. That behavior lives in
+/// `run_resume_loop` itself and is shared verbatim with the relay route (it
+/// predates Epic R); its lifetime is bounded only by whether `ssh(1)` reaps
+/// its `ProxyCommand` child, which is Task 2.9's still-open orphaning
+/// question. See <https://github.com/cuzic/isekai-terminal/issues/111>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
 
