@@ -453,7 +453,27 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
         }
     }
     let mut panic_guard = PanicOutcomeGuard { profile: &profile_for_outcome, armed: true };
-    let result = run_connect(launch).await;
+    // Task 2.9 / issue #111: races the *entire* dial/handshake/resume-loop
+    // future against a watchdog that fires once this process's local peer
+    // (normally `ssh(1)`) is gone — see `parent_watchdog`'s module docs for
+    // why a blocking `poll()` rather than reacting only inside the pump
+    // (`resume_loop::PumpFailure`) or a kernel parent-death primitive.
+    // Losing this race drops `run_connect`'s future in place, which
+    // recursively drops any live QUIC stream — sending a clean FIN via the
+    // transport's own `Drop` impl, exactly like a normal stdin-EOF exit
+    // (see `resume_loop::ParentGoneSignal`'s docs for why that matters more
+    // than it might look).
+    let mut parent_gone = crate::parent_watchdog::spawn();
+    let result = tokio::select! {
+        result = run_connect(launch) => result,
+        () = crate::parent_watchdog::wait(&mut parent_gone) => {
+            Err(anyhow::anyhow!(
+                "isekai-pipe connect: the local peer (most likely ssh(1)) is gone; giving up \
+                 rather than continuing to dial/resume"
+            )
+            .context(crate::resume_loop::ParentGoneSignal))
+        }
+    };
     panic_guard.armed = false;
 
     match result {
@@ -485,7 +505,21 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
 /// nowhere useful to write to. Failure to write is logged and swallowed:
 /// this must never change `connect_command`'s own exit code or touch
 /// stdout (stdout purity is a separately-tested hard invariant elsewhere).
+///
+/// Writes nothing at all — not even `Unreachable` — when `err` carries
+/// `resume_loop::ParentGoneSignal` (Task 2.9 / issue #111): see that
+/// marker's own docs for why. In short, on the relay route (which attaches
+/// no `MidSessionDisconnectSignal`) an unmarked local/watchdog-triggered
+/// error would otherwise be recorded `Unreachable`, driving
+/// `wrapper.rs::decide_connect_failure_recovery` to `RebootstrapAndRetry` —
+/// an arm with no guard against re-running a non-idempotent remote command,
+/// unlike `RetryConnectLightweight`'s B5 guard — for a failure whose only
+/// real cause is "the `ssh(1)` session this ran under is already gone",
+/// where no re-deploy or retry is a meaningful response anyway.
 fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
+    if err.downcast_ref::<crate::resume_loop::ParentGoneSignal>().is_some() {
+        return;
+    }
     let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") else { return };
     let intent_id = intent_id.to_string_lossy().into_owned();
     let Ok(runtime_dir) = default_runtime_dir() else {
@@ -1494,5 +1528,49 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(rendered.contains("simulated STUN failure"), "{rendered}");
         assert!(rendered.contains("cross-family relay fallback also failed"), "{rendered}");
+    }
+
+    /// Task 2.9 / issue #111: `resume_loop::ParentGoneSignal` must suppress
+    /// the connect-outcome file entirely, not just steer its `class` — see
+    /// `write_connect_outcome_for_wrapper`'s docs for why (an unmarked
+    /// `Unreachable` on the relay route can drive an unwanted
+    /// `RebootstrapAndRetry`/non-idempotent-command-rerun hazard). Checked
+    /// against a real filesystem write/no-write, not just the classification
+    /// branch, since that's the property the wrapper actually observes.
+    #[test]
+    fn write_connect_outcome_for_wrapper_writes_nothing_for_a_parent_gone_error() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "isekai-pipe-connect-outcome-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::env::set_var("ISEKAI_PIPE_RUNTIME_DIR", &runtime_dir);
+
+        // Baseline: an ordinary error (no marker) for a first intent_id must
+        // still produce a claimable outcome — proves this test's own
+        // plumbing (env vars, runtime_dir) actually reaches
+        // `write_connect_outcome_for_wrapper`'s real write path, so the
+        // *absence* of a file for the second intent_id below is meaningful
+        // rather than an artifact of a broken test setup.
+        std::env::set_var("ISEKAI_INTENT_ID", "test-intent-baseline");
+        write_connect_outcome_for_wrapper("test-profile", &anyhow::anyhow!("ordinary unreachable failure"));
+        let baseline = isekai_pipe_core::claim_connect_outcome(&runtime_dir, "test-intent-baseline").unwrap();
+        assert!(baseline.is_some(), "the baseline (unmarked) error must still produce a claimable outcome file");
+
+        // The actual assertion: a `ParentGoneSignal`-marked error for a
+        // *different* intent_id must produce no file at all.
+        std::env::set_var("ISEKAI_INTENT_ID", "test-intent-parent-gone");
+        write_connect_outcome_for_wrapper(
+            "test-profile",
+            &anyhow::anyhow!("local peer gone").context(crate::resume_loop::ParentGoneSignal),
+        );
+        let parent_gone = isekai_pipe_core::claim_connect_outcome(&runtime_dir, "test-intent-parent-gone").unwrap();
+        assert!(parent_gone.is_none(), "a ParentGoneSignal-marked error must not write any connect outcome");
+
+        std::env::remove_var("ISEKAI_INTENT_ID");
+        std::env::remove_var("ISEKAI_PIPE_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 }
