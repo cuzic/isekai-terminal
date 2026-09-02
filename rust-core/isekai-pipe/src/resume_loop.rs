@@ -1260,6 +1260,18 @@ pub(crate) async fn run_resume_loop(
         })
     });
 
+    // `c2h_already_done` lives here — outside the `loop` below, and never
+    // reset back to `false` once set — not just outside the inner
+    // `select!`. It's a permanent property of this process's own stdin
+    // (once the underlying fd hits EOF, every subsequent read sees EOF
+    // again too), so re-deriving it fresh each generation would only be
+    // correct if `pump_c2h`'s read were guaranteed to be polled at least
+    // once before any sibling future could fail first in the *next*
+    // generation's `select!` — `tokio::select!` polls its branches in
+    // random order for fairness, so that's not guaranteed. Declaring it
+    // once, set-only-to-true, sidesteps needing that guarantee (found by
+    // adversarial review, 2026-09-02, N3's follow-up).
+    let mut c2h_already_done = false;
     loop {
         // See `spawn_reconnect_signal`'s docs for the full design rationale
         // (this replaces what used to be a single `network_monitor` shared
@@ -1277,12 +1289,10 @@ pub(crate) async fn run_resume_loop(
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
-        // `c2h_already_done` lives *outside* the `select!` (not as part of
-        // `run_data_pump`'s own return value) specifically so it survives
-        // `run_data_pump`'s future being cancelled when the
-        // `reconnect_signal_rx` branch wins instead — see `run_data_pump`'s
-        // docs (N3).
-        let mut c2h_already_done = false;
+        // Passed to `run_data_pump` as `&mut` (not as part of its own
+        // return value) specifically so it survives `run_data_pump`'s
+        // future being cancelled when the `reconnect_signal_rx` branch wins
+        // instead — see `run_data_pump`'s docs (N3).
         let outcome = tokio::select! {
             result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters, &mut c2h_already_done) => result,
             Some(()) = reconnect_signal_rx.recv() => {
@@ -1302,29 +1312,29 @@ pub(crate) async fn run_resume_loop(
             }
             (Err(e), true) => {
                 // Deliberately does *not* reset `quic_write` (contrast the
-                // unconditional reset below) — an explicit, *awaited*
-                // `shutdown()` instead, exactly like `pump_c2h`'s own
-                // stdin-EOF path, queues *and* gives the runtime a real
-                // poll to actually flush a clean FIN via the underlying
-                // transport. A bare `Drop` (an earlier draft of this fix)
-                // only queues `finish()` — nothing then polls the
-                // connection's driver task again before this function
-                // returns and its caller (`connect_command`) exits, so the
-                // FIN can lose an unsynchronized race against process
-                // teardown and never actually reach the wire (found by
-                // adversarial review, 2026-09-02, N2). A reset here would
-                // make the server park this session for the full resume
-                // grace (`RelayOutcome::DataStreamDied`) for a connection
-                // nothing will ever resume — see `ParentGoneSignal`'s docs.
-                // The short sleep afterward is defense-in-depth against the
-                // same uncertainty `connect_command`'s watchdog-triggered
-                // exit sleeps for: whether an awaited `shutdown()` returning
-                // actually means the FIN reached the wire, or only that it
-                // was accepted into the connection's local send queue,
-                // depends on details of the underlying `noq`/`qmux`
-                // transport this code doesn't rely on either way.
+                // unconditional reset below) — an explicit `shutdown()`
+                // instead, matching `pump_c2h`'s own stdin-EOF path, queues
+                // a clean FIN via the underlying transport rather than the
+                // reset's error signal. A reset here would make the server
+                // park this session for the full resume grace
+                // (`RelayOutcome::DataStreamDied`) for a connection nothing
+                // will ever resume — see `ParentGoneSignal`'s docs.
+                //
+                // NOTE: `shutdown()` only *queues* the FIN — verified
+                // against noq's actual `poll_shutdown` (adversarial review,
+                // 2026-09-02, N2), it resolves `Poll::Ready` immediately
+                // without waiting for the connection driver to actually put
+                // the FIN on the wire, so `.await`ing it doesn't even yield
+                // to the scheduler. It is *not* what makes this path
+                // reliable — it's kept for parity with `pump_c2h`'s pattern
+                // and because queuing the right frame (FIN, not reset) is
+                // still necessary, just not sufficient. The actual flush
+                // opportunity is the bounded sleep `connect_command`
+                // performs once this error (tagged `ParentGoneSignal`)
+                // reaches it, regardless of whether it came from here or
+                // from the watchdog directly — seeing this comment without
+                // that sleep in place means the fix regressed.
                 let _ = quic_write.shutdown().await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
                 if let Some(t) = &warm_standby_task {
                     t.abort();
                 }

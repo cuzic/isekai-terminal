@@ -460,27 +460,11 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     // (`resume_loop::PumpFailure`) or a kernel parent-death primitive.
     // Losing this race drops `run_connect`'s future in place, which
     // recursively drops any live QUIC stream, queuing a clean FIN via the
-    // transport's own `Drop` impl (`finish()`) — but `finish()` only
-    // *queues* it; nothing else here polls the connection's driver task
-    // again before this function returns, so without the grace sleep below,
-    // whether it ever actually reaches the wire would be an unsynchronized
-    // race against this process exiting (found by adversarial review,
-    // 2026-09-02, N2 — see `resume_loop::ParentGoneSignal`'s docs for why a
-    // FIN that never reaches the server matters: it takes the exact same
-    // path as an abrupt kill, parking the session for the full resume grace
-    // instead of tearing it down immediately).
+    // transport's own `Drop` impl (`finish()`).
     let mut parent_gone = crate::parent_watchdog::spawn();
     let result = tokio::select! {
         result = run_connect(launch) => result,
         () = crate::parent_watchdog::wait(&mut parent_gone) => {
-            // Give the runtime a real chance to poll the (still-running,
-            // independent of the just-dropped connection object) endpoint
-            // driver task and actually flush the queued FIN before this
-            // process exits. Bounded and best-effort: if the driver hasn't
-            // sent it within this window, giving up is still strictly
-            // better than blocking the whole "local peer is gone" exit
-            // indefinitely on a server round-trip that may never come.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Err(anyhow::anyhow!(
                 "isekai-pipe connect: the local peer (most likely ssh(1)) is gone; giving up \
                  rather than continuing to dial/resume"
@@ -490,8 +474,51 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     };
     panic_guard.armed = false;
 
+    // Checked on the *error value*, not on which `select!` branch above
+    // won: `run_resume_loop`'s own in-loop give-up path (`resume_loop.rs`,
+    // its `PumpFailure`/EOF-latch handling) also attaches
+    // `ParentGoneSignal` and returns through the `result = run_connect(...)`
+    // branch, not the watchdog branch — a grace sleep scoped to only the
+    // watchdog branch would miss it entirely (adversarial review,
+    // 2026-09-02, N2's follow-up).
+    let is_parent_gone = matches!(&result, Err(e) if e.downcast_ref::<crate::resume_loop::ParentGoneSignal>().is_some());
+    if is_parent_gone {
+        // Neither a bare `Drop`-queued `finish()` (the watchdog branch
+        // above) nor an explicitly awaited `shutdown()`
+        // (`resume_loop::run_resume_loop`'s give-up branch — its own
+        // `poll_shutdown` resolves `Poll::Ready` immediately without
+        // waiting on the connection driver, confirmed against noq's actual
+        // source) guarantees the FIN reaches the wire before this process
+        // exits — both only *queue* it. This bounded, best-effort sleep is
+        // what actually gives the still-running (independent of whichever
+        // connection object just got dropped/shut down) endpoint driver
+        // task a real scheduler turn to flush it (adversarial review,
+        // 2026-09-02, N2). If it hasn't gone out within this window, giving
+        // up is still strictly better than blocking the whole "local peer
+        // is gone" exit indefinitely on a server round-trip that may never
+        // come — see `resume_loop::ParentGoneSignal`'s docs for why a FIN
+        // that never reaches the server matters (it takes the exact same
+        // path as an abrupt kill, parking the session for the full resume
+        // grace instead of tearing it down immediately).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if is_parent_gone => {
+            // Never print this one to the user's terminal (`connect`'s
+            // stderr is inherited from `ssh(1)`'s own, i.e. the user's real
+            // terminal, or a `--isekai-log-file` that accumulates across
+            // sessions) — the watchdog reliably wins the race against the
+            // clean-EOF path's own full network round trip, so on an
+            // *ordinary* `exit`/logout this is actually the common case,
+            // not a rare failure worth surfacing (adversarial review,
+            // 2026-09-02, N2's follow-up). `write_connect_outcome_for_wrapper`
+            // still no-ops on its own `ParentGoneSignal` check — called here
+            // anyway to keep this arm's shape uniform with the one below.
+            write_connect_outcome_for_wrapper(&profile_for_outcome, &e);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("{e:?}");
             write_connect_outcome_for_wrapper(&profile_for_outcome, &e);

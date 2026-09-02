@@ -137,30 +137,52 @@ pub(crate) async fn wait(rx: &mut ParentGoneWatch) {
 #[cfg(unix)]
 pub(crate) fn spawn() -> ParentGoneWatch {
     let (tx, rx) = watch::channel(false);
+    // Leak a clone of `tx` so the channel can never close *without* firing
+    // — both of `watch_loop`'s own give-up paths below (an unexpected
+    // `poll()` error) and this function's own thread-spawn-failure path
+    // drop their copy of `tx` without ever sending `true`, meaning they are
+    // meant to fail *open* ("no additional signal available on this run,
+    // defer to the reactive fallback") — but `wait()` cannot otherwise tell
+    // that apart from a real fire, since `changed()` also returns once
+    // every sender is gone (found by adversarial review, 2026-09-02, N1 /
+    // "Blocking 2": both paths' own comments already said "fail open," but
+    // the actual effect was the opposite — an immediate or spurious
+    // mid-session fire). This leaked clone is exactly the same trick the
+    // non-Unix `spawn` below already used for the same reason.
+    std::mem::forget(tx.clone());
     // Deliberately not joined/cancelled anywhere: the process either exits
     // normally (the OS tears down every thread, this one included) or this
     // thread itself drives that exit by sending on `tx` — there is no
     // third case where anything still needs to wait on it.
-    let spawned = std::thread::Builder::new().name("parent-watchdog".to_string()).spawn(move || watch_loop(tx));
+    let spawned = std::thread::Builder::new().name("parent-watchdog".to_string()).spawn(move || watch_loop(tx, &[0, 1]));
     if spawned.is_err() {
-        // Spawning a plain OS thread failing at all is itself a sign of a
-        // process in serious trouble (fd/memory exhaustion) — fail open:
-        // the reactive PumpFailure/EOF-latch mechanisms remain as a
-        // fallback, same as the non-Unix stub below.
         log::warn!("isekai-pipe connect: failed to spawn the parent-liveness watchdog thread; falling back to reactive detection only");
     }
     rx
 }
 
+/// The actual `poll()` loop, over `fds` — production always passes `&[0,
+/// 1]` (this process's own stdin/stdout); tests pass a single throwaway
+/// pipe fd instead, so they exercise this exact function (its `TERMINAL`
+/// mask, its `EINTR` retry, its give-up path) rather than a hand-copied
+/// stand-in that could silently drift from it. An earlier draft of this
+/// module's own test did exactly that — reimplemented this loop inline
+/// instead of calling it — and a round of adversarial review flagged it as
+/// the same "test pins a copy, not the real function" mistake `resume_loop.rs`
+/// has already made and fixed once before (`effective_resume_window`,
+/// round 2 review of Epic R PR3).
 #[cfg(unix)]
-fn watch_loop(tx: watch::Sender<bool>) {
+fn watch_loop(tx: watch::Sender<bool>, fds: &[libc::c_int]) {
     const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: 0, revents: 0 }).collect();
     loop {
-        let mut fds = [libc::pollfd { fd: 0, events: 0, revents: 0 }, libc::pollfd { fd: 1, events: 0, revents: 0 }];
-        // SAFETY: `fds` is a valid, correctly-sized array for the duration
-        // of this call; `poll(2)` only reads/writes through the pointer we
-        // give it.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        for pfd in &mut pollfds {
+            pfd.revents = 0;
+        }
+        // SAFETY: `pollfds` is a valid, correctly-sized buffer for the
+        // duration of this call; `poll(2)` only reads/writes through the
+        // pointer we give it.
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -168,12 +190,13 @@ fn watch_loop(tx: watch::Sender<bool>) {
             }
             // An unexpected `poll()` failure leaves this watchdog unable to
             // usefully continue; give up quietly rather than busy-loop on a
-            // condition that keeps recurring. The reactive mechanisms
-            // remain as a fallback.
+            // condition that keeps recurring. Fails open — see `spawn`'s
+            // leaked extra sender clone for why dropping `tx` here does not
+            // by itself make `wait()` treat this as a fire.
             log::warn!("isekai-pipe connect: parent-liveness watchdog poll() failed unexpectedly, giving up: {err}");
             return;
         }
-        if fds.iter().any(|pfd| pfd.revents & TERMINAL != 0) {
+        if pollfds.iter().any(|pfd| pfd.revents & TERMINAL != 0) {
             let _ = tx.send(true);
             return;
         }
@@ -197,39 +220,18 @@ pub(crate) fn spawn() -> ParentGoneWatch {
 mod tests {
     use super::*;
 
-    /// Regression test for the module's core claim: closing the *far* end
-    /// of a pipe this process holds open must make the watchdog fire, even
-    /// though nothing is reading or writing at the time. Doesn't touch the
-    /// real fd 0/1 (would require subprocess plumbing) — exercises the same
-    /// `poll()` logic directly against a throwaway pipe pair instead.
-    #[test]
-    fn watch_loop_fires_when_the_peer_closes_its_end() {
-        let (read_fd, write_fd) = {
-            let mut fds = [0i32; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            (fds[0], fds[1])
-        };
-        let (tx, mut rx) = watch::channel(false);
-        let handle = std::thread::spawn(move || {
-            const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-            loop {
-                let mut fds = [libc::pollfd { fd: read_fd, events: 0, revents: 0 }];
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-                if ret < 0 {
-                    continue;
-                }
-                if fds[0].revents & TERMINAL != 0 {
-                    let _ = tx.send(true);
-                    return;
-                }
-            }
-        });
+    fn pipe_pair() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
 
-        // Closing the write end is what an externally-killed `ssh(1)`
-        // effectively does to this process's stdin.
-        unsafe {
-            libc::close(write_fd);
-        }
+    /// Runs the real `watch_loop` (not a hand-copied stand-in) on `watched`
+    /// in a background thread, and blocks (with a generous timeout) for it
+    /// to fire.
+    fn assert_watch_loop_fires(watched: libc::c_int) {
+        let (tx, mut rx) = watch::channel(false);
+        let handle = std::thread::spawn(move || watch_loop(tx, &[watched]));
 
         let fired = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -237,10 +239,54 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(fired.is_ok(), "the watchdog must fire promptly once the peer closes its end");
+        match fired {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire)"),
+            Err(_) => panic!("the watchdog did not fire within the timeout"),
+        }
         handle.join().unwrap();
+    }
+
+    /// Regression test for the module's core claim: closing the *far* end
+    /// of a pipe this process holds open must make the watchdog fire, even
+    /// though nothing is reading or writing at the time. This is the fd-0
+    /// direction (a pipe read end, whose writer closing raises `POLLHUP`) —
+    /// see the sibling test below for the fd-1 direction (`POLLERR`), which
+    /// is what real `ssh(1)` was actually measured to raise.
+    #[test]
+    fn watch_loop_fires_on_pollhup_when_the_writer_closes_a_read_ends_peer() {
+        let (read_fd, write_fd) = pipe_pair();
+        // Closing the write end is what an externally-killed `ssh(1)`
+        // effectively does to this process's stdin (fd 0, a pipe read end).
+        unsafe {
+            libc::close(write_fd);
+        }
+        assert_watch_loop_fires(read_fd);
         unsafe {
             libc::close(read_fd);
+        }
+    }
+
+    /// The direction that actually matters in production: fd 1 (this
+    /// process's stdout) is a pipe *write* end, and real `ssh(1)` closing
+    /// its corresponding read end was measured (2026-09-02, real OpenSSH)
+    /// to raise `POLLERR`, **not** `POLLHUP` — a watchdog checking only
+    /// `POLLHUP` would silently never fire on this fd. Without this test,
+    /// nothing pinned that half of `TERMINAL`'s mask; a well-meaning
+    /// "simplification" to just `POLLHUP` would have kept the sibling test
+    /// above green while breaking fd-1 detection entirely (adversarial
+    /// review, 2026-09-02).
+    #[test]
+    fn watch_loop_fires_on_pollerr_when_the_reader_closes_a_write_ends_peer() {
+        let (read_fd, write_fd) = pipe_pair();
+        // Closing the read end is what an externally-killed `ssh(1)`
+        // effectively does to this process's stdout (fd 1, a pipe write end).
+        unsafe {
+            libc::close(read_fd);
+        }
+        assert_watch_loop_fires(write_fd);
+        unsafe {
+            libc::close(write_fd);
         }
     }
 }
