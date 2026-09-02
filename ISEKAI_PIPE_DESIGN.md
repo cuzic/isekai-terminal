@@ -207,7 +207,9 @@ NAT越え方式を選べる。
 
 - `isekai-ssh` wrapper: `Stdio::inherit()`で`ssh`に丸ごと委譲するだけでstdoutを触らない。
   `--isekai-explain`/`--isekai-dry-run`・エラーは全てstderr。
-- `isekai-pipe connect`: HELLO/proof/ACK成功後の`pump_h2c`/`relay_stdio`だけがstdoutに書き込む。
+- `isekai-pipe connect`: HELLO/proof/ACK成功後の`pump_h2c`（Epic R PR3で`relay_stdio`は
+  削除、STUN P2P経路もrelayと同じ`run_resume_loop`のこの一本に統合された）だけが
+  stdoutに書き込む。
   失敗系(trust store未登録・secret不一致・relay到達不可)はstdoutに一切書かない。
 - `isekai-pipe serve`: stdoutは起動handshake JSON1行のみ。ログは全てstderr。
 
@@ -1917,3 +1919,42 @@ isekai-terminal側に残る関連情報:
 v1では既存の3配信方式(`IsekaiPipeCtl`/`TmuxSession`/`DirectTty`)をそのまま維持。
 `subscribe`/`snapshot`購読プロトコルへの格下げ(delivery層のプラグイン化)は、
 実際の外部消費者が現れてから新リポジトリ側で着手する設計判断を引き継いでいる。
+
+### Epic R: セッション確立後のネットワーク切断からの自動リカバリ — 完了(2026-09-02)
+
+**動機**: `isekai-ssh <host>`で対話セッションを開いた後、Wi-Fi切断・スリープ
+復帰・セルラー⇔Wi-Fi切替のような**セッション確立後の**ネットワーク瞬断が
+起きると、セッション全体が即座に終了しローカルシェルへ戻された。Unix
+(`ssh(1)` ProxyCommand経由)・Windows(`russh`ネイティブ経由)の両方で
+同じ症状が再現していた——根本原因は両OSが共通して起動する単一の中継
+プロセス`isekai-pipe connect`にあった。詳細な設計判断・レビュー経緯は
+`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`(§1が根本原因分析、§2が3PR分の
+設計、§0改訂履歴がround 1〜5+フォローアップの敵対的レビュー記録)を参照。
+
+PR1(#108)・PR2(#109)・PR3の3段階で実装した:
+- **PR1**: `ConnectOutcomeClass::Unknown`のforward-compat対応、
+  `give_up()`のstdout close順序修正(B6)——後続PRの土台。
+- **PR2**: Windows mux経路がtransport死を`Frame::Exit(255)`へ「洗浄」して
+  `OwnerLost`回復を無効化していたバグを修正。`MidSessionDisconnectSignal`
+  マーカーとUnix/Windows単一プロセスfallback向けの軽量リトライループ
+  (`isekai-ssh`側、`MAX_LIGHTWEIGHT_RETRIES`回まで再STUN/再接続を試み、
+  尽きたら`RebootstrapAndRetry`へフォールバック)を新設。
+- **PR3**: STUN P2Pへの真のバイトレベルresumeを実装。`connect_stun_p2p`系の
+  戻り値を拡張し、relay経路と同じ`run_resume_loop`(`isekai_transport::
+  reconnect_and_resume`経由のRESUMEプロトコル)にSTUN P2Pも載せた。
+  **既知の限界**: STUN P2Pのresumeはbare redial(再STUN問い合わせ・
+  再ホールパンチを行わない)であり、**サーバー側の観測アドレスが安定して
+  いること**が前提——クライアント側のIP/NAT変化(Wi-Fi切替等、最も典型的な
+  トリガー)はこの前提の範囲内で正しくresumeできるが、対称NAT越しで
+  サーバー・クライアント双方のアドレスが同時に変わるような真の
+  再ランデブーにはこの前提を超えて対応できない(この場合はPR2の軽量
+  リトライが数十秒〜120秒のSTUN専用give-up境界後にフルSTUN再確立
+  ——新しいセッションとして——を試みる、という形で最終的には復旧する。
+  scrollbackの継続性だけが失われる)。この120秒の境界は、STUN経路の
+  再接続がサーバー到達不能な場合に`resume_with_backoff_until_deadline`の
+  既定10日デッドラインへ落ち込み無音でハングするのを防ぐために導入した
+  (`isekai-pipe/src/resume_loop.rs`の`STUN_RESUME_GIVE_UP_WINDOW`)。
+  root-cause reworkとして「STUN側の再接続時に再STUN問い合わせ+再パンチを
+  行う」案も検討したが、`isekai-pipe serve`のホールパンチが起動時
+  一度きりの動作であり再接続クライアントの新アドレスを学習する手段が
+  無いため到達可能性を一切改善しないと判明し却下した(詳細はADR §2.3.0)。

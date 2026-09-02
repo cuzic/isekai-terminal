@@ -67,12 +67,12 @@ pub enum ConnectOutcomeClass {
     Unreachable,
     /// The connect-time handshake already succeeded — this is a failure
     /// from *after* that point (the data-pump phase), not a connect-time
-    /// failure (Epic R PR2). Currently only produced by the STUN P2P
-    /// route's `relay_stdio` (`MidSessionDisconnectSignal`'s own docs
-    /// explain why the Relay route's resume loop does *not* produce this
-    /// class — its own internal resume already covers up to 10 days, so an
-    /// error escaping it is terminal and `Unreachable`'s
-    /// `RebootstrapAndRetry` response is correct there). Drives
+    /// failure (Epic R PR2). Produced only when a STUN P2P route's
+    /// `run_resume_loop` gives up and its caller attaches
+    /// `MidSessionDisconnectSignal`; the Relay route's resume loop does
+    /// *not* produce this class because an error escaping the full relay
+    /// resume window is terminal and `Unreachable`'s `RebootstrapAndRetry`
+    /// response is correct there. Drives
     /// `isekai-ssh`'s lightweight reconnect loop
     /// (`ConnectFailureRecoveryAction::RetryConnectLightweight`) rather
     /// than a full re-deploy.
@@ -232,7 +232,7 @@ mod tests {
         let mut outcome = sample_outcome();
         outcome.intent_id = "ghi789".to_string();
         outcome.class = ConnectOutcomeClass::MidSessionDisconnect;
-        outcome.detail = "relay_stdio: writing to remote stream failed".to_string();
+        outcome.detail = "STUN P2P resume loop gave up after its short client-side window".to_string();
         write_connect_outcome(dir.path(), &outcome).unwrap();
 
         let claimed = claim_connect_outcome(dir.path(), &outcome.intent_id).unwrap();

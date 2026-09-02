@@ -129,11 +129,11 @@ fn stage_from_attempt_failure(failure: &AttemptFailure) -> (ProbeStageStatus, Pr
 /// `connect_via_relay_resumable_with_fallback` and
 /// `connect_stun_p2p_with_fallback` both return `SequentialConnectError`
 /// (`isekai_transport::stun_p2p`'s docs: `SequentialStunConnectError` is now
-/// just an alias for it), though the STUN path never actually constructs
+/// just an alias for it), though the STUN probe path only performs initial
+/// establishment and never constructs
 /// `AttachedButControlStreamFailed`/`MustResumeButResumeFailed`/
-/// `GaveUpAfterGenerationRetries` — it has no resume/control-stream concept
-/// at all (`stun_p2p.rs`'s module docs) — those three arms only ever fire
-/// for the relay path in practice.
+/// `GaveUpAfterGenerationRetries`; those three arms only ever fire for the
+/// relay path in practice.
 fn stage_from_sequential_connect_error(error: &SequentialConnectError) -> (ProbeStageStatus, ProbeStageStatus) {
     match error {
         SequentialConnectError::NoCandidates => unreachable!("probe always passes exactly one candidate"),
@@ -367,7 +367,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             session_secret,
         };
         let candidates = vec![SequentialStunCandidate { stun_server, candidate_id: "probe".to_string() }];
-        let stun_result = connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates).await;
+        let stun_result = connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates, 0).await;
         let stale_trust_suspected = stun_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
         let (handshake, target_reachability) = match stun_result {
             Ok(_established) => (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None }),

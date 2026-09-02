@@ -53,7 +53,7 @@ async fn connect_stun_p2p_completes_stun_probe_and_hello_ack_over_a_real_quic_co
 
     let mut connection = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&system_quic_factory(), stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), stun_server, &target, 0, TEST_IDENTITY),
     )
         .await
         .expect("connect_stun_p2p should not hang")
@@ -99,7 +99,7 @@ async fn connect_stun_p2p_surfaces_reject_auth_for_a_wrong_session_secret() {
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&system_quic_factory(), stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), stun_server, &target, 0, TEST_IDENTITY),
     )
     .await
     {
@@ -131,7 +131,7 @@ async fn connect_stun_p2p_fails_fast_when_the_stun_server_is_unreachable() {
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&system_quic_factory(), dead_stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), dead_stun_server, &target, 0, TEST_IDENTITY),
     )
     .await
     {

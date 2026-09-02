@@ -4,11 +4,11 @@
 //! `isekai-ssh/tests/stdout_cleanliness.rs` already established for the
 //! legacy `isekai-ssh connect` subcommand.
 //!
-//! `connect`'s only stdout writer is `pump_h2c`/`relay_stdio` (`main.rs`),
-//! and both are only ever reached after the QUIC HELLO/proof/ACK exchange
-//! has already succeeded -- every failure before that point (missing trust
-//! store entry, wrong cached credentials) must surface as a non-zero exit
-//! with stderr-only diagnostics and a completely untouched stdout.
+//! `connect`'s only stdout writer is `pump_h2c` (`resume_loop.rs`), and it
+//! is only reached after the QUIC HELLO/proof/ACK exchange has already
+//! succeeded -- every failure before that point (missing trust store entry,
+//! wrong cached credentials) must surface as a non-zero exit with
+//! stderr-only diagnostics and a completely untouched stdout.
 //!
 //! `serve` is a thin CLI translation layer over the `engine` module's
 //! `run_from_args` (formerly the standalone `isekai-helper` crate,

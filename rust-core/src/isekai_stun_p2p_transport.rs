@@ -260,10 +260,13 @@ async fn connect_stun_p2p_stream(
     // からの復旧はこれで十分カバーできるが、NATマッピング自体が失われるような長時間の
     // 切断・ネットワーク切り替えからは復旧できない（その場合はユーザーが再接続する）。
     // relay版は relay が常時経路に残るためこの制約が無い、というのが2方式の設計上の
-    // トレードオフ(PLAN.md Phase 10参照)。isekai-transportのSTUN P2Pにはresume概念自体が
-    // 無いため(stun_p2p.rsのモジュールdoc参照)、reattachは`RelayTarget{helper_addr:
-    // peer_addr, ..}`とみなしてreconnect_and_resume(直接dial+RESUME)を呼ぶだけにする——
-    // その`RelayTarget`をここで組み立てて、共通の後処理(`finish_quic_stream`)に渡す。
+    // トレードオフ(PLAN.md Phase 10参照)。この経路が使う`connect_stun_p2p_on_socket`は
+    // isekai-transport::stun_p2p内で独立した公開エントリポイントであり(Epic R PR3で
+    // resume対応した`connect_stun_p2p`/`connect_stun_p2p_with_fallback`とは別物、
+    // stun_p2p.rsのTask 3.1コメント参照)、この関数自身のRESUME再構築ロジックは
+    // 変更していない——reattachは`RelayTarget{helper_addr: peer_addr, ..}`とみなして
+    // reconnect_and_resume(直接dial+RESUME)を呼ぶだけにする——その`RelayTarget`を
+    // ここで組み立てて、共通の後処理(`finish_quic_stream`)に渡す。
     let relay_target = isekai_transport::RelayTarget {
         helper_addr: peer_addr,
         server_name: target.server_name.clone(),
