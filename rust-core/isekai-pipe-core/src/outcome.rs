@@ -68,14 +68,22 @@ pub enum ConnectOutcomeClass {
     /// The connect-time handshake already succeeded — this is a failure
     /// from *after* that point (the data-pump phase), not a connect-time
     /// failure (Epic R PR2). Produced only when a STUN P2P route's
-    /// `run_resume_loop` gives up and its caller attaches
-    /// `MidSessionDisconnectSignal`; the Relay route's resume loop does
-    /// *not* produce this class because an error escaping the full relay
-    /// resume window is terminal and `Unreachable`'s `RebootstrapAndRetry`
-    /// response is correct there. Drives
-    /// `isekai-ssh`'s lightweight reconnect loop
-    /// (`ConnectFailureRecoveryAction::RetryConnectLightweight`) rather
-    /// than a full re-deploy.
+    /// `run_resume_loop` gives up via *resume-window exhaustion* and its
+    /// caller attaches `MidSessionDisconnectSignal`; the Relay route's
+    /// resume loop does *not* produce this class because an error escaping
+    /// the full relay resume window is terminal and `Unreachable`'s
+    /// `RebootstrapAndRetry` response is correct there.
+    ///
+    /// A local/watchdog-triggered give-up (`PumpFailure::Local`, the
+    /// EOF-latch, or `parent_watchdog` — Task 2.9 / issue #111) does *not*
+    /// reach this class even on the STUN route, despite also flowing
+    /// through the same `MidSessionDisconnectSignal`-attaching wrapper:
+    /// those additionally carry `resume_loop::ParentGoneSignal`, which
+    /// `connect::write_connect_outcome_for_wrapper` checks *first* and,
+    /// when present, skips writing any outcome file at all — see that
+    /// marker's own docs for why. Drives `isekai-ssh`'s lightweight
+    /// reconnect loop (`ConnectFailureRecoveryAction::RetryConnectLightweight`)
+    /// rather than a full re-deploy.
     MidSessionDisconnect,
     /// Any tag this build doesn't recognize (Epic R PR1). The writer
     /// (`isekai-pipe`, possibly overridden via `--isekai-pipe-path`) and

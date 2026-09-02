@@ -934,14 +934,23 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe
 /// `ssh(1)` is killed by an external signal (`SIGTERM`/`SIGKILL`, as opposed
 /// to exiting on its own, e.g. via `ConnectTimeout`) it does **not** reap its
 /// `ProxyCommand` grandchild — the grandchild is simply reparented to init
-/// and keeps running. This is harmless to inspecting the side-channel file in
-/// `runtime_dir` immediately after `.status()` returns
-/// (`run_ssh_with_connect_failure_recovery`): the orphaned
-/// `isekai-pipe connect` detects its own now-broken stdin/stdout (the pipes
-/// `ssh(1)`'s exit closed) on its very next read/write and exits promptly on
-/// its own (`isekai-pipe/src/resume_loop.rs::PumpFailure`), without needing
-/// `ssh(1)`'s cooperation — it does not linger indefinitely nor race this
-/// function's own read of the outcome file in practice.
+/// and keeps running.
+///
+/// This is harmless in practice, but *not* because the grandchild reacts to
+/// its broken stdin/stdout right away — a second round of review (ADR Round
+/// 7) found that claim was wrong: the dominant signal when `ssh(1)` dies is
+/// a clean stdin **EOF**, not an I/O error, so `isekai-pipe connect`'s own
+/// reactive `PumpFailure` classification rarely fires from that alone. The
+/// actual fix is `isekai-pipe/src/parent_watchdog.rs`: a dedicated thread in
+/// `isekai-pipe connect` itself blocks in `poll(2)` on its own stdin *and*
+/// stdout for `POLLERR`/`POLLHUP`/`POLLNVAL`, needing no cooperation from
+/// `ssh(1)` beyond the pipes it already holds, and fires promptly and
+/// uniformly across every phase of that process's life (dial, handshake,
+/// backoff, active pump) once `ssh(1)`'s exit — by *any* means — closes
+/// them. `resume_loop::PumpFailure`/its EOF-latch remain as the reactive
+/// fallback for platforms without that watchdog (a native-Windows
+/// `isekai-pipe connect` spawned by an MSYS2/Cygwin-hosted `ssh.exe`, where
+/// no `poll(2)` on these fds is available).
 /// Prepares the opportunistic `#@isekai ctl-socket` `-R` forward (if enabled
 /// and the session is interactive) and appends the ssh(1) args in the right
 /// order: any `-R` option *before* the destination, then (if `--isekai-tty`
@@ -2137,6 +2146,27 @@ fn default_pipe_path() -> PathBuf {
 /// already safe to emit bare (e.g. 8.3 short names are disabled on that
 /// volume, or an unusual `#@isekai profile` value) — no worse than this
 /// function's previous unconditional behavior for that residual case.
+///
+/// **Invariant: the returned string must stay a single simple command**
+/// (this function's own `format!` already satisfies this — no `;`/`&&`/`|`
+/// ever appears in it). On any POSIX-shell-invoked `ssh(1)` (real Unix
+/// OpenSSH, or an MSYS2/Cygwin-hosted `ssh.exe`), `ssh_config(5)` documents
+/// that `ProxyCommand` is run via `$SHELL -c "exec <this string>"` — an
+/// explicit `exec` the *caller* (`ssh(1)`) already prepends, precisely to
+/// avoid a lingering shell process. That's what makes `isekai-pipe connect`
+/// `ssh(1)`'s literal, PID-stable direct child today, with no code on this
+/// side needed to arrange it (confirmed by direct experiment, ADR Round 7 —
+/// an earlier draft of that investigation wrongly assumed this needed a
+/// second, explicit `exec` prepended here; adding one produces
+/// `exec exec <cmd>`, which every POSIX shell tested fails immediately with
+/// `exec: exec: not found`, since the outer `exec` does a `PATH` lookup for
+/// a program literally named `exec`). If this string is ever turned into a
+/// pipeline or a `cmd1 && cmd2` sequence, `ssh(1)`'s `exec` only replaces
+/// the shell for the *first* element, a lingering shell reappears as
+/// `isekai-pipe connect`'s parent, and `isekai-pipe/src/parent_watchdog.rs`'s
+/// direct-parentage assumption is irrelevant to it anyway (it doesn't rely
+/// on process ancestry — see that module's docs) but any *future* mechanism
+/// built on `getppid()`/`prctl`/`kqueue` would silently degrade.
 fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String {
     let force_posix_quoting = cfg!(windows) && is_posix_shell_ssh(openssh_path);
     format!(
