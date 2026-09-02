@@ -16,7 +16,7 @@
 //! dial/handshake. This module closes that gap directly, instead of
 //! extending the reactive approach further.
 //!
-//! ## Why a blocking `poll()`, not `prctl(PR_SET_PDEATHSIG)`/`kqueue`
+//! ## Why `poll()`, not `prctl(PR_SET_PDEATHSIG)`/`kqueue`
 //!
 //! An earlier design considered forcing `isekai-pipe connect` to become
 //! `ssh(1)`'s literal direct child (prepending `exec` to the `ProxyCommand`
@@ -53,15 +53,29 @@
 //!   abrupt kill here would make the *server* park the session for the
 //!   full resume grace instead of tearing it down immediately).
 //!
-//! A blocking `poll()` sidesteps all of this: it is level-triggered, so
-//! there is no arm-time race to guard in the first place (if the peer is
-//! already gone when `poll()` is called, it returns immediately); it tests
-//! the actual predicate this process cares about — "is anyone still on the
-//! other end of my stdio" — rather than a proxy for it ("did one specific
-//! PID exit"), so it also catches the rarer case where `ssh(1)` itself is
-//! still alive but this specific pipe broke; and firing it wakes ordinary
-//! async code via a channel, which can run a normal graceful shutdown
-//! instead of fighting async-signal-safety inside a signal handler.
+//! A `poll()`-based watchdog sidesteps all of this: it's level-triggered, so
+//! there's no arm-time race to guard in the first place (if the peer is
+//! already gone when `poll()` is called, it returns immediately, no
+//! snapshot/comparison needed); it tests the actual predicate this process
+//! cares about — "is anyone still on the other end of my stdio" — rather
+//! than a proxy for it ("did one specific PID exit"), so it also catches
+//! the rarer case where `ssh(1)` itself is still alive but this specific
+//! pipe broke; and firing it wakes ordinary async code via a channel, which
+//! can run a normal graceful shutdown instead of fighting
+//! async-signal-safety inside a signal handler.
+//!
+//! It also needs, once the per-fd `events`/sleep-guard fix below is
+//! accounted for, exactly the "one identical implementation for Linux,
+//! macOS, and every BSD" that motivated choosing it over `prctl`/`kqueue`
+//! in the first place — a claim that briefly looked false when real
+//! `rust-core-test-macos` CI (2026-09-02) found the *first* draft's
+//! `events: 0` didn't work on Darwin, and a Darwin-specific `kqueue` path
+//! (`EVFILT_READ`/`EVFILT_WRITE` + `EV_CLEAR`) was designed as the fix.
+//! Both adversarial reviewers who'd proposed that design independently
+//! withdrew it once they found the simpler per-fd-`events`-plus-sleep-guard
+//! fix instead (see the next section) — it closes the same gap without
+//! adding any platform-specific code, restoring the original portability
+//! claim rather than requiring the platform split `kqueue` would have.
 //!
 //! ## Why fd 0 *and* fd 1, why per-fd `events`, and why a sleep-guard
 //!
@@ -420,15 +434,25 @@ mod tests {
     /// independently flagged this as the one gap the single-fd tests can't
     /// close).
     ///
-    /// Two independent pipes stand in for fd 0/fd 1: pipe A's read end
-    /// (`POLLIN`) is the one that closes and must fire; pipe B's write end
-    /// (`POLLOUT`) stays open and continuously spuriously-ready the whole
-    /// time, exactly like fd 1 in production, so this also proves that
-    /// permanent readiness on one fd never masks a real close on another.
-    #[test]
-    fn watch_loop_fires_on_one_fd_while_another_stays_continuously_spuriously_ready() {
+    /// Two independent pipes stand in for fd 0/fd 1, watched in the exact
+    /// same `[(POLLIN fd, ...), (POLLOUT fd, ...)]` shape and order
+    /// `spawn()` uses. `close_which` selects which of the two peers closes
+    /// (and must make the watchdog fire) while the *other* fd stays
+    /// permanently spuriously-ready the whole time — run as two separate
+    /// tests below (closing each fd's peer in turn) so neither position is
+    /// the only one ever proven capable of firing (adversarial review,
+    /// 2026-09-02: closing only the `POLLIN` fd's peer, as an earlier draft
+    /// of this test did, leaves the `POLLOUT` fd's own ability to fire
+    /// completely unproven).
+    fn assert_watch_loop_fires_regardless_of_which_of_two_fds_closes(close_which: WhichFd) {
         let (read_a, write_a) = pipe_pair();
-        let (read_b, write_b) = pipe_pair(); // `read_b` kept open so `write_b` stays POLLOUT-ready.
+        let (read_b, write_b) = pipe_pair();
+        // Make both fds spuriously-ready for the whole quiet window: `read_a`
+        // gets a byte to sit unread (`POLLIN`-ready); `write_b`'s peer
+        // (`read_b`) stays open, so `write_b` stays `POLLOUT`-ready.
+        unsafe {
+            assert_eq!(libc::write(write_a, b"x".as_ptr().cast(), 1), 1);
+        }
 
         let (tx, mut rx) = watch::channel(false);
         let handle = std::thread::spawn(move || watch_loop(tx, &[(read_a, libc::POLLIN), (write_b, libc::POLLOUT)]));
@@ -437,16 +461,21 @@ mod tests {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async move {
                 let quiet = tokio::time::timeout(QUIET_WINDOW, rx.changed()).await;
-                assert!(quiet.is_err(), "the watchdog must not fire while pipe A's peer is still alive, even with pipe B continuously spuriously-ready");
+                assert!(quiet.is_err(), "the watchdog must not fire while both peers are still alive, even with both fds continuously spuriously-ready");
 
-                unsafe {
-                    libc::close(write_a);
+                match close_which {
+                    WhichFd::PollinSide => unsafe {
+                        libc::close(write_a);
+                    },
+                    WhichFd::PolloutSide => unsafe {
+                        libc::close(read_b);
+                    },
                 }
 
                 match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire)"),
-                    Err(_) => panic!("the watchdog did not fire within the timeout after pipe A's peer closed"),
+                    Err(_) => panic!("the watchdog did not fire within the timeout after the peer closed"),
                 }
             });
         })
@@ -457,7 +486,28 @@ mod tests {
         unsafe {
             libc::close(read_a);
             libc::close(write_b);
-            libc::close(read_b);
+            if !matches!(close_which, WhichFd::PollinSide) {
+                libc::close(write_a);
+            }
+            if !matches!(close_which, WhichFd::PolloutSide) {
+                libc::close(read_b);
+            }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WhichFd {
+        PollinSide,
+        PolloutSide,
+    }
+
+    #[test]
+    fn watch_loop_fires_on_the_pollin_side_while_the_pollout_side_stays_spuriously_ready() {
+        assert_watch_loop_fires_regardless_of_which_of_two_fds_closes(WhichFd::PollinSide);
+    }
+
+    #[test]
+    fn watch_loop_fires_on_the_pollout_side_while_the_pollin_side_stays_spuriously_ready() {
+        assert_watch_loop_fires_regardless_of_which_of_two_fds_closes(WhichFd::PolloutSide);
     }
 }
