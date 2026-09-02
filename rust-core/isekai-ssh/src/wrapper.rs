@@ -928,10 +928,20 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe
 /// Writes `intent`, execs `ssh` with the `isekai-pipe connect` `ProxyCommand`
 /// injected, and waits for it to exit. All three of `ssh`'s stdio streams
 /// are inherited (interactive TTY passthrough) — `.status()` (not
-/// `.output()`) still blocks until the whole process tree, including the
-/// `ProxyCommand` grandchild, has exited, which is what makes inspecting a
-/// side-channel file in `runtime_dir` immediately afterward both correct
-/// and zero-cost to this stdio wiring (`run_ssh_with_connect_failure_recovery`).
+/// `.output()`) only waits on the direct child (`ssh(1)` itself), *not* the
+/// whole process tree: confirmed 2026-09-02 by direct experiment (Task 2.9 /
+/// issue #111, `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Round 6) that when
+/// `ssh(1)` is killed by an external signal (`SIGTERM`/`SIGKILL`, as opposed
+/// to exiting on its own, e.g. via `ConnectTimeout`) it does **not** reap its
+/// `ProxyCommand` grandchild — the grandchild is simply reparented to init
+/// and keeps running. This is harmless to inspecting the side-channel file in
+/// `runtime_dir` immediately after `.status()` returns
+/// (`run_ssh_with_connect_failure_recovery`): the orphaned
+/// `isekai-pipe connect` detects its own now-broken stdin/stdout (the pipes
+/// `ssh(1)`'s exit closed) on its very next read/write and exits promptly on
+/// its own (`isekai-pipe/src/resume_loop.rs::PumpFailure`), without needing
+/// `ssh(1)`'s cooperation — it does not linger indefinitely nor race this
+/// function's own read of the outcome file in practice.
 /// Prepares the opportunistic `#@isekai ctl-socket` `-R` forward (if enabled
 /// and the session is interactive) and appends the ssh(1) args in the right
 /// order: any `-R` option *before* the destination, then (if `--isekai-tty`
