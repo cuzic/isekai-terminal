@@ -90,29 +90,20 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// resume-grace.
 ///
 /// Attached to whatever `run_resume_loop` returns as `Err`, which since
-/// `PumpFailure` (Task 2.9 / issue #111 fix, 2026-09) is one of two shapes:
+/// `PumpFailure`/[`ParentGoneSignal`] (Task 2.9 / issue #111, 2026-09) can be
 /// a *resume-exhaustion* error (`resume_with_backoff_until_deadline`'s
-/// give-up, after a `Remote`-classified pump failure or network change), or
-/// a `PumpFailure::Local` error returned immediately, without ever entering
-/// the resume loop. Both are correctly `MidSessionDisconnect` from the
-/// wrapper's point of view: a `Local` failure most often means `ssh(1)`
-/// itself already exited and closed this process's stdin/stdout (confirmed
-/// 2026-09-02 by direct experiment — see `PumpFailure`'s docs), in which
-/// case the wrapper has already reacted to `ssh(1)`'s own exit and this
-/// process's outcome write is moot; on the rarer path where the local pipe
-/// breaks while `ssh(1)` is still alive, a lightweight retry (spawning a
-/// fresh `isekai-pipe connect`) is exactly the right response.
-///
-/// Before this fix, a local-side failure with a *healthy* network produced
-/// an unbounded reconnect loop instead — the pump fails, the resume
-/// succeeds, `disconnected_since` resets so the give-up clock never
-/// accumulates, and the helper replays the same bytes that failed the
-/// stdout write, forever, since nothing distinguished a `Local` failure
-/// (which will fail identically on the very next pump too) from a `Remote`
-/// one worth resuming past. Whether that loop ever terminated depended
-/// entirely on whether `ssh(1)` reaps its `ProxyCommand` child — it does
-/// not reliably (see `PumpFailure`'s docs) — which is exactly why this type
-/// distinction exists now instead of relying on that.
+/// give-up, after a `Remote`-classified pump failure or network change), a
+/// `PumpFailure::Local` error, or a `ParentGoneSignal`-marked error — the
+/// latter two returned immediately, without ever entering the resume loop.
+/// All are correctly `MidSessionDisconnect` from the wrapper's point of
+/// view: `connect_command`'s `write_connect_outcome_for_wrapper` special-cases
+/// `ParentGoneSignal` to skip writing an outcome file at all (see its own
+/// docs) rather than reach this class, since that path means there is no
+/// meaningful action left for the wrapper to take (see `ParentGoneSignal`'s
+/// docs for why); a bare `PumpFailure::Local` reaching here instead (the
+/// rarer path where the local pipe breaks while `ssh(1)` is still alive —
+/// see `PumpFailure`'s docs) is exactly the case a lightweight retry
+/// (spawning a fresh `isekai-pipe connect`) is the right response to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
 
@@ -124,22 +115,79 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 
 impl std::error::Error for MidSessionDisconnectSignal {}
 
+/// Marks an `anyhow::Error` as meaning "this process's local peer (normally
+/// `ssh(1)`) is gone, so no recovery action is meaningful" — Task 2.9 /
+/// issue #111. Two independent sources attach it, both handled uniformly by
+/// `connect_command::write_connect_outcome_for_wrapper` (which checks for
+/// this marker first and skips writing a `ConnectOutcome` file at all when
+/// present, rather than classifying it `Unreachable`/`MidSessionDisconnect`):
+///
+/// 1. [`parent_watchdog`]'s blocking-`poll()` watchdog, raced against the
+///    whole `run_connect` future in `connect_command` — fires uniformly
+///    across dial, handshake, the resume backoff loop, and the active pump,
+///    on Unix targets where it's available (see that module's docs for why
+///    a blocking `poll()` rather than `prctl(PR_SET_PDEATHSIG)`/`kqueue`).
+/// 2. `run_resume_loop`'s own `PumpFailure::Local` branch and its EOF-latch
+///    (see `PumpFailure`'s docs) — the reactive fallback that still matters
+///    on non-Unix targets (MSYS2/Cygwin-hosted `ssh.exe`'s native-Windows
+///    `isekai-pipe connect` child has no `poll(2)` available) and, on Unix,
+///    as defense-in-depth for the moment between a real I/O failure and the
+///    watchdog's own detection.
+///
+/// Skipping the outcome write (rather than writing `Unreachable`, which
+/// `RebootstrapAndRetry`s, or `MidSessionDisconnect`, which lightweight-
+/// retries) matters concretely on the relay route: `run_relay_resumable`/
+/// `run_relay_resumable_with_fallback` attach no `MidSessionDisconnectSignal`
+/// (see its own docs for why), so an unmarked `Local`/watchdog-triggered
+/// error would otherwise surface as `Unreachable` → `RebootstrapAndRetry`
+/// (`wrapper.rs::decide_connect_failure_recovery`) — an arm that, unlike
+/// `RetryConnectLightweight`, has no guard against re-running a non-idempotent
+/// remote command (`wrapper.rs`'s B5 guard, Epic R PR2). A broken local pipe
+/// means the `ssh(1)` session this command was running under is already
+/// gone; silently re-deploying and re-running `isekai-ssh host -- ./deploy.sh`
+/// in response would be exactly the hazard that guard exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParentGoneSignal;
+
+impl std::fmt::Display for ParentGoneSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the local peer (most likely ssh(1)) is gone; no recovery action is meaningful")
+    }
+}
+
+impl std::error::Error for ParentGoneSignal {}
+
 /// `run_data_pump`'s failure, classified by which side of the pipe broke.
 ///
-/// The distinction exists to fix the exact hang `MidSessionDisconnectSignal`'s
-/// own doc comment above describes (Task 2.9 / issue #111): a `Local` failure
-/// means the process's own stdin/stdout — the pipe `ssh(1)`'s `ProxyCommand`
-/// gave this process — is gone, most often because `ssh(1)` itself already
-/// exited. Confirmed 2026-09-02 by direct experiment (synthetic
-/// `ProxyCommand`, real OpenSSH `ssh(1)`): `ssh(1)` reaps this child when
-/// *it* decides to exit (e.g. `ConnectTimeout`), but does **not** when
-/// something else kills `ssh(1)` itself (`SIGTERM`/`SIGKILL`) — the child is
-/// simply reparented to init and keeps running. Entering the resume-with-
-/// backoff loop on a `Local` failure would wait out `resume_window` (or,
-/// with a healthy network, loop forever — see the doc comment above) with no
-/// reader left on the other end. A `Remote` failure (the QUIC stream itself,
-/// or an OS-reported network change) is exactly the case the resume loop
-/// exists for and is handled unchanged.
+/// Originally the sole fix for the hang `MidSessionDisconnectSignal`'s docs
+/// describe (Task 2.9 / issue #111): a `Local` failure means the process's
+/// own stdin/stdout — the pipe `ssh(1)`'s `ProxyCommand` gave this process —
+/// is gone, most often because `ssh(1)` itself already exited. Confirmed
+/// 2026-09-02 by direct experiment (synthetic `ProxyCommand`, real OpenSSH
+/// `ssh(1)`): `ssh(1)` reaps this child when *it* decides to exit (e.g.
+/// `ConnectTimeout`), but does **not** when something else kills `ssh(1)`
+/// itself (`SIGTERM`/`SIGKILL`) — the child is simply reparented to init and
+/// keeps running.
+///
+/// This split alone is **not sufficient**, for two reasons a second round of
+/// adversarial review found: (a) the dominant signal when `ssh(1)` dies is a
+/// clean stdin **EOF** (`pump_c2h`'s `n == 0` branch), not an `Err` —
+/// `PumpFailure::Local` never fires from that side in the common case; and
+/// (b) neither pump is even running while this process is blocked in
+/// `resume_with_backoff_until_deadline` or an initial dial/handshake, so a
+/// `Local`/`Remote` classification of a pump result can't help there at all.
+/// [`parent_watchdog`]'s blocking-`poll()` watchdog is the actual primary
+/// fix for both — see its module docs. What's left for `PumpFailure`/the
+/// EOF-latch to cover: the reactive fallback on non-Unix targets (no
+/// watchdog there), and, on Unix, the narrower case (a) doesn't fully close
+/// even with the watchdog present — a `Remote` failure in `pump_h2c` arriving
+/// *after* `pump_c2h` already saw clean EOF in the same generation, which
+/// the EOF-latch (`run_resume_loop`'s `c2h_already_done` check) declines to
+/// resume past for the identical reason: no local producer is left to
+/// resume for. A `Remote` failure (the QUIC stream itself, the C2H replay
+/// buffer invariant, or an OS-reported network change) with no
+/// already-observed local EOF is exactly the case the resume loop exists
+/// for and is handled unchanged.
 #[derive(Debug)]
 enum PumpFailure {
     Local(anyhow::Error),
@@ -354,8 +402,10 @@ pub(crate) async fn run_stun_p2p_with_fallback(
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
 /// `reconnect_and_resume` against `target` — the *specific* candidate that
-/// won, in the fallback case) across disconnects until either the local side
-/// closes cleanly or the resume window is exceeded. Shared by both
+/// won, in the fallback case) across disconnects until one of: the local
+/// side closes cleanly, the resume window is exceeded, or a `PumpFailure`/
+/// EOF-latch-driven give-up decides no resume attempt is worthwhile at all
+/// (see `PumpFailure`'s and `ParentGoneSignal`'s docs). Shared by both
 /// `run_relay_resumable` (single fixed target) and
 /// `run_relay_resumable_with_fallback` (the winning target out of several
 /// candidates) — resuming a session is always scoped to the one connection
@@ -1125,6 +1175,23 @@ async fn resume_with_backoff_until_deadline(
     }
 }
 
+/// The EOF-latch decision (Task 2.9 / issue #111): whether `run_resume_loop`
+/// should give up outright rather than attempt a resume, given one
+/// `run_data_pump` outcome. `true` for `PumpFailure::Local` unconditionally,
+/// and for a `PumpFailure::Remote` that arrived *after* `pump_c2h` already
+/// reached a clean stdin EOF in the same generation (`c2h_already_done`) —
+/// both cases reach the identical conclusion that no local producer is left
+/// to resume for. Extracted as its own pure function specifically so it's
+/// directly unit-testable without needing a real pump/QUIC connection (see
+/// the `tests` module below).
+fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_already_done: bool) -> bool {
+    match outcome {
+        Ok(()) => false,
+        Err(PumpFailure::Local(_)) => true,
+        Err(PumpFailure::Remote(_)) => c2h_already_done,
+    }
+}
+
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1210,57 +1277,62 @@ pub(crate) async fn run_resume_loop(
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
-        let outcome = tokio::select! {
-            outcome = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters) => outcome,
+        let (outcome, c2h_already_done) = tokio::select! {
+            result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters) => result,
             Some(()) = reconnect_signal_rx.recv() => {
-                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting")))
+                (Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting"))), false)
             }
         };
         reconnect_signal_task.abort();
         state.app_ack_tasks.abort();
 
-        match outcome {
-            Ok(()) => {
+        let give_up = should_give_up_without_resuming(&outcome, c2h_already_done);
+        match (outcome, give_up) {
+            (Ok(()), _) => {
                 if let Some(t) = &warm_standby_task {
                     t.abort();
                 }
                 return Ok(());
             }
-            Err(PumpFailure::Local(e)) => {
-                // The stream is already unusable to us; still reset it so the
-                // server parks/releases this session promptly instead of
-                // waiting out its own idle timeout (same rationale as the
-                // unconditional reset below), then give up immediately
-                // rather than entering the resume loop — see `PumpFailure`'s
-                // doc comment for why.
-                quic_write.reset(0);
+            (Err(e), true) => {
+                // Deliberately does *not* reset `quic_write` (contrast the
+                // unconditional reset below) — letting it drop naturally at
+                // the end of this iteration sends a clean FIN via the
+                // underlying transport's own `Drop` impl (`finish()`),
+                // exactly like `pump_c2h`'s own stdin-EOF path already does.
+                // A reset here would make the server park this session for
+                // the full resume grace (`RelayOutcome::DataStreamDied`) for
+                // a connection nothing will ever resume — see
+                // `ParentGoneSignal`'s docs.
                 if let Some(t) = &warm_standby_task {
                     t.abort();
                 }
-                return Err(e.context(
-                    "isekai-pipe connect: local stdin/stdout I/O failed (the process on the \
-                     other end of this pipe, most likely ssh(1), is already gone); not \
-                     attempting resume",
+                let (PumpFailure::Local(inner) | PumpFailure::Remote(inner)) = e;
+                return Err(inner.context(ParentGoneSignal).context(
+                    "isekai-pipe connect: giving up rather than attempting resume — either local \
+                     stdin/stdout I/O failed directly, or the remote side failed after the local \
+                     side (stdin) already reached a clean EOF; either way, the process on the \
+                     other end of this pipe (most likely ssh(1)) has nothing left to resume for",
                 ));
             }
-            Err(PumpFailure::Remote(_)) => {}
+            (Err(_), _) => {}
         }
 
         // Abandoning this connection (network change, or run_data_pump's own
-        // remote-side I/O failure — a local-side one already returned above)
-        // — explicitly reset the send side instead of letting
-        // it drop gracefully. `noq`/`qmux`'s `Drop` for a send stream calls
-        // `finish()` (a clean FIN) by default, which `isekai-pipe serve`'s
-        // `relay_buffered` cannot distinguish from a legitimate half-close
-        // (e.g. stdin EOF, where S→C must keep flowing) — so it leaves the
-        // session `Established`-but-never-parked on this now-dead
-        // connection instead of parking it for resume, and every subsequent
-        // RESUME then fails as "not resumable" (`UnknownSession`) forever
-        // (found via live debugging, 2026-07-11: the very next reconnect
-        // attempt after a network-change-triggered abandon got exactly this
-        // rejection). A reset instead makes the server's read return an
-        // error, correctly classified as `RelayOutcome::DataStreamDied` and
-        // parked.
+        // remote-side I/O failure with no already-observed local EOF — the
+        // give-up cases above already returned) — explicitly reset the send
+        // side instead of letting it drop gracefully. `noq`/`qmux`'s `Drop`
+        // for a send stream calls `finish()` (a clean FIN) by default, which
+        // `isekai-pipe serve`'s `relay_buffered` cannot distinguish from a
+        // legitimate half-close (e.g. stdin EOF, where S→C must keep
+        // flowing) — so it leaves the session `Established`-but-never-parked
+        // on this now-dead connection instead of parking it for resume, and
+        // every subsequent RESUME then fails as "not resumable"
+        // (`UnknownSession`) forever (found via live debugging, 2026-07-11:
+        // the very next reconnect attempt after a network-change-triggered
+        // abandon got exactly this rejection). A reset instead makes the
+        // server's read return an error, correctly classified as
+        // `RelayOutcome::DataStreamDied` and parked.
         quic_write.reset(0);
 
         // The resume window's clock starts here, at disconnect detection —
@@ -1309,6 +1381,17 @@ pub(crate) async fn run_resume_loop(
     }
 }
 
+/// Runs both pump directions until either both finish cleanly or one fails.
+///
+/// The second element of the returned tuple is the **EOF-latch**: whether
+/// `pump_c2h` had already reached a clean stdin EOF (`c2h_done`) at the
+/// moment a failure occurred. `c2h_done` only ever becomes `true` via `res?`
+/// *not* short-circuiting, i.e. via `pump_c2h`'s own `Ok(())` — so it's a
+/// ready-made answer to "was the local producer already finished when this
+/// failed", with no extra bookkeeping needed. See `PumpFailure`'s docs for
+/// why this matters: a `Remote` failure in `pump_h2c` arriving after `pump_c2h`
+/// already cleanly finished means no local producer is left to resume for
+/// either way, the same conclusion a `Local` failure reaches directly.
 async fn run_data_pump(
     stdin: &mut (impl AsyncRead + Unpin),
     stdout: &mut (impl AsyncWrite + Unpin),
@@ -1316,7 +1399,7 @@ async fn run_data_pump(
     quic_write: &mut AnyByteStreamWriteHalf,
     replay: &Arc<Mutex<C2hReplayBuffer>>,
     counters: &Arc<AppAckCounters>,
-) -> Result<(), PumpFailure> {
+) -> (Result<(), PumpFailure>, bool) {
     let c2h_fut = pump_c2h(stdin, quic_write, replay.clone(), counters.clone());
     let h2c_fut = pump_h2c(quic_read, stdout, counters.clone());
     tokio::pin!(c2h_fut);
@@ -1327,16 +1410,20 @@ async fn run_data_pump(
     loop {
         tokio::select! {
             res = &mut c2h_fut, if !c2h_done => {
-                res?;
+                if let Err(e) = res {
+                    return (Err(e), c2h_done);
+                }
                 c2h_done = true;
             }
             res = &mut h2c_fut, if !h2c_done => {
-                res?;
+                if let Err(e) = res {
+                    return (Err(e), c2h_done);
+                }
                 h2c_done = true;
             }
         }
         if c2h_done && h2c_done {
-            return Ok(());
+            return (Ok(()), c2h_done);
         }
     }
 }
@@ -1486,6 +1573,33 @@ mod tests {
         assert_eq!(
             clamp_resume_window(Duration::from_secs(30), Some(STUN_RESUME_GIVE_UP_WINDOW)),
             Duration::from_secs(30)
+        );
+    }
+
+    /// Task 2.9 / issue #111: pins `run_resume_loop`'s EOF-latch decision —
+    /// see `should_give_up_without_resuming`'s own docs. A clean `Ok(())`
+    /// never gives up; a `Local` failure always does, regardless of
+    /// `c2h_already_done`; a `Remote` failure gives up only when
+    /// `c2h_already_done` is `true` (a `Remote` failure with the local side
+    /// still live must keep resuming exactly as before this fix).
+    #[test]
+    fn should_give_up_without_resuming_matches_the_eof_latch_design() {
+        let local = || PumpFailure::Local(anyhow::anyhow!("local"));
+        let remote = || PumpFailure::Remote(anyhow::anyhow!("remote"));
+
+        assert!(!should_give_up_without_resuming(&Ok(()), false), "a clean exit must never give up");
+        assert!(!should_give_up_without_resuming(&Ok(()), true), "a clean exit must never give up, even with the latch set");
+
+        assert!(should_give_up_without_resuming(&Err(local()), false), "Local must give up unconditionally");
+        assert!(should_give_up_without_resuming(&Err(local()), true), "Local must give up unconditionally");
+
+        assert!(
+            !should_give_up_without_resuming(&Err(remote()), false),
+            "Remote with the local side still live must keep resuming (unchanged pre-fix behavior)"
+        );
+        assert!(
+            should_give_up_without_resuming(&Err(remote()), true),
+            "Remote arriving after the local side already reached clean EOF must give up (the EOF-latch)"
         );
     }
 
