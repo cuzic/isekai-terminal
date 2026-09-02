@@ -285,33 +285,60 @@
   自動リトライされないことを確認するテスト（B5）。
 
 ### Task 2.9 — 孫プロセスの実測と条件付き対応（S1、独立した調査タスク
-    として分離、S10で手順を厳密化）
+    として分離、S10で手順を厳密化、**2026-09-02解決済み、ADR Round 7参照**）
 
-- **これは調査タスクであり、Task 2.8をブロックしない**（M3——
-  実測が終わるまでTask 2.8の他の要素の着手を止める必要はない）。
-- **手順（S10で厳密化）**: 経路によって「正解」が逆になる
-  （STUN=15秒で自然に落ちるのが正常、Relay=最大10日残るのが正常）
-  ため、**必ずSTUN P2P経路のホスト**（`#@isekai stun`設定済み）で
-  意図的にネットワークを切断し、**20〜30秒後**（QUIC idle timeout
-  15秒に余裕を見た時間）に`pgrep -f 'isekai-pipe connect'`が
-  残るかを確認する（ローカル実行で良い、`cargo build`/`test`では
-  ないため`prefer-gh-actions-over-local-cargo`に抵触しない）。
-  Relay経路での孫の残存はこの対策の対象外——観測してはいけない。
-- **残らない場合**: `ensure_process_terminated`機構は実装しない。
-  `wrapper.rs:719-725`のdocコメントを「`.status()`自体は直接の子
-  だけを待つが、`ssh(1)`が自分のProxyCommandを終了させるため
-  結果として孫も残らない」と理由を正確にする訂正のみ行う。このタスク
-  はここで完了（Task 2.8への追加実装は無し）。
-- **残る場合（S3: pid単発killという選択肢は存在しないと明記）**:
-  `run_ssh_once`は`Result<(ExitStatus, String /*intent_id*/)>`
-  （`wrapper.rs:798-803`）を返すのみでpidを取得できず、そもそも
-  孫（`isekai-pipe connect`）のpidはwrapperから原理的に取得
-  不能——**取れるのは`ssh(1)`自身のpidだけ**。したがって唯一の
-  実装可能な選択肢は、`ssh(1)`を独自プロセスグループで起動し
-  （`setsid`/`process_group(0)`）、次の試行前にグループ全体へ
-  `SIGTERM`→猶予後`SIGKILL`を送ること。この場合のみTask 2.8の
-  ループに実装を追加し、対応するテスト（プロセス監視付き）も
-  追加する。
+- **実測結果**: `ssh(1)`が**自発的に**終了する場合（`ConnectTimeout`
+  満了等）は`ProxyCommand`子も道連れになるが、**外部から
+  `SIGTERM`/`SIGKILL`された場合は子が生存し続ける**（initへ
+  reparentされる）。すなわち「残る場合」が確認された。
+- **Round 6での最初の対応（`PumpFailure::Local`/`Remote`型分離）は
+  opus 2体の敵対的レビューで不十分と判明した**: `ssh(1)`死亡の
+  支配的シグナルは`stdin`のEOFであってエラーではないため
+  `PumpFailure::Local`は実質発火せず、resume-with-backoffループ
+  最中やネットワーク既断状態での`ssh(1)`死亡はどちらも`Remote`
+  分類のまま最大10日のresume windowに入っていた（詳細はADR Round 7）。
+- **最終的に採用した対応**: `ensure_process_terminated`
+  （`wrapper.rs`側のプロセスグループ管理、ジョブコントロール/
+  `SIGHUP`/Ctrl+Cへの副作用と、wrapper自身が死ぬケースを覆えない
+  という2つの理由で両批評家が独立に却下）ではなく、
+  `isekai-pipe/src/parent_watchdog.rs`を新設した:
+  `connect_command`冒頭で専用OSスレッドが自分のfd0/fd1を
+  `poll(events:0)`でブロッキング監視し、`ssh(1)`が**どんな理由で
+  終了しても**(自発的終了・外部kill問わず)`POLLERR`/`POLLHUP`で
+  即座に検知する。検知時は`run_connect`全体とのレースに負けさせて
+  futureを自然dropさせ、QUIC送信ストリームの既定Drop実装
+  （`finish()`＝clean FIN）に任せることで、`.reset(0)`を書かずに
+  「二度とresumeしないので サーバー側を即座にteardownさせる」を
+  実現している。`prctl(PR_SET_PDEATHSIG)`/`kqueue`案（根本原因を
+  問い直した末に一度提案）は実機実験で「`ssh(1)`は既に自前で
+  `exec`しておりPart 1の変更は全接続を壊す」と判明し却下、代わりに
+  ブロッキング`poll()`という単一POSIX実装に収束した（詳細な経緯・
+  却下理由はADR Round 7、`parent_watchdog.rs`のモジュールdoc）。
+  `PumpFailure::Local`/`Remote`分離とEOF-latch
+  （`run_data_pump`が`(Result<(), PumpFailure>, bool)`を返し、
+  `pump_c2h`が既にEOFに達した後の`Remote`失敗も同じ「即座に諦める」
+  経路へ合流させる）は、watchdogの無いプラットフォーム
+  （MSYS2/Cygwin版`ssh.exe`が起動するnative Windows版
+  `isekai-pipe connect`）向けのフォールバックとして維持する。
+  新設した`resume_loop::ParentGoneSignal`マーカーを
+  watchdog起因・`Local`起因・EOF-latch起因のいずれのエラーにも
+  付与し、`connect::write_connect_outcome_for_wrapper`がこれを
+  他のどの分類より先にチェックしてoutcomeファイル自体を書かない
+  ようにした——relay経路で`Unreachable`→`RebootstrapAndRetry`
+  （B5ガード無し）に化ける経路を根本から断つ。
+- **検証**: `parent_watchdog.rs`の
+  `watch_loop_fires_when_the_peer_closes_its_end`（実pipeペアで
+  watchdogの核心的な主張——読み書きが起きていなくても相手側の
+  クローズを検知できること——を直接ピン留め）に加え、
+  `pump_c2h_classifies_a_stdin_read_failure_as_local`・
+  `pump_h2c_classifies_a_stdout_write_failure_as_local`
+  （フォールバック経路の分類が正しいことのピン留め、`resume_loop.rs`）。
+- **`wrapper.rs::apply_ctl_socket_forward`のdocコメント**を
+  実測結果に合わせて訂正済み（`.status()`は直接の子だけを待つ、
+  `ssh(1)`は自発的終了時のみ道連れにする、実際の解決は
+  `parent_watchdog`である旨）。`proxy_command()`にも
+  「単一の単純コマンドのまま維持すること」という不変条件のdocを
+  追加した（`exec`前置の却下理由の記録も兼ねる）。
 
 ### Task 2.10 — ctl-socket forwardの反復ごとteardown（S3旧、独立タスク）
 

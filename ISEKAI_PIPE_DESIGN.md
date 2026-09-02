@@ -1958,3 +1958,39 @@ PR1(#108)・PR2(#109)・PR3の3段階で実装した:
   行う」案も検討したが、`isekai-pipe serve`のホールパンチが起動時
   一度きりの動作であり再接続クライアントの新アドレスを学習する手段が
   無いため到達可能性を一切改善しないと判明し却下した(詳細はADR §2.3.0)。
+
+**Task 2.9フォローアップ(2026-09-02、ADR Round 6〜7)**: PR1〜PR3マージ後、
+唯一残っていた調査タスク(`ssh(1)`が`ProxyCommand`の孫プロセスを終了時に
+道連れにするか)を実測した。結果、`ssh(1)`が自発的に終了する場合は道連れに
+なるが、外部から`SIGTERM`/`SIGKILL`された場合は道連れにならない(initへ
+reparentされ生存し続ける)ことを確認した。
+
+最初に実装した`PumpFailure::Local`/`Remote`型分離(Round 6)は、opus 2体の
+敵対的レビューで「`ssh(1)`死亡の支配的シグナルはエラーではなくstdinの
+EOFであり`Local`は実質発火しない」「resume-with-backoffループ中や
+ネットワーク既断状態での死亡はどちらも未解決のまま残る」と判明し、単体
+では不十分だった。根本原因を問い直した末、`isekai-pipe connect`を
+`ssh(1)`の直接の子に強制する`exec`前置+`prctl(PR_SET_PDEATHSIG)`/
+`kqueue`案を検討したが、実機実験で「`ssh(1)`は既に自前で`exec`しており
+提案通りの変更は`exec exec <cmd>`となって全接続を壊す」と判明し却下した。
+
+**最終的な解決(Round 7)**: `isekai-pipe/src/parent_watchdog.rs`を新設。
+`connect_command`冒頭で専用OSスレッドが自分のfd0/fd1を`poll(events:0)`で
+ブロッキング監視し、`ssh(1)`がどんな理由で終了しても(自発的終了・外部
+kill問わず)`POLLERR`/`POLLHUP`で即座に検知、`run_connect`全体との
+`tokio::select!`レースに負けさせてfutureを自然dropさせることで、QUIC
+送信ストリームの既定Drop実装(`finish()`)に任せた clean FIN を送る
+(`.reset(0)`を書かずに、二度とresumeしないセッションをサーバー側に
+park させない)。プロセスグループ管理(`ensure_process_terminated`)は
+ジョブコントロール/`SIGHUP`/Ctrl+Cへの副作用とwrapper自身が死ぬケースを
+覆えないという2つの理由で却下した。`PumpFailure::Local`/`Remote`分離と
+EOF-latch(`pump_c2h`が既にEOFに達した後の`Remote`失敗も同じ経路へ合流
+させる)は、watchdogの無いプラットフォーム(MSYS2/Cygwin版`ssh.exe`が
+起動するnative Windows版`isekai-pipe connect`)向けフォールバックとして
+維持する。新設した`resume_loop::ParentGoneSignal`マーカーをこれら全ての
+経路のエラーに付与し、`connect::write_connect_outcome_for_wrapper`が
+他のどの分類より先にチェックしてoutcomeファイル自体を書かないようにした
+——relay経路で`Unreachable`→`RebootstrapAndRetry`(非冪等リモート
+コマンド再実行防止のB5ガード無し)に化ける経路を根本から断つ。詳細な
+経緯・却下した代替案の理由は`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
+Round 6〜7、`parent_watchdog.rs`自身のモジュールdoc参照。

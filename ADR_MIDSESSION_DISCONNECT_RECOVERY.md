@@ -32,6 +32,320 @@
 
 ## 0. 改訂履歴
 
+### Round 7（2026-09-02）— Round 6の`PumpFailure`分離だけでは不十分と
+    判明し、`parent_watchdog`（ブロッキング`poll()`）で再解決
+
+Round 6実装（`PumpFailure::Local`/`Remote`分離）をPR #112として提出後、
+opus 2体（opus-critic-task29-a/b、それぞれ実験による裏取りを伴う）に
+複数ラウンドの敵対的レビューを依頼し、**Round 6単体では不十分**という
+結論に収束した:
+
+- **F1（blocking）**: `ssh(1)`が死んだ際の支配的なシグナルは`stdin`の
+  **EOF**であってエラーではない。`pump_c2h`の`n == 0`分岐は`Ok(())`を
+  返す既存の「正常終了」経路であり、`PumpFailure::Local`は実質
+  発火しない。
+- **F2（blocking）**: 実際に孤児が長時間残る2シナリオ——(a)
+  resume-with-backoffループの最中に`ssh(1)`が殺される、(b)ネットワーク
+  が既に落ちている状態で`ssh(1)`が死ぬ——はどちらも`Remote`分類に
+  落ち、relay経路ではデフォルト10日のresume windowにそのまま入る。
+  Round 6はこの核心部分を未解決のまま残していた。
+- **F3（significant）**: relay経路（`MidSessionDisconnectSignal`を
+  付与しない）で`Local`失敗が`Unreachable`として素通しされると
+  `RebootstrapAndRetry`（`wrapper.rs::decide_connect_failure_recovery`）
+  に到達しうるが、このアームには非冪等リモートコマンド再実行防止の
+  B5ガード（`RetryConnectLightweight`側にのみ存在）が無い。
+- **F4（significant）**: `Local`分岐の`quic_write.reset(0)`が、
+  「二度とresumeされないセッションをサーバー側に最大10日間park
+  させる」という、コメントの意図と正反対の結果を招いていた。
+
+ユーザー指示「根本原因を考えて非連続な変更を」を受け、`isekai-ssh`が
+`ProxyCommand`文字列に`exec `を前置して`isekai-pipe connect`を
+`ssh(1)`の直接の子に強制し、`prctl(PR_SET_PDEATHSIG)`（Linux）/
+`kqueue`+`EVFILT_PROC`（macOS）でカーネルレベルの親死亡通知を使う案を
+提案したが、**両批評家が独立に実機実験でこれを否定した**:
+`ssh_config(5)`が明記する通り`ssh(1)`は既に`ProxyCommand`を
+`$SHELL -c "exec <cmd>"`として起動しており(「the command string ...
+is executed using the user's shell 'exec' directive to avoid a
+lingering shell process」)、`isekai-pipe connect`は既に`ssh(1)`の
+直接の子である。二重`exec`を追加する提案通りの変更は
+`exec exec <cmd>`となり、dash/bashともに`exec: exec: not found`
+(rc=127)で即座に失敗し、**全てのUnix接続を壊す**ことが実証された
+(この近接ミスの記録として本セクションに残す)。
+
+その後さらに数ラウンドの往復を経て、両批評家が
+「専用スレッドでのブロッキング`poll()`」という、`prctl`/`kqueue`より
+単純かつ正しい方式に収束した。理由: レベルトリガーのためarm時
+レース(`prctl`にはある——親が既に死んでいると通知自体が届かない
+既知の問題、しかもorphanは`systemd --user`のようなchild subreaperへ
+reparentされるため`getppid() == 1`という素朴なguardは静かに機能
+しない、という具体的なバグを両批評家が独立に発見した)が原理上存在
+しない、Linux/macOS/BSDで単一のPOSIX実装で済む、「特定のPIDが
+死んだか」ではなく「stdioの向こう側に誰かまだいるか」という本質的な
+述語を直接検査できる、という3点。`SIGTERM`のデフォルトアクションが
+即座にプロセスを終了させグレースフルシャットダウン(FIN送信)を
+スキップしてしまう(結果としてF4と同じ「サーバー側10日park」を招く)
+という点も、独立にどちらの批評家からも指摘された。
+
+**最終的に実装した設計**(`rust-core/isekai-pipe/src/parent_watchdog.rs`):
+
+- `connect_command`の冒頭で一度だけ、専用OSスレッドが`poll(fd=0, fd=1,
+  events:0)`をタイムアウト無しでブロッキング待機する
+  (`POLLERR`/`POLLHUP`/`POLLNVAL`は要求した`events`に関わらず
+  `revents`に常に現れる)。fd0とfd1は別々のpipe(同一
+  socketpairではない、2026-09-02実機測定で確認——`fd1`側は
+  `POLLHUP`ではなく`POLLERR`で倒れることも判明したため両方を
+  受理する)。`tokio::io::unix::AsyncFd`は使わない
+  (`O_NONBLOCK`はopen file description単位のプロパティであり、
+  fd1に設定すると`pump_h2c`の実際の`stdout`書き込みまで
+  non-blocking化してしまう——素のスレッドならこの問題自体が
+  発生しない)。
+- 検知したら、`connect_command`が`run_connect`全体を
+  この watchdog と`tokio::select!`で競わせているため、負けた側の
+  `run_connect`のfutureがその場でdropされる。これによりネストされた
+  非同期フレーム(`data_stream`/`quic_write`含む)が通常のRust
+  スコープ脱出と同じ順序でdropされ、`quicmux`(内部の`noq`/`qmux`)の
+  送信ストリームのデフォルトDrop実装がclean FIN(`finish()`)を
+  キューに積む——`.reset(0)`を呼ぶコードを一切書かずに、まさにF4が
+  求めていた「今回は二度とresumeしないのでサーバー側をparkさせず
+  即座にteardownさせる」動作を狙ったもの。**ただしこれはbest-effort
+  であり保証ではない**(Round 7フォローアップ参照——`finish()`は
+  キューに積むだけで、実際に配線へ流すにはconnectionのdriverタスクが
+  再度pollされる必要があり、Drop自体はそれを保証しない。失敗しても
+  実害は「サーバー側が15秒のidle timeoutでDataStreamDiedに倒れ
+  resume-grace分parkされ、後でsweep_expired_parkedに回収される」だけで、
+  PR適用前の状態(F4のバグ)より悪化はしない)。
+- `resume_loop.rs`側の`PumpFailure::Local`/EOF-latch(下記)は
+  廃止せず、(a) macOS以外でwatchdogが無いプラットフォーム
+  (MSYS2/Cygwin版`ssh.exe`が起動するnative Windowsバイナリの
+  `isekai-pipe connect`——`poll(2)`が使えない)向けのフォールバック、
+  (b) Unix上でも`ssh(1)`自体は生きたままこのpipeだけ壊れる稀な
+  ケース、として維持する。`PumpFailure::Local`到達時も
+  `.reset(0)`を呼ばず`.shutdown()`を呼ぶよう変更(F4対応。ただし
+  `.shutdown()`自体もnoqの`poll_shutdown`実装がPoll::Readyを即座に
+  返すだけで、Dropと同じくキューに積むのみ——実際にflushの機会を
+  与えるのは後述のgrace sleepであり、`.shutdown()`はreset/FINの
+  フレーム種別を正しくするためだけの呼び出し)。
+- **EOF-latch**(F2対応の一部): `run_data_pump`が
+  `c2h_already_done: &mut bool`を追加引数として受け取り、
+  `pump_c2h`がOkを返した瞬間に同期的に`true`を書き込むよう変更した
+  (戻り値の一部としてタプルで返す設計は、`run_resume_loop`の外側
+  `tokio::select!`で`reconnect_signal_rx`側が勝って`run_data_pump`の
+  futureごとcancelされた際にこの情報を失う実バグがあり、opus再レビュー
+  で発見・修正済み——Round 7フォローアップ参照)。この変数は
+  `run_resume_loop`の外側loopの外で1度だけ宣言し、二度と`false`へ
+  戻さない。`run_resume_loop`はこれが`true`の状態で`Remote`失敗を
+  受け取った場合、`Local`と同じ「即座に諦める」経路へ合流させる
+  (ローカル側の送出元が既に終わっている以上、resumeを試みる価値が
+  無いという結論はどちらも同じ)。watchdogの無いプラットフォームで
+  F2(b)の一部を狭く塞ぐ。
+- **F3対応**: `ParentGoneSignal`という新しいマーカーを
+  `resume_loop.rs`に新設し、watchdog起因のエラー・
+  `PumpFailure::Local`起因のエラー・EOF-latch起因のエラーの
+  いずれにも(route/STUN・relay問わず)付与する。
+  `connect::write_connect_outcome_for_wrapper`はこのマーカーを
+  他のどの分類判定よりも先にチェックし、存在すれば**outcomeファイル
+  自体を一切書かない**——relay経路で`Unreachable`
+  →`RebootstrapAndRetry`(B5ガード無し)に化ける経路を根本から断つ。
+
+### Round 7フォローアップ（2026-09-02）— 実装直後のopus再レビューで
+    見つかった5件のバグ、および誇張の自己訂正
+
+Round 7の初回実装をopus 2体に再レビューさせたところ、独立に同一の
+3件の実バグ（+関連指摘）が見つかった:
+
+- **wait()のfail-open反転**: `spawn()`のスレッド起動失敗
+  （`std::thread::Builder::spawn`は失敗時にクロージャ自体を
+  txごと破棄し、呼び出し元へ返さない）と`watch_loop()`自身の
+  `poll()`異常時の`return`は、どちらも「fail open」という
+  コメント通りの意図だったが、`wait()`旧実装
+  (`let _ = rx.changed().await;`)はsender全滅による`changed()`の
+  `Err`を実際の発火と区別できず、逆に即座のfire(接続開始直後の
+  abort、または健全なセッション中のabort)を引き起こしていた。
+  `spawn()`で`tx.clone()`を1つ`mem::forget`でリークし、どちらの
+  経路が`tx`を送らずdropしてもチャンネルが閉じないよう修正した。
+- **`.shutdown()`はflushを保証しない**: noqの`SendStream`の
+  `poll_shutdown`実装を確認したところ`Poll::Ready`を即座に返す
+  だけで、`Drop`同様キューに積むのみ。`.await`してもスケジューラへ
+  yieldしない。実際にflushの機会を与えるのは
+  `tokio::time::sleep()`のみであり、これを「watchdog起因の
+  selectアーム」ではなく「結果が`ParentGoneSignal`を持つか」で
+  `connect_command`側に一元化した——`run_resume_loop`のin-loop
+  give-up分岐も`run_connect`ブランチ経由で戻ってくるため、
+  watchdogアームだけにsleepを置くとこちらを取りこぼす。
+- **EOF-latchの世代跨ぎ**: `c2h_already_done`を`run_resume_loop`の
+  外側`loop`の中で毎世代`false`初期化していたのを、loopの外で
+  1回だけ宣言し二度と`false`に戻さないよう変更した（レビューでは
+  「`tokio::select!`の非決定的なポーリング順序次第で理論上
+  再発しうる」と指摘されたが、事後の相互検証で「実際には
+  latchが立った世代は必ずその場でreturnするため次の世代には
+  到達しない」ことが判明——本質的には`&mut`で借用を渡すこと自体が
+  cancel耐性の効いている理由であり、宣言位置はbelt-and-braces。
+  それでも「set-only-to-true」という規律自体は正しいため変更は
+  維持した）。
+- **UX（N5）**: watchdogは通常の`exit`でも、S→C方向がTCP往復済みの
+  clean EOF経路より先に倒れることが多く、`ParentGoneSignal`は
+  レアケースではなく毎回のログアウトで頻繁に発生しうる。
+  `connect_command`のeprintln!(anyhowダンプ)をこのケースで
+  抑制した。**ただし終了コードはEX_UNAVAILABLEのまま維持**——
+  一度`ExitCode::SUCCESS`に変更したが、「`ParentGoneSignal`は
+  dial中のssh(1)強制終了やssh(1)生存中の`PumpFailure::Local`
+  など本当に異常なケースも含むため、終了コードを見るスクリプトが
+  気づけなくなる」という指摘を受けて差し戻した。
+- **テストが`watch_loop`本体を呼んでいなかった**: 手書きコピーの
+  ループを検証していたのを、`watch_loop(tx, fds: &[libc::c_int])`
+  というシグネチャに変更して本物を呼ぶようにし、fd1側で実際に
+  発火する`POLLERR`（`POLLHUP`ではない）方向のテストケースも
+  追加した（既存テストはfd0側の`POLLHUP`のみ検証していた）。
+
+**自己訂正の記録**: 上記UX対応の初稿で、「watchdogがclean EOF
+経路との競合に確実に勝つため通常ログアウトでは`ParentGoneSignal`が
+例外ではなく通常経路になる」という一文を、あたかもopus-critic-task29-a
+のレビュー結果であるかのようにコードコメントへ記録したが、
+実際にはレビュー側は「勝つことがある、断続的に」としか述べておらず、
+断定はこちらの誤った言い換えだった（このセッション中に同種の
+誇張——未検証の思いつきを確定事実として記録する——が3回発生した
+うちの1つとして本人が自認し訂正）。`eprintln!`抑制自体の判断は
+維持しつつ、コメントの根拠を「その時点でローカル側の相手が既に
+いないため報告先が無い」という無条件に正しい理由に書き換えた。
+
+### Round 7フォローアップ2（2026-09-02）— macOS実CIが`events: 0`の
+    非対応を検出、per-fd events+sleep-guardで解決（kqueue案は両批評家が
+    自ら撤回）
+
+Round 7フォローアップの実装をpushしたところ、`rust-core-test-macos`
+（必須チェックではないが実在するCI）が新設した`parent_watchdog`の
+2テストとも「タイムアウトで発火せず」失敗した。`events: 0`で
+`poll()`した場合、LinuxではPOSIXの保証通り`POLLHUP`/`POLLERR`/
+`POLLNVAL`が常に`revents`へ現れるが、Darwinでは同じ保証が成立
+しないことが実測で判明した(Darwinは`poll(2)`をネイティブ実装
+しておらず、`poll_nocancel()`が各`pollfd`を`kqueue`登録へ変換する
+——`events`が読み取り方向を要求しなければ`EVFILT_READ`は登録
+されず、その fd には何も監視するものが無くなるため`revents`が
+一切生成されない、というのがopus 2体独立の見立て)。
+
+**最初の対応(即座にrevert)**: `events: 0`を`POLLIN`へ全fd一律で
+変更したが、これは「watchdogスレッド自身は一切fd0をreadしない」
+という設計上の事実と衝突する重大な回帰だった——`ssh(1)`は
+接続確立直後にバージョンバナーをstdinへ書き込むが、
+`run_resume_loop`のpumpが実際にreadを始めるのはdial/handshake/
+`retry_while_busy_other_session`が終わった後であり、その間ずっと
+未読データがfd0に residual するため、level-triggeredな`poll()`が
+即座に`POLLIN`を返し続け、CPU 100%でスピンする(全接続・全
+プラットフォームで発生する、Darwin固有ではない一般的な性質)。
+opus-critic-task29-aの指摘で即座にrevertした。
+
+**検討したが両批評家が自ら撤回したkqueue案**: Darwin/BSD向けに
+`EVFILT_READ`/`EVFILT_WRITE`+`EV_CLEAR`(edge-triggered)を使う
+プラットフォーム別実装をユーザーの明示的指示で一度設計したが、
+実装に着手する前に両批評家が独立に「もっと単純な代替案がある」
+と撤回を申し出た。
+
+**最終的に採用した設計**: `poll()`実装を1つのまま維持し、
+(a)各fdが実際にサポートする方向のみを要求する(fd0=`POLLIN`、
+fd1=`POLLOUT`、逆方向は要求しない——書き込み専用のfd1に読み取り
+フィルタを要求するのは、登録失敗による即時発火という別の危険が
+疑われる、実測はしていない)、(b)`watch_loop`本体に「`TERMINAL`
+ビットが立たずに`poll()`が戻った場合はSPURIOUS_BACKOFF(1秒)だけ
+sleepしてから再度pollする」というガードを追加する。これにより
+per-fd events要求で再発するspurious wakeup(fd0の未読データ・
+fd1の常時書き込み可能状態)をスピンではなく1秒間隔のポーリングに
+変換する。kqueueによるedge-triggered化より単純で、新規の
+プラットフォーム固有コードを一切増やさずに済む。
+
+**この設計変更の副次的な帰結**(critic Bの指摘、記録に値する):
+検知レイテンシが実質最大1秒になったことで、`parent_watchdog`は
+通常のログアウト(clean EOF経路)との競合にもう確実には勝たなく
+なった——これは望ましい division of labor の回復であり、退行では
+ない。通常ケースは元々の`pump_c2h`のEOF経路が`Ok(())`で処理し、
+`parent_watchdog`はdial/handshake/resume待機中などpumpが動いて
+いない「静かな」局面のバックストップとしてのみ機能する、という
+役割分担が実現された(N5で追加した`eprintln!`抑制・非ゼロ終了
+コード維持は引き続き必要かつ正しいが、発火頻度は当初の想定より
+低い)。
+
+**テスト**: 「peerが生きている間は発火しない」という否定側の
+チェックを全ての肯定的テストに組み込んだ(単に閉じてから起動する
+既存の全テストでは「常に無条件で発火する」という壊れ方——
+まさにレジストレーション失敗による誤発火のシナリオ——を検知
+できないため、両批評家が独立にmerge gateとして要求した)。
+さらに、production が実際に渡す`&[(0, POLLIN), (1, POLLOUT)]`
+という複数fd構成そのものを検証するテストも追加した——単一fdずつの
+テストでは、「片方のfdが常時spuriously-readyな状態でも、もう片方の
+fdの本当のcloseを見逃さない」という production の定常状態を
+検証できないため(両批評家が独立に指摘した、唯一残っていた
+テストギャップ)。
+
+**再発した教訓**: このEpic Rの過程でこの設計を実際に変えた訂正は、
+そのすべてが「推論」ではなく「実際に何かを実行した」ことから来ている——
+`man ssh_config`が`exec`前置案の前提を殺し、実際のfd statが
+socketpairではなく2本の別々のpipeだと示し、実測がPOLLHUPではなく
+POLLERRだと分かり、noqの`poll_shutdown`の実装確認がPoll::Readyの
+即時返却(=flush非保証)だと判明し、実CIの失敗がDarwinの`events: 0`
+の穴を暴いた。この5件のうち4件は、レビュアーか筆者自身が最初に
+自信を持って断定していたことと矛盾していた。次にプラットフォーム
+依存のコードを触るときのための、再利用可能な教訓として記録する。
+
+**Task 2.9自体の結論**: `ensure_process_terminated`
+(`wrapper.rs`側のプロセスグループ管理)は実装しない
+(ジョブコントロール/`SIGHUP`/Ctrl+Cへの副作用が大きく、かつ
+wrapper自身が死ぬケースを覆えないため——両批評家が独立に到達した
+結論)。代わりに`isekai-pipe connect`自身が自分のstdin/stdoutの
+生死を能動的に監視する`parent_watchdog`で解決した。
+
+### Round 6（2026-09-02）— Task 2.9（孫プロセスの実測）を実施し、
+    `ensure_process_terminated`より汎用的な自己終了型の修正で解決
+
+PR1〜PR3（#108〜#110）マージ後、唯一残っていたTask 2.9（§2.3.6/
+TASKS.md該当節）を実機に近い形で検証した。当初の実測手順（実際に
+STUN P2Pホストのネットワークを切断する）の代わりに、**Task 2.9の
+本質はOS一般の`ssh(1)`+`ProxyCommand`の性質であり、実ネットワーク
+切断もSTUN固有の事情も不要**と判断し、合成`ProxyCommand`
+（`sh -c 'echo $$ > pidfile; exec sleep 600'`）でローカルに再現した:
+
+| `ssh(1)`の終了経路 | ProxyCommand子プロセス |
+|---|---|
+| 自身の`ConnectTimeout`満了（自発的終了） | 道連れで終了 |
+| 外部からの`SIGTERM` | **生存**（initへreparent） |
+| 外部からの`SIGKILL` | **生存**（initへreparent） |
+
+`ssh(1)`は自分の`cleanup_exit()`が走る自発的終了でのみ子を終了させ、
+外部から殺された場合は終了させない（`SIGKILL`はcleanup_exit自体を
+実行不能にするため当然だが、`SIGTERM`でも同様だったのは実測するまで
+自明ではなかった）。TASKS.mdのTask 2.9が要求していた「実際に…」
+という手順とは異なる、より汎用的な検証だが、この結果は
+`wrapper.rs`が`ssh(1)`を再起動する際の内部シグナル経路にも、外部
+要因（OOM killer・端末強制終了等）にも等しく当てはまる、より広い
+主張として扱える。
+
+この結果を受けて**`ensure_process_terminated`（プロセスグループ管理
+によるkill）は実装しなかった**。代わりに、より根本的で経路非依存の
+修正を`resume_loop.rs`に実装した: `run_data_pump`の失敗を
+`PumpFailure::Local`（`stdin`/`stdout`側、`ssh(1)`のパイプが壊れた
+ことを示す）と`PumpFailure::Remote`（QUIC/ネットワーク側、resumeを
+試す価値がある）に型で分離し、`run_resume_loop`は`Local`失敗を
+即座に`Err`として返してresumeループに入らないようにした。
+
+この修正が`ensure_process_terminated`より優れる理由: `ssh(1)`が
+自分の子の**パイプfdを閉じる**のはOSカーネルがプロセス終了時に
+無条件で行う後始末であり、`ssh(1)`自身の終了経路（自発的/`SIGTERM`/
+`SIGKILL`のいずれか）にも、`ssh(1)`が孫プロセスを明示的にkillする
+かどうかにも依存しない——`isekai-pipe connect`は自分のstdin/stdout
+が壊れたことを次のread/writeで即座に検出でき、`ssh(1)`側の協力を
+一切必要としない。これにより`MidSessionDisconnectSignal`のdoc
+コメントが警告していた「ローカル側障害＋健全なネットワークが
+`disconnected_since`のリセットにより無限に再接続ループする」という、
+relay・STUN両経路が共有していた既存バグ（Epic R以前から存在）も
+同時に解消される。
+
+検証: `pump_c2h`/`pump_h2c`それぞれについて、実QUIC接続を使い
+「`stdin.read()`失敗」「`stdout.write_all()`失敗」がそれぞれ
+`Local`に分類されることを直接ピン留めする回帰テストを追加した
+（`pump_c2h_classifies_a_stdin_read_failure_as_local`・
+`pump_h2c_classifies_a_stdout_write_failure_as_local`）。
+
+PR1〜PR3とは独立した修正のため新規PRとして分離し、TASKS.mdの
+Task 2.9をこの結果で更新した。
+
 ### Round 5（2026-09-02）— PR2マージ後、PR3着手前にopus-critic-a・
     opus-critic-bへ独立並行レビューを再依頼して発見
 
