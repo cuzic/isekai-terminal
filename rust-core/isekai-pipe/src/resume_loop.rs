@@ -16,7 +16,8 @@ use isekai_transport::{
     open_control_stream, reconnect_and_resume, spawn_app_ack_tasks, system_quic_factory, AnyByteStream,
     AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxFactory, AnyMuxRebinder, AppAckCounters,
     AppAckTasks, BackoffPolicy, BindSpec, C2hSentOffset, H2cClientDeliveredOffset, RelayTarget,
-    SequentialRelayCandidate, SequentialStunCandidate, StunP2pTarget,
+    ResumableRelaySession, SequentialRelayCandidate, SequentialStunCandidate, StunP2pConnection,
+    StunP2pTarget,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -62,10 +63,14 @@ const WARM_STANDBY_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 /// real suspend shows up here as wall-clock racing far ahead of the
 /// monotonic tick count.
 const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
+/// STUN P2P uses the server-granted resume grace unchanged, but this client
+/// only keeps bare-redial resume attempts alive briefly before returning
+/// control to the wrapper's full STUN re-establishment loop.
+const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 
 /// Marks an `anyhow::Error` as having occurred *after* the STUN P2P
-/// handshake already succeeded — i.e. during the pump phase (`relay_stdio`),
-/// not while dialing (Epic R PR2, Task 2.4). Mirrors
+/// handshake already succeeded — i.e. after the route has entered its
+/// STUN-scoped `run_resume_loop`, not while dialing. Mirrors
 /// `isekai_transport::StaleTrustSignal`'s attach-at-the-source/
 /// downcast-at-the-top shape (`connect.rs::attach_stale_trust_signal`): a
 /// bare `err.downcast_ref::<MidSessionDisconnectSignal>()` finds this
@@ -74,27 +79,15 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// `err.chain()` traversal needed (round 1 review, R1-B2/B2, corrected a
 /// wrong assumption in an earlier draft of this fix).
 ///
-/// Deliberately **not** attached to `run_resume_loop`'s own `give_up` path
-/// (the Relay — and, before PR3, non-existent-for-STUN — resume loop): that
-/// loop already retries internally for up to `DEFAULT_RESUME_GRACE_SECS`
-/// (10 days) before giving up, so an error escaping it is essentially
-/// terminal and the existing `RebootstrapAndRetry` (full re-deploy) is the
-/// correct response, not a lightweight retry (S1(old) from the ADR review).
-///
-/// Attached at the source, inside [`relay_stdio`] itself, to only its two
-/// *remote*-stream I/O failures ("reading remote stream failed"/"writing to
-/// remote stream failed") — **not** its local stdin/stdout ones (round 2
-/// review finding). `relay_stdio`'s callers used to blanket-wrap its entire
-/// `Result` with this marker, which meant a local-side failure (e.g. `ssh(1)`
-/// itself already exited and closed the pipe this process's stdout writes
-/// into, so `stdout.write_all`/`flush` fails with a broken-pipe error) could
-/// get misclassified as a network disconnection and trigger an unwanted
-/// extra reconnect — even though nothing about the actual network or remote
-/// session was at fault. `isekai-pipe/src/engine/mod.rs`'s graceful
-/// `send.shutdown()` on a clean server-side close makes this a narrow race
-/// rather than a systematic misclassification, but there's no reason to
-/// accept it when scoping the marker to the two sites that can actually mean
-/// "the network died" avoids it entirely.
+/// Deliberately attached only by STUN P2P callers of `run_resume_loop`.
+/// Relay callers still do not add it: relay resume already retries
+/// internally for its full server-granted window, so an error escaping that
+/// loop is terminal and the existing full re-bootstrap response is correct.
+/// STUN P2P has a shorter client-side give-up boundary because bare redial
+/// cannot fix cases where the server-side observed address is no longer
+/// reachable; once that boundary is hit, the wrapper should retry a fresh
+/// STUN establishment rather than silently wait for the much longer server
+/// resume-grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidSessionDisconnectSignal;
 
@@ -105,70 +98,6 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 }
 
 impl std::error::Error for MidSessionDisconnectSignal {}
-
-/// Invariant (round 3 review, N1): only STUN P2P call sites
-/// (`connect.rs`'s single-candidate arm and [`run_stun_p2p_with_fallback`])
-/// may call this. It unconditionally attaches [`MidSessionDisconnectSignal`]
-/// to its two remote-stream I/O failures, and that marker is specifically
-/// the ADR's STUN-only `RetryConnectLightweight` signal — a relay-route
-/// caller must **not** inherit it (relay's own resume loop already retries
-/// internally for up to `DEFAULT_RESUME_GRACE_SECS`, so an error escaping
-/// *that* loop is terminal, and a lightweight redial would be the wrong
-/// response to it). Generic over `AnyByteStream` for STUN P2P's own sake,
-/// not as an invitation for a relay-side caller to reuse it.
-pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
-    let (mut quic_read, mut quic_write) = stream.split();
-    let mut c2h = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = stdin.read(&mut buf).await.context("reading stdin failed")?;
-            if n == 0 {
-                let _ = quic_write.shutdown().await;
-                return Ok::<_, anyhow::Error>(());
-            }
-            quic_write
-                .write_all(&buf[..n])
-                .await
-                .context("writing to remote stream failed")
-                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
-        }
-    });
-    let mut h2c = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = quic_read
-                .read(&mut buf)
-                .await
-                .context("reading remote stream failed")
-                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
-            if n == 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            stdout
-                .write_all(&buf[..n])
-                .await
-                .context("writing stdout failed")?;
-            stdout.flush().await.context("flushing stdout failed")?;
-        }
-    });
-
-    let (mut c2h_done, mut h2c_done) = (false, false);
-    while !c2h_done || !h2c_done {
-        tokio::select! {
-            res = &mut c2h, if !c2h_done => {
-                c2h_done = true;
-                res.context("stdin->remote task panicked")??;
-            }
-            res = &mut h2c, if !h2c_done => {
-                h2c_done = true;
-                res.context("remote->stdout task panicked")??;
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Narrow signal a retried-connect error type must expose for
 /// [`retry_while_busy_other_session`] — named distinctly from the underlying
@@ -224,11 +153,10 @@ pub(crate) const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs
 /// since neither `connect_via_relay_resumable` nor `_with_fallback` persist
 /// one across invocations) would otherwise fail outright instead of waiting
 /// the same window a same-process resume would have. `pub(crate)` (Epic R
-/// PR2, Task 2.11) so `connect.rs`'s single-candidate STUN P2P path can
-/// reuse it too — STUN P2P has no resume/control-stream concept of its own
-/// (`run_stun_p2p_with_fallback`'s docs), but a fresh reconnect attempt
-/// racing this same client's own not-yet-expired parked session is exactly
-/// as possible there as it is for relay.
+/// PR2, Task 2.11) so STUN P2P's initial establishment paths can reuse it
+/// too: a fresh reconnect attempt racing this same client's own
+/// not-yet-expired parked session is exactly as possible there as it is for
+/// relay.
 pub(crate) async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
@@ -270,7 +198,7 @@ pub(crate) async fn run_relay_resumable(
     let established = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable(&factory, target, requested, identity))
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface).await
+    run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface, None).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -293,18 +221,53 @@ pub(crate) async fn run_relay_resumable_with_fallback(
         retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
             .await
             .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface).await
+    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface, None).await
+}
+
+pub(crate) async fn run_stun_p2p_resumable(
+    factory: &AnyMuxFactory,
+    target: &RelayTarget,
+    profile: &str,
+    connection: StunP2pConnection,
+) -> Result<()> {
+    let control = open_control_stream(&connection.connection, &connection.proof).await?;
+    let established = ResumableRelaySession {
+        connection: connection.connection,
+        data_stream: connection.stream,
+        control_stream: control.stream,
+        session_id: control.session_id,
+        effective_resume_grace_secs: connection.effective_resume_grace_secs,
+        network_rebinder: connection.network_rebinder,
+    };
+    run_resume_loop(
+        factory,
+        target,
+        profile,
+        established,
+        // STUN P2P's punched NAT mapping is tied to the socket used for
+        // initial establishment. Rebinding or warm-standby promotion would
+        // switch sockets/interfaces without the rejected re-rendezvous
+        // primitive, so both are deliberately disabled on this path.
+        /* experimental_network_rebind */ false,
+        /* tethering_interface */ None,
+        Some(STUN_RESUME_GIVE_UP_WINDOW),
+    )
+    .await
+    .map_err(|e| e.context(MidSessionDisconnectSignal))
 }
 
 /// Like the single-candidate `CandidateRoute::StunP2p` path in `run_connect`,
 /// but tries `candidates` (each a different STUN server against the same
 /// peer) in priority order (`#11`) instead of dialing a single fixed STUN
-/// server. STUN P2P has no resume/control-stream concept (`stun_p2p.rs`'s
-/// module docs), so — unlike `run_relay_resumable_with_fallback` — there is
-/// no `run_resume_loop` step here: the winning candidate's stream goes
-/// straight into `relay_stdio`, exactly like the legacy single-candidate path
-/// already does.
-pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
+/// server. After the winning STUN connection is established, it uses the
+/// same byte-level RESUME loop as relay mode, scoped to that winning peer
+/// address and session id.
+pub(crate) async fn run_stun_p2p_with_fallback(
+    target: &StunP2pTarget,
+    candidates: &[SequentialStunCandidate],
+    profile: &str,
+    requested_resume_grace_secs: u64,
+) -> Result<()> {
     let factory = system_quic_factory();
     // Epic R PR2, Task 2.11: STUN P2P used to skip the same
     // `BUSY_OTHER_SESSION` retry the relay paths already get above — a
@@ -314,18 +277,22 @@ pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidate
     // this same client's own prior session still parked on the remote
     // helper, not a real conflicting session.
     let (connection, _winning_stun_server) =
-        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p_with_fallback(&factory, target, candidates))
+        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || {
+            let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
+            connect_stun_p2p_with_fallback(&factory, target, candidates, requested)
+        })
             .await
             .map_err(attach_stale_trust_signal)?;
-    // Epic R PR2, Task 2.4 (round 2 review: scope narrowed to `relay_stdio`'s
-    // own remote-stream I/O sites, not blanket-applied here anymore — see
-    // `MidSessionDisconnectSignal`'s doc comment): a `relay_stdio` failure
-    // here means the STUN P2P handshake above already succeeded, so a
-    // *remote*-stream failure is a mid-session disconnect, not a
-    // connect-time one — `write_connect_outcome_for_wrapper` classifies it
-    // as `ConnectOutcomeClass::MidSessionDisconnect` instead of
-    // `Unreachable` accordingly.
-    relay_stdio(connection.stream).await
+    let relay_target = RelayTarget {
+        helper_addr: target.peer_addr,
+        server_name: target.server_name.clone(),
+        cert_sha256_hex: target.cert_sha256_hex.clone(),
+        session_secret: target.session_secret.clone(),
+        // `run_stun_p2p_with_fallback` receives no `ConnectionIntent`, so
+        // this path intentionally has no source for `local_bind_port_range`.
+        local_bind_port_range: None,
+    };
+    run_stun_p2p_resumable(&factory, &relay_target, profile, connection).await
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
@@ -335,7 +302,10 @@ pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidate
 /// `run_relay_resumable` (single fixed target) and
 /// `run_relay_resumable_with_fallback` (the winning target out of several
 /// candidates) — resuming a session is always scoped to the one connection
-/// that established it, never a fresh candidate search.
+/// that established it, never a fresh candidate search. `max_resume_window`
+/// is `None` for relay callers and `Some` only for STUN P2P's shorter
+/// client-side give-up boundary; it does not alter the server-granted
+/// `effective_resume_grace_secs`.
 /// Picks an OS-assigned-ephemeral-port wildcard bind address matching
 /// `remote`'s address family — the same "let the OS pick a fresh source"
 /// approach `BindSpec::any_ipv4()` already uses for every *new* connection,
@@ -574,6 +544,10 @@ fn resume_window_for(effective_resume_grace_secs: u32) -> Duration {
         0 => DEFAULT_RESUME_WINDOW,
         secs => Duration::from_secs(secs.into()),
     }
+}
+
+fn clamp_resume_window(resume_window: Duration, max_resume_window: Option<Duration>) -> Duration {
+    max_resume_window.map(|max| resume_window.min(max)).unwrap_or(resume_window)
 }
 
 // ── tssh風のライブ再接続表示(`run_resume_loop`専用) ──────────────
@@ -921,6 +895,10 @@ fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>
     }
 }
 
+/// `max_resume_window` is the STUN-only client-side clamp already applied
+/// by `run_resume_loop`; when present, this helper also suppresses desktop
+/// give-up notifications so repeated lightweight STUN retries do not spam
+/// the user.
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -931,7 +909,9 @@ async fn resume_with_backoff_until_deadline(
     state: &mut ResumeLoopState,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
+    max_resume_window: Option<Duration>,
 ) -> Result<AnyByteStream> {
+    let notify_on_give_up = max_resume_window.is_none();
     let mut attempt: u32 = 0;
     loop {
         let now = Instant::now();
@@ -952,10 +932,12 @@ async fn resume_with_backoff_until_deadline(
                      Ending this connect attempt; ssh will treat this as a lost connection.",
                 ),
             );
-            notify_os(
-                "isekai-pipe connect",
-                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
-            );
+            if notify_on_give_up {
+                notify_os(
+                    "isekai-pipe connect",
+                    &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
+                );
+            }
             return Err(anyhow::anyhow!(
                 "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
                  for '{profile}'.{last_error_suffix}"
@@ -1046,10 +1028,12 @@ async fn resume_with_backoff_until_deadline(
                              ssh will treat this as a lost connection.",
                         ),
                     );
-                    notify_os(
-                        "isekai-pipe connect",
-                        &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
-                    );
+                    if notify_on_give_up {
+                        notify_os(
+                            "isekai-pipe connect",
+                            &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+                        );
+                    }
                     return Err(anyhow::anyhow!(
                         "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
                          retrying would never succeed."
@@ -1079,11 +1063,15 @@ pub(crate) async fn run_resume_loop(
     established: isekai_transport::ResumableRelaySession,
     experimental_network_rebind: bool,
     tethering_interface: Option<isekai_transport::InterfaceIndex>,
+    max_resume_window: Option<Duration>,
 ) -> Result<()> {
     let session_id = established.session_id;
     drop(established.connection);
 
-    let resume_window = resume_window_for(established.effective_resume_grace_secs);
+    let resume_window = clamp_resume_window(
+        resume_window_for(established.effective_resume_grace_secs),
+        max_resume_window,
+    );
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1222,6 +1210,7 @@ pub(crate) async fn run_resume_loop(
                     &mut state,
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
+                    max_resume_window,
                 )
                 .await?
             }
@@ -1379,6 +1368,45 @@ mod tests {
     #[test]
     fn resume_window_for_a_real_value_uses_it_verbatim() {
         assert_eq!(resume_window_for(180), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn clamp_resume_window_leaves_relay_window_unchanged_when_no_max_is_set() {
+        assert_eq!(clamp_resume_window(Duration::from_secs(600), None), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn clamp_resume_window_caps_stun_window_without_changing_the_server_grace_value() {
+        assert_eq!(
+            clamp_resume_window(Duration::from_secs(600), Some(STUN_RESUME_GIVE_UP_WINDOW)),
+            STUN_RESUME_GIVE_UP_WINDOW
+        );
+    }
+
+    #[test]
+    fn clamp_resume_window_does_not_extend_a_shorter_server_window() {
+        assert_eq!(
+            clamp_resume_window(Duration::from_secs(30), Some(STUN_RESUME_GIVE_UP_WINDOW)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn plain_resume_loop_give_up_errors_do_not_carry_the_stun_mid_session_marker() {
+        let err = anyhow::anyhow!("relay resume window exceeded");
+        assert!(
+            err.downcast_ref::<MidSessionDisconnectSignal>().is_none(),
+            "relay callers must not inherit the STUN-only mid-session marker"
+        );
+    }
+
+    #[test]
+    fn stun_resume_loop_callers_attach_the_mid_session_marker_through_context() {
+        let err = anyhow::anyhow!("STUN resume window exceeded").context(MidSessionDisconnectSignal);
+        assert!(
+            err.downcast_ref::<MidSessionDisconnectSignal>().is_some(),
+            "top-level outcome classification relies on anyhow::Error::downcast_ref walking context sources"
+        );
     }
 
     /// A `NetworkChangeMonitor` that fires exactly one event, then never
@@ -1833,6 +1861,7 @@ mod tests {
                 &mut state,
                 &None,
                 &mut monitor,
+                None,
             )
             .await;
 

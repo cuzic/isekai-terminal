@@ -25,8 +25,8 @@ use isekai_transport::{
 use std::process::ExitCode;
 
 use crate::resume_loop::{
-    relay_stdio, retry_while_busy_other_session, run_relay_resumable, run_relay_resumable_with_fallback, run_stun_p2p_with_fallback,
-    BUSY_OTHER_SESSION_RETRY_WINDOW,
+    retry_while_busy_other_session, run_relay_resumable, run_relay_resumable_with_fallback,
+    run_stun_p2p_resumable, run_stun_p2p_with_fallback, BUSY_OTHER_SESSION_RETRY_WINDOW,
 };
 use crate::{RelayTransportKind, DEFAULT_RESUME_WINDOW, EX_USAGE, EX_UNAVAILABLE};
 
@@ -76,8 +76,9 @@ struct ConnectLaunch {
     /// falling back to the ordinary `reconnect_and_resume` retry loop. Meant
     /// for PC Wi-Fi + USB/Bluetooth tethering failover (this session's
     /// `pc-tethering-warm-standby-design` memory); has no effect in `--mode
-    /// stun` (STUN P2P has no resume/control-stream concept at all, see
-    /// `stun_p2p.rs`'s module docs).
+    /// stun` because STUN P2P's punched NAT mapping is tied to the socket
+    /// used for that establishment, and warm standby would switch to a
+    /// different socket/interface without a fresh rendezvous.
     tethering_interface: Option<String>,
 }
 
@@ -630,7 +631,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         }
         ConnectRoute::StunWithFallback => {
             let (target, candidates) = resolve_stun_candidates(&intent, &session_secret).await?;
-            let stun_result = run_stun_p2p_with_fallback(&target, &candidates).await;
+            let stun_result = run_stun_p2p_with_fallback(&target, &candidates, &profile, intent.resume_grace_secs).await;
             return recover_via_cross_family_fallback(
                 stun_result,
                 &intent,
@@ -694,25 +695,22 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             // `run_relay_resumable`/`run_relay_resumable_with_fallback`
             // (`resume_loop.rs`), which have always retried their primary
             // before propagating to their own caller.
-            let stun_result = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p(&factory, *stun_server, &target, identity))
-                .await
-                .map(|conn| conn.stream);
+            let requested = u32::try_from(intent.resume_grace_secs).unwrap_or(u32::MAX);
+            let stun_result = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || {
+                connect_stun_p2p(&factory, *stun_server, &target, requested, identity)
+            })
+            .await;
             match stun_result {
-                // Epic R PR2, Task 2.4 (round 2 review: `relay_stdio` now
-                // attaches `MidSessionDisconnectSignal` itself, scoped to
-                // just its remote-stream I/O sites — see that marker's own
-                // doc comment): the handshake above already succeeded, so a
-                // `relay_stdio` failure here is a mid-session disconnect,
-                // not a connect-time failure — `write_connect_outcome_for_wrapper`
-                // classifies it as `ConnectOutcomeClass::MidSessionDisconnect`
-                // instead of `Unreachable` accordingly. Deliberately does not
-                // go through `recover_via_cross_family_fallback` below (that
-                // arm only ever sees the *connect*-time `Err(e)` from
-                // `connect_stun_p2p` itself, never a post-success
-                // `relay_stdio` failure — see that function's own call
-                // site one arm up for the `ConnectRoute::StunWithFallback`
-                // case, where this same distinction matters more: Task 2.7).
-                Ok(stream) => relay_stdio(stream).await,
+                Ok(connection) => {
+                    let relay_target = RelayTarget {
+                        helper_addr: *peer_addr,
+                        server_name: server_name.as_str().to_string(),
+                        cert_sha256_hex: cert_pin.to_hex(),
+                        session_secret: target.session_secret.clone(),
+                        local_bind_port_range: intent.local_bind_port_range,
+                    };
+                    run_stun_p2p_resumable(&factory, &relay_target, &profile, connection).await
+                }
                 Err(e) => {
                     recover_via_cross_family_fallback(
                         Err(attach_stale_trust_signal(e)),
