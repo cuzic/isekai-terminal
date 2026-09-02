@@ -250,22 +250,88 @@ pub(crate) fn spawn() -> ParentGoneWatch {
 /// against the multi-day orphan window this module exists to bound.
 const SPURIOUS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Filters `fds` down to the ones actually worth `poll()`ing for peer
+/// liveness — real pipes and sockets, where `POLLERR`/`POLLHUP` genuinely
+/// mean "the peer is gone." Everything else (regular files, character
+/// devices like `/dev/null`, ttys, directories) is dropped: for those,
+/// `poll()`'s behavior isn't about peer liveness at all, and on at least
+/// one platform (Darwin — found via a real CI regression, 2026-09-02:
+/// `isekai-pipe/tests/stale_trust_signal_e2e.rs` spawns real
+/// `isekai-pipe connect` with `stdin` redirected from `/dev/null`, a
+/// completely ordinary thing to do for a non-interactive/headless
+/// invocation) polling an unsupported fd type produces a false terminal
+/// `revents` immediately, firing the watchdog before the real connection
+/// attempt can even complete — the same "fires on a configuration it
+/// doesn't support" bug class as the direction-mismatch hazard the per-fd
+/// `events` fix above closes, just on a different axis (fd *type* rather
+/// than *direction*).
+///
+/// `S_ISSOCK` is included alongside `S_ISFIFO`, not just pipes, so `ssh(1)`'s
+/// `ProxyUseFdpass` path (a `socketpair(2)`-based alternative to the
+/// ordinary two-`pipe(2)` `ProxyCommand` this module was designed against)
+/// still gets real watchdog coverage instead of silently degrading to a
+/// no-op — measured directly: a socketpair's closed peer end reports
+/// `POLLIN|POLLHUP`, the same shape a pipe's does.
+///
+/// A pure function specifically so the fd-*type* axis is directly
+/// unit-testable, the same way the fd-*direction* axis already was — every
+/// bug this module has shipped so far was a configuration axis (first
+/// direction, now type) no test varied.
+#[cfg(unix)]
+fn watchable_fds(fds: &[(libc::c_int, libc::c_short)]) -> Vec<(libc::c_int, libc::c_short)> {
+    fds.iter()
+        .copied()
+        .filter(|&(fd, _)| {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `stat` is a valid, correctly-sized buffer for the
+            // duration of this call; `fstat(2)` only writes through the
+            // pointer we give it.
+            if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+                return false; // an fd `fstat()` can't even describe isn't watchable either.
+            }
+            matches!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK)
+        })
+        .collect()
+}
+
 /// The actual `poll()` loop, over `fds` — each entry is `(fd, events)`;
 /// production always passes `&[(0, POLLIN), (1, POLLOUT)]` (this process's
 /// own stdin/stdout, each requesting the direction it actually supports —
 /// see the module doc); tests pass a single throwaway pipe fd instead, so
 /// they exercise this exact function (its `TERMINAL` mask, its `EINTR`
-/// retry, its give-up path, its `SPURIOUS_BACKOFF`) rather than a
-/// hand-copied stand-in that could silently drift from it. An earlier draft
-/// of this module's own test did exactly that — reimplemented this loop
-/// inline instead of calling it — and a round of adversarial review flagged
-/// it as the same "test pins a copy, not the real function" mistake
-/// `resume_loop.rs` has already made and fixed once before
+/// retry, its give-up path, its `SPURIOUS_BACKOFF`, and now `watchable_fds`)
+/// rather than a hand-copied stand-in that could silently drift from it. An
+/// earlier draft of this module's own test did exactly that — reimplemented
+/// this loop inline instead of calling it — and a round of adversarial
+/// review flagged it as the same "test pins a copy, not the real function"
+/// mistake `resume_loop.rs` has already made and fixed once before
 /// (`effective_resume_window`, round 2 review of Epic R PR3).
 #[cfg(unix)]
 fn watch_loop(tx: watch::Sender<bool>, fds: &[(libc::c_int, libc::c_short)]) {
-    const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect();
+    // `POLLNVAL` is deliberately *not* in this mask (found alongside the
+    // `watchable_fds` fix, 2026-09-02): it means "this fd isn't pollable
+    // the way we asked," never "the peer is gone" — treating it as terminal
+    // is exactly what turns an unsupported watch configuration into an
+    // instant, incorrect fire. Handled separately below instead of being
+    // folded into "fire."
+    const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP;
+
+    let mut pollfds: Vec<libc::pollfd> =
+        watchable_fds(fds).into_iter().map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect();
+    if pollfds.is_empty() {
+        // Nothing left worth watching (every fd was filtered out by
+        // `watchable_fds`, or `fds` itself was empty) — fail open rather
+        // than calling `poll()` with zero entries (defined behavior, but
+        // needless exposure for no benefit). Dropping `tx` here does not by
+        // itself make `wait()` treat this as a fire; see `spawn`'s leaked
+        // extra sender clone.
+        log::warn!(
+            "isekai-pipe connect: parent-liveness watchdog has no pipe/socket fd to watch (stdin/stdout aren't \
+             ssh(1)'s ProxyCommand pipes); disabling, falling back to reactive detection only"
+        );
+        return;
+    }
+
     loop {
         for pfd in &mut pollfds {
             pfd.revents = 0;
@@ -287,10 +353,36 @@ fn watch_loop(tx: watch::Sender<bool>, fds: &[(libc::c_int, libc::c_short)]) {
             log::warn!("isekai-pipe connect: parent-liveness watchdog poll() failed unexpectedly, giving up: {err}");
             return;
         }
-        if pollfds.iter().any(|pfd| pfd.revents & TERMINAL != 0) {
+
+        if let Some(pfd) = pollfds.iter().find(|pfd| pfd.revents & TERMINAL != 0) {
+            // Logged specifically so a future surprise on some fd type or
+            // platform this module can't be tested against interactively
+            // is self-diagnosing from a single CI log, not another
+            // multi-round investigation like this one.
+            log::debug!("isekai-pipe connect: parent-liveness watchdog fired (fd={} revents={:#x})", pfd.fd, pfd.revents);
             let _ = tx.send(true);
             return;
         }
+
+        if pollfds.iter().any(|pfd| pfd.revents & libc::POLLNVAL != 0) {
+            // The fd itself is telling us our watch configuration doesn't
+            // work for it — not that the peer is gone. Stop watching just
+            // that fd and keep going with whatever's left, rather than
+            // treating a misconfiguration as a fire.
+            let (kept, dropped): (Vec<_>, Vec<_>) = pollfds.into_iter().partition(|pfd| pfd.revents & libc::POLLNVAL == 0);
+            for pfd in &dropped {
+                log::warn!("isekai-pipe connect: parent-liveness watchdog: fd {} rejected poll(), no longer watching it", pfd.fd);
+            }
+            pollfds = kept;
+            if pollfds.is_empty() {
+                log::warn!(
+                    "isekai-pipe connect: parent-liveness watchdog has no pollable fd left; disabling, falling back to reactive detection only"
+                );
+                return;
+            }
+            continue;
+        }
+
         // `ret > 0` here means some fd became ready in the direction we
         // asked for (`POLLIN` data pending on fd 0, `POLLOUT` space
         // available on fd 1) without anything terminal — spurious from this
@@ -322,6 +414,101 @@ mod tests {
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         (fds[0], fds[1])
+    }
+
+    fn socketpair() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    /// Regression test for the fd-*type* axis (Task 2.9 follow-up,
+    /// 2026-09-02): a real CI failure found that watching a non-pipe,
+    /// non-socket fd (`/dev/null`, standing in for a plain `isekai-pipe
+    /// connect` invocation with `stdin` redirected from it — see
+    /// `isekai-pipe/tests/stale_trust_signal_e2e.rs`) made the watchdog fire
+    /// immediately and incorrectly on Darwin. Pins that `watchable_fds`
+    /// keeps exactly the fd types this module is designed for (pipes,
+    /// sockets — the latter for `ssh(1)`'s `ProxyUseFdpass` path) and drops
+    /// everything else, using the real function rather than reasoning about
+    /// what it *should* do.
+    fn open_path(path: &std::path::Path, flags: libc::c_int) -> libc::c_int {
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        unsafe { libc::open(cpath.as_ptr(), flags) }
+    }
+
+    #[test]
+    fn watchable_fds_keeps_pipes_and_sockets_drops_everything_else() {
+        let (pipe_read, pipe_write) = pipe_pair();
+        let (sock_a, sock_b) = socketpair();
+        let dev_null = open_path(std::path::Path::new("/dev/null"), libc::O_RDONLY);
+        assert!(dev_null >= 0, "failed to open /dev/null for this test");
+
+        let tmp = std::env::temp_dir().join(format!("isekai-pipe-watchable-fds-test-{}", std::process::id()));
+        std::fs::write(&tmp, b"x").unwrap();
+        let real_file = open_path(&tmp, libc::O_RDONLY);
+        assert!(real_file >= 0, "failed to open a regular file for this test");
+
+        let candidates = [
+            (pipe_read, libc::POLLIN),
+            (pipe_write, libc::POLLOUT),
+            (sock_a, libc::POLLIN),
+            (sock_b, libc::POLLOUT),
+            (dev_null, libc::POLLIN),
+            (real_file, libc::POLLIN),
+        ];
+        let kept = watchable_fds(&candidates);
+
+        assert!(kept.contains(&(pipe_read, libc::POLLIN)), "a pipe read end must stay watchable: {kept:?}");
+        assert!(kept.contains(&(pipe_write, libc::POLLOUT)), "a pipe write end must stay watchable: {kept:?}");
+        assert!(kept.contains(&(sock_a, libc::POLLIN)), "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass): {kept:?}");
+        assert!(kept.contains(&(sock_b, libc::POLLOUT)), "a socketpair end must stay watchable (ssh(1) ProxyUseFdpass): {kept:?}");
+        assert!(!kept.contains(&(dev_null, libc::POLLIN)), "/dev/null must be dropped: {kept:?}");
+        assert!(!kept.contains(&(real_file, libc::POLLIN)), "a regular file must be dropped: {kept:?}");
+        assert_eq!(kept.len(), 4, "exactly the 4 pipe/socket entries, nothing else: {kept:?}");
+
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+            libc::close(sock_a);
+            libc::close(sock_b);
+            libc::close(dev_null);
+            libc::close(real_file);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// End-to-end companion to the unit test above: `watch_loop` itself
+    /// (not just `watchable_fds` in isolation) must stay quiet indefinitely
+    /// when given only a non-pipe, non-socket fd — this is the exact shape
+    /// of the real regression (`isekai-pipe connect` invoked with `stdin`
+    /// redirected from `/dev/null`), reproduced directly against the real
+    /// function rather than inferring it from the unit test above alone.
+    #[test]
+    fn watch_loop_stays_disabled_forever_when_given_only_a_dev_null_fd() {
+        let dev_null = open_path(std::path::Path::new("/dev/null"), libc::O_RDONLY);
+        assert!(dev_null >= 0, "failed to open /dev/null for this test");
+
+        let (tx, mut rx) = watch::channel(false);
+        let handle = std::thread::spawn(move || watch_loop(tx, &[(dev_null, libc::POLLIN)]));
+
+        let result = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move { tokio::time::timeout(std::time::Duration::from_secs(2), rx.changed()).await })
+        })
+        .join()
+        .unwrap();
+        // Either outcome is correct here — a timeout (still "watching," but
+        // never fires because `watchable_fds` emptied the set before the
+        // first `poll()`) or an immediate channel-close (the empty-set
+        // early return already ran) — what must NOT happen is `Ok(Ok(()))`,
+        // a real fire.
+        assert!(!matches!(result, Ok(Ok(()))), "must never fire when the only watched fd is /dev/null: {result:?}");
+
+        handle.join().unwrap();
+        unsafe {
+            libc::close(dev_null);
+        }
     }
 
     /// Comfortably longer than [`SPURIOUS_BACKOFF`] (currently 1s) — the
