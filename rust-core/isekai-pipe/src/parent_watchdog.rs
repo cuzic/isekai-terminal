@@ -59,20 +59,13 @@
 //! the actual predicate this process cares about — "is anyone still on the
 //! other end of my stdio" — rather than a proxy for it ("did one specific
 //! PID exit"), so it also catches the rarer case where `ssh(1)` itself is
-//! still alive but this specific pipe broke; and firing it wakes ordinary
-//! async code via a channel, which can run a normal graceful shutdown
-//! instead of fighting async-signal-safety inside a signal handler.
+//! still alive but this specific pipe broke; it needs exactly one identical
+//! implementation for Linux, macOS, and every BSD (all expose the same
+//! POSIX `poll(2)`); and firing it wakes ordinary async code via a channel,
+//! which can run a normal graceful shutdown instead of fighting
+//! async-signal-safety inside a signal handler.
 //!
-//! It does **not** need "exactly one identical implementation for Linux,
-//! macOS, and every BSD," despite an earlier draft of this doc claiming
-//! that — real `rust-core-test-macos` CI (2026-09-02) found `poll()` with
-//! `events: 0` never reports `POLLHUP`/`POLLERR` at all on that runner, only
-//! on Linux, contradicting the assumption that those bits are always
-//! reported in `revents` regardless of the requested mask (true on Linux,
-//! per `poll(2)`; evidently not guaranteed on Darwin). See the next section
-//! for the actual, portable event mask this settled on instead.
-//!
-//! ## Why fd 0 *and* fd 1, and why `events: POLLIN`
+//! ## Why fd 0 *and* fd 1, and why `events: 0`
 //!
 //! `ssh(1)` gives its `ProxyCommand` two independent `pipe(2)`s (confirmed
 //! by direct experiment, 2026-09-02: different inodes, not a shared
@@ -83,29 +76,17 @@
 //! platform's `poll()` happens to report for which half:
 //!
 //! - fd 0 (our stdin, `ssh(1)`'s write end): reports `POLLHUP` once `ssh(1)`
-//!   closes its end (measured on Linux).
+//!   closes its end.
 //! - fd 1 (our stdout, `ssh(1)`'s read end): reports `POLLERR` (not
 //!   `POLLHUP`) once `ssh(1)` closes its end — measured directly; a
 //!   watchdog that only checked `POLLHUP` would silently never fire on this
 //!   fd.
 //!
-//! `events: POLLIN` (not `0`, and not `POLLOUT`) is requested on both fds:
-//! on Linux, `POLLERR`/`POLLHUP`/`POLLNVAL` are always reported in `revents`
-//! regardless of the requested mask, so `POLLIN` here changes nothing there
-//! — but `rust-core-test-macos` CI showed `events: 0` doesn't reliably wake
-//! `poll()` for those bits on Darwin, and `POLLIN` is what fixed it (2026-09-02
-//! — reached empirically via CI, not a documented guarantee this comment can
-//! point to; if a future Darwin bug report surfaces a citation, add it
-//! here). `POLLOUT` is deliberately never requested: fd 1 (a pipe write end)
-//! is `POLLOUT`-ready almost continuously while healthy, so that would make
-//! this thread spin instead of block. `POLLIN` on fd 1 itself is harmless —
-//! a pipe write end can never legitimately become readable, so it never
-//! contributes a spurious wakeup — but `POLLIN` on fd 0 (this process's
-//! *real* stdin) does mean the thread also wakes on every incoming byte
-//! (every keystroke in an interactive session), not just on close; each
-//! such wakeup is a cheap `poll()` call that finds no terminal bit set and
-//! loops immediately, so this is a real but minor efficiency cost, not a
-//! correctness one.
+//! `events: 0` (not `POLLIN`/`POLLOUT`) is requested on both: `POLLERR`/
+//! `POLLHUP`/`POLLNVAL` are always reported in `revents` regardless of the
+//! requested mask, and fd 1 (a pipe write end) is `POLLOUT`-ready almost
+//! continuously while healthy, so requesting `POLLOUT` would make this
+//! thread spin instead of block.
 //!
 //! ## Why a dedicated thread, not `tokio::io::unix::AsyncFd`
 //!
@@ -193,10 +174,7 @@ pub(crate) fn spawn() -> ParentGoneWatch {
 #[cfg(unix)]
 fn watch_loop(tx: watch::Sender<bool>, fds: &[libc::c_int]) {
     const TERMINAL: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-    // `POLLIN`, not `0` — see the module doc's "Why fd 0 and fd 1, and why
-    // `events: POLLIN`" section for why `0` doesn't reliably wake `poll()`
-    // for `TERMINAL` on macOS, despite working on Linux.
-    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+    let mut pollfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: 0, revents: 0 }).collect();
     loop {
         for pfd in &mut pollfds {
             pfd.revents = 0;
