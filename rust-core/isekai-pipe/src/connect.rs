@@ -505,22 +505,27 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) if is_parent_gone => {
-            // Never print this one to the user's terminal (`connect`'s
-            // stderr is inherited from `ssh(1)`'s own, i.e. the user's real
-            // terminal, or a `--isekai-log-file` that accumulates across
-            // sessions) — the watchdog reliably wins the race against the
-            // clean-EOF path's own full network round trip, so on an
-            // *ordinary* `exit`/logout this is actually the common case,
-            // not a rare failure worth surfacing (adversarial review,
-            // 2026-09-02, N2's follow-up). `write_connect_outcome_for_wrapper`
-            // still no-ops on its own `ParentGoneSignal` check — called here
-            // anyway to keep this arm's shape uniform with the one below.
-            write_connect_outcome_for_wrapper(&profile_for_outcome, &e);
-            ExitCode::SUCCESS
-        }
         Err(e) => {
-            eprintln!("{e:?}");
+            // Never print a `ParentGoneSignal`-marked error to the user's
+            // terminal (`connect`'s stderr is inherited from `ssh(1)`'s
+            // own, i.e. the user's real terminal, or a `--isekai-log-file`
+            // that accumulates across sessions): by the time this fires,
+            // the local peer is already gone, so there is no session left
+            // to report *to* — not because this outcome is rare (whether
+            // the watchdog usually beats the clean-EOF path on an ordinary
+            // logout is, honestly, an open question this session didn't
+            // measure either way; don't restate that guess as a finding —
+            // adversarial review, 2026-09-02, N5 follow-up). Still exits
+            // non-zero either way: this marker also covers genuinely
+            // abnormal cases (`ssh(1)` killed mid-dial, a
+            // `PumpFailure::Local` while `ssh(1)` is still alive, a
+            // manual/scripted invocation piped from a short-lived process)
+            // that a script watching this exit code should still be able
+            // to notice, even though `isekai-ssh`'s own wrapper never
+            // observes it (it reads `ssh(1)`'s status, not this process's).
+            if !is_parent_gone {
+                eprintln!("{e:?}");
+            }
             write_connect_outcome_for_wrapper(&profile_for_outcome, &e);
             ExitCode::from(EX_UNAVAILABLE)
         }

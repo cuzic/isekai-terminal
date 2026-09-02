@@ -181,9 +181,10 @@ impl std::error::Error for ParentGoneSignal {}
 /// EOF-latch to cover: the reactive fallback on non-Unix targets (no
 /// watchdog there), and, on Unix, the narrower case (a) doesn't fully close
 /// even with the watchdog present — a `Remote` failure in `pump_h2c` arriving
-/// *after* `pump_c2h` already saw clean EOF in the same generation, which
-/// the EOF-latch (`run_resume_loop`'s `c2h_already_done` check) declines to
-/// resume past for the identical reason: no local producer is left to
+/// *after* `pump_c2h` already saw clean EOF (in this generation or any
+/// earlier one — the latch persists once set, see `run_resume_loop`'s
+/// `c2h_already_done`), which the EOF-latch declines to resume past for
+/// the identical reason: no local producer is left to
 /// resume for. A `Remote` failure (the QUIC stream itself, the C2H replay
 /// buffer invariant, or an OS-reported network change) with no
 /// already-observed local EOF is exactly the case the resume loop exists
@@ -1179,11 +1180,13 @@ async fn resume_with_backoff_until_deadline(
 /// should give up outright rather than attempt a resume, given one
 /// `run_data_pump` outcome. `true` for `PumpFailure::Local` unconditionally,
 /// and for a `PumpFailure::Remote` that arrived *after* `pump_c2h` already
-/// reached a clean stdin EOF in the same generation (`c2h_already_done`) —
-/// both cases reach the identical conclusion that no local producer is left
-/// to resume for. Extracted as its own pure function specifically so it's
-/// directly unit-testable without needing a real pump/QUIC connection (see
-/// the `tests` module below).
+/// reached a clean stdin EOF at any point (`c2h_already_done`, which
+/// `run_resume_loop` declares once outside its own resume loop and never
+/// resets — a stdin EOF observed in an earlier generation is still true in
+/// every later one) — both cases reach the identical conclusion that no
+/// local producer is left to resume for. Extracted as its own pure function
+/// specifically so it's directly unit-testable without needing a real
+/// pump/QUIC connection (see the `tests` module below).
 fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_already_done: bool) -> bool {
     match outcome {
         Ok(()) => false,
