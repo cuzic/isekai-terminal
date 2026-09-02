@@ -378,16 +378,46 @@
 ---
 
 ## PR3: STUN P2Pへの真のバイトレベルresume（ADR §2.3、round 5＋
-    round 5フォローアップで全面改訂）
+    round 5フォローアップ＋opus-task-review実装可能性レビューで
+    全面改訂）
 
-**マージ条件**: PR2がベース（マージ済み、`origin/main`＝`8f71b0be`）。
+**マージ条件**: PR2がベース（マージ済み、`origin/main`＝`9fe13e6c`）。
 
 **re-scoping全体像**: 旧Task 3.1〜3.4（4タスク）を、opus-critic-a・
 opus-critic-bの独立並行レビュー（round 5）とそのフォローアップ
 （root-cause rework案"Option B"の検討・却下）を経て6タスクへ
-再分割した。Task 3.1〜3.3は元の設計のまま実装詳細を訂正、Task 3.4は
-「スコープ境界の判断」から「STUN専用の短いgive-up境界の実装」へ
-役割が変わった（load-bearing）、Task 3.2b・3.5は新設。
+再分割した。さらにopus-task-reviewによる実装可能性レビューで
+blocking 2件（Task 3.1とTask 3.4が同じ`resume_window`について
+矛盾した指示を出していた／Task 3.4の「`Err`を返す」効果を実現する
+配線先が現行シグネチャに存在しなかった）・significant 8件・
+minor 3件が発見され、それらを反映して再度改訂した。Task 3.1〜3.3は
+元の設計のまま実装詳細を訂正、Task 3.4は「スコープ境界の判断」から
+「STUN専用の短いgive-up境界の実装」へ役割が変わった（load-bearing）、
+Task 3.2b・3.5は新設。
+
+### 実装前チェック（opus-task-reviewが「崩れているとPR3の設計自体が
+    成立しない」と指摘、team-leadが実コードで検証済み・解消）
+
+opus-task-reviewから「`factory.wrap_bound_socket(...)`（STUN初回確立、
+自前でbind済みのソケットを渡す）で作った接続と、
+`factory.create_endpoint(...)`（`reconnect_and_resume`のresume時、
+新規bindする）で作った接続とで、RESUMEプロトコルに互換性があるか
+未検証」という懸念が出た。`rust-core/quicmux/src/mux.rs:54-75`を
+確認した結果、**両者は同じ`AnyMuxEndpoint`型を返し、どちらも同じ
+`AnyMuxEndpoint::connect(remote)`を経由して同じ`AnyMuxConnection`型に
+なる**（`qmux_backend.rs:146`/`noq_backend.rs:343`のバックエンド実装
+レベルでも`connect`は`Endpoint`のメソッドであり、そのEndpointが
+`create_endpoint`由来か`wrap_bound_socket`由来かを区別しない）。
+RESUMEプロトコル自体（`session_id`・proof・`quicmux::request_resume`）は
+サーバーとの間の接続上位層のやり取りであり、ローカルソケットの
+生成方法とは完全に無関係。**この懸念は解消済み——PR3の設計は
+この点で成立する。**
+
+opus-task-reviewが挙げた残り2点（M3: `--punch-peer`確立接続の
+server-side park共有／`probe.rs:370`の`AnyMuxConnection`保持位置）は
+未解決のままでよい——それぞれTask 3.2・Task 3.1に実装時の確認事項
+として既に明記済みであり、実装（Codexへの委譲を含む）と並行して
+確認する。
 
 ### Task 3.1 — `stun_p2p.rs`の戻り値を拡張する
     （S4で変更範囲を訂正、round 5のN5で説明の力点を訂正）
@@ -423,8 +453,32 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
   変更になる。Androidの`isekai-terminal-core`側は既に独立した
   `connect_stun_p2p_on_socket`（`stun_p2p.rs:135`付近、自前で
   `connect_and_handshake`を呼ぶ）を使っており影響を受けない
-  （round 5で再検証済み）。**`StunP2pConnection`は`pub`なので、
-  変更前にワークスペース全体で他の利用者が無いかgrepで確認する**。
+  （round 5で再検証済み）。**`StunP2pConnection`は`pub`であり、
+  実際に他に以下の利用者がいることをopus-task-reviewが確認済み
+  （S4）——「grepで確認せよ」だけでなく、少なくとも以下は確認・
+  更新すること**:
+  - `isekai-pipe/src/probe.rs:370`（**プロダクションコード**、
+    `isekai-ssh doctor`/probe経路）。`StunP2pConnection`に
+    `AnyMuxConnection`（`conn`）が増えることでprobeが接続ハンドルを
+    保持するようになるため、drop位置（probe完了後すぐ切断されるか）
+    を確認する。
+  - `isekai-transport/tests/stun_p2p_e2e.rs:56,102,134`・
+    `stun_p2p_fallback_e2e.rs:44,85,114,134`
+  - `isekai-pipe/tests/connect_stun_fallback_e2e.rs`
+- **重要（B1、opus-task-review発見）: この`requested_resume_grace_secs`
+  はTask 3.4の短いgive-up境界とは独立した別のノブである**——
+  混同すると実装が壊れる。本タスクが配線するのは「クライアントが
+  サーバーに対して要求し、サーバーが（`--resume-window`上限内で）
+  実際に許可する、parked sessionの保持期間」（`effective_resume_grace_secs`、
+  ユーザーの`#@isekai resume-grace`設定を尊重するためのもの）。
+  Task 3.4が短くするのは「このクライアントプロセス自身が
+  `resume_with_backoff_until_deadline`でbare redialを試み続ける
+  時間」であり、**サーバーへ要求するgraceの値そのものは変更しない**
+  （サーバー側のparked session保持期間は従来通り長くてよい——PR2の
+  軽量リトライが後で同じセッションに戻ってこられる可能性を潰さない
+  ため）。本タスクの実装時にTask 3.4の変更を先取りして
+  `effective_resume_grace_secs`自体を短縮する実装をしないこと
+  （具体的な理由と正しい配線先はTask 3.4参照）。
 
 ### Task 3.2 — `run_stun_p2p_with_fallback`の`run_resume_loop`移行
 
@@ -438,14 +492,17 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
   - `server_name`
   - `cert_sha256_hex`
   - `session_secret`
-  - `local_bind_port_range`: **供給元が無い**（S-4）——
-    `StunP2pTarget`にこのフィールドは無く、値は
-    `ConnectionIntent::local_bind_port_range`にしかないが、
-    `run_stun_p2p_with_fallback`はこのintentを受け取っていない。
-    デフォルト`None`にする（ユーザーの`#@isekai local-bind-port-range`
-    設定がSTUN経路のみサイレントに無視される、という挙動差になる
-    ——コードコメントで意図的な決定として残す）か、シグネチャを
-    拡張してintentを貫通させるかを実装時に決定する。
+  - `local_bind_port_range`: **この関数に限り供給元が無い**
+    （S-4、opus-task-reviewがTask 3.2bとの違いを確認済み——
+    Task 3.2bの単一candidate経路には`intent`がスコープ内にあり
+    問題にならない、下記参照）。`StunP2pTarget`にこのフィールドは
+    無く、値は`ConnectionIntent::local_bind_port_range`にしかないが、
+    `run_stun_p2p_with_fallback(target, candidates)`はこのintentを
+    受け取っていない。デフォルト`None`にする（ユーザーの`#@isekai
+    local-bind-port-range`設定がこのSTUN経路のみサイレントに
+    無視される、という挙動差になる——コードコメントで意図的な決定
+    として残す）か、シグネチャを拡張してintentを貫通させるかを
+    実装時に決定する。
 - **`factory`は`system_quic_factory()`を使う**（S-1）——
   `connect_stun_p2p_with_fallback`が既に使っているものと同一。
   `relay_endpoint_factory(RelayTransportKind::Qmux)`（TCP
@@ -456,17 +513,54 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
   物理インターフェースへ切り替える」機構であり、relay（安定した
   公開アドレス）では無害だが、STUN P2Pのホールパンチ済みNAT
   マッピングは特定のソケットに紐づいているため、再パンチなしに
-  切り替えると到達不能になる。同じコミットで`ConnectLaunch::
-  tethering_interface`の「STUN P2Pには効果がない」という現行doc
-  コメントも訂正する（本タスク実装後は誤りになるため）。
+  切り替えると到達不能になる。
+- **doc修正（同一コミットで、S6でwordingを訂正）**: `ConnectLaunch::
+  tethering_interface`の現行doc（`connect.rs:71-80`付近）の
+  「`--mode stun`では効果が無い」という**結論はPR3後も正しいまま**
+  （上記の通り明示的に`None`を渡すため）——訂正が必要なのは
+  「STUN P2Pにはresume/control-stream概念が無いから」という
+  **理由の部分のみ**。「ホールパンチ済みソケットとwarm standbyの
+  socket rebindは両立しないため意図的に無効化している」という
+  正しい理由に差し替えること。「効果が無い、という記述自体が
+  誤りになる」と読んで「STUNでもtetheringが効く」ように実装と逆の
+  docへ書き換えないこと。
+  同様に`run_stun_p2p_with_fallback`自身のdocコメント（`resume_loop.rs:299-306`
+  付近、「STUN P2P has no resume/control-stream concept … there is
+  no `run_resume_loop` step here」）もPR3で全面的に誤りになるため
+  同じコミットで書き換える（M2）。
+- **確認事項（M3、実装コストは低いがPR3の効果が実地で成立する前提）**:
+  `isekai-pipe serve --punch-peer`が確立した接続でも、通常の
+  `--relay`確立と同じ`AttachArbiter`のaccept/attach/park機構が
+  使われ、セッションが正しくparkされてRESUMEを受け付けることを
+  `engine/mod.rs`で確認する（`punch_peer`は起動時のprobe送出にしか
+  関与しないはずだが、ここが崩れているとクライアント側の単体
+  テストでは検知できないままPR3が実地で無効になる）。
 
 ### Task 3.2b — 単一candidate経路のSTUN P2Pも同様に移行する（新設）
 
 - **対象**: `isekai-pipe/src/connect.rs`の`CandidateRoute::StunP2p`
-  アーム（`connect.rs:695-716`付近）。
+  アーム（`connect.rs:675-720`付近）。
 - **変更**: Task 3.2と同じ内容をこの経路にも適用する。**Task 3.2の
   みでは「フォールバック経路はresumeするが単一candidate経路は
   しない」という分裂状態になる**（round 5のN3）。
+- **実際の変更箇所を明示（S3、opus-task-review発見）**:
+  `connect.rs:697-699`付近の
+  `retry_while_busy_other_session(...).await.map(|conn| conn.stream)`
+  が、Task 3.1が新たに返すようになる`conn`・`proof`・
+  `effective_resume_grace_secs`・`endpoint.rebinder()`を**すべて
+  握り潰している最大の書き換え箇所**——「Task 3.2と同じ内容を適用」
+  だけでは伝わらないので明記する。この`.map(...)`をやめて、
+  `RelayTarget`合成→`run_resume_loop`呼び出しに置き換える。
+- **`local_bind_port_range`はTask 3.2と違い供給元がある（S2、
+  opus-task-review発見）**: Task 3.2のADR/TASKS記述にあった
+  「単一candidate経路も`intent`を受け取っていない」は**事実誤認**——
+  同じ`match &candidate.route`式のrelayアーム（`connect.rs:663`
+  付近）が既に`local_bind_port_range: intent.local_bind_port_range`
+  を使っており、`intent`はこの`StunP2p`アームでも**スコープ内**。
+  したがってこのTask 3.2bでは`intent.local_bind_port_range`を
+  素直に渡す（Task 3.2のように`None`固定にする必要はない）。
+  これを取り違えると、2つのSTUN経路で`#@isekai
+  local-bind-port-range`の扱いが割れる（片方は尊重、片方は無視）。
 - **確認事項**: このアームのエラーは`recover_via_cross_family_fallback`
   にも渡る。Task 3.3のマーカー配置後もそのbail-out条件
   （`connect.rs:759`付近）が正しく機能することを確認する。
@@ -474,11 +568,19 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
 ### Task 3.3 — マーカー付与は呼び出し元での`.map_err`のみでよい
     （B3で決定を反転、round 5で実装方法を訂正）
 
-- **対象**: Task 2.4で導入したSTUN 2箇所への
-  `MidSessionDisconnectSignal`付与。
-- **変更**: Task 3.2/3.2bにより`relay_stdio`直接呼び出し2箇所は
-  消滅する。**代わりに、Task 3.2/3.2bの`run_resume_loop`呼び出し
-  それぞれで`.await.map_err(|e| e.context(MidSessionDisconnectSignal))`
+- **対象**: PR2で導入したSTUN P2P向け`MidSessionDisconnectSignal`
+  付与。**現在の実際の付与位置を訂正（S1、opus-task-review発見）**:
+  「Task 2.4で導入したSTUN 2箇所への付与」ではなく、現状は
+  **`relay_stdio`関数の内部**（その2つの remote-stream I/O 失敗
+  箇所）に付いている——`resume_loop.rs:84-97`のdocコメント
+  "Attached at the source, inside [`relay_stdio`] itself, to only
+  its two *remote*-stream I/O failures" 参照。`connect.rs:715`や
+  `resume_loop.rs:328`（呼び出し元）に`.map_err(...)`を探しに
+  行っても何も無いので注意。
+- **変更**: Task 3.2/3.2bにより`relay_stdio`の呼び出し元はゼロに
+  なる（関数自体の削除はTask 3.5）。**Task 3.2/3.2bで新設する
+  `run_resume_loop`呼び出しそれぞれで
+  `.await.map_err(|e| e.context(MidSessionDisconnectSignal))`
   するだけでよい**（ルート判別フラグを`resume_with_backoff_until_deadline`
   まで貫通させる必要は無い）——`run_resume_loop`の`Err`は内部が
   1個の`?`と1個の`Ok(())`のみであるため常に「resumeを諦めた」ことを
@@ -487,14 +589,26 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
   `recover_via_cross_family_fallback`のbail-out判定もこの配置の
   ままで正しく機能する（ADR §2.3の非対称設計自体は変更なし——
   relay経路の`give_up`には引き続き付けない）。
-- **検証**: STUN経路でresumeを使い切った（Task 3.4のgive-up境界に
-  到達した）場合に`MidSessionDisconnect`として分類され、PR2の
-  軽量リトライループが発火することを確認する統合テスト。relay側の
-  give-upが誤ってこのマーカーを継承しないことを確認するテストも
-  追加する。
+- **実装順序の注意（S1続き）**: Task 3.3をTask 3.5より先に実装すると、
+  一時的に「呼ばれない`relay_stdio`内に旧マーカー付与コード＋新しい
+  呼び出し元にも新マーカー付与」という中間状態になる。実害は無いが
+  紛らわしいため、Task 3.3と3.5は同一コミット（または連続する
+  コミット）で実施することを推奨する。
+- **検証（S8で既存の足場を明記）**: relay側のgive-upが誤ってこの
+  マーカーを継承しないことを確認する単体テストを追加する。「STUN
+  経路でresumeを使い切った場合にPR2の軽量リトライループが発火する」
+  ことを確認する統合テストも追加したいが、これは`isekai-pipe`
+  （子プロセス）と`isekai-ssh`（wrapperプロセス）をまたぐため
+  単体テストでは書けず、`isekai-ssh/tests/*_e2e.rs`に置くことになる
+  ——**このテストはrequired checkの対象外**（`rust-core-test-linux`
+  では機械的に検証されない）。Task 3.4側の同種の検証
+  （`resume_with_backoff_until_deadline`が`Err`を返す確認、こちらは
+  `rust-core-test-linux`で検証される）との非対称性を認識しておくこと
+  ——「両方ともCIで機械的に守られている」と誤解しないこと。
 
 ### Task 3.4 — STUN専用の短いgive-up境界（load-bearing、旧「スコープ
-    境界の判断」から役割変更）
+    境界の判断」から役割変更、opus-task-reviewのB1/B2で配線方法を
+    確定）
 
 - **背景（round 5フォローアップで根本原因を再検討済み、ADR §2.3.0
   参照）**: STUN P2Pのresume再接続（`reconnect_and_resume`）は
@@ -512,27 +626,93 @@ opus-critic-bの独立並行レビュー（round 5）とそのフォローアッ
   のホールパンチが起動時一度きりの動作であり、クライアント側だけの
   再パンチはサーバー側NATの許可フィルタを更新しないため到達可能性を
   一切改善しない（ADR §2.3.0参照）。
-- **変更**: STUN P2P経路には、`run_resume_loop`が通常使うresume
-  デッドラインとは別に、独自の短いgive-up境界を持たせる。具体的な
-  形（接続試行回数の上限か、数十秒〜120秒程度の短いタイム
-  デッドラインか）は実装時に決めてよいが、**この境界に達したら
-  `run_resume_loop`自身が`Err`を返してPR2の軽量リトライへ制御を
-  戻す**（フルSTUN再確立をやり直させる）という効果は必須。
-- **ログ**: 境界に到達した際、`--isekai-log-file`使用時にハングの
-  ように見えないよう「scrollbackが失われ新しいセッションを確立する」
-  旨を一度だけログ出力する。
-- **検証**: サーバー到達不能をシミュレートし、短いgive-up境界の後に
-  `MidSessionDisconnect`分類→PR2軽量リトライが発火することを確認する
-  統合テスト。
+- **B1（opus-task-review発見）: Task 3.1が配線する`resume_grace`と
+  本タスクの短い境界は独立したノブであり、混同しないこと**。
+  Task 3.1は「サーバーに要求し、サーバーが許可する、parked session
+  保持期間」を配線する（`effective_resume_grace_secs`）。本タスクが
+  短くするのは「このクライアントプロセス自身がbare redialを試み
+  続ける時間」であり、**`effective_resume_grace_secs`の値そのものは
+  変更しない**（サーバー側のparked session保持期間は長いままにして
+  おく——PR2の軽量リトライが後で同じセッションへ戻ってこられる
+  余地を残すため）。
+- **B2（opus-task-review発見）: 配線方法を確定**——
+  `resume_window`は`run_resume_loop`内部で
+  `resume_window_for(established.effective_resume_grace_secs)`
+  （`resume_loop.rs:1085`、`resume_window_for`は`:572`）として
+  導出され、呼び出し元からは触れない。以下3案を検討した結果、
+  **(i)を採用する**:
+  - **(i) 採用: `run_resume_loop`（および内部で呼ぶ
+    `resume_with_backoff_until_deadline`）に、`effective_resume_grace_secs`
+    とは別の新しい引数（例: `max_resume_window: Option<Duration>`）を
+    追加し、`Some`のときは`resume_window_for(...)`が返す通常の
+    デッドラインをさらにこの値で上書き/クランプする**。relay側の
+    2つの呼び出し元（`run_relay_resumable`/`run_relay_resumable_with_fallback`
+    相当）は`None`を渡し既存動作を一切変えない。STUN側
+    （Task 3.2/3.2b）は`Some(STUN_GIVE_UP_WINDOW)`
+    （目安60〜120秒、実装時に定数として定義）を渡す。
+  - (ii) 却下: `effective_resume_grace_secs`自体をSTUN用に小さい値へ
+    上書きしてから`ResumableRelaySession`を組み立てる案は、
+    **`resume_window_for(0) == DEFAULT_RESUME_WINDOW`
+    （`resume_loop.rs:573-576`、テストも`:1371`にある）という
+    落とし穴がある**——上書き先が`0`になった場合、意図と逆に
+    デフォルトの10日デッドラインへ戻ってしまう。値を`0`にしない
+    よう慎重に実装すれば動作はするが、B1が言う「別ノブ」の原則にも
+    反する（`effective_resume_grace_secs`は他の用途にも使われる
+    値であり、STUNの都合で書き換えるのは筋が悪い）。
+  - (iii) 却下: `resume_with_backoff_until_deadline`が試行回数上限を
+    直接持つ案は、`give_up`がrelay/STUN共有（`:946`と`:1038`の
+    2箇所）であるため、結局ADR §2.3.3が「過剰な変更」として明示的に
+    却下したルート判別フラグの貫通が必要になり、Task 3.3の設計
+    （呼び出し元での単純な`.map_err`のみ）と矛盾する。
+- **効果**: この境界に達したら`run_resume_loop`自身が`Err`を返し、
+  Task 3.3の`.map_err`で`MidSessionDisconnect`に分類され、PR2の
+  軽量リトライへ制御が戻る（フルSTUN再確立をやり直す）。
+- **ログ・OS通知（S7、opus-task-review発見）**: デッドライン超過分岐
+  （`resume_loop.rs:936-960`付近）は既に`give_up(...)`でログ出力し、
+  続けて`notify_os(...)`でデスクトップ通知を発火している。本タスクで
+  STUNのデッドラインが10日→60〜120秒になることで、**このOS通知が
+  最悪数分おきに飛ぶようになる**（PR2の軽量リトライが再確立→また
+  切断、を繰り返す状況で通知スパムになる）。STUN経路では
+  `notify_os`を抑制する（またはセッションごとに初回のみに絞る）
+  判断を本タスクに含めること。ログメッセージ自体は既存の
+  `give_up`の文言（session_id・resume window超過量を含む）で
+  十分——新規に「scrollbackが失われ新しいセッションを確立する」旨を
+  別途足す場合は、この既存メッセージと重複・矛盾しない形にする。
+- **検証（S8で既存の足場を明記）**: `resume_loop.rs:1791`の
+  `resume_with_backoff_until_deadline_returns_err_once_the_resume_window_is_exceeded`
+  テストが、`spawn_control_hello_listener()`＋`system_quic_factory()`＋
+  `reestablish_control_stream()`＋到達済みdeadlineという構成で、
+  give-up経路が`Err`を返すことを実ネットワーク・実sshd無しに直接
+  検証している。本タスクの検証（サーバー到達不能→短いgive-up境界→
+  `Err`）は**このテストのほぼクローン**（deadlineを新しい
+  `max_resume_window`由来にするだけ）として`rust-core-test-linux`
+  （required check）で機械的に検証できる——実sshd/実ネットワークの
+  E2Eを新規に書く必要はない。
 
 ### Task 3.5 — `relay_stdio`の削除（新設）
 
 - **対象**: `isekai-pipe/src/resume_loop.rs`の`relay_stdio`関数。
-- **背景**: Task 3.2/3.2b完了後、`relay_stdio`の呼び出し元はゼロに
-  なる（元の2箇所: `resume_loop.rs`・`connect.rs`）。放置すると
-  `dead_code`警告で`rust-core-test-linux`が失敗する。
+- **背景（S5で理由を訂正、opus-task-review発見）**: 「放置すると
+  `dead_code`警告で`rust-core-test-linux`が失敗する」という当初の
+  理由は**誤り**——このワークスペースには`-D warnings`等の設定は
+  どこにも無く（ワークフロー・`Cargo.toml`・`.cargo/config.toml`
+  いずれにも無し）、`relay_stdio`を放置しても警告が出るだけでCIは
+  緑のまま通る。**正しい理由**: Task 3.2/3.2b完了後、`relay_stdio`の
+  呼び出し元はゼロになる（元の2箇所: `resume_loop.rs`・
+  `connect.rs`）。放置すると、呼び出し元が存在しないのに
+  `MidSessionDisconnectSignal`の付与コードと
+  「only STUN P2P call sites may call this」という不変条件doc
+  （`resume_loop.rs:111-118`）だけが生き残り、(a) マーカー付与箇所が
+  `relay_stdio`内部（死にコード）と`run_resume_loop`呼び出し元
+  （実際に使われる箇所）の二重管理になる、(b) 将来の誰かが
+  「STUN経路なら使ってよい関数」として誤って復活させる罠になる、
+  という保守上のリスクがCIのgreen/redとは無関係に残るため。
 - **変更**（同一コミットで）:
   - `relay_stdio`関数自体を削除する。
+  - `isekai-pipe/src/connect.rs:28`付近の`relay_stdio`の`use`文
+    （未使用importになる、M1）を削除する。
+    `isekai-pipe/tests/stdout_purity.rs:7`付近のコメント言及は
+    コンパイルに影響しないが、あわせて更新するとなお良い。
   - `MidSessionDisconnectSignal`のdocコメント（現在「`relay_stdio`の
     リモートストリームI/O 2箇所のみ」とスコープを説明している）を、
     新しい付与箇所（Task 3.2/3.2bの`run_resume_loop`呼び出し元）を
