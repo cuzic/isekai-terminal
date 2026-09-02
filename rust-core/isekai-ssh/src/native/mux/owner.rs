@@ -35,7 +35,7 @@ use russh_stream_session::{open_channel, ForwardRoutes};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::log_file::log_line;
@@ -439,7 +439,7 @@ where
         rx
     });
 
-    let result = relay_loop(reader, &mut writer, &mut channel, ctl_frame_rx).await;
+    let result = relay_loop(reader, &mut writer, &mut channel, ctl_frame_rx, handle, shutdown).await;
 
     // Best-effort teardown of this client's forward.
     if let (Some(path), Some(routes)) = (&ctl_remote_path, ctl_routes) {
@@ -447,6 +447,40 @@ where
     }
 
     result
+}
+
+/// Why [`relay_loop`]'s main loop ended (Epic R PR2, B1/B2). Round 0/1/2 of
+/// this fix used a single `remote_reported_exit: bool`/`exit_code.is_some()`
+/// check, which conflated at least two genuinely different situations this
+/// enum keeps apart: "this client went away" (nothing wrong with the shared
+/// connection — every other tab is fine) and "the remote channel died with
+/// no explanation" (possibly the *shared* connection itself is gone, which
+/// every tab needs to know about). Getting this wrong in either direction
+/// is a real regression: classifying `ClientGone` as `TransportDead` would
+/// tear down the whole holder — and every other tab's session with it —
+/// just because *one* client (or its own `~.`-equivalent, or a `Frame::Ctl`
+/// write failing because that one client vanished) disconnected; the
+/// reverse (classifying a genuine transport death as `ClientGone`) is
+/// exactly the bug this Epic fixes (a silently-sent `Frame::Exit(255)`
+/// hides the death from `client.rs`'s `OwnerLost` recovery).
+enum BreakReason {
+    /// The remote sent `ChannelMsg::ExitStatus` or `ChannelMsg::ExitSignal`
+    /// before the channel closed — a normal, informative end. `exit_code`
+    /// is `Some` whenever this variant is used.
+    RemoteExitReported,
+    /// This client itself went away first (its named-pipe connection ended,
+    /// or a `Frame::Ctl` write-back to it failed) — the shared remote
+    /// connection and every other tab are unaffected.
+    ClientGone,
+    /// The remote channel closed, or a write to it failed, without ever
+    /// reporting why. This is the case that used to get unconditionally
+    /// laundered into `Frame::Exit(255)`, hiding a genuine transport death
+    /// from the client and its `OwnerLost` recovery machinery.
+    TransportDead,
+    /// Local stdin hit EOF and the remote didn't confirm the channel was
+    /// done within `SHUTDOWN_CLOSE_GRACE` — a normal (if slow) local-exit
+    /// path, not a transport failure.
+    CloseDeadline,
 }
 
 /// The core owner-side relay: client frames drive the remote channel, and
@@ -461,18 +495,26 @@ where
 /// desync the client's frame stream). Ordering is unaffected: the mpsc is FIFO
 /// and each frame is fully applied to the remote channel before the next is
 /// received.
-async fn relay_loop<R, W>(
+async fn relay_loop<R, W, H>(
     reader: R,
     writer: &mut W,
     channel: &mut russh::Channel<client::Msg>,
     mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<ctl_forward::CtlRelayEvent>>,
+    handle: &Mutex<client::Handle<H>>,
+    shutdown: &Notify,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
+    H: client::Handler,
 {
-    let mut frame_rx = spawn_frame_reader(reader);
+    let (mut frame_rx, frame_reader_task) = spawn_frame_reader(reader);
     let mut exit_code: Option<u8> = None;
+    // Epic R PR2 (B1/B2, task 2.1): why this loop's `break` happened —
+    // determines whether `Frame::Exit` is sent to the client at all, and
+    // whether a `TransportDead` break should trigger the shared-handle-death
+    // fast path (`shutdown.notify_waiters()`). See `BreakReason`'s own docs.
+    let mut break_reason = BreakReason::ClientGone;
     // After the client sends `Shutdown` (its local stdin hit EOF) we stop
     // *forwarding* its input, but keep reading the connection so a subsequent
     // client disconnect is still noticed promptly (`None` below) — otherwise a
@@ -511,6 +553,10 @@ where
                 match frame {
                     Some(Ok(Some(Frame::Stdin(data)))) if !stdin_done => {
                         if channel.data(&data[..]).await.is_err() {
+                            // This client just sent us data, so it's
+                            // definitely still alive — a write failure here
+                            // is the remote channel's, not the client's.
+                            break_reason = BreakReason::TransportDead;
                             break;
                         }
                     }
@@ -559,6 +605,7 @@ where
                     // leaking a session (session cleanup).
                     Some(Ok(None)) | None => {
                         log_line!("isekai-ssh mux owner: client connection ended before the remote channel did; tearing down its remote shell");
+                        break_reason = BreakReason::ClientGone;
                         break;
                     }
                     // A truncated or malformed frame is a hard error, surfaced to
@@ -579,11 +626,24 @@ where
                         log_line!("isekai-ssh mux owner: remote channel sent ExitStatus={exit_status}");
                         exit_code = Some(exit_status as u8);
                     }
+                    // Epic R PR2 (R2-S1): the remote can end a command via
+                    // an SSH-level signal instead of an exit status (RFC
+                    // 4254 §6.10) — previously fell into the `_ => {}` catch-
+                    // all below, leaving `exit_code` at `None` and making
+                    // this indistinguishable from a genuine transport death.
+                    // `255` matches `ssh(1)`'s own convention for reporting
+                    // a signal-terminated remote command, and this crate's
+                    // own single-process path's `NO_EXIT_STATUS_RECEIVED`.
+                    Some(russh::ChannelMsg::ExitSignal { signal_name, .. }) => {
+                        log_line!("isekai-ssh mux owner: remote channel sent ExitSignal={signal_name:?}");
+                        exit_code = Some(255);
+                    }
                     // Like the single-process loop, `Eof` is a no-op (an
                     // exit-status may still legally follow it, RFC 4254); only
                     // `Close`/`None` end the session.
                     Some(russh::ChannelMsg::Close) | None => {
                         log_line!("isekai-ssh mux owner: remote channel closed (exit_code so far: {exit_code:?}); breaking relay loop");
+                        break_reason = if exit_code.is_some() { BreakReason::RemoteExitReported } else { BreakReason::TransportDead };
                         break;
                     }
                     _ => {}
@@ -617,6 +677,10 @@ where
                             active_build_channel_id = None;
                         }
                         if write_frame(writer, &Frame::Ctl(bytes)).await.is_err() {
+                            // `writer` is this client's own connection — a
+                            // write failure here means the client is gone,
+                            // not the shared remote connection.
+                            break_reason = BreakReason::ClientGone;
                             break;
                         }
                     }
@@ -674,6 +738,10 @@ where
                                 active_build_reply_tx = None;
                                 active_build_channel_id = None;
                                 if write_frame(writer, &Frame::Ctl(abort)).await.is_err() {
+                                    // Same reasoning as the other `Frame::Ctl`
+                                    // write-back above: this client's own
+                                    // connection failed, not the shared one.
+                                    break_reason = BreakReason::ClientGone;
                                     break;
                                 }
                             }
@@ -695,18 +763,90 @@ where
                     "isekai-ssh mux owner: remote channel did not confirm close within {SHUTDOWN_CLOSE_GRACE:?} of local EOF; forcing close (exit_code so far: {exit_code:?})"
                 );
                 let _ = channel.close().await;
+                break_reason = BreakReason::CloseDeadline;
                 break;
             }
         }
     }
 
-    // Report the session's end to the client. 255 stands in for "closed
-    // without an exit status" (abnormal disconnect), matching the
-    // single-process path's `NO_EXIT_STATUS_RECEIVED`. Best-effort: if the
-    // client already vanished, there's no one to tell.
-    let final_code = exit_code.unwrap_or(255);
-    let write_result = write_frame(writer, &Frame::Exit(final_code)).await;
-    log_line!("isekai-ssh mux owner: sent Frame::Exit({final_code}) to client, write_result_ok={}", write_result.is_ok());
+    match break_reason {
+        BreakReason::RemoteExitReported | BreakReason::ClientGone | BreakReason::CloseDeadline => {
+            // Report the session's end to the client. 255 stands in for
+            // "closed without an exit status" (only reachable here via
+            // `CloseDeadline`, or in principle `ClientGone` with a
+            // still-pending exit status — matching the single-process
+            // path's `NO_EXIT_STATUS_RECEIVED`). Best-effort: if the client
+            // already vanished (`ClientGone`), there's no one to tell.
+            let final_code = exit_code.unwrap_or(255);
+            let write_result = write_frame(writer, &Frame::Exit(final_code)).await;
+            log_line!("isekai-ssh mux owner: sent Frame::Exit({final_code}) to client, write_result_ok={}", write_result.is_ok());
+        }
+        BreakReason::TransportDead => {
+            // Epic R PR2 (B3): deliberately do *not* send `Frame::Exit`
+            // here — doing so used to launder a genuine transport death
+            // into what `client.rs` reads as a normal `Frame::Exit(255)`
+            // (`ClientOutcome::Exited(255)` → `DispatchOutcome::Done(255)`),
+            // which never reaches its `OwnerLost` recovery path
+            // (`native::mux::run_with_reconnect`'s 24h budget/backoff/
+            // Ctrl-C/non-idempotent-command guard). Simply returning here
+            // drops this client's connection without a closing frame,
+            // which `client.rs` reads as `OwnerLost` — exactly the signal
+            // that lets it reconnect (to this same holder, if only this one
+            // channel died, or to a fresh one, if the whole handle is gone).
+            log_line!("isekai-ssh mux owner: remote channel died without reporting why; not sending Frame::Exit so the client treats this as OwnerLost");
+            // Force this connection closed from the owner's side so the
+            // client's read actually observes EOF and can tell the
+            // connection is over. Neither half of this alone is enough:
+            //
+            // - `writer.shutdown().await` half-closes the *write* direction
+            //   for real stream transports (TCP/Unix sockets), but is a
+            //   no-op on the Windows named-pipe transport this module
+            //   actually runs on in production (`tokio::net::windows::
+            //   named_pipe::NamedPipeServer::poll_shutdown` is just
+            //   `poll_flush`, which itself does nothing) — kept anyway
+            //   because it's correct and harmless for stream transports,
+            //   but it cannot be relied on by itself here.
+            // - Simply letting `writer` drop when this function returns
+            //   isn't enough either: `tokio::io::split`'s read/write halves
+            //   share the underlying connection via an internal `Arc`, and
+            //   the read half is owned by `spawn_frame_reader`'s own
+            //   spawned task — which, unless force-aborted, stays blocked
+            //   inside its own `read_frame` call (and therefore keeps that
+            //   `Arc` reference alive) for as long as the client itself
+            //   neither sends nor closes anything, which is exactly the
+            //   state a client waiting to detect `OwnerLost` is in.
+            //
+            // Aborting `frame_reader_task` drops its in-progress read (and
+            // therefore its `ReadHalf`) immediately, regardless of what the
+            // underlying transport is or whether the client ever sends
+            // anything — dropping the last reference to the shared
+            // connection is what actually makes the OS tear it down and the
+            // peer observe EOF. (Epic R PR2 round 2 review: a `duplex()`-based
+            // test caught the symptom — a 30-minute CI hang — but its
+            // `DuplexStream::poll_shutdown` doesn't share `NamedPipeServer`'s
+            // no-op semantics, so it didn't prove this fix actually works on
+            // the one transport this code runs on; round 3 review caught
+            // that gap.)
+            frame_reader_task.abort();
+            let _ = writer.shutdown().await;
+            // Best-effort optimization, not required for correctness: if
+            // the *shared* handle itself is confirmed dead, proactively
+            // wake `serve_clients`'s `shutdown` branch so the whole holder
+            // exits immediately rather than waiting out `handle_died`'s own
+            // `HANDLE_HEALTH_POLL_INTERVAL` poll — every other tab's own
+            // relay hits this same `TransportDead` path independently, so
+            // this is strictly a latency improvement, not a load-bearing
+            // dependency for any one tab's own recovery. Deliberately
+            // scoped to *confirmed* handle death (R2-S1's original
+            // "handle_died"-style check) — a channel dying while the
+            // shared handle is still alive (e.g. this specific SSH channel
+            // was closed by policy) must not tear down every other tab's
+            // session just because this one channel had a bad day.
+            if handle.lock().await.is_closed() {
+                shutdown.notify_waiters();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1176,6 +1316,205 @@ mod tests {
         write_frame(&mut client, &Frame::Shutdown).await.unwrap();
         drop(client);
         let _ = relay.await.unwrap();
+    }
+
+    /// A mock sshd that ends the remote command via `exit-signal` (RFC 4254
+    /// §6.10) instead of `exit-status`, then closes the channel — standing
+    /// in for a remote process killed by a signal rather than exiting
+    /// normally.
+    #[derive(Clone)]
+    struct ExitSignalServer;
+
+    impl server::Server for ExitSignalServer {
+        type Handler = ExitSignalHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> ExitSignalHandler {
+            ExitSignalHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExitSignalHandler;
+
+    #[async_trait]
+    impl server::Handler for ExitSignalHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(&mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.exit_signal_request(channel, russh::Sig::TERM, false, "killed by signal", "en")?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// Epic R PR2 (R2-S1): `ChannelMsg::ExitSignal` must be treated the same
+    /// as `ChannelMsg::ExitStatus` — reported to the client as `Frame::Exit`
+    /// — not silently dropped into the `TransportDead` classification the
+    /// way it was before this fix (which would have suppressed `Frame::Exit`
+    /// entirely and made the client wrongly treat a normal signal-terminated
+    /// command as a transport failure).
+    #[tokio::test]
+    async fn relay_client_sends_exit_frame_when_the_remote_sends_exit_signal_instead_of_exit_status() {
+        let keypair = Ed25519Keypair::from_seed(&[121; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = ExitSignalServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        loop {
+            match read_frame(&mut client).await.unwrap() {
+                Some(Frame::Exit(code)) => {
+                    assert_eq!(code, 255, "an ExitSignal must be reported as 255, matching ssh(1)'s own convention");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("stream ended without a Frame::Exit — an ExitSignal must still be reported to the client"),
+            }
+        }
+        let _ = relay.await.unwrap();
+    }
+
+    /// A mock sshd that closes the channel with no `exit-status`/`exit-signal`
+    /// at all — standing in for a genuine transport-level failure (Epic R,
+    /// B3) rather than any kind of normal command termination.
+    #[derive(Clone)]
+    struct SilentChannelCloseServer;
+
+    impl server::Server for SilentChannelCloseServer {
+        type Handler = SilentChannelCloseHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> SilentChannelCloseHandler {
+            SilentChannelCloseHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct SilentChannelCloseHandler;
+
+    #[async_trait]
+    impl server::Handler for SilentChannelCloseHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(&mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        // Closes only *this* channel — the underlying TCP connection (and
+        // therefore the shared `client::Handle`) stays alive, standing in
+        // for a channel-specific anomaly (e.g. a server-side channel limit
+        // or policy close) rather than the whole transport dying.
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// Epic R PR2 (B3): a remote channel that closes with no exit
+    /// information at all must **not** be reported to the client as
+    /// `Frame::Exit` — doing so used to launder a genuine transport death
+    /// into a normal-looking exit, hiding it from `client.rs`'s `OwnerLost`
+    /// recovery. The client must instead see its connection simply end.
+    #[tokio::test]
+    async fn relay_client_sends_no_exit_frame_when_the_remote_channel_closes_without_reporting_why() {
+        let keypair = Ed25519Keypair::from_seed(&[122; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = SilentChannelCloseServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        let handle = Mutex::new(authed_handle(addr).await);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // The relay must end the connection (`None` from `read_frame`)
+        // without ever sending a `Frame::Exit` in between.
+        loop {
+            match read_frame(&mut client).await.unwrap() {
+                Some(Frame::Exit(code)) => panic!("must not send Frame::Exit({code}) for a silent transport death"),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let _ = relay.await.unwrap();
+    }
+
+    /// Epic R PR2 (S9): a channel dying while the *shared* handle stays
+    /// alive must not tear down every other tab — proven here by checking
+    /// the handle is still usable (a fresh channel can still be opened)
+    /// immediately after `relay_client` returns from the silent-close
+    /// scenario above.
+    #[tokio::test]
+    async fn a_silent_channel_close_does_not_kill_the_shared_handle() {
+        let keypair = Ed25519Keypair::from_seed(&[123; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = SilentChannelCloseServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        let handle = authed_handle(addr).await;
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let handle = Mutex::new(handle);
+        let relay = tokio::spawn(async move {
+            let result = relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await;
+            (result, handle)
+        });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        drop(client);
+
+        let (_result, handle) = relay.await.unwrap();
+        assert!(!handle.lock().await.is_closed(), "a single channel closing must not close the shared handle");
     }
 
     /// A mock sshd that only answers `exec` (never `shell_request`) — echoes

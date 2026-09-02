@@ -20,6 +20,7 @@ mod init;
 mod log_file;
 mod login;
 mod native;
+mod reconnect_backoff;
 mod tty_attach;
 mod wrapper;
 

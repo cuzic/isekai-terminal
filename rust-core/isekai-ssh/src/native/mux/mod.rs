@@ -245,6 +245,21 @@ impl ReconnectBackoff {
 /// (a malformed destination, `--isekai-no-bootstrap` against an unregistered
 /// host) exactly as it always has, rather than retrying it for up to
 /// [`RECONNECT_BUDGET`].
+///
+/// **Known asymmetry with `wrapper.rs`'s own retry loop** (Epic R PR2, Task
+/// 2.12, decided S8): `wrapper.rs::run_ssh_with_connect_failure_recovery`
+/// caps its lightweight-retry count at `MAX_LIGHTWEIGHT_RETRIES` before
+/// falling back to a full re-deploy. This loop's `attempt` counter has no
+/// such cap — an env-var-based counter handoff was considered and rejected,
+/// because the process that actually spawns `isekai-pipe connect`
+/// (`spawn_isekai_pipe_connect`, `child_stdio.rs`) is the mux
+/// owner/holder process, not this client process the counter lives in, and
+/// an existing holder reused from another tab (the common case) gives this
+/// client no opportunity to pass an env var to it at all. Left as-is: the
+/// `isekai-pipe connect` process(es) the holder spawns already get
+/// `retry_while_busy_other_session`'s own 180s `BUSY_OTHER_SESSION` backoff
+/// (Task 2.11), which is judged sufficient in practice without also
+/// plumbing a matching attempt cap through this cross-process boundary.
 async fn run_with_reconnect<C, S>(
     args: Vec<String>,
     spawner: &S,

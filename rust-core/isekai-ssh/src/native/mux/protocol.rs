@@ -417,12 +417,24 @@ const FRAME_READER_BUFFER: usize = 16;
 /// The task forwards frames until the first terminal result — `Ok(None)` (the
 /// peer closed cleanly) or an `Err` — which it also forwards, then exits (so the
 /// receiver observes exactly one terminal result and then the channel closes).
-pub fn spawn_frame_reader<R>(mut reader: R) -> mpsc::Receiver<io::Result<Option<Frame>>>
+///
+/// Also returns the task's own [`tokio::task::JoinHandle`] (Epic R PR2 round
+/// 2 review finding): dropping the returned `Receiver` alone does **not**
+/// make this task (and the `reader` it exclusively owns) go away promptly —
+/// it's typically parked inside `read_frame`'s own `.await` and only notices
+/// the receiver is gone on its *next* `tx.send()`, which may never come if
+/// the peer never sends anything else. A caller that needs to force this
+/// task (and therefore its `reader`) to actually drop *right now* — e.g. to
+/// release the last reference to a shared, `Arc`-backed connection so the
+/// peer observes EOF — must `.abort()` this handle explicitly; tokio's abort
+/// drops the task's future (including a read it's parked inside) without
+/// waiting for it to notice anything on its own.
+pub fn spawn_frame_reader<R>(mut reader: R) -> (mpsc::Receiver<io::Result<Option<Frame>>>, tokio::task::JoinHandle<()>)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(FRAME_READER_BUFFER);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let result = read_frame(&mut reader).await;
             let is_terminal = !matches!(result, Ok(Some(_)));
@@ -431,7 +443,7 @@ where
             }
         }
     });
-    rx
+    (rx, task)
 }
 
 /// Constant-time equality for the auth token — compares every byte regardless

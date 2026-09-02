@@ -24,7 +24,10 @@ use isekai_transport::{
 };
 use std::process::ExitCode;
 
-use crate::resume_loop::{relay_stdio, run_relay_resumable, run_relay_resumable_with_fallback, run_stun_p2p_with_fallback};
+use crate::resume_loop::{
+    relay_stdio, retry_while_busy_other_session, run_relay_resumable, run_relay_resumable_with_fallback, run_stun_p2p_with_fallback,
+    BUSY_OTHER_SESSION_RETRY_WINDOW,
+};
 use crate::{RelayTransportKind, DEFAULT_RESUME_WINDOW, EX_USAGE, EX_UNAVAILABLE};
 
 #[derive(Debug)]
@@ -485,6 +488,12 @@ fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
     };
     let class = if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+    } else if err.downcast_ref::<crate::resume_loop::MidSessionDisconnectSignal>().is_some() {
+        // Epic R PR2, Task 2.5: a bare downcast finds this even through the
+        // outer `.context("isekai-pipe connect: ... failed")` wrap each
+        // `run_connect` call site adds — `anyhow::Error::downcast_ref`
+        // already walks the `ContextError` chain itself.
+        isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect
     } else {
         isekai_pipe_core::ConnectOutcomeClass::Unreachable
     };
@@ -663,20 +672,46 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         .await
         .context("isekai-pipe connect: relay transport failed"),
         CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
-            let stun_result = connect_stun_p2p(
-                &system_quic_factory(),
-                *stun_server,
-                &StunP2pTarget {
-                    peer_addr: *peer_addr,
-                    server_name: server_name.as_str().to_string(),
-                    cert_sha256_hex: cert_pin.to_hex(),
-                    session_secret,
-                },
-                identity,
-            )
-            .await
-            .map(|conn| conn.stream);
+            let factory = system_quic_factory();
+            let target = StunP2pTarget {
+                peer_addr: *peer_addr,
+                server_name: server_name.as_str().to_string(),
+                cert_sha256_hex: cert_pin.to_hex(),
+                session_secret,
+            };
+            // Epic R PR2, Task 2.11: same `BUSY_OTHER_SESSION` retry the
+            // relay paths and `run_stun_p2p_with_fallback` already get — a
+            // fresh reconnect racing this same client's own not-yet-expired
+            // parked session is just as possible on the single-candidate
+            // STUN path. Deliberately delays the `Err(e)` arm below (and
+            // therefore `recover_via_cross_family_fallback`'s relay fallback)
+            // by up to `BUSY_OTHER_SESSION_RETRY_WINDOW` on this specific
+            // rejection, even though a working relay fallback used to be
+            // reachable within milliseconds (round 2 review, finding #7):
+            // the conflict lives in the remote helper's shared session
+            // table, so the fallback would very likely hit the exact same
+            // rejection anyway, and this keeps the shape symmetric with
+            // `run_relay_resumable`/`run_relay_resumable_with_fallback`
+            // (`resume_loop.rs`), which have always retried their primary
+            // before propagating to their own caller.
+            let stun_result = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p(&factory, *stun_server, &target, identity))
+                .await
+                .map(|conn| conn.stream);
             match stun_result {
+                // Epic R PR2, Task 2.4 (round 2 review: `relay_stdio` now
+                // attaches `MidSessionDisconnectSignal` itself, scoped to
+                // just its remote-stream I/O sites — see that marker's own
+                // doc comment): the handshake above already succeeded, so a
+                // `relay_stdio` failure here is a mid-session disconnect,
+                // not a connect-time failure — `write_connect_outcome_for_wrapper`
+                // classifies it as `ConnectOutcomeClass::MidSessionDisconnect`
+                // instead of `Unreachable` accordingly. Deliberately does not
+                // go through `recover_via_cross_family_fallback` below (that
+                // arm only ever sees the *connect*-time `Err(e)` from
+                // `connect_stun_p2p` itself, never a post-success
+                // `relay_stdio` failure — see that function's own call
+                // site one arm up for the `ConnectRoute::StunWithFallback`
+                // case, where this same distinction matters more: Task 2.7).
                 Ok(stream) => relay_stdio(stream).await,
                 Err(e) => {
                     recover_via_cross_family_fallback(
@@ -711,6 +746,19 @@ async fn recover_via_cross_family_fallback(
     tethering_interface: Option<isekai_transport::InterfaceIndex>,
 ) -> Result<()> {
     let Err(primary_err) = result else { return Ok(()) };
+    // Epic R PR2, Task 2.7: a `MidSessionDisconnect` means the STUN P2P
+    // handshake already succeeded and a *live* session was later lost —
+    // never route that into a cross-family relay fallback. Doing so would
+    // silently start a brand-new session over a different transport instead
+    // of reconnecting the one the user was actually using, and would also
+    // bypass the `always-connects.md`-mandated recovery path for this
+    // signal: `isekai-ssh`'s own lightweight-retry loop
+    // (`wrapper.rs`/`native/connect.rs`'s `RetryConnectLightweight`), which
+    // is keyed on seeing this exact `ConnectOutcomeClass` unwrapped, not on
+    // this function inventing a same-attempt substitute for it.
+    if primary_err.downcast_ref::<crate::resume_loop::MidSessionDisconnectSignal>().is_some() {
+        return Err(primary_err).with_context(|| format!("isekai-pipe connect: {context_label} failed"));
+    }
     let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
         return Err(primary_err).with_context(|| format!("isekai-pipe connect: {context_label} failed"));
     };
@@ -1393,6 +1441,29 @@ mod tests {
         let err = result.unwrap_err();
         assert!(format!("{err:#}").contains("simulated STUN failure"), "{err:#}");
         assert!(format!("{err:#}").contains("STUN P2P transport failed"), "{err:#}");
+    }
+
+    /// Epic R PR2, Task 2.7: a `MidSessionDisconnect` must bail out of the
+    /// cross-family fallback immediately, even when a `cross_family_fallback`
+    /// target is configured and would otherwise be tried.
+    #[tokio::test]
+    async fn recover_via_cross_family_fallback_bails_out_on_a_mid_session_disconnect_signal() {
+        let mut intent = sample_stun_primary_intent();
+        intent.cross_family_fallback = Some(IntentTransport::Relay {
+            helper_addr: "127.0.0.1:1".to_string(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: "c2VjcmV0".to_string(),
+        });
+        let primary_err = anyhow::anyhow!("connection lost").context(crate::resume_loop::MidSessionDisconnectSignal);
+
+        let result = recover_via_cross_family_fallback(Err(primary_err), &intent, "STUN P2P transport", false, RelayTransportKind::Udp, None).await;
+
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("connection lost"), "{err:#}");
+        assert!(
+            !format!("{err:#}").contains("cross-family"),
+            "a mid-session disconnect must never attempt the cross-family fallback: {err:#}"
+        );
     }
 
     #[tokio::test]

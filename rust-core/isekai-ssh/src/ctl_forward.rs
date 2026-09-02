@@ -65,6 +65,8 @@ use std::path::PathBuf;
 
 #[cfg(unix)]
 use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use crate::log_file::log_line_verbose;
 use isekai_protocol::{CtlMessage, NotifyKind};
 #[cfg(test)]
 use isekai_protocol::ClipboardMime;
@@ -96,6 +98,42 @@ pub(crate) const REMOTE_SOCK_PREFIX: &str = "/tmp/isekai-pipe-ctl-";
 pub(crate) struct CtlForward {
     pub(crate) remote_path: String,
     pub(crate) local_path: PathBuf,
+    /// The background listener task `spawn_ctl_listener` started, once it
+    /// has run (`None` until then). Epic R PR2, Task 2.10: previously this
+    /// task ran fully detached (`tokio::spawn` with no retained handle),
+    /// which was harmless when `run_ssh_once` ran at most twice per
+    /// `isekai-ssh` invocation — but the `MidSessionDisconnect`
+    /// lightweight-retry loop can now call it dozens of times over a single
+    /// 24h reconnect budget, and each retry's `prepare_ctl_forward` mints a
+    /// brand-new random local socket path, so a detached listener would
+    /// accumulate one live task + bound socket per retry for the rest of
+    /// the process's life. Retaining the handle lets the caller abort the
+    /// previous attempt's listener once its `ssh`/session ends, keeping at
+    /// most one live listener at a time regardless of how many reconnects
+    /// happen.
+    pub(crate) listener_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl CtlForward {
+    /// Aborts this attempt's listener task (if it was ever started) and
+    /// best-effort removes its local socket file — called once per
+    /// `run_ssh_once` attempt, right after that attempt's `ssh` child has
+    /// exited (Epic R PR2, Task 2.10). Best-effort: an already-gone file is
+    /// not an error (nothing to clean up), and any other removal failure is
+    /// merely logged — this cleanup must never surface as a connection
+    /// failure (same opportunistic-feature stance as the rest of this
+    /// module).
+    pub(crate) fn teardown(self) {
+        if let Some(task) = self.listener_task {
+            task.abort();
+        }
+        match std::fs::remove_file(&self.local_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log_line_verbose!("isekai-ssh: could not remove ctl-socket file {}: {e}", self.local_path.display()),
+        }
+    }
 }
 
 /// 128 bits of randomness as lowercase hex, matching
@@ -211,6 +249,7 @@ pub(crate) fn prepare_ctl_forward(runtime_dir: &Path) -> Result<CtlForward> {
     Ok(CtlForward {
         remote_path: format!("{REMOTE_SOCK_PREFIX}{token}.sock"),
         local_path: local_dir.join(format!("{token}.sock")),
+        listener_task: None,
     })
 }
 
@@ -225,7 +264,7 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward, host: String) {
 
     let local_path = forward.local_path.clone();
     let secret = forward.remote_path.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result: Result<()> = async {
             let listener = UnixListener::bind(&local_path)
                 .with_context(|| format!("failed to bind ctl listener at {}", local_path.display()))?;
@@ -245,6 +284,12 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward, host: String) {
             eprintln!("isekai-ssh: ctl listener error: {e:#}");
         }
     });
+    // Epic R PR2, Task 2.10: retained so a caller running through multiple
+    // `run_ssh_once` attempts (the `MidSessionDisconnect` lightweight-retry
+    // loop) can abort this attempt's listener via `CtlForward::teardown`
+    // once its `ssh` session ends, instead of leaking one live task per
+    // retry for the rest of the process's life — see `listener_task`'s docs.
+    forward.listener_task = Some(task);
 }
 
 /// Reads and checks the secret preamble line, then decodes exactly one
@@ -570,7 +615,46 @@ mod tests {
         CtlForward {
             remote_path: "/tmp/isekai-pipe-ctl-aaaa.sock".to_string(),
             local_path: PathBuf::from("/run/user/1000/isekai-ssh/ctl/aaaa.sock"),
+            listener_task: None,
         }
+    }
+
+    /// Epic R PR2, Task 2.10: `teardown` must abort the listener task (so it
+    /// doesn't keep running forever) and remove the local socket file — the
+    /// whole point of retaining the handle instead of letting
+    /// `spawn_ctl_listener` fully detach it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_aborts_the_listener_task_and_removes_the_local_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("aaaa.sock");
+        std::fs::write(&local_path, b"").unwrap();
+
+        // A task that would otherwise run forever — teardown must stop it,
+        // not just drop the handle (dropping a `JoinHandle` alone does
+        // *not* abort a `tokio::spawn`ed task, which is exactly the bug
+        // this task's docs describe fixing).
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = task.abort_handle();
+        let forward = CtlForward { remote_path: "/tmp/isekai-pipe-ctl-aaaa.sock".to_string(), local_path: local_path.clone(), listener_task: Some(task) };
+        forward.teardown();
+
+        // `abort()` only takes effect once the runtime next polls the task;
+        // yielding gives it that chance before asserting.
+        tokio::task::yield_now().await;
+        assert!(abort_handle.is_finished(), "the listener task must be aborted, not left running");
+        assert!(!local_path.exists(), "the local socket file must be removed");
+    }
+
+    /// A `teardown` where the local socket file was never created (e.g. the
+    /// listener never actually bound successfully) must not error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_tolerates_an_already_missing_local_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("never-existed.sock");
+        let forward = CtlForward { remote_path: "/tmp/isekai-pipe-ctl-bbbb.sock".to_string(), local_path, listener_task: None };
+        forward.teardown(); // must not panic
     }
 
     #[cfg(unix)]

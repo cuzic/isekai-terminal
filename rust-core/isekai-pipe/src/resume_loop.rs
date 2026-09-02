@@ -63,6 +63,59 @@ const WARM_STANDBY_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 /// monotonic tick count.
 const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 
+/// Marks an `anyhow::Error` as having occurred *after* the STUN P2P
+/// handshake already succeeded — i.e. during the pump phase (`relay_stdio`),
+/// not while dialing (Epic R PR2, Task 2.4). Mirrors
+/// `isekai_transport::StaleTrustSignal`'s attach-at-the-source/
+/// downcast-at-the-top shape (`connect.rs::attach_stale_trust_signal`): a
+/// bare `err.downcast_ref::<MidSessionDisconnectSignal>()` finds this
+/// even through an outer `.context(...)` wrap, since `anyhow`'s own
+/// `downcast_ref` already walks the `ContextError` chain — no manual
+/// `err.chain()` traversal needed (round 1 review, R1-B2/B2, corrected a
+/// wrong assumption in an earlier draft of this fix).
+///
+/// Deliberately **not** attached to `run_resume_loop`'s own `give_up` path
+/// (the Relay — and, before PR3, non-existent-for-STUN — resume loop): that
+/// loop already retries internally for up to `DEFAULT_RESUME_GRACE_SECS`
+/// (10 days) before giving up, so an error escaping it is essentially
+/// terminal and the existing `RebootstrapAndRetry` (full re-deploy) is the
+/// correct response, not a lightweight retry (S1(old) from the ADR review).
+///
+/// Attached at the source, inside [`relay_stdio`] itself, to only its two
+/// *remote*-stream I/O failures ("reading remote stream failed"/"writing to
+/// remote stream failed") — **not** its local stdin/stdout ones (round 2
+/// review finding). `relay_stdio`'s callers used to blanket-wrap its entire
+/// `Result` with this marker, which meant a local-side failure (e.g. `ssh(1)`
+/// itself already exited and closed the pipe this process's stdout writes
+/// into, so `stdout.write_all`/`flush` fails with a broken-pipe error) could
+/// get misclassified as a network disconnection and trigger an unwanted
+/// extra reconnect — even though nothing about the actual network or remote
+/// session was at fault. `isekai-pipe/src/engine/mod.rs`'s graceful
+/// `send.shutdown()` on a clean server-side close makes this a narrow race
+/// rather than a systematic misclassification, but there's no reason to
+/// accept it when scoping the marker to the two sites that can actually mean
+/// "the network died" avoids it entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MidSessionDisconnectSignal;
+
+impl std::fmt::Display for MidSessionDisconnectSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the connection was lost mid-session, after it was already established")
+    }
+}
+
+impl std::error::Error for MidSessionDisconnectSignal {}
+
+/// Invariant (round 3 review, N1): only STUN P2P call sites
+/// (`connect.rs`'s single-candidate arm and [`run_stun_p2p_with_fallback`])
+/// may call this. It unconditionally attaches [`MidSessionDisconnectSignal`]
+/// to its two remote-stream I/O failures, and that marker is specifically
+/// the ADR's STUN-only `RetryConnectLightweight` signal — a relay-route
+/// caller must **not** inherit it (relay's own resume loop already retries
+/// internally for up to `DEFAULT_RESUME_GRACE_SECS`, so an error escaping
+/// *that* loop is terminal, and a lightweight redial would be the wrong
+/// response to it). Generic over `AnyByteStream` for STUN P2P's own sake,
+/// not as an invitation for a relay-side caller to reuse it.
 pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
     let mut c2h = tokio::spawn(async move {
@@ -77,7 +130,8 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
             quic_write
                 .write_all(&buf[..n])
                 .await
-                .context("writing to remote stream failed")?;
+                .context("writing to remote stream failed")
+                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
         }
     });
     let mut h2c = tokio::spawn(async move {
@@ -87,7 +141,8 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
             let n = quic_read
                 .read(&mut buf)
                 .await
-                .context("reading remote stream failed")?;
+                .context("reading remote stream failed")
+                .map_err(|e| e.context(MidSessionDisconnectSignal))?;
             if n == 0 {
                 return Ok::<_, anyhow::Error>(());
             }
@@ -120,7 +175,7 @@ pub(crate) async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
 /// `TransportError`/`SequentialConnectError::is_busy_other_session` inherent
 /// methods it delegates to, so calling `self.is_busy_other_session()` inside
 /// each impl unambiguously reaches the inherent one rather than recursing.
-trait BusyOtherSessionSignal {
+pub(crate) trait BusyOtherSessionSignal {
     fn signals_busy_other_session(&self) -> bool;
 }
 
@@ -155,7 +210,7 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
 /// this window is never the limiting factor in the common case; against one
 /// that doesn't, it turns what would otherwise be a silent multi-day hang
 /// into a fast, visible failure instead.
-const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
+pub(crate) const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 
 /// Retries `attempt` while — and only while — it fails with
 /// `BUSY_OTHER_SESSION`, for up to `window` (production call sites always
@@ -168,8 +223,13 @@ const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 /// `isekai-pipe connect` process (a brand new `session_id` every time,
 /// since neither `connect_via_relay_resumable` nor `_with_fallback` persist
 /// one across invocations) would otherwise fail outright instead of waiting
-/// the same window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
+/// the same window a same-process resume would have. `pub(crate)` (Epic R
+/// PR2, Task 2.11) so `connect.rs`'s single-candidate STUN P2P path can
+/// reuse it too — STUN P2P has no resume/control-stream concept of its own
+/// (`run_stun_p2p_with_fallback`'s docs), but a fresh reconnect attempt
+/// racing this same client's own not-yet-expired parked session is exactly
+/// as possible there as it is for relay.
+pub(crate) async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
@@ -245,9 +305,26 @@ pub(crate) async fn run_relay_resumable_with_fallback(
 /// straight into `relay_stdio`, exactly like the legacy single-candidate path
 /// already does.
 pub(crate) async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
-    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&system_quic_factory(), target, candidates)
-        .await
-        .map_err(attach_stale_trust_signal)?;
+    let factory = system_quic_factory();
+    // Epic R PR2, Task 2.11: STUN P2P used to skip the same
+    // `BUSY_OTHER_SESSION` retry the relay paths already get above — a
+    // fresh `isekai-pipe connect` process reconnecting right after a
+    // mid-session disconnect (this module's whole reason for existing) is
+    // exactly the case `retry_while_busy_other_session`'s docs describe:
+    // this same client's own prior session still parked on the remote
+    // helper, not a real conflicting session.
+    let (connection, _winning_stun_server) =
+        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_stun_p2p_with_fallback(&factory, target, candidates))
+            .await
+            .map_err(attach_stale_trust_signal)?;
+    // Epic R PR2, Task 2.4 (round 2 review: scope narrowed to `relay_stdio`'s
+    // own remote-stream I/O sites, not blanket-applied here anymore — see
+    // `MidSessionDisconnectSignal`'s doc comment): a `relay_stdio` failure
+    // here means the STUN P2P handshake above already succeeded, so a
+    // *remote*-stream failure is a mid-session disconnect, not a
+    // connect-time one — `write_connect_outcome_for_wrapper` classifies it
+    // as `ConnectOutcomeClass::MidSessionDisconnect` instead of
+    // `Unreachable` accordingly.
     relay_stdio(connection.stream).await
 }
 

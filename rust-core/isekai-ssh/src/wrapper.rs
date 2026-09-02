@@ -5,6 +5,7 @@
 //! production`, is treated as an OpenSSH invocation with an injected
 //! `ProxyCommand` that delegates the byte stream to `isekai-pipe connect`.
 
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::log_file::{log_line, log_line_verbose};
+use crate::reconnect_backoff;
 
 mod config;
 mod directive;
@@ -582,6 +584,15 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     run_ssh_with_connect_failure_recovery(&plan, &resolution, intent).await
 }
 
+/// STUN P2P's lightweight reconnect claims a fresh `AttachArbiter` session
+/// slot on every attempt; capped well short of the server's
+/// `--max-sessions` default (16) so a long run of lightweight retries can
+/// never evict another tab's genuinely parked session (ADR round 1, S2).
+/// Once exceeded, the loop falls back to one `RebootstrapAndRetry`-style
+/// attempt (gated on `should_bootstrap`, unlike the lightweight path
+/// itself) rather than lightweight-retrying forever.
+const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
+
 /// Runs `ssh` once against `intent`; if it fails *and* `isekai-pipe connect`
 /// left behind a `ConnectOutcome` side-channel file for this exact attempt
 /// (`isekai-pipe-core::claim_connect_outcome`, `ISEKAI_PIPE_DESIGN.md` §8
@@ -592,62 +603,187 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
 /// manually), silently refreshes the trust store (no `[y/N]` prompt —
 /// confirmed product decision: this profile was already trusted once, and
 /// the underlying SSH re-deploy connection is still gated by the user's own
-/// `~/.ssh/known_hosts`, `OpenSshBackend`'s module docs) and retries exactly
-/// once more. Structurally at most two `ssh` invocations ever happen here —
-/// no loop, no recursion — so this cannot run away even if the retry's own
-/// attempt also fails (e.g. a crash-looping helper, or a genuinely
-/// unreachable network): whatever the second attempt returns is final for
-/// *this* invocation, though a subsequent manual `isekai-ssh <destination>`
-/// gets its own fresh two-attempt budget.
+/// `~/.ssh/known_hosts`, `OpenSshBackend`'s module docs) and retries.
+///
+/// Epic R PR2 turned this from a single retry into a bounded loop: a
+/// `ConnectOutcomeClass::MidSessionDisconnect` signal (the SSH bridge was
+/// genuinely live for a while before failing, ADR §2.2.2) now retries
+/// lightweight — no re-deploy — using the same `RECONNECT_BUDGET`(24h)/
+/// backoff policy `native::mux::run_with_reconnect` already established
+/// for Windows mux (`reconnect_backoff`, Q1). `StaleTrust`/`Unreachable`
+/// keep the original single-shot `RebootstrapAndRetry` behavior — a
+/// pre-handshake failure means the cached deployment itself might be
+/// stale/dead, and looping a full re-deploy indefinitely would be both
+/// slow and, if the target is genuinely gone, pointless.
 ///
 /// Only reachable *after* `build_connection_intent` already succeeded once
 /// in `run()` — a brand-new (never-registered) profile's own, separately
 /// prompted bootstrap path is untouched by this function entirely.
+/// Live process-level reconnect status line (Epic R PR2, Task 2.13) — the
+/// `run_ssh_with_connect_failure_recovery` loop's counterpart to
+/// `isekai-pipe/src/resume_loop.rs`'s `format_reconnect_status`/
+/// `print_reconnect_status` for its own (session-level QUIC resume)
+/// reconnects. Deliberately worded differently ("isekai-ssh" + "attempt
+/// {n}" rather than "isekai-pipe connect" + an elapsed/total countdown):
+/// this loop restarts the whole `ssh(1)` process rather than resuming one
+/// live QUIC connection, and has no fixed total-window countdown to show
+/// (`reconnect_backoff::RECONNECT_BUDGET` is 24h, not a useful "X/Y"
+/// display). Pure so it's unit-testable without touching stderr, mirroring
+/// that module's own split.
+///
+/// Deliberately **not** an in-place `\r`-redrawn line the way
+/// `resume_loop.rs`'s countdown is (round 2 review finding, self-corrected
+/// before merge): unlike that module's tight per-second countdown loop
+/// inside one continuous process, this function has no way to detect the
+/// *moment* a retry actually succeeds — `run_ssh_once`'s `.wait()` only
+/// returns once the whole `ssh(1)` session ends (i.e. potentially hours
+/// later, when the user types `exit`), so there is no matching "reconnected"
+/// event to redraw over this line with. A one-shot, newline-terminated line
+/// per attempt avoids needing to clear anything before the reconnected
+/// session's own terminal output resumes.
+fn format_process_reconnect_status(is_tty: bool, attempt: u32) -> String {
+    if is_tty {
+        format!("\x1b[0;33misekai-ssh: connection lost, reconnecting... (attempt {attempt})\x1b[0m")
+    } else {
+        format!("isekai-ssh: connection lost, reconnecting... (attempt {attempt})")
+    }
+}
+
+/// Prints [`format_process_reconnect_status`] to stderr, one newline-terminated
+/// line per attempt via `log_line!` (so `--isekai-log-file` output stays free
+/// of ANSI color bytes, same reasoning as `resume_loop.rs`'s own
+/// `is_terminal()` gate) — called *before* the backoff wait so the user sees
+/// it promptly rather than only once the wait has already elapsed.
+fn print_process_reconnect_status(is_tty: bool, attempt: u32) {
+    log_line!("{}", format_process_reconnect_status(is_tty, attempt));
+}
+
 async fn run_ssh_with_connect_failure_recovery(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
     intent: ConnectionIntent,
 ) -> Result<u8> {
     let runtime_dir = default_runtime_dir()?;
-    let (status, intent_id) = run_ssh_once(plan, resolution, &intent, &runtime_dir).await?;
-    if status.success() {
-        return Ok(0);
-    }
-    let exit_code = status.code().unwrap_or(1) as u8;
+    let mut intent = intent;
+    let mut attempt: u32 = 0;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+    let mut lightweight_retries: u32 = 0;
+    // Task 2.13: computed once — `--isekai-log-file` redirects stderr away
+    // from the terminal for the *ssh child's* stderr (`run_ssh_once`), but
+    // this process's own stderr (what `is_terminal()` here actually checks)
+    // is unaffected by that; the `!log_file::is_enabled()` half of this
+    // check is what keeps `\r`/ANSI bytes out of the log file specifically.
+    let is_tty = std::io::stderr().is_terminal() && !crate::log_file::is_enabled();
 
-    let outcome = resolve_claimed_outcome(claim_connect_outcome(&runtime_dir, &intent_id));
-
-    match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
-        ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
-        ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
-            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            log_auto_bootstrap_disabled(&outcome.class, &resolution.isekai.profile, &outcome.detail);
-            Ok(exit_code)
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        let (status, intent_id) = run_ssh_once(plan, resolution, &intent, &runtime_dir).await?;
+        if status.success() {
+            // Deliberately no "reconnected" message here (round 2 review
+            // finding, self-corrected before merge): `run_ssh_once` only
+            // returns once the whole `ssh(1)` session has *ended*, which for
+            // a successful reconnect is whenever the user eventually types
+            // `exit` — often much later, and unrelated to the reconnect
+            // itself. There is no event at this layer that actually means
+            // "the retry just succeeded".
+            return Ok(0);
         }
-        ConnectFailureRecoveryAction::RebootstrapAndRetry => {
-            let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
-            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
-                print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+        let exit_code = status.code().unwrap_or(1) as u8;
+
+        let outcome = resolve_claimed_outcome(claim_connect_outcome(&runtime_dir, &intent_id));
+
+        match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), should_bootstrap(plan, resolution)) {
+            ConnectFailureRecoveryAction::NoRecoverableSignal => return Ok(exit_code),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
+                let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
+                log_auto_bootstrap_disabled(&outcome.class, &resolution.isekai.profile, &outcome.detail);
+                return Ok(exit_code);
             }
-            let intent2 = build_connection_intent(resolution)
-                .context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
-            let (status2, _) = run_ssh_once(plan, resolution, &intent2, &runtime_dir).await?;
-            Ok(status2.code().unwrap_or(1) as u8)
+            ConnectFailureRecoveryAction::RebootstrapAndRetry => {
+                let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
+                log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
+                return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+            }
+            ConnectFailureRecoveryAction::RetryConnectLightweight => {
+                // Epic R PR2 (B5): never silently re-run a one-shot remote
+                // command — `isekai-ssh host -- ./deploy.sh` interrupted
+                // mid-run must not be retried from scratch, since a
+                // non-idempotent command could be repeated. Matches the
+                // identical guard `native::mux::mod::run_with_reconnect`
+                // already applies to its own `OwnerLost` reconnect.
+                if plan.remote_command().is_some() {
+                    log_line!(
+                        "isekai-ssh: connection lost while running a remote command; not auto-retrying \
+                         (rerunning it could repeat a non-idempotent action)."
+                    );
+                    return Ok(exit_code);
+                }
+                // Reset *before* checking the cap below: a `lightweight_retries`
+                // that's already at the cap from an earlier, long-since-stable
+                // storm must not immediately trip the cap for what is really
+                // the first failure of a brand-new one (round 2 review finding
+                // — see `reset_budget_if_stable`'s own docs).
+                reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
+                lightweight_retries += 1;
+                if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
+                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
+                    if !should_bootstrap(plan, resolution) {
+                        return Ok(exit_code);
+                    }
+                    return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+                }
+                // Printed *before* the backoff wait below (round 2 review
+                // finding: it used to print only after already sleeping out
+                // the whole delay, so the terminal stayed silent for up to
+                // 10s before the user saw anything). `attempt + 1` is the
+                // attempt number `reconnect_backoff_or_give_up` is about to
+                // record, since it increments `attempt` itself on `Retry`.
+                print_process_reconnect_status(is_tty, attempt + 1);
+                match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    reconnect_backoff::ReconnectDecision::Retry => {
+                        intent = build_connection_intent(resolution).context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
+                        continue;
+                    }
+                    reconnect_backoff::ReconnectDecision::GiveUp => return Ok(exit_code),
+                }
+            }
         }
     }
 }
 
-/// Human-readable lead-in for the two `eprintln!`s above, branching on
-/// `ConnectOutcomeClass` purely for message accuracy — both classes drive
-/// the exact same [`ConnectFailureRecoveryAction`]. `pub(crate)` so the
-/// Windows-native connect path (`native/connect.rs`) can reuse the exact
-/// same message wording for its own mirror of this recovery flow.
+/// The re-deploy-then-retry-once action shared by `RebootstrapAndRetry` and
+/// (once its own lightweight retry budget is exhausted)
+/// `RetryConnectLightweight`. Structurally at most one extra `ssh`
+/// invocation happens here — no loop, no recursion — so this cannot run
+/// away even if the retry's own attempt also fails (e.g. a crash-looping
+/// helper, or a genuinely unreachable network): whatever this attempt
+/// returns is final for *this* invocation, though a subsequent manual
+/// `isekai-ssh <destination>` gets its own fresh recovery budget.
+async fn rebootstrap_and_retry_once(plan: &WrapperPlan, resolution: &WrapperResolution, runtime_dir: &Path) -> Result<u8> {
+    if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+        print_bootstrap_failure_guidance(&bootstrap_err);
+        return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+    }
+    let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+    let (status2, _) = run_ssh_once(plan, resolution, &intent2, runtime_dir).await?;
+    Ok(status2.code().unwrap_or(1) as u8)
+}
+
+/// Human-readable lead-in for the `eprintln!`s below, branching on
+/// `ConnectOutcomeClass` purely for message accuracy. `StaleTrust`/
+/// `Unreachable`/`Unknown` all drive the same [`ConnectFailureRecoveryAction`]
+/// family (`RebootstrapAndRetry`/`AutoBootstrapDisabled`); `MidSessionDisconnect`
+/// (Epic R PR2) drives `RetryConnectLightweight` instead and in practice
+/// never reaches `log_auto_bootstrap_disabled` (see
+/// `decide_connect_failure_recovery`), but this `match` still needs an arm
+/// for it to stay exhaustive. `pub(crate)` so the Windows-native connect
+/// path (`native/connect.rs`) can reuse the exact same message wording for
+/// its own mirror of this recovery flow.
 pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
     match class {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
+        isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect => "the connection was lost mid-session",
         // Epic R PR1 (R2-M1): deliberately not the `Unreachable` wording —
         // "the cached deployment could not be reached ... run `isekai-ssh
         // init` manually" would misdirect the user for a class this build
@@ -723,6 +859,15 @@ pub(crate) enum ConnectFailureRecoveryAction {
     /// A signal was found and auto-bootstrap is allowed — attempt a silent
     /// re-bootstrap and retry `ssh` exactly once more.
     RebootstrapAndRetry,
+    /// The connect-time handshake had already succeeded before this attempt
+    /// failed (`ConnectOutcomeClass::MidSessionDisconnect`, Epic R PR2) —
+    /// retry by re-dialing the already-deployed helper, with no re-deploy
+    /// step. Unlike `RebootstrapAndRetry`, this is attempted regardless of
+    /// `should_bootstrap`: it never touches SSH-based re-deployment, so
+    /// `--isekai-no-bootstrap`'s contract ("don't silently re-deploy over
+    /// SSH") isn't violated by trying it (ADR round 1, Q2 — both opus
+    /// reviewers agreed on this reading).
+    RetryConnectLightweight,
 }
 
 /// Turns `claim_connect_outcome`'s `Result` into the `Option` the rest of
@@ -760,13 +905,23 @@ pub(crate) fn resolve_claimed_outcome(
     }
 }
 
-pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
-    if !connect_failure_signaled {
-        ConnectFailureRecoveryAction::NoRecoverableSignal
-    } else if !should_bootstrap {
-        ConnectFailureRecoveryAction::AutoBootstrapDisabled
-    } else {
-        ConnectFailureRecoveryAction::RebootstrapAndRetry
+/// Epic R PR2 changed this from a plain `bool` to
+/// `Option<&ConnectOutcomeClass>` so `MidSessionDisconnect` can route to its
+/// own `RetryConnectLightweight` action instead of `RebootstrapAndRetry`.
+/// **`Unknown` must fall through to the `Some(_)` arm, not be treated like
+/// `None`** — round 1 review (R1-B1) caught an earlier draft doing exactly
+/// that, which would have been a regression against
+/// `.claude/rules/always-connects.md`: before `ConnectOutcomeClass` existed,
+/// `wrapper.rs`'s old bool-based check treated *any* outcome file
+/// (`outcome.is_some()`) as a recoverable signal, regardless of which class
+/// it carried — `Unknown` existing at all already means "some outcome was
+/// recorded", which is the only thing this function used to need to know.
+pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe_core::ConnectOutcomeClass>, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
+    match outcome_class {
+        None => ConnectFailureRecoveryAction::NoRecoverableSignal,
+        Some(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect) => ConnectFailureRecoveryAction::RetryConnectLightweight,
+        Some(_) if !should_bootstrap => ConnectFailureRecoveryAction::AutoBootstrapDisabled,
+        Some(_) => ConnectFailureRecoveryAction::RebootstrapAndRetry,
     }
 }
 
@@ -787,13 +942,22 @@ pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, sh
 /// disabling the other. Unix-only — this is the `ssh(1)` ProxyCommand path;
 /// the Windows-native path handles both on its own `russh` handle
 /// (`native/mux/ctl_forward.rs`).
+///
+/// Returns the [`crate::ctl_forward::CtlForward`] it prepared (if any) so
+/// the caller (`run_ssh_once`) can keep its background listener task alive
+/// for exactly this attempt's `ssh` child and tear it down right after —
+/// Epic R PR2, Task 2.10: this function itself must not drop it, since
+/// dropping a plain struct does nothing to the already-detached listener
+/// task `spawn_ctl_listener` started (see `CtlForward::listener_task`'s
+/// docs for why that matters now that `run_ssh_once` can run many times per
+/// invocation).
 #[cfg(unix)]
 async fn apply_ctl_socket_forward(
     command: &mut Command,
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
     runtime_dir: &Path,
-) {
+) -> Option<crate::ctl_forward::CtlForward> {
     let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
         resolution.isekai.ctl_socket_enabled,
         plan.ssh_args.len(),
@@ -847,6 +1011,7 @@ async fn apply_ctl_socket_forward(
             tty_exec.as_deref(),
         ));
     }
+    ctl_forward
 }
 
 async fn run_ssh_once(
@@ -884,7 +1049,7 @@ async fn run_ssh_once(
     // forwards streamlocal in-process (see `ctl_forward.rs`'s module docs and
     // `native/mux/ctl_forward.rs`).
     #[cfg(unix)]
-    apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
+    let ctl_forward = apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
     #[cfg(not(unix))]
     command.args(&plan.ssh_args);
     // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
@@ -901,20 +1066,43 @@ async fn run_ssh_once(
         command.stderr(Stdio::inherit());
     }
 
-    let mut child = command.spawn().map_err(|e| {
-        anyhow!(
-            "isekai-ssh: failed to execute OpenSSH at {}: {e}",
-            plan.openssh_path.display()
-        )
-    })?;
+    let spawn_result = command.spawn();
+    // Epic R PR2, Task 2.10: tear down this attempt's ctl-socket listener
+    // (if any) on every exit from this function — spawn failure, wait
+    // failure, or a normal exit — not just the happy path, so a long
+    // `MidSessionDisconnect` lightweight-retry loop (`run_ssh_once` can now
+    // run many times per invocation) never accumulates one leaked listener
+    // task + local socket file per failed/completed attempt.
+    #[cfg(unix)]
+    let teardown = |result| {
+        if let Some(forward) = ctl_forward {
+            forward.teardown();
+        }
+        result
+    };
+    #[cfg(not(unix))]
+    let teardown = |result| result;
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(e) => {
+            return teardown(Err(anyhow!(
+                "isekai-ssh: failed to execute OpenSSH at {}: {e}",
+                plan.openssh_path.display()
+            )));
+        }
+    };
     let stderr_redirect = child.stderr.take().map(|stderr| tokio::spawn(crate::log_file::redirect_child_stderr(stderr)));
 
-    let status = child.wait().await.map_err(|e| {
-        anyhow!(
-            "isekai-ssh: failed while waiting for OpenSSH at {}: {e}",
-            plan.openssh_path.display()
-        )
-    })?;
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            return teardown(Err(anyhow!(
+                "isekai-ssh: failed while waiting for OpenSSH at {}: {e}",
+                plan.openssh_path.display()
+            )));
+        }
+    };
     // ssh(1) exiting closes its stderr, which ends `redirect_child_stderr`'s
     // read loop on its own — this just makes sure that last batch of bytes
     // has actually landed before returning (so a caller inspecting the log
@@ -922,7 +1110,7 @@ async fn run_ssh_once(
     if let Some(handle) = stderr_redirect {
         let _ = handle.await;
     }
-    Ok((status, intent.intent_id.clone()))
+    teardown(Ok((status, intent.intent_id.clone())))
 }
 
 async fn run_openssh_direct(plan: &WrapperPlan) -> Result<u8> {
@@ -2284,19 +2472,83 @@ mod tests {
 
     #[test]
     fn decide_connect_failure_recovery_returns_no_signal_when_no_signal_was_found() {
-        assert_eq!(decide_connect_failure_recovery(false, true), ConnectFailureRecoveryAction::NoRecoverableSignal);
+        assert_eq!(decide_connect_failure_recovery(None, true), ConnectFailureRecoveryAction::NoRecoverableSignal);
         // Whether auto-bootstrap is allowed is irrelevant without a signal.
-        assert_eq!(decide_connect_failure_recovery(false, false), ConnectFailureRecoveryAction::NoRecoverableSignal);
+        assert_eq!(decide_connect_failure_recovery(None, false), ConnectFailureRecoveryAction::NoRecoverableSignal);
     }
 
     #[test]
     fn decide_connect_failure_recovery_returns_disabled_when_signal_found_but_bootstrap_off() {
-        assert_eq!(decide_connect_failure_recovery(true, false), ConnectFailureRecoveryAction::AutoBootstrapDisabled);
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unreachable), false),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled
+        );
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::StaleTrust), false),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled
+        );
     }
 
     #[test]
     fn decide_connect_failure_recovery_retries_when_signal_found_and_bootstrap_allowed() {
-        assert_eq!(decide_connect_failure_recovery(true, true), ConnectFailureRecoveryAction::RebootstrapAndRetry);
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unreachable), true),
+            ConnectFailureRecoveryAction::RebootstrapAndRetry
+        );
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::StaleTrust), true),
+            ConnectFailureRecoveryAction::RebootstrapAndRetry
+        );
+    }
+
+    /// Epic R PR2: `MidSessionDisconnect` always retries lightweight,
+    /// regardless of `should_bootstrap` — it never re-deploys over SSH, so
+    /// `--isekai-no-bootstrap`'s "don't silently re-deploy" contract isn't
+    /// violated by trying it (ADR round 1, Q2).
+    #[test]
+    fn decide_connect_failure_recovery_retries_lightweight_for_mid_session_disconnect_regardless_of_bootstrap_flag() {
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect), true),
+            ConnectFailureRecoveryAction::RetryConnectLightweight
+        );
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect), false),
+            ConnectFailureRecoveryAction::RetryConnectLightweight
+        );
+    }
+
+    /// Epic R PR2 (R1-B1): `Unknown` must be treated like `Unreachable` —
+    /// attempt recovery — not like "no signal at all". An earlier draft of
+    /// this fix got this backwards, which round 1 review caught as a
+    /// regression against `.claude/rules/always-connects.md`.
+    #[test]
+    fn decide_connect_failure_recovery_treats_unknown_class_like_unreachable_not_like_no_signal() {
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unknown), true),
+            ConnectFailureRecoveryAction::RebootstrapAndRetry
+        );
+        assert_eq!(
+            decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unknown), false),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled
+        );
+    }
+
+    // Epic R PR2, Task 2.13: live reconnect status formatting.
+
+    #[test]
+    fn format_process_reconnect_status_colors_on_a_tty_but_stays_a_single_newline_terminated_line() {
+        let msg = format_process_reconnect_status(true, 3);
+        assert!(msg.contains("\x1b["), "TTY display should still be colored: {msg:?}");
+        assert!(!msg.contains('\r'), "must not be an in-place \\r redraw (round 2 review: there's no matching 'reconnected' event to redraw over at this layer): {msg:?}");
+        assert!(msg.contains("attempt 3"), "{msg:?}");
+    }
+
+    #[test]
+    fn format_process_reconnect_status_is_plain_text_off_a_tty() {
+        let msg = format_process_reconnect_status(false, 3);
+        assert!(!msg.contains('\r'), "non-TTY output must not contain \\r (would corrupt --isekai-log-file): {msg:?}");
+        assert!(!msg.contains('\x1b'), "non-TTY output must not contain ANSI escapes: {msg:?}");
+        assert!(msg.contains("attempt 3"), "{msg:?}");
     }
 
     #[tokio::test]

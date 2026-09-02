@@ -340,6 +340,19 @@ trait ConnectRecoveryOps {
     /// Whether auto-bootstrap is currently allowed (`--isekai-no-bootstrap` /
     /// `#@isekai bootstrap-policy never` turn it off).
     fn should_bootstrap(&self) -> bool;
+    /// Whether this invocation is running a one-shot remote command
+    /// (`isekai-ssh host -- cmd`) rather than an interactive shell (Epic R
+    /// PR2, B5). A `MidSessionDisconnect` must never auto-retry when this
+    /// is `true` — rerunning a remote command from scratch after it was
+    /// interrupted mid-execution could repeat a non-idempotent action,
+    /// mirroring `native::mux::mod::run_with_reconnect`'s identical guard
+    /// on its own `OwnerLost` reconnect.
+    fn has_remote_command(&self) -> bool;
+    /// Rebuilds the connection intent from already-trusted material,
+    /// without re-deploying anything over SSH (Epic R PR2) — the
+    /// lightweight counterpart to `rebootstrap_and_rebuild_intent` below,
+    /// used for `ConnectFailureRecoveryAction::RetryConnectLightweight`.
+    fn build_intent(&self) -> Result<ConnectionIntent>;
     /// Re-deploys the helper for the already-trusted profile (no `[y/N]` trust
     /// confirmation — see [`run_native_connect_with_recovery`]'s docs on the
     /// separate host-key TOFU prompt), then rebuilds the intent from the
@@ -347,41 +360,101 @@ trait ConnectRecoveryOps {
     async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent>;
 }
 
+/// How many lightweight (no-rebootstrap) reconnect attempts a
+/// `MidSessionDisconnect` gets before this path falls back to a full
+/// re-deploy — mirrors `wrapper.rs::MAX_LIGHTWEIGHT_RETRIES` (Epic R PR2,
+/// same policy on both platforms, kept as a separate constant rather than a
+/// shared one for the same "same policy, not same Rust item" reason
+/// `reconnect_backoff`'s module doc gives).
+const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
+
 /// Pure sequencing of the "always-connects" recovery, generic over
 /// [`ConnectRecoveryOps`] so the retry path is testable without real I/O.
-/// At most two `attempt`s ever happen (see [`run_native_connect_with_recovery`]).
+/// Unlike PR1, this can now run more than two `attempt`s in a row — a
+/// `MidSessionDisconnect` (Epic R PR2) drives a bounded lightweight-retry
+/// loop with the same backoff/budget policy as `wrapper.rs`'s Unix
+/// equivalent — but a `StaleTrust`/`Unreachable` signal is still handled in
+/// at most one extra rebootstrap-and-retry attempt, matching
+/// [`run_native_connect_with_recovery`]'s original "at most two attempts"
+/// description for that class of failure.
 async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: ConnectionIntent) -> Result<u8> {
-    let first_error = match ops.attempt(&intent, false).await {
-        Ok(exit_code) => return Ok(exit_code),
-        Err(e) => e,
-    };
+    let mut intent = intent;
+    let mut attempt: u32 = 0;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+    let mut lightweight_retries: u32 = 0;
 
-    // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome` rather
-    // than reimplementing the degrade-to-no-signal policy here — the two
-    // used to drift (different error type, different format flag, and a
-    // doubled log message from `claim_outcome` pre-wrapping its error before
-    // this call wrapped it again). Also, critically, does not discard
-    // `first_error` (the actual connect failure reason) in favor of the
-    // claim-check error, which the original `?` here did.
-    let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        let first_error = match ops.attempt(&intent, false).await {
+            Ok(exit_code) => return Ok(exit_code),
+            Err(e) => e,
+        };
 
-    match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
-        ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
-        ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
-            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            crate::wrapper::log_auto_bootstrap_disabled(&outcome.class, &outcome.profile, &outcome.detail);
-            Err(first_error)
-        }
-        ConnectFailureRecoveryAction::RebootstrapAndRetry => {
-            let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            crate::wrapper::log_rebootstrap_and_retry_decision(
-                &outcome.class,
-                &outcome.profile,
-                &outcome.detail,
-                "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
-            );
-            let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
-            ops.attempt(&intent2, true).await
+        // Epic R PR1 (S4): reuses `wrapper.rs`'s `resolve_claimed_outcome`
+        // rather than reimplementing the degrade-to-no-signal policy here —
+        // the two used to drift (different error type, different format
+        // flag, and a doubled log message from `claim_outcome`
+        // pre-wrapping its error before this call wrapped it again). Also,
+        // critically, does not discard `first_error` (the actual connect
+        // failure reason) in favor of the claim-check error, which the
+        // original `?` here did.
+        let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
+
+        match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), ops.should_bootstrap()) {
+            ConnectFailureRecoveryAction::NoRecoverableSignal => return Err(first_error),
+            ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
+                let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
+                crate::wrapper::log_auto_bootstrap_disabled(&outcome.class, &outcome.profile, &outcome.detail);
+                return Err(first_error);
+            }
+            ConnectFailureRecoveryAction::RebootstrapAndRetry => {
+                let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
+                crate::wrapper::log_rebootstrap_and_retry_decision(
+                    &outcome.class,
+                    &outcome.profile,
+                    &outcome.detail,
+                    "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
+                );
+                let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
+                return ops.attempt(&intent2, true).await;
+            }
+            ConnectFailureRecoveryAction::RetryConnectLightweight => {
+                if ops.has_remote_command() {
+                    log_line!(
+                        "isekai-ssh: connection lost while running a remote command; not auto-retrying (rerunning it could repeat a non-idempotent action)."
+                    );
+                    return Err(first_error);
+                }
+                // Reset *before* checking the cap below: a `lightweight_retries`
+                // that's already at the cap from an earlier, long-since-stable
+                // storm must not immediately trip the cap for what is really
+                // the first failure of a brand-new one (round 2 review finding
+                // — see `reset_budget_if_stable`'s own docs).
+                crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
+                lightweight_retries += 1;
+                if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
+                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
+                    if !ops.should_bootstrap() {
+                        return Err(first_error);
+                    }
+                    let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
+                    return ops.attempt(&intent2, true).await;
+                }
+                // Printed *before* the backoff wait below (round 2 review
+                // finding, mirroring the same fix in `wrapper.rs`): it used
+                // to print only after already sleeping out the whole delay.
+                // `attempt + 1` is the attempt number
+                // `reconnect_backoff_or_give_up` is about to record, since it
+                // increments `attempt` itself on `Retry`.
+                log_line!("isekai-ssh: connection lost, reconnecting... (attempt {})", attempt + 1);
+                match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    crate::reconnect_backoff::ReconnectDecision::Retry => {
+                        intent = ops.build_intent().context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
+                        continue;
+                    }
+                    crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(first_error),
+                }
+            }
         }
     }
 }
@@ -422,6 +495,14 @@ impl ConnectRecoveryOps for NativeConnectOps<'_> {
 
     fn should_bootstrap(&self) -> bool {
         should_bootstrap(self.plan, self.resolution)
+    }
+
+    fn has_remote_command(&self) -> bool {
+        self.plan.remote_command().is_some()
+    }
+
+    fn build_intent(&self) -> Result<ConnectionIntent> {
+        build_connection_intent(self.resolution)
     }
 
     async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
@@ -1068,15 +1149,41 @@ async fn try_agent_auth<H: client::Handler>(
     Ok(false)
 }
 
+/// Why [`run_shell_io_loop_inner`]'s main loop ended (Epic R PR2, B1/B2).
+/// Mirrors `native/mux/owner.rs`'s own `BreakReason` (same distinction,
+/// applied to this single-process path's break sites, which differ from
+/// the mux owner's — there is no separate "client connection" here, so
+/// what plays the `ClientGone` role is *this side* ending things on
+/// purpose, not a remote/transport failure).
+enum BreakReason {
+    /// The remote sent `ChannelMsg::ExitStatus` or `ChannelMsg::ExitSignal`
+    /// before the channel closed — a normal, informative end.
+    RemoteExitReported,
+    /// The user ended the session on purpose (the `~.` escape sequence) —
+    /// nothing wrong with the connection.
+    UserDisconnected,
+    /// The channel closed, or a write to it failed, without ever reporting
+    /// why — a genuine transport failure (Epic R, B1). Previously collapsed
+    /// into `Ok(255)` indistinguishably from every other ending, which hid
+    /// the failure from `drive_connect_recovery`'s `Err`-only recovery path
+    /// (see `run_shell_io_loop_inner`'s return value docs).
+    TransportDead,
+}
+
 /// Relays bytes between the local terminal (raw mode, already enabled by
 /// the caller) and the remote shell channel until the channel closes,
 /// returning the remote exit status as this process's own exit code (`ssh(1)`'s
-/// own convention) — or **255** if the channel closed without ever sending
-/// one (Codex review finding: an abnormal disconnect — network loss, the
-/// `isekai-pipe connect` child dying — must not be reported as a successful
-/// exit just because `exit_code`'s initial value happened to be `0`; `255`
-/// matches real `ssh(1)`'s own exit code for "connection lost/could not
-/// execute command"). Local stdin EOF (Ctrl-D redirected from a non-tty, or
+/// own convention) — or `Err` if the channel died without ever reporting why
+/// (Epic R PR2, B1: previously **255** — Codex review finding: an abnormal
+/// disconnect — network loss, the `isekai-pipe connect` child dying — must
+/// not be reported as a successful exit just because `exit_code`'s initial
+/// value happened to be `0`; the *value* 255 was right, matching real
+/// `ssh(1)`'s own exit code for "connection lost/could not execute command",
+/// but folding it into `Ok` made it indistinguishable from every other
+/// ending — including a genuine remote command that itself exited 255 — to
+/// `drive_connect_recovery`, whose auto-recovery is keyed on `Err`). A
+/// user-initiated `~.` disconnect or a normal remote exit still return `Ok`.
+/// Local stdin EOF (Ctrl-D redirected from a non-tty, or
 /// a real EOF) sends a channel EOF rather than closing the channel outright,
 /// so any buffered remote output still in flight is not lost.
 ///
@@ -1118,13 +1225,19 @@ where
     E: tokio::io::AsyncWrite + Unpin,
 {
     /// `ssh(1)`'s own exit code for "the connection was lost, or the remote
-    /// command couldn't be run" — used here when the channel closes without
-    /// ever delivering a `ChannelMsg::ExitStatus`.
+    /// command couldn't be run" — used for `BreakReason::TransportDead`
+    /// (Epic R PR2) and for an `ExitSignal`, matching `ssh(1)`'s own
+    /// convention for a signal-terminated remote command.
     const NO_EXIT_STATUS_RECEIVED: u8 = 255;
 
     let mut buf = [0u8; 8192];
     let mut exit_code: Option<u8> = None;
     let mut stdin_open = true;
+    // Epic R PR2 (B1/B2): see `BreakReason`'s own docs. Defaults to the
+    // most conservative option — if some future break site is added
+    // without updating this variable, failing the whole attempt (allowing
+    // a retry) is a much safer failure mode than silently reporting success.
+    let mut break_reason = BreakReason::TransportDead;
 
     // Escape sequence state: `ssh(1)`-style `~` commands only at the start of
     // a line (after `\r` or `\n`). `pending_escape` means the previous byte
@@ -1144,11 +1257,18 @@ where
                         let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
                         if !to_send.is_empty() {
                             if channel.data(&to_send[..]).await.is_err() {
+                                // Local stdin just produced real bytes, so
+                                // this side is fine — a write failure here
+                                // is the remote channel's, not ours.
+                                break_reason = BreakReason::TransportDead;
                                 break;
                             }
                         }
                         match action {
-                            EscapeAction::Disconnect => break,
+                            EscapeAction::Disconnect => {
+                                break_reason = BreakReason::UserDisconnected;
+                                break;
+                            }
                             EscapeAction::Suspend => {
                                 #[cfg(unix)]
                                 {
@@ -1194,6 +1314,17 @@ where
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as u8);
                     }
+                    // Epic R PR2 (R2-S1): the remote can end a command via
+                    // an SSH-level signal instead of an exit status (RFC
+                    // 4254 §6.10) — previously fell into the `_ => {}`
+                    // catch-all below, leaving `exit_code` at `None` and
+                    // making this indistinguishable from a genuine
+                    // transport death. `NO_EXIT_STATUS_RECEIVED` (255)
+                    // matches `ssh(1)`'s own convention for reporting a
+                    // signal-terminated remote command.
+                    Some(russh::ChannelMsg::ExitSignal { .. }) => {
+                        exit_code = Some(NO_EXIT_STATUS_RECEIVED);
+                    }
                     // A server may legally send `CHANNEL_EOF` *before* the
                     // `exit-status` channel request — RFC 4254 doesn't mandate
                     // the order (Codex review finding). Breaking on `Eof` here
@@ -1202,7 +1333,10 @@ where
                     // catch-all below): data never arrives after it, but
                     // `ExitStatus` still can. Only `Close`/`None` — the channel
                     // truly ending — break the loop.
-                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(russh::ChannelMsg::Close) | None => {
+                        break_reason = if exit_code.is_some() { BreakReason::RemoteExitReported } else { BreakReason::TransportDead };
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -1214,7 +1348,17 @@ where
         }
     }
 
-    Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED))
+    match break_reason {
+        BreakReason::RemoteExitReported | BreakReason::UserDisconnected => Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED)),
+        // Epic R PR2 (B1): propagate as `Err` rather than folding into
+        // `Ok(255)` — the caller (`run_authenticated_session`) already
+        // `?`-propagates this up to `connect_attempt`, whose `Err` is what
+        // `drive_connect_recovery` actually keys its auto-recovery on (via
+        // `resolve_claimed_outcome`/`claim_outcome`). An `Ok(255)` here used
+        // to be indistinguishable from a remote command that itself legally
+        // exited 255, silently defeating that recovery.
+        BreakReason::TransportDead => Err(anyhow!("isekai-ssh: remote channel closed without reporting why (transport lost)")),
+    }
 }
 
 #[cfg(test)]
@@ -1584,6 +1728,43 @@ mod tests {
         }
     }
 
+    /// Ends the remote command via `exit-signal` (RFC 4254 §6.10) instead of
+    /// `exit-status`, then closes the channel — standing in for a remote
+    /// process killed by a signal rather than exiting normally.
+    #[derive(Clone)]
+    struct ExitSignalServer;
+
+    impl server::Server for ExitSignalServer {
+        type Handler = ExitSignalHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> ExitSignalHandler {
+            ExitSignalHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct ExitSignalHandler;
+
+    #[async_trait]
+    impl server::Handler for ExitSignalHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.exit_signal_request(channel, russh::Sig::TERM, false, "killed by signal", "en")?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
     /// Accepts any password and any channel open, then closes the channel
     /// the moment a shell is requested — without ever sending
     /// `ChannelMsg::ExitStatus` first — standing in for an abnormal
@@ -1733,15 +1914,21 @@ mod tests {
         );
     }
 
-    /// Codex review finding: `run_shell_io_loop` used to initialize
-    /// `exit_code` to `0` and only ever overwrite it on
+    /// Codex review finding (original version): `run_shell_io_loop` used to
+    /// initialize `exit_code` to `0` and only ever overwrite it on
     /// `ChannelMsg::ExitStatus` — a channel that closes abnormally (network
     /// loss, the `isekai-pipe connect` child dying) without ever sending one
     /// would silently report success. `CloseWithoutExitStatusServer` closes
     /// the channel immediately after opening it, before any exit status is
     /// ever sent, standing in for exactly that scenario.
+    ///
+    /// Epic R PR2 (B1) updated the fix itself: `Ok(255)` was already an
+    /// improvement over `Ok(0)`, but it was still `Ok` — indistinguishable
+    /// from a remote command that legitimately exited 255, and therefore
+    /// invisible to `drive_connect_recovery`'s `Err`-keyed auto-recovery.
+    /// This scenario must now propagate as `Err`, not `Ok(255)`.
     #[tokio::test]
-    async fn run_shell_io_loop_reports_255_when_the_channel_closes_without_an_exit_status() {
+    async fn run_shell_io_loop_returns_err_when_the_channel_closes_without_an_exit_status() {
         let addr = spawn_server(CloseWithoutExitStatusServer, 202).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1757,8 +1944,36 @@ mod tests {
             .await
             .unwrap();
 
+        let result = run_shell_io_loop(&mut channel).await;
+        assert!(result.is_err(), "an abnormal disconnect must propagate as Err, not a successful-looking exit code");
+    }
+
+    /// Epic R PR2 (R2-S1): `ChannelMsg::ExitSignal` must be treated the same
+    /// as `ChannelMsg::ExitStatus` — reported as a successful `Ok(255)` exit
+    /// code, matching `ssh(1)`'s own convention — not misclassified as
+    /// `BreakReason::TransportDead` (which would turn a normal
+    /// signal-terminated command into an `Err`, wrongly triggering
+    /// `drive_connect_recovery`'s auto-recovery for a completely ordinary
+    /// remote command ending).
+    #[tokio::test]
+    async fn run_shell_io_loop_reports_255_when_the_remote_sends_exit_signal_instead_of_exit_status() {
+        let addr = spawn_server(ExitSignalServer, 205).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let handler = verifying_handler(&verifier);
+        let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string()))
+            .await
+            .unwrap();
+        assert!(authed, "ExitSignalServer accepts any password");
+
+        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![], command: None })
+            .await
+            .unwrap();
+
         let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
-        assert_eq!(exit_code, 255, "an abnormal disconnect must not be reported as a successful (0) exit");
+        assert_eq!(exit_code, 255, "an ExitSignal must be reported as 255, matching ssh(1)'s own convention, and as Ok (not Err)");
     }
 
     /// Connects to `addr`, accepts its host key, authenticates with a
@@ -2221,6 +2436,36 @@ mod tests {
         should_bootstrap: bool,
         rebootstrap_calls: usize,
         rebootstrap_ok: bool,
+        /// Epic R PR2: mirrors `WrapperPlan::remote_command().is_some()`.
+        has_remote_command: bool,
+        /// `Cell` because `build_intent` takes `&self` (see its trait doc —
+        /// unlike `rebootstrap_and_rebuild_intent`, it does no I/O of its
+        /// own and doesn't need `&mut`).
+        build_intent_calls: std::cell::Cell<usize>,
+        /// If set, `attempt` advances the (paused) tokio clock by this much
+        /// before returning its queued result — lets a test simulate "this
+        /// attempt stayed connected for a while before failing again"
+        /// without needing a real wall-clock wait, for exercising
+        /// `reset_budget_if_stable`'s effect on `lightweight_retries`.
+        advance_before_attempt: Option<std::time::Duration>,
+    }
+
+    impl Default for FakeRecoveryOps {
+        fn default() -> Self {
+            FakeRecoveryOps {
+                attempt_results: std::collections::VecDeque::new(),
+                attempt_calls: 0,
+                silent_flags_seen: Vec::new(),
+                outcome: None,
+                claim_outcome_err: false,
+                should_bootstrap: true,
+                rebootstrap_calls: 0,
+                advance_before_attempt: None,
+                rebootstrap_ok: true,
+                has_remote_command: false,
+                build_intent_calls: std::cell::Cell::new(0),
+            }
+        }
     }
 
     fn fake_outcome(class: isekai_pipe_core::ConnectOutcomeClass) -> isekai_pipe_core::ConnectOutcome {
@@ -2253,6 +2498,9 @@ mod tests {
         async fn attempt(&mut self, _intent: &ConnectionIntent, silent: bool) -> Result<u8> {
             self.attempt_calls += 1;
             self.silent_flags_seen.push(silent);
+            if let Some(duration) = self.advance_before_attempt {
+                tokio::time::advance(duration).await;
+            }
             match self.attempt_results.pop_front().expect("attempt called more times than the test queued results for") {
                 Ok(code) => Ok(code),
                 Err(msg) => Err(anyhow!(msg)),
@@ -2266,6 +2514,13 @@ mod tests {
         }
         fn should_bootstrap(&self) -> bool {
             self.should_bootstrap
+        }
+        fn has_remote_command(&self) -> bool {
+            self.has_remote_command
+        }
+        fn build_intent(&self) -> Result<ConnectionIntent> {
+            self.build_intent_calls.set(self.build_intent_calls.get() + 1);
+            Ok(fake_intent())
         }
         async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
             self.rebootstrap_calls += 1;
@@ -2292,6 +2547,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert_eq!(result.unwrap(), 7, "the retry's exit code must be returned");
@@ -2322,6 +2578,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: false,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "a failed re-bootstrap must surface as an error");
@@ -2342,6 +2599,7 @@ mod tests {
             should_bootstrap: false,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "with auto-bootstrap disabled the original error must propagate");
@@ -2363,6 +2621,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert!(result.is_err(), "no signal means the original error propagates");
@@ -2387,6 +2646,7 @@ mod tests {
             should_bootstrap: true,
             rebootstrap_calls: 0,
             rebootstrap_ok: true,
+            ..Default::default()
         };
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         let err = result.expect_err("a claim_outcome failure must still surface an error (there was no successful attempt)");
@@ -2396,5 +2656,109 @@ mod tests {
         );
         assert_eq!(ops.rebootstrap_calls, 0, "claim_outcome failing must not trigger a re-deploy");
         assert_eq!(ops.attempt_calls, 1, "claim_outcome failing must not trigger a retry");
+    }
+
+    // -----------------------------------------------------------------
+    // Epic R PR2: `MidSessionDisconnect` lightweight-retry loop. Mirrors
+    // `wrapper.rs`'s equivalent tests on the Unix side — see that module's
+    // doc comments for why the decision logic itself
+    // (`decide_connect_failure_recovery`) is unit-tested there rather than
+    // duplicated here; this module only tests the *sequencing* against a
+    // fake, per this file's existing test-module doc comment above.
+    // -----------------------------------------------------------------
+
+    /// A `MidSessionDisconnect` signal drives a no-rebootstrap retry that
+    /// rebuilds the intent via `build_intent` (not
+    /// `rebootstrap_and_rebuild_intent`) and succeeds without ever deploying
+    /// anything.
+    #[tokio::test]
+    async fn recovery_retries_lightweight_on_mid_session_disconnect_without_rebootstrapping() {
+        tokio::time::pause();
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string()), Ok(0)].into_iter().collect(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, 2);
+        assert_eq!(ops.rebootstrap_calls, 0, "a lightweight retry must never re-deploy the helper");
+        assert_eq!(ops.build_intent_calls.get(), 1, "the intent must be rebuilt once for the retry");
+    }
+
+    /// A remote-command invocation (`isekai-ssh host -- cmd`) must never
+    /// auto-retry a `MidSessionDisconnect` — rerunning it could repeat a
+    /// non-idempotent action (mirrors `native::mux::mod::run_with_reconnect`'s
+    /// identical guard).
+    #[tokio::test]
+    async fn recovery_does_not_retry_mid_session_disconnect_for_a_remote_command() {
+        tokio::time::pause();
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string())].into_iter().collect(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            has_remote_command: true,
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert!(result.is_err(), "a remote command must not be silently rerun after a mid-session disconnect");
+        assert_eq!(ops.attempt_calls, 1);
+        assert_eq!(ops.rebootstrap_calls, 0);
+        assert_eq!(ops.build_intent_calls.get(), 0);
+    }
+
+    /// Once the lightweight-retry cap is exceeded, the loop falls back to a
+    /// full re-deploy exactly like a `StaleTrust`/`Unreachable` signal would.
+    #[tokio::test]
+    async fn recovery_falls_back_to_rebootstrap_after_exhausting_lightweight_retries() {
+        tokio::time::pause();
+        // `lightweight_retries` only exceeds `MAX_LIGHTWEIGHT_RETRIES` on the
+        // (MAX_LIGHTWEIGHT_RETRIES + 1)-th failure (it's incremented *after*
+        // each failed attempt and compared with `>`, not `>=`), so that many
+        // failures happen before the rebootstrap fallback kicks in.
+        let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
+            (0..MAX_LIGHTWEIGHT_RETRIES + 1).map(|_| Err("connection lost".to_string())).collect();
+        attempt_results.push_back(Ok(0)); // the post-rebootstrap retry succeeds
+        let mut ops = FakeRecoveryOps {
+            attempt_results,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, MAX_LIGHTWEIGHT_RETRIES as usize + 2);
+        assert_eq!(ops.rebootstrap_calls, 1, "exhausting lightweight retries must fall back to exactly one full re-deploy");
+    }
+
+    /// Epic R PR2 round 2 review finding: `lightweight_retries` must reset
+    /// on a stable-enough attempt, the same way `attempt`/`lost_since` do —
+    /// otherwise it's a per-process-lifetime cap rather than a per-storm
+    /// one, and a long-lived session that reconnects successfully many
+    /// separate times (each stable for a while in between) would eventually
+    /// trip an unwarranted full re-deploy on a totally unrelated, later
+    /// blip. Here, every attempt "stays connected" for longer than
+    /// `RECONNECT_STABLE_THRESHOLD` before failing again — far more than
+    /// `MAX_LIGHTWEIGHT_RETRIES` failures must all still retry lightweight,
+    /// never falling back to rebootstrap.
+    #[tokio::test]
+    async fn recovery_resets_lightweight_retries_after_a_stable_attempt() {
+        tokio::time::pause();
+        let stable_duration = crate::reconnect_backoff::RECONNECT_STABLE_THRESHOLD + std::time::Duration::from_secs(1);
+        let total_failures = (MAX_LIGHTWEIGHT_RETRIES as usize) * 3;
+        let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
+            (0..total_failures).map(|_| Err("connection lost".to_string())).collect();
+        attempt_results.push_back(Ok(0));
+        let mut ops = FakeRecoveryOps {
+            attempt_results,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect)),
+            advance_before_attempt: Some(stable_duration),
+            ..Default::default()
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(ops.attempt_calls, total_failures + 1);
+        assert_eq!(
+            ops.rebootstrap_calls, 0,
+            "far more than MAX_LIGHTWEIGHT_RETRIES failures, each separated by a stable connection, must never trip the rebootstrap fallback"
+        );
     }
 }
