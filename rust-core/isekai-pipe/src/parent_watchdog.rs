@@ -64,18 +64,29 @@
 //! can run a normal graceful shutdown instead of fighting
 //! async-signal-safety inside a signal handler.
 //!
-//! It also needs, once the per-fd `events`/sleep-guard fix below is
-//! accounted for, exactly the "one identical implementation for Linux,
-//! macOS, and every BSD" that motivated choosing it over `prctl`/`kqueue`
-//! in the first place — a claim that briefly looked false when real
+//! The per-fd `events`/sleep-guard fix below is *intended* to restore
+//! exactly the "one identical implementation for Linux, macOS, and every
+//! BSD" that motivated choosing `poll()` over `prctl`/`kqueue` in the first
+//! place — a claim that briefly looked false when real
 //! `rust-core-test-macos` CI (2026-09-02) found the *first* draft's
 //! `events: 0` didn't work on Darwin, and a Darwin-specific `kqueue` path
 //! (`EVFILT_READ`/`EVFILT_WRITE` + `EV_CLEAR`) was designed as the fix.
 //! Both adversarial reviewers who'd proposed that design independently
 //! withdrew it once they found the simpler per-fd-`events`-plus-sleep-guard
-//! fix instead (see the next section) — it closes the same gap without
-//! adding any platform-specific code, restoring the original portability
-//! claim rather than requiring the platform split `kqueue` would have.
+//! fix instead (see the next section), on the reasoning that it closes the
+//! same gap without adding platform-specific code.
+//!
+//! **That reasoning is not yet confirmed by measurement** — this module's
+//! own established pattern is not to assert something CI can settle as fact
+//! ahead of CI actually settling it (this exact paragraph would otherwise
+//! be a fifth instance of that mistake in this file's history). Whether
+//! `rust-core-test-macos` is green on the commit containing this fix is the
+//! actual evidence; check the PR/commit history rather than trusting this
+//! sentence's confidence. If it's red with both new two-fd tests failing,
+//! the per-`events` fix didn't take on Darwin at all and the withdrawn
+//! `kqueue` design should be revisited; if only one direction fails, see
+//! that test's own doc comment for what it implies and why keeping both fds
+//! already protects production either way.
 //!
 //! ## Why fd 0 *and* fd 1, why per-fd `events`, and why a sleep-guard
 //!
@@ -444,6 +455,19 @@ mod tests {
     /// 2026-09-02: closing only the `POLLIN` fd's peer, as an earlier draft
     /// of this test did, leaves the `POLLOUT` fd's own ability to fire
     /// completely unproven).
+    ///
+    /// `read_a` deliberately has an unread byte sitting in it for the whole
+    /// run (see below) — this is not incidental to the `PollinSide` variant:
+    /// production's real fd 0 always has `ssh(1)`'s version banner sitting
+    /// unread the same way until the pump starts, so if a platform's
+    /// `poll()` ever failed to report `POLLHUP` on a read end *while data is
+    /// still buffered* (unverified — this is exactly the kind of Darwin
+    /// `EVFILT_READ` behavior this module can't check without CI), this is
+    /// the variant that would catch it, and only fd 1's `POLLOUT` (unrelated
+    /// to buffered data at all) would still be covering production on that
+    /// platform. If `PollinSide` alone fails on a given CI runner where
+    /// `PolloutSide` passes, that's the diagnosis — and the fix is keeping
+    /// both fds (already true today) plus a doc note, not new code.
     fn assert_watch_loop_fires_regardless_of_which_of_two_fds_closes(close_which: WhichFd) {
         let (read_a, write_a) = pipe_pair();
         let (read_b, write_b) = pipe_pair();
