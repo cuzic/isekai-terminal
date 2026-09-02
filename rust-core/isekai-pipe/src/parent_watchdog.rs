@@ -74,11 +74,14 @@
 //! platform's `poll()` happens to report for which half:
 //!
 //! - fd 0 (our stdin, `ssh(1)`'s write end): reports `POLLHUP` once `ssh(1)`
-//!   closes its end (measured on Linux).
+//!   closes its end (measured on Linux — Darwin routes this through
+//!   `EVFILT_READ`'s `EV_EOF`, which its `poll()` shim may map to a
+//!   different bit; `TERMINAL` accepts either, so this is a difference in
+//!   which flag fires, not in whether detection works).
 //! - fd 1 (our stdout, `ssh(1)`'s read end): reports `POLLERR` (not
-//!   `POLLHUP`) once `ssh(1)` closes its end — measured directly; a
+//!   `POLLHUP`) once `ssh(1)` closes its end on Linux — measured directly; a
 //!   watchdog that only checked `POLLHUP` would silently never fire on this
-//!   fd.
+//!   fd. Same Darwin caveat as fd 0 above.
 //!
 //! An earlier draft requested `events: 0` on both, reasoning that
 //! `POLLERR`/`POLLHUP`/`POLLNVAL` are always reported in `revents`
@@ -95,10 +98,13 @@
 //! So each fd now requests the direction it actually supports: `POLLIN` for
 //! fd 0, `POLLOUT` for fd 1. Never the other way around — asking Darwin to
 //! register a read filter on fd 1 (a pipe *write* end) is asking for
-//! something that fd cannot do, which is exactly the kind of request that
-//! produces `POLLNVAL` (in `TERMINAL`) rather than being silently ignored,
-//! which would make the watchdog fire immediately and unconditionally at
-//! startup rather than only on a real close.
+//! something that fd cannot do, which is **suspected** (never measured —
+//! the code deliberately avoids this configuration rather than
+//! characterizing what it actually does, matching this module's own history
+//! of inferences-stated-as-fact turning out wrong) to produce `POLLNVAL`
+//! (in `TERMINAL`) rather than being silently ignored, which would make the
+//! watchdog fire immediately and unconditionally at startup rather than
+//! only on a real close.
 //!
 //! Requesting a "real" direction reintroduces the spurious-wakeup problem
 //! the `events: 0` draft existed to avoid, from **both** sides now, not just
@@ -396,6 +402,62 @@ mod tests {
         });
         unsafe {
             libc::close(read_fd);
+        }
+    }
+
+    /// Exercises the exact multi-fd shape `spawn()` actually passes to
+    /// production (`&[(0, POLLIN), (1, POLLOUT)]`), not just each direction
+    /// in isolation — the three tests above each watch a single fd, so none
+    /// of them can catch a bug that only shows up when scanning *multiple*
+    /// `pollfd`s together, e.g. an accidental `all()` instead of `any()` in
+    /// the `TERMINAL` check, or only ever looking at `pollfds[0]`. That
+    /// matters concretely here: since one of the two production fds
+    /// (`POLLOUT` on fd 1) is essentially always spuriously ready, *every*
+    /// production `poll()` call returns `ret > 0`, so correctness rests
+    /// entirely on the scan correctly picking a terminal bit off the *other*
+    /// fd out of a `pollfds` slice where not every entry is terminal (found
+    /// necessary by adversarial review, 2026-09-02 — both reviewers
+    /// independently flagged this as the one gap the single-fd tests can't
+    /// close).
+    ///
+    /// Two independent pipes stand in for fd 0/fd 1: pipe A's read end
+    /// (`POLLIN`) is the one that closes and must fire; pipe B's write end
+    /// (`POLLOUT`) stays open and continuously spuriously-ready the whole
+    /// time, exactly like fd 1 in production, so this also proves that
+    /// permanent readiness on one fd never masks a real close on another.
+    #[test]
+    fn watch_loop_fires_on_one_fd_while_another_stays_continuously_spuriously_ready() {
+        let (read_a, write_a) = pipe_pair();
+        let (read_b, write_b) = pipe_pair(); // `read_b` kept open so `write_b` stays POLLOUT-ready.
+
+        let (tx, mut rx) = watch::channel(false);
+        let handle = std::thread::spawn(move || watch_loop(tx, &[(read_a, libc::POLLIN), (write_b, libc::POLLOUT)]));
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let quiet = tokio::time::timeout(QUIET_WINDOW, rx.changed()).await;
+                assert!(quiet.is_err(), "the watchdog must not fire while pipe A's peer is still alive, even with pipe B continuously spuriously-ready");
+
+                unsafe {
+                    libc::close(write_a);
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => panic!("the channel closed without the watchdog ever sending `true` (fail-open path, not a fire)"),
+                    Err(_) => panic!("the watchdog did not fire within the timeout after pipe A's peer closed"),
+                }
+            });
+        })
+        .join()
+        .unwrap();
+        handle.join().unwrap();
+
+        unsafe {
+            libc::close(read_a);
+            libc::close(write_b);
+            libc::close(read_b);
         }
     }
 }

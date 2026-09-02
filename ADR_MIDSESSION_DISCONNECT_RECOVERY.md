@@ -208,6 +208,73 @@ Round 7の初回実装をopus 2体に再レビューさせたところ、独立�
 維持しつつ、コメントの根拠を「その時点でローカル側の相手が既に
 いないため報告先が無い」という無条件に正しい理由に書き換えた。
 
+### Round 7フォローアップ2（2026-09-02）— macOS実CIが`events: 0`の
+    非対応を検出、per-fd events+sleep-guardで解決（kqueue案は両批評家が
+    自ら撤回）
+
+Round 7フォローアップの実装をpushしたところ、`rust-core-test-macos`
+（必須チェックではないが実在するCI）が新設した`parent_watchdog`の
+2テストとも「タイムアウトで発火せず」失敗した。`events: 0`で
+`poll()`した場合、LinuxではPOSIXの保証通り`POLLHUP`/`POLLERR`/
+`POLLNVAL`が常に`revents`へ現れるが、Darwinでは同じ保証が成立
+しないことが実測で判明した(Darwinは`poll(2)`をネイティブ実装
+しておらず、`poll_nocancel()`が各`pollfd`を`kqueue`登録へ変換する
+——`events`が読み取り方向を要求しなければ`EVFILT_READ`は登録
+されず、その fd には何も監視するものが無くなるため`revents`が
+一切生成されない、というのがopus 2体独立の見立て)。
+
+**最初の対応(即座にrevert)**: `events: 0`を`POLLIN`へ全fd一律で
+変更したが、これは「watchdogスレッド自身は一切fd0をreadしない」
+という設計上の事実と衝突する重大な回帰だった——`ssh(1)`は
+接続確立直後にバージョンバナーをstdinへ書き込むが、
+`run_resume_loop`のpumpが実際にreadを始めるのはdial/handshake/
+`retry_while_busy_other_session`が終わった後であり、その間ずっと
+未読データがfd0に residual するため、level-triggeredな`poll()`が
+即座に`POLLIN`を返し続け、CPU 100%でスピンする(全接続・全
+プラットフォームで発生する、Darwin固有ではない一般的な性質)。
+opus-critic-task29-aの指摘で即座にrevertした。
+
+**検討したが両批評家が自ら撤回したkqueue案**: Darwin/BSD向けに
+`EVFILT_READ`/`EVFILT_WRITE`+`EV_CLEAR`(edge-triggered)を使う
+プラットフォーム別実装をユーザーの明示的指示で一度設計したが、
+実装に着手する前に両批評家が独立に「もっと単純な代替案がある」
+と撤回を申し出た。
+
+**最終的に採用した設計**: `poll()`実装を1つのまま維持し、
+(a)各fdが実際にサポートする方向のみを要求する(fd0=`POLLIN`、
+fd1=`POLLOUT`、逆方向は要求しない——書き込み専用のfd1に読み取り
+フィルタを要求するのは、登録失敗による即時発火という別の危険が
+疑われる、実測はしていない)、(b)`watch_loop`本体に「`TERMINAL`
+ビットが立たずに`poll()`が戻った場合はSPURIOUS_BACKOFF(1秒)だけ
+sleepしてから再度pollする」というガードを追加する。これにより
+per-fd events要求で再発するspurious wakeup(fd0の未読データ・
+fd1の常時書き込み可能状態)をスピンではなく1秒間隔のポーリングに
+変換する。kqueueによるedge-triggered化より単純で、新規の
+プラットフォーム固有コードを一切増やさずに済む。
+
+**この設計変更の副次的な帰結**(critic Bの指摘、記録に値する):
+検知レイテンシが実質最大1秒になったことで、`parent_watchdog`は
+通常のログアウト(clean EOF経路)との競合にもう確実には勝たなく
+なった——これは望ましい division of labor の回復であり、退行では
+ない。通常ケースは元々の`pump_c2h`のEOF経路が`Ok(())`で処理し、
+`parent_watchdog`はdial/handshake/resume待機中などpumpが動いて
+いない「静かな」局面のバックストップとしてのみ機能する、という
+役割分担が実現された(N5で追加した`eprintln!`抑制・非ゼロ終了
+コード維持は引き続き必要かつ正しいが、発火頻度は当初の想定より
+低い)。
+
+**テスト**: 「peerが生きている間は発火しない」という否定側の
+チェックを全ての肯定的テストに組み込んだ(単に閉じてから起動する
+既存の全テストでは「常に無条件で発火する」という壊れ方——
+まさにレジストレーション失敗による誤発火のシナリオ——を検知
+できないため、両批評家が独立にmerge gateとして要求した)。
+さらに、production が実際に渡す`&[(0, POLLIN), (1, POLLOUT)]`
+という複数fd構成そのものを検証するテストも追加した——単一fdずつの
+テストでは、「片方のfdが常時spuriously-readyな状態でも、もう片方の
+fdの本当のcloseを見逃さない」という production の定常状態を
+検証できないため(両批評家が独立に指摘した、唯一残っていた
+テストギャップ)。
+
 **Task 2.9自体の結論**: `ensure_process_terminated`
 (`wrapper.rs`側のプロセスグループ管理)は実装しない
 (ジョブコントロール/`SIGHUP`/Ctrl+Cへの副作用が大きく、かつ
