@@ -104,23 +104,36 @@ reparentされるため`getppid() == 1`という素朴なguardは静かに機能
   `run_connect`のfutureがその場でdropされる。これによりネストされた
   非同期フレーム(`data_stream`/`quic_write`含む)が通常のRust
   スコープ脱出と同じ順序でdropされ、`quicmux`(内部の`noq`/`qmux`)の
-  送信ストリームのデフォルトDrop実装が自然にclean FIN(`finish()`)を
-  送る——`.reset(0)`を呼ぶコードを一切書かずに、まさにF4が求めていた
-  「今回は二度とresumeしないのでサーバー側をparkさせず即座に
-  teardownさせる」動作が実現される。
+  送信ストリームのデフォルトDrop実装がclean FIN(`finish()`)を
+  キューに積む——`.reset(0)`を呼ぶコードを一切書かずに、まさにF4が
+  求めていた「今回は二度とresumeしないのでサーバー側をparkさせず
+  即座にteardownさせる」動作を狙ったもの。**ただしこれはbest-effort
+  であり保証ではない**(Round 7フォローアップ参照——`finish()`は
+  キューに積むだけで、実際に配線へ流すにはconnectionのdriverタスクが
+  再度pollされる必要があり、Drop自体はそれを保証しない。失敗しても
+  実害は「サーバー側が15秒のidle timeoutでDataStreamDiedに倒れ
+  resume-grace分parkされ、後でsweep_expired_parkedに回収される」だけで、
+  PR適用前の状態(F4のバグ)より悪化はしない)。
 - `resume_loop.rs`側の`PumpFailure::Local`/EOF-latch(下記)は
   廃止せず、(a) macOS以外でwatchdogが無いプラットフォーム
   (MSYS2/Cygwin版`ssh.exe`が起動するnative Windowsバイナリの
   `isekai-pipe connect`——`poll(2)`が使えない)向けのフォールバック、
   (b) Unix上でも`ssh(1)`自体は生きたままこのpipeだけ壊れる稀な
   ケース、として維持する。`PumpFailure::Local`到達時も
-  `.reset(0)`を呼ばず自然dropに変更(F4対応)。
-- **EOF-latch**(F2対応の一部): `run_data_pump`が`(Result<(),
-  PumpFailure>, bool)`を返すよう変更し、第2要素で「`pump_c2h`が
-  失敗発生時点で既にclean EOFに達していたか」を呼び出し元へ運ぶ
-  (`c2h_done`という既存のフラグがこの答えを兼ねる——`res?`が
-  ショートサーキットしない限り`true`にならないため追加の記帳が
-  不要)。`run_resume_loop`はこれが`true`の状態で`Remote`失敗を
+  `.reset(0)`を呼ばず`.shutdown()`を呼ぶよう変更(F4対応。ただし
+  `.shutdown()`自体もnoqの`poll_shutdown`実装がPoll::Readyを即座に
+  返すだけで、Dropと同じくキューに積むのみ——実際にflushの機会を
+  与えるのは後述のgrace sleepであり、`.shutdown()`はreset/FINの
+  フレーム種別を正しくするためだけの呼び出し)。
+- **EOF-latch**(F2対応の一部): `run_data_pump`が
+  `c2h_already_done: &mut bool`を追加引数として受け取り、
+  `pump_c2h`がOkを返した瞬間に同期的に`true`を書き込むよう変更した
+  (戻り値の一部としてタプルで返す設計は、`run_resume_loop`の外側
+  `tokio::select!`で`reconnect_signal_rx`側が勝って`run_data_pump`の
+  futureごとcancelされた際にこの情報を失う実バグがあり、opus再レビュー
+  で発見・修正済み——Round 7フォローアップ参照)。この変数は
+  `run_resume_loop`の外側loopの外で1度だけ宣言し、二度と`false`へ
+  戻さない。`run_resume_loop`はこれが`true`の状態で`Remote`失敗を
   受け取った場合、`Local`と同じ「即座に諦める」経路へ合流させる
   (ローカル側の送出元が既に終わっている以上、resumeを試みる価値が
   無いという結論はどちらも同じ)。watchdogの無いプラットフォームで
@@ -133,6 +146,67 @@ reparentされるため`getppid() == 1`という素朴なguardは静かに機能
   他のどの分類判定よりも先にチェックし、存在すれば**outcomeファイル
   自体を一切書かない**——relay経路で`Unreachable`
   →`RebootstrapAndRetry`(B5ガード無し)に化ける経路を根本から断つ。
+
+### Round 7フォローアップ（2026-09-02）— 実装直後のopus再レビューで
+    見つかった5件のバグ、および誇張の自己訂正
+
+Round 7の初回実装をopus 2体に再レビューさせたところ、独立に同一の
+3件の実バグ（+関連指摘）が見つかった:
+
+- **wait()のfail-open反転**: `spawn()`のスレッド起動失敗
+  （`std::thread::Builder::spawn`は失敗時にクロージャ自体を
+  txごと破棄し、呼び出し元へ返さない）と`watch_loop()`自身の
+  `poll()`異常時の`return`は、どちらも「fail open」という
+  コメント通りの意図だったが、`wait()`旧実装
+  (`let _ = rx.changed().await;`)はsender全滅による`changed()`の
+  `Err`を実際の発火と区別できず、逆に即座のfire(接続開始直後の
+  abort、または健全なセッション中のabort)を引き起こしていた。
+  `spawn()`で`tx.clone()`を1つ`mem::forget`でリークし、どちらの
+  経路が`tx`を送らずdropしてもチャンネルが閉じないよう修正した。
+- **`.shutdown()`はflushを保証しない**: noqの`SendStream`の
+  `poll_shutdown`実装を確認したところ`Poll::Ready`を即座に返す
+  だけで、`Drop`同様キューに積むのみ。`.await`してもスケジューラへ
+  yieldしない。実際にflushの機会を与えるのは
+  `tokio::time::sleep()`のみであり、これを「watchdog起因の
+  selectアーム」ではなく「結果が`ParentGoneSignal`を持つか」で
+  `connect_command`側に一元化した——`run_resume_loop`のin-loop
+  give-up分岐も`run_connect`ブランチ経由で戻ってくるため、
+  watchdogアームだけにsleepを置くとこちらを取りこぼす。
+- **EOF-latchの世代跨ぎ**: `c2h_already_done`を`run_resume_loop`の
+  外側`loop`の中で毎世代`false`初期化していたのを、loopの外で
+  1回だけ宣言し二度と`false`に戻さないよう変更した（レビューでは
+  「`tokio::select!`の非決定的なポーリング順序次第で理論上
+  再発しうる」と指摘されたが、事後の相互検証で「実際には
+  latchが立った世代は必ずその場でreturnするため次の世代には
+  到達しない」ことが判明——本質的には`&mut`で借用を渡すこと自体が
+  cancel耐性の効いている理由であり、宣言位置はbelt-and-braces。
+  それでも「set-only-to-true」という規律自体は正しいため変更は
+  維持した）。
+- **UX（N5）**: watchdogは通常の`exit`でも、S→C方向がTCP往復済みの
+  clean EOF経路より先に倒れることが多く、`ParentGoneSignal`は
+  レアケースではなく毎回のログアウトで頻繁に発生しうる。
+  `connect_command`のeprintln!(anyhowダンプ)をこのケースで
+  抑制した。**ただし終了コードはEX_UNAVAILABLEのまま維持**——
+  一度`ExitCode::SUCCESS`に変更したが、「`ParentGoneSignal`は
+  dial中のssh(1)強制終了やssh(1)生存中の`PumpFailure::Local`
+  など本当に異常なケースも含むため、終了コードを見るスクリプトが
+  気づけなくなる」という指摘を受けて差し戻した。
+- **テストが`watch_loop`本体を呼んでいなかった**: 手書きコピーの
+  ループを検証していたのを、`watch_loop(tx, fds: &[libc::c_int])`
+  というシグネチャに変更して本物を呼ぶようにし、fd1側で実際に
+  発火する`POLLERR`（`POLLHUP`ではない）方向のテストケースも
+  追加した（既存テストはfd0側の`POLLHUP`のみ検証していた）。
+
+**自己訂正の記録**: 上記UX対応の初稿で、「watchdogがclean EOF
+経路との競合に確実に勝つため通常ログアウトでは`ParentGoneSignal`が
+例外ではなく通常経路になる」という一文を、あたかもopus-critic-task29-a
+のレビュー結果であるかのようにコードコメントへ記録したが、
+実際にはレビュー側は「勝つことがある、断続的に」としか述べておらず、
+断定はこちらの誤った言い換えだった（このセッション中に同種の
+誇張——未検証の思いつきを確定事実として記録する——が3回発生した
+うちの1つとして本人が自認し訂正）。`eprintln!`抑制自体の判断は
+維持しつつ、コメントの根拠を「その時点でローカル側の相手が既に
+いないため報告先が無い」という無条件に正しい理由に書き換えた。
 
 **Task 2.9自体の結論**: `ensure_process_terminated`
 (`wrapper.rs`側のプロセスグループ管理)は実装しない
