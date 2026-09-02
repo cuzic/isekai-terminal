@@ -117,6 +117,19 @@
 //! [`SPURIOUS_BACKOFF`]'s length is a non-issue against the multi-day
 //! orphan window this whole module exists to bound.
 //!
+//! **This means the loop is not actually "blocking with zero CPU until
+//! `ssh(1)` dies" in steady state** (an earlier draft of this doc claimed
+//! exactly that, before `POLLOUT` was added — flagged as an overclaim by
+//! adversarial review, 2026-09-02): fd 1's `POLLOUT` is ready essentially
+//! continuously on a healthy pipe write end, so this thread spends most of
+//! its life in the sleep-and-repoll cycle, not parked in a single indefinite
+//! `poll()` call. Detection latency for a genuine close is therefore bounded
+//! by [`SPURIOUS_BACKOFF`] (at most one interval, since `poll()` returning
+//! `TERMINAL` short-circuits the sleep entirely) rather than being
+//! instantaneous — a real, deliberate tradeoff, not a bug, made because the
+//! alternative (only watching directions that are provably idle when
+//! healthy) would mean not watching fd 1 for its `POLLERR` case at all.
+//!
 //! ## Why a dedicated thread, not `tokio::io::unix::AsyncFd`/`mio`
 //!
 //! Rust does have portable epoll/kqueue/IOCP abstractions (`mio`, and
@@ -280,9 +293,18 @@ mod tests {
         (fds[0], fds[1])
     }
 
+    /// Comfortably longer than [`SPURIOUS_BACKOFF`] (currently 1s) — the
+    /// negative half of [`assert_watch_loop_stays_quiet_then_fires`] must
+    /// outlast several full sleep-and-repoll cycles, not just the first one,
+    /// or it would pass vacuously (still inside the very first sleep) without
+    /// actually proving the loop keeps declining to fire in steady state
+    /// (an earlier draft used 300ms — shorter than `SPURIOUS_BACKOFF`
+    /// itself — flagged as proving nothing by adversarial review, 2026-09-02).
+    const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(3_500);
+
     /// Runs the real `watch_loop` (not a hand-copied stand-in) on `watched`,
     /// requesting `events`, in a background thread. First asserts it stays
-    /// quiet for a short window while `still_alive` is true (this is the
+    /// quiet for [`QUIET_WINDOW`] while the peer is still alive (this is the
     /// negative half — without it, a `watch_loop` that fired *unconditionally*
     /// at startup, e.g. because Darwin turns an unsupported direction into an
     /// immediate `POLLNVAL`, would make this test pass for the wrong reason;
@@ -296,7 +318,7 @@ mod tests {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async move {
-                let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), rx.changed()).await;
+                let quiet = tokio::time::timeout(QUIET_WINDOW, rx.changed()).await;
                 assert!(quiet.is_err(), "the watchdog must not fire while the peer is still alive");
 
                 close_peer();
