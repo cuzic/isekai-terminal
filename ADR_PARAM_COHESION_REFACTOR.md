@@ -186,11 +186,15 @@ opus-critic-b指摘)外しても再増加を検知する効果は無いため、
 
 ```rust
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ServeConfig {
-    pub resume_buffer_size: usize,
-    pub max_resume_grace_secs: u64,
+struct ServeConfig {
+    resume_buffer_size: usize,
+    max_resume_grace_secs: u64,
 }
 ```
+
+(実装時の訂正: 利用箇所——`handle_connection`/`handle_attach_stream`——が全て同一
+モジュール内のprivate関数のため、`pub(crate)`ではなくmodule-privateな`struct`で
+十分。PR #113の実装レビューでopus-critic-bが指摘。)
 
 手書きパーサ(`Args`構造体定義は`engine/mod.rs:81-140`、パーサは
 `parse_args_from`(`:257`)の`next_val(&mut iter, "--resume-buffer-size")`方式、

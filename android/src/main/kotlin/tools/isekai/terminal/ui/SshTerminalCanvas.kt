@@ -407,7 +407,7 @@ internal class SixelBitmapCache {
  * 一切関与しない)。`bgPaint`/`textPaint`はここでも従来通り同一インスタンスの`.color`等を
  * 呼び出しごとに書き換えて使い回す(`data class`ではないので、equalsは生成されない)。
  * `bitmapWidthPx`(per-frameのBitmap実ピクセル幅)はスタイルではないため意図的に
- * このクラスに含めず個別引数のまま(`ADR_PARAM_COHESION_REFACTOR.md` §2.4)。
+ * このクラスに含めず個別引数のまま。
  */
 internal class GridRenderStyle(
     val cellW: Float,

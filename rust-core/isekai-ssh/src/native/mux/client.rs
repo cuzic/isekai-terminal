@@ -233,8 +233,7 @@ pub(crate) struct PtySessionRequest {
 /// than joining [`PtySessionRequest`]: their generic/borrow shapes
 /// (`I`/`O`/`E`, and `select!`'s need to borrow `stdin`/`stdout`/`stderr`
 /// independently) don't fit a single owned struct without adding a lifetime
-/// and extra generics for no real benefit (`ADR_PARAM_COHESION_REFACTOR.md`
-/// §2.1).
+/// and extra generics for no real benefit.
 pub(crate) async fn run_inner<CR, CW, I, O, E>(
     conn_read: CR,
     conn_write: &mut CW,

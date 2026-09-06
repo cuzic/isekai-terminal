@@ -905,8 +905,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
 /// `isekai-pipe serve`起動時に一度だけ決まる設定値。接続ごとに変わる
 /// `target`/`session_secret`(プロトコルコンテキスト)とは意図的に分離する:
 /// `Args`は`relay_jwt`のようなsecretも保持しており、専用structに絞ることで
-/// secretの伝播範囲を広げない。`Copy`なので接続ごとの`Arc`共有は不要
-/// (`ADR_PARAM_COHESION_REFACTOR.md` §2.2)。
+/// secretの伝播範囲を広げない。`Copy`なので接続ごとの`Arc`共有は不要。
 #[derive(Debug, Clone, Copy)]
 struct ServeConfig {
     resume_buffer_size: usize,

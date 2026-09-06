@@ -105,9 +105,11 @@ pub type IsekaiPipeHandshake = isekai_protocol::handshake::HandshakeJson;
 ///
 /// `isekai-bootstrap::types::LaunchSpec`(isekai-ssh側)と対応する概念だが、
 /// 意図的に別型として保つ:
-/// - bind機構が異なる(このenumの利用先は`[::]:{port}`固定ポート・IPv6
-///   dual-stack bind、`LaunchSpec::Direct`は`0.0.0.0:0`+ポート範囲——
-///   Phase 9-4の実機検証に基づく設計判断)
+/// - bind機構が異なる(このenumの利用先は、固定ポート指定時は`[::]:{port}`
+///   というIPv6 dual-stack bind、無指定(`bind_port: None`)時は`--bind`
+///   フラグ自体を渡さずisekai-helper自身の既定に任せる——Phase 9-4の実機
+///   検証に基づく設計判断。`LaunchSpec::Direct`は常に`0.0.0.0:0`+
+///   `--bind-port-range`というIPv4限定の別方式)
 /// - デフォルト値の方針が異なる(このenumの利用先は`--max-idle-lifetime`/
 ///   `--log-level`/`--resume-window`を一切渡さずisekai-helperの既定値に
 ///   任せるが、`LaunchSpec`はこれらを常に明示的に渡す)

@@ -943,9 +943,9 @@ fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>
 /// keeps retrying and whether it may give up early. `max_resume_window` is
 /// the STUN-only client-side clamp already applied by `run_resume_loop`;
 /// when present (`Some`), this helper also suppresses desktop give-up
-/// notifications so repeated lightweight STUN retries do not spam the user
-/// (`ADR_PARAM_COHESION_REFACTOR.md` §2.5 — kept as `Option<Duration>`, not
-/// `Duration`, since `None`-ness itself is the branch condition).
+/// notifications so repeated lightweight STUN retries do not spam the user.
+/// Kept as `Option<Duration>`, not `Duration`, since `None`-ness itself is
+/// the branch condition.
 struct ResumeDeadlinePolicy {
     resume_window: Duration,
     disconnected_at: Instant,
