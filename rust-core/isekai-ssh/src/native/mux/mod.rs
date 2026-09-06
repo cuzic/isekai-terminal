@@ -994,7 +994,22 @@ mod tests {
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
         let outcome = super::client::run_inner(
-            cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None,
+            cr,
+            &mut cw,
+            super::client::PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: token.to_vec(),
+            },
+            &b"hello\n"[..],
+            &mut stdout,
+            &mut stderr,
+            None,
         )
         .await
         .unwrap();
