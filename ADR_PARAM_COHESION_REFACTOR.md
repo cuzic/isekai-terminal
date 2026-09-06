@@ -231,8 +231,9 @@ round 1レビューで、この2型は「意図せず重複した概念」では
 ///   中核。統合すると、この不変条件を知らないまま片方にフィールドを足す人が
 ///   静かに壊しうる)
 /// 将来どちらかに統合する場合は、まずargv生成ロジック
-/// (`helper_bootstrap.rs`のlaunch_cmdと`isekai-bootstrap/src/install_script.rs`
-/// のbuild_install_script)を共通化してから型を統合すること——型だけ先に
+/// (`helper_bootstrap.rs`の`launch_and_capture_handshake`と
+/// `isekai-bootstrap/src/install_script.rs`の`build_install_script`)を
+/// 共通化してから型を統合すること——型だけ先に
 /// 統合すると、レンダラが対応していないフィールドが黙って無視される
 /// (`ISEKAI_PIPE_DESIGN.md`のbootstrap関連Epic参照。ADRやレビュー文書は
 /// 将来archive移動されうるため、恒久ドキュメントを参照する)。
