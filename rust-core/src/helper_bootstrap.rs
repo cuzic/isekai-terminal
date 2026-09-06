@@ -102,6 +102,29 @@ pub type IsekaiPipeHandshake = isekai_protocol::handshake::HandshakeJson;
 /// main.rsのparse_argsも参照）であり、enumにすることで呼び出し側が矛盾した
 /// 組み合わせ（例: stun_serverとrelay_addrを両方Someにする)を型として表現できない
 /// ようにしてある。
+///
+/// `isekai-bootstrap::types::LaunchSpec`(isekai-ssh側)と対応する概念だが、
+/// 意図的に別型として保つ:
+/// - bind機構が異なる(このenumの利用先は`[::]:{port}`固定ポート・IPv6
+///   dual-stack bind、`LaunchSpec::Direct`は`0.0.0.0:0`+ポート範囲——
+///   Phase 9-4の実機検証に基づく設計判断)
+/// - デフォルト値の方針が異なる(このenumの利用先は`--max-idle-lifetime`/
+///   `--log-level`/`--resume-window`を一切渡さずisekai-helperの既定値に
+///   任せるが、`LaunchSpec`はこれらを常に明示的に渡す)
+/// - `launch_fingerprint`(isekai-bootstrap/src/reuse.rs)の除外フィールド
+///   リストがLaunchSpec側にしか無い(helper再利用判定=常に接続できる原則の
+///   中核。統合すると、この不変条件を知らないまま片方にフィールドを足す人が
+///   静かに壊しうる)
+///
+/// 将来どちらかに統合する場合は、まずargv生成ロジック(このファイルの
+/// `launch_cmd`と`isekai-bootstrap/src/install_script.rs`の
+/// `build_install_script`)を共通化してから型を統合すること——型だけ先に
+/// 統合すると、レンダラが対応していないフィールドが黙って無視される
+/// (`ISEKAI_PIPE_DESIGN.md`のbootstrap関連Epic参照)。`Stun`バリアントを
+/// `LaunchSpec`側へ先行追加しないこと——isekai-sshのbootstrap時STUNは既に
+/// `Direct`+`stun_servers`(`isekai-bootstrap::backend::BootstrapBackend::
+/// install_and_start`)として正規化済みで、`Stun`バリアントを足すと表現方法が
+/// 2通りになる。
 #[derive(Debug, Clone, Default)]
 pub enum IsekaiPipeP2pMode {
     #[default]
