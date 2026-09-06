@@ -67,6 +67,18 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// only keeps bare-redial resume attempts alive briefly before returning
 /// control to the wrapper's full STUN re-establishment loop.
 const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
+/// How long a disconnect stays silent before [`print_reconnect_status`]
+/// actually prints anything. Matches trzsz-ssh's own
+/// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
+/// every ~1s but only calls its `notifyConnectionLost()` once elapsed time
+/// since the last active moment exceeds this same 15s, so a blip shorter
+/// than that produces no visible output at all on that client. Before this
+/// existed, `run_resume_loop` printed a status line the instant a disconnect
+/// was *detected* (see the call site's history) — every brief Wi-Fi/cellular
+/// handoff surfaced a "connection lost" message that a same-length outage
+/// on `tssh` never showed, even though both sides were transparently
+/// recovering within their (much longer) resume windows the whole time.
+const RECONNECT_NOTIFY_GRACE: Duration = Duration::from_secs(15);
 
 /// Marks an `anyhow::Error` as having occurred *after* the STUN P2P
 /// handshake already succeeded — i.e. after the route has entered its
@@ -679,6 +691,11 @@ fn effective_resume_window(effective_resume_grace_secs: u32, max_resume_window: 
 // (`rust-core/src/orchestrator.rs`)のように新しいUI基盤を用意しなくても
 // ライブな状態表示ができる。
 //
+// `tssh`同様、切断から`RECONNECT_NOTIFY_GRACE`(15秒)以内は何も表示しない
+// (`print_reconnect_status`内部でガード) —— Wi-Fi/セルラーの短い瞬断が
+// resumeウィンドウ内で自己修復するたびにユーザーへ「切断」を見せてしまう
+// ことを避けるため。
+//
 // ただし `isekai-ssh --log-file` 相当が有効な場合、`ssh` の stderr は
 // 端末ではなくログファイルへpipeされる(`isekai-ssh/src/wrapper.rs`の
 // `log_file::is_enabled()`)。この場合に `\r`/ANSI を出すとログファイルが
@@ -701,8 +718,23 @@ fn format_reconnect_status(is_tty: bool, elapsed_secs: u64, total_secs: u64) -> 
     }
 }
 
+/// Whether [`print_reconnect_status`] should actually print anything yet —
+/// split out as a pure function (same reason [`format_reconnect_status`] is:
+/// `print_reconnect_status` itself does direct stderr I/O, which a unit test
+/// can't easily observe) so the `RECONNECT_NOTIFY_GRACE` boundary is
+/// testable without needing to actually sleep or fake stderr.
+fn reconnect_notify_due(disconnected_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(disconnected_at) >= RECONNECT_NOTIFY_GRACE
+}
+
 fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window: Duration) {
-    let elapsed_secs = Instant::now().saturating_duration_since(disconnected_at).as_secs();
+    let now = Instant::now();
+    if !reconnect_notify_due(disconnected_at, now) {
+        // Still within tssh's own silent grace period — a blip this short
+        // is expected to self-heal, so don't alarm the user over it.
+        return;
+    }
+    let elapsed_secs = now.saturating_duration_since(disconnected_at).as_secs();
     let msg = format_reconnect_status(is_tty, elapsed_secs, resume_window.as_secs());
     if is_tty {
         eprint!("{msg}");
@@ -1383,8 +1415,11 @@ pub(crate) async fn run_resume_loop(
         // a slow-to-fail `reconnect_and_resume` attempt would.
         let disconnected_at = *disconnected_since.get_or_insert_with(Instant::now);
         let deadline = disconnected_at + resume_window;
-        // tssh風のライブ再接続表示: 切断検知の瞬間に即座に1回出す(これが
-        // 無いと、最初の再接続試行が失敗するまで何も表示されない)。
+        // tssh風のライブ再接続表示: ここで呼んでおくのは、`disconnected_at`が
+        // (このループの前回の周回等で)既に`RECONNECT_NOTIFY_GRACE`より過去の
+        // 場合に、最初のバックオフtickを待たずに即座に表示させるため。
+        // `disconnected_at`がまさに今の瞬間なら`print_reconnect_status`内部の
+        // 猶予チェックで何も表示されない(tsshと同じく、短い瞬断は無音)。
         print_reconnect_status(state.is_tty, disconnected_at, resume_window);
 
         let promoted_stream = match &warm_standby {
@@ -2300,6 +2335,28 @@ mod tests {
             assert!(!msg.contains('\x1b'), "非TTY時はANSIエスケープを含んではいけない: {msg:?}");
             assert!(msg.contains("3s"), "経過秒数を含むはず: {msg:?}");
             assert!(msg.contains("60s"), "上限秒数を含むはず: {msg:?}");
+        }
+
+        #[test]
+        fn reconnect_notify_due_is_false_within_the_grace_period() {
+            let now = Instant::now();
+            let disconnected_at = now - Duration::from_secs(5);
+            assert!(
+                !reconnect_notify_due(disconnected_at, now),
+                "tsshのkDefaultUdpReconnectTimeoutと同じく、15秒未満の瞬断では何も表示しないはず"
+            );
+        }
+
+        #[test]
+        fn reconnect_notify_due_is_true_once_the_grace_period_elapses() {
+            let now = Instant::now();
+            let disconnected_at = now - RECONNECT_NOTIFY_GRACE;
+            assert!(
+                reconnect_notify_due(disconnected_at, now),
+                "猶予期間ちょうどで表示が解禁されるはず"
+            );
+            let disconnected_at_longer_ago = now - RECONNECT_NOTIFY_GRACE - Duration::from_secs(1);
+            assert!(reconnect_notify_due(disconnected_at_longer_ago, now));
         }
 
         // `sleep_with_live_status`本体はタイミングだけを担当し(実際の描画は
