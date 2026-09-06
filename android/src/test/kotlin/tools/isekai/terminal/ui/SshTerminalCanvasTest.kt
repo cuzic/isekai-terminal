@@ -473,11 +473,14 @@ class SshTerminalCanvasTest {
         val p = renderPaints(cellH)
         redrawDirtyRows(
             canvas = Canvas(bmp), rows = (0 until rows).toList(), bitmapWidthPx = bmp.width,
-            cells = cells, cols = cols, cellW = cellW, cellH = cellH, baseline = p.baseline,
-            themeBgArgb = 0xFF000000.toInt(), effectiveBlinkPhase = false,
-            clearPaint = p.clearPaint, bgPaint = p.bgPaint, textPaint = p.textPaint,
-            typeface = p.typeface, italicTypeface = p.italicTypeface,
-            glyphFallback = GlyphFallbackResolver(),
+            cells = cells, cols = cols,
+            style = GridRenderStyle(
+                cellW = cellW, cellH = cellH, baseline = p.baseline,
+                themeBgArgb = 0xFF000000.toInt(), effectiveBlinkPhase = false,
+                bgPaint = p.bgPaint, textPaint = p.textPaint, clearPaint = p.clearPaint,
+                typeface = p.typeface, italicTypeface = p.italicTypeface,
+                glyphFallback = GlyphFallbackResolver(),
+            ),
         )
         return bmp
     }
@@ -522,11 +525,14 @@ class SshTerminalCanvasTest {
         val p = renderPaints(cellH)
         redrawDirtyRows(
             canvas = Canvas(base), rows = listOf(2), bitmapWidthPx = base.width,
-            cells = frame2, cols = cols, cellW = cellW, cellH = cellH, baseline = p.baseline,
-            themeBgArgb = defaultBg, effectiveBlinkPhase = false,
-            clearPaint = p.clearPaint, bgPaint = p.bgPaint, textPaint = p.textPaint,
-            typeface = p.typeface, italicTypeface = p.italicTypeface,
-            glyphFallback = GlyphFallbackResolver(),
+            cells = frame2, cols = cols,
+            style = GridRenderStyle(
+                cellW = cellW, cellH = cellH, baseline = p.baseline,
+                themeBgArgb = defaultBg, effectiveBlinkPhase = false,
+                bgPaint = p.bgPaint, textPaint = p.textPaint, clearPaint = p.clearPaint,
+                typeface = p.typeface, italicTypeface = p.italicTypeface,
+                glyphFallback = GlyphFallbackResolver(),
+            ),
         )
 
         val row2After = base.rowPixels(2, cols, cellW, cellH)
