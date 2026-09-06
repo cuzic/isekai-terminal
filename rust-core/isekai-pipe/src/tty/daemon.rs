@@ -399,6 +399,41 @@ async fn handle_client(stream: UnixStream, master: &Arc<PtyMaster>, attach_slot:
                         }
                     }
                     Some(RelayMsg::Exit(code)) => {
+                        // Unconditional resync, not gated on `take_missed` —
+                        // real bug found via CI flake investigation
+                        // (2026-09-06): `rust-core-test-linux` on `main`
+                        // (commit 204d8f59, run 33633703642) failed
+                        // `tty_daemon_dropped_output_resync_e2e.rs` with
+                        // exactly one line missing out of 4000, mid-burst,
+                        // not at the very end — pointing at this exit-time
+                        // race rather than a simple trailing-output-loss.
+                        // `notify_exit` only *queues*
+                        // `RelayMsg::Exit` on this same occupant channel
+                        // (`AttachSlot::notify_exit`'s own docs) — it does not
+                        // stop `read_loop` from broadcasting further trailing
+                        // pty output after that, up until `run`'s
+                        // `READ_LOOP_DRAIN_TIMEOUT` gives up waiting (or,
+                        // under real CI CPU contention, well past it, since
+                        // that wait is a bounded timeout, not an unconditional
+                        // await). A trailing `broadcast()` in that window can
+                        // `try_send` successfully (the channel had room) and
+                        // land *behind* the already-queued `Exit` — it never
+                        // trips `missed` (its own send succeeded), so
+                        // `take_missed` above has nothing to catch, and this
+                        // arm's own `return` right after `Exit` means no later
+                        // loop iteration ever gets a chance to notice it
+                        // either. `current_replay()` always reflects the
+                        // ring's latest state regardless of channel timing
+                        // (`broadcast` appends to the ring before ever
+                        // touching the channel), so sending it here
+                        // unconditionally — right before `Exit`, not only
+                        // when `missed` happened to be set — catches any such
+                        // straggler regardless of why draining took as long
+                        // as it did. Costs a harmless duplicate of whatever
+                        // was already delivered on the common "nothing raced"
+                        // path, the same trade-off `take_missed`'s own resync
+                        // already makes elsewhere in this loop.
+                        let _ = write_frame(&mut write_half, &Frame::Stdout(attach_slot.current_replay())).await;
                         let _ = write_frame(&mut write_half, &Frame::Exit(code)).await;
                         return;
                     }
