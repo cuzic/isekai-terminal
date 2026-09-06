@@ -702,7 +702,7 @@ async fn run_ssh_with_connect_failure_recovery(
             ConnectFailureRecoveryAction::RebootstrapAndRetry => {
                 let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
                 log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
-                return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+                return rebootstrap_and_retry_until_recovered(plan, resolution, &runtime_dir).await;
             }
             ConnectFailureRecoveryAction::RetryConnectLightweight => {
                 // Epic R PR2 (B5): never silently re-run a one-shot remote
@@ -730,7 +730,7 @@ async fn run_ssh_with_connect_failure_recovery(
                     if !should_bootstrap(plan, resolution) {
                         return Ok(exit_code);
                     }
-                    return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+                    return rebootstrap_and_retry_until_recovered(plan, resolution, &runtime_dir).await;
                 }
                 // Printed *before* the backoff wait below (round 2 review
                 // finding: it used to print only after already sleeping out
@@ -751,22 +751,71 @@ async fn run_ssh_with_connect_failure_recovery(
     }
 }
 
-/// The re-deploy-then-retry-once action shared by `RebootstrapAndRetry` and
+/// The re-deploy-then-retry action shared by `RebootstrapAndRetry` and
 /// (once its own lightweight retry budget is exhausted)
-/// `RetryConnectLightweight`. Structurally at most one extra `ssh`
-/// invocation happens here — no loop, no recursion — so this cannot run
-/// away even if the retry's own attempt also fails (e.g. a crash-looping
-/// helper, or a genuinely unreachable network): whatever this attempt
-/// returns is final for *this* invocation, though a subsequent manual
-/// `isekai-ssh <destination>` gets its own fresh recovery budget.
-async fn rebootstrap_and_retry_once(plan: &WrapperPlan, resolution: &WrapperResolution, runtime_dir: &Path) -> Result<u8> {
-    if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
-        print_bootstrap_failure_guidance(&bootstrap_err);
-        return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+/// `RetryConnectLightweight`.
+///
+/// Loops the whole re-deploy+retry pair under the same backoff/budget policy
+/// as the lightweight retry loop above (`reconnect_backoff`, `RECONNECT_BUDGET`
+/// = 24h) whenever a failure — either the re-deploy's own SSH dial
+/// (classified via [`BootstrapFailure::may_retry`]) or the subsequent
+/// connect attempt itself (classified via `decide_connect_failure_recovery`,
+/// same as the caller's own top-of-loop attempt) — looks like an ordinary
+/// connectivity blip rather than a trust/config problem.
+///
+/// This used to attempt the pair exactly once and return whatever it got,
+/// on the reasoning that looping here "cannot run away". That reasoning
+/// missed the actual failure mode found via `.claude/rules/always-connects.md`'s
+/// own principle applied to this function: a still-down network makes this
+/// one-shot retry fail too (`isekai-ssh: automatic re-bootstrap after a
+/// connect failure failed`), and the *whole process then exits* — which,
+/// unlike `tssh`'s equivalent mid-session-loss handling, a user watching a
+/// terminal tab reads as a crash rather than an ongoing, self-healing
+/// reconnect. A failure that is NOT retryable (`BootstrapFailure::may_retry`
+/// false — a rejected/mismatched host key, missing credentials, ...) still
+/// ends this loop immediately, unchanged from before: only the
+/// "network/deployment just isn't reachable *yet*" case now keeps going
+/// instead of terminating.
+async fn rebootstrap_and_retry_until_recovered(plan: &WrapperPlan, resolution: &WrapperResolution, runtime_dir: &Path) -> Result<u8> {
+    let mut attempt: u32 = 0;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+    loop {
+        if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+            print_bootstrap_failure_guidance(&bootstrap_err);
+            let may_retry = bootstrap_err.downcast_ref::<BootstrapFailure>().is_some_and(BootstrapFailure::may_retry);
+            if !may_retry {
+                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+            }
+            match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                reconnect_backoff::ReconnectDecision::Retry => continue,
+                reconnect_backoff::ReconnectDecision::GiveUp => {
+                    return Err(bootstrap_err.context(
+                        "isekai-ssh: automatic re-bootstrap kept hitting a transient failure until the retry budget was exhausted",
+                    ));
+                }
+            }
+        }
+
+        let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+        let (status2, intent_id2) = run_ssh_once(plan, resolution, &intent2, runtime_dir).await?;
+        if status2.success() {
+            return Ok(0);
+        }
+        let exit_code2 = status2.code().unwrap_or(1) as u8;
+        let outcome2 = resolve_claimed_outcome(claim_connect_outcome(runtime_dir, &intent_id2));
+        match decide_connect_failure_recovery(outcome2.as_ref().map(|o| &o.class), should_bootstrap(plan, resolution)) {
+            ConnectFailureRecoveryAction::NoRecoverableSignal | ConnectFailureRecoveryAction::AutoBootstrapDisabled => return Ok(exit_code2),
+            ConnectFailureRecoveryAction::RebootstrapAndRetry | ConnectFailureRecoveryAction::RetryConnectLightweight => {
+                // Still looks like a connectivity blip right after a fresh
+                // redeploy — loop and try the whole pair again rather than
+                // ending the process.
+                match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    reconnect_backoff::ReconnectDecision::Retry => continue,
+                    reconnect_backoff::ReconnectDecision::GiveUp => return Ok(exit_code2),
+                }
+            }
+        }
     }
-    let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
-    let (status2, _) = run_ssh_once(plan, resolution, &intent2, runtime_dir).await?;
-    Ok(status2.code().unwrap_or(1) as u8)
 }
 
 /// Human-readable lead-in for the `eprintln!`s below, branching on
