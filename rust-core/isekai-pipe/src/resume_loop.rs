@@ -1015,22 +1015,30 @@ fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>
     }
 }
 
-/// `max_resume_window` is the STUN-only client-side clamp already applied
-/// by `run_resume_loop`; when present, this helper also suppresses desktop
-/// give-up notifications so repeated lightweight STUN retries do not spam
-/// the user.
+/// The time-related values that decide how long [`resume_with_backoff_until_deadline`]
+/// keeps retrying and whether it may give up early. `max_resume_window` is
+/// the STUN-only client-side clamp already applied by `run_resume_loop`;
+/// when present (`Some`), this helper also suppresses desktop give-up
+/// notifications so repeated lightweight STUN retries do not spam the user.
+/// Kept as `Option<Duration>`, not `Duration`, since `None`-ness itself is
+/// the branch condition.
+struct ResumeDeadlinePolicy {
+    resume_window: Duration,
+    disconnected_at: Instant,
+    deadline: Instant,
+    max_resume_window: Option<Duration>,
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
     profile: &str,
-    resume_window: Duration,
-    disconnected_at: Instant,
-    deadline: Instant,
+    policy: ResumeDeadlinePolicy,
     state: &mut ResumeLoopState,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-    max_resume_window: Option<Duration>,
 ) -> Result<AnyByteStream> {
+    let ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window } = policy;
     let notify_on_give_up = max_resume_window.is_none();
     let mut attempt: u32 = 0;
     loop {
@@ -1397,13 +1405,10 @@ pub(crate) async fn run_resume_loop(
                     factory,
                     target,
                     profile,
-                    resume_window,
-                    disconnected_at,
-                    deadline,
+                    ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window },
                     &mut state,
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
-                    max_resume_window,
                 )
                 .await?
             }
@@ -2174,13 +2179,15 @@ mod tests {
                 &factory,
                 &target,
                 "test-profile",
-                Duration::from_secs(0),
-                now,
-                now, // deadline already reached: must give up on the first check
+                ResumeDeadlinePolicy {
+                    resume_window: Duration::from_secs(0),
+                    disconnected_at: now,
+                    deadline: now, // deadline already reached: must give up on the first check
+                    max_resume_window: None,
+                },
                 &mut state,
                 &None,
                 &mut monitor,
-                None,
             )
             .await;
 
@@ -2250,13 +2257,10 @@ mod tests {
                 &factory,
                 &target,
                 "test-profile",
-                resume_window,
-                now,
-                now,
+                ResumeDeadlinePolicy { resume_window, disconnected_at: now, deadline: now, max_resume_window },
                 &mut state,
                 &None,
                 &mut monitor,
-                max_resume_window,
             )
             .await;
 

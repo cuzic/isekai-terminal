@@ -864,14 +864,16 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let attach_runtime = attach_runtime.clone();
                 let last_activity = last_activity.clone();
                 let sessions = sessions.clone();
-                let resume_buffer_size = args.resume_buffer_size;
-                let max_resume_grace_secs = args.resume_window;
+                let serve_config = ServeConfig {
+                    resume_buffer_size: args.resume_buffer_size,
+                    max_resume_grace_secs: args.resume_window,
+                };
                 let handle_incoming = async move {
                     match incoming.accept().await {
                         Ok(conn) => {
                             let remote = conn.remote_addr();
                             log::info!("QUIC connection established from {remote:?}");
-                            if let Err(e) = handle_connection(conn, target, secret, attach_runtime, sessions, resume_buffer_size, max_resume_grace_secs).await {
+                            if let Err(e) = handle_connection(conn, target, secret, attach_runtime, sessions, serve_config).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
@@ -900,14 +902,23 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     Ok(())
 }
 
+/// `isekai-pipe serve`起動時に一度だけ決まる設定値。接続ごとに変わる
+/// `target`/`session_secret`(プロトコルコンテキスト)とは意図的に分離する:
+/// `Args`は`relay_jwt`のようなsecretも保持しており、専用structに絞ることで
+/// secretの伝播範囲を広げない。`Copy`なので接続ごとの`Arc`共有は不要。
+#[derive(Debug, Clone, Copy)]
+struct ServeConfig {
+    resume_buffer_size: usize,
+    max_resume_grace_secs: u64,
+}
+
 async fn handle_connection(
     conn: AnyMuxConnection,
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
-    resume_buffer_size: usize,
-    max_resume_grace_secs: u64,
+    config: ServeConfig,
 ) -> Result<()> {
     // 最初の1バイトでフレーム種別（ATTACH_HELLO=新規 / RESUME=reattach）を
     // 判定してから、種別に応じた残りバイト数を読む。いずれも一定時間内に
@@ -945,19 +956,8 @@ async fn handle_connection(
             let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
             hello_bytes[0] = FRAME_ATTACH_HELLO;
             hello_bytes[1..].copy_from_slice(&rest);
-            handle_attach_stream(
-                conn,
-                send,
-                recv,
-                hello_bytes,
-                target,
-                session_secret,
-                attach_runtime,
-                sessions,
-                resume_buffer_size,
-                max_resume_grace_secs,
-            )
-            .await
+            handle_attach_stream(conn, send, recv, hello_bytes, target, session_secret, attach_runtime, sessions, config)
+                .await
         }
         quicmux::FRAME_RESUME => {
             handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime, sessions).await
@@ -1161,8 +1161,7 @@ async fn handle_attach_stream(
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
-    resume_buffer_size: usize,
-    max_resume_grace_secs: u64,
+    config: ServeConfig,
 ) -> Result<()> {
     let hello = match decode_attach_hello(&hello_bytes) {
         Ok(hello) => hello,
@@ -1207,7 +1206,7 @@ async fn handle_attach_stream(
     // clampした上でACKに実効値を返す（ISEKAI_PIPE_DESIGN.md — client任せに
     // しない設計）。
     let negotiated_resume_grace_secs =
-        effective_resume_grace(hello.requested_resume_grace_secs, max_resume_grace_secs);
+        effective_resume_grace(hello.requested_resume_grace_secs, config.max_resume_grace_secs);
     let ready = AttachResponse::Ready {
         session_id: hello.session_id,
         generation: hello.generation,
@@ -1256,7 +1255,7 @@ async fn handle_attach_stream(
     };
 
     let (tcp_read, tcp_write) = tcp.into_split();
-    let mut new_session = Session::new(resume_buffer_size);
+    let mut new_session = Session::new(config.resume_buffer_size);
     // ACKで実際に約束した値をセッションに刻んでおく — `sweep_expired_parked`
     // がグローバルな`--resume-window`だけでなくこれも尊重できるようにする
     // (`Session::negotiated_resume_grace_secs`のdocs参照)。

@@ -167,18 +167,20 @@ where
     let outcome = run_inner(
         reader,
         &mut writer,
-        token,
-        term,
-        cols as u16,
-        rows as u16,
+        PtySessionRequest {
+            term,
+            cols: cols as u16,
+            rows: rows as u16,
+            host,
+            remote_command,
+            want_pty,
+            tty_exec,
+            token: token.to_vec(),
+        },
         super::super::console_stdin::ConsoleStdin::open(),
         tokio::io::stdout(),
         tokio::io::stderr(),
         resize_rx,
-        host,
-        remote_command,
-        want_pty,
-        tty_exec,
     )
     .await?;
 
@@ -187,6 +189,29 @@ where
         ClientOutcome::OwnerLost => Ok(ClientRunResult::OwnerLost),
         ClientOutcome::Rejected { reason } => Ok(ClientRunResult::Rejected { reason }),
     }
+}
+
+/// The values [`run_inner`] sends the owner in its opening [`Frame::Hello`]
+/// (everything about *this* PTY session request, as opposed to the I/O
+/// streams a test drives it against — see `run_inner`'s own doc comment for
+/// why those stay separate parameters instead of joining this struct).
+/// `remote_command`/`want_pty` decide the same `-t`/`-T` `SessionKind` as the
+/// non-mux path's `native::connect::decide_session_kind` — see that
+/// function's doc comment. `tty_exec` (`--isekai-tty`) is a separate
+/// `Frame::Hello` field for the same reason it's separate everywhere else in
+/// this crate — see `protocol::MUX_PROTOCOL_VERSION`'s doc comment.
+pub(crate) struct PtySessionRequest {
+    pub(crate) term: String,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) host: String,
+    pub(crate) remote_command: Option<String>,
+    pub(crate) want_pty: bool,
+    pub(crate) tty_exec: Option<String>,
+    /// Owned rather than `&[u8]`: `run_inner` only ever needs it once (to
+    /// build `Frame::Hello`), so the borrow this used to be bought nothing
+    /// and complicated bundling it into this struct's lifetime.
+    pub(crate) token: Vec<u8>,
 }
 
 /// The body of [`run`] with the terminal streams plus an optional resize
@@ -203,22 +228,20 @@ where
 /// cancel-safe `recv()`; reading `read_frame` directly in the `select!` arm
 /// would drop a half-read frame whenever the stdin branch won the race and
 /// desync the stream.
-#[allow(clippy::too_many_arguments)]
+///
+/// `stdin`/`stdout`/`stderr`/`resize_rx` stay individual parameters rather
+/// than joining [`PtySessionRequest`]: their generic/borrow shapes
+/// (`I`/`O`/`E`, and `select!`'s need to borrow `stdin`/`stdout`/`stderr`
+/// independently) don't fit a single owned struct without adding a lifetime
+/// and extra generics for no real benefit.
 pub(crate) async fn run_inner<CR, CW, I, O, E>(
     conn_read: CR,
     conn_write: &mut CW,
-    token: &[u8],
-    term: String,
-    cols: u16,
-    rows: u16,
+    request: PtySessionRequest,
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
     mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
-    host: String,
-    remote_command: Option<String>,
-    want_pty: bool,
-    tty_exec: Option<String>,
 ) -> Result<ClientOutcome>
 where
     CR: AsyncRead + Unpin + Send + 'static,
@@ -227,9 +250,11 @@ where
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    let PtySessionRequest { term, cols, rows, host, remote_command, want_pty, tty_exec, token } = request;
+
     write_frame(
         conn_write,
-        &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: token.to_vec(), term, cols, rows, want_pty, remote_command, tty_exec },
+        &Frame::Hello { version: MUX_PROTOCOL_VERSION, token, term, cols, rows, want_pty, remote_command, tty_exec },
     )
     .await
     .map_err(|e| anyhow!("isekai-ssh: failed to send Hello to the owner: {e}"))?;
@@ -438,17 +463,19 @@ mod tests {
         let outcome = run_inner(
             cr,
             &mut cw,
-            b"tok",
-            "xterm".to_string(),
-            80,
-            24,
+            PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: b"tok".to_vec(),
+            },
             stdin_bytes,
             &mut stdout,
             &mut stderr,
-            None,
-            "mybox".to_string(),
-            None,
-            true,
             None,
         )
         .await;
@@ -545,7 +572,24 @@ mod tests {
 
         tokio::time::pause();
         let (outcome, ()) = tokio::join!(
-            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None),
+            run_inner(
+                cr,
+                &mut cw,
+                PtySessionRequest {
+                    term: "xterm".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    host: "mybox".to_string(),
+                    remote_command: None,
+                    want_pty: true,
+                    tty_exec: None,
+                    token: b"tok".to_vec(),
+                },
+                &b""[..],
+                &mut stdout,
+                &mut stderr,
+                None,
+            ),
             tokio::time::advance(HELLO_ACK_TIMEOUT + Duration::from_secs(1)),
         );
 
@@ -675,9 +719,26 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None)
-            .await
-            .unwrap();
+        let outcome = run_inner(
+            cr,
+            &mut cw,
+            PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: b"tok".to_vec(),
+            },
+            &b"echo hi\n"[..],
+            &mut stdout,
+            &mut stderr,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ClientOutcome::Exited(0));
         let got_stdin = owner.await.unwrap();
@@ -733,9 +794,26 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None)
-            .await
-            .unwrap();
+        let outcome = run_inner(
+            cr,
+            &mut cw,
+            PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: b"tok".to_vec(),
+            },
+            stdin_r,
+            &mut stdout,
+            &mut stderr,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ClientOutcome::Exited(0), "a clean remote exit must be reported even under stdin-branch pressure");
         let mut expected = Vec::new();
@@ -810,9 +888,26 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None)
-            .await
-            .unwrap();
+        let outcome = run_inner(
+            cr,
+            &mut cw,
+            PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: b"tok".to_vec(),
+            },
+            &b""[..],
+            &mut stdout,
+            &mut stderr,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ClientOutcome::Exited(0));
         let (build_stdout, build_stderr, exit_code) = owner.await.unwrap();
@@ -877,7 +972,24 @@ mod tests {
         let mut stderr = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None),
+            run_inner(
+                cr,
+                &mut cw,
+                PtySessionRequest {
+                    term: "xterm".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    host: "mybox".to_string(),
+                    remote_command: None,
+                    want_pty: true,
+                    tty_exec: None,
+                    token: b"tok".to_vec(),
+                },
+                &b""[..],
+                &mut stdout,
+                &mut stderr,
+                None,
+            ),
         )
         .await
         .expect("run_inner must not hang waiting on a second build that the active_build guard silently ignores")
@@ -977,7 +1089,24 @@ mod tests {
         let mut stderr = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string(), None, true, None),
+            run_inner(
+                cr,
+                &mut cw,
+                PtySessionRequest {
+                    term: "xterm".to_string(),
+                    cols: 80,
+                    rows: 24,
+                    host: "mybox".to_string(),
+                    remote_command: None,
+                    want_pty: true,
+                    tty_exec: None,
+                    token: b"tok".to_vec(),
+                },
+                &b""[..],
+                &mut stdout,
+                &mut stderr,
+                None,
+            ),
         )
         .await
         .expect("run_inner must not hang after the abort sentinel and a clean Exit")

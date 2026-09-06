@@ -398,6 +398,32 @@ internal class SixelBitmapCache {
 }
 
 /**
+ * [drawRow]/[redrawDirtyRows]が1フレームの間ずっと不変な描画スタイル・メトリクス
+ * 一式をまとめたもの(呼び出しごとに変わる`canvas`/`rowIndex`/`rows`/`cells`/`cols`とは
+ * 分離)。`Canvas {}`のDrawScope内、`baseline`確定直後にプレーンなローカル変数として
+ * 毎フレーム構築する——`remember`はしない(`cellW`/`baseline`等はDrawScope内でしか
+ * 確定せず、composable本体スコープでは`remember`できないため。`effectiveBlinkPhase`が
+ * 530ms周期で切り替わることもあり、この配置ならComposeのrecomposition/`equals`判定は
+ * 一切関与しない)。`bgPaint`/`textPaint`はここでも従来通り同一インスタンスの`.color`等を
+ * 呼び出しごとに書き換えて使い回す(`data class`ではないので、equalsは生成されない)。
+ * `bitmapWidthPx`(per-frameのBitmap実ピクセル幅)はスタイルではないため意図的に
+ * このクラスに含めず個別引数のまま。
+ */
+internal class GridRenderStyle(
+    val cellW: Float,
+    val cellH: Float,
+    val baseline: Float,
+    val themeBgArgb: Int,
+    val effectiveBlinkPhase: Boolean,
+    val bgPaint: Paint,
+    val textPaint: Paint,
+    val clearPaint: Paint,
+    val typeface: Typeface,
+    val italicTypeface: Typeface,
+    val glyphFallback: GlyphFallbackResolver,
+)
+
+/**
  * グリッド1行分(背景run + 文字 + underline/strikethrough装飾)を [canvas] に描画する。
  * [GridRenderCache] の全走査ループ本体を1行単位に切り出したもの——描画結果は
  * 従来のインラインループと完全に一致する(将来のdirty-row最適化で、変化した行だけを
@@ -409,24 +435,15 @@ internal fun drawRow(
     rowIndex: Int,
     cells: List<CellData>,
     cols: Int,
-    cellW: Float,
-    cellH: Float,
-    baseline: Float,
-    themeBgArgb: Int,
-    effectiveBlinkPhase: Boolean,
-    bgPaint: Paint,
-    textPaint: Paint,
-    typeface: Typeface,
-    italicTypeface: Typeface,
-    glyphFallback: GlyphFallbackResolver,
+    style: GridRenderStyle,
 ) {
-    val y = rowIndex * cellH
+    val y = rowIndex * style.cellH
     val rowStart = rowIndex * cols
 
     // 背景(テーマの既定背景以外が連続する区間だけをバッチ描画)
-    for (run in computeBgRuns(cells, rowStart, cols, themeBgArgb)) {
-        bgPaint.color = run.argb
-        canvas.drawRect(run.startCol * cellW, y, run.endColExclusive * cellW, y + cellH, bgPaint)
+    for (run in computeBgRuns(cells, rowStart, cols, style.themeBgArgb)) {
+        style.bgPaint.color = run.argb
+        canvas.drawRect(run.startCol * style.cellW, y, run.endColExclusive * style.cellW, y + style.cellH, style.bgPaint)
     }
 
     // 文字
@@ -440,28 +457,28 @@ internal fun drawRow(
         // (SGR 4/9)が立っている空白セルは装飾線だけ描く必要があるため
         // isNotBlank() の早期スキップから除外する(codexレビュー指摘:
         // 装飾のみの空白セルが描かれないと下線/取り消し線が消えてしまう)。
-        val blinkHidden = cell.blink && !effectiveBlinkPhase
+        val blinkHidden = cell.blink && !style.effectiveBlinkPhase
         val hasLineDecoration = cell.underline || cell.strikethrough
         if (cell.ch.isNotEmpty() && (cell.ch.isNotBlank() || hasLineDecoration) &&
             !cell.invisible && !blinkHidden
         ) {
-            val x = col * cellW
+            val x = col * style.cellW
             val fgArgb = cell.fg.toInt()
             val resolvedFg = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
-            textPaint.color = resolvedFg
-            textPaint.isFakeBoldText = cell.bold
+            style.textPaint.color = resolvedFg
+            style.textPaint.isFakeBoldText = cell.bold
             // primary(カスタム or 既定)フォントがこのグリフを持たなければ、この1セルの
             // drawText だけシステムフォールバックへ差し替える。isFakeBoldText はそのまま
             // 効くのでボールドは維持されるが、フォールバック側には「本物の italic バリアント」が
             // 無いため、まれなフォールバックグリフでは斜体が失われる(軽微な見た目の妥協)。
-            val primary = if (cell.italic) italicTypeface else typeface
-            textPaint.typeface = glyphFallback.resolve(cell.ch, primary)
-            canvas.drawText(cell.ch, x, y + baseline, textPaint)
+            val primary = if (cell.italic) style.italicTypeface else style.typeface
+            style.textPaint.typeface = style.glyphFallback.resolve(cell.ch, primary)
+            canvas.drawText(cell.ch, x, y + style.baseline, style.textPaint)
 
             if (hasLineDecoration) {
-                bgPaint.color = resolvedFg
-                for (rect in computeLineDecorationRects(x, y, cellW, cellH, cell.underline, cell.strikethrough)) {
-                    canvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, bgPaint)
+                style.bgPaint.color = resolvedFg
+                for (rect in computeLineDecorationRects(x, y, style.cellW, style.cellH, cell.underline, cell.strikethrough)) {
+                    canvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, style.bgPaint)
                 }
             }
         }
@@ -471,7 +488,8 @@ internal fun drawRow(
 /**
  * タスク#97: `dirty_rows` が指定した [rows] だけを、既存の(前フレームを保持している)
  * Bitmap [canvas] に部分再描画する。各行は描画前に**行全幅**([0, bitmapWidthPx))を
- * [clearPaint](PorterDuff CLEAR = 透明化)でクリアしてから [drawRow] で描き直す。
+ * [GridRenderStyle.clearPaint](PorterDuff CLEAR = 透明化)でクリアしてから [drawRow] で
+ * 描き直す。
  *
  * 列レンジ(`LineDamage.left`/`right`)ではなく必ず行全幅をクリアするのは、損傷レンジの
  * 外側に前フレームの背景色や、セル幅を超えて右へはみ出したグリフの残骸が残り得るため
@@ -484,37 +502,12 @@ internal fun redrawDirtyRows(
     bitmapWidthPx: Int,
     cells: List<CellData>,
     cols: Int,
-    cellW: Float,
-    cellH: Float,
-    baseline: Float,
-    themeBgArgb: Int,
-    effectiveBlinkPhase: Boolean,
-    clearPaint: Paint,
-    bgPaint: Paint,
-    textPaint: Paint,
-    typeface: Typeface,
-    italicTypeface: Typeface,
-    glyphFallback: GlyphFallbackResolver,
+    style: GridRenderStyle,
 ) {
     for (row in rows) {
-        val y = row * cellH
-        canvas.drawRect(0f, y, bitmapWidthPx.toFloat(), y + cellH, clearPaint)
-        drawRow(
-            canvas = canvas,
-            rowIndex = row,
-            cells = cells,
-            cols = cols,
-            cellW = cellW,
-            cellH = cellH,
-            baseline = baseline,
-            themeBgArgb = themeBgArgb,
-            effectiveBlinkPhase = effectiveBlinkPhase,
-            bgPaint = bgPaint,
-            textPaint = textPaint,
-            typeface = typeface,
-            italicTypeface = italicTypeface,
-            glyphFallback = glyphFallback,
-        )
+        val y = row * style.cellH
+        canvas.drawRect(0f, y, bitmapWidthPx.toFloat(), y + style.cellH, style.clearPaint)
+        drawRow(canvas = canvas, rowIndex = row, cells = cells, cols = cols, style = style)
     }
 }
 
@@ -645,6 +638,19 @@ fun SshTerminalCanvas(
             fontFit.markFit(cellW, cellH, typeface, baseline = -fm.top)
         }
         val baseline = fontFit.baseline
+        val style = GridRenderStyle(
+            cellW = cellW,
+            cellH = cellH,
+            baseline = baseline,
+            themeBgArgb = themeBgArgb,
+            effectiveBlinkPhase = effectiveBlinkPhase,
+            bgPaint = bgPaint,
+            textPaint = textPaint,
+            clearPaint = clearPaint,
+            typeface = typeface,
+            italicTypeface = italicTypeface,
+            glyphFallback = glyphFallback,
+        )
 
         // グリッド全体を描画する off-screen Bitmap。Canvas の実ピクセルサイズに合わせて
         // 確保し直す(回転・分割ペイン等でのリサイズ時のみ再確保が走る)。
@@ -665,22 +671,7 @@ fun SshTerminalCanvas(
                 bmp.eraseColor(android.graphics.Color.TRANSPARENT)
                 val bitmapCanvas = android.graphics.Canvas(bmp)
                 for (row in 0 until rows) {
-                    drawRow(
-                        canvas = bitmapCanvas,
-                        rowIndex = row,
-                        cells = update.cells,
-                        cols = cols,
-                        cellW = cellW,
-                        cellH = cellH,
-                        baseline = baseline,
-                        themeBgArgb = themeBgArgb,
-                        effectiveBlinkPhase = effectiveBlinkPhase,
-                        bgPaint = bgPaint,
-                        textPaint = textPaint,
-                        typeface = typeface,
-                        italicTypeface = italicTypeface,
-                        glyphFallback = glyphFallback,
-                    )
+                    drawRow(canvas = bitmapCanvas, rowIndex = row, cells = update.cells, cols = cols, style = style)
                 }
                 // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
                 // グリッド以外(カーソル等)では使わないが、rememberで使い回されるインスタンス
@@ -697,17 +688,7 @@ fun SshTerminalCanvas(
                         bitmapWidthPx = pixelW,
                         cells = update.cells,
                         cols = cols,
-                        cellW = cellW,
-                        cellH = cellH,
-                        baseline = baseline,
-                        themeBgArgb = themeBgArgb,
-                        effectiveBlinkPhase = effectiveBlinkPhase,
-                        clearPaint = clearPaint,
-                        bgPaint = bgPaint,
-                        textPaint = textPaint,
-                        typeface = typeface,
-                        italicTypeface = italicTypeface,
-                        glyphFallback = glyphFallback,
+                        style = style,
                     )
                     textPaint.typeface = typeface
                 }
