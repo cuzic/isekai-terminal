@@ -117,8 +117,8 @@ pub type IsekaiPipeHandshake = isekai_protocol::handshake::HandshakeJson;
 ///   静かに壊しうる)
 ///
 /// 将来どちらかに統合する場合は、まずargv生成ロジック(このファイルの
-/// `launch_cmd`と`isekai-bootstrap/src/install_script.rs`の
-/// `build_install_script`)を共通化してから型を統合すること——型だけ先に
+/// `launch_and_capture_handshake`と`isekai-bootstrap/src/install_script.rs`の
+/// argv構築ロジック)を共通化してから型を統合すること——型だけ先に
 /// 統合すると、レンダラが対応していないフィールドが黙って無視される
 /// (`ISEKAI_PIPE_DESIGN.md`のbootstrap関連Epic参照)。`Stun`バリアントを
 /// `LaunchSpec`側へ先行追加しないこと——isekai-sshのbootstrap時STUNは既に
