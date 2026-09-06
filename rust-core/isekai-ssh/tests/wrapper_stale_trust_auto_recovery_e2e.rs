@@ -623,13 +623,21 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     // mismatch, not CI nondeterminism, was the actual cause of this test's
     // long-standing CI-only failure, issue #6). `resolve_helper_binary`
     // also makes zero `ssh(1)` calls here since `--isekai-helper-binary`
-    // is explicit (skips `detect_remote_arch`). So exactly one
-    // `exec_request` here means the re-bootstrap happened exactly once,
-    // not that it was retried an extra time.
-    assert_eq!(
-        deploy_count.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "expected exactly one re-bootstrap deploy (1 combined ssh exec: install_and_launch)"
+    // is explicit (skips `detect_remote_arch`).
+    //
+    // This used to assert *exactly* one `exec_request` (the retry-after-
+    // rebootstrap attempt was a one-shot, so no second deploy could ever
+    // happen). Since the always-connects fix that made a failed
+    // post-rebootstrap retry loop back and redeploy again instead of
+    // giving up (this test's own canned second-attempt target is designed
+    // to keep failing — see the setup comment above), a second (or third,
+    // ...) deploy can legitimately start before `child.start_kill()` above
+    // actually lands, so only "at least one" is a deterministic invariant
+    // to assert here — the meaningful behavior this test checks (silent
+    // re-deploy, no TOFU prompt, refreshed session_secret) is unaffected.
+    assert!(
+        deploy_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "expected at least one re-bootstrap deploy (1 combined ssh exec: install_and_launch)"
     );
 
     let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
