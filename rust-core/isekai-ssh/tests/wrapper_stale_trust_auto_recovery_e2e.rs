@@ -567,11 +567,22 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     let mut stderr_log = String::new();
     let mut saw_stale_notice = false;
     let mut saw_second_registration = false;
+    // See the identical `consecutive_timeouts` tolerance in the sibling
+    // unreachable-endpoint test below (its read-loop comment has the full
+    // 2026-07-23 real-CI-failure account): a single slow-Windows-CI timeout
+    // window here must not be mistaken for the process being stuck,
+    // especially now that a failed post-rebootstrap retry loops back and
+    // redeploys again (`always-connects.md` fix) instead of giving up after
+    // one retry — this test still only needs to observe the *first*
+    // stale-trust notice and first registration, both unaffected by that
+    // loop, but must survive ordinary CI scheduling jitter to see them.
+    let mut consecutive_timeouts = 0;
     for _ in 0..400 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_log.push_str(&line);
                 if line.contains("looks stale") {
@@ -583,7 +594,12 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
