@@ -630,21 +630,29 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     // happen). The always-connects fix that made a failed post-rebootstrap
     // retry loop back instead of giving up (this test's own canned
     // second-attempt target is designed to keep failing — see the setup
-    // comment above) initially made a second (or third, ...) deploy start
-    // before `child.start_kill()` above landed, on essentially every retry.
-    // A later round of adversarial review (opus, PR #115 round 2) gated
-    // that behind `reconnect_backoff::RedeployGate`: a second redeploy now
-    // needs at least `delay_for_attempt(0)`'s jitter floor (45s) to have
-    // elapsed since the first, and this test's read loop bails out well
-    // before that (worst case ~60s: three 20s timeouts) — so at most one
-    // extra redeploy can plausibly start, not an unbounded number. `(1..=2)`
-    // keeps this deterministic while still catching a regression back to
-    // the unbounded-redeploy behavior this range guards against.
+    // comment above) meant a second (or third, ...) deploy could in
+    // principle start before `child.start_kill()` above lands.
+    //
+    // This is deliberately only a lower bound, not a tight range (an
+    // earlier version of this comment argued the read loop above reliably
+    // bails within "~60s: three 20s timeouts", so at most one extra
+    // redeploy could plausibly sneak in — a later `/code-review` round
+    // pointed out that reasoning doesn't hold: `RebootstrapAndRetry`'s own
+    // per-backoff-tick `isekai-ssh: connection lost, reconnecting...` line
+    // (printed roughly every ≤10s while `reconnect_backoff::RedeployGate`
+    // stays closed) keeps resetting `consecutive_timeouts` to 0, so the
+    // 3-timeouts escape hatch essentially never fires during that phase;
+    // the loop's *real* exit is "as soon as it observes `registered_count
+    // >= 1 && saw_stale_notice`", which happens almost immediately after
+    // the first redeploy in practice but isn't strictly time-bounded, so a
+    // genuinely slow CI run could still observe more than two). The actual
+    // regression this PR fixed — unbounded, rapid-fire redeploying — is
+    // covered precisely and deterministically by `RedeployGate`'s own unit
+    // tests in `reconnect_backoff.rs`, not by pinning a fragile count here;
+    // this assertion's job is just confirming a redeploy happened at all,
+    // silently, without the TOFU prompt, and refreshed the session_secret.
     let observed_deploy_count = deploy_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        (1..=2).contains(&observed_deploy_count),
-        "expected 1 or 2 re-bootstrap deploys (1 combined ssh exec each: install_and_launch), got {observed_deploy_count}"
-    );
+    assert!(observed_deploy_count >= 1, "expected at least one re-bootstrap deploy (1 combined ssh exec: install_and_launch), got {observed_deploy_count}");
 
     let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
     let legacy_relay = refreshed.legacy_relay_transport.as_ref().expect("expected a cached relay transport");

@@ -744,7 +744,19 @@ fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window:
     }
 }
 
-fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId) {
+/// `disconnected_at` lets this skip printing anything when the matching
+/// disconnect was itself never announced — still within
+/// `RECONNECT_NOTIFY_GRACE` of `disconnected_at` (`/code-review` on
+/// `isekai-ssh` PR #115, round 2: without this, a blip that self-healed via
+/// `promote_warm_standby_once` or the first `reconnect_and_resume` attempt
+/// before the grace period elapsed still printed an unexplained
+/// "reconnected." with no matching "connection lost" ever shown — exactly
+/// the kind of surprising, unattributable message this tssh-style grace
+/// period exists to avoid).
+fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId, disconnected_at: Instant) {
+    if !reconnect_notify_due(disconnected_at, Instant::now()) {
+        return;
+    }
     if is_tty {
         eprintln!("\r\x1b[0;32misekai-pipe connect: reconnected.\x1b[0m\x1b[K");
     } else {
@@ -876,6 +888,7 @@ async fn promote_warm_standby_once(
     warm_standby: &isekai_transport::WarmStandby,
     target: &RelayTarget,
     state: &mut ResumeLoopState,
+    disconnected_at: Instant,
 ) -> Option<AnyByteStream> {
     let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
     let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
@@ -902,7 +915,7 @@ async fn promote_warm_standby_once(
         return None;
     }
     log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={}", state.session_id);
-    print_reconnect_success(state.is_tty, state.session_id);
+    print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
     match reestablish_control_stream(&promoted.connection, &target.session_secret, &state.counters).await {
         Ok(new_tasks) => state.app_ack_tasks = new_tasks,
         Err(e) => eprintln!(
@@ -1146,7 +1159,7 @@ async fn resume_with_backoff_until_deadline(
                     state.last_resume_error = Some(msg);
                     continue;
                 }
-                print_reconnect_success(state.is_tty, state.session_id);
+                print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
                 match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
                     Ok(new_tasks) => state.app_ack_tasks = new_tasks,
                     Err(e) => eprintln!(
@@ -1423,7 +1436,7 @@ pub(crate) async fn run_resume_loop(
         print_reconnect_status(state.is_tty, disconnected_at, resume_window);
 
         let promoted_stream = match &warm_standby {
-            Some(ws) => promote_warm_standby_once(ws, target, &mut state).await,
+            Some(ws) => promote_warm_standby_once(ws, target, &mut state, disconnected_at).await,
             None => None,
         };
 

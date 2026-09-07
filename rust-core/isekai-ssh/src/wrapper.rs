@@ -737,9 +737,8 @@ async fn run_ssh_with_connect_failure_recovery(
                 // `redeploy_gate` (not a loop-local one-shot) is what keeps
                 // this from redeploying on every single retry (see its own
                 // docs and `REDEPLOY_BACKOFF`'s for why that matters).
-                if redeploy_gate.due() {
+                if redeploy_gate.try_consume() {
                     log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
-                    redeploy_gate.record_attempt();
                     match bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
                         Ok(()) => {
                             intent = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
@@ -801,8 +800,8 @@ async fn run_ssh_with_connect_failure_recovery(
                 // not just this arm's `lightweight_retries`.
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
-                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
                     if !should_bootstrap(plan, resolution) {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts and auto-bootstrap is disabled; giving up");
                         return Ok(exit_code);
                     }
                     // Same `redeploy_gate` the `RebootstrapAndRetry` arm
@@ -810,8 +809,17 @@ async fn run_ssh_with_connect_failure_recovery(
                     // authority (`.claude/rules/rust-ssot.md`): whether a
                     // redeploy is allowed right now is decided in exactly
                     // one place regardless of which classification asked.
-                    if redeploy_gate.due() {
-                        redeploy_gate.record_attempt();
+                    //
+                    // The "trying a full re-deploy instead" log line only
+                    // fires when a redeploy is actually about to happen
+                    // (gate actually consumed) — round 2 `/code-review`:
+                    // printing it unconditionally every time this branch was
+                    // reached meant it kept firing on every single failure
+                    // while `lightweight_retries` stayed capped above
+                    // `MAX_LIGHTWEIGHT_RETRIES` and the gate stayed closed,
+                    // falsely claiming a redeploy that never happened.
+                    if redeploy_gate.try_consume() {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
                         match bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
                             Ok(()) => {
                                 intent = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;

@@ -456,14 +456,13 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     );
                     return Err(first_error);
                 }
-                if redeploy_gate.due() {
+                if redeploy_gate.try_consume() {
                     crate::wrapper::log_rebootstrap_and_retry_decision(
                         &outcome.class,
                         &outcome.profile,
                         &outcome.detail,
                         "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
                     );
-                    redeploy_gate.record_attempt();
                     match ops.rebootstrap_and_rebuild_intent().await {
                         Ok(new_intent) => {
                             intent = new_intent;
@@ -513,16 +512,24 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                 // not just this arm's `lightweight_retries`.
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
-                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
                     if !ops.should_bootstrap() {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts and auto-bootstrap is disabled; giving up");
                         return Err(first_error);
                     }
                     // Same `redeploy_gate` the `RebootstrapAndRetry` arm
                     // consults — one decision authority for "is a redeploy
                     // allowed right now", regardless of which classification
                     // asked (`.claude/rules/rust-ssot.md`).
-                    if redeploy_gate.due() {
-                        redeploy_gate.record_attempt();
+                    //
+                    // The "trying a full re-deploy instead" log line only
+                    // fires when a redeploy is actually about to happen
+                    // (round 2 `/code-review`: printing it unconditionally
+                    // here kept firing on every failure while
+                    // `lightweight_retries` stayed capped and the gate
+                    // stayed closed, falsely claiming a redeploy that never
+                    // happened).
+                    if redeploy_gate.try_consume() {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
                         match ops.rebootstrap_and_rebuild_intent().await {
                             Ok(new_intent) => {
                                 intent = new_intent;

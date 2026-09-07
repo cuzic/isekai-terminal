@@ -41,11 +41,36 @@ pub(crate) const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initia
 /// A reconnect attempt that stayed connected at least this long before
 /// failing again counts as a genuinely separate, later failure — not a
 /// continuation of the same reconnect storm — and resets the budget back
-/// to a fresh `RECONNECT_BUDGET` window. Comfortably above
-/// `RECONNECT_BACKOFF.max` so a run of purely back-to-back failed attempts
-/// never spuriously resets the budget that's meant to bound exactly that
-/// case. Same value as `native::mux::mod::RECONNECT_STABLE_THRESHOLD`.
-pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
+/// to a fresh `RECONNECT_BUDGET` window.
+///
+/// Comfortably above `RECONNECT_BACKOFF.max` (10s) so a run of purely
+/// back-to-back failed attempts never spuriously resets the budget that's
+/// meant to bound exactly that case — but must *also* stay above the
+/// longest a single attempt can legitimately take to fail at all, not just
+/// the backoff *between* attempts. `isekai-pipe::resume_loop::
+/// BUSY_OTHER_SESSION_RETRY_WINDOW` is 180s: a single `isekai-pipe connect`
+/// invocation (what `run_ssh_once`/`ConnectRecoveryOps::attempt` each
+/// measure `attempt_started` around) can spend up to that long retrying
+/// internally before ever reporting failure back to this crate. At the
+/// previous value of 60s, every attempt that hit that internal retry ceiling
+/// looked "stable" purely from having taken a while to fail — during a real,
+/// ongoing outage this reset the redeploy gate and lightweight-retry budget
+/// back to fresh on every single failure, defeating the storm protection
+/// both exist for (`/code-review` on `isekai-ssh` PR #115, round 2: 200s
+/// gives 20s of margin over the 180s ceiling for the scheduling/connection
+/// overhead surrounding that internal retry loop, without being so large it
+/// meaningfully delays recognizing an actually-new, later failure).
+///
+/// This diverges from `native::mux::mod::RECONNECT_STABLE_THRESHOLD`
+/// (still 60s), which historically documented the same value — that copy
+/// gates `native::mux::mod::run_with_reconnect`'s own reconnect loop
+/// (Windows' default mux/`ControlMaster`-equivalent path), which also wraps
+/// an `isekai-pipe connect` child and is exposed to the identical false-
+/// stable-reset risk, but fixing it is out of scope for the PR that found
+/// this (scoped to the `RedeployGate`/lightweight-retry code this crate's
+/// `run_ssh_with_connect_failure_recovery`/`drive_connect_recovery` own) —
+/// tracked as a known follow-up, not silently forgotten.
+pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(200);
 
 /// How often a full re-deploy (`bootstrap_and_register`: a *separate* SSH
 /// dial to the bootstrap host, re-uploading/relaunching `isekai-pipe serve`)
@@ -54,9 +79,12 @@ pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
 /// went stale, one redeploy fixes it" case, `wrapper.rs`'s most common
 /// `RebootstrapAndRetry` scenario, must not regress in latency — but
 /// subsequent ones back off 60s → 120s → 240s → capped at 300s. 60s as the
-/// floor reuses [`RECONNECT_STABLE_THRESHOLD`]'s existing meaning ("long
-/// enough to count as a separate event") rather than invent an unrelated
-/// constant.
+/// floor was originally chosen to numerically match
+/// [`RECONNECT_STABLE_THRESHOLD`] — that constant later grew to 200s for an
+/// unrelated reason (see its own docs), so the two are no longer equal, but
+/// this one's own reasoning (a redeploy costs two real SSH logins; 60s
+/// between attempts one and two is a reasonable floor on its own) still
+/// holds independently.
 ///
 /// This exists because `decide_connect_failure_recovery` gives
 /// `Unreachable`/`StaleTrust`/`Unknown` no lightweight (no-redeploy) tier at
@@ -120,6 +148,23 @@ impl RedeployGate {
     pub(crate) fn record_attempt(&mut self) {
         self.next_due_at = Some(tokio::time::Instant::now() + REDEPLOY_BACKOFF.delay_for_attempt(self.attempt));
         self.attempt += 1;
+    }
+
+    /// `due()` immediately followed by `record_attempt()` if it was —
+    /// atomically, as one call. Prefer this at call sites over pairing
+    /// `due()`/`record_attempt()` by hand: nothing enforces that pairing
+    /// (`/code-review` on `isekai-ssh` PR #115, round 2), so a future call
+    /// site that checks `due()` but forgets `record_attempt()` on some new
+    /// branch would silently leave the gate perpetually open, reintroducing
+    /// the unbounded-redeploy-storm bug this type exists to prevent.
+    /// `due()`/`record_attempt()` stay separate (pub(crate)) only for tests
+    /// that need to inspect gate state without mutating it.
+    pub(crate) fn try_consume(&mut self) -> bool {
+        if !self.due() {
+            return false;
+        }
+        self.record_attempt();
+        true
     }
 
     /// Same "this attempt ran long enough to count as a separate, later
