@@ -271,7 +271,7 @@ pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHoo
 /// (opus review round 1 found this could still redeploy on every single
 /// retry — up to ~17,000 SSH logins/day — against a live network with a
 /// merely-stuck remote helper). [`drive_connect_recovery`] now gates
-/// redeploys through `wrapper::RedeployGate` instead: while the gate is
+/// redeploys through `reconnect_backoff::RedeployGate` instead: while the gate is
 /// closed, a failure that would otherwise redeploy just falls through to a
 /// plain lightweight reconnect against the existing (already-trusted)
 /// intent — see that type's own docs for the reasoning and backoff shape.
@@ -386,7 +386,7 @@ const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
 /// `MidSessionDisconnect` (Epic R PR2) drives a bounded lightweight-retry
 /// loop with the same backoff/budget policy as `wrapper.rs`'s Unix
 /// equivalent, and a `StaleTrust`/`Unreachable`/`Unknown` signal (which has
-/// no lightweight tier of its own) is gated by `wrapper::RedeployGate`
+/// no lightweight tier of its own) is gated by `reconnect_backoff::RedeployGate`
 /// instead of redeploying on every single failure — see that type's docs
 /// (opus adversarial review, PR #115 round 2) for why an ungated loop here
 /// would either exit on the first transient failure (round 1 of this PR) or
@@ -397,7 +397,7 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
     let mut attempt: u32 = 0;
     let mut lost_since: Option<tokio::time::Instant> = None;
     let mut lightweight_retries: u32 = 0;
-    let mut redeploy_gate = crate::wrapper::RedeployGate::new();
+    let mut redeploy_gate = crate::reconnect_backoff::RedeployGate::new();
     // `true` only for the one `attempt` call immediately following a
     // successful re-deploy — see [`ConnectRecoveryOps::attempt`]'s own docs
     // on why that specific attempt must never prompt. Consumed (reset to
@@ -422,11 +422,15 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         // original `?` here did.
         let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
 
-        // Same "long enough since the last attempt started to count as a
-        // fresh, unrelated event" reset `reset_budget_if_stable` already
-        // gives `attempt`/`lost_since`/`lightweight_retries` below, extended
-        // to the redeploy gate (opus review round 2, SHOULD-FIX 3).
+        // Any failure this long after the previous attempt started counts as
+        // a fresh, unrelated event, not a continuation of the same storm —
+        // same heuristic applied to both the redeploy gate and (below)
+        // `attempt`/`lost_since`/`lightweight_retries`, hoisted here (opus
+        // review round 2, SHOULD-FIX R2-2) so it covers `RebootstrapAndRetry`'s
+        // own use of `attempt`/`lost_since` too, not just the
+        // `RetryConnectLightweight` arm.
         redeploy_gate.reset_if_stable(attempt_started);
+        crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
 
         match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), ops.should_bootstrap()) {
             ConnectFailureRecoveryAction::NoRecoverableSignal => return Err(first_error),
@@ -437,6 +441,21 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
             }
             ConnectFailureRecoveryAction::RebootstrapAndRetry => {
                 let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
+                // `StaleTrust`/`Unreachable` are pre-handshake failure
+                // classes — no SSH bytes ever flowed, so a remote command
+                // (if any) never started and looping here is safe. `Unknown`
+                // is different: a future mid-session class this build has
+                // never heard of (the two binaries are independently
+                // versioned) would also land here as `Unknown` instead of
+                // `RetryConnectLightweight` — exactly the B5 guard's
+                // scenario. Apply it here too for `Unknown` specifically
+                // (opus review round 2, SHOULD-FIX R2-4).
+                if outcome.class == isekai_pipe_core::ConnectOutcomeClass::Unknown && ops.has_remote_command() {
+                    log_line!(
+                        "isekai-ssh: connection lost while running a remote command; not auto-retrying (rerunning it could repeat a non-idempotent action)."
+                    );
+                    return Err(first_error);
+                }
                 if redeploy_gate.due() {
                     crate::wrapper::log_rebootstrap_and_retry_decision(
                         &outcome.class,
@@ -465,11 +484,18 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     }
                 }
                 // Gate closed, or a retryable re-deploy failure just above:
-                // wait and retry with the *existing* (already-trusted)
-                // intent instead of redeploying again.
+                // wait and retry with a *freshly rebuilt* intent (round 2
+                // review, SHOULD-FIX R2-3: reusing the same `intent_id` here
+                // broke `isekai-pipe-core::outcome`'s documented invariant
+                // that a retried attempt always gets its own outcome file)
+                // against the existing (already-trusted) deployment instead
+                // of redeploying again.
                 log_line!("isekai-ssh: connection lost, reconnecting... (attempt {})", attempt + 1);
                 match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                    crate::reconnect_backoff::ReconnectDecision::Retry => continue,
+                    crate::reconnect_backoff::ReconnectDecision::Retry => {
+                        intent = ops.build_intent().context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
+                        continue;
+                    }
                     crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(first_error),
                 }
             }
@@ -480,12 +506,11 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     );
                     return Err(first_error);
                 }
-                // Reset *before* checking the cap below: a `lightweight_retries`
-                // that's already at the cap from an earlier, long-since-stable
-                // storm must not immediately trip the cap for what is really
-                // the first failure of a brand-new one (round 2 review finding
-                // — see `reset_budget_if_stable`'s own docs).
-                crate::reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
+                // `reset_budget_if_stable` already ran above (before this
+                // `match`, alongside `redeploy_gate.reset_if_stable` — round
+                // 2 review, SHOULD-FIX R2-2) so it also covers
+                // `RebootstrapAndRetry`'s own use of `attempt`/`lost_since`,
+                // not just this arm's `lightweight_retries`.
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
                     log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
@@ -2823,7 +2848,7 @@ mod tests {
     /// cost ~17,000 SSH logins/day against a live network with a merely-stuck
     /// remote helper. The corrected behavior — asserted here — is that a
     /// transient failure right after a redeploy falls through to a plain
-    /// lightweight reconnect (no second redeploy) while `wrapper::RedeployGate`
+    /// lightweight reconnect (no second redeploy) while `reconnect_backoff::RedeployGate`
     /// stays closed; see [`recovery_stops_retrying_when_the_post_rebootstrap_failure_is_not_retryable`]
     /// for the non-retryable case and `wrapper.rs`'s own `RedeployGate` unit
     /// tests for the gate's timing in isolation.
