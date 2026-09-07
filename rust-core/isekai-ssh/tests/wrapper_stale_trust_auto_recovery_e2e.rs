@@ -627,17 +627,23 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     //
     // This used to assert *exactly* one `exec_request` (the retry-after-
     // rebootstrap attempt was a one-shot, so no second deploy could ever
-    // happen). Since the always-connects fix that made a failed
-    // post-rebootstrap retry loop back and redeploy again instead of
-    // giving up (this test's own canned second-attempt target is designed
-    // to keep failing — see the setup comment above), a second (or third,
-    // ...) deploy can legitimately start before `child.start_kill()` above
-    // actually lands, so only "at least one" is a deterministic invariant
-    // to assert here — the meaningful behavior this test checks (silent
-    // re-deploy, no TOFU prompt, refreshed session_secret) is unaffected.
+    // happen). The always-connects fix that made a failed post-rebootstrap
+    // retry loop back instead of giving up (this test's own canned
+    // second-attempt target is designed to keep failing — see the setup
+    // comment above) initially made a second (or third, ...) deploy start
+    // before `child.start_kill()` above landed, on essentially every retry.
+    // A later round of adversarial review (opus, PR #115 round 2) gated
+    // that behind `reconnect_backoff::RedeployGate`: a second redeploy now
+    // needs at least `delay_for_attempt(0)`'s jitter floor (45s) to have
+    // elapsed since the first, and this test's read loop bails out well
+    // before that (worst case ~60s: three 20s timeouts) — so at most one
+    // extra redeploy can plausibly start, not an unbounded number. `(1..=2)`
+    // keeps this deterministic while still catching a regression back to
+    // the unbounded-redeploy behavior this range guards against.
+    let observed_deploy_count = deploy_count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
-        deploy_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-        "expected at least one re-bootstrap deploy (1 combined ssh exec: install_and_launch)"
+        (1..=2).contains(&observed_deploy_count),
+        "expected 1 or 2 re-bootstrap deploys (1 combined ssh exec each: install_and_launch), got {observed_deploy_count}"
     );
 
     let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
