@@ -349,7 +349,26 @@ pub async fn resolve_helper_binary(
     let arch = backend
         .detect_remote_arch(target, via)
         .await
-        .context("failed to detect the remote architecture (uname -m) needed to auto-download a helper binary")?;
+        .map_err(|e| {
+            // A real SSH dial (`uname -m` over the bootstrap connection) —
+            // classify it via the same `classify_bootstrap_error` the rest
+            // of the bootstrap flow uses, so a purely transient
+            // connectivity failure here (e.g. the network is down) is
+            // still recognized as retryable. Without this, every
+            // `resolve_helper_binary` failure — including this one — used
+            // to get collapsed into `BootstrapFailure::RemoteBinaryMissing`
+            // by the caller (`wrapper::bootstrap_and_register`), which is
+            // NOT retryable (`may_retry() == false`): during exactly the
+            // kind of outage `always-connects.md` exists for, the
+            // reconnect loop would classify this as an unfixable "binary
+            // missing" problem and exit on its very first iteration (opus
+            // adversarial review, PR #115 round 2, BLOCKER 1).
+            let e = e.context("failed to detect the remote architecture (uname -m) needed to auto-download a helper binary");
+            match e.downcast_ref::<isekai_bootstrap::BootstrapError>().and_then(isekai_bootstrap_plan::classify_bootstrap_error) {
+                Some(failure) => e.context(failure),
+                None => e,
+            }
+        })?;
     let cache_dir = default_helper_cache_dir().context("could not determine the helper binary cache directory")?;
     let path = ensure_helper_binary_cached(&cache_dir, source, &arch, &base_url, &api_base_url)
         .await
