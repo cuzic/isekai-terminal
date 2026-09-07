@@ -668,6 +668,7 @@ async fn run_ssh_with_connect_failure_recovery(
     let mut attempt: u32 = 0;
     let mut lost_since: Option<tokio::time::Instant> = None;
     let mut lightweight_retries: u32 = 0;
+    let mut redeploy_gate = reconnect_backoff::RedeployGate::new();
     // Task 2.13: computed once — `--isekai-log-file` redirects stderr away
     // from the terminal for the *ssh child's* stderr (`run_ssh_once`), but
     // this process's own stderr (what `is_terminal()` here actually checks)
@@ -692,6 +693,16 @@ async fn run_ssh_with_connect_failure_recovery(
 
         let outcome = resolve_claimed_outcome(claim_connect_outcome(&runtime_dir, &intent_id));
 
+        // Any failure this long after the previous attempt started counts as
+        // a fresh, unrelated event, not a continuation of the same storm —
+        // same heuristic applied to both the redeploy gate and (below)
+        // `attempt`/`lost_since`/`lightweight_retries`, hoisted here (opus
+        // review round 2, SHOULD-FIX R2-2) so it covers `RebootstrapAndRetry`'s
+        // own use of `attempt`/`lost_since` too, not just the
+        // `RetryConnectLightweight` arm.
+        redeploy_gate.reset_if_stable(attempt_started);
+        reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
+
         match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), should_bootstrap(plan, resolution)) {
             ConnectFailureRecoveryAction::NoRecoverableSignal => return Ok(exit_code),
             ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
@@ -701,8 +712,72 @@ async fn run_ssh_with_connect_failure_recovery(
             }
             ConnectFailureRecoveryAction::RebootstrapAndRetry => {
                 let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-                log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
-                return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+                // `StaleTrust`/`Unreachable` are pre-handshake failure
+                // classes — no SSH bytes ever flowed, so a remote command
+                // (if any) never started and looping here is safe. `Unknown`
+                // is different: it means this build of `isekai-ssh` doesn't
+                // recognize the class tag a *newer* `isekai-pipe` wrote (the
+                // two are independently versioned binaries —
+                // `isekai-pipe-core::ConnectOutcome`'s own module docs), so a
+                // future mid-session class this build has never heard of
+                // would also land here as `Unknown` instead of
+                // `RetryConnectLightweight` — exactly the B5 guard's
+                // scenario. Apply it here too for `Unknown` specifically
+                // (opus review round 2, SHOULD-FIX R2-4).
+                if outcome.class == isekai_pipe_core::ConnectOutcomeClass::Unknown && plan.remote_command().is_some() {
+                    log_line!(
+                        "isekai-ssh: connection lost while running a remote command; not auto-retrying \
+                         (rerunning it could repeat a non-idempotent action)."
+                    );
+                    return Ok(exit_code);
+                }
+                // `StaleTrust`/`Unreachable`/`Unknown` have no lightweight
+                // tier of their own in `decide_connect_failure_recovery` —
+                // every failure classified this way lands here, so
+                // `redeploy_gate` (not a loop-local one-shot) is what keeps
+                // this from redeploying on every single retry (see its own
+                // docs and `REDEPLOY_BACKOFF`'s for why that matters).
+                if redeploy_gate.try_consume() {
+                    log_rebootstrap_and_retry_decision(&outcome.class, &resolution.isekai.profile, &outcome.detail, "refreshing automatically...");
+                    match bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+                        Ok(()) => {
+                            intent = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+                            continue;
+                        }
+                        Err(bootstrap_err) => {
+                            print_bootstrap_failure_guidance(&bootstrap_err);
+                            let may_retry = bootstrap_err.downcast_ref::<BootstrapFailure>().is_some_and(BootstrapFailure::may_retry);
+                            if !may_retry {
+                                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+                            }
+                            // Retryable re-deploy failure: fall through to
+                            // the same plain lightweight reconnect wait below
+                            // as a closed gate would, rather than a second,
+                            // separate backoff for the redeploy step itself.
+                        }
+                    }
+                }
+                // Gate closed, or a retryable re-deploy failure just above:
+                // wait and retry with a *freshly rebuilt* intent (same as
+                // `RetryConnectLightweight`'s own `Retry` arm below — round 2
+                // review, SHOULD-FIX R2-3: reusing the same `ConnectionIntent`
+                // here broke `isekai-pipe-core::outcome`'s documented
+                // invariant that a retried attempt always gets its own
+                // `intent_id`, risking a stale leftover outcome file from an
+                // earlier attempt being read as this one's result) against
+                // the existing (already-trusted) deployment instead of
+                // redeploying again — a bare reconnect is enough for most
+                // transient blips (`isekai-bootstrap::reuse` would make
+                // another redeploy right now a no-op against a still-live
+                // helper anyway).
+                print_process_reconnect_status(is_tty, attempt + 1);
+                match reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    reconnect_backoff::ReconnectDecision::Retry => {
+                        intent = build_connection_intent(resolution).context("isekai-ssh: could not rebuild the connection intent for a reconnect")?;
+                        continue;
+                    }
+                    reconnect_backoff::ReconnectDecision::GiveUp => return Ok(exit_code),
+                }
             }
             ConnectFailureRecoveryAction::RetryConnectLightweight => {
                 // Epic R PR2 (B5): never silently re-run a one-shot remote
@@ -718,19 +793,50 @@ async fn run_ssh_with_connect_failure_recovery(
                     );
                     return Ok(exit_code);
                 }
-                // Reset *before* checking the cap below: a `lightweight_retries`
-                // that's already at the cap from an earlier, long-since-stable
-                // storm must not immediately trip the cap for what is really
-                // the first failure of a brand-new one (round 2 review finding
-                // — see `reset_budget_if_stable`'s own docs).
-                reconnect_backoff::reset_budget_if_stable(attempt_started, &mut attempt, &mut lost_since, &mut lightweight_retries);
+                // `reset_budget_if_stable` already ran above (before this
+                // `match`, alongside `redeploy_gate.reset_if_stable` — round
+                // 2 review, SHOULD-FIX R2-2) so it also covers
+                // `RebootstrapAndRetry`'s own use of `attempt`/`lost_since`,
+                // not just this arm's `lightweight_retries`.
                 lightweight_retries += 1;
                 if lightweight_retries > MAX_LIGHTWEIGHT_RETRIES {
-                    log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
                     if !should_bootstrap(plan, resolution) {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts and auto-bootstrap is disabled; giving up");
                         return Ok(exit_code);
                     }
-                    return rebootstrap_and_retry_once(plan, resolution, &runtime_dir).await;
+                    // Same `redeploy_gate` the `RebootstrapAndRetry` arm
+                    // consults — deliberately not a second decision
+                    // authority (`.claude/rules/rust-ssot.md`): whether a
+                    // redeploy is allowed right now is decided in exactly
+                    // one place regardless of which classification asked.
+                    //
+                    // The "trying a full re-deploy instead" log line only
+                    // fires when a redeploy is actually about to happen
+                    // (gate actually consumed) — round 2 `/code-review`:
+                    // printing it unconditionally every time this branch was
+                    // reached meant it kept firing on every single failure
+                    // while `lightweight_retries` stayed capped above
+                    // `MAX_LIGHTWEIGHT_RETRIES` and the gate stayed closed,
+                    // falsely claiming a redeploy that never happened.
+                    if redeploy_gate.try_consume() {
+                        log_line!("isekai-ssh: gave up on {MAX_LIGHTWEIGHT_RETRIES} lightweight reconnect attempts; trying a full re-deploy instead");
+                        match bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+                            Ok(()) => {
+                                intent = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+                                lightweight_retries = 0;
+                                continue;
+                            }
+                            Err(bootstrap_err) => {
+                                print_bootstrap_failure_guidance(&bootstrap_err);
+                                let may_retry = bootstrap_err.downcast_ref::<BootstrapFailure>().is_some_and(BootstrapFailure::may_retry);
+                                if !may_retry {
+                                    return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+                                }
+                                // Fall through to the lightweight wait below,
+                                // still against the existing intent.
+                            }
+                        }
+                    }
                 }
                 // Printed *before* the backoff wait below (round 2 review
                 // finding: it used to print only after already sleeping out
@@ -749,24 +855,6 @@ async fn run_ssh_with_connect_failure_recovery(
             }
         }
     }
-}
-
-/// The re-deploy-then-retry-once action shared by `RebootstrapAndRetry` and
-/// (once its own lightweight retry budget is exhausted)
-/// `RetryConnectLightweight`. Structurally at most one extra `ssh`
-/// invocation happens here — no loop, no recursion — so this cannot run
-/// away even if the retry's own attempt also fails (e.g. a crash-looping
-/// helper, or a genuinely unreachable network): whatever this attempt
-/// returns is final for *this* invocation, though a subsequent manual
-/// `isekai-ssh <destination>` gets its own fresh recovery budget.
-async fn rebootstrap_and_retry_once(plan: &WrapperPlan, resolution: &WrapperResolution, runtime_dir: &Path) -> Result<u8> {
-    if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
-        print_bootstrap_failure_guidance(&bootstrap_err);
-        return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
-    }
-    let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
-    let (status2, _) = run_ssh_once(plan, resolution, &intent2, runtime_dir).await?;
-    Ok(status2.code().unwrap_or(1) as u8)
 }
 
 /// Human-readable lead-in for the `eprintln!`s below, branching on
@@ -1408,6 +1496,18 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     )
     .await
     .map_err(|e| {
+        // `resolve_helper_binary` already attaches its own `BootstrapFailure`
+        // classification when the failure is `detect_remote_arch`'s (a
+        // connectivity problem, not "the binary is missing" —
+        // `helper_download.rs`'s own docs on that call site). Only fall back
+        // to `RemoteBinaryMissing` here when nothing more specific was
+        // already found, so that classification isn't silently overwritten
+        // (opus adversarial review, PR #115 round 2, BLOCKER 1: this
+        // fallback used to apply unconditionally to every failure, which
+        // made a purely transient network failure non-retryable).
+        if e.downcast_ref::<BootstrapFailure>().is_some() {
+            return e;
+        }
         let e = if helper_binary_was_explicit {
             e
         } else {
@@ -2617,7 +2717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_and_register_classifies_missing_helper_binary() {
+    async fn bootstrap_and_register_classifies_unreachable_arch_probe_target_as_retryable() {
         let plan = WrapperPlan {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
@@ -2666,19 +2766,34 @@ mod tests {
         };
 
         // `plan.isekai.helper_binary` is `None` (the default): no explicit
-        // path is given, `detect_remote_arch` fails against the unreachable
-        // target above, and `resolve_helper_binary` surfaces that failure —
-        // classified the same as the old "no --isekai-helper-binary given"
-        // hard error used to be, since the practical guidance is identical
-        // either way ("no local isekai-pipe binary to upload").
+        // path is given, so `resolve_helper_binary` calls `detect_remote_arch`
+        // (a real `uname -m` SSH probe), which fails against the unreachable
+        // target above.
+        //
+        // This used to get collapsed into `BootstrapFailure::RemoteBinaryMissing`
+        // regardless of *why* the probe failed — "no local isekai-pipe binary
+        // to upload" reads fine for a genuinely unsupported architecture, but
+        // is wrong (and, worse, non-retryable) for a plain connectivity
+        // failure that has nothing to do with the binary at all. An opus
+        // adversarial review (PR #115 round 2, BLOCKER 1) found this made a
+        // transient network outage — exactly what this repo's
+        // `always-connects.md` reconnect loop exists to survive — look like
+        // an unfixable "binary missing" problem and exit on the very first
+        // retry. `resolve_helper_binary` now classifies the probe's own
+        // failure via `classify_bootstrap_error` first: a connection refused/
+        // `RemoteCommandFailed` (this test's scenario) is `JumpHostUnreachable`
+        // (retryable); only a genuinely unrecognized architecture
+        // (`UnsupportedArch`) still falls under `RemoteBinaryMissing`
+        // (correctly non-retryable — no amount of retrying resolves an
+        // architecture this plan has no pre-built binary for).
         let err = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await.unwrap_err();
         let failure = err
             .downcast_ref::<BootstrapFailure>()
             .expect("a classified BootstrapFailure should be attached to the error chain");
-        assert!(matches!(failure, BootstrapFailure::RemoteBinaryMissing));
-        assert!(failure.should_redirect_to_init());
+        assert!(matches!(failure, BootstrapFailure::JumpHostUnreachable), "{failure:?}");
+        assert!(!failure.should_redirect_to_init());
         assert!(!failure.should_redirect_to_login());
-        assert!(!failure.may_retry());
+        assert!(failure.may_retry(), "a plain connectivity failure probing the remote architecture must be retryable");
     }
 
     #[tokio::test]

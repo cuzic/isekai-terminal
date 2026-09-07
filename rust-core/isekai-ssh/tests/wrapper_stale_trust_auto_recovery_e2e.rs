@@ -567,11 +567,22 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     let mut stderr_log = String::new();
     let mut saw_stale_notice = false;
     let mut saw_second_registration = false;
+    // See the identical `consecutive_timeouts` tolerance in the sibling
+    // unreachable-endpoint test below (its read-loop comment has the full
+    // 2026-07-23 real-CI-failure account): a single slow-Windows-CI timeout
+    // window here must not be mistaken for the process being stuck,
+    // especially now that a failed post-rebootstrap retry loops back and
+    // redeploys again (`always-connects.md` fix) instead of giving up after
+    // one retry — this test still only needs to observe the *first*
+    // stale-trust notice and first registration, both unaffected by that
+    // loop, but must survive ordinary CI scheduling jitter to see them.
+    let mut consecutive_timeouts = 0;
     for _ in 0..400 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_log.push_str(&line);
                 if line.contains("looks stale") {
@@ -583,7 +594,12 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -607,14 +623,36 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     // mismatch, not CI nondeterminism, was the actual cause of this test's
     // long-standing CI-only failure, issue #6). `resolve_helper_binary`
     // also makes zero `ssh(1)` calls here since `--isekai-helper-binary`
-    // is explicit (skips `detect_remote_arch`). So exactly one
-    // `exec_request` here means the re-bootstrap happened exactly once,
-    // not that it was retried an extra time.
-    assert_eq!(
-        deploy_count.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "expected exactly one re-bootstrap deploy (1 combined ssh exec: install_and_launch)"
-    );
+    // is explicit (skips `detect_remote_arch`).
+    //
+    // This used to assert *exactly* one `exec_request` (the retry-after-
+    // rebootstrap attempt was a one-shot, so no second deploy could ever
+    // happen). The always-connects fix that made a failed post-rebootstrap
+    // retry loop back instead of giving up (this test's own canned
+    // second-attempt target is designed to keep failing — see the setup
+    // comment above) meant a second (or third, ...) deploy could in
+    // principle start before `child.start_kill()` above lands.
+    //
+    // This is deliberately only a lower bound, not a tight range (an
+    // earlier version of this comment argued the read loop above reliably
+    // bails within "~60s: three 20s timeouts", so at most one extra
+    // redeploy could plausibly sneak in — a later `/code-review` round
+    // pointed out that reasoning doesn't hold: `RebootstrapAndRetry`'s own
+    // per-backoff-tick `isekai-ssh: connection lost, reconnecting...` line
+    // (printed roughly every ≤10s while `reconnect_backoff::RedeployGate`
+    // stays closed) keeps resetting `consecutive_timeouts` to 0, so the
+    // 3-timeouts escape hatch essentially never fires during that phase;
+    // the loop's *real* exit is "as soon as it observes `registered_count
+    // >= 1 && saw_stale_notice`", which happens almost immediately after
+    // the first redeploy in practice but isn't strictly time-bounded, so a
+    // genuinely slow CI run could still observe more than two). The actual
+    // regression this PR fixed — unbounded, rapid-fire redeploying — is
+    // covered precisely and deterministically by `RedeployGate`'s own unit
+    // tests in `reconnect_backoff.rs`, not by pinning a fragile count here;
+    // this assertion's job is just confirming a redeploy happened at all,
+    // silently, without the TOFU prompt, and refreshed the session_secret.
+    let observed_deploy_count = deploy_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(observed_deploy_count >= 1, "expected at least one re-bootstrap deploy (1 combined ssh exec: install_and_launch), got {observed_deploy_count}");
 
     let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
     let legacy_relay = refreshed.legacy_relay_transport.as_ref().expect("expected a cached relay transport");
