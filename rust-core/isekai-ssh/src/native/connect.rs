@@ -267,11 +267,14 @@ pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHoo
 /// re-deploy's own SSH dial can't succeed with no network either) and the
 /// *whole process exits* — unlike `tssh`'s equivalent handling of the same
 /// situation, which keeps the terminal session alive and simply keeps
-/// retrying. [`rebootstrap_and_retry_until_recovered`] now loops the pair
-/// under the same backoff/budget as [`drive_connect_recovery`]'s own
-/// lightweight retries whenever the failure — the re-deploy's own dial, or
-/// the retried connect attempt itself — is classified as an ordinary
-/// connectivity blip rather than a trust/config problem (see its own docs).
+/// retrying. A first fix looped the redeploy+attempt pair unconditionally
+/// (opus review round 1 found this could still redeploy on every single
+/// retry — up to ~17,000 SSH logins/day — against a live network with a
+/// merely-stuck remote helper). [`drive_connect_recovery`] now gates
+/// redeploys through `wrapper::RedeployGate` instead: while the gate is
+/// closed, a failure that would otherwise redeploy just falls through to a
+/// plain lightweight reconnect against the existing (already-trusted)
+/// intent — see that type's own docs for the reasoning and backoff shape.
 ///
 /// "Silent" here means the *helper re-deploy* takes no `[y/N]` trust
 /// confirmation (`TofuConfirmation::Silent`) — the profile was already
@@ -382,21 +385,29 @@ const MAX_LIGHTWEIGHT_RETRIES: u32 = 5;
 /// Unlike PR1, this can now run more than two `attempt`s in a row — a
 /// `MidSessionDisconnect` (Epic R PR2) drives a bounded lightweight-retry
 /// loop with the same backoff/budget policy as `wrapper.rs`'s Unix
-/// equivalent — and a `StaleTrust`/`Unreachable` signal (or lightweight-retry
-/// exhaustion) is handed off to [`rebootstrap_and_retry_until_recovered`],
-/// which keeps retrying the re-deploy-and-connect pair rather than ending
-/// the process the first time that pair also hits a transient failure (see
-/// its own docs — this was `run_native_connect_with_recovery`'s original
-/// "at most two attempts" behavior, since corrected).
+/// equivalent, and a `StaleTrust`/`Unreachable`/`Unknown` signal (which has
+/// no lightweight tier of its own) is gated by `wrapper::RedeployGate`
+/// instead of redeploying on every single failure — see that type's docs
+/// (opus adversarial review, PR #115 round 2) for why an ungated loop here
+/// would either exit on the first transient failure (round 1 of this PR) or
+/// redeploy indefinitely against a live-but-broken remote helper (round 1's
+/// fix for that same bug, before this gate existed).
 async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: ConnectionIntent) -> Result<u8> {
     let mut intent = intent;
     let mut attempt: u32 = 0;
     let mut lost_since: Option<tokio::time::Instant> = None;
     let mut lightweight_retries: u32 = 0;
+    let mut redeploy_gate = crate::wrapper::RedeployGate::new();
+    // `true` only for the one `attempt` call immediately following a
+    // successful re-deploy — see [`ConnectRecoveryOps::attempt`]'s own docs
+    // on why that specific attempt must never prompt. Consumed (reset to
+    // `false`) by every `attempt` call, not just that one.
+    let mut next_attempt_silent = false;
 
     loop {
         let attempt_started = tokio::time::Instant::now();
-        let first_error = match ops.attempt(&intent, false).await {
+        let silent = std::mem::take(&mut next_attempt_silent);
+        let first_error = match ops.attempt(&intent, silent).await {
             Ok(exit_code) => return Ok(exit_code),
             Err(e) => e,
         };
@@ -411,6 +422,12 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
         // original `?` here did.
         let outcome = resolve_claimed_outcome(ops.claim_outcome(&intent.intent_id));
 
+        // Same "long enough since the last attempt started to count as a
+        // fresh, unrelated event" reset `reset_budget_if_stable` already
+        // gives `attempt`/`lost_since`/`lightweight_retries` below, extended
+        // to the redeploy gate (opus review round 2, SHOULD-FIX 3).
+        redeploy_gate.reset_if_stable(attempt_started);
+
         match decide_connect_failure_recovery(outcome.as_ref().map(|o| &o.class), ops.should_bootstrap()) {
             ConnectFailureRecoveryAction::NoRecoverableSignal => return Err(first_error),
             ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
@@ -420,13 +437,41 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
             }
             ConnectFailureRecoveryAction::RebootstrapAndRetry => {
                 let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-                crate::wrapper::log_rebootstrap_and_retry_decision(
-                    &outcome.class,
-                    &outcome.profile,
-                    &outcome.detail,
-                    "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
-                );
-                return rebootstrap_and_retry_until_recovered(ops).await;
+                if redeploy_gate.due() {
+                    crate::wrapper::log_rebootstrap_and_retry_decision(
+                        &outcome.class,
+                        &outcome.profile,
+                        &outcome.detail,
+                        "re-deploying the helper automatically (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
+                    );
+                    redeploy_gate.record_attempt();
+                    match ops.rebootstrap_and_rebuild_intent().await {
+                        Ok(new_intent) => {
+                            intent = new_intent;
+                            next_attempt_silent = true;
+                            continue;
+                        }
+                        Err(bootstrap_err) => {
+                            let may_retry = bootstrap_err
+                                .downcast_ref::<isekai_bootstrap_plan::BootstrapFailure>()
+                                .is_some_and(isekai_bootstrap_plan::BootstrapFailure::may_retry);
+                            if !may_retry {
+                                return Err(bootstrap_err);
+                            }
+                            // Retryable re-deploy failure: fall through to
+                            // the same plain lightweight reconnect wait
+                            // below as a closed gate would.
+                        }
+                    }
+                }
+                // Gate closed, or a retryable re-deploy failure just above:
+                // wait and retry with the *existing* (already-trusted)
+                // intent instead of redeploying again.
+                log_line!("isekai-ssh: connection lost, reconnecting... (attempt {})", attempt + 1);
+                match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
+                    crate::reconnect_backoff::ReconnectDecision::Retry => continue,
+                    crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(first_error),
+                }
             }
             ConnectFailureRecoveryAction::RetryConnectLightweight => {
                 if ops.has_remote_command() {
@@ -447,7 +492,31 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                     if !ops.should_bootstrap() {
                         return Err(first_error);
                     }
-                    return rebootstrap_and_retry_until_recovered(ops).await;
+                    // Same `redeploy_gate` the `RebootstrapAndRetry` arm
+                    // consults — one decision authority for "is a redeploy
+                    // allowed right now", regardless of which classification
+                    // asked (`.claude/rules/rust-ssot.md`).
+                    if redeploy_gate.due() {
+                        redeploy_gate.record_attempt();
+                        match ops.rebootstrap_and_rebuild_intent().await {
+                            Ok(new_intent) => {
+                                intent = new_intent;
+                                next_attempt_silent = true;
+                                lightweight_retries = 0;
+                                continue;
+                            }
+                            Err(bootstrap_err) => {
+                                let may_retry = bootstrap_err
+                                    .downcast_ref::<isekai_bootstrap_plan::BootstrapFailure>()
+                                    .is_some_and(isekai_bootstrap_plan::BootstrapFailure::may_retry);
+                                if !may_retry {
+                                    return Err(bootstrap_err);
+                                }
+                                // Fall through to the lightweight wait below,
+                                // still against the existing intent.
+                            }
+                        }
+                    }
                 }
                 // Printed *before* the backoff wait below (round 2 review
                 // finding, mirroring the same fix in `wrapper.rs`): it used
@@ -462,61 +531,6 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                         continue;
                     }
                     crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(first_error),
-                }
-            }
-        }
-    }
-}
-
-/// Mirrors `wrapper.rs::rebootstrap_and_retry_until_recovered` — same
-/// policy, kept as a separate function for this trait-generic path (same
-/// "same policy, not same Rust item" reason `reconnect_backoff`'s module doc
-/// gives for the rest of this split).
-///
-/// Loops the whole re-deploy+retry pair under the same backoff/budget
-/// policy as [`drive_connect_recovery`]'s own lightweight retries whenever a
-/// failure — either the re-deploy's own SSH dial (classified via
-/// `isekai_bootstrap_plan::BootstrapFailure::may_retry`) or the subsequent
-/// connect attempt itself (classified via `decide_connect_failure_recovery`,
-/// same as [`drive_connect_recovery`]'s own top-of-loop attempt) — looks
-/// like an ordinary connectivity blip rather than a trust/config problem. A
-/// non-retryable failure (a rejected/mismatched host key, missing
-/// credentials, ...) still ends this loop immediately.
-async fn rebootstrap_and_retry_until_recovered<O: ConnectRecoveryOps>(ops: &mut O) -> Result<u8> {
-    let mut attempt: u32 = 0;
-    let mut lost_since: Option<tokio::time::Instant> = None;
-    loop {
-        let intent2 = match ops.rebootstrap_and_rebuild_intent().await {
-            Ok(intent2) => intent2,
-            Err(bootstrap_err) => {
-                let may_retry = bootstrap_err
-                    .downcast_ref::<isekai_bootstrap_plan::BootstrapFailure>()
-                    .is_some_and(isekai_bootstrap_plan::BootstrapFailure::may_retry);
-                if !may_retry {
-                    return Err(bootstrap_err);
-                }
-                match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                    crate::reconnect_backoff::ReconnectDecision::Retry => continue,
-                    crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(bootstrap_err),
-                }
-            }
-        };
-
-        match ops.attempt(&intent2, true).await {
-            Ok(exit_code2) => return Ok(exit_code2),
-            Err(e) => {
-                let outcome2 = resolve_claimed_outcome(ops.claim_outcome(&intent2.intent_id));
-                match decide_connect_failure_recovery(outcome2.as_ref().map(|o| &o.class), ops.should_bootstrap()) {
-                    ConnectFailureRecoveryAction::NoRecoverableSignal | ConnectFailureRecoveryAction::AutoBootstrapDisabled => return Err(e),
-                    ConnectFailureRecoveryAction::RebootstrapAndRetry | ConnectFailureRecoveryAction::RetryConnectLightweight => {
-                        // Still looks like a connectivity blip right after a
-                        // fresh redeploy — loop and try the whole pair again
-                        // rather than ending the process.
-                        match crate::reconnect_backoff::reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                            crate::reconnect_backoff::ReconnectDecision::Retry => continue,
-                            crate::reconnect_backoff::ReconnectDecision::GiveUp => return Err(e),
-                        }
-                    }
                 }
             }
         }
@@ -2799,19 +2813,28 @@ mod tests {
     /// attempt: if it also failed — as it would during a real outage, since
     /// the re-deploy's own SSH dial and the retried connect attempt both
     /// need the same dead network — the whole recovery gave up and the
-    /// process exited. It must now keep retrying (redeploy + connect) with
-    /// the same backoff/budget as the lightweight loop for as long as the
-    /// failure keeps looking transient, only actually returning once the
-    /// network (simulated here by the queued results finally turning `Ok`)
-    /// comes back — matching `tssh`'s own behavior of never giving up on an
-    /// eventually-recoverable outage.
+    /// process exited. It must now keep retrying instead, only actually
+    /// returning once the network (simulated here by the queued results
+    /// finally turning `Ok`) comes back — matching `tssh`'s own behavior of
+    /// never giving up on an eventually-recoverable outage.
+    ///
+    /// A first version of this fix looped a full redeploy on every single
+    /// retry, which an opus adversarial review (PR #115 round 2) found could
+    /// cost ~17,000 SSH logins/day against a live network with a merely-stuck
+    /// remote helper. The corrected behavior — asserted here — is that a
+    /// transient failure right after a redeploy falls through to a plain
+    /// lightweight reconnect (no second redeploy) while `wrapper::RedeployGate`
+    /// stays closed; see [`recovery_stops_retrying_when_the_post_rebootstrap_failure_is_not_retryable`]
+    /// for the non-retryable case and `wrapper.rs`'s own `RedeployGate` unit
+    /// tests for the gate's timing in isolation.
     #[tokio::test]
-    async fn recovery_keeps_retrying_after_the_post_rebootstrap_attempt_also_fails_transiently() {
+    async fn recovery_falls_through_to_lightweight_reconnect_instead_of_redeploying_again_immediately() {
         tokio::time::pause();
         let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
             (0..MAX_LIGHTWEIGHT_RETRIES + 1).map(|_| Err("connection lost".to_string())).collect();
-        // Two more post-rebootstrap attempts fail transiently (network still
-        // down) before one finally succeeds (network came back).
+        // Two more failures right after the redeploy, well within the
+        // redeploy gate's 60s backoff window — these must fall through to a
+        // plain reconnect, not trigger a second redeploy.
         attempt_results.push_back(Err("still no network".to_string()));
         attempt_results.push_back(Err("still no network".to_string()));
         attempt_results.push_back(Ok(0));
@@ -2823,8 +2846,9 @@ mod tests {
         let result = drive_connect_recovery(&mut ops, fake_intent()).await;
         assert_eq!(result.unwrap(), 0, "must eventually recover instead of exiting once the network comes back");
         assert_eq!(
-            ops.rebootstrap_calls, 3,
-            "each retry after the post-rebootstrap attempt fails transiently must redeploy and try again, not give up"
+            ops.rebootstrap_calls, 1,
+            "the redeploy gate must stay closed for its backoff window — these transient failures must fall through \
+             to a plain reconnect against the existing intent, not redeploy again"
         );
         assert_eq!(ops.attempt_calls, MAX_LIGHTWEIGHT_RETRIES as usize + 4);
     }
@@ -2837,9 +2861,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_stops_retrying_when_the_post_rebootstrap_failure_is_not_retryable() {
         tokio::time::pause();
-        let mut attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
+        let attempt_results: std::collections::VecDeque<std::result::Result<u8, String>> =
             (0..MAX_LIGHTWEIGHT_RETRIES + 1).map(|_| Err("connection lost".to_string())).collect();
-        attempt_results.push_back(Err("host key mismatch".to_string()));
         // `FakeRecoveryOps::rebootstrap_and_rebuild_intent` returns a plain
         // `anyhow!(...)` error (no `BootstrapFailure` attached) when
         // `rebootstrap_ok` is `false` — i.e. "no evidence this was a
