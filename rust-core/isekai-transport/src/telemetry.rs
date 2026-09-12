@@ -197,6 +197,56 @@ pub fn log_must_resume_convergence(session_id: SessionId, resume_candidate_id: &
     );
 }
 
+/// Logged for the two per-round "birth"/"death" events a round runner
+/// (`resume::connect_via_relay_resumable_with_fallback`) can produce for one
+/// attach attempt: a brand new session being minted at the very start of a
+/// round (`class = "fresh-rendezvous"`, `new_session_id = Some(..)`), or the
+/// round giving up entirely — every candidate exhausted, or the generation
+/// retry budget exhausted — before ever completing an attach
+/// (`class = "abandoned"`, `new_session_id = None`). See
+/// `ADR_ISEKAI_SSH_OBSERVABILITY.md` §3.3, which added this to answer
+/// `ADR_STUN_REESTABLISH_CONTINUITY.md` §3's open question of whether a true
+/// re-rendezvous (both client and server addresses changing at once) is
+/// detected at all.
+///
+/// `previous_session_id` is `None` at every call site this ADR's scope
+/// actually covers: within one round runner invocation there is no earlier
+/// in-process session to report (the one case where it would be
+/// meaningful — a bare redial that keeps the *same* `session_id`, i.e.
+/// `previous_session_id == new_session_id` — is deliberately out of scope
+/// here; `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Task 3.4 already logs that
+/// path once). The parameter still exists (rather than being dropped
+/// outright) so a future caller that *does* have an earlier session to
+/// report (e.g. a bare-redial call site) can populate it without a second,
+/// near-identical logging function.
+///
+/// `attempts`/`elapsed` are only meaningful for `"abandoned"` (the number of
+/// per-candidate failures collected so far, and wall-clock time since the
+/// *whole* connect attempt — every round, including any earlier
+/// successful generation advances — began, not just the final round) —
+/// both are `0`/`Duration::ZERO` for `"fresh-rendezvous"`, which logs the
+/// instant a session is minted, before any attempt has been made.
+pub fn log_rendezvous_outcome(
+    previous_session_id: Option<SessionId>,
+    new_session_id: Option<SessionId>,
+    class: &str,
+    attempts: u32,
+    elapsed: Duration,
+) {
+    // The `previous`/`new_session` `String`s are built as inline macro
+    // arguments (rather than `let`-bound before the call) so `log::info!`'s
+    // own level check can skip them entirely when INFO logging is disabled —
+    // a `let` above this call would allocate unconditionally regardless of
+    // the active log level (code review finding).
+    log::info!(
+        "isekai-transport: rendezvous outcome: previous_session_id={previous} new_session_id={new_session} \
+         class={class} attempts={attempts} elapsed_ms={elapsed_ms}",
+        previous = previous_session_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        new_session = new_session_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        elapsed_ms = elapsed.as_millis(),
+    );
+}
+
 fn format_duration_ms(d: Option<Duration>) -> String {
     match d {
         Some(d) => d.as_millis().to_string(),
@@ -285,5 +335,11 @@ mod tests {
     #[test]
     fn log_must_resume_convergence_does_not_panic() {
         log_must_resume_convergence(SessionId::from_bytes([1u8; 16]), "relay-1");
+    }
+
+    #[test]
+    fn log_rendezvous_outcome_does_not_panic_for_fresh_rendezvous_or_abandoned() {
+        log_rendezvous_outcome(None, Some(SessionId::from_bytes([1u8; 16])), "fresh-rendezvous", 0, Duration::ZERO);
+        log_rendezvous_outcome(None, None, "abandoned", 3, Duration::from_millis(4500));
     }
 }
