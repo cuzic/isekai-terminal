@@ -644,7 +644,7 @@ async fn connect_attempt(
     handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
-    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
+    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent, plan.log_file())?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 

@@ -349,18 +349,105 @@ fn resolve_tethering_interface(name: &str) -> Result<isekai_transport::Interface
         })
 }
 
-/// Opens `path` for this process's `env_logger` output (creating parent
-/// directories as needed, always appending — same "accumulate one history"
+/// Truncated (by rotation, see [`RotatingLogFile`]) once a log file this
+/// process writes to reaches this size — matches
+/// `isekai-ssh/src/log_file.rs`'s own `VERBOSE_LOG_MAX_BYTES` default so the
+/// two crates' log-growth policies agree, even though this one rotates at
+/// runtime instead of truncating once at open (`ADR_ISEKAI_SSH_OBSERVABILITY.md`
+/// §3.2 Open Questions — no evidence yet that a different threshold is
+/// needed).
+const LOG_ROTATE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// A `std::io::Write` target for `env_logger` that rotates by renaming the
+/// current file to `<name>.1` (overwriting any older `.1` — a single backup
+/// generation, `ADR_ISEKAI_SSH_OBSERVABILITY.md` §3.2 Open Questions) once
+/// it has accumulated at least [`LOG_ROTATE_MAX_BYTES`], then opens a fresh
+/// file at the original path and keeps writing.
+///
+/// This exists because `isekai-ssh`'s holder (`native/mux/holder.rs`) is a
+/// long-lived, day-to-week-scale detached process, so its child
+/// `isekai-pipe connect`'s own log file needs *runtime* rotation — unlike
+/// `isekai-ssh/src/log_file.rs::Sink`'s `truncate_over`, which only ever
+/// judges size once, at `open()` (i.e. once per process start), and would
+/// never fire again for a process that itself never restarts. Modeled on
+/// that `Sink`'s overall shape (a single mutable `File` behind simple
+/// size-tracking) rather than reusing it directly, since reuse would need
+/// a `truncate_over`-at-write-time mode `isekai-ssh` itself has no use for.
+///
+/// Deliberately hand-rolled instead of pulling in `tracing-appender`: this
+/// crate's `Cargo.toml` intentionally stays on `log`+`env_logger` only
+/// (`ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`'s "isekai-pipe should stay thin"
+/// decision) and `tracing-appender` would drag in the whole
+/// `tracing-subscriber` dependency graph just to be used as a `Write` impl.
+///
+/// Every I/O failure here (a failed rotation, a failed write) is swallowed
+/// rather than propagated — logging must never be able to fail the actual
+/// connection, matching `isekai-ssh/src/log_file.rs`'s "fail-open" doc
+/// comments throughout. A rotation failure just means this keeps appending
+/// to the current (over-threshold) file instead of losing log output.
+struct RotatingLogFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    written: u64,
+}
+
+impl RotatingLogFile {
+    /// Opens (creating parent dirs as needed) `path`, appending to any
+    /// existing content, and seeds [`Self::written`] from the file's
+    /// current size — otherwise a holder that's already near/over
+    /// [`LOG_ROTATE_MAX_BYTES`] from a previous run would never rotate
+    /// until it grew by another full threshold's worth of bytes past that.
+    fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata()?.len();
+        Ok(Self { path, file, written })
+    }
+
+    /// Renames the current file to `<name>.1` (dropping whatever `.1`
+    /// already existed) and reopens a fresh file at `self.path`. Bubbles up
+    /// any I/O error to [`Write::write`], which swallows it — see this
+    /// struct's docs on why rotation failure is never fatal.
+    fn rotate(&mut self) -> std::io::Result<()> {
+        let file_name = self.path.file_name().unwrap_or_default();
+        let mut rotated_name = file_name.to_os_string();
+        rotated_name.push(".1");
+        let rotated_path = self.path.with_file_name(rotated_name);
+        let _ = std::fs::remove_file(&rotated_path);
+        std::fs::rename(&self.path, &rotated_path)?;
+        self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.written = 0;
+        Ok(())
+    }
+}
+
+impl std::io::Write for RotatingLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written >= LOG_ROTATE_MAX_BYTES {
+            let _ = self.rotate();
+        }
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Opens `path` for this process's `env_logger` output as a
+/// [`RotatingLogFile`] (creating parent directories as needed, always
+/// appending to any existing content — same "accumulate one history"
 /// convention as `isekai-ssh/src/log_file.rs::init_verbose`, which resolves
 /// to the same default path via `isekai_pipe_core::default_log_file()` when
 /// `ISEKAI_PIPE_LOG_FILE` wasn't explicitly overridden). Returns `None` on
 /// any I/O failure so the caller falls back to `stderr` rather than ever
 /// failing the connection over a logging nicety.
-fn open_log_file_target(path: &std::path::Path) -> Option<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+fn open_log_file_target(path: &std::path::Path) -> Option<RotatingLogFile> {
+    RotatingLogFile::open(path.to_path_buf()).ok()
 }
 
 pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
@@ -1118,6 +1205,53 @@ mod tests {
         parse_connect(args.iter().map(|arg| arg.to_string()))
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn rotating_log_file_appends_without_rotating_below_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("holder.log");
+        let mut log = RotatingLogFile::open(path.clone()).unwrap();
+        log.write_all(b"first line\n").unwrap();
+        log.write_all(b"second line\n").unwrap();
+        drop(log);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first line\nsecond line\n");
+        assert!(!path.with_file_name("holder.log.1").exists(), "no rotation should have happened yet");
+    }
+
+    #[test]
+    fn rotating_log_file_rotates_once_the_threshold_is_crossed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("holder.log");
+        // Pre-seed the file past the threshold directly (bypassing the
+        // struct) so this test doesn't need to actually write 5MB through
+        // it to exercise the rotation branch.
+        std::fs::write(&path, vec![b'x'; LOG_ROTATE_MAX_BYTES as usize + 1]).unwrap();
+
+        let mut log = RotatingLogFile::open(path.clone()).unwrap();
+        assert_eq!(log.written, LOG_ROTATE_MAX_BYTES + 1, "written must be seeded from the pre-existing file's size");
+        log.write_all(b"after rotation\n").unwrap();
+        drop(log);
+
+        let rotated_path = path.with_file_name("holder.log.1");
+        assert!(rotated_path.exists(), "the oversized file should have been rotated out to .1");
+        assert_eq!(std::fs::read(&rotated_path).unwrap().len(), LOG_ROTATE_MAX_BYTES as usize + 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after rotation\n", "the new file should start fresh");
+    }
+
+    #[test]
+    fn rotating_log_file_overwrites_an_older_generation_1_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("holder.log");
+        std::fs::write(path.with_file_name("holder.log.1"), b"stale generation from a previous rotation\n").unwrap();
+        std::fs::write(&path, vec![b'x'; LOG_ROTATE_MAX_BYTES as usize + 1]).unwrap();
+
+        let mut log = RotatingLogFile::open(path.clone()).unwrap();
+        log.write_all(b"fresh\n").unwrap();
+        drop(log);
+
+        assert_eq!(std::fs::read(path.with_file_name("holder.log.1")).unwrap().len(), LOG_ROTATE_MAX_BYTES as usize + 1);
     }
 
     #[test]
