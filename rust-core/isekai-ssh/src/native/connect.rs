@@ -49,6 +49,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::mux::ctl_forward;
 use super::mux::handoff::HandoffCredentials;
+use super::mux::naming;
 
 use crate::log_file::log_line;
 use crate::wrapper::{
@@ -644,7 +645,16 @@ async fn connect_attempt(
     handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
-    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent, plan.log_file())?;
+    // Same identity `naming::channel_name` already uses to decide which
+    // holder a `isekai-ssh <host>` invocation shares with (`mux/mod.rs`) —
+    // reused here (recomputed rather than threaded through, since it's a
+    // cheap SHA-256 over a handful of fields and threading it through every
+    // caller of `connect_attempt` would be a much larger diff) so the
+    // holder-only log path this destination's `isekai-pipe connect` child
+    // gets (`child_stdio.rs::holder_log_file`) is unique **per holder**, not
+    // a single name shared by every concurrently-active destination.
+    let channel_name = naming::channel_name(host_config, resolution, plan.destination_host());
+    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent, plan.log_file(), &channel_name)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 

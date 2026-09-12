@@ -215,9 +215,19 @@ holderのログ先を分ける理由の1つ。
   `native::mux::holder::is_holder_reexec()`(既存、`HOLDER_MARKER_ENV`を
   見るだけの1行関数、`main.rs`の起動時分岐が既に使っている)を
   `spawn_isekai_pipe_connect`内部で直接呼んで判定する。holder経由の
-  時だけ別のログファイル名(例: `isekai-ssh-holder.log`)を
-  `ISEKAI_PIPE_LOG_FILE`として渡す——単一ファイル共有にはこだわらず
-  役割ごとに分ける。
+  時だけ別のログファイル名を`ISEKAI_PIPE_LOG_FILE`として渡す——単一
+  ファイル共有にはこだわらず役割ごとに分ける。
+
+  **実装時のcode reviewで修正: ファイル名は固定の`isekai-ssh-holder.log`
+  ではなく`isekai-ssh-holder-<hex>.log`(`<hex>`は`naming::channel_name`
+  の末尾ハッシュ、holderがどの宛先と共有されるかを決める既存の識別子と
+  同じもの)にする。** holderは宛先(実質的に解決済み接続設定全体)ごとに
+  1つ立つ(`native/mux/holder.rs`)ため、複数の`isekai-ssh <host>`タブを
+  同時に開くと複数のholderが並行して存在しうる——固定ファイル名のままだと
+  それら全ての`isekai-pipe connect`子プロセスの`RotatingLogFile`が同じ
+  ファイルを奪い合い、互いのローテーション(rename)を踏みつけて片方の
+  出力が消える。ログファイルの「1holderにつき1ファイル」という対応を
+  `channel_name`と同じ識別子で保証する。
 
 ### 3.3 真の再ランデブー境界の計装(`telemetry.rs`の既存規約を拡張)
 

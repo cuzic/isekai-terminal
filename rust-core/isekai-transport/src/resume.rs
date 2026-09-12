@@ -399,7 +399,11 @@ pub async fn connect_via_relay_resumable_with_fallback(
     // allowed to advance `generation`, and only after an
     // `AmbiguousAfterAttach`/`StaleAttempt` failure — never for a
     // `RetryablePreAttach` one.
-    let round_start = std::time::Instant::now();
+    // Spans the *whole* connect attempt (every round, including any earlier
+    // successful generation advances via `continue 'rounds` below) — not
+    // reset per round — matching `log_rendezvous_outcome`'s documented
+    // `elapsed` semantics.
+    let attempt_start = std::time::Instant::now();
     let mut coordinator = crate::generation_coordinator::GenerationCoordinator::new(random_session_id());
     crate::telemetry::log_rendezvous_outcome(
         None,
@@ -484,7 +488,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                         None,
                                         "abandoned",
                                         failures.len() as u32,
-                                        round_start.elapsed(),
+                                        attempt_start.elapsed(),
                                     );
                                     return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
                                         failures,
@@ -513,7 +517,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                         None,
                                         "abandoned",
                                         failures.len() as u32,
-                                        round_start.elapsed(),
+                                        attempt_start.elapsed(),
                                     );
                                     return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
                                         failures,
@@ -585,7 +589,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
         // Every candidate in this round failed `RetryablePreAttach` — no
         // ambiguous/stale failure occurred, so there's no reason to advance
         // the generation and try again.
-        crate::telemetry::log_rendezvous_outcome(None, None, "abandoned", failures.len() as u32, round_start.elapsed());
+        crate::telemetry::log_rendezvous_outcome(None, None, "abandoned", failures.len() as u32, attempt_start.elapsed());
         return Err(SequentialConnectError::AllCandidatesFailed { failures });
     }
 }

@@ -50,12 +50,21 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// `log_file_override` is `plan.log_file()` (`--isekai-log-file`, if given)
 /// — see [`resolve_pipe_log_file`] for why this path always sets
 /// `ISEKAI_PIPE_LOG_FILE` (unlike the Unix ProxyCommand path, which only
-/// does so in the no-flag default case).
+/// does so in the no-flag default case). `channel_name` is
+/// `naming::channel_name(..)` for this same destination — the same identity
+/// `mux/mod.rs` uses to decide which holder this invocation shares with —
+/// reused (see [`resolve_pipe_log_file`]) so the holder-only log path is
+/// unique per holder rather than a single name shared by every
+/// concurrently-active destination (code review finding: two `isekai-ssh
+/// <host>` tabs to different destinations, each with their own detached
+/// holder, would otherwise both point their `isekai-pipe connect` children's
+/// `RotatingLogFile` at the exact same file and race each other's rotations).
 pub(crate) fn spawn_isekai_pipe_connect(
     isekai_pipe_path: &Path,
     runtime_dir: &Path,
     intent: &ConnectionIntent,
     log_file_override: Option<&Path>,
+    channel_name: &str,
 ) -> Result<Child> {
     isekai_pipe_core::write_connection_intent(runtime_dir, intent)
         .with_context(|| format!("failed to write ConnectionIntent {} to {}", intent.intent_id, runtime_dir.display()))?;
@@ -64,7 +73,9 @@ pub(crate) fn spawn_isekai_pipe_connect(
     command
         .env("ISEKAI_INTENT_ID", &intent.intent_id)
         .env("ISEKAI_PIPE_RUNTIME_DIR", runtime_dir);
-    if let Some(log_file) = resolve_pipe_log_file(log_file_override, crate::native::mux::holder::is_holder_reexec()) {
+    if let Some(log_file) =
+        resolve_pipe_log_file(log_file_override, crate::native::mux::holder::is_holder_reexec(), channel_name)
+    {
         command.env("ISEKAI_PIPE_LOG_FILE", log_file);
     }
     command
@@ -118,28 +129,44 @@ pub(crate) fn spawn_isekai_pipe_connect(
 /// resolves to — nothing at all once the holder's null-stderr parent
 /// (`native/mux/holder.rs`) is in the picture, which was the actual bug this
 /// ADR investigates.
-fn resolve_pipe_log_file(explicit_override: Option<&Path>, is_holder: bool) -> Option<PathBuf> {
+fn resolve_pipe_log_file(explicit_override: Option<&Path>, is_holder: bool, channel_name: &str) -> Option<PathBuf> {
     if let Some(explicit) = explicit_override {
         return Some(explicit.to_path_buf());
     }
     if is_holder {
-        return holder_log_file().ok();
+        return holder_log_file(channel_name).ok();
     }
     isekai_pipe_core::default_log_file().ok()
 }
 
-/// `isekai-ssh-holder.log`, alongside `default_log_file()`'s own
-/// `isekai-ssh.log` — a separate file so the long-lived holder's child
-/// (which needs runtime log rotation, `isekai-pipe/src/connect.rs`'s
-/// `RotatingLogFile`) never shares a path with a short-lived foreground
-/// client's child (which keeps appending to `default_log_file()` forever,
-/// same as before this ADR). Env inheritance means `default_log_file()`
-/// itself resolves identically for both (`holder.rs` doesn't touch the env
-/// block), so this is purely a naming split, not a different resolution
-/// mechanism.
-fn holder_log_file() -> std::io::Result<PathBuf> {
+/// `isekai-ssh-holder-<hex>.log`, alongside `default_log_file()`'s own
+/// `isekai-ssh.log` — a separate file *per holder* (`<hex>` is
+/// `channel_name`'s own trailing SHA-256 hex digest — the exact identity
+/// `mux/mod.rs` uses to decide which holder an invocation shares with, so
+/// this stays 1:1 with "one holder" the same way `channel_name` itself
+/// does) so the long-lived holder's child (which needs runtime log
+/// rotation, `isekai-pipe/src/connect.rs`'s `RotatingLogFile`) never shares
+/// a path with *either* a short-lived foreground client's child (which
+/// keeps appending to `default_log_file()` forever, same as before this
+/// ADR) *or* a different destination's own holder — two concurrently-active
+/// `isekai-ssh <host>` destinations (an ordinary multi-tab usage pattern)
+/// each get their own detached holder (`native/mux/holder.rs`), and without
+/// this per-holder split their `isekai-pipe connect` children's
+/// `RotatingLogFile` instances would collide on one shared file, each
+/// independently tracking size and rotating out from under the other's open
+/// handle (a real bug an earlier code review caught in this ADR's first
+/// draft, which used a single global `isekai-ssh-holder.log` name). Env
+/// inheritance means `default_log_file()` itself resolves identically
+/// regardless of holder (`holder.rs` doesn't touch the env block), so this
+/// is purely a naming split, not a different resolution mechanism.
+fn holder_log_file(channel_name: &str) -> std::io::Result<PathBuf> {
     let mut path = isekai_pipe_core::default_log_file()?;
-    path.set_file_name("isekai-ssh-holder.log");
+    // `channel_name` is `\\.\pipe\isekai-ssh-mux-<hex>` — hyphens appear
+    // only inside the literal `isekai-ssh-mux-` prefix, never inside the
+    // hex digest itself, so splitting on the *last* `-` reliably isolates
+    // just the digest regardless of how many hyphens precede it.
+    let digest = channel_name.rsplit('-').next().unwrap_or(channel_name);
+    path.set_file_name(format!("isekai-ssh-holder-{digest}.log"));
     Ok(path)
 }
 
@@ -259,9 +286,14 @@ mod tests {
         let intent = sample_intent("example-profile", "ssh");
         let explicit_log_file = runtime_dir.path().join("explicit.log");
 
-        let mut child =
-            spawn_isekai_pipe_connect(&echo_test_shim_path(), runtime_dir.path(), &intent, Some(&explicit_log_file))
-                .expect("spawn_isekai_pipe_connect should succeed");
+        let mut child = spawn_isekai_pipe_connect(
+            &echo_test_shim_path(),
+            runtime_dir.path(),
+            &intent,
+            Some(&explicit_log_file),
+            r"\\.\pipe\isekai-ssh-mux-test",
+        )
+        .expect("spawn_isekai_pipe_connect should succeed");
 
         let intent_path = runtime_dir.path().join("intents").join(format!("{}.json", intent.intent_id));
         let written: ConnectionIntent =
@@ -307,20 +339,35 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    const TEST_CHANNEL_NAME: &str = r"\\.\pipe\isekai-ssh-mux-abcdef0123456789";
+
     #[test]
     fn resolve_pipe_log_file_prioritizes_explicit_override_over_holder_status() {
         let explicit = Path::new("/tmp/explicit.log");
-        assert_eq!(resolve_pipe_log_file(Some(explicit), true), Some(explicit.to_path_buf()));
-        assert_eq!(resolve_pipe_log_file(Some(explicit), false), Some(explicit.to_path_buf()));
+        assert_eq!(resolve_pipe_log_file(Some(explicit), true, TEST_CHANNEL_NAME), Some(explicit.to_path_buf()));
+        assert_eq!(resolve_pipe_log_file(Some(explicit), false, TEST_CHANNEL_NAME), Some(explicit.to_path_buf()));
     }
 
     #[test]
     fn resolve_pipe_log_file_splits_holder_and_foreground_paths_when_no_override() {
-        let holder = resolve_pipe_log_file(None, true).expect("holder_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
-        let foreground = resolve_pipe_log_file(None, false).expect("default_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
+        let holder = resolve_pipe_log_file(None, true, TEST_CHANNEL_NAME)
+            .expect("holder_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
+        let foreground = resolve_pipe_log_file(None, false, TEST_CHANNEL_NAME)
+            .expect("default_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
         assert_ne!(holder, foreground, "holder and foreground must never share a log path (ADR §3.2)");
-        assert_eq!(holder.file_name().unwrap(), "isekai-ssh-holder.log");
+        assert_eq!(holder.file_name().unwrap(), "isekai-ssh-holder-abcdef0123456789.log");
         assert_eq!(holder.parent(), foreground.parent(), "only the file name should differ, not the directory");
+    }
+
+    #[test]
+    fn resolve_pipe_log_file_gives_different_channels_different_holder_paths() {
+        // Regression test for a code-review finding on this ADR's first
+        // draft: two concurrently-active destinations (two `isekai-ssh
+        // <host>` tabs, each with their own detached holder) must never
+        // collide on the same holder log path.
+        let first = resolve_pipe_log_file(None, true, r"\\.\pipe\isekai-ssh-mux-aaaa").unwrap();
+        let second = resolve_pipe_log_file(None, true, r"\\.\pipe\isekai-ssh-mux-bbbb").unwrap();
+        assert_ne!(first, second, "two different holders (different channel_name) must get different log paths");
     }
 
     #[tokio::test]

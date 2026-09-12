@@ -415,7 +415,12 @@ impl RotatingLogFile {
         let mut rotated_name = file_name.to_os_string();
         rotated_name.push(".1");
         let rotated_path = self.path.with_file_name(rotated_name);
-        let _ = std::fs::remove_file(&rotated_path);
+        // `std::fs::rename` already atomically replaces an existing
+        // `rotated_path` on both Unix (`rename(2)`) and Windows
+        // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) — no separate
+        // `remove_file` needed first (code review finding: the extra call
+        // was redundant and briefly turned one atomic replace into
+        // delete-then-rename for no benefit).
         std::fs::rename(&self.path, &rotated_path)?;
         self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         self.written = 0;

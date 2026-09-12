@@ -222,9 +222,10 @@ pub fn log_must_resume_convergence(session_id: SessionId, resume_candidate_id: &
 ///
 /// `attempts`/`elapsed` are only meaningful for `"abandoned"` (the number of
 /// per-candidate failures collected so far, and wall-clock time since the
-/// round began) — both are `0`/`Duration::ZERO` for `"fresh-rendezvous"`,
-/// which logs the instant a session is minted, before any attempt has been
-/// made.
+/// *whole* connect attempt — every round, including any earlier
+/// successful generation advances — began, not just the final round) —
+/// both are `0`/`Duration::ZERO` for `"fresh-rendezvous"`, which logs the
+/// instant a session is minted, before any attempt has been made.
 pub fn log_rendezvous_outcome(
     previous_session_id: Option<SessionId>,
     new_session_id: Option<SessionId>,
@@ -232,12 +233,17 @@ pub fn log_rendezvous_outcome(
     attempts: u32,
     elapsed: Duration,
 ) {
-    let previous = previous_session_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
-    let new_session = new_session_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
+    // The `previous`/`new_session` `String`s are built as inline macro
+    // arguments (rather than `let`-bound before the call) so `log::info!`'s
+    // own level check can skip them entirely when INFO logging is disabled —
+    // a `let` above this call would allocate unconditionally regardless of
+    // the active log level (code review finding).
     log::info!(
         "isekai-transport: rendezvous outcome: previous_session_id={previous} new_session_id={new_session} \
-         class={class} attempts={attempts} elapsed_ms={}",
-        elapsed.as_millis()
+         class={class} attempts={attempts} elapsed_ms={elapsed_ms}",
+        previous = previous_session_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        new_session = new_session_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        elapsed_ms = elapsed.as_millis(),
     );
 }
 
