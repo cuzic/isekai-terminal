@@ -1136,6 +1136,7 @@ async fn resume_with_backoff_until_deadline(
     target: &RelayTarget,
     cross_family_target: Option<&RelayTarget>,
     episode_started_by_network_change: bool,
+    already_cross_family: bool,
     effective_resume_grace_secs: u32,
     profile: &str,
     policy: ResumeDeadlinePolicy,
@@ -1186,6 +1187,24 @@ async fn resume_with_backoff_until_deadline(
                 notify_os(
                     "isekai-pipe connect",
                     &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
+                );
+            }
+            if already_cross_family || switched_this_call.is_some() {
+                // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: the deadline
+                // give-up while already on the cross-family relay target
+                // means every attempt against it kept failing with a
+                // network/mux error long enough to exhaust the (now
+                // relay-length) resume window — never an `UnknownSession`
+                // rejection, or the streak give-up below would have fired
+                // first. This is exactly §3.3's unverified "cached_relay_addr
+                // reachable from the new network" assumption not holding.
+                log::info!("isekai-pipe connect: continuity-lost reason: relay-unreachable");
+                isekai_transport::telemetry::log_rendezvous_outcome(
+                    Some(session_id),
+                    None,
+                    "continuity-lost",
+                    0,
+                    Duration::ZERO,
                 );
             }
             return Err(anyhow::anyhow!(
@@ -1265,6 +1284,23 @@ async fn resume_with_backoff_until_deadline(
                 }
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
+                if switched_this_call.is_some() {
+                    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: only
+                    // logged the one time the switch actually happens in
+                    // this call — deliberately *not* gated on
+                    // `already_cross_family` too, since that would repeat
+                    // this event on every later successful resume against
+                    // the now-permanent relay target for the rest of the
+                    // session, which isn't what this event is meant to mark
+                    // (the transition, not every subsequent resume).
+                    isekai_transport::telemetry::log_rendezvous_outcome(
+                        Some(state.session_id),
+                        Some(state.session_id),
+                        "cross-family-resumed",
+                        0,
+                        Duration::ZERO,
+                    );
+                }
                 return Ok((resumed.data_stream, switched_this_call));
             }
             Err(e) => {
@@ -1304,6 +1340,21 @@ async fn resume_with_backoff_until_deadline(
                         notify_os(
                             "isekai-pipe connect",
                             &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+                        );
+                    }
+                    if already_cross_family || switched_this_call.is_some() {
+                        // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: the
+                        // server has confirmed (via the UnknownSession streak)
+                        // that this session_id is genuinely gone — distinct
+                        // from the deadline give-up above, which means the
+                        // cross-family target was simply unreachable.
+                        log::info!("isekai-pipe connect: continuity-lost reason: session-gone");
+                        isekai_transport::telemetry::log_rendezvous_outcome(
+                            Some(session_id),
+                            None,
+                            "continuity-lost",
+                            0,
+                            Duration::ZERO,
                         );
                     }
                     return Err(anyhow::anyhow!(
@@ -1365,6 +1416,10 @@ pub(crate) async fn run_resume_loop(
     let mut cross_family_target = cross_family_target;
     let mut max_resume_window = max_resume_window;
     let mut resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
+    // Persists across disconnect episodes once the STUN→relay switch
+    // happens in any one of them; this cannot be derived from
+    // `cross_family_target.is_none()` alone.
+    let mut switched_to_cross_family = false;
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1562,6 +1617,7 @@ pub(crate) async fn run_resume_loop(
                     &current_target,
                     cross_family_target.as_ref(),
                     episode_started_by_network_change,
+                    switched_to_cross_family,
                     effective_resume_grace_secs,
                     profile,
                     ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window },
@@ -1573,6 +1629,7 @@ pub(crate) async fn run_resume_loop(
                 if let Some(new_target) = switched {
                     current_target = new_target;
                     cross_family_target = None;
+                    switched_to_cross_family = true;
                     max_resume_window = None;
                     resume_window = effective_resume_window(effective_resume_grace_secs, None);
                 }
@@ -2344,6 +2401,10 @@ mod tests {
             let result = resume_with_backoff_until_deadline(
                 &factory,
                 &target,
+                None,
+                false,
+                false,
+                0,
                 "test-profile",
                 ResumeDeadlinePolicy {
                     resume_window: Duration::from_secs(0),
@@ -2422,6 +2483,10 @@ mod tests {
             let result = resume_with_backoff_until_deadline(
                 &factory,
                 &target,
+                None,
+                false,
+                false,
+                server_granted_grace_secs,
                 "test-profile",
                 ResumeDeadlinePolicy { resume_window, disconnected_at: now, deadline: now, max_resume_window },
                 &mut state,
