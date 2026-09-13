@@ -1319,12 +1319,13 @@ async fn resume_with_backoff_until_deadline(
         )
         .await;
         // Only the `NetworkChanged`-interrupted-a-wait trigger lives here —
-        // the "enough consecutive failures" trigger is checked right after
-        // `stun_failures` is incremented in the `Err` arm below, *before*
-        // this function waits out another backoff delay for an attempt it's
-        // about to abandon anyway (`/code-review` finding on this ADR's
-        // implementation: checking the failure-count trigger only here, at
-        // the top of the *next* iteration, meant the actual switch always
+        // the "enough consecutive failures" trigger is checked later, in
+        // the `Err` arm below (after its own give-up check — see that
+        // block's comment for why), *before* this function waits out
+        // another backoff delay for an attempt it's about to abandon
+        // anyway (`/code-review` finding on this ADR's implementation:
+        // originally checking the failure-count trigger only here, at the
+        // top of the *next* iteration, meant the actual switch always
         // waited through one extra backoff delay beyond
         // `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own "roughly 15s" doc —
         // e.g. its full 10s-capped 6th wait, landing at ~25.5s instead).
@@ -1422,28 +1423,6 @@ async fn resume_with_backoff_until_deadline(
             Err(e) => {
                 if switched_this_call.is_none() {
                     stun_failures = stun_failures.saturating_add(1);
-                    // Checked immediately on the same attempt that pushed
-                    // `stun_failures` over the threshold, not deferred to
-                    // the top of the next iteration's wait (see the
-                    // `NetworkChanged` trigger's own comment above for why
-                    // that deferred form cost an extra backoff delay).
-                    if stun_failures >= switch_attempts_before_cross_family {
-                        if let Some(fallback_target) = cross_family_target {
-                            log::info!(
-                                "isekai-pipe connect: switching to cross-family relay fallback \
-                                 (the original STUN peer failed enough consecutive bare-redial attempts)"
-                            );
-                            current_target = fallback_target;
-                            let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
-                            max_resume_window = budget.max_resume_window;
-                            resume_window = budget.resume_window;
-                            deadline = budget.deadline;
-                            switched_this_call = Some((*current_target).clone());
-                            // See the `NetworkChanged` trigger's identical
-                            // reset above for why this is needed.
-                            attempt = 0;
-                        }
-                    }
                 }
                 // See `is_unknown_session_rejection`'s docs: a single
                 // occurrence isn't reliable proof the session is gone for
@@ -1489,6 +1468,35 @@ async fn resume_with_backoff_until_deadline(
                         "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
                          retrying would never succeed."
                     ));
+                }
+                // Checked only once this attempt's failure didn't already
+                // end the episode above — not right after the
+                // `stun_failures` increment (opus review round 4 on this
+                // ADR's implementation, finding N1): checking it earlier
+                // meant an episode that happened to hit the switch
+                // threshold on the *same* attempt that also confirmed the
+                // `UnknownSession` streak recorded `continuity-lost /
+                // session-gone` as if it had tried the cross-family target,
+                // when it had in fact just decided to switch and given up
+                // on the *old* one in the same breath — inflating ADR §6's
+                // "cross-family actually attempted" denominator with
+                // episodes that never attempted it at all.
+                if switched_this_call.is_none() && stun_failures >= switch_attempts_before_cross_family {
+                    if let Some(fallback_target) = cross_family_target {
+                        log::info!(
+                            "isekai-pipe connect: switching to cross-family relay fallback \
+                             (the original STUN peer failed enough consecutive bare-redial attempts)"
+                        );
+                        current_target = fallback_target;
+                        let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
+                        max_resume_window = budget.max_resume_window;
+                        resume_window = budget.resume_window;
+                        deadline = budget.deadline;
+                        switched_this_call = Some((*current_target).clone());
+                        // See the `NetworkChanged` trigger's identical
+                        // reset above for why this is needed.
+                        attempt = 0;
+                    }
                 }
                 let msg = format!("{e:#}");
                 // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると

@@ -876,3 +876,172 @@ round 2 の major 1件・minor 3件について、対応されたものは正し
 据え置かれたものはいずれも実害が計測品質か稀な経路に限られる。
 **correctness 観点での指摘は残っていない。CI(`rust-core-test-linux` 等)が
 緑になることを確認のうえ、マージしてよい。**
+
+---
+---
+
+# Round 4: `a441addf` + `7b85a2e7`(`/code-review` 由来の追加修正)の再確認
+
+対象: `git diff 8fa7a9f6..7b85a2e7`
+依頼された重点: Site A(`NetworkChanged`、待機直後)と Site B(回数条件、`Err` アーム内)が
+同一イテレーションで二重発火しないか / 一方向切替・streak ロジックとの相互作用。
+
+## 結論
+
+**二重発火はしない(構造的に排他)。一方向切替・streak・budget 計算のいずれも
+壊れていない。タイミング修正そのものは正しい。**
+新規指摘は **minor 1件(N1、計装の帰属)** と記録用の注記2件のみで、
+correctness の退行はない。**マージ可の判断は維持。**
+
+---
+
+## 重点確認(a): Site A / Site B の排他性 — **構造的に排他、二重発火なし**
+
+| | 位置 | ガード |
+|---|---|---|
+| Site A | `resume_loop.rs:1315`(backoff 待機直後) | `switched_this_call.is_none() && backoff_wait_outcome == NetworkChanged && stun_failures >= 1` |
+| Site B | `resume_loop.rs:1401`(`Err` アーム、`stun_failures` インクリメント直後) | 外側 `if switched_this_call.is_none()` の中の `stun_failures >= switch_attempts_before_cross_family` |
+
+同一イテレーション内の実行順は **A → 試行 → B** で、A が発火すると
+`switched_this_call = Some(..)` になるため、
+
+- B の**外側**ガード `if switched_this_call.is_none()`(`:1394`)が false になり、
+  B 本体だけでなく `stun_failures` のインクリメント自体もスキップされる。
+- 逆に B が発火した場合、次イテレーション先頭の A は `switched_this_call.is_none()` が
+  false で素通りする。
+
+いずれか一方しか発火せず、かつ**全体で高々1回**。
+`switched_this_call` が単調(None → Some のみ、Some → None への遷移がない)なことも
+確認したので、一方向切替の不変条件は維持されている。
+
+`switch_attempts_before_cross_family == 1`(ネットワーク変化起因 episode)のときは
+B が必ず最初の失敗で発火するため A は事実上到達不能になるが、これは冗長なだけで
+害はない(round 2 の R2 修正で A にも `stun_failures >= 1` を入れた意図と一致)。
+
+## 重点確認(b): streak / budget との相互作用 — 壊れていない
+
+- **`stun_failures` のカウント**: 切替後は外側ガードで増えなくなる(`:1394`)。
+  cross-family target への失敗が STUN 側のカウンタに混入しない。round 1 からの
+  性質が維持されている。
+- **`state.consecutive_unknown_session`(streak)**: 一切触られていない。
+  切替時にリセットしない仕様(ADR §3.2 タスク4 が明示承認)も維持。
+- **budget 再計算**: 2箇所とも `cross_family_switch_budget()`(`:1218-1223`)を
+  呼ぶ形に集約され、`max_resume_window` / `resume_window` / `deadline` の
+  3値が必ず同時に更新される。C1/R1 で2度起きた「導出値の同期漏れ」の
+  再発経路が構造的に塞がれた。**round 3 で確認した計算式は1文字も変わっていない**
+  (`(elapsed + 45s).max(30s)` → `effective_resume_window` → `disconnected_at + resume_window`)。
+- **`notify_on_give_up` の削除**: 旧変数は初期化時と切替時にしか書かれず、
+  常に `max_resume_window.is_none()` と同値だった。2つの give-up 地点
+  (`:1273`、`:1444`)で直接評価する形に置き換わっており、意味は完全に等価。
+  ミュータブルな導出値が1つ減ったのは、このADRが C1/R1 で踏んだ事故の
+  同型リスクを1つ潰す妥当な変更。
+- **`record_continuity_lost_if_applicable`(`a441addf`)**: 旧2箇所のガード
+  `already_cross_family || switched_this_call.is_some()` を
+  `if !already_cross_family && !switched_this_call { return; }` に
+  ド・モルガン変換しただけで、telemetry 引数の並びも含めて等価。
+  忠実なリファクタであることを diff で確認した。
+- **タイミング修正の正しさ**: B が「Nコ目の失敗と同じ地点」で発火するため、
+  切替までの backoff 累積は 0.5+1+2+4+8 = **15.5秒**となり、
+  `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS` の doc が主張する「roughly 15s」と一致する。
+  指摘(実測 ~25.5秒)は正しく、修正も正しい。
+  なお試行そのものに掛かる時間(最大15秒 × N)はこの15.5秒に含まれないが、
+  それは R1 修正で budget を切替時刻起点にしたことで既に吸収済み。
+
+---
+
+## 新規指摘
+
+### N1(minor). Site B が streak give-up の**前**にあるため、cross-family target を1回も試していないのに `"continuity-lost" / session-gone` が記録されうる
+
+**該当**: `resume_loop.rs:1393-1414`(Site B)と `:1431-1460`(streak give-up)の順序
+
+`Err` アームは現在この順で実行される:
+
+1. `stun_failures += 1` → 閾値到達なら **Site B が切替**(`switched_this_call = Some(..)`)
+2. `update_unknown_session_streak(...)` → `should_give_up` なら
+   `record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), ..., "session-gone")`
+   を呼んで `return Err`
+
+**失敗シナリオ**: `switch_attempts_before_cross_family = 5` の episode で、
+STUN peer は到達可能だがサーバー側でセッションが消えている。
+
+- 試行1〜4 が `UnknownSession`(streak 1〜4)。ただし `elapsed < 30s` のうちは
+  `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` が効いて give-up しない。
+- 試行5 が `UnknownSession`。ここで **まず Site B が発火**して
+  `switched_this_call = Some(..)` になり、**その直後**に streak 判定が
+  `elapsed >= 30s` を満たして give-up → `switched_this_call.is_some() == true` のまま
+  `"continuity-lost" / session-gone` を記録して `return Err`。
+
+つまり **cross-family target へは1回も `reconnect_and_resume` していないのに、
+「cross-family resume も失敗した」を意味する計装が出る**。
+ADR §6 は分母を「cross-family resume が実際に試みられた回数」と定義しているので、
+この1件は分母・分子の両方を1ずつ水増しし、§3.3 の前提(relay の到達可能性)を
+検証するための比率をわずかに歪める。
+
+この修正コミット以前は、切替判定が次イテレーション先頭にあったため
+streak give-up のほうが先に `return` し、この記録は出なかった。
+**タイミング修正の副作用として新しく入った経路。**
+
+**推奨修正**(ロジックの移動のみ、1ブロック): Site B のブロックを
+`if should_give_up { ... return Err(...) }` の**後ろ**へ移す。
+`stun_failures` のインクリメントは今の位置(ガードの中)のままでよい。
+これでタイミング修正の利得(余分な backoff を1回待たない)は保ったまま、
+「切替を記録するのは実際に cross-family を試す直前だけ」に戻せる。
+
+なお挙動面では、この経路で `return Err` すること自体は**正しい**。
+`UnknownSession` は ADR §3.2 タスク4 が明記する通り
+「session_id についての主張であってアドレスについての主張ではない」ため、
+cross-family へ移っても同じ拒否が返るだけで救済にならない。
+直すべきは計装の帰属だけ。
+
+### N2(記録のみ). round 2 で確認した「切替と同一イテレーション内で必ず1回は試行される」という不変条件は、Site B については成立しなくなった
+
+Site A は「切替 → 同じイテレーション内で `reconnect_and_resume`」だが、
+Site B はイテレーション末尾で切替えるため、次に起きるのは
+ループ先頭の `now >= deadline` 判定(`:1264`)である。したがって
+「切替えたのに cross-family を1回も試さず give-up」が理論上ありうる。
+
+実際に到達する条件は2つだけで、どちらも結果としては正しい挙動:
+
+- `grace_window <= elapsed`(ユーザーが `--resume-grace` に極端に小さい値を
+  指定し、サーバー側の猶予も既に尽きている)→ 即 give-up が正しい。
+  既定の10日 grace では到達しない。
+- N1 の streak give-up 経路 → 上述の通り give-up 自体は正しい。
+
+実害はないが、round 2 の OK-1 で「構造上起こりえない」と書いた不変条件が
+弱まった事実は記録しておく(次にこの関数を触る人が round 2 の記述を
+根拠に何かを仮定しないように)。N1 を修正すれば、残るのは1つ目の
+条件だけになる。
+
+### N3(trivia). 切替ログが、それを引き起こした失敗のログより先に出る
+
+Site B は `log::info!("switching to cross-family relay fallback (...)")` を
+出した後で、同じ `Err` アームの末尾(`:1468` 付近)が
+`resume attempt N failed: ...` を出す。ログファイル上は
+「切替 → その原因の失敗」という逆順に見える。
+`--isekai-log-file` を人手で読む運用(ADR §6)なので、気づけば読み解けるが、
+切替ログを `Err` アーム末尾(失敗ログの後)に置くか、失敗の要約を
+切替ログ側に含めると読みやすい。修正は任意。
+
+### R3 は引き続き有効(据え置きのまま)
+
+deadline give-up 側のコメント(`:1283-1286`)の
+「never an `UnknownSession` rejection, or the streak give-up below would have
+fired first」は依然として厳密には不正確(`UnknownSession` が他エラーと
+交互に来ると streak がリセットされ、deadline 側で give-up しうる)。
+round 2 の R3 と同じ内容で、据え置き判断も変わらず妥当。
+
+---
+
+## Round 4 の推奨アクション
+
+1. **N1 を直す**(推奨、必須ではない)。Site B のブロックを
+   streak give-up の `return` の後ろへ移すだけ。計装の正確さは
+   ADR §6 の成功基準を測る唯一の手段なので、運用データを取り始める前に
+   入れておく価値がある。
+2. N2 は記録のみ。N3・R3 は任意。
+3. m9(回帰テスト)は `ISEKAI_PIPE_DESIGN.md` Epic S 末尾に
+   フォローアップとして明記済み(`2bb9e098`)であることを確認した。
+   round 3 の F-3 で推奨した対応が取られている。
+
+**N1 を直しても直さなくても correctness の退行はない。CI が緑ならマージしてよい。**
