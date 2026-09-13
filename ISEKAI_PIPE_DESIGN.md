@@ -2062,3 +2062,13 @@ russh に依存しないという既存方針に反するため——ただし�
 自動復旧する見込みで`.claude/rules/always-connects.md`には抵触しない)。
 Androidは`isekai-pipe connect`プロセスを起動しない構造のため、本Epicの変更は
 構造上到達しない(§5)。
+
+**フォローアップ(未対応)**: opus-adversarial-consultによる実装レビュー
+(3ラウンド)で見つかったC1(critical、切替直後にmax_resume_windowを
+即座に成功前提のNoneへ昇格していたバグ)→R1(major、その修正が
+disconnected_at起点だったため試行回数が実質1回に減っていたバグ)という、
+「窓の起点・試行回数」を巡る取り違えが2段階で発生した。これを機械的に
+止める回帰テスト(cross-family targetへの切替後、実際に何回
+`reconnect_and_resume`が試みられるかを数える単体テスト、
+`resume_with_backoff_until_deadline`を直接呼ぶ既存テストの形で書ける)は
+未追加のまま。次にこの関数の窓計算を触るときに追加することを推奨する。
