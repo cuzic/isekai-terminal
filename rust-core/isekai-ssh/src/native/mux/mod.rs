@@ -472,6 +472,95 @@ async fn wait_or_abort_over<I: tokio::io::AsyncRead + Unpin>(delay: Duration, st
 /// only — no foreground shell (see [`run_as_holder`]'s docs).
 #[cfg(windows)]
 pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
+    // Open this holder's own diagnostics log (ADR_ISEKAI_SSH_EXIT_
+    // DIAGNOSTICS.md §3.4) *before* anything below that can fail this
+    // function early — most importantly `prepare_with_tofu`'s
+    // `build_intent_or_bootstrap` a few lines down, whose silent re-bootstrap
+    // is exactly the failure this log exists to explain (ADR §C1: a holder
+    // that dies before ever serving a client is the single most opaque
+    // failure mode, and it must not depend on `prepare_with_tofu` having
+    // already succeeded once). `parse_wrapper`/`resolve_for_native` are
+    // local/synchronous (no network dial, unlike the bootstrap this avoids
+    // depending on) — cheap enough not to meaningfully delay the stdin drain
+    // immediately below, and recomputing them here plus again inside
+    // `prepare_with_tofu` is the same "safe to redo, it's pure" trade this
+    // module's `dispatch`/`run_with_reconnect` already make on every retry
+    // rather than threading a hook through `prepare_with_tofu`'s shared
+    // (Unix-reused) signature just for this one caller.
+    let early_channel_name = crate::wrapper::parse_wrapper(args.clone())
+        .and_then(|plan| {
+            // `prepare_with_tofu` below normally does this via its own
+            // internal `wrapper::init_logging(&plan)` call, moments later —
+            // but the `is_enabled()`/`append_verbose_line` calls just below
+            // need `LOG_FILE`/`VERBOSE_LOG_FILE` to already reflect this
+            // invocation's real `--isekai-log-file` setting *now*, not after
+            // `prepare_with_tofu` gets around to it (`/code-review` finding:
+            // without this, `is_enabled()` always reads false here — this
+            // whole block runs before either sink exists — silently
+            // defeating both the §C4 skip-when-explicit-override check and
+            // the §C2 breadcrumb writes below). `init_logging` opening the
+            // same target twice is harmless (`Sink::open`'s docs: a second
+            // `open()` just drops the redundant handle) and
+            // `prepare_with_tofu`'s own call still owns the real error
+            // handling for an explicit `--isekai-log-file` that fails to
+            // open — this early, ignored-result call exists purely for the
+            // side effect of populating the sinks sooner.
+            let _ = crate::wrapper::init_logging(&plan);
+            crate::wrapper::resolve_for_native(&plan)
+                .map(|(resolution, host_config)| naming::channel_name(&host_config, &resolution, plan.destination_host()))
+        })
+        .map_err(|err| {
+            // `resolve_for_native` does real file I/O (`~/.ssh/config`
+            // parsing) and can fail on its own, independent of the
+            // bootstrap dial §C1 is about. There is no channel digest to
+            // name a per-holder file with in that case, so this is the one
+            // remaining spot this early block can still report to: the
+            // default verbose log, if `init_logging` (just above) managed
+            // to open it (`/code-review` finding — otherwise this failure
+            // would reach `prepare_with_tofu`'s identical `?` moments later
+            // and vanish into the same `NUL` this whole block exists to
+            // avoid).
+            crate::log_file::append_verbose_line(&format!(
+                "isekai-ssh mux holder: could not resolve connection config before opening its diagnostics log: {err:#}"
+            ));
+            err
+        })
+        .ok();
+    // Skip entirely when `--isekai-log-file` was explicitly given:
+    // `log_file::dispatch`'s priority order always prefers that override
+    // over this holder sink, so installing it anyway would only create a
+    // permanently-empty `-ssh.log` companion file and log a "writing holder
+    // diagnostics to <path>" line that is not actually where anything ends
+    // up (`ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md` §C4).
+    if !crate::log_file::is_enabled() {
+        if let Some(channel_name) = &early_channel_name {
+            match naming::ssh_holder_log_file(channel_name).and_then(|path| crate::log_file::init_holder_log(&path).map(|()| path)) {
+                Ok(path) => {
+                    log_line!("isekai-ssh mux holder: writing holder diagnostics to {}", path.display());
+                    // A breadcrumb in the *old* default log: once the
+                    // holder sink above is installed, `dispatch` routes
+                    // every subsequent `log_line!`/`log_line_verbose!`
+                    // there instead of `isekai-ssh.log` (ADR §C2) —
+                    // without this line, a reader who already found
+                    // `isekai-ssh.log` (e.g. via `isekai-ssh doctor`)
+                    // would see the trail go cold with no pointer to
+                    // where it actually continues.
+                    crate::log_file::append_verbose_line(&format!(
+                        "isekai-ssh mux holder: further diagnostics for this holder continue in {}",
+                        path.display()
+                    ));
+                }
+                // This one line is the most important thing to know when
+                // the holder log doesn't exist at all — it must not itself
+                // depend on the log it's reporting as unavailable, so it
+                // goes to the always-on default verbose log instead of
+                // `log_line!`'s terminal-only (i.e. `NUL`, for a holder)
+                // fallback.
+                Err(err) => crate::log_file::append_verbose_line(&format!("isekai-ssh mux holder: holder diagnostics log unavailable: {err}")),
+            }
+        }
+    }
+
     // Read the passphrase hand-off (Phase 1b), if any, off this process's own
     // stdin *before* `connect::prepare` (a trust-store lookup that can
     // involve a network re-deploy dial) or `try_claim` — draining stdin
@@ -499,6 +588,17 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     // (the destination is already trusted by the time a holder is spawned)
     // and what happens in the rare case it isn't.
     let prepared = connect::prepare_with_tofu(args, crate::wrapper::TofuConfirmation::Silent).await?;
+    // Deliberately *not* reusing `early_channel_name` here: `prepared` is
+    // this call's own authoritative `host_config`/`resolution`, resolved
+    // after the `await` above (draining stdin, then `prepare_with_tofu`'s
+    // own dial) had a chance to race a concurrent config/trust change
+    // (`/code-review` finding — `early_channel_name` is a best-effort
+    // snapshot taken *before* that await, good enough to name a diagnostics
+    // file early, but the channel this holder actually claims below must
+    // match what every other tab's own fresh `prepare` call will compute,
+    // not a possibly-stale earlier snapshot). Recomputing here is the same
+    // "safe to redo, it's pure" trade `early_channel_name` itself already
+    // relies on.
     let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
     let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
     let holder_channel = local_ipc_mux::WindowsNamedPipeChannel::try_claim(&channel_name)
