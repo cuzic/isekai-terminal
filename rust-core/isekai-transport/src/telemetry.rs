@@ -197,35 +197,36 @@ pub fn log_must_resume_convergence(session_id: SessionId, resume_candidate_id: &
     );
 }
 
-/// Logged for the two per-round "birth"/"death" events a round runner
-/// (`resume::connect_via_relay_resumable_with_fallback`) can produce for one
-/// attach attempt: a brand new session being minted at the very start of a
-/// round (`class = "fresh-rendezvous"`, `new_session_id = Some(..)`), or the
-/// round giving up entirely — every candidate exhausted, or the generation
-/// retry budget exhausted — before ever completing an attach
-/// (`class = "abandoned"`, `new_session_id = None`). See
-/// `ADR_ISEKAI_SSH_OBSERVABILITY.md` §3.3, which added this to answer
-/// `ADR_STUN_REESTABLISH_CONTINUITY.md` §3's open question of whether a true
-/// re-rendezvous (both client and server addresses changing at once) is
-/// detected at all.
+/// Logged for rendezvous and resume-continuity outcomes produced by
+/// `resume::connect_via_relay_resumable_with_fallback` and by
+/// `isekai-pipe`'s cross-family STUN-to-relay switch in `resume_loop.rs`
+/// (`ADR_STUN_REESTABLISH_CONTINUITY.md` §3.2). The relay fallback round
+/// runner records a brand new session minted at the start of a round
+/// (`class = "fresh-rendezvous"`, `new_session_id = Some(..)`) or a round
+/// that gives up before completing an attach (`class = "abandoned"`,
+/// `new_session_id = None`). The cross-family resume path records preserved
+/// byte-stream continuity across a transport-family switch
+/// (`class = "cross-family-resumed"`, `previous_session_id == new_session_id`)
+/// and loss of that continuity after the cross-family target also fails
+/// (`class = "continuity-lost"`, `new_session_id = None`).
 ///
-/// `previous_session_id` is `None` at every call site this ADR's scope
-/// actually covers: within one round runner invocation there is no earlier
-/// in-process session to report (the one case where it would be
-/// meaningful — a bare redial that keeps the *same* `session_id`, i.e.
-/// `previous_session_id == new_session_id` — is deliberately out of scope
-/// here; `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Task 3.4 already logs that
-/// path once). The parameter still exists (rather than being dropped
-/// outright) so a future caller that *does* have an earlier session to
-/// report (e.g. a bare-redial call site) can populate it without a second,
-/// near-identical logging function.
+/// `previous_session_id` is `None` for the relay fallback round runner
+/// because one invocation has no earlier in-process session to report. It is
+/// intentionally populated by callers that do have such a session. In
+/// particular, `"cross-family-resumed"` is the supported case where
+/// `previous_session_id` and `new_session_id` are the same value: the session
+/// id did not change, and that sameness is the signal that byte-level resume
+/// continuity survived the family switch.
 ///
 /// `attempts`/`elapsed` are only meaningful for `"abandoned"` (the number of
 /// per-candidate failures collected so far, and wall-clock time since the
 /// *whole* connect attempt — every round, including any earlier
 /// successful generation advances — began, not just the final round) —
-/// both are `0`/`Duration::ZERO` for `"fresh-rendezvous"`, which logs the
-/// instant a session is minted, before any attempt has been made.
+/// both are `0`/`Duration::ZERO` for `"fresh-rendezvous"` and
+/// `"cross-family-resumed"`, which log the instant an outcome is known rather
+/// than a counted exhaustion path. Cross-family `"continuity-lost"` also uses
+/// `0`/`Duration::ZERO`; its more specific failure bucket is emitted by the
+/// caller as a paired `continuity-lost reason:` log line.
 pub fn log_rendezvous_outcome(
     previous_session_id: Option<SessionId>,
     new_session_id: Option<SessionId>,

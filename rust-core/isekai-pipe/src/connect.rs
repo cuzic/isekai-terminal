@@ -715,7 +715,8 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         }
         ConnectRoute::StunWithFallback => {
             let (target, candidates) = resolve_stun_candidates(&intent, &session_secret).await?;
-            let stun_result = run_stun_p2p_with_fallback(&target, &candidates, &profile, intent.resume_grace_secs).await;
+            let cross_family_target = build_cross_family_target(&intent);
+            let stun_result = run_stun_p2p_with_fallback(&target, &candidates, cross_family_target, &profile, intent.resume_grace_secs).await;
             return recover_via_cross_family_fallback(
                 stun_result,
                 &intent,
@@ -764,6 +765,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 cert_sha256_hex: cert_pin.to_hex(),
                 session_secret,
             };
+            let cross_family_target = build_cross_family_target(&intent);
             // Epic R PR2, Task 2.11: same `BUSY_OTHER_SESSION` retry the
             // relay paths and `run_stun_p2p_with_fallback` already get — a
             // fresh reconnect racing this same client's own not-yet-expired
@@ -793,7 +795,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                         session_secret: target.session_secret.clone(),
                         local_bind_port_range: intent.local_bind_port_range,
                     };
-                    run_stun_p2p_resumable(&factory, &relay_target, &profile, connection).await
+                    run_stun_p2p_resumable(&factory, &relay_target, cross_family_target, &profile, connection).await
                 }
                 Err(e) => {
                     recover_via_cross_family_fallback(
@@ -809,6 +811,54 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             }
         }
     }
+}
+
+/// Builds the pre-validated cross-family relay target for STUN P2P's
+/// resume-preserving fallback (`ADR_STUN_REESTABLISH_CONTINUITY.md` §3.2 task 2).
+///
+/// Deliberately never fails the caller: an invalid/missing
+/// `cross_family_fallback` on the profile just disables cross-family resume
+/// for this connect attempt (`None`) rather than aborting before the
+/// *primary* STUN transport is even tried. Erroring out here would violate
+/// `.claude/rules/always-connects.md` — a stale or malformed fallback entry
+/// must never break an otherwise-healthy STUN P2P connection (opus review
+/// round on this ADR's implementation, finding M2).
+fn build_cross_family_target(intent: &ConnectionIntent) -> Option<RelayTarget> {
+    let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
+        return None;
+    };
+    match try_build_cross_family_target(intent, helper_addr, server_name, session_secret_b64) {
+        Ok(target) => Some(target),
+        Err(e) => {
+            log::warn!(
+                "isekai-pipe connect: ignoring invalid cross_family_fallback ({e:#}); \
+                 cross-family resume is disabled for this connect attempt"
+            );
+            None
+        }
+    }
+}
+
+fn try_build_cross_family_target(
+    intent: &ConnectionIntent,
+    helper_addr: &str,
+    server_name: &str,
+    session_secret_b64: &str,
+) -> Result<RelayTarget> {
+    let session_secret = decode_secret(session_secret_b64)
+        .context("isekai-pipe connect: cross_family_fallback has an invalid session secret")?;
+    let (cert_pin, server_name) =
+        isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
+            .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
+    Ok(RelayTarget {
+        helper_addr: helper_addr
+            .parse()
+            .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
+        server_name: server_name.as_str().to_string(),
+        cert_sha256_hex: cert_pin.to_hex(),
+        session_secret,
+        local_bind_port_range: intent.local_bind_port_range,
+    })
 }
 
 /// If `result` failed and `intent.cross_family_fallback` names a `Relay`
@@ -845,9 +895,6 @@ async fn recover_via_cross_family_fallback(
         return Err(primary_err).with_context(|| format!("isekai-pipe connect: {context_label} failed"));
     };
     log::warn!("isekai-pipe connect: {context_label} failed ({primary_err:#}); trying cross-family relay fallback");
-    let session_secret = decode_secret(session_secret_b64).with_context(|| {
-        format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback's session secret was invalid")
-    })?;
     let identity = isekai_transport::CandidateIdentity {
         kind: "relay",
         source: "cross-family-fallback",
@@ -857,29 +904,21 @@ async fn recover_via_cross_family_fallback(
     // Unlike `intent.transport`, `intent.cross_family_fallback` never passes
     // through `TryFrom<&isekai_transport::TransportIntent> for CandidateDraft`
     // — it's read directly here, so it needs its own validation checkpoint
-    // rather than trusting the raw persisted strings.
-    let (cert_pin, server_name) =
-        isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
-            .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
-    run_relay_resumable(
-        &RelayTarget {
-            helper_addr: helper_addr
-                .parse()
-                .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
-            server_name: server_name.as_str().to_string(),
-            cert_sha256_hex: cert_pin.to_hex(),
-            session_secret,
-            local_bind_port_range: intent.local_bind_port_range,
-        },
-        &intent.profile,
-        intent.resume_grace_secs,
-        identity,
-        experimental_network_rebind,
-        relay_transport,
-        tethering_interface,
-    )
-    .await
-    .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
+    // rather than trusting the raw persisted strings. Shared with
+    // `build_cross_family_target`'s own validation (`/code-review` finding
+    // on this ADR's implementation: this function used to reimplement the
+    // identical decode/validate/parse/`RelayTarget`-construction sequence
+    // inline) — the two error-wrapping conventions differ (this one embeds
+    // `primary_err`/`context_label`, `build_cross_family_target`'s degrades
+    // to `None`), but the underlying validation must stay identical between
+    // the STUN-primary-with-cross-family-target path and this sequential
+    // relay-fallback path.
+    let relay_target = try_build_cross_family_target(intent, helper_addr, server_name, session_secret_b64).with_context(|| {
+        format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback was invalid")
+    })?;
+    run_relay_resumable(&relay_target, &intent.profile, intent.resume_grace_secs, identity, experimental_network_rebind, relay_transport, tethering_interface)
+        .await
+        .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
 }
 
 fn intent_session_secret_b64(transport: &IntentTransport) -> &str {

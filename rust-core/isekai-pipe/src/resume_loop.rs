@@ -67,6 +67,123 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// only keeps bare-redial resume attempts alive briefly before returning
 /// control to the wrapper's full STUN re-establishment loop.
 const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
+/// How many consecutive failed bare-redial attempts against the *original*
+/// STUN peer address, within one disconnect episode, before switching to the
+/// cross-family relay fallback (if one exists) — independent of, and usually
+/// reached much sooner than, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` (that streak
+/// only increments on a specific `UnknownSession` *rejection*; this counter
+/// increments on *any* attempt failure, since a STUN bare redial against a
+/// peer address the client can no longer reach typically fails as a mux/QUIC
+/// dial error, never even reaching a point where the server could reject it).
+/// At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, 4s, 8s, capped at 10s) the
+/// cumulative *wait between* attempts is roughly 15s — **but that is not
+/// when the switch actually fires** (opus review round 5 on this ADR's
+/// implementation): each attempt's own `reconnect_and_resume` can itself
+/// cost up to two separate `TRANSPORT_STEP_TIMEOUT`s (its `connect` step
+/// and its `request_resume` step are timed independently, ~15s each — see
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`'s own docs), so the
+/// count alone can take up to ~90s (15s/attempt) or ~165s (30s/attempt) of
+/// wall-clock time to reach this many failures — the second figure already
+/// exceeds `STUN_RESUME_GIVE_UP_WINDOW` (120s), meaning the count-based
+/// trigger could silently *never* fire before the deadline it's supposed to
+/// preempt. `should_switch_to_cross_family` (near `cross_family_switch_
+/// budget`) closes this by also switching once the *remaining* time before
+/// the deadline stops being enough for even one cross-family probe,
+/// independent of this attempt count — see that function's own docs.
+///
+/// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
+/// single sequential loop with no second concurrent reconnect driver, so
+/// there's nothing to latch against yet; build one only if real-world
+/// measurement shows otherwise. The server's own PREEMPT_WAIT_TIMEOUT
+/// (engine/mod.rs, 2s) adds at most 2s of latency to whichever attempt races
+/// it, comfortably inside this switch's own bounded windows above.
+const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
+/// How long, measured from the *moment of the switch itself* (not from
+/// `disconnected_at` — see the R1 note below), `resume_with_backoff_until_
+/// deadline` keeps retrying the cross-family relay target *before that
+/// target has ever succeeded* in this disconnect episode.
+///
+/// This is deliberately **not** the same as the relay-grace-based deadline
+/// (`None`/multi-day) that `run_resume_loop` installs for later episodes
+/// once the switch has actually succeeded once (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 7's "成功した後" wording, and its own separate task 4 bullet
+/// requiring a *bounded* first attempt) — the two are easy to conflate
+/// because both are implemented as `ResumeDeadlinePolicy::max_resume_window`
+/// (opus review round on this ADR's implementation, finding C1: an earlier
+/// cut of this code installed the multi-day deadline immediately upon
+/// switching, before the cross-family target had ever answered, which — if
+/// `cached_relay_addr` turned out to be unreachable from the client's new
+/// network, exactly the unverified assumption §3.3 calls out — made
+/// `isekai-pipe connect` hang for up to `DEFAULT_RESUME_GRACE_SECS` instead
+/// of ever returning control to `isekai-ssh`'s wrapper-level
+/// `lightweight_retries`/`redeploy_gate` escalation that `always-connects.md`
+/// depends on).
+///
+/// **R1** (opus review round 2 on this ADR's implementation): the switch
+/// call site adds this to *elapsed time since `disconnected_at`* rather than
+/// anchoring the whole window to `disconnected_at` directly, because the
+/// switch itself can already be tens of seconds into the episode by the
+/// time it fires — `switch_attempts_before_cross_family` real attempts
+/// against the *original* STUN target, each up to two separate
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`s (15s each, for its
+/// `connect` and `request_resume` steps — see `STUN_TO_CROSS_FAMILY_SWITCH_
+/// ATTEMPTS`'s own docs for the full corrected cost model, opus review
+/// round 5), not just the `RESUME_BACKOFF` waits between them. Anchoring this constant to
+/// `disconnected_at` instead left as little as zero of it for the
+/// cross-family target on a slow-to-fail STUN peer, defeating task 4's
+/// "short *bounded retry*" (up to ~`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+/// attempts) requirement — see the call site's own `.max(
+/// UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)`, which keeps task 4's *other* half
+/// (never give up before 30s since `disconnected_at`) true even when the
+/// switch happens quickly. That `.max()` is a no-op against *this*
+/// constant's current value (45s > 30s, so the sum term always wins) —
+/// kept anyway as a guard against a future tuning of `CROSS_FAMILY_SWITCH_
+/// DEADLINE` below 30s silently reopening the gap it exists to close
+/// (confirmed intentional, opus review round 3 on this ADR's
+/// implementation).
+///
+/// This is a budget on the cross-family target *alone*, from the moment of
+/// the switch — not a promise that the whole episode (STUN attempts plus
+/// this) stays under `STUN_RESUME_GIVE_UP_WINDOW` (120s) end to end
+/// (`/code-review` finding on this ADR's implementation, correcting an
+/// earlier version of this doc that claimed exactly that). In the realistic
+/// worst case (all `switch_attempts_before_cross_family` STUN attempts each
+/// burning up to *two* separate `TRANSPORT_STEP_TIMEOUT`s before failing —
+/// their `connect` and `request_resume` steps are timed independently, not
+/// jointly — see `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own docs, updated
+/// after opus review round 5 caught this same undercount here), the
+/// count-based switch can be up to ~90s (one `TRANSPORT_STEP_TIMEOUT`/attempt)
+/// or ~165s (two/attempt) into the episode by the time it *would* fire —
+/// the second figure already past `STUN_RESUME_GIVE_UP_WINDOW`. This
+/// constant alone doesn't reach that trigger in time; the deadline-aware
+/// half of `should_switch_to_cross_family` (near `cross_family_switch_
+/// budget`, below) is what actually keeps the switch from silently never
+/// firing in that band — see its own docs. Either way, `isekai-ssh`'s
+/// wrapper-level `lightweight_retries`/`redeploy_gate` escalation still
+/// takes over once this function finally returns `Err` — always-connects.md
+/// is about *eventual* automatic recovery, not a hard latency SLA.
+const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
+/// The smallest remaining slice of the current deadline in which switching
+/// to the cross-family relay target can still buy anything: one
+/// `RESUME_BACKOFF` first delay (500ms, +25% jitter, rounded up to a whole
+/// second here) plus one `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`-
+/// bounded QUIC connect step. Derived from that constant directly (not
+/// hand-mirrored as a second literal) — `/code-review` finding on this
+/// ADR's implementation: a hand-mirrored copy is exactly the kind of
+/// cross-crate drift this ADR's own review rounds already caught once for
+/// this same 15s-vs-30s distinction (opus review round 5).
+///
+/// Deliberately *not* the ~30s worst case of a whole `reconnect_and_resume`
+/// (its `connect` and `request_resume` steps are each bounded by
+/// `TRANSPORT_STEP_TIMEOUT` *separately*, not jointly): demanding 31s of
+/// headroom would suppress the switch across exactly the moderate
+/// `#@isekai resume-grace` band where it matters most, and the case this
+/// ADR exists for (a `cached_relay_addr` the client's new network cannot
+/// reach at all) is decided in the *connect* step alone — a probe that only
+/// gets this far still yields a real relay-reachability verdict (opus
+/// review round 5 on this ADR's implementation).
+const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(isekai_transport::resume::TRANSPORT_STEP_TIMEOUT.as_secs() + 1);
 /// How long a disconnect stays silent before [`print_reconnect_status`]
 /// actually prints anything. Matches trzsz-ssh's own
 /// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
@@ -126,6 +243,28 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 }
 
 impl std::error::Error for MidSessionDisconnectSignal {}
+
+/// Attached (via `anyhow::Context::context`) to the `anyhow::Error` inside
+/// `PumpFailure::Remote` when `run_resume_loop`'s outer `select!` picked the
+/// `reconnect_signal_rx` branch — i.e. this disconnect episode began because
+/// the OS reported a network change, not because `run_data_pump` itself
+/// failed. Replaces the previous string-only encoding
+/// (`anyhow!("network change detected, reconnecting")`) with the same
+/// typed-marker + `downcast_ref` pattern already used by
+/// `MidSessionDisconnectSignal`/`StaleTrustSignal`, so callers can check for
+/// it without string-matching (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 2:
+/// this is what lets the cross-family switch trigger react to "this episode
+/// started from a network change" without inventing a second channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkChangeReconnectSignal;
+
+impl std::fmt::Display for NetworkChangeReconnectSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the reconnect episode began from an OS network-change signal")
+    }
+}
+
+impl std::error::Error for NetworkChangeReconnectSignal {}
 
 /// Marks an `anyhow::Error` as meaning "this process's local peer (normally
 /// `ssh(1)`) is gone, so no recovery action is meaningful" — Task 2.9 /
@@ -306,7 +445,7 @@ pub(crate) async fn run_relay_resumable(
     let established = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable(&factory, target, requested, identity))
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface, None).await
+    run_resume_loop(&factory, target, None, profile, established, experimental_network_rebind, tethering_interface, None).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -329,12 +468,13 @@ pub(crate) async fn run_relay_resumable_with_fallback(
         retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
             .await
             .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface, None).await
+    run_resume_loop(&factory, &winning_target, None, profile, established, experimental_network_rebind, tethering_interface, None).await
 }
 
 pub(crate) async fn run_stun_p2p_resumable(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     connection: StunP2pConnection,
 ) -> Result<()> {
@@ -358,6 +498,7 @@ pub(crate) async fn run_stun_p2p_resumable(
         run_resume_loop(
             factory,
             target,
+            cross_family_target,
             profile,
             established,
             // STUN P2P's punched NAT mapping is tied to the socket used for
@@ -383,6 +524,7 @@ pub(crate) async fn run_stun_p2p_resumable(
 pub(crate) async fn run_stun_p2p_with_fallback(
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     requested_resume_grace_secs: u64,
 ) -> Result<()> {
@@ -410,7 +552,7 @@ pub(crate) async fn run_stun_p2p_with_fallback(
         // this path intentionally has no source for `local_bind_port_range`.
         local_bind_port_range: None,
     };
-    run_stun_p2p_resumable(&factory, &relay_target, profile, connection).await
+    run_stun_p2p_resumable(&factory, &relay_target, cross_family_target, profile, connection).await
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
@@ -421,10 +563,12 @@ pub(crate) async fn run_stun_p2p_with_fallback(
 /// (see `PumpFailure`'s and `ParentGoneSignal`'s docs). Shared by both
 /// `run_relay_resumable` (single fixed target) and
 /// `run_relay_resumable_with_fallback` (the winning target out of several
-/// candidates) — resuming a session is always scoped to the one connection
-/// that established it, never a fresh candidate search. `max_resume_window`
-/// is `None` for relay callers and `Some` only for STUN P2P's shorter
-/// client-side give-up boundary; it does not alter the server-granted
+/// candidates). STUN P2P may also receive a pre-validated cross-family relay
+/// target for the same helper/session_secret; once the resume loop switches
+/// there, it remains on that target for later disconnect episodes rather
+/// than doing a fresh candidate search. `max_resume_window` is `None` for
+/// relay callers and `Some` only for STUN P2P's shorter client-side give-up
+/// boundary before such a switch; it does not alter the server-granted
 /// `effective_resume_grace_secs`.
 /// Picks an OS-assigned-ephemeral-port wildcard bind address matching
 /// `remote`'s address family — the same "let the OS pick a fresh source"
@@ -804,6 +948,16 @@ async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
     }
 }
 
+/// Which branch [`wait_backoff_or_network_change`] returned through — lets
+/// callers (the cross-family switch trigger, ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 1/2) react to "this wait ended because of a fresh network
+/// change" without string-matching a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffWaitOutcome {
+    TimedOut,
+    NetworkChanged,
+}
+
 /// One backoff wait inside [`resume_with_backoff_until_deadline`]'s retry
 /// loop: sleeps out `delay` (via `sleep_with_live_status` when `is_tty`,
 /// ticking `on_tick`) — but returns early the moment `network_monitor`
@@ -818,7 +972,7 @@ async fn wait_backoff_or_network_change(
     is_tty: bool,
     mut on_tick: impl FnMut(),
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) {
+) -> BackoffWaitOutcome {
     tokio::select! {
         _ = async {
             if is_tty {
@@ -826,12 +980,13 @@ async fn wait_backoff_or_network_change(
             } else {
                 tokio::time::sleep(delay).await;
             }
-        } => {}
+        } => BackoffWaitOutcome::TimedOut,
         Some(_) = network_monitor.next_change() => {
             log::info!(
                 "isekai-pipe connect: OS reported another network change while backing off; \
                  retrying immediately instead of waiting out the remaining backoff"
             );
+            BackoffWaitOutcome::NetworkChanged
         }
     }
 }
@@ -1074,17 +1229,172 @@ struct ResumeDeadlinePolicy {
     max_resume_window: Option<Duration>,
 }
 
+/// Records `"continuity-lost"` (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)
+/// the moment [`resume_with_backoff_until_deadline`] gives up while on the
+/// cross-family relay target — whether that's *this* call's own bounded
+/// probe (`switched_this_call.is_some()`) or a later episode that already
+/// proved the target reachable (`already_cross_family`) — distinguishing
+/// *why* it gave up (`reason`: `"relay-unreachable"` for the deadline
+/// give-up, `"session-gone"` for the confirmed `UnknownSession` streak
+/// give-up) so §3.3's unverified "cached_relay_addr reachable from the new
+/// network" assumption can be checked against real data. No-op (not even the
+/// log line) unless one of the two flags is set — callers don't need to gate
+/// the call themselves.
+///
+/// Factored out (`/code-review` finding on this ADR's implementation) so the
+/// two give-up sites that need this can't drift from each other on the
+/// guard condition or the telemetry call's fixed argument shape, the way
+/// this ADR's own switch-window logic already drifted twice across review
+/// rounds (C1, R1).
+fn record_continuity_lost_if_applicable(already_cross_family: bool, switched_this_call: bool, session_id: isekai_transport::SessionId, reason: &str) {
+    if !already_cross_family && !switched_this_call {
+        return;
+    }
+    log::info!("isekai-pipe connect: continuity-lost reason: {reason}");
+    isekai_transport::telemetry::log_rendezvous_outcome(Some(session_id), None, "continuity-lost", 0, Duration::ZERO);
+}
+
+/// Whether a switch made *now* would still get at least one real probe in
+/// before the current `deadline` — see [`CROSS_FAMILY_MIN_PROBE_BUDGET`].
+///
+/// Switching without this is worse than not switching: the very next thing
+/// `resume_with_backoff_until_deadline` does is its loop-top deadline
+/// give-up, which then records `continuity-lost` / `"relay-unreachable"`
+/// for an episode that never sent a single packet to the relay — the same
+/// ADR §6 denominator inflation N1 (opus review round 4) closed at the
+/// *other* give-up site (the `UnknownSession`-streak one), reached here
+/// through the residual gap round 4's own N2 recorded as harmless (opus
+/// review round 5 on this ADR's implementation).
+fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
+    remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
+}
+
+/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 1's second disjunct), made deadline-aware.
+///
+/// The count alone can silently *never* fire whenever the episode's
+/// deadline is shorter than what reaching `switch_attempts_before_cross_
+/// family` failures actually takes — see `STUN_TO_CROSS_FAMILY_SWITCH_
+/// ATTEMPTS`'s own docs (opus review round 5 on this ADR's implementation).
+/// That is the same "silently degrades back into waiting out the whole
+/// window" failure ADR §3.2 task 1 forbids, arrived at from the other side:
+/// so this also switches once what remains of the window stops being any
+/// bigger than the cross-family probe itself would want — at that point
+/// another bare redial against the *original* target can only consume the
+/// remaining window, while the fallback can still change the outcome.
+///
+/// Deliberately *lowers* the deadline's meaning here, never raises it — the
+/// client must never retry past the server's own grant, which is also what
+/// discards the parked session (`resume_window_for`'s own docs,
+/// `engine/mod.rs`'s `max_parked`/`effective_resume_grace`) — so this
+/// cannot be satisfied by widening `remaining_before_deadline` itself, only
+/// by switching sooner within it.
+fn should_switch_to_cross_family(stun_failures: u32, switch_attempts_before_cross_family: u32, remaining_before_deadline: Duration) -> bool {
+    cross_family_probe_fits(remaining_before_deadline)
+        && (stun_failures >= switch_attempts_before_cross_family || remaining_before_deadline <= CROSS_FAMILY_SWITCH_DEADLINE)
+}
+
+/// The four [`ResumeDeadlinePolicy`]-shaped values that change the moment
+/// [`resume_with_backoff_until_deadline`] switches to the cross-family relay
+/// target — computed once here (`/code-review` finding on this ADR's
+/// implementation: the two call sites that trigger a switch used to
+/// recompute all four inline, identically apart from the trigger's own log
+/// message) so they can't drift from each other. See `CROSS_FAMILY_SWITCH_
+/// DEADLINE`'s own doc for why the budget is anchored to *now*, not to
+/// `disconnected_at`.
+struct CrossFamilySwitchBudget {
+    max_resume_window: Option<Duration>,
+    resume_window: Duration,
+    deadline: Instant,
+}
+
+fn cross_family_switch_budget(disconnected_at: Instant, effective_resume_grace_secs: u32) -> CrossFamilySwitchBudget {
+    let elapsed_since_disconnect = Instant::now().saturating_duration_since(disconnected_at);
+    let max_resume_window = Some((elapsed_since_disconnect + CROSS_FAMILY_SWITCH_DEADLINE).max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR));
+    let resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
+    CrossFamilySwitchBudget { max_resume_window, resume_window, deadline: disconnected_at + resume_window }
+}
+
+/// The full switch side-effect, applied at either of [`resume_with_backoff_
+/// until_deadline`]'s two trigger sites (the `NetworkChanged` wait outcome,
+/// and the failure-count/deadline-imminent check in the `Err` arm): point
+/// `current_target` at `fallback_target`, install its
+/// [`cross_family_switch_budget`], mark `switched_this_call`, and reset
+/// `attempt` so the new target's first backoff delay doesn't inherit a
+/// stale, possibly near-`RESUME_BACKOFF`-max count from the target it's
+/// replacing.
+///
+/// Factored out (`/code-review` finding on this ADR's implementation,
+/// reported independently by three review passes) because this exact block
+/// — previously duplicated verbatim at both call sites apart from their log
+/// message — is precisely the kind of switch-mechanics detail that has
+/// already drifted out of sync across this ADR's own review rounds (C1,
+/// R1, N1, N2, round 5's deadline-aware trigger): one shared function means
+/// a future change to what "switching" does can't update one site and miss
+/// the other.
+///
+/// Deliberately does **not** reset `state.consecutive_unknown_session`
+/// (`/code-review` finding on this ADR's implementation raised this as a
+/// possible bug — confirmed not one): that streak is ADR_STUN_REESTABLISH_
+/// CONTINUITY.md §3.2 task 4's explicit design, carried session-wide rather
+/// than per-target, because an `UnknownSession` rejection is the *server*
+/// asserting it doesn't know this `session_id` — a claim about the session,
+/// not about which network path was used to ask. A rejection observed via
+/// the abandoned STUN target and one observed via the fresh cross-family
+/// target are two independent confirmations of the *same* claim, not stale
+/// evidence about a different target (opus review round 1's "OK-2" already
+/// reached this conclusion for the pre-switch code; it still holds here).
+fn apply_cross_family_switch<'a>(
+    fallback_target: &'a RelayTarget,
+    disconnected_at: Instant,
+    effective_resume_grace_secs: u32,
+    current_target: &mut &'a RelayTarget,
+    max_resume_window: &mut Option<Duration>,
+    resume_window: &mut Duration,
+    deadline: &mut Instant,
+    switched_this_call: &mut Option<RelayTarget>,
+    attempt: &mut u32,
+) {
+    *current_target = fallback_target;
+    let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
+    *max_resume_window = budget.max_resume_window;
+    *resume_window = budget.resume_window;
+    *deadline = budget.deadline;
+    *switched_this_call = Some(fallback_target.clone());
+    *attempt = 0;
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<&RelayTarget>,
+    episode_started_by_network_change: bool,
+    already_cross_family: bool,
+    effective_resume_grace_secs: u32,
     profile: &str,
     policy: ResumeDeadlinePolicy,
     state: &mut ResumeLoopState,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) -> Result<AnyByteStream> {
-    let ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window } = policy;
-    let notify_on_give_up = max_resume_window.is_none();
+) -> Result<(AnyByteStream, Option<RelayTarget>)> {
+    let ResumeDeadlinePolicy { mut resume_window, disconnected_at, mut deadline, mut max_resume_window } = policy;
+    let mut current_target: &RelayTarget = target;
+    let mut switched_this_call: Option<RelayTarget> = None;
+    let mut stun_failures: u32 = 0;
+    // Deliberately no "switch before the first attempt" branch here even
+    // when `episode_started_by_network_change` is true (opus review round on
+    // this ADR's implementation, finding M3): the OS's network-change
+    // monitor also fires for changes that never affect this client's actual
+    // reachability (VPN/tailscale interface flapping, suspend/resume,
+    // secondary-NIC DHCP renewal, ...), and switching away from a perfectly
+    // healthy STUN P2P session on every such event would be a silent,
+    // one-way (see `switched_this_call`'s doc below) downgrade for the rest
+    // of the connection's life. `switch_attempts_before_cross_family` below
+    // gives a network-change-started episode exactly one real attempt
+    // against `current_target` (RESUME_BACKOFF's own first delay, ~500ms)
+    // before switching — still nowhere near the 120s ADR §3.2 task 1 says
+    // not to wait out, but no longer zero attempts either.
+    let switch_attempts_before_cross_family = if episode_started_by_network_change { 1 } else { STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS };
     let mut attempt: u32 = 0;
     loop {
         let now = Instant::now();
@@ -1105,12 +1415,18 @@ async fn resume_with_backoff_until_deadline(
                      Ending this connect attempt; ssh will treat this as a lost connection.",
                 ),
             );
-            if notify_on_give_up {
+            if max_resume_window.is_none() {
                 notify_os(
                     "isekai-pipe connect",
                     &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
                 );
             }
+            // The deadline give-up while on the cross-family relay target
+            // means every attempt against it kept failing with a
+            // network/mux error long enough to exhaust the window — never
+            // an `UnknownSession` rejection, or the streak give-up below
+            // would have fired first.
+            record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "relay-unreachable");
             return Err(anyhow::anyhow!(
                 "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
                  for '{profile}'.{last_error_suffix}"
@@ -1119,19 +1435,69 @@ async fn resume_with_backoff_until_deadline(
 
         let delay = RESUME_BACKOFF.delay_for_attempt(attempt, &mut rand::thread_rng()).min(deadline - now);
         attempt = attempt.saturating_add(1);
-        wait_backoff_or_network_change(
+        let backoff_wait_outcome = wait_backoff_or_network_change(
             delay,
             state.is_tty,
             || print_reconnect_status(true, disconnected_at, resume_window),
             network_monitor,
         )
         .await;
+        // Only the `NetworkChanged`-interrupted-a-wait trigger lives here —
+        // the "enough consecutive failures" trigger is checked later, in
+        // the `Err` arm below (after its own give-up check — see that
+        // block's comment for why), *before* this function waits out
+        // another backoff delay for an attempt it's about to abandon
+        // anyway (`/code-review` finding on this ADR's implementation:
+        // originally checking the failure-count trigger only here, at the
+        // top of the *next* iteration, meant the actual switch always
+        // waited through one extra backoff delay beyond
+        // `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own "roughly 15s" doc —
+        // e.g. its full 10s-capped 6th wait, landing at ~25.5s instead).
+        // `stun_failures >= 1` still guards this: a network-change signal
+        // arriving before the very first attempt against `current_target`
+        // is the M3/R2 zero-attempt-switch hole this ADR's implementation
+        // already closed once and must not reopen here.
+        //
+        // `cross_family_probe_fits` is checked directly (not via
+        // `should_switch_to_cross_family`) — that function's OR branch can
+        // be true even at `stun_failures == 0`, which would reopen the
+        // exact M3/R2 hole the line above just closed (opus review round 5
+        // on this ADR's implementation, explicit warning against reusing it
+        // here). Without this guard, a network-change signal arriving with
+        // little of the deadline left would switch to a target it then
+        // never actually probes — the loop's very next deadline check gives
+        // up immediately and wrongly records `continuity-lost /
+        // "relay-unreachable"` (round 4's N2, "harmless" at the time,
+        // turned out to have this real cost after all).
+        if switched_this_call.is_none()
+            && backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged
+            && stun_failures >= 1
+            && cross_family_probe_fits(deadline.saturating_duration_since(Instant::now()))
+        {
+            if let Some(fallback_target) = cross_family_target {
+                log::info!(
+                    "isekai-pipe connect: switching to cross-family relay fallback \
+                     (OS reported another network change while backing off)"
+                );
+                apply_cross_family_switch(
+                    fallback_target,
+                    disconnected_at,
+                    effective_resume_grace_secs,
+                    &mut current_target,
+                    &mut max_resume_window,
+                    &mut resume_window,
+                    &mut deadline,
+                    &mut switched_this_call,
+                    &mut attempt,
+                );
+            }
+        }
 
         let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
         let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
         match reconnect_and_resume(
             factory,
-            target,
+            current_target,
             state.session_id,
             client_sent_offset,
             client_delivered_offset,
@@ -1160,7 +1526,7 @@ async fn resume_with_backoff_until_deadline(
                     continue;
                 }
                 print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
-                match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
+                match reestablish_control_stream(&resumed.connection, &current_target.session_secret, &state.counters).await {
                     Ok(new_tasks) => state.app_ack_tasks = new_tasks,
                     Err(e) => eprintln!(
                         "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
@@ -1169,9 +1535,29 @@ async fn resume_with_backoff_until_deadline(
                 }
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
-                return Ok(resumed.data_stream);
+                if switched_this_call.is_some() {
+                    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: only
+                    // logged the one time the switch actually happens in
+                    // this call — deliberately *not* gated on
+                    // `already_cross_family` too, since that would repeat
+                    // this event on every later successful resume against
+                    // the now-permanent relay target for the rest of the
+                    // session, which isn't what this event is meant to mark
+                    // (the transition, not every subsequent resume).
+                    isekai_transport::telemetry::log_rendezvous_outcome(
+                        Some(state.session_id),
+                        Some(state.session_id),
+                        "cross-family-resumed",
+                        0,
+                        Duration::ZERO,
+                    );
+                }
+                return Ok((resumed.data_stream, switched_this_call));
             }
             Err(e) => {
+                if switched_this_call.is_none() {
+                    stun_failures = stun_failures.saturating_add(1);
+                }
                 // See `is_unknown_session_rejection`'s docs: a single
                 // occurrence isn't reliable proof the session is gone for
                 // good (it's also what a transient not-yet-parked race on
@@ -1201,16 +1587,63 @@ async fn resume_with_backoff_until_deadline(
                              ssh will treat this as a lost connection.",
                         ),
                     );
-                    if notify_on_give_up {
+                    if max_resume_window.is_none() {
                         notify_os(
                             "isekai-pipe connect",
                             &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
                         );
                     }
+                    // The server has confirmed (via the UnknownSession
+                    // streak) that this session_id is genuinely gone —
+                    // distinct from the deadline give-up above, which means
+                    // the cross-family target was simply unreachable.
+                    record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "session-gone");
                     return Err(anyhow::anyhow!(
                         "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
                          retrying would never succeed."
                     ));
+                }
+                // Checked only once this attempt's failure didn't already
+                // end the episode above — not right after the
+                // `stun_failures` increment (opus review round 4 on this
+                // ADR's implementation, finding N1): checking it earlier
+                // meant an episode that happened to hit the switch
+                // threshold on the *same* attempt that also confirmed the
+                // `UnknownSession` streak recorded `continuity-lost /
+                // session-gone` as if it had tried the cross-family target,
+                // when it had in fact just decided to switch and given up
+                // on the *old* one in the same breath — inflating ADR §6's
+                // "cross-family actually attempted" denominator with
+                // episodes that never attempted it at all.
+                //
+                // `should_switch_to_cross_family` (not a bare `stun_failures
+                // >= switch_attempts_before_cross_family` count check): see
+                // its own docs — the plain count can take longer to reach
+                // than the deadline gives it, in which case this also
+                // switches once the remaining window stops leaving room for
+                // even one cross-family probe (opus review round 5 on this
+                // ADR's implementation).
+                if switched_this_call.is_none()
+                    && should_switch_to_cross_family(stun_failures, switch_attempts_before_cross_family, deadline.saturating_duration_since(Instant::now()))
+                {
+                    if let Some(fallback_target) = cross_family_target {
+                        log::info!(
+                            "isekai-pipe connect: switching to cross-family relay fallback \
+                             (the original STUN peer failed enough consecutive bare-redial attempts, \
+                             or too little of the resume window remains to keep retrying it)"
+                        );
+                        apply_cross_family_switch(
+                            fallback_target,
+                            disconnected_at,
+                            effective_resume_grace_secs,
+                            &mut current_target,
+                            &mut max_resume_window,
+                            &mut resume_window,
+                            &mut deadline,
+                            &mut switched_this_call,
+                            &mut attempt,
+                        );
+                    }
                 }
                 let msg = format!("{e:#}");
                 // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると
@@ -1251,16 +1684,38 @@ fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_alread
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
     experimental_network_rebind: bool,
     tethering_interface: Option<isekai_transport::InterfaceIndex>,
     max_resume_window: Option<Duration>,
 ) -> Result<()> {
+    // `tethering_interface`'s warm-standby is built once from the original
+    // `target` and never re-pointed at `current_target` after a cross-family
+    // switch — deliberately safe today only because every call site that
+    // can pass a `cross_family_target` also hardcodes `tethering_interface`
+    // to `None` (see the warm-standby setup below for the full reasoning).
+    // This turns that "they never coexist" invariant from a comment into
+    // something that fails loudly the day it stops holding, instead of
+    // silently warm-standby-ing a stale target (`/code-review` finding on
+    // this ADR's implementation).
+    debug_assert!(
+        tethering_interface.is_none() || cross_family_target.is_none(),
+        "tethering_interface and cross_family_target must never both be set until warm-standby is made switch-aware"
+    );
     let session_id = established.session_id;
+    let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);
 
-    let resume_window = effective_resume_window(established.effective_resume_grace_secs, max_resume_window);
+    let mut current_target: RelayTarget = target.clone();
+    let mut cross_family_target = cross_family_target;
+    let mut max_resume_window = max_resume_window;
+    let mut resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
+    // Persists across disconnect episodes once the STUN→relay switch
+    // happens in any one of them; this cannot be derived from
+    // `cross_family_target.is_none()` alone.
+    let mut switched_to_cross_family = false;
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1287,8 +1742,24 @@ pub(crate) async fn run_resume_loop(
     // module docs. `None` when the flag wasn't given; every use below is a
     // no-op in that case, matching this codebase's "opportunistic,
     // default-off" convention for experimental features.
+    //
+    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 7's last bullet asks this
+    // to be an explicit decision rather than left implicit: this function
+    // (and `experimental_network_rebind` above) are received once, as plain
+    // arguments, and are *not* re-derived after a cross-family switch. This
+    // is safe today only because `tethering_interface` is currently always
+    // `None` on every call path that can ever carry a `cross_family_target`
+    // (`run_stun_p2p_resumable`/`run_stun_p2p_with_fallback` hardcode `None`
+    // for it) — the two never coexist, so there is nothing to switch. If
+    // `--tethering-interface` is ever wired up for the STUN paths, this
+    // needs revisiting (opus review round on this ADR's implementation,
+    // finding m6, confirmed no live bug for exactly this reason).
+    // Reuses `current_target`'s own clone of `target` (`/code-review`
+    // finding on this ADR's implementation) rather than cloning `target` a
+    // second time — the two are still equal here, before the first loop
+    // iteration has had any chance to switch `current_target` away from it.
     let warm_standby = tethering_interface
-        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), target.clone(), session_id, iface)));
+        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), current_target.clone(), session_id, iface)));
     let warm_standby_task = warm_standby.clone().map(|ws| {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(WARM_STANDBY_PROBE_INTERVAL);
@@ -1340,8 +1811,8 @@ pub(crate) async fn run_resume_loop(
             isekai_netmon::system_monitor(),
             state.network_rebinder.take(),
             experimental_network_rebind,
-            target.helper_addr,
-            target.local_bind_port_range,
+            current_target.helper_addr,
+            current_target.local_bind_port_range,
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
@@ -1352,11 +1823,15 @@ pub(crate) async fn run_resume_loop(
         let outcome = tokio::select! {
             result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters, &mut c2h_already_done) => result,
             Some(()) = reconnect_signal_rx.recv() => {
-                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting")))
+                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting").context(NetworkChangeReconnectSignal)))
             }
         };
         reconnect_signal_task.abort();
         state.app_ack_tasks.abort();
+        let episode_started_by_network_change = matches!(
+            &outcome,
+            Err(PumpFailure::Remote(e)) if e.downcast_ref::<NetworkChangeReconnectSignal>().is_some()
+        );
 
         let give_up = should_give_up_without_resuming(&outcome, c2h_already_done);
         match (outcome, give_up) {
@@ -1436,7 +1911,7 @@ pub(crate) async fn run_resume_loop(
         print_reconnect_status(state.is_tty, disconnected_at, resume_window);
 
         let promoted_stream = match &warm_standby {
-            Some(ws) => promote_warm_standby_once(ws, target, &mut state, disconnected_at).await,
+            Some(ws) => promote_warm_standby_once(ws, &current_target, &mut state, disconnected_at).await,
             None => None,
         };
 
@@ -1449,16 +1924,28 @@ pub(crate) async fn run_resume_loop(
                 // while already backing off, not the first one that got us
                 // here.
                 let mut backoff_network_monitor = isekai_netmon::system_monitor();
-                resume_with_backoff_until_deadline(
+                let (stream, switched) = resume_with_backoff_until_deadline(
                     factory,
-                    target,
+                    &current_target,
+                    cross_family_target.as_ref(),
+                    episode_started_by_network_change,
+                    switched_to_cross_family,
+                    effective_resume_grace_secs,
                     profile,
                     ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window },
                     &mut state,
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
                 )
-                .await?
+                .await?;
+                if let Some(new_target) = switched {
+                    current_target = new_target;
+                    cross_family_target = None;
+                    switched_to_cross_family = true;
+                    max_resume_window = None;
+                    resume_window = effective_resume_window(effective_resume_grace_secs, None);
+                }
+                stream
             }
         };
 
@@ -1922,6 +2409,72 @@ mod tests {
         assert!(!should_give_up);
     }
 
+    // Regression coverage for opus review round 5 on this ADR's
+    // implementation: `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS` alone can take
+    // longer to reach than a short `#@isekai resume-grace` deadline allows,
+    // silently defeating the whole cross-family switch. These pin
+    // `should_switch_to_cross_family`'s two independent reasons to switch
+    // (count reached, or too little of the deadline remains for even one
+    // more probe) without needing a runtime or a dial.
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_below_the_attempt_count_with_plenty_of_time_left() {
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS - 1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(3600)),
+            "must not switch before the attempt count is reached while the deadline is nowhere close"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_fires_once_the_attempt_count_is_reached() {
+        assert!(
+            should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(3600)),
+            "the original count-based trigger must still fire once the threshold is reached"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_fires_early_when_the_deadline_is_about_to_expire_even_below_the_attempt_count() {
+        // This is the fix itself: a short deadline must not silently wait
+        // out the attempt count that would never be reached in time.
+        assert!(
+            should_switch_to_cross_family(1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(40)),
+            "must switch once the remaining window is inside CROSS_FAMILY_SWITCH_DEADLINE, \
+             even with the attempt count far from its threshold"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_when_no_probe_would_fit_before_the_deadline() {
+        // The minimum-probe-budget guard: switching this late would only
+        // produce a same-iteration deadline give-up that never actually
+        // contacted the cross-family target — the false "relay-unreachable"
+        // telemetry row this fix exists to prevent.
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS - 1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(10)),
+            "must not switch when even one cross-family probe would not fit before the deadline"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_on_the_count_reached_branch_either_when_no_probe_would_fit() {
+        // Same guard as the test above, but pinned via the *other*
+        // disjunct (the attempt count itself has already been reached, not
+        // just approached) — `cross_family_probe_fits` gates the whole
+        // function, not just the deadline-imminent branch (opus review
+        // round 6 on this ADR's implementation, finding P4).
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(10)),
+            "must not switch on a reached attempt count either when even one cross-family probe would not fit"
+        );
+    }
+
+    #[test]
+    fn cross_family_probe_fits_is_true_at_exactly_the_minimum_budget() {
+        assert!(cross_family_probe_fits(CROSS_FAMILY_MIN_PROBE_BUDGET), "the boundary itself must still count as fitting");
+        assert!(!cross_family_probe_fits(CROSS_FAMILY_MIN_PROBE_BUDGET - Duration::from_millis(1)), "one tick under the boundary must not");
+    }
+
     #[tokio::test]
     async fn retry_while_busy_other_session_gives_up_once_the_window_elapses() {
         let result: Result<(), FakeConnectError> =
@@ -2226,6 +2779,10 @@ mod tests {
             let result = resume_with_backoff_until_deadline(
                 &factory,
                 &target,
+                None,
+                false,
+                false,
+                0,
                 "test-profile",
                 ResumeDeadlinePolicy {
                     resume_window: Duration::from_secs(0),
@@ -2304,6 +2861,10 @@ mod tests {
             let result = resume_with_backoff_until_deadline(
                 &factory,
                 &target,
+                None,
+                false,
+                false,
+                server_granted_grace_secs,
                 "test-profile",
                 ResumeDeadlinePolicy { resume_window, disconnected_at: now, deadline: now, max_resume_window },
                 &mut state,
@@ -2413,7 +2974,8 @@ mod tests {
             let mut monitor = FireOnceNetworkChangeMonitor::default();
             let started = tokio::time::Instant::now();
             let mut tick_count = 0;
-            wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
+            let outcome = wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
+            assert_eq!(outcome, BackoffWaitOutcome::NetworkChanged);
             assert_eq!(
                 tokio::time::Instant::now(),
                 started,
@@ -2426,7 +2988,8 @@ mod tests {
         async fn waits_out_the_full_delay_when_the_network_monitor_never_fires() {
             let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
             let started = tokio::time::Instant::now();
-            wait_backoff_or_network_change(Duration::from_millis(2500), false, || (), &mut monitor).await;
+            let outcome = wait_backoff_or_network_change(Duration::from_millis(2500), false, || (), &mut monitor).await;
+            assert_eq!(outcome, BackoffWaitOutcome::TimedOut);
             assert_eq!(
                 tokio::time::Instant::now() - started,
                 Duration::from_millis(2500),
