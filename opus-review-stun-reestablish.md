@@ -1045,3 +1045,585 @@ round 2 の R3 と同じ内容で、据え置き判断も変わらず妥当。
    round 3 の F-3 で推奨した対応が取られている。
 
 **N1 を直しても直さなくても correctness の退行はない。CI が緑ならマージしてよい。**
+
+---
+---
+
+# Round 5: `f489b97c`(N1 修正)ほか3コミットの確認 — **見落としなし**
+
+対象: `git diff 7b85a2e7..f489b97c`(`0b4666bd` / `100286a9` / `7f682f7b` / `f489b97c`)
+
+## N1 修正は正しい
+
+Site B のブロックが `if should_give_up { ... return Err(...) }` の**後ろ**
+(`resume_loop.rs:1483-1502`)へ移り、ガードが
+`switched_this_call.is_none() && stun_failures >= switch_attempts_before_cross_family`
+として明示された。確認した点:
+
+- **N1 の経路は閉じた**: streak give-up が先に `return` するため、
+  `record_continuity_lost_if_applicable(..., switched_this_call.is_some(), ..., "session-gone")`
+  (`:1469`)に渡る値は、この経路では必ず `false`(`already_cross_family` でない限り)。
+  cross-family を1回も試していないのに計装が出ることはなくなった。
+- **排他性は維持**: `stun_failures` のインクリメントは依然
+  `if switched_this_call.is_none()`(`:1424`)の中。Site B 自身にも
+  同じ条件が入ったので、Site A が発火済みのイテレーションでは
+  どちらも走らない。全体で高々1回・一方向という不変条件は保たれている。
+- **タイミング修正の利得は失われていない**: Site B は依然として同じ
+  イテレーションの `Err` アーム内にあり、次の backoff 待機に入る前に
+  切替が適用される。`7b85a2e7` が直した「余分な1回の待機(~25.5s)」は
+  再発しない。
+- **streak との関係**: `state.consecutive_unknown_session = streak`(`:1440`)は
+  Site B より前で更新済みなので、切替後も streak が引き継がれる
+  (ADR §3.2 タスク4 が明示承認した仕様)。変更なし。
+- **N2 の残り**: N1 経路が閉じたことで、round 4 の N2(「切替したのに
+  1回も試さず give-up」)に到達しうる条件は
+  「`grace_window <= elapsed`(極端に小さい `--resume-grace`)」1つだけになった。
+  その場合の即 give-up は正しい挙動。記録として残すだけでよい。
+
+## 併せて入った2コミットも確認した(いずれも妥当)
+
+- **`7f682f7b`(切替時に `attempt = 0`)**: 正しい修正。`RESUME_BACKOFF.delay_for_attempt`
+  は `attempt` のみの純関数なので、リセットしないと初めて触る
+  cross-family target への最初のプローブが STUN 側で積み上がった
+  カウントに基づく ~10秒(cap)待ちを食い、45秒しかない probe 窓を
+  大きく削っていた。リセット後は 0.5/1/2/4/8/10s と刻み直すため、
+  45秒の窓に5〜6試行が入る。round 2 の R1 / round 3 で
+  「タスク4の『最大3回』が満たせるか」を論点にしていた部分が、
+  これでさらに余裕を持って満たされる。無限ループ等の副作用もない
+  (`deadline` が依然として上限)。
+- **`100286a9`(doc 訂正)**: 指摘内容・訂正内容とも正しい。
+  R1 修正後の実効エピソード長は最悪 ~135秒になりうるので、
+  旧 doc の「comfortably below `STUN_RESUME_GIVE_UP_WINDOW` (120s)」は
+  確かに成立しない。「これは cross-family target *単体* への予算であって
+  エピソード全体の保証ではない」「`always-connects.md` は *eventual* な
+  自動復旧の要求であってレイテンシ SLA ではない」という整理に同意する。
+  変更前も同シナリオで ~120秒使っていた(しかも連続性を保つ試みは
+  一切しなかった)ので regression でないという評価も正しい。
+
+## 残る指摘(trivia、対応不要)
+
+### T1(trivia). `attempt = 0` リセットにより、その周回の失敗ログが `resume attempt 0 failed` になる
+
+`attempt` はループ先頭で `saturating_add(1)` されてから使われる 1-origin の
+値だが、Site A(`:1358`)/ Site B(`:1498`)のリセットはどちらも、
+そのイテレーションの失敗ログ(`:1508` / `:1510`
+`"resume attempt {attempt} failed"`)より**前**に実行される。
+結果、切替が起きた周回だけ「`resume attempt 0 failed`」と出る
+(Site B の場合、実際には5回目の試行の失敗)。
+ログ上の見た目だけの問題で挙動には影響しない。気になるなら
+リセットを `state.last_resume_error = Some(msg)` の後ろに置くか、
+ログ側で `attempt.max(1)` を使えばよい。修正は任意。
+
+N3(切替ログが原因の失敗ログより先に出る)と R3(deadline give-up 側
+コメントの厳密性)は round 4 のまま有効。いずれも据え置きで問題ない。
+
+---
+
+## 最終判定(Round 5)
+
+**N1 の直し方に見落としはない。correctness の指摘は残っていない。
+CI が緑ならマージしてよい。**
+
+---
+---
+
+# Round 5: `/code-review` 由来の「短い `--resume-window` で切替が餓死する」指摘の裁定
+
+対象: HEAD(`172d2c25`)時点の `rust-core/isekai-pipe/src/resume_loop.rs`
+依頼された論点: (1) 算術とコード経路の独立検証、(2) always-connects 上の重大度、
+(3) 候補A/Bの選択と実装スケッチ、(4) C1/M2/M3/R1/R2/N1 との整合、(5) テスト。
+
+## 結論(先に)
+
+1. **指摘は成立する。ただし依頼文の数値は2箇所ずれており、実害は依頼文より広い。**
+   - 切替が発火するための条件は「窓が90秒以上」ではなく**「窓が約67.5秒以上」**
+     (5回目の試行が*開始*できればよく、切替判定は失敗直後の `Err` アーム内なので
+     deadline を跨いでも実行される)。
+   - `reconnect_and_resume` は **15秒で有界ではなく、最悪30秒**
+     (`TRANSPORT_STEP_TIMEOUT` は「各ネットワーク往復」を縛るもので、connect と
+     request_resume に**別々に**掛かる)。この場合5回目の失敗は t≈165秒で、
+     **既定設定(10日 grace → 事前窓は120秒クランプ)ですら回数トリガーに到達しない。**
+     つまりこれは「短い `--resume-window` を設定した運用者だけの問題」ではない。
+2. **always-connects.md 違反ではない。** 依頼文の見立て通り、give-up は運用者が設定した
+   deadline どおりに起き、`isekai-ssh` の `lightweight_retries`/`redeploy_gate` は
+   ADR 導入前とまったく同じタイミングで起動する。C1 とは**逆向き**の失敗
+   (C1は復旧経路を最大10日殺した / 本件は復旧経路を一切触らない)。
+   重大度は **MAJOR(サイレントな機能無効化 + §6 計装の誤記録)**、
+   blocking の理由は always-connects ではなく **ADR §6 のデータが汚れること**。
+3. **候補Aは却下、候補Bを採る。** ただしAの却下理由は「スコープクリープ」ではなく、
+   もっと強い技術的理由がある(後述 D2): **A は「サーバーが既に破棄した
+   parked session に対して retry し続ける」ことを意味し、このファイルが
+   現在どこでも守っている不変条件を初めて破る。**
+4. 候補Bには**必須の補強が1つ**ある(D3): 早期切替の OR 枝だけでなく、
+   **「1回分のプローブすら入らないなら切り替えない」下限ガード**を
+   *両方の*切替サイトに入れること。これは新機能ではなく、round 4 の N2 が
+   「記録のみ」として残した穴(切替直後に0回試行で give-up)が、実は
+   **`continuity-lost / relay-unreachable` の偽記録**を生む——N1 とまったく同じ
+   分母水増しの別経路——ことが分かったための修正。
+
+---
+
+## 1. 独立検証
+
+### 1.1 コード経路(読んだうえで確認)
+
+| 要素 | 現在地 | 確認内容 |
+|---|---|---|
+| ループ先頭の deadline 判定 | `resume_loop.rs:1276-1310` | `now >= deadline` で give-up。**試行の開始前にだけ**評価される |
+| 事前窓の合成 | `:1771` → `:790`/`:778` | `min(resume_window_for(grace), Some(STUN_RESUME_GIVE_UP_WINDOW))` |
+| `effective_resume_grace_secs` | `engine/mod.rs:1535-1542` | `requested==0 ? max : min(requested, max)`。`max` は `serve --resume-window` |
+| Site A(netmon) | `:1336-1360` | `switched_this_call.is_none() && NetworkChanged && stun_failures>=1` |
+| Site B(回数) | `:1484-1500` | streak give-up の**後**(N1 修正済み)、`stun_failures >= switch_attempts_before_cross_family` |
+| 切替後の予算 | `:1236-1241` | `max_resume_window = (elapsed+45s).max(30s)`、`resume_window = min(grace, それ)` |
+| 1試行の上限 | `isekai-transport/src/resume.rs:734-744` と `:813-822` | **15秒 × 2段**(connect / request_resume それぞれ独立の `timeout`) |
+| backoff | `backoff.rs:47-56` | `500ms × 2^attempt`(10s上限)、ジッター ±25% |
+
+**重要な訂正**: `TRANSPORT_STEP_TIMEOUT` の doc 自身が
+「Bounds **each network round trip** in `reconnect_and_resume`」と書いており、
+`reconnect_and_resume` は `timeout(15s, endpoint.connect(..))` と、その後
+`resume_on_connection` 内の `timeout(15s, request_resume(..))` を**直列に**踏む。
+依頼文(および `CROSS_FAMILY_SWITCH_DEADLINE` の doc `:139-150`)が前提にしている
+「1試行=最大15秒」は**片方の段だけ**を数えている。
+
+### 1.2 算術
+
+ジッター無しの公称値で、`W = min(#@isekai resume-grace, serve --resume-window, 120s)`
+を事前窓とする。n回目の試行の失敗時刻 `T(n) = (累積backoff) + (1試行の所要時間)×n`、
+累積backoff = 0.5 / 1.5 / 3.5 / 7.5 / 15.5 秒。
+
+| 1試行の所要 | T(1..5) | 5回目が**開始**できる条件 | 切替の成立時刻 |
+|---|---|---|---|
+| 15秒(connect が黙って落ちる) | 15.5 / 31.5 / 48.5 / 67.5 / **90.5** | `W > 67.5s` | t≈90.5s |
+| 30秒(connect は通るが RESUME が無応答) | 30.5 / 61.5 / 93.5 / 127.5 / **165.5** | `W > 127.5s` → **120秒クランプにより恒久的に不成立** | 到達しない |
+
+したがって 15秒ケースでの帯域は以下の4つに分かれる(`grace` = 実効 grace 秒):
+
+| 帯域 | 起きること |
+|---|---|
+| `grace ≤ ~67.5s` | **切替が一度も発火しない**。ADR の機能が丸ごと無効(サイレント) |
+| `~67.5s < grace ≤ ~90.5s` | 切替は発火するが、直後の予算が `min(grace, 135.5s) = grace ≤ now` となり**ループ先頭で即 give-up。cross-family へのパケットは0回**。にもかかわらず `record_continuity_lost_if_applicable(.., switched_this_call.is_some()=true, "relay-unreachable")`(`:1305`)が**発火する** |
+| `~90.5s < grace < ~135.5s` | プローブ窓が45秒未満に切り詰められる(例: `grace=120` → 29.5秒) |
+| `grace ≥ ~135.5s`(既定の10日を含む) | 設計どおり45秒のフル予算 |
+
+30秒ケースでは、**上の全帯域が「切替が一度も発火しない」に潰れる**
+(`W` は 120秒クランプを超えられないため)。
+
+### 1.3 到達可能性 — 「運用者の特殊設定」ではない
+
+- `#@isekai resume-grace <duration>` は `isekai-ssh` の**ユーザー向け公開ディレクティブ**
+  (`isekai-ssh/src/wrapper/config.rs:175-178`)で、解決値は
+  (a) クライアントの要求 grace と (b) リモート `isekai-pipe serve --resume-window`
+  の**両方**に同じ値が流れる(`wrapper.rs:1541-1554` → `install_script.rs:242-273`)。
+  つまり `effective_resume_grace_secs` は**ほぼそのままこのディレクティブの値**になる。
+  リポジトリ自身のテストが使っている値は `120` / `180` / `999`
+  (`wrapper.rs:2753` ほか、`:3460` の doc 例は `180s`)——**危険帯域のすぐ内側**。
+- 回数トリガーが唯一のトリガーになるのは、まさに本ADRの中核シナリオの一つである
+  **「ローカルのインターフェースは何も変わらないまま、キャリアNATのマッピングだけが
+  張り替わる」**ケース(netmon が何も報告しない)。round 1 の M3 が指摘した
+  「netmon は過敏」の裏返しで、**この経路では過敏どころか無言**であり、
+  回数トリガーは「めったに使わない保険」ではない。
+- ADR §3.2 タスク1 自身が、条件を論理積にすると
+  「netmon が無言の環境で**このタスクが禁じている『120秒待ち』に静かに退行する**」
+  と警告している。今回の欠陥は**同じ退行の一段深い版**である:
+  論理和にはなっているが、**回数側の disjunct が壁時計 deadline と競争しており、
+  負けると黙って消える**。ADR の文言違反ではないが、明確に文言の意図違反。
+
+---
+
+## 2. always-connects.md 上の重大度 — **違反ではない(依頼文の見立てを支持)**
+
+`resume_with_backoff_until_deadline` は `Err` を返し、
+`run_resume_loop` → `MidSessionDisconnectSignal` → `write_connect_outcome_for_wrapper`
+→ wrapper の `lightweight_retries`/`redeploy_gate` という**ADR導入前と同一の
+エスカレーション**に、**同一のタイミングで**到達する。接続そのものは自動復旧する。
+
+C1 との差は決定的で、C1 は `max_resume_window = None` により
+**エスカレーション自体が最大10日起動しなくなる**ものだった。本件は
+エスカレーション経路にまったく触れていない。
+`always-connects.md` は「*最終的に*自動復旧すること」の規約であり
+(`CROSS_FAMILY_SWITCH_DEADLINE` の doc `:147-150` が自分で書いているとおり)、
+連続性(セッション保持)の維持はその規約の対象外。
+
+**したがって blocking 判定の根拠は always-connects ではない。**
+私がそれでもマージ前修正を推す理由は1点だけ:
+
+> ADR §6 の分母は「cross-family resume が**実際に試みられた**回数」と定義されている。
+> 1.2 の第2帯域は、**1パケットも送っていない episode を分母にも分子にも1ずつ足す**。
+> これは round 4 の N1 とまったく同じ欠陥で、round 4 はそれを(minor ながら)
+> 「運用データを取り始める前に入れておく価値がある」として修正を推奨し、実際に修正された。
+> 同じ基準を当てるなら、**同じ欠陥の別経路である本件も運用データ収集の開始前に塞ぐべき**。
+
+加えて 1.2 の30秒ケースは「既定設定でも機能が一度も動かない」を意味するので、
+**§6 のデータは「relay が到達不能だった」ではなく「そもそも試していない」を
+測ってしまう**。ADR §3.3 の未検証仮定を検証する、という本ADRの主目的が達成できない。
+
+---
+
+## 3. 候補の裁定
+
+### D2. 候補A(事前窓に下限を敷く)は却下 — スコープクリープ以前に、不変条件違反
+
+依頼文は A の難点を「運用者が設定した窓を黙って延ばす」と整理しているが、
+それより強い理由がある。`resume_window_for` の doc(`:756-758`)自身が書いている:
+
+> granted — that, not our own request, is the real deadline: the server
+> **will have already discarded the parked session past this point**
+> regardless of how long we keep retrying.
+
+そしてこれは doc 上の主張にとどまらない:
+`engine/mod.rs:794` が `max_parked = Duration::from_secs(args.resume_window)`、
+`:1535-1542` が `effective_resume_grace = min(requested, args.resume_window)` なので、
+**`effective_resume_grace_secs` は常にサーバー側の parked 保持時間以下**である。
+その先へ retry を延ばしても、サーバーには resume する対象がもう無い。
+
+現状このファイルのすべての窓計算は `effective_resume_window`(= `min`)を通っており、
+**「クライアントはサーバーの付与を超えて retry しない」という不変条件が
+例外なく成立している**(`cross_family_switch_budget` ですら `min` を通す)。
+候補Aはこれを破る**最初の1箇所**になる。しかも買える retry は原理的に無駄。
+
+さらに副次的な理由として、Aの「~95秒」という下限値は 1.1 で訂正した
+**誤ったコストモデル(1試行=15秒)から導かれている**。正しい上限(30秒)で
+引き直すなら下限は ~170秒になり、120秒クランプとも grace とも整合しない。
+**固定の時間下限は、可変な試行コストに対して原理的に正しく引けない。**
+
+### D3. 候補Bを採る(依頼文の leaning を支持)+ 必須の補強
+
+候補Bは「残り時間が1回分のプローブ予算を下回る前に切り替える」ことで、
+試行コストが15秒でも30秒でも、grace が60秒でも10日でも**自動的に正しい側に倒れる**。
+`--resume-window`(= `#@isekai resume-grace`)の意味も、サーバー付与との
+`min` 不変条件も、どちらも変えない。
+
+**依頼文の「窓が短すぎて1回分すら入らないなら切替自体を諦め、今日の挙動のまま」
+という直感に同意する。** ただし理由は依頼文の「どうせ助からないから」より強い:
+1.2 の第2帯域で見たとおり、**そこで切り替えると `continuity-lost /
+relay-unreachable` を偽記録する**。つまり下限ガードは「無害な最適化」ではなく
+**候補Bの正しさの一部**であり、しかも **Site A(netmon 経路)には
+候補Bと無関係に今日から存在する穴**でもある
+(例: `grace=10s` の episode → 15.5秒で Site A が発火 → 予算 `min(10s,60.5s)=10s`
+→ 即 give-up + 偽記録)。round 4 の N2 が「実害はない」と記録した経路の実害は、
+**計装の嘘**という形で存在していた。
+
+---
+
+## 4. 実装スケッチ
+
+すべて `resume_loop.rs` 内で閉じる。`run_resume_loop` 側の状態追加は**不要**
+(判定に必要な情報は `deadline` / `stun_failures` / `switch_attempts_before_cross_family`
+だけで、いずれも1回の呼び出し内で完結する)。
+
+### (1) 定数を1つ追加(`CROSS_FAMILY_SWITCH_DEADLINE`(`:151`)の直後)
+
+```rust
+/// The smallest remaining slice of the current deadline in which switching
+/// to the cross-family relay target can still buy anything: one
+/// `RESUME_BACKOFF` first delay (500ms, +25% jitter) plus one
+/// `TRANSPORT_STEP_TIMEOUT`-bounded QUIC connect step (15s — mirrored here
+/// rather than imported, for the same reason `REPLAY_WRITE_TIMEOUT` above
+/// mirrors it: that constant is private to `isekai-transport`).
+///
+/// Deliberately *not* the ~30s worst case of a whole `reconnect_and_resume`
+/// (its connect and its `request_resume` are bounded by that 15s
+/// *separately* — `TRANSPORT_STEP_TIMEOUT` bounds "each network round
+/// trip", not the call): demanding 31s of headroom would suppress the
+/// switch across exactly the moderate `#@isekai resume-grace` band where it
+/// is most valuable, and the case this ADR exists for (a `cached_relay_addr`
+/// the client's new network cannot reach at all) is decided in the *connect*
+/// step, so a probe that only gets this far still yields a real
+/// relay-reachability verdict.
+const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(16);
+```
+
+### (2) 純粋関数を2つ追加(`cross_family_switch_budget`(`:1236`)の直前)
+
+`update_unknown_session_streak`(`:1136`)と同じ「ダイヤル無しで単体テストできる
+純粋な判定コア」の前例に揃える。
+
+```rust
+/// Whether a switch made *now* would still get at least one real probe in
+/// before the current `deadline` — see `CROSS_FAMILY_MIN_PROBE_BUDGET`.
+///
+/// Switching without this is worse than not switching: the very next thing
+/// `resume_with_backoff_until_deadline` does is its loop-top deadline
+/// give-up, which then records `continuity-lost / relay-unreachable` for an
+/// episode that never sent a single packet to the relay — the same ADR §6
+/// denominator inflation N1 (opus review round 4) closed at the *other*
+/// give-up site, reached here through the residual path that round's N2
+/// recorded as harmless.
+fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
+    remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
+}
+
+/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 1's second disjunct), made deadline-aware.
+///
+/// The count alone silently *never fires* whenever the episode's deadline is
+/// shorter than the attempts the count needs (opus review round 5): each
+/// attempt can burn up to two `TRANSPORT_STEP_TIMEOUT`s, so reaching
+/// `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS` takes ~90s in the 15s-per-attempt
+/// case and ~165s in the 30s one — against a window that is
+/// `min(#@isekai resume-grace, serve --resume-window, STUN_RESUME_GIVE_UP_
+/// WINDOW)`. That is the same "silently degrades back into waiting out the
+/// whole window" failure ADR §3.2 task 1 forbids, arrived at from the other
+/// side. So also switch once what remains of the window is no longer bigger
+/// than the cross-family probe itself would want: at that point another bare
+/// redial can only consume the window, while the fallback can still change
+/// the outcome.
+///
+/// Deliberately *lowers* the deadline's meaning, never raises it — the
+/// client must not retry past the server's own grant, which is also what
+/// discards the parked session (`resume_window_for`'s docs,
+/// `engine/mod.rs`'s `max_parked`/`effective_resume_grace`).
+fn should_switch_to_cross_family(stun_failures: u32, switch_attempts_before_cross_family: u32, remaining_before_deadline: Duration) -> bool {
+    cross_family_probe_fits(remaining_before_deadline)
+        && (stun_failures >= switch_attempts_before_cross_family || remaining_before_deadline <= CROSS_FAMILY_SWITCH_DEADLINE)
+}
+```
+
+### (3) Site B(`:1484`)の条件を差し替える
+
+```rust
+if switched_this_call.is_none()
+    && should_switch_to_cross_family(
+        stun_failures,
+        switch_attempts_before_cross_family,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+{
+    if let Some(fallback_target) = cross_family_target {
+        // ...ブロック本体(ログ / current_target / budget / switched_this_call / attempt = 0)は無変更
+    }
+}
+```
+
+### (4) Site A(`:1336`)には**下限ガードだけ**を足す
+
+```rust
+if switched_this_call.is_none()
+    && backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged
+    && stun_failures >= 1
+    && cross_family_probe_fits(deadline.saturating_duration_since(Instant::now()))
+{
+```
+
+**ここで `should_switch_to_cross_family(stun_failures, 1, remaining)` に
+置き換えてはいけない。** OR 枝が `stun_failures == 0` でも真になりうるため、
+「netmon シグナルが最初の試行より前に来たら0回試行で切り替わる」という
+**M3 / R2 が2度塞いだ穴がそのまま再び開く**。Site A の
+`stun_failures >= 1` は独立した連言のまま残すこと。
+
+### (5) doc の訂正(推奨)
+
+- `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`(`:78-83`)の
+  「cumulative wait is roughly 15s — comfortably far below the 120s」は、
+  **backoff の待ち時間だけを数えていて試行そのものの所要を数えていない**。
+  この誤ったメンタルモデルが本件の直接の原因なので、
+  「これは待ち時間の合計であって切替到達時刻ではない」ことを明記する。
+- `CROSS_FAMILY_SWITCH_DEADLINE`(`:139-150`)の「~90s in」は15秒/試行前提。
+  30秒/試行の上限があることを追記する。
+
+---
+
+## 5. 既存指摘との整合(C1 / M2 / M3 / R1 / R2 / N1)
+
+| 指摘 | 本修正の影響 |
+|---|---|
+| **C1**(成功前に多日 deadline を入れない) | `max_resume_window = None` への昇格は `run_resume_loop:1777-1783`(切替成功後)のまま。本修正は**どの deadline も延ばさない**。むしろ延ばす方向の候補Aを明示的に却下している |
+| **M2**(`build_cross_family_target` を `Option` に) | `connect.rs` 側。無関係、無変更 |
+| **M3 / R2**(0回試行での切替禁止) | Site A の `stun_failures >= 1` は連言のまま維持(4項の警告)。Site B の OR 枝は `Err` アーム内=必ず1回以上失敗した後にしか評価されない。**「切替前に最低1回は現 target を試す」不変条件は維持** |
+| **R1**(予算は切替時刻起点、`disconnected_at` 起点でない) | `cross_family_switch_budget` は一切触らない。`.max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)`(30秒)もそのまま。なお grace が30秒未満のとき、この `.max` は後段の `min(grace, ..)` に打ち消される——これは本修正の影響ではなく、grace クランプ由来の既存の性質(サーバーがその時点で parked session を捨てている以上、正しい挙動) |
+| **N1**(試していないのに `session-gone` を記録しない) | Site B の**位置**(streak give-up の後)は変更しない。条件式だけを差し替える。加えて下限ガードにより、N1 と同型の**もう1つの**偽記録経路(`relay-unreachable` 側)が塞がる |
+| 一方向切替 | `switched_this_call.is_none()` ガード・単調性ともに無変更。切替後は両サイトとも評価されないので振動しない |
+| **N2**(round 4、記録のみ) | 「切替えたのに0回試行で give-up」は下限ガードにより、`grace` 起因の経路が消える。残るのは N1 が既に塞いだ streak 経路のみ。N2 の記述は更新が必要 |
+
+---
+
+## 6. テスト
+
+**この修正は F-3 / m9 の「据え置き」対象にすべきではない。安価に、今すぐ書ける。**
+
+理由: 判定ロジックを純粋関数2つ(`cross_family_probe_fits` /
+`should_switch_to_cross_family`)に出す形にしてあるので、テストは
+`update_unknown_session_streak` の既存テスト(`:2186-2241`)とまったく同じ形
+——ダイヤルもランタイムも不要な `#[test]`——で書ける。最低限これだけ固定すれば
+本件の再発は止まる:
+
+1. `stun_failures = 4, attempts = 5, remaining = 大` → `false`(回数未達では切り替えない)
+2. `stun_failures = 5, attempts = 5, remaining = 大` → `true`(従来の回数トリガーが無傷)
+3. `stun_failures = 1, attempts = 5, remaining = 40s`(< 45s)→ `true`
+   (**本修正の本体**: 回数未達でも deadline 逼迫で切り替わる)
+4. `stun_failures = 4, attempts = 5, remaining = 10s` → `false`
+   (**下限ガード**: 1回分も入らないなら切り替えない=偽 `relay-unreachable` を出さない)
+5. `remaining = CROSS_FAMILY_MIN_PROBE_BUDGET` ちょうど → `true`(境界)
+
+一方、**「短い grace の episode 全体で cross-family へ1回もダイヤルしないこと」を
+end-to-end で固定するテストは、依然として m9 の側に置いたままでよい**:
+`resume_with_backoff_until_deadline` は `Err` 経路では切替の有無を戻り値に
+出さない(`switched` は `Ok` のときだけ返る)ので、観測にはログ/telemetry の
+フックが要る。これは F-3 が指摘した「試行回数と give-up 時刻を数える」テストと
+同じ土俵の作業であり、`ISEKAI_PIPE_DESIGN.md` Epic S 末尾の follow-up(`2bb9e098`)
+に含めれば足りる。**上記5本の純粋関数テストは今回の修正と同じコミットに入れること。**
+
+---
+
+## 7. Round 5 の推奨アクション
+
+1. **候補B + 下限ガードを実装する**(4項のスケッチそのまま、`resume_loop.rs` 内で閉じる)。
+   Site A への適用は**下限ガードのみ**——OR 枝を持ち込むと M3/R2 が再発する。
+2. **純粋関数テスト5本を同じコミットに入れる**(6項)。
+3. **doc を2箇所訂正する**(4-(5))。特に
+   `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS` の「roughly 15s」は本件の原因そのもの。
+4. round 4 の N2 の記述を「実害なし」から「`relay-unreachable` の偽記録を生んでいた、
+   本修正で解消」に更新する(このファイル内の記録として)。
+5. 候補A(窓の下限化)は**採らない**。採る場合は
+   「サーバーが既に破棄した parked session に retry する」ことの是非を
+   ADR 側で先に決める必要があり、それは本ADRのスコープ外。
+
+**always-connects 上の blocking ではない。したがって「CI が緑ならマージしてよい」という
+round 3/4 の判定自体は覆さない**——ただし §6 の運用データ収集を開始する前に
+本修正を入れておくこと。入れずに測ると、測定対象(§3.3 の仮定)ではなく
+測定器の欠陥(切替が発火していない/試していないのに失敗と記録される)を測ることになる。
+
+---
+---
+
+# Round 6: 修正コミット `97264e5d` の再確認 — **実装は一致、残りは doc 3件とテスト1件**
+
+対象: `git diff f489b97c..97264e5d`(`resume_loop.rs` のみ、+166/-16)
+
+## 結論
+
+**Round 5 の実装スケッチと完全に一致している。correctness の退行はない。**
+定数・純粋関数2つ・Site B の条件差し替え・Site A の下限ガードのみ追加(OR枝を持ち込んでいない)、
+いずれも指示どおり。**テスト5本の期待値はすべて正しい。**
+新規指摘は **doc 3件(うち2件は `ISEKAI_PIPE_DESIGN.md` 側の見落とし)と、テスト1本の追加推奨**
+だけで、いずれもマージ阻害要因ではない。
+
+## 検証: 帯域ごとの挙動(修正前後)
+
+`W` を事前窓として、Round 5 の 1.2 の帯域を修正後の実装で引き直した。
+
+| ケース | 修正前 | 修正後 |
+|---|---|---|
+| `grace=30s`(1回分も入らない) | 切替なし | **切替なし(不変)**。t≈15.5s の失敗で `remaining=14.5s < 16s` → 下限ガードで抑止。偽記録も出ない |
+| `grace=80s`(旧・第2帯域) | t≈90.5s で切替 → **0回試行で即 give-up + 偽 `relay-unreachable`** | t≈48.5s(3回目の失敗、`remaining=31.5s ≤ 45s`)で切替 → **約31.5秒の実プローブ** |
+| `grace≥135s` / 既定の10日 | t≈90.5s で回数トリガー | **完全に不変**。t≈67.5s 時点の `remaining=52.5s > 45s` なので OR 枝は発火せず、従来どおり5回目の失敗で切替 |
+| 1試行30秒 × 既定 grace | **切替が一度も発火しない**(5回目の失敗 t≈165.5s > 120s クランプ) | t≈93.5s(3回目の失敗、`remaining=26.5s ≤ 45s`)で切替 → 45秒のフル予算 |
+
+**既定設定の挙動がビット単位で変わらないこと**を確認した(ジッター ±25% と
+試行コストの上下を振っても、`T(4)` 時点の残りは45秒を上回る)。これは
+Round 5 で候補Bを推した際の前提条件そのものなので、重要な確認点。
+
+## テスト5本の期待値検証
+
+| テスト | 引数 | 期待 | 検算 | 判定 |
+|---|---|---|---|---|
+| 1 | `(4, 5, 3600s)` | `false` | `fits(true) && (false ‖ false)` | ✓ |
+| 2 | `(5, 5, 3600s)` | `true` | `fits(true) && (true ‖ …)` | ✓ |
+| 3 | `(1, 5, 40s)` | `true` | `fits(true) && (false ‖ 40≤45)` | ✓ |
+| 4 | `(4, 5, 10s)` | `false` | `fits(false)` → 短絡 | ✓(**下限ガードを実際に固定している**: ガードを外すと `10≤45` が真になり `true` に反転してテストが落ちる) |
+| 5 | 境界(`16s` / `16s-1ms`) | `true` / `false` | — | ✓ |
+
+## 新規指摘
+
+### P1(minor). `CROSS_FAMILY_SWITCH_DEADLINE` の doc 内に、訂正し損ねた「15秒」が1箇所残っている
+
+**該当**: `resume_loop.rs:127-130`(同じ doc コメントの **R1 の段落**)
+
+```
+/// against the *original* STUN target, each up to
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT` (15s), not just the
+/// `RESUME_BACKOFF` waits between them.
+```
+
+この修正コミットは同じ doc コメントの**下の段落**(`:147-160`)を
+「2段 × 15秒」に訂正したが、**25行上の R1 の段落は 15秒のまま**で、
+1つの doc コメント内で同じ量に2つの異なる値が書かれている状態になった。
+C1/R1 が2度踏んだ「導出値の同期漏れ」と同型の、doc 版の drift。
+
+なお **R1 の結論自体は影響を受けない**(「切替時点で既に episode の数十秒が
+経過しうる」という主張は、30秒/試行ならむしろ強まる)。
+`(15s)` → `(up to two of them, ~30s)` 相当に直すだけでよい。
+
+### P2(major-ish な見落とし、ただし doc のみ). `ISEKAI_PIPE_DESIGN.md` Epic S 節が未更新
+
+**該当**: `ISEKAI_PIPE_DESIGN.md:2013` と `:2045`
+
+- `:2013`「`STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`(5回、**累積約15秒**)に達した時点」
+- `:2045`「タスク1の**切替窓(約15秒)**に対して十分小さい(2秒)ため無視できる」
+
+**本件の原因になった誤ったコストモデルが、設計ドキュメント側にそのまま残っている。**
+`resume_loop.rs` の doc だけを直しても、次にこの機能を触る人が最初に読むのは
+`CLAUDE.md` が「実装前に必ず目を通すこと」と指定している `ISEKAI_PIPE_DESIGN.md`
+の方であり、そこに「累積約15秒で切り替わる」と書いてあれば同じ取り違えが再発する。
+**依頼された「doc 訂正の見落とし」は、実質これ。**
+
+加えて `:2007-2013` の切替トリガーの記述は ADR §3.2 タスク1 の2つの disjunct
+しか列挙しておらず、**本コミットが追加した3つ目の条件(deadline 逼迫による
+早期切替)と下限ガードがどこにも書かれていない**。Epic S 節は m9 フォローアップ
+(`2bb9e098`)の置き場所でもあるので、ここに追記しておくのが自然。
+
+`:2045` の結論(preempt 待ち2秒は無視できる)は**そのまま有効**
+(2秒 « `CROSS_FAMILY_MIN_PROBE_BUDGET` の16秒)。直すのは前提の数値だけ。
+
+### P3(記録/独立). 同じ Epic S 節のタスク7の記述が C1 修正前のまま
+
+**該当**: `ISEKAI_PIPE_DESIGN.md:2038-2041`
+
+> 切替時に`ResumeDeadlinePolicy`をfield-patchせず再計算(`max_resume_window`を
+> `Some(STUN_RESUME_GIVE_UP_WINDOW)`から**`None`へ**、…)
+
+これは **C1 が「まさにそれが critical バグ」と指摘した挙動**の記述である。
+現在の実装は切替時に `Some((elapsed + 45s).max(30s))` を入れ、`None` への昇格は
+`run_resume_loop`(切替が成功した後)でのみ行う。本コミットとは無関係の
+既存の staleness だが、**放置すると「設計どおりに直す」つもりで C1 を
+再導入されうる**ので、P2 を直すついでに同じ節で直しておくのが安全。
+
+### P4(テスト、推奨1本追加). 下限ガードが「回数条件」側に対して固定されていない
+
+テスト4 は `stun_failures = 4`(閾値未満)なので、**OR 枝経由でのみ**
+下限ガードを固定している。将来誰かが
+
+```rust
+stun_failures >= switch_attempts_before_cross_family
+    || (remaining <= CROSS_FAMILY_SWITCH_DEADLINE && cross_family_probe_fits(remaining))
+```
+
+のように「下限ガードは OR 枝だけの条件」へ書き換えると、**5本すべて緑のまま**
+Round 5 の第2帯域(`grace` 67.5〜90.5秒: 回数条件が t≈90.5s で成立するが
+残り時間ゼロ)の偽 `relay-unreachable` が復活する。1行足すだけで塞げる:
+
+```rust
+#[test]
+fn should_switch_to_cross_family_does_not_fire_when_the_count_is_reached_but_no_probe_would_fit() {
+    // The `#@isekai resume-grace` band (~68-90s) where the attempt count
+    // *is* reached, but only at a point where the deadline has nothing
+    // left — switching there would record `continuity-lost /
+    // "relay-unreachable"` without ever contacting the relay.
+    assert!(!should_switch_to_cross_family(
+        STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS,
+        STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS,
+        Duration::from_secs(10)
+    ));
+}
+```
+
+### P5(trivia). 削られた1文
+
+`CROSS_FAMILY_SWITCH_DEADLINE` の doc から
+「episode 全体が ~135秒に伸びるのは accepted trade-off であって regression ではない
+(ADR 導入前も同じシナリオで120秒前後で give up していた)」という
+正当化の2文が落ちた。同段落冒頭の「120秒に収まる約束ではない」は残っているので
+実害はないが、「なぜ120秒超過を許容してよいか」の根拠だけが消えた形。
+戻すかどうかは任意。
+
+## Round 6 の推奨アクション
+
+1. **P2 を直す**(`ISEKAI_PIPE_DESIGN.md` Epic S: 「累積約15秒」2箇所の訂正 +
+   3つ目の切替条件と下限ガードの追記)。今回の依頼で聞かれた「doc の見落とし」は実質これ。
+2. **P1 を直す**(`resume_loop.rs:129` の `(15s)`)。同一 doc コメント内の数値不一致。
+3. **P4 のテストを1本足す**(下限ガードを回数条件側に対しても固定)。
+4. P3 は本コミットとは独立の既存 staleness だが、P2 と同じ節なので同時に直すのが効率的。
+5. P5 は任意。
+
+**correctness 上の指摘はない。CI(`rust-core-test-linux`)が緑なら、
+上記 doc/テストの追補とあわせてマージしてよい。**
