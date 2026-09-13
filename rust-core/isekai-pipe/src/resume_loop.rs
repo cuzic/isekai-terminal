@@ -125,9 +125,11 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 /// anchoring the whole window to `disconnected_at` directly, because the
 /// switch itself can already be tens of seconds into the episode by the
 /// time it fires — `switch_attempts_before_cross_family` real attempts
-/// against the *original* STUN target, each up to
-/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT` (15s), not just the
-/// `RESUME_BACKOFF` waits between them. Anchoring this constant to
+/// against the *original* STUN target, each up to two separate
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`s (15s each, for its
+/// `connect` and `request_resume` steps — see `STUN_TO_CROSS_FAMILY_SWITCH_
+/// ATTEMPTS`'s own docs for the full corrected cost model, opus review
+/// round 5), not just the `RESUME_BACKOFF` waits between them. Anchoring this constant to
 /// `disconnected_at` instead left as little as zero of it for the
 /// cross-family target on a slow-to-fail STUN peer, defeating task 4's
 /// "short *bounded retry*" (up to ~`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
@@ -2386,6 +2388,19 @@ mod tests {
         assert!(
             !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS - 1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(10)),
             "must not switch when even one cross-family probe would not fit before the deadline"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_on_the_count_reached_branch_either_when_no_probe_would_fit() {
+        // Same guard as the test above, but pinned via the *other*
+        // disjunct (the attempt count itself has already been reached, not
+        // just approached) — `cross_family_probe_fits` gates the whole
+        // function, not just the deadline-imminent branch (opus review
+        // round 6 on this ADR's implementation, finding P4).
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(10)),
+            "must not switch on a reached attempt count either when even one cross-family probe would not fit"
         );
     }
 

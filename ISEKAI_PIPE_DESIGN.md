@@ -2008,16 +2008,26 @@ opus-adversarial-consult 3ラウンドのレビュー経緯は`ADR_STUN_REESTABL
 参照。
 
 **実装した内容**(同ADR§3.2タスク1〜9):
-- **切替トリガー**(タスク1・2): ネットワーク変化シグナル、または元のSTUN
-  ピアアドレスへの連続bare-redial失敗が`STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`
-  (5回、累積約15秒)に達した時点のいずれか早い方でcross-family relay
-  fallbackへ切り替える(論理積にすると netmon が無応答な環境で120秒待ちに
-  静かに退行するため、論理和にした)。`wait_backoff_or_network_change`の
-  戻り値を`BackoffWaitOutcome`型に、ネットワーク変化起因の切断を
-  `NetworkChangeReconnectSignal`型付きマーカーに変更し、文字列マッチを排除。
-  `intent.cross_family_fallback`由来の`RelayTarget`を`connect.rs`の
-  `build_cross_family_target`で事前検証し、`run_resume_loop`から
-  `resume_with_backoff_until_deadline`まで配線した。
+- **切替トリガー**(タスク1・2): ネットワーク変化シグナル、元のSTUNピア
+  アドレスへの連続bare-redial失敗が`STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`
+  (5回)に達した、または残りのdeadline時間が1回分のcross-familyプローブ
+  予算(`CROSS_FAMILY_MIN_PROBE_BUDGET`、16秒)すら残っていない、の
+  いずれか早い方でcross-family relay fallbackへ切り替える(論理積にすると
+  netmonが無応答な環境で120秒待ちに静かに退行するため、論理和にした)。
+  **3つ目の条件(deadline逼迫)はopus review round5で追加**——
+  `reconnect_and_resume`の1試行は`TRANSPORT_STEP_TIMEOUT`(15秒)が
+  「connect」「request_resume」の2段に**別々に**かかるため最悪30秒かかり、
+  5回の回数条件だけでは既定の120秒STUNクランプ内に到達すらしない
+  (=cross-family fallback機能そのものがサイレントに無効化される)ケースが
+  あったため。切替先に1回分のプローブも入らない場合は切り替えない下限ガード
+  (`cross_family_probe_fits`)も併せて追加——これが無いと切替直後にdeadline
+  超過で即give-upし、cross-familyへ1パケットも送らずに
+  `continuity-lost`/`relay-unreachable`を記録してしまう(§6の分母水増し)。
+  `wait_backoff_or_network_change`の戻り値を`BackoffWaitOutcome`型に、
+  ネットワーク変化起因の切断を`NetworkChangeReconnectSignal`型付きマーカーに
+  変更し、文字列マッチを排除。`intent.cross_family_fallback`由来の
+  `RelayTarget`を`connect.rs`の`build_cross_family_target`で事前検証し、
+  `run_resume_loop`から`resume_with_backoff_until_deadline`まで配線した。
 - **既存のbail-outガードは変更していない**(タスク3): `connect.rs`の
   `MidSessionDisconnectSignal`チェック(cross-family fallbackへの遷移を防ぐ
   ガード)はそのまま。cross-family resumeは`run_resume_loop`内部(データポンプ
@@ -2033,16 +2043,23 @@ opus-adversarial-consult 3ラウンドのレビュー経緯は`ADR_STUN_REESTABL
   `previous_session_id == new_session_id`はスコープ外」という記述を明示的に
   撤回)。
 - **パラメータ束の切替**(タスク7): 切替時に`ResumeDeadlinePolicy`を
-  field-patchせず再計算(`max_resume_window`を`Some(STUN_RESUME_GIVE_UP_WINDOW)`
-  から`None`へ、`resume_window`/`deadline`を`effective_resume_window`から
-  再導出)。この新しいpolicyはセッション内の以後の切断episodeにも持ち回る。
+  field-patchせず再計算するが、**`max_resume_window`をその場で`None`にはしない**
+  (opus review round1のC1で「成功前にNoneへ昇格すると、切替先relayが未検証・
+  到達不能な場合に最大10日ハングする」バグとして発見・修正)。切替の瞬間は
+  短い有界プローブ窓(`CROSS_FAMILY_SWITCH_DEADLINE`、45秒、`disconnected_at`
+  ではなく切替の瞬間からの経過時間+45秒、ただし`UNKNOWN_SESSION_MIN_ELAPSED_
+  FLOOR`の30秒未満にはしない——`cross_family_switch_budget`に集約)を
+  `Some(..)`として設定し、`None`(relay本来の耐性)への昇格は`run_resume_loop`が
+  **cross-family resumeが実際に成功したことを確認した後にのみ**行う。
+  この新しいpolicyはセッション内の以後の切断episodeにも持ち回る。
 - **サーバー側変更なし**(タスク6): `engine/`は無変更(既に`SessionId`のみを
   キーに任意アドレスからのRESUMEを受理する設計のため)。
 - **preemptラッチは実装しない**(タスク8): round 2レビューの結論(cross-family
   resumeは`run_resume_loop`内の単一逐次ループで行われ、2つの再接続駆動主体が
   同時に走る構造にならない)通り、先んじて機構を作らず、実測してから要否を
   決める方針を維持。サーバー側preempt待ちタイムアウト(`engine/mod.rs`)は
-  タスク1の切替窓(約15秒)に対して十分小さい(2秒)ため無視できる。
+  2秒であり、タスク1の切替窓(回数条件で最短約15.5秒、deadline逼迫条件・
+  netmon条件ではそれより短くなることもある)に対して十分小さいため無視できる。
 - **`isekai-ssh doctor`は変更不要**(タスク9): 確立済みセッションの経路を
   静的表示する機能自体が存在しない(常に新規`isekai-pipe probe`を叩く設計)
   ため、追従すべき表示が無いことを確認した。
