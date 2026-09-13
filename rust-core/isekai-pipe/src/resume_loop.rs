@@ -1176,6 +1176,31 @@ struct ResumeDeadlinePolicy {
     max_resume_window: Option<Duration>,
 }
 
+/// Records `"continuity-lost"` (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)
+/// the moment [`resume_with_backoff_until_deadline`] gives up while on the
+/// cross-family relay target — whether that's *this* call's own bounded
+/// probe (`switched_this_call.is_some()`) or a later episode that already
+/// proved the target reachable (`already_cross_family`) — distinguishing
+/// *why* it gave up (`reason`: `"relay-unreachable"` for the deadline
+/// give-up, `"session-gone"` for the confirmed `UnknownSession` streak
+/// give-up) so §3.3's unverified "cached_relay_addr reachable from the new
+/// network" assumption can be checked against real data. No-op (not even the
+/// log line) unless one of the two flags is set — callers don't need to gate
+/// the call themselves.
+///
+/// Factored out (`/code-review` finding on this ADR's implementation) so the
+/// two give-up sites that need this can't drift from each other on the
+/// guard condition or the telemetry call's fixed argument shape, the way
+/// this ADR's own switch-window logic already drifted twice across review
+/// rounds (C1, R1).
+fn record_continuity_lost_if_applicable(already_cross_family: bool, switched_this_call: bool, session_id: isekai_transport::SessionId, reason: &str) {
+    if !already_cross_family && !switched_this_call {
+        return;
+    }
+    log::info!("isekai-pipe connect: continuity-lost reason: {reason}");
+    isekai_transport::telemetry::log_rendezvous_outcome(Some(session_id), None, "continuity-lost", 0, Duration::ZERO);
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1234,30 +1259,12 @@ async fn resume_with_backoff_until_deadline(
                     &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
                 );
             }
-            if already_cross_family || switched_this_call.is_some() {
-                // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: the deadline
-                // give-up while on the cross-family relay target means every
-                // attempt against it kept failing with a network/mux error
-                // long enough to exhaust the window — never an
-                // `UnknownSession` rejection, or the streak give-up below
-                // would have fired first. This is exactly §3.3's unverified
-                // "cached_relay_addr reachable from the new network"
-                // assumption not holding. The window itself is either the
-                // short `CROSS_FAMILY_SWITCH_DEADLINE` probe (`switched_this_
-                // call.is_some()`, this is the *first* attempt against the
-                // cross-family target this episode) or the full relay grace
-                // (`already_cross_family`, an earlier episode already
-                // proved the target reachable) — either way the conclusion
-                // ("relay-unreachable", not "session-gone") is the same.
-                log::info!("isekai-pipe connect: continuity-lost reason: relay-unreachable");
-                isekai_transport::telemetry::log_rendezvous_outcome(
-                    Some(session_id),
-                    None,
-                    "continuity-lost",
-                    0,
-                    Duration::ZERO,
-                );
-            }
+            // The deadline give-up while on the cross-family relay target
+            // means every attempt against it kept failing with a
+            // network/mux error long enough to exhaust the window — never
+            // an `UnknownSession` rejection, or the streak give-up below
+            // would have fired first.
+            record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "relay-unreachable");
             return Err(anyhow::anyhow!(
                 "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
                  for '{profile}'.{last_error_suffix}"
@@ -1310,6 +1317,16 @@ async fn resume_with_backoff_until_deadline(
                 // *other* half of task 4 (never give up before 30s since
                 // `disconnected_at`) true even when the switch happens
                 // quickly (the network-change-signal path, ~1 attempt in).
+                // Deliberately the *same* constant as
+                // `update_unknown_session_streak`'s own floor, not a
+                // separately-named-but-same-valued one (`/code-review`
+                // finding on this ADR's implementation) — ADR §3.2 task 4's
+                // own wording names `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`
+                // itself as this window's floor, because both floors exist
+                // to answer the same question ("has enough time passed
+                // since disconnect for a rejection streak to mean anything
+                // yet?") for the same session, just observed from two call
+                // sites 30+ lines apart in the same function.
                 let elapsed_since_disconnect = Instant::now().saturating_duration_since(disconnected_at);
                 max_resume_window = Some((elapsed_since_disconnect + CROSS_FAMILY_SWITCH_DEADLINE).max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR));
                 resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
@@ -1419,21 +1436,11 @@ async fn resume_with_backoff_until_deadline(
                             &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
                         );
                     }
-                    if already_cross_family || switched_this_call.is_some() {
-                        // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: the
-                        // server has confirmed (via the UnknownSession streak)
-                        // that this session_id is genuinely gone — distinct
-                        // from the deadline give-up above, which means the
-                        // cross-family target was simply unreachable.
-                        log::info!("isekai-pipe connect: continuity-lost reason: session-gone");
-                        isekai_transport::telemetry::log_rendezvous_outcome(
-                            Some(session_id),
-                            None,
-                            "continuity-lost",
-                            0,
-                            Duration::ZERO,
-                        );
-                    }
+                    // The server has confirmed (via the UnknownSession
+                    // streak) that this session_id is genuinely gone —
+                    // distinct from the deadline give-up above, which means
+                    // the cross-family target was simply unreachable.
+                    record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "session-gone");
                     return Err(anyhow::anyhow!(
                         "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
                          retrying would never succeed."
