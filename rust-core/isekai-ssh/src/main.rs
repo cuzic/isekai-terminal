@@ -141,10 +141,11 @@ const MAIN_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// instead of) the default stderr behavior, so a panic still shows on the
 /// terminal exactly as before, but also gets recorded into whichever
 /// `log_file.rs` sink is already active — the explicit `--isekai-log-file`
-/// target if given, otherwise the always-on default verbose log
-/// (`log_file::append_verbose_line`/`init_verbose`, itself a silent no-op
-/// until `wrapper::run`/`native::connect::run` calls `init_verbose` early
-/// on). Without this, a panic simply vanished once the terminal's own
+/// target if given, otherwise the detached holder's own rotating log when
+/// that holder-only sink exists, otherwise the always-on default verbose
+/// log (`log_file::append_verbose_line`/`init_verbose`, itself a silent
+/// no-op until `wrapper::run`/`native::connect::run` calls `init_verbose`
+/// early on). Without this, a panic simply vanished once the terminal's own
 /// scrollback was gone: `main()`'s `.join().unwrap_or_else(|panic|
 /// std::panic::resume_unwind(panic))` only re-raises the payload for the
 /// process's own exit handling, it never logs it anywhere. Must be
@@ -159,11 +160,7 @@ fn install_panic_hook() {
         default_hook(info);
         let backtrace = std::backtrace::Backtrace::force_capture();
         let line = format!("PANIC: {info}\n{backtrace}");
-        if log_file::is_enabled() {
-            log_file::append_line(&line);
-        } else {
-            log_file::append_verbose_line(&line);
-        }
+        log_file::dispatch(&line, |line| log_file::append_verbose_line(line));
     }));
 }
 
