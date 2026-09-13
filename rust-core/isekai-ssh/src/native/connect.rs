@@ -651,8 +651,8 @@ async fn connect_attempt(
     // cheap SHA-256 over a handful of fields and threading it through every
     // caller of `connect_attempt` would be a much larger diff) so the
     // holder-only log path this destination's `isekai-pipe connect` child
-    // gets (`child_stdio.rs::holder_log_file`) is unique **per holder**, not
-    // a single name shared by every concurrently-active destination.
+    // gets (`naming::pipe_holder_log_file`) is unique **per holder**, not a
+    // single name shared by every concurrently-active destination.
     let channel_name = naming::channel_name(host_config, resolution, plan.destination_host());
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent, plan.log_file(), &channel_name)?;
     let stdio = ChildStdio::take_from(&mut child)
