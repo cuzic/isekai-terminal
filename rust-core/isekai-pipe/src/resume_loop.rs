@@ -1312,6 +1312,43 @@ fn cross_family_switch_budget(disconnected_at: Instant, effective_resume_grace_s
     CrossFamilySwitchBudget { max_resume_window, resume_window, deadline: disconnected_at + resume_window }
 }
 
+/// The full switch side-effect, applied at either of [`resume_with_backoff_
+/// until_deadline`]'s two trigger sites (the `NetworkChanged` wait outcome,
+/// and the failure-count/deadline-imminent check in the `Err` arm): point
+/// `current_target` at `fallback_target`, install its
+/// [`cross_family_switch_budget`], mark `switched_this_call`, and reset
+/// `attempt` so the new target's first backoff delay doesn't inherit a
+/// stale, possibly near-`RESUME_BACKOFF`-max count from the target it's
+/// replacing.
+///
+/// Factored out (`/code-review` finding on this ADR's implementation,
+/// reported independently by three review passes) because this exact block
+/// — previously duplicated verbatim at both call sites apart from their log
+/// message — is precisely the kind of switch-mechanics detail that has
+/// already drifted out of sync across this ADR's own review rounds (C1,
+/// R1, N1, N2, round 5's deadline-aware trigger): one shared function means
+/// a future change to what "switching" does can't update one site and miss
+/// the other.
+fn apply_cross_family_switch<'a>(
+    fallback_target: &'a RelayTarget,
+    disconnected_at: Instant,
+    effective_resume_grace_secs: u32,
+    current_target: &mut &'a RelayTarget,
+    max_resume_window: &mut Option<Duration>,
+    resume_window: &mut Duration,
+    deadline: &mut Instant,
+    switched_this_call: &mut Option<RelayTarget>,
+    attempt: &mut u32,
+) {
+    *current_target = fallback_target;
+    let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
+    *max_resume_window = budget.max_resume_window;
+    *resume_window = budget.resume_window;
+    *deadline = budget.deadline;
+    *switched_this_call = Some(fallback_target.clone());
+    *attempt = 0;
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1427,23 +1464,17 @@ async fn resume_with_backoff_until_deadline(
                     "isekai-pipe connect: switching to cross-family relay fallback \
                      (OS reported another network change while backing off)"
                 );
-                current_target = fallback_target;
-                let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
-                max_resume_window = budget.max_resume_window;
-                resume_window = budget.resume_window;
-                deadline = budget.deadline;
-                switched_this_call = Some((*current_target).clone());
-                // `/code-review` finding on this ADR's implementation:
-                // without this reset, the next iteration's backoff delay
-                // (`RESUME_BACKOFF.delay_for_attempt(attempt, ..)`, a pure
-                // function of `attempt` alone) is still computed from the
-                // *STUN* side's accumulated `attempt` count, so the very
-                // first probe against `current_target` (never tried before
-                // this call) would wait out a stale, near-`RESUME_BACKOFF.max`
-                // (10s) delay instead of a fresh one — eating a large slice
-                // of the tightly-bounded `CROSS_FAMILY_SWITCH_DEADLINE` (45s)
-                // probe window for no reason tied to the new target at all.
-                attempt = 0;
+                apply_cross_family_switch(
+                    fallback_target,
+                    disconnected_at,
+                    effective_resume_grace_secs,
+                    &mut current_target,
+                    &mut max_resume_window,
+                    &mut resume_window,
+                    &mut deadline,
+                    &mut switched_this_call,
+                    &mut attempt,
+                );
             }
         }
 
@@ -1586,15 +1617,17 @@ async fn resume_with_backoff_until_deadline(
                              (the original STUN peer failed enough consecutive bare-redial attempts, \
                              or too little of the resume window remains to keep retrying it)"
                         );
-                        current_target = fallback_target;
-                        let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
-                        max_resume_window = budget.max_resume_window;
-                        resume_window = budget.resume_window;
-                        deadline = budget.deadline;
-                        switched_this_call = Some((*current_target).clone());
-                        // See the `NetworkChanged` trigger's identical
-                        // reset above for why this is needed.
-                        attempt = 0;
+                        apply_cross_family_switch(
+                            fallback_target,
+                            disconnected_at,
+                            effective_resume_grace_secs,
+                            &mut current_target,
+                            &mut max_resume_window,
+                            &mut resume_window,
+                            &mut deadline,
+                            &mut switched_this_call,
+                            &mut attempt,
+                        );
                     }
                 }
                 let msg = format!("{e:#}");
@@ -1643,6 +1676,19 @@ pub(crate) async fn run_resume_loop(
     tethering_interface: Option<isekai_transport::InterfaceIndex>,
     max_resume_window: Option<Duration>,
 ) -> Result<()> {
+    // `tethering_interface`'s warm-standby is built once from the original
+    // `target` and never re-pointed at `current_target` after a cross-family
+    // switch — deliberately safe today only because every call site that
+    // can pass a `cross_family_target` also hardcodes `tethering_interface`
+    // to `None` (see the warm-standby setup below for the full reasoning).
+    // This turns that "they never coexist" invariant from a comment into
+    // something that fails loudly the day it stops holding, instead of
+    // silently warm-standby-ing a stale target (`/code-review` finding on
+    // this ADR's implementation).
+    debug_assert!(
+        tethering_interface.is_none() || cross_family_target.is_none(),
+        "tethering_interface and cross_family_target must never both be set until warm-standby is made switch-aware"
+    );
     let session_id = established.session_id;
     let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);

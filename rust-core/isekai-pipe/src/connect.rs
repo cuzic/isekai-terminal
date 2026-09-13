@@ -895,9 +895,6 @@ async fn recover_via_cross_family_fallback(
         return Err(primary_err).with_context(|| format!("isekai-pipe connect: {context_label} failed"));
     };
     log::warn!("isekai-pipe connect: {context_label} failed ({primary_err:#}); trying cross-family relay fallback");
-    let session_secret = decode_secret(session_secret_b64).with_context(|| {
-        format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback's session secret was invalid")
-    })?;
     let identity = isekai_transport::CandidateIdentity {
         kind: "relay",
         source: "cross-family-fallback",
@@ -907,29 +904,21 @@ async fn recover_via_cross_family_fallback(
     // Unlike `intent.transport`, `intent.cross_family_fallback` never passes
     // through `TryFrom<&isekai_transport::TransportIntent> for CandidateDraft`
     // — it's read directly here, so it needs its own validation checkpoint
-    // rather than trusting the raw persisted strings.
-    let (cert_pin, server_name) =
-        isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
-            .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
-    run_relay_resumable(
-        &RelayTarget {
-            helper_addr: helper_addr
-                .parse()
-                .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
-            server_name: server_name.as_str().to_string(),
-            cert_sha256_hex: cert_pin.to_hex(),
-            session_secret,
-            local_bind_port_range: intent.local_bind_port_range,
-        },
-        &intent.profile,
-        intent.resume_grace_secs,
-        identity,
-        experimental_network_rebind,
-        relay_transport,
-        tethering_interface,
-    )
-    .await
-    .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
+    // rather than trusting the raw persisted strings. Shared with
+    // `build_cross_family_target`'s own validation (`/code-review` finding
+    // on this ADR's implementation: this function used to reimplement the
+    // identical decode/validate/parse/`RelayTarget`-construction sequence
+    // inline) — the two error-wrapping conventions differ (this one embeds
+    // `primary_err`/`context_label`, `build_cross_family_target`'s degrades
+    // to `None`), but the underlying validation must stay identical between
+    // the STUN-primary-with-cross-family-target path and this sequential
+    // relay-fallback path.
+    let relay_target = try_build_cross_family_target(intent, helper_addr, server_name, session_secret_b64).with_context(|| {
+        format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback was invalid")
+    })?;
+    run_relay_resumable(&relay_target, &intent.profile, intent.resume_grace_secs, identity, experimental_network_rebind, relay_transport, tethering_interface)
+        .await
+        .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
 }
 
 fn intent_session_secret_b64(transport: &IntentTransport) -> &str {
