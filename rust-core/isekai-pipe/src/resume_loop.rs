@@ -125,11 +125,29 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 /// attempts) requirement — see the call site's own `.max(
 /// UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)`, which keeps task 4's *other* half
 /// (never give up before 30s since `disconnected_at`) true even when the
-/// switch happens quickly.
+/// switch happens quickly. That `.max()` is a no-op against *this*
+/// constant's current value (45s > 30s, so the sum term always wins) —
+/// kept anyway as a guard against a future tuning of `CROSS_FAMILY_SWITCH_
+/// DEADLINE` below 30s silently reopening the gap it exists to close
+/// (confirmed intentional, opus review round 3 on this ADR's
+/// implementation).
 ///
-/// Comfortably below `STUN_RESUME_GIVE_UP_WINDOW` (120s) so a genuinely
-/// unreachable cross-family target still hands back control well inside the
-/// time this project already treats as "too long to make the user wait".
+/// This is a budget on the cross-family target *alone*, from the moment of
+/// the switch — not a promise that the whole episode (STUN attempts plus
+/// this) stays under `STUN_RESUME_GIVE_UP_WINDOW` (120s) end to end
+/// (`/code-review` finding on this ADR's implementation, correcting an
+/// earlier version of this doc that claimed exactly that). In the realistic
+/// worst case (all `switch_attempts_before_cross_family` STUN attempts each
+/// burning their full `TRANSPORT_STEP_TIMEOUT` before failing — a silently
+/// packet-dropping path rather than an actively refused one), the switch
+/// itself doesn't fire until ~90s in, and this constant then extends the
+/// episode to ~135s before giving up on the cross-family target too. That's
+/// an accepted trade-off, not a regression: the pre-ADR behavior *also* gave
+/// up around the 120s mark in this exact scenario, just without ever having
+/// tried to preserve continuity at all. Either way, `isekai-ssh`'s
+/// wrapper-level `lightweight_retries`/`redeploy_gate` escalation still
+/// takes over once this function finally returns `Err` — always-connects.md
+/// is about *eventual* automatic recovery, not a hard latency SLA.
 const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
 /// How long a disconnect stays silent before [`print_reconnect_status`]
 /// actually prints anything. Matches trzsz-ssh's own
