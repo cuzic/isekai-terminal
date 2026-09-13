@@ -75,12 +75,21 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// increments on *any* attempt failure, since a STUN bare redial against a
 /// peer address the client can no longer reach typically fails as a mux/QUIC
 /// dial error, never even reaching a point where the server could reject it).
-/// At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, 4s, 8s, capped at 10s) this
-/// value's cumulative wait is roughly 15s — comfortably "far below the 120s
-/// STUN_RESUME_GIVE_UP_WINDOW" per ADR_STUN_REESTABLISH_CONTINUITY.md §3.2
-/// task 1, while still giving a real bare redial (a false alarm, or a NAT
-/// mapping that happens to still be valid) more than one attempt before
-/// giving up on it.
+/// At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, 4s, 8s, capped at 10s) the
+/// cumulative *wait between* attempts is roughly 15s — **but that is not
+/// when the switch actually fires** (opus review round 5 on this ADR's
+/// implementation): each attempt's own `reconnect_and_resume` can itself
+/// cost up to two separate `TRANSPORT_STEP_TIMEOUT`s (its `connect` step
+/// and its `request_resume` step are timed independently, ~15s each — see
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`'s own docs), so the
+/// count alone can take up to ~90s (15s/attempt) or ~165s (30s/attempt) of
+/// wall-clock time to reach this many failures — the second figure already
+/// exceeds `STUN_RESUME_GIVE_UP_WINDOW` (120s), meaning the count-based
+/// trigger could silently *never* fire before the deadline it's supposed to
+/// preempt. `should_switch_to_cross_family` (near `cross_family_switch_
+/// budget`) closes this by also switching once the *remaining* time before
+/// the deadline stops being enough for even one cross-family probe,
+/// independent of this attempt count — see that function's own docs.
 ///
 /// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
 /// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
@@ -138,17 +147,38 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 /// (`/code-review` finding on this ADR's implementation, correcting an
 /// earlier version of this doc that claimed exactly that). In the realistic
 /// worst case (all `switch_attempts_before_cross_family` STUN attempts each
-/// burning their full `TRANSPORT_STEP_TIMEOUT` before failing — a silently
-/// packet-dropping path rather than an actively refused one), the switch
-/// itself doesn't fire until ~90s in, and this constant then extends the
-/// episode to ~135s before giving up on the cross-family target too. That's
-/// an accepted trade-off, not a regression: the pre-ADR behavior *also* gave
-/// up around the 120s mark in this exact scenario, just without ever having
-/// tried to preserve continuity at all. Either way, `isekai-ssh`'s
+/// burning up to *two* separate `TRANSPORT_STEP_TIMEOUT`s before failing —
+/// their `connect` and `request_resume` steps are timed independently, not
+/// jointly — see `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own docs, updated
+/// after opus review round 5 caught this same undercount here), the
+/// count-based switch can be up to ~90s (one `TRANSPORT_STEP_TIMEOUT`/attempt)
+/// or ~165s (two/attempt) into the episode by the time it *would* fire —
+/// the second figure already past `STUN_RESUME_GIVE_UP_WINDOW`. This
+/// constant alone doesn't reach that trigger in time; the deadline-aware
+/// half of `should_switch_to_cross_family` (near `cross_family_switch_
+/// budget`, below) is what actually keeps the switch from silently never
+/// firing in that band — see its own docs. Either way, `isekai-ssh`'s
 /// wrapper-level `lightweight_retries`/`redeploy_gate` escalation still
 /// takes over once this function finally returns `Err` — always-connects.md
 /// is about *eventual* automatic recovery, not a hard latency SLA.
 const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
+/// The smallest remaining slice of the current deadline in which switching
+/// to the cross-family relay target can still buy anything: one
+/// `RESUME_BACKOFF` first delay (500ms, +25% jitter) plus one
+/// `TRANSPORT_STEP_TIMEOUT`-bounded QUIC connect step (15s — mirrored here
+/// rather than imported, since that constant is private to
+/// `isekai-transport`).
+///
+/// Deliberately *not* the ~30s worst case of a whole `reconnect_and_resume`
+/// (its `connect` and `request_resume` steps are each bounded by
+/// `TRANSPORT_STEP_TIMEOUT` *separately*, not jointly): demanding 31s of
+/// headroom would suppress the switch across exactly the moderate
+/// `#@isekai resume-grace` band where it matters most, and the case this
+/// ADR exists for (a `cached_relay_addr` the client's new network cannot
+/// reach at all) is decided in the *connect* step alone — a probe that only
+/// gets this far still yields a real relay-reachability verdict (opus
+/// review round 5 on this ADR's implementation).
+const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(16);
 /// How long a disconnect stays silent before [`print_reconnect_status`]
 /// actually prints anything. Matches trzsz-ssh's own
 /// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
@@ -1219,6 +1249,46 @@ fn record_continuity_lost_if_applicable(already_cross_family: bool, switched_thi
     isekai_transport::telemetry::log_rendezvous_outcome(Some(session_id), None, "continuity-lost", 0, Duration::ZERO);
 }
 
+/// Whether a switch made *now* would still get at least one real probe in
+/// before the current `deadline` — see [`CROSS_FAMILY_MIN_PROBE_BUDGET`].
+///
+/// Switching without this is worse than not switching: the very next thing
+/// `resume_with_backoff_until_deadline` does is its loop-top deadline
+/// give-up, which then records `continuity-lost` / `"relay-unreachable"`
+/// for an episode that never sent a single packet to the relay — the same
+/// ADR §6 denominator inflation N1 (opus review round 4) closed at the
+/// *other* give-up site (the `UnknownSession`-streak one), reached here
+/// through the residual gap round 4's own N2 recorded as harmless (opus
+/// review round 5 on this ADR's implementation).
+fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
+    remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
+}
+
+/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 1's second disjunct), made deadline-aware.
+///
+/// The count alone can silently *never* fire whenever the episode's
+/// deadline is shorter than what reaching `switch_attempts_before_cross_
+/// family` failures actually takes — see `STUN_TO_CROSS_FAMILY_SWITCH_
+/// ATTEMPTS`'s own docs (opus review round 5 on this ADR's implementation).
+/// That is the same "silently degrades back into waiting out the whole
+/// window" failure ADR §3.2 task 1 forbids, arrived at from the other side:
+/// so this also switches once what remains of the window stops being any
+/// bigger than the cross-family probe itself would want — at that point
+/// another bare redial against the *original* target can only consume the
+/// remaining window, while the fallback can still change the outcome.
+///
+/// Deliberately *lowers* the deadline's meaning here, never raises it — the
+/// client must never retry past the server's own grant, which is also what
+/// discards the parked session (`resume_window_for`'s own docs,
+/// `engine/mod.rs`'s `max_parked`/`effective_resume_grace`) — so this
+/// cannot be satisfied by widening `remaining_before_deadline` itself, only
+/// by switching sooner within it.
+fn should_switch_to_cross_family(stun_failures: u32, switch_attempts_before_cross_family: u32, remaining_before_deadline: Duration) -> bool {
+    cross_family_probe_fits(remaining_before_deadline)
+        && (stun_failures >= switch_attempts_before_cross_family || remaining_before_deadline <= CROSS_FAMILY_SWITCH_DEADLINE)
+}
+
 /// The four [`ResumeDeadlinePolicy`]-shaped values that change the moment
 /// [`resume_with_backoff_until_deadline`] switches to the cross-family relay
 /// target — computed once here (`/code-review` finding on this ADR's
@@ -1333,7 +1403,23 @@ async fn resume_with_backoff_until_deadline(
         // arriving before the very first attempt against `current_target`
         // is the M3/R2 zero-attempt-switch hole this ADR's implementation
         // already closed once and must not reopen here.
-        if switched_this_call.is_none() && backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged && stun_failures >= 1 {
+        //
+        // `cross_family_probe_fits` is checked directly (not via
+        // `should_switch_to_cross_family`) — that function's OR branch can
+        // be true even at `stun_failures == 0`, which would reopen the
+        // exact M3/R2 hole the line above just closed (opus review round 5
+        // on this ADR's implementation, explicit warning against reusing it
+        // here). Without this guard, a network-change signal arriving with
+        // little of the deadline left would switch to a target it then
+        // never actually probes — the loop's very next deadline check gives
+        // up immediately and wrongly records `continuity-lost /
+        // "relay-unreachable"` (round 4's N2, "harmless" at the time,
+        // turned out to have this real cost after all).
+        if switched_this_call.is_none()
+            && backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged
+            && stun_failures >= 1
+            && cross_family_probe_fits(deadline.saturating_duration_since(Instant::now()))
+        {
             if let Some(fallback_target) = cross_family_target {
                 log::info!(
                     "isekai-pipe connect: switching to cross-family relay fallback \
@@ -1481,11 +1567,22 @@ async fn resume_with_backoff_until_deadline(
                 // on the *old* one in the same breath — inflating ADR §6's
                 // "cross-family actually attempted" denominator with
                 // episodes that never attempted it at all.
-                if switched_this_call.is_none() && stun_failures >= switch_attempts_before_cross_family {
+                //
+                // `should_switch_to_cross_family` (not a bare `stun_failures
+                // >= switch_attempts_before_cross_family` count check): see
+                // its own docs — the plain count can take longer to reach
+                // than the deadline gives it, in which case this also
+                // switches once the remaining window stops leaving room for
+                // even one cross-family probe (opus review round 5 on this
+                // ADR's implementation).
+                if switched_this_call.is_none()
+                    && should_switch_to_cross_family(stun_failures, switch_attempts_before_cross_family, deadline.saturating_duration_since(Instant::now()))
+                {
                     if let Some(fallback_target) = cross_family_target {
                         log::info!(
                             "isekai-pipe connect: switching to cross-family relay fallback \
-                             (the original STUN peer failed enough consecutive bare-redial attempts)"
+                             (the original STUN peer failed enough consecutive bare-redial attempts, \
+                             or too little of the resume window remains to keep retrying it)"
                         );
                         current_target = fallback_target;
                         let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
@@ -2243,6 +2340,59 @@ mod tests {
         let (streak, should_give_up) = update_unknown_session_streak(streak, false, elapsed);
         assert_eq!(streak, 0, "a non-UnknownSession outcome must reset the streak");
         assert!(!should_give_up);
+    }
+
+    // Regression coverage for opus review round 5 on this ADR's
+    // implementation: `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS` alone can take
+    // longer to reach than a short `#@isekai resume-grace` deadline allows,
+    // silently defeating the whole cross-family switch. These pin
+    // `should_switch_to_cross_family`'s two independent reasons to switch
+    // (count reached, or too little of the deadline remains for even one
+    // more probe) without needing a runtime or a dial.
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_below_the_attempt_count_with_plenty_of_time_left() {
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS - 1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(3600)),
+            "must not switch before the attempt count is reached while the deadline is nowhere close"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_fires_once_the_attempt_count_is_reached() {
+        assert!(
+            should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(3600)),
+            "the original count-based trigger must still fire once the threshold is reached"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_fires_early_when_the_deadline_is_about_to_expire_even_below_the_attempt_count() {
+        // This is the fix itself: a short deadline must not silently wait
+        // out the attempt count that would never be reached in time.
+        assert!(
+            should_switch_to_cross_family(1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(40)),
+            "must switch once the remaining window is inside CROSS_FAMILY_SWITCH_DEADLINE, \
+             even with the attempt count far from its threshold"
+        );
+    }
+
+    #[test]
+    fn should_switch_to_cross_family_does_not_fire_when_no_probe_would_fit_before_the_deadline() {
+        // The minimum-probe-budget guard: switching this late would only
+        // produce a same-iteration deadline give-up that never actually
+        // contacted the cross-family target — the false "relay-unreachable"
+        // telemetry row this fix exists to prevent.
+        assert!(
+            !should_switch_to_cross_family(STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS - 1, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, Duration::from_secs(10)),
+            "must not switch when even one cross-family probe would not fit before the deadline"
+        );
+    }
+
+    #[test]
+    fn cross_family_probe_fits_is_true_at_exactly_the_minimum_budget() {
+        assert!(cross_family_probe_fits(CROSS_FAMILY_MIN_PROBE_BUDGET), "the boundary itself must still count as fitting");
+        assert!(!cross_family_probe_fits(CROSS_FAMILY_MIN_PROBE_BUDGET - Duration::from_millis(1)), "one tick under the boundary must not");
     }
 
     #[tokio::test]
