@@ -1994,3 +1994,71 @@ EOF-latch(`pump_c2h`が既にEOFに達した後の`Remote`失敗も同じ経路�
 コマンド再実行防止のB5ガード無し)に化ける経路を根本から断つ。詳細な
 経緯・却下した代替案の理由は`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
 Round 6〜7、`parent_watchdog.rs`自身のモジュールdoc参照。
+
+### Epic S: cross-family resume-preserving fallback(STUN P2P→relay) — 完了(2026-09-13)
+
+**動機**: Epic Rが実装したSTUN P2Pのbare redialは、サーバー側の観測アドレスが
+安定していることが前提で、クライアント側アドレスだけが変わる最も典型的な
+切断(Wi-Fi⇔セルラー切替等)では、restricted-cone NATがクライアントの新しい
+アドレスからのパケットを落とすため失敗する。この場合`STUN_RESUME_GIVE_UP_WINDOW`
+(120秒)を待ってから`ssh(1)`ごと殺しフルSTUN再確立(新セッション、scrollback
+連続性喪失)へ落ちるのが唯一の復旧経路だった——サーバー自身のアドレスは変わって
+いないため、実はrelay経路は生きているにもかかわらず。詳細な設計判断・
+opus-adversarial-consult 3ラウンドのレビュー経緯は`ADR_STUN_REESTABLISH_CONTINUITY.md`
+参照。
+
+**実装した内容**(同ADR§3.2タスク1〜9):
+- **切替トリガー**(タスク1・2): ネットワーク変化シグナル、または元のSTUN
+  ピアアドレスへの連続bare-redial失敗が`STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`
+  (5回、累積約15秒)に達した時点のいずれか早い方でcross-family relay
+  fallbackへ切り替える(論理積にすると netmon が無応答な環境で120秒待ちに
+  静かに退行するため、論理和にした)。`wait_backoff_or_network_change`の
+  戻り値を`BackoffWaitOutcome`型に、ネットワーク変化起因の切断を
+  `NetworkChangeReconnectSignal`型付きマーカーに変更し、文字列マッチを排除。
+  `intent.cross_family_fallback`由来の`RelayTarget`を`connect.rs`の
+  `build_cross_family_target`で事前検証し、`run_resume_loop`から
+  `resume_with_backoff_until_deadline`まで配線した。
+- **既存のbail-outガードは変更していない**(タスク3): `connect.rs`の
+  `MidSessionDisconnectSignal`チェック(cross-family fallbackへの遷移を防ぐ
+  ガード)はそのまま。cross-family resumeは`run_resume_loop`内部(データポンプ
+  生存中)でのみ行う。
+- **有界リトライ・一方向切替**(タスク4): 既存の`UnknownSession`streak判定が
+  意味を持つよう、cross-family targetへの切替後も同一ターゲットへの再試行を
+  続ける(同一episode内でSTUN targetへは戻らない)。
+- **検知計装**(タスク5): 既存の`log_rendezvous_outcome`を再利用し、新しい
+  `class`値`"cross-family-resumed"`(連続性が保たれた)・`"continuity-lost"`
+  (cross-family resumeも失敗)を追加。失敗理由を「session-gone」
+  (`UnknownSession`streak確定)と「relay-unreachable」(デッドライン超過)に
+  分けてログするペア行も追加し、`telemetry.rs`のdocコメントを更新(旧「
+  `previous_session_id == new_session_id`はスコープ外」という記述を明示的に
+  撤回)。
+- **パラメータ束の切替**(タスク7): 切替時に`ResumeDeadlinePolicy`を
+  field-patchせず再計算(`max_resume_window`を`Some(STUN_RESUME_GIVE_UP_WINDOW)`
+  から`None`へ、`resume_window`/`deadline`を`effective_resume_window`から
+  再導出)。この新しいpolicyはセッション内の以後の切断episodeにも持ち回る。
+- **サーバー側変更なし**(タスク6): `engine/`は無変更(既に`SessionId`のみを
+  キーに任意アドレスからのRESUMEを受理する設計のため)。
+- **preemptラッチは実装しない**(タスク8): round 2レビューの結論(cross-family
+  resumeは`run_resume_loop`内の単一逐次ループで行われ、2つの再接続駆動主体が
+  同時に走る構造にならない)通り、先んじて機構を作らず、実測してから要否を
+  決める方針を維持。サーバー側preempt待ちタイムアウト(`engine/mod.rs`)は
+  タスク1の切替窓(約15秒)に対して十分小さい(2秒)ため無視できる。
+- **`isekai-ssh doctor`は変更不要**(タスク9): 確立済みセッションの経路を
+  静的表示する機能自体が存在しない(常に新規`isekai-pipe probe`を叩く設計)
+  ため、追従すべき表示が無いことを確認した。
+
+**未検証の前提**(同ADR§3.3): この価値は「`cached_relay_addr`がクライアントの
+*新しい*ネットワークからも到達可能である」ことに依存する。Tailscale/LAN
+アドレスの場合、クライアントのネットワークが変わった瞬間にrelayも同時に
+到達不能になりうる。タスク5の「session-gone」/「relay-unreachable」の実測比率
+が出るまで、この前提の成立度合いは未検証のまま(§6、初期観測期間には合否
+判定を置かない)。
+
+**対象外**(同ADR§4): フルSTUN再確立後の`OutputBuffer`引き継ぎ(旧`ssh(1)`の
+暗号状態に束縛されているため恒久的に対象外)、クライアント・サーバー双方が
+同時にアドレスを変える真の再ランデブー(`isekai-pipe`が`isekai-bootstrap`/
+russh に依存しないという既存方針に反するため——ただし接続そのものは
+`wrapper.rs`の`lightweight_retries`→`redeploy_gate`エスカレーション経路により
+自動復旧する見込みで`.claude/rules/always-connects.md`には抵触しない)。
+Androidは`isekai-pipe connect`プロセスを起動しない構造のため、本Epicの変更は
+構造上到達しない(§5)。
