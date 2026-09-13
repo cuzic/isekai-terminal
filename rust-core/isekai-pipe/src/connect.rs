@@ -715,7 +715,8 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         }
         ConnectRoute::StunWithFallback => {
             let (target, candidates) = resolve_stun_candidates(&intent, &session_secret).await?;
-            let stun_result = run_stun_p2p_with_fallback(&target, &candidates, &profile, intent.resume_grace_secs).await;
+            let cross_family_target = build_cross_family_target(&intent)?;
+            let stun_result = run_stun_p2p_with_fallback(&target, &candidates, cross_family_target, &profile, intent.resume_grace_secs).await;
             return recover_via_cross_family_fallback(
                 stun_result,
                 &intent,
@@ -764,6 +765,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 cert_sha256_hex: cert_pin.to_hex(),
                 session_secret,
             };
+            let cross_family_target = build_cross_family_target(&intent)?;
             // Epic R PR2, Task 2.11: same `BUSY_OTHER_SESSION` retry the
             // relay paths and `run_stun_p2p_with_fallback` already get — a
             // fresh reconnect racing this same client's own not-yet-expired
@@ -793,7 +795,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                         session_secret: target.session_secret.clone(),
                         local_bind_port_range: intent.local_bind_port_range,
                     };
-                    run_stun_p2p_resumable(&factory, &relay_target, &profile, connection).await
+                    run_stun_p2p_resumable(&factory, &relay_target, cross_family_target, &profile, connection).await
                 }
                 Err(e) => {
                     recover_via_cross_family_fallback(
@@ -809,6 +811,26 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             }
         }
     }
+}
+
+fn build_cross_family_target(intent: &ConnectionIntent) -> Result<Option<RelayTarget>> {
+    let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
+        return Ok(None);
+    };
+    let session_secret = decode_secret(session_secret_b64)
+        .context("isekai-pipe connect: cross_family_fallback has an invalid session secret")?;
+    let (cert_pin, server_name) =
+        isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
+            .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
+    Ok(Some(RelayTarget {
+        helper_addr: helper_addr
+            .parse()
+            .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
+        server_name: server_name.as_str().to_string(),
+        cert_sha256_hex: cert_pin.to_hex(),
+        session_secret,
+        local_bind_port_range: intent.local_bind_port_range,
+    }))
 }
 
 /// If `result` failed and `intent.cross_family_fallback` names a `Relay`

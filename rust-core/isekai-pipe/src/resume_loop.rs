@@ -67,6 +67,29 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// only keeps bare-redial resume attempts alive briefly before returning
 /// control to the wrapper's full STUN re-establishment loop.
 const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
+/// How many consecutive failed bare-redial attempts against the *original*
+/// STUN peer address, within one disconnect episode, before switching to the
+/// cross-family relay fallback (if one exists) — independent of, and usually
+/// reached much sooner than, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` (that streak
+/// only increments on a specific `UnknownSession` *rejection*; this counter
+/// increments on *any* attempt failure, since a STUN bare redial against a
+/// peer address the client can no longer reach typically fails as a mux/QUIC
+/// dial error, never even reaching a point where the server could reject it).
+/// At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, 4s, 8s, capped at 10s) this
+/// value's cumulative wait is roughly 15s — comfortably "far below the 120s
+/// STUN_RESUME_GIVE_UP_WINDOW" per ADR_STUN_REESTABLISH_CONTINUITY.md §3.2
+/// task 1, while still giving a real bare redial (a false alarm, or a NAT
+/// mapping that happens to still be valid) more than one attempt before
+/// giving up on it.
+///
+/// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
+/// single sequential loop with no second concurrent reconnect driver, so
+/// there's nothing to latch against yet; build one only if real-world
+/// measurement shows otherwise. The server's own PREEMPT_WAIT_TIMEOUT
+/// (engine/mod.rs, 2s) adds at most 2s of latency to whichever attempt races
+/// it, comfortably inside this switch's own bounded windows above.
+const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 /// How long a disconnect stays silent before [`print_reconnect_status`]
 /// actually prints anything. Matches trzsz-ssh's own
 /// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
@@ -126,6 +149,28 @@ impl std::fmt::Display for MidSessionDisconnectSignal {
 }
 
 impl std::error::Error for MidSessionDisconnectSignal {}
+
+/// Attached (via `anyhow::Context::context`) to the `anyhow::Error` inside
+/// `PumpFailure::Remote` when `run_resume_loop`'s outer `select!` picked the
+/// `reconnect_signal_rx` branch — i.e. this disconnect episode began because
+/// the OS reported a network change, not because `run_data_pump` itself
+/// failed. Replaces the previous string-only encoding
+/// (`anyhow!("network change detected, reconnecting")`) with the same
+/// typed-marker + `downcast_ref` pattern already used by
+/// `MidSessionDisconnectSignal`/`StaleTrustSignal`, so callers can check for
+/// it without string-matching (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 2:
+/// this is what lets the cross-family switch trigger react to "this episode
+/// started from a network change" without inventing a second channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkChangeReconnectSignal;
+
+impl std::fmt::Display for NetworkChangeReconnectSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the reconnect episode began from an OS network-change signal")
+    }
+}
+
+impl std::error::Error for NetworkChangeReconnectSignal {}
 
 /// Marks an `anyhow::Error` as meaning "this process's local peer (normally
 /// `ssh(1)`) is gone, so no recovery action is meaningful" — Task 2.9 /
@@ -306,7 +351,7 @@ pub(crate) async fn run_relay_resumable(
     let established = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable(&factory, target, requested, identity))
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface, None).await
+    run_resume_loop(&factory, target, None, profile, established, experimental_network_rebind, tethering_interface, None).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -329,12 +374,13 @@ pub(crate) async fn run_relay_resumable_with_fallback(
         retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
             .await
             .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface, None).await
+    run_resume_loop(&factory, &winning_target, None, profile, established, experimental_network_rebind, tethering_interface, None).await
 }
 
 pub(crate) async fn run_stun_p2p_resumable(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     connection: StunP2pConnection,
 ) -> Result<()> {
@@ -358,6 +404,7 @@ pub(crate) async fn run_stun_p2p_resumable(
         run_resume_loop(
             factory,
             target,
+            cross_family_target,
             profile,
             established,
             // STUN P2P's punched NAT mapping is tied to the socket used for
@@ -383,6 +430,7 @@ pub(crate) async fn run_stun_p2p_resumable(
 pub(crate) async fn run_stun_p2p_with_fallback(
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     requested_resume_grace_secs: u64,
 ) -> Result<()> {
@@ -410,7 +458,7 @@ pub(crate) async fn run_stun_p2p_with_fallback(
         // this path intentionally has no source for `local_bind_port_range`.
         local_bind_port_range: None,
     };
-    run_stun_p2p_resumable(&factory, &relay_target, profile, connection).await
+    run_stun_p2p_resumable(&factory, &relay_target, cross_family_target, profile, connection).await
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
@@ -421,10 +469,12 @@ pub(crate) async fn run_stun_p2p_with_fallback(
 /// (see `PumpFailure`'s and `ParentGoneSignal`'s docs). Shared by both
 /// `run_relay_resumable` (single fixed target) and
 /// `run_relay_resumable_with_fallback` (the winning target out of several
-/// candidates) — resuming a session is always scoped to the one connection
-/// that established it, never a fresh candidate search. `max_resume_window`
-/// is `None` for relay callers and `Some` only for STUN P2P's shorter
-/// client-side give-up boundary; it does not alter the server-granted
+/// candidates). STUN P2P may also receive a pre-validated cross-family relay
+/// target for the same helper/session_secret; once the resume loop switches
+/// there, it remains on that target for later disconnect episodes rather
+/// than doing a fresh candidate search. `max_resume_window` is `None` for
+/// relay callers and `Some` only for STUN P2P's shorter client-side give-up
+/// boundary before such a switch; it does not alter the server-granted
 /// `effective_resume_grace_secs`.
 /// Picks an OS-assigned-ephemeral-port wildcard bind address matching
 /// `remote`'s address family — the same "let the OS pick a fresh source"
@@ -813,12 +863,18 @@ async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
 /// monitor branch disabled (never fires again) for the rest of *this* call
 /// if the monitor ever yields `None` (permanently stopped) — that call just
 /// falls back to the plain timeout, no extra bookkeeping needed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffWaitOutcome {
+    TimedOut,
+    NetworkChanged,
+}
+
 async fn wait_backoff_or_network_change(
     delay: Duration,
     is_tty: bool,
     mut on_tick: impl FnMut(),
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) {
+) -> BackoffWaitOutcome {
     tokio::select! {
         _ = async {
             if is_tty {
@@ -826,12 +882,13 @@ async fn wait_backoff_or_network_change(
             } else {
                 tokio::time::sleep(delay).await;
             }
-        } => {}
+        } => BackoffWaitOutcome::TimedOut,
         Some(_) = network_monitor.next_change() => {
             log::info!(
                 "isekai-pipe connect: OS reported another network change while backing off; \
                  retrying immediately instead of waiting out the remaining backoff"
             );
+            BackoffWaitOutcome::NetworkChanged
         }
     }
 }
@@ -1077,14 +1134,34 @@ struct ResumeDeadlinePolicy {
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<&RelayTarget>,
+    episode_started_by_network_change: bool,
+    effective_resume_grace_secs: u32,
     profile: &str,
     policy: ResumeDeadlinePolicy,
     state: &mut ResumeLoopState,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) -> Result<AnyByteStream> {
-    let ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window } = policy;
-    let notify_on_give_up = max_resume_window.is_none();
+) -> Result<(AnyByteStream, Option<RelayTarget>)> {
+    let ResumeDeadlinePolicy { mut resume_window, disconnected_at, mut deadline, mut max_resume_window } = policy;
+    let mut notify_on_give_up = max_resume_window.is_none();
+    let mut current_target: &RelayTarget = target;
+    let mut switched_this_call: Option<RelayTarget> = None;
+    let mut stun_failures: u32 = 0;
+    if episode_started_by_network_change {
+        if let Some(fallback_target) = cross_family_target {
+            log::info!(
+                "isekai-pipe connect: switching to cross-family relay fallback immediately \
+                 (this disconnect episode started from an OS network-change signal)"
+            );
+            current_target = fallback_target;
+            max_resume_window = None;
+            resume_window = effective_resume_window(effective_resume_grace_secs, None);
+            deadline = disconnected_at + resume_window;
+            notify_on_give_up = max_resume_window.is_none();
+            switched_this_call = Some((*current_target).clone());
+        }
+    }
     let mut attempt: u32 = 0;
     loop {
         let now = Instant::now();
@@ -1119,19 +1196,38 @@ async fn resume_with_backoff_until_deadline(
 
         let delay = RESUME_BACKOFF.delay_for_attempt(attempt, &mut rand::thread_rng()).min(deadline - now);
         attempt = attempt.saturating_add(1);
-        wait_backoff_or_network_change(
+        let backoff_wait_outcome = wait_backoff_or_network_change(
             delay,
             state.is_tty,
             || print_reconnect_status(true, disconnected_at, resume_window),
             network_monitor,
         )
         .await;
+        if switched_this_call.is_none()
+            && (backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged
+                || stun_failures >= STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS)
+        {
+            if let Some(fallback_target) = cross_family_target {
+                let trigger = if backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged {
+                    "OS reported another network change while backing off"
+                } else {
+                    "the original STUN peer failed enough consecutive bare-redial attempts"
+                };
+                log::info!("isekai-pipe connect: switching to cross-family relay fallback ({trigger})");
+                current_target = fallback_target;
+                max_resume_window = None;
+                resume_window = effective_resume_window(effective_resume_grace_secs, None);
+                deadline = disconnected_at + resume_window;
+                notify_on_give_up = max_resume_window.is_none();
+                switched_this_call = Some((*current_target).clone());
+            }
+        }
 
         let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
         let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
         match reconnect_and_resume(
             factory,
-            target,
+            current_target,
             state.session_id,
             client_sent_offset,
             client_delivered_offset,
@@ -1160,7 +1256,7 @@ async fn resume_with_backoff_until_deadline(
                     continue;
                 }
                 print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
-                match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
+                match reestablish_control_stream(&resumed.connection, &current_target.session_secret, &state.counters).await {
                     Ok(new_tasks) => state.app_ack_tasks = new_tasks,
                     Err(e) => eprintln!(
                         "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
@@ -1169,9 +1265,12 @@ async fn resume_with_backoff_until_deadline(
                 }
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
-                return Ok(resumed.data_stream);
+                return Ok((resumed.data_stream, switched_this_call));
             }
             Err(e) => {
+                if switched_this_call.is_none() {
+                    stun_failures = stun_failures.saturating_add(1);
+                }
                 // See `is_unknown_session_rejection`'s docs: a single
                 // occurrence isn't reliable proof the session is gone for
                 // good (it's also what a transient not-yet-parked race on
@@ -1251,6 +1350,7 @@ fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_alread
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
+    cross_family_target: Option<RelayTarget>,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
     experimental_network_rebind: bool,
@@ -1258,9 +1358,13 @@ pub(crate) async fn run_resume_loop(
     max_resume_window: Option<Duration>,
 ) -> Result<()> {
     let session_id = established.session_id;
+    let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);
 
-    let resume_window = effective_resume_window(established.effective_resume_grace_secs, max_resume_window);
+    let mut current_target: RelayTarget = target.clone();
+    let mut cross_family_target = cross_family_target;
+    let mut max_resume_window = max_resume_window;
+    let mut resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1340,8 +1444,8 @@ pub(crate) async fn run_resume_loop(
             isekai_netmon::system_monitor(),
             state.network_rebinder.take(),
             experimental_network_rebind,
-            target.helper_addr,
-            target.local_bind_port_range,
+            current_target.helper_addr,
+            current_target.local_bind_port_range,
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
@@ -1352,11 +1456,15 @@ pub(crate) async fn run_resume_loop(
         let outcome = tokio::select! {
             result = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters, &mut c2h_already_done) => result,
             Some(()) = reconnect_signal_rx.recv() => {
-                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting")))
+                Err(PumpFailure::Remote(anyhow::anyhow!("network change detected, reconnecting").context(NetworkChangeReconnectSignal)))
             }
         };
         reconnect_signal_task.abort();
         state.app_ack_tasks.abort();
+        let episode_started_by_network_change = matches!(
+            &outcome,
+            Err(PumpFailure::Remote(e)) if e.downcast_ref::<NetworkChangeReconnectSignal>().is_some()
+        );
 
         let give_up = should_give_up_without_resuming(&outcome, c2h_already_done);
         match (outcome, give_up) {
@@ -1436,7 +1544,7 @@ pub(crate) async fn run_resume_loop(
         print_reconnect_status(state.is_tty, disconnected_at, resume_window);
 
         let promoted_stream = match &warm_standby {
-            Some(ws) => promote_warm_standby_once(ws, target, &mut state, disconnected_at).await,
+            Some(ws) => promote_warm_standby_once(ws, &current_target, &mut state, disconnected_at).await,
             None => None,
         };
 
@@ -1449,16 +1557,26 @@ pub(crate) async fn run_resume_loop(
                 // while already backing off, not the first one that got us
                 // here.
                 let mut backoff_network_monitor = isekai_netmon::system_monitor();
-                resume_with_backoff_until_deadline(
+                let (stream, switched) = resume_with_backoff_until_deadline(
                     factory,
-                    target,
+                    &current_target,
+                    cross_family_target.as_ref(),
+                    episode_started_by_network_change,
+                    effective_resume_grace_secs,
                     profile,
                     ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window },
                     &mut state,
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
                 )
-                .await?
+                .await?;
+                if let Some(new_target) = switched {
+                    current_target = new_target;
+                    cross_family_target = None;
+                    max_resume_window = None;
+                    resume_window = effective_resume_window(effective_resume_grace_secs, None);
+                }
+                stream
             }
         };
 
@@ -2413,7 +2531,8 @@ mod tests {
             let mut monitor = FireOnceNetworkChangeMonitor::default();
             let started = tokio::time::Instant::now();
             let mut tick_count = 0;
-            wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
+            let outcome = wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
+            assert_eq!(outcome, BackoffWaitOutcome::NetworkChanged);
             assert_eq!(
                 tokio::time::Instant::now(),
                 started,
@@ -2426,7 +2545,8 @@ mod tests {
         async fn waits_out_the_full_delay_when_the_network_monitor_never_fires() {
             let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
             let started = tokio::time::Instant::now();
-            wait_backoff_or_network_change(Duration::from_millis(2500), false, || (), &mut monitor).await;
+            let outcome = wait_backoff_or_network_change(Duration::from_millis(2500), false, || (), &mut monitor).await;
+            assert_eq!(outcome, BackoffWaitOutcome::TimedOut);
             assert_eq!(
                 tokio::time::Instant::now() - started,
                 Duration::from_millis(2500),
