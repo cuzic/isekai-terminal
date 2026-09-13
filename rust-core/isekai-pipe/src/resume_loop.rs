@@ -166,10 +166,13 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
 /// The smallest remaining slice of the current deadline in which switching
 /// to the cross-family relay target can still buy anything: one
-/// `RESUME_BACKOFF` first delay (500ms, +25% jitter) plus one
-/// `TRANSPORT_STEP_TIMEOUT`-bounded QUIC connect step (15s — mirrored here
-/// rather than imported, since that constant is private to
-/// `isekai-transport`).
+/// `RESUME_BACKOFF` first delay (500ms, +25% jitter, rounded up to a whole
+/// second here) plus one `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`-
+/// bounded QUIC connect step. Derived from that constant directly (not
+/// hand-mirrored as a second literal) — `/code-review` finding on this
+/// ADR's implementation: a hand-mirrored copy is exactly the kind of
+/// cross-crate drift this ADR's own review rounds already caught once for
+/// this same 15s-vs-30s distinction (opus review round 5).
 ///
 /// Deliberately *not* the ~30s worst case of a whole `reconnect_and_resume`
 /// (its `connect` and `request_resume` steps are each bounded by
@@ -180,7 +183,7 @@ const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
 /// reach at all) is decided in the *connect* step alone — a probe that only
 /// gets this far still yields a real relay-reachability verdict (opus
 /// review round 5 on this ADR's implementation).
-const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(16);
+const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(isekai_transport::resume::TRANSPORT_STEP_TIMEOUT.as_secs() + 1);
 /// How long a disconnect stays silent before [`print_reconnect_status`]
 /// actually prints anything. Matches trzsz-ssh's own
 /// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
@@ -1329,6 +1332,18 @@ fn cross_family_switch_budget(disconnected_at: Instant, effective_resume_grace_s
 /// R1, N1, N2, round 5's deadline-aware trigger): one shared function means
 /// a future change to what "switching" does can't update one site and miss
 /// the other.
+///
+/// Deliberately does **not** reset `state.consecutive_unknown_session`
+/// (`/code-review` finding on this ADR's implementation raised this as a
+/// possible bug — confirmed not one): that streak is ADR_STUN_REESTABLISH_
+/// CONTINUITY.md §3.2 task 4's explicit design, carried session-wide rather
+/// than per-target, because an `UnknownSession` rejection is the *server*
+/// asserting it doesn't know this `session_id` — a claim about the session,
+/// not about which network path was used to ask. A rejection observed via
+/// the abandoned STUN target and one observed via the fresh cross-family
+/// target are two independent confirmations of the *same* claim, not stale
+/// evidence about a different target (opus review round 1's "OK-2" already
+/// reached this conclusion for the pre-switch code; it still holds here).
 fn apply_cross_family_switch<'a>(
     fallback_target: &'a RelayTarget,
     disconnected_at: Instant,
@@ -1739,8 +1754,12 @@ pub(crate) async fn run_resume_loop(
     // `--tethering-interface` is ever wired up for the STUN paths, this
     // needs revisiting (opus review round on this ADR's implementation,
     // finding m6, confirmed no live bug for exactly this reason).
+    // Reuses `current_target`'s own clone of `target` (`/code-review`
+    // finding on this ADR's implementation) rather than cloning `target` a
+    // second time — the two are still equal here, before the first loop
+    // iteration has had any chance to switch `current_target` away from it.
     let warm_standby = tethering_interface
-        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), target.clone(), session_id, iface)));
+        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), current_target.clone(), session_id, iface)));
     let warm_standby_task = warm_standby.clone().map(|ws| {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(WARM_STANDBY_PROBE_INTERVAL);

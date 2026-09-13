@@ -91,7 +91,14 @@ const CONTROL_ACK_FRAME_LEN: usize = 1 + SESSION_ID_LEN;
 /// Generous relative to a healthy handshake (normally well under a second)
 /// to avoid false trips on a slow/lossy link, while still being far shorter
 /// than "hangs forever".
-const TRANSPORT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// `pub` (not `pub(crate)`) so `isekai-pipe`'s own per-attempt cost budgets
+/// (`resume_loop.rs`'s `CROSS_FAMILY_MIN_PROBE_BUDGET`) can derive from this
+/// value directly instead of hand-mirroring it in a comment across crates
+/// (`/code-review` finding on `ADR_STUN_REESTABLISH_CONTINUITY.md`'s
+/// implementation — the very mismatch that caused opus review round 5's
+/// finding on that ADR).
+pub const TRANSPORT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A successfully-established control stream (`archive/ISEKAI_SSH_DESIGN.md`
 /// "接続確立順序" step 2), plus the `session_id` isekai-helper echoed back
