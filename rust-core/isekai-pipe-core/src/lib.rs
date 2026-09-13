@@ -42,6 +42,9 @@ pub use ctl_gc::sweep_stale_sockets;
 mod color;
 pub use color::{format_hex_color, parse_hex_color};
 
+mod rotating_log;
+pub use rotating_log::{RotatingLogFile, LOG_ROTATE_MAX_BYTES};
+
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;

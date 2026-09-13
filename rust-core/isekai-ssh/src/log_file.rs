@@ -26,30 +26,68 @@
 //!
 //! A second, independent channel ([`append_verbose_line`]/[`log_line_verbose!`])
 //! backs the *default* (no flag needed) quiet behavior: verbose bootstrap/
-//! diagnostic detail always goes to `isekai_pipe_core::default_log_file()`
-//! instead of the terminal, without touching `is_enabled()` — which also
-//! gates whether `wrapper.rs` pipes `ssh(1)`'s child stderr (see
-//! `run_ssh_once`). Conflating the two would route `resume_loop.rs`'s
-//! human-facing reconnect status lines into a log file by default too,
-//! defeating the point (found during design review before implementing —
-//! see the plan for this change).
+//! diagnostic detail goes to `isekai_pipe_core::default_log_file()` instead
+//! of the terminal, without touching `is_enabled()` — which also gates
+//! whether `wrapper.rs` pipes `ssh(1)`'s child stderr (see `run_ssh_once`).
+//! Conflating the two would route `resume_loop.rs`'s human-facing reconnect
+//! status lines into a log file by default too, defeating the point (found
+//! during design review before implementing — see the plan for this
+//! change). "Goes to `default_log_file()`" is no longer an unconditional
+//! claim once [`HOLDER_LOG_FILE`] exists (below): `dispatch` checks the
+//! holder sink *before* ever calling `append_verbose_line` as
+//! [`log_line_verbose!`]'s fallback, so a holder's verbose output lands in
+//! its own per-destination companion log instead — [`append_verbose_line`]
+//! itself is still always `default_log_file()`, but the macro that normally
+//! reaches it is not, once a holder sink is installed.
 //!
-//! The two process-wide targets ([`LOG_FILE`]/[`VERBOSE_LOG_FILE`]) are both
-//! [`Sink`] instances: a single `OnceLock<Mutex<File>>`-backed open/append
-//! implementation, since `init`/`append_line` and `init_verbose`/
-//! `append_verbose_line` used to be two independent, near-identical copies
-//! of that exact logic. One real drift this unification fixes: `init`
-//! (`--isekai-log-file`) never created its target's parent directory or
-//! restricted its permissions to `0o600` on Unix, while `init_verbose` (the
-//! always-on default sink) already did both — folding both into
-//! [`Sink::open`] makes `--isekai-log-file` do the same now, a small,
-//! deliberate hardening riding along with the dedup rather than a
-//! functional change anyone depends on the old gap for.
+//! A third process-wide target ([`HOLDER_LOG_FILE`]) exists only for the
+//! Windows-native detached mux holder: that process owns the actual
+//! reconnect/recovery loop, but both stdout and stderr are `NUL`, so the
+//! ordinary `log_line!` fallback would otherwise disappear. It uses
+//! `isekai_pipe_core::RotatingLogFile`, not [`Sink`]'s open-time
+//! `truncate_over`, because a holder can run for days and needs rotation
+//! while the process is still alive. `--isekai-log-file` remains the
+//! absolute override: when [`LOG_FILE`] is enabled, holder output still goes
+//! there and nowhere else.
+//!
+//! The two older process-wide targets ([`LOG_FILE`]/[`VERBOSE_LOG_FILE`])
+//! are both [`Sink`] instances: a single `OnceLock<Mutex<File>>`-backed
+//! open/append implementation, since `init`/`append_line` and
+//! `init_verbose`/`append_verbose_line` used to be two independent,
+//! near-identical copies of that exact logic. One real drift this
+//! unification fixes: `init` (`--isekai-log-file`) never created its
+//! target's parent directory or restricted its permissions to `0o600` on
+//! Unix, while `init_verbose` (the always-on default sink) already did both
+//! — folding both into [`Sink::open`] makes `--isekai-log-file` do the same
+//! now, a small, deliberate hardening riding along with the dedup rather
+//! than a functional change anyone depends on the old gap for.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+use isekai_pipe_core::{RotatingLogFile, LOG_ROTATE_MAX_BYTES};
+
+/// `[<RFC 3339 UTC>] <line>\n`. All three sinks this module can write to
+/// (`--isekai-log-file`, the always-on default verbose log, and the holder
+/// companion log) share this exact format as a functional requirement, not
+/// a coincidence: a user comparing them needs one consistent chronology,
+/// not three subtly different timestamp styles to mentally normalize. Kept
+/// as the single place that decides the format so the three call sites
+/// (`Sink::append_line`, [`append_holder_line`]) can never drift from each
+/// other the way two independent copies of this exact logic already did
+/// once before this module's own `Sink` unification (see the module docs).
+fn timestamped(line: &str) -> String {
+    let timestamp = isekai_trust::now_rfc3339();
+    let mut buf = String::with_capacity(timestamp.len() + 3 + line.len() + 1);
+    buf.push('[');
+    buf.push_str(&timestamp);
+    buf.push_str("] ");
+    buf.push_str(line);
+    buf.push('\n');
+    buf
+}
 
 /// A single process-wide log target: `open()` installs the backing file (at
 /// most once — a second `open()` call is a caller bug, per [`init`]'s doc
@@ -76,7 +114,7 @@ impl Sink {
     /// permissions on Unix. `truncate_over`, when given, first removes a
     /// pre-existing file already larger than that many bytes — the default
     /// verbose sink's bounded-growth safety net (see
-    /// [`VERBOSE_LOG_MAX_BYTES`]); the explicit `--isekai-log-file` sink
+    /// [`isekai_pipe_core::LOG_ROTATE_MAX_BYTES`]); the explicit `--isekai-log-file` sink
     /// passes `None` and append-forevers by design.
     fn open(&self, path: &Path, truncate_over: Option<u64>) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -135,27 +173,13 @@ impl Sink {
         if !self.is_enabled() {
             return;
         }
-        let timestamp = isekai_trust::now_rfc3339();
-        let mut buf = String::with_capacity(timestamp.len() + 3 + line.len() + 1);
-        buf.push('[');
-        buf.push_str(&timestamp);
-        buf.push_str("] ");
-        buf.push_str(line);
-        buf.push('\n');
-        self.append_bytes(buf.as_bytes());
+        self.append_bytes(timestamped(line).as_bytes());
     }
 }
 
 static LOG_FILE: Sink = Sink::new();
 static VERBOSE_LOG_FILE: Sink = Sink::new();
-
-/// Truncated if larger than this when (re-)opened — a lightweight safety
-/// net against unbounded growth now that this file is written by default
-/// rather than only when a user explicitly opts into `--isekai-log-file`.
-/// Not a real rotation scheme (matches `--isekai-log-file`'s own
-/// append-forever behavior otherwise); just prevents an all-day flaky-WiFi
-/// session from growing this file without bound.
-const VERBOSE_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+static HOLDER_LOG_FILE: OnceLock<Mutex<RotatingLogFile>> = OnceLock::new();
 
 /// Opens the default verbose log at `path` and installs it as the
 /// process-wide verbose-log target. Called at most once, from `run()`, only
@@ -164,8 +188,18 @@ const VERBOSE_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// read-only filesystem, ...) is not fatal — `run()` simply proceeds
 /// without verbose logging enabled, same "never block the connection over a
 /// diagnostics nicety" philosophy as every other write in this module.
+///
+/// Truncated (a lightweight safety net, not a real rotation scheme — matches
+/// `--isekai-log-file`'s own append-forever behavior otherwise) if larger
+/// than [`LOG_ROTATE_MAX_BYTES`] when (re-)opened, reusing the same
+/// threshold `isekai-pipe-core`'s `RotatingLogFile` rotates at
+/// ([`HOLDER_LOG_FILE`]) rather than an independent local constant that
+/// could silently drift from it — this file and the holder companion log
+/// are meant to agree on how much growth counts as "too much" even though
+/// they bound it with different mechanisms (open-time truncate vs.
+/// write-time rename).
 pub fn init_verbose(path: &Path) -> std::io::Result<()> {
-    VERBOSE_LOG_FILE.open(path, Some(VERBOSE_LOG_MAX_BYTES))
+    VERBOSE_LOG_FILE.open(path, Some(LOG_ROTATE_MAX_BYTES))
 }
 
 /// Appends one already-formatted line to the default verbose log, silently
@@ -182,6 +216,22 @@ pub fn init(path: &Path) -> std::io::Result<()> {
     LOG_FILE.open(path, None)
 }
 
+/// Opens the per-holder default diagnostic log for the detached
+/// Windows-native mux holder.
+///
+/// This is deliberately separate from [`init`]: setting it must not change
+/// [`is_enabled`], because other code uses that predicate to decide whether
+/// `--isekai-log-file` was explicitly requested and should therefore hide
+/// terminal diagnostics or pipe `ssh(1)` stderr. The holder sink is only a
+/// replacement for the `log_line!` fallback in a process whose fallback
+/// stream is known to be `NUL`; foreground clients keep their terminal
+/// behavior unchanged.
+pub fn init_holder_log(path: &Path) -> std::io::Result<()> {
+    let file = RotatingLogFile::open(path.to_path_buf())?;
+    let _ = HOLDER_LOG_FILE.set(Mutex::new(file));
+    Ok(())
+}
+
 pub fn is_enabled() -> bool {
     LOG_FILE.is_enabled()
 }
@@ -191,19 +241,46 @@ pub fn append_line(line: &str) {
     LOG_FILE.append_line(line);
 }
 
+/// Appends one line to the holder-default rotating log. Returns `false`
+/// only when [`init_holder_log`] was never called — i.e. "this sink does not
+/// apply, caller should try its own fallback" — never when the sink exists
+/// but is momentarily unwritable (a poisoned lock, a failed write): those
+/// count as "handled" (silently dropped) rather than falling through to
+/// [`dispatch`]'s `fallback`, same as this sink's earlier inline form did.
+///
+/// A poisoned lock (some earlier caller panicked while holding it) means
+/// every later call blackholes for the rest of this process's life, same as
+/// [`Sink::append_bytes`]'s identical `let Ok(..) = ..lock() else { return
+/// }` already accepts for [`LOG_FILE`]/[`VERBOSE_LOG_FILE`] — a pre-existing,
+/// deliberate trade-off across this whole module (recovering a poisoned
+/// `Mutex` mid-process, or falling back to a *second* sink on poison, is a
+/// larger design change than this ADR's scope), not something new to this
+/// sink.
+fn append_holder_line(line: &str) -> bool {
+    let Some(file) = HOLDER_LOG_FILE.get() else { return false };
+    let Ok(mut file) = file.lock() else { return true };
+    let _ = file.write_all(timestamped(line).as_bytes());
+    let _ = file.flush();
+    true
+}
+
 /// Writes `line` to [`LOG_FILE`] if `--isekai-log-file` is active, otherwise
-/// to `fallback` — the branching [`log_line!`]/[`log_line_verbose!`] used to
-/// each re-implement per macro arm (four near-identical copies total: two
-/// macros × the empty-args/format-args arms each needs). `fallback` is what
-/// keeps the two macros meaningfully different — `log_line!`'s prints to
-/// this process's own stderr, `log_line_verbose!`'s writes to the always-on
-/// default verbose sink — not just "which file," so they remain two
-/// macros, each now a thin wrapper around this one function instead of
-/// hand-rolling the `is_enabled` branch itself.
+/// to the holder-default rotating log if that holder-only sink has been
+/// initialized, otherwise to `fallback`.
+///
+/// The priority order is the compatibility contract: explicit
+/// `--isekai-log-file` wins over every default, holder logging only replaces
+/// a detached holder's otherwise-null stderr, and foreground/verbose callers
+/// that never initialize the holder sink keep their old fallback behavior.
+/// `fallback` is what keeps [`log_line!`] and [`log_line_verbose!`]
+/// meaningfully different — `log_line!`'s prints to this process's own
+/// stderr, `log_line_verbose!`'s writes to the always-on default verbose
+/// sink — not just "which file," so they remain two macros, each a thin
+/// wrapper around this one function.
 pub(crate) fn dispatch(line: &str, fallback: impl FnOnce(&str)) {
     if is_enabled() {
         append_line(line);
-    } else {
+    } else if !append_holder_line(line) {
         fallback(line);
     }
 }

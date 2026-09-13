@@ -88,6 +88,57 @@ pub fn spawn_lock_file_name(channel_name: &str) -> String {
     format!("{leaf}.spawning.lock")
 }
 
+/// The digest suffix embedded in a mux [`channel_name`].
+///
+/// `channel_name` is `\\.\pipe\isekai-ssh-mux-<hex>` today. Hyphens appear
+/// only inside the literal `isekai-ssh-mux-` prefix, never inside the hex
+/// digest itself, so splitting on the *last* `-` reliably isolates the
+/// digest regardless of how many hyphens precede it. Keeping this as the
+/// single helper matters because multiple artifacts derived from the mux
+/// name — the token/spawn-lock leaf names plus the two holder log files —
+/// are meant to refer to the same per-destination holder identity; duplicate
+/// ad hoc splitting would make it too easy for one of them to drift.
+fn channel_digest(channel_name: &str) -> &str {
+    channel_name.rsplit('-').next().unwrap_or(channel_name)
+}
+
+/// Shared body of [`pipe_holder_log_file`]/[`ssh_holder_log_file`]:
+/// `isekai-ssh-holder-<hex><suffix>` next to `default_log_file()`'s own
+/// `isekai-ssh.log`. Both derive from the same digest as the mux channel
+/// instead of from the user-facing host token: the holder identity already
+/// includes every connection-relevant OpenSSH and `#@isekai` setting, so two
+/// tabs that truly share one holder share one log, while different
+/// destinations/configurations never race the same file. Kept as one
+/// private helper so the two public names can never drift on the shared
+/// `default_log_file()`-plus-digest part — only the caller-supplied suffix
+/// differs.
+fn holder_log_file(channel_name: &str, suffix: &str) -> std::io::Result<std::path::PathBuf> {
+    let mut path = isekai_pipe_core::default_log_file()?;
+    path.set_file_name(format!("isekai-ssh-holder-{}{suffix}", channel_digest(channel_name)));
+    Ok(path)
+}
+
+/// `isekai-ssh-holder-<hex>.log`: the per-holder log used by the holder's
+/// `isekai-pipe connect` child for QUIC/STUN/resume diagnostics.
+pub fn pipe_holder_log_file(channel_name: &str) -> std::io::Result<std::path::PathBuf> {
+    holder_log_file(channel_name, ".log")
+}
+
+/// `isekai-ssh-holder-<hex>-ssh.log`: the per-holder log for `isekai-ssh`
+/// itself.
+///
+/// This must *not* reuse [`pipe_holder_log_file`]'s path. The child
+/// `isekai-pipe connect` process owns a rename-based
+/// [`isekai_pipe_core::RotatingLogFile`] there, while the holder process
+/// owns its own long-lived write handle for `log_line!` output. Sharing one
+/// filename would leave one process writing through a handle the other
+/// process just rotated out from under it, which is exactly the
+/// cross-process logging race ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS §3.4 avoids
+/// by giving `isekai-ssh` its own `-ssh.log` companion file.
+pub fn ssh_holder_log_file(channel_name: &str) -> std::io::Result<std::path::PathBuf> {
+    holder_log_file(channel_name, "-ssh.log")
+}
+
 /// Writes a length-prefixed field into the hasher so field boundaries are
 /// unambiguous (the injectivity property the module docs rely on).
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -229,6 +280,42 @@ mod tests {
         let name = r"\\.\pipe\isekai-ssh-mux-abcdef";
         assert_eq!(token_file_name(name), "isekai-ssh-mux-abcdef.token");
         assert!(!token_file_name(name).contains('\\'), "the token file name must not contain path separators");
+    }
+
+    #[test]
+    fn holder_log_files_share_the_digest_but_not_the_file_name() {
+        let name = r"\\.\pipe\isekai-ssh-mux-abcdef";
+        let pipe = pipe_holder_log_file(name).expect("default_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
+        let ssh = ssh_holder_log_file(name).expect("default_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
+
+        assert_eq!(pipe.file_name().unwrap(), "isekai-ssh-holder-abcdef.log");
+        assert_eq!(ssh.file_name().unwrap(), "isekai-ssh-holder-abcdef-ssh.log");
+        assert_eq!(pipe.parent(), ssh.parent(), "the two holder logs should sit in the same diagnostics directory");
+        assert_ne!(pipe, ssh, "the holder and its child must not share a rotating log file");
+    }
+
+    /// `channel_digest`'s "split on the last `-`" trick is only safe because
+    /// today's `channel_name` format never puts a `-` inside the digest
+    /// itself (see its own doc comment). Unlike
+    /// `holder_log_files_share_the_digest_but_not_the_file_name` above,
+    /// which hand-writes a `channel_name`-shaped string, this test feeds
+    /// `channel_digest` the output of the *real* `channel_name()` — so a
+    /// future change to that format (e.g. appending a protocol-version
+    /// suffix) fails this test loudly instead of `channel_digest` silently
+    /// isolating the wrong substring for both holder log names
+    /// (ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md §R8).
+    #[test]
+    fn channel_digest_isolates_the_hex_digest_of_a_real_channel_name() {
+        let (resolution, host_config) = resolve("digest-safety-test-host");
+        let name = channel_name(&host_config, &resolution, "digest-safety-test-host");
+        let digest = channel_digest(&name);
+
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit()) && !digest.contains('-'),
+            "channel_digest must isolate the bare hex digest, got {digest:?} from {name:?}"
+        );
+        assert_eq!(digest.len(), 64, "sha256 hex is 64 chars; a shorter split means channel_name's format changed");
+        assert!(name.ends_with(digest), "channel_digest must be the trailing segment of {name:?}");
     }
 
     #[test]

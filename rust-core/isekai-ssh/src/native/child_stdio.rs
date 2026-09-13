@@ -114,7 +114,7 @@ pub(crate) fn spawn_isekai_pipe_connect(
 /// Priority order for the `isekai-pipe connect` child's `ISEKAI_PIPE_LOG_FILE`
 /// target (`ADR_ISEKAI_SSH_OBSERVABILITY.md` §3.1): (1) `--isekai-log-file`
 /// explicit override, if given; (2) the holder-specific rotating log
-/// ([`holder_log_file`]), if `is_holder` (the caller passes
+/// ([`crate::native::mux::naming::pipe_holder_log_file`]), if `is_holder` (the caller passes
 /// `native::mux::holder::is_holder_reexec()` — kept as a plain `bool`
 /// parameter here, rather than calling that directly, purely so this
 /// priority logic stays unit-testable without mutating the real
@@ -134,40 +134,9 @@ fn resolve_pipe_log_file(explicit_override: Option<&Path>, is_holder: bool, chan
         return Some(explicit.to_path_buf());
     }
     if is_holder {
-        return holder_log_file(channel_name).ok();
+        return crate::native::mux::naming::pipe_holder_log_file(channel_name).ok();
     }
     isekai_pipe_core::default_log_file().ok()
-}
-
-/// `isekai-ssh-holder-<hex>.log`, alongside `default_log_file()`'s own
-/// `isekai-ssh.log` — a separate file *per holder* (`<hex>` is
-/// `channel_name`'s own trailing SHA-256 hex digest — the exact identity
-/// `mux/mod.rs` uses to decide which holder an invocation shares with, so
-/// this stays 1:1 with "one holder" the same way `channel_name` itself
-/// does) so the long-lived holder's child (which needs runtime log
-/// rotation, `isekai-pipe/src/connect.rs`'s `RotatingLogFile`) never shares
-/// a path with *either* a short-lived foreground client's child (which
-/// keeps appending to `default_log_file()` forever, same as before this
-/// ADR) *or* a different destination's own holder — two concurrently-active
-/// `isekai-ssh <host>` destinations (an ordinary multi-tab usage pattern)
-/// each get their own detached holder (`native/mux/holder.rs`), and without
-/// this per-holder split their `isekai-pipe connect` children's
-/// `RotatingLogFile` instances would collide on one shared file, each
-/// independently tracking size and rotating out from under the other's open
-/// handle (a real bug an earlier code review caught in this ADR's first
-/// draft, which used a single global `isekai-ssh-holder.log` name). Env
-/// inheritance means `default_log_file()` itself resolves identically
-/// regardless of holder (`holder.rs` doesn't touch the env block), so this
-/// is purely a naming split, not a different resolution mechanism.
-fn holder_log_file(channel_name: &str) -> std::io::Result<PathBuf> {
-    let mut path = isekai_pipe_core::default_log_file()?;
-    // `channel_name` is `\\.\pipe\isekai-ssh-mux-<hex>` — hyphens appear
-    // only inside the literal `isekai-ssh-mux-` prefix, never inside the
-    // hex digest itself, so splitting on the *last* `-` reliably isolates
-    // just the digest regardless of how many hyphens precede it.
-    let digest = channel_name.rsplit('-').next().unwrap_or(channel_name);
-    path.set_file_name(format!("isekai-ssh-holder-{digest}.log"));
-    Ok(path)
 }
 
 /// A child process's piped stdin+stdout, combined into one
@@ -351,7 +320,7 @@ mod tests {
     #[test]
     fn resolve_pipe_log_file_splits_holder_and_foreground_paths_when_no_override() {
         let holder = resolve_pipe_log_file(None, true, TEST_CHANNEL_NAME)
-            .expect("holder_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
+            .expect("pipe_holder_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
         let foreground = resolve_pipe_log_file(None, false, TEST_CHANNEL_NAME)
             .expect("default_log_file should resolve on a test host with $HOME/%LOCALAPPDATA%");
         assert_ne!(holder, foreground, "holder and foreground must never share a log path (ADR §3.2)");
