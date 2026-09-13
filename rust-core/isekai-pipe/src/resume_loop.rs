@@ -90,10 +90,10 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// (engine/mod.rs, 2s) adds at most 2s of latency to whichever attempt races
 /// it, comfortably inside this switch's own bounded windows above.
 const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
-/// How long, measured from `disconnected_at` (not from the moment of the
-/// switch itself), `resume_with_backoff_until_deadline` keeps retrying the
-/// cross-family relay target *before that target has ever succeeded* in
-/// this disconnect episode.
+/// How long, measured from the *moment of the switch itself* (not from
+/// `disconnected_at` — see the R1 note below), `resume_with_backoff_until_
+/// deadline` keeps retrying the cross-family relay target *before that
+/// target has ever succeeded* in this disconnect episode.
 ///
 /// This is deliberately **not** the same as the relay-grace-based deadline
 /// (`None`/multi-day) that `run_resume_loop` installs for later episodes
@@ -111,13 +111,23 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 /// `lightweight_retries`/`redeploy_gate` escalation that `always-connects.md`
 /// depends on).
 ///
-/// Must stay comfortably above `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` (30s) so
-/// task 4's "回数条件だけでは足りない" floor is always satisfiable within this
-/// window regardless of how much of it the original STUN attempts already
-/// spent before the switch (deadline is anchored to `disconnected_at`, so a
-/// switch that happens at, say, `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own
-/// ~15.5s still leaves ~30s of budget against the cross-family target) —
-/// and comfortably below `STUN_RESUME_GIVE_UP_WINDOW` (120s) so a genuinely
+/// **R1** (opus review round 2 on this ADR's implementation): the switch
+/// call site adds this to *elapsed time since `disconnected_at`* rather than
+/// anchoring the whole window to `disconnected_at` directly, because the
+/// switch itself can already be tens of seconds into the episode by the
+/// time it fires — `switch_attempts_before_cross_family` real attempts
+/// against the *original* STUN target, each up to
+/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT` (15s), not just the
+/// `RESUME_BACKOFF` waits between them. Anchoring this constant to
+/// `disconnected_at` instead left as little as zero of it for the
+/// cross-family target on a slow-to-fail STUN peer, defeating task 4's
+/// "short *bounded retry*" (up to ~`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+/// attempts) requirement — see the call site's own `.max(
+/// UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)`, which keeps task 4's *other* half
+/// (never give up before 30s since `disconnected_at`) true even when the
+/// switch happens quickly.
+///
+/// Comfortably below `STUN_RESUME_GIVE_UP_WINDOW` (120s) so a genuinely
 /// unreachable cross-family target still hands back control well inside the
 /// time this project already treats as "too long to make the user wait".
 const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
@@ -1264,7 +1274,8 @@ async fn resume_with_backoff_until_deadline(
         )
         .await;
         if switched_this_call.is_none()
-            && (backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged || stun_failures >= switch_attempts_before_cross_family)
+            && ((backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged && stun_failures >= 1)
+                || stun_failures >= switch_attempts_before_cross_family)
         {
             if let Some(fallback_target) = cross_family_target {
                 let trigger = if backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged {
@@ -1283,7 +1294,24 @@ async fn resume_with_backoff_until_deadline(
                 // installed later, by `run_resume_loop`, only once this
                 // function actually returns `Ok` with `switched_this_call`
                 // set — i.e. only after a real success.
-                max_resume_window = Some(CROSS_FAMILY_SWITCH_DEADLINE);
+                //
+                // R1 fix (opus review round 2 on this ADR's implementation):
+                // the budget below is anchored to *now* (the moment of the
+                // switch), not to `disconnected_at` — a switch that only
+                // happens after `switch_attempts_before_cross_family` real
+                // attempts, each of which can itself take up to
+                // `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT` (15s) to
+                // fail, can already be tens of seconds into the episode by
+                // the time it fires; anchoring to `disconnected_at` there
+                // left as little as zero budget for the cross-family target
+                // itself, defeating task 4's "short *bounded retry*" (up to
+                // ~`UNKNOWN_SESSION_CONFIRM_THRESHOLD` attempts) requirement.
+                // The `.max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)` keeps the
+                // *other* half of task 4 (never give up before 30s since
+                // `disconnected_at`) true even when the switch happens
+                // quickly (the network-change-signal path, ~1 attempt in).
+                let elapsed_since_disconnect = Instant::now().saturating_duration_since(disconnected_at);
+                max_resume_window = Some((elapsed_since_disconnect + CROSS_FAMILY_SWITCH_DEADLINE).max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR));
                 resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
                 deadline = disconnected_at + resume_window;
                 notify_on_give_up = max_resume_window.is_none();
