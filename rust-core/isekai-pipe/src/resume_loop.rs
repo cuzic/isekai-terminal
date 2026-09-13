@@ -1344,6 +1344,17 @@ async fn resume_with_backoff_until_deadline(
                 resume_window = budget.resume_window;
                 deadline = budget.deadline;
                 switched_this_call = Some((*current_target).clone());
+                // `/code-review` finding on this ADR's implementation:
+                // without this reset, the next iteration's backoff delay
+                // (`RESUME_BACKOFF.delay_for_attempt(attempt, ..)`, a pure
+                // function of `attempt` alone) is still computed from the
+                // *STUN* side's accumulated `attempt` count, so the very
+                // first probe against `current_target` (never tried before
+                // this call) would wait out a stale, near-`RESUME_BACKOFF.max`
+                // (10s) delay instead of a fresh one — eating a large slice
+                // of the tightly-bounded `CROSS_FAMILY_SWITCH_DEADLINE` (45s)
+                // probe window for no reason tied to the new target at all.
+                attempt = 0;
             }
         }
 
@@ -1428,6 +1439,9 @@ async fn resume_with_backoff_until_deadline(
                             resume_window = budget.resume_window;
                             deadline = budget.deadline;
                             switched_this_call = Some((*current_target).clone());
+                            // See the `NetworkChanged` trigger's identical
+                            // reset above for why this is needed.
+                            attempt = 0;
                         }
                     }
                 }
