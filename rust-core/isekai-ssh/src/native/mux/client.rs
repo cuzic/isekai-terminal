@@ -64,7 +64,7 @@ async fn abort_active(active_build: &mut Option<super::build_relay::ActiveBuild>
 /// connection dropped during the handshake" arm just below), so the caller
 /// must be free to fall back to an unmultiplexed direct connect rather than
 /// treat this as fatal.
-const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const HELLO_ACK_PROGRESS_AFTER: Duration = Duration::from_secs(2);
 
 /// How a client session ended.

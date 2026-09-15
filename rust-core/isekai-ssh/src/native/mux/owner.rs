@@ -32,14 +32,16 @@ use anyhow::{anyhow, Context, Result};
 use local_ipc_mux::ExclusiveChannel;
 use russh::client;
 use russh_stream_session::{open_channel, ForwardRoutes};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, MutexGuard, Notify};
 
 use crate::log_file::log_line;
 
+use super::client::HELLO_ACK_TIMEOUT;
 use super::ctl_forward;
 use super::protocol::{read_frame, spawn_frame_reader, token_eq, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
@@ -79,6 +81,7 @@ const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// this const exists to fix), long enough not to burn a whole task purely
 /// spinning on a lock.
 const HANDLE_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HANDLE_NOT_BUSY: u64 = u64::MAX;
 
 /// How long [`relay_loop`] waits, after forwarding the client's local stdin
 /// EOF to the remote as a channel EOF (`Frame::Shutdown` → `channel.eof()`),
@@ -115,6 +118,78 @@ async fn shutdown_close_deadline(stdin_done_at: Option<tokio::time::Instant>) {
     }
 }
 
+fn monotonic_elapsed_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    elapsed.min((u64::MAX - 1) as u128) as u64
+}
+
+pub(crate) struct GatedHandle<H> {
+    handle: Arc<Mutex<client::Handle<H>>>,
+    busy_since_ms: AtomicU64,
+}
+
+impl<H> GatedHandle<H> {
+    pub(crate) fn new(handle: Arc<Mutex<client::Handle<H>>>) -> Self {
+        Self { handle, busy_since_ms: AtomicU64::new(HANDLE_NOT_BUSY) }
+    }
+
+    async fn lock_tracked(&self) -> GatedHandleGuard<'_, H> {
+        let guard = self.handle.lock().await;
+        self.busy_since_ms.store(monotonic_elapsed_ms(), Ordering::Relaxed);
+        GatedHandleGuard { owner: self, guard: Some(guard) }
+    }
+
+    async fn lock_untracked(&self) -> MutexGuard<'_, client::Handle<H>> {
+        self.handle.lock().await
+    }
+
+    fn peer_busy_for(&self) -> Option<Duration> {
+        let since = self.busy_since_ms.load(Ordering::Relaxed);
+        if since == HANDLE_NOT_BUSY {
+            return None;
+        }
+        let now = monotonic_elapsed_ms();
+        #[cfg(test)]
+        if since > now {
+            return Some(Duration::from_millis(HANDLE_NOT_BUSY.saturating_sub(since)));
+        }
+        Some(Duration::from_millis(now.saturating_sub(since)))
+    }
+
+    #[cfg(test)]
+    fn force_busy_for(&self, duration: Duration) {
+        let duration_ms = duration.as_millis().min((u64::MAX - 1) as u128) as u64;
+        self.busy_since_ms.store(HANDLE_NOT_BUSY - duration_ms, Ordering::Relaxed);
+    }
+}
+
+struct GatedHandleGuard<'a, H> {
+    owner: &'a GatedHandle<H>,
+    guard: Option<MutexGuard<'a, client::Handle<H>>>,
+}
+
+impl<H> Deref for GatedHandleGuard<'_, H> {
+    type Target = client::Handle<H>;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.guard.as_ref().expect("tracked handle guard already dropped")
+    }
+}
+
+impl<H> DerefMut for GatedHandleGuard<'_, H> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.guard.as_mut().expect("tracked handle guard already dropped")
+    }
+}
+
+impl<H> Drop for GatedHandleGuard<'_, H> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.owner.busy_since_ms.store(HANDLE_NOT_BUSY, Ordering::Relaxed);
+    }
+}
+
 /// Accepts clients on `channel` until either `accept` itself fails (the
 /// underlying IPC channel died — a genuine local-pipe infrastructure
 /// problem), or the client count drops to (and stays at) zero for the
@@ -143,6 +218,7 @@ where
     C: ExclusiveChannel,
     H: client::Handler + 'static,
 {
+    let handle = Arc::new(GatedHandle::new(handle));
     let active_clients = Arc::new(AtomicUsize::new(0));
     // Notified on every count change (increment *or* decrement) — the
     // idle-exit wait below only actually cares about decrements reaching
@@ -246,9 +322,9 @@ where
 /// crate). Polls rather than subscribing to some push signal because
 /// `russh::client::Handle` exposes none; `HANDLE_HEALTH_POLL_INTERVAL` keeps
 /// the cost of that negligible.
-async fn handle_died<H: client::Handler>(handle: &Mutex<client::Handle<H>>) {
+async fn handle_died<H: client::Handler>(handle: &GatedHandle<H>) {
     loop {
-        if handle.lock().await.is_closed() {
+        if handle.lock_untracked().await.is_closed() {
             return;
         }
         tokio::time::sleep(HANDLE_HEALTH_POLL_INTERVAL).await;
@@ -293,6 +369,26 @@ fn session_kind_for_hello(term: &str, cols: u16, rows: u16, want_pty: bool, remo
     super::connect::decide_session_kind(remote_cmd_words.as_deref(), request_tty, term, cols as u32, rows as u32, &[])
 }
 
+async fn request_ctl_forward<H: client::Handler>(handle: &GatedHandle<H>, routes: &ForwardRoutes) -> Option<ctl_forward::CtlForward> {
+    let remote_path = format!("{}{}.sock", crate::ctl_forward::REMOTE_SOCK_PREFIX, crate::ctl_forward::new_ctl_token());
+    let channels = routes.register(&remote_path);
+    let result = {
+        let mut guard = handle.lock_tracked().await;
+        guard.streamlocal_forward(remote_path.clone()).await
+    };
+    if let Err(e) = result {
+        routes.unregister(&remote_path);
+        log_line!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e}");
+        return None;
+    }
+    Some(ctl_forward::CtlForward { remote_path, channels })
+}
+
+async fn cancel_ctl_forward<H: client::Handler>(handle: &GatedHandle<H>, routes: &ForwardRoutes, remote_path: &str) {
+    let _ = handle.lock_tracked().await.cancel_streamlocal_forward(remote_path.to_string()).await;
+    routes.unregister(remote_path);
+}
+
 /// Serves exactly one client: reads its [`Frame::Hello`] (validating the
 /// protocol version and auth token), opens a private remote shell channel with
 /// the client's requested PTY geometry, then relays until either side ends.
@@ -302,7 +398,7 @@ fn session_kind_for_hello(term: &str, cols: u16, rows: u16, want_pty: bool, remo
 /// client as a [`Frame::Ctl`] so it lands on *that* client's own terminal.
 pub(crate) async fn relay_client<Conn, H>(
     conn: Conn,
-    handle: &Mutex<client::Handle<H>>,
+    handle: &GatedHandle<H>,
     expected_token: &[u8],
     ctl_routes: Option<&ForwardRoutes>,
     tab_idle_color: Option<(u8, u8, u8)>,
@@ -345,6 +441,17 @@ where
     };
     let session_kind = session_kind_for_hello(&term, cols, rows, want_pty, remote_command.as_deref());
 
+    if let Some(busy_for) = handle.peer_busy_for() {
+        if busy_for >= HELLO_ACK_TIMEOUT {
+            let reason = format!(
+                "the shared connection has had an SSH request outstanding for {}s; continuing on a direct connection. multiplexing resumes automatically on your next connection.",
+                busy_for.as_secs()
+            );
+            let _ = write_frame(&mut writer, &Frame::Rejected { reason }).await;
+            return Ok(());
+        }
+    }
+
     // This client's own private ctl-socket forward (opportunistic: a failed
     // setup just leaves `ctl` as `None`). Skipped entirely for a
     // `remote_command` request (mirrors `native::connect::run_authenticated_session`'s
@@ -354,7 +461,7 @@ where
     // `tty_exec` (`--isekai-tty`) is gated the same way for the same reason,
     // but independently — the two compose (see `Frame::Hello`'s doc comment).
     let ctl = match ctl_routes {
-        Some(routes) if remote_command.is_none() => ctl_forward::request(handle, routes).await,
+        Some(routes) if remote_command.is_none() => request_ctl_forward(handle, routes).await,
         _ => None,
     };
 
@@ -363,7 +470,9 @@ where
         // client's traffic never blocks another's channel open or forward. The
         // guard is dropped at the end of this block, before any `ctl_forward`
         // cleanup below re-locks the handle.
-        let guard = handle.lock().await;
+        // Do not wrap `channel_open_session` in its own timeout: russh cannot
+        // reliably recover the half-open remote channel after cancellation.
+        let guard = handle.lock_tracked().await;
         if ctl.is_some() || tty_exec.is_some() {
             ctl_forward::open_login_shell(
                 &guard,
@@ -402,7 +511,7 @@ where
             // bailing so it doesn't leak on the remote (and its route entry
             // linger locally) — every exit path must release a requested forward.
             if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
-                ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
+                cancel_ctl_forward(handle, routes, &fwd.remote_path).await;
             }
             let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
             // A failed *channel open* (as opposed to a protocol
@@ -424,7 +533,7 @@ where
         // call).
         let _ = channel.close().await;
         if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
-            ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
+            cancel_ctl_forward(handle, routes, &fwd.remote_path).await;
         }
         return Err(anyhow::Error::new(e).context("isekai-ssh mux owner: sending HelloAck failed"));
     }
@@ -443,7 +552,7 @@ where
 
     // Best-effort teardown of this client's forward.
     if let (Some(path), Some(routes)) = (&ctl_remote_path, ctl_routes) {
-        ctl_forward::cancel(handle, routes, path).await;
+        cancel_ctl_forward(handle, routes, path).await;
     }
 
     result
@@ -500,7 +609,7 @@ async fn relay_loop<R, W, H>(
     writer: &mut W,
     channel: &mut russh::Channel<client::Msg>,
     mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<ctl_forward::CtlRelayEvent>>,
-    handle: &Mutex<client::Handle<H>>,
+    handle: &GatedHandle<H>,
     shutdown: &Notify,
 ) -> Result<()>
 where
@@ -842,7 +951,7 @@ where
             // shared handle is still alive (e.g. this specific SSH channel
             // was closed by policy) must not tear down every other tab's
             // session just because this one channel had a bad day.
-            if handle.lock().await.is_closed() {
+            if handle.lock_untracked().await.is_closed() {
                 shutdown.notify_waiters();
             }
         }
@@ -1010,7 +1119,7 @@ mod tests {
     /// session task is still alive.
     #[tokio::test]
     async fn handle_died_does_not_resolve_while_the_handle_is_alive() {
-        let handle = Mutex::new(authed_test_handle().await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_test_handle().await)));
         let result = tokio::time::timeout(Duration::from_secs(2), handle_died(&handle)).await;
         assert!(result.is_err(), "handle_died must not resolve for a still-live handle");
     }
@@ -1024,7 +1133,7 @@ mod tests {
     async fn handle_died_resolves_once_the_shared_handle_disconnects() {
         let inner = authed_test_handle().await;
         inner.disconnect(russh::Disconnect::ByApplication, "test teardown", "en").await.unwrap();
-        let handle = Mutex::new(inner);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(inner)));
         let result = tokio::time::timeout(Duration::from_secs(5), handle_died(&handle)).await;
         assert!(result.is_ok(), "handle_died must resolve once the shared handle's session task ends");
     }
@@ -1232,6 +1341,37 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingOpenServer {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl server::Server for CountingOpenServer {
+        type Handler = CountingOpenHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CountingOpenHandler {
+            CountingOpenHandler { opens: self.opens.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingOpenHandler {
+        opens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl server::Handler for CountingOpenHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(&mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
     async fn spawn_echo_server(seed: u8) -> SocketAddr {
         let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
         let host_key = SshPrivateKey::from(keypair);
@@ -1279,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_opens_a_shell_and_relays_stdin_and_stdout() {
         let addr = spawn_echo_server(120).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1316,6 +1456,85 @@ mod tests {
         write_frame(&mut client, &Frame::Shutdown).await.unwrap();
         drop(client);
         let _ = relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_client_allows_a_client_while_the_shared_handle_busy_time_is_below_the_client_timeout() {
+        let addr = spawn_echo_server(126).await;
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
+        handle.force_busy_for(HELLO_ACK_TIMEOUT - Duration::from_secs(1));
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { version } => assert_eq!(version, MUX_PROTOCOL_VERSION),
+            other => panic!("a short busy interval must not reject the client, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_client_rejects_when_the_shared_handle_has_been_busy_past_the_client_timeout() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let keypair = Ed25519Keypair::from_seed(&[127; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = CountingOpenServer { opens: opens.clone() };
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
+        handle.force_busy_for(HELLO_ACK_TIMEOUT);
+        let token = b"tok".to_vec();
+        let shutdown = Arc::new(Notify::new());
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let shutdown_for_relay = shutdown.clone();
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &shutdown_for_relay).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None }).await.unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::Rejected { reason } => {
+                assert!(reason.contains("continuing on a direct connection"), "reject reason must mention direct fallback: {reason}");
+                assert!(
+                    reason.contains("multiplexing resumes automatically on your next connection"),
+                    "reject reason must mention automatic mux recovery: {reason}"
+                );
+            }
+            other => panic!("a long-busy shared handle must reject before opening a channel, got {other:?}"),
+        }
+
+        assert!(relay.await.unwrap().is_ok(), "busy-gate rejection is a clean degradation, not a relay error");
+        assert_eq!(opens.load(Ordering::SeqCst), 0, "the busy gate must reject before channel_open_session is called");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), shutdown.notified()).await.is_err(),
+            "busy-gate rejection must not notify the owner shutdown path"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_handle_clears_busy_state_when_a_tracked_guard_drops_or_panics() {
+        let handle = Arc::new(GatedHandle::new(Arc::new(Mutex::new(authed_test_handle().await))));
+        {
+            let _guard = handle.lock_tracked().await;
+            assert!(handle.peer_busy_for().is_some(), "tracked lock acquisition must mark the handle busy");
+        }
+        assert!(handle.peer_busy_for().is_none(), "dropping the tracked guard must clear busy state");
+
+        let handle_for_task = handle.clone();
+        let panic_task = tokio::spawn(async move {
+            let _guard = handle_for_task.lock_tracked().await;
+            panic!("intentional panic while holding the tracked handle");
+        });
+        assert!(panic_task.await.is_err(), "the task should panic for this RAII regression test");
+        assert!(handle.peer_busy_for().is_none(), "panic unwinding must drop the guard and clear busy state");
     }
 
     /// A mock sshd that ends the remote command via `exit-signal` (RFC 4254
@@ -1371,7 +1590,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
         });
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1452,7 +1671,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
         });
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1498,7 +1717,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let relay = tokio::spawn(async move {
             let result = relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await;
             (result, handle)
@@ -1514,7 +1733,7 @@ mod tests {
         drop(client);
 
         let (_result, handle) = relay.await.unwrap();
-        assert!(!handle.lock().await.is_closed(), "a single channel closing must not close the shared handle");
+        assert!(!handle.lock_untracked().await.is_closed(), "a single channel closing must not close the shared handle");
     }
 
     /// A mock sshd that only answers `exec` (never `shell_request`) — echoes
@@ -1567,7 +1786,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_execs_a_remote_command_instead_of_opening_a_shell() {
         let addr = spawn_exec_echo_server(124).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1634,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_execs_tty_exec_even_without_ctl_socket() {
         let addr = spawn_exec_echo_server(125).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1692,7 +1911,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_rejects_a_version_mismatch() {
         let addr = spawn_echo_server(121).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
@@ -1710,7 +1929,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_rejects_a_bad_token() {
         let addr = spawn_echo_server(122).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
@@ -1730,7 +1949,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_requires_hello_first() {
         let addr = spawn_echo_server(123).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
@@ -1751,7 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_times_out_a_peer_that_never_sends_hello() {
         let addr = spawn_echo_server(125).await;
-        let handle = Mutex::new(authed_handle(addr).await);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(authed_handle(addr).await)));
         let token = b"tok".to_vec();
 
         let (_client, owner_side) = tokio::io::duplex(4096);
@@ -1843,7 +2062,7 @@ mod tests {
         let handler = verifying_handler_with_routes(&verifier, &routes);
         let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
         assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -1907,7 +2126,7 @@ mod tests {
         let handler = verifying_handler_with_routes(&verifier, &routes);
         let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
         assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -2031,7 +2250,7 @@ mod tests {
         let handler = verifying_handler_with_routes(&verifier, &routes);
         let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
         assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -2218,7 +2437,7 @@ mod tests {
         let handler = verifying_handler_with_routes(&verifier, &routes);
         let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
         assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -2357,7 +2576,7 @@ mod tests {
         let handler = verifying_handler_with_routes(&verifier, &routes);
         let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
         assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
-        let handle = Mutex::new(handle);
+        let handle = GatedHandle::new(Arc::new(Mutex::new(handle)));
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
