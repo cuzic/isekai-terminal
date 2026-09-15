@@ -164,7 +164,7 @@ impl<H: client::Handler> GatedHandle<H> {
     }
 }
 
-struct GatedHandleGuard<'a, H> {
+struct GatedHandleGuard<'a, H: client::Handler> {
     owner: &'a GatedHandle<H>,
     guard: Option<MutexGuard<'a, client::Handle<H>>>,
 }
