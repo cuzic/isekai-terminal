@@ -5,6 +5,7 @@
 //! production`, is treated as an OpenSSH invocation with an injected
 //! `ProxyCommand` that delegates the byte stream to `isekai-pipe connect`.
 
+use std::future::Future;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -49,6 +50,39 @@ const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor", "bu
 /// separate `isekai-ssh <destination>` invocations, possibly hours/days
 /// apart, unlike `isekai-terminal-core`'s (Android's) per-session bootstrap.
 const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
+const PRE_SHELL_PROGRESS_AFTER: Duration = Duration::from_secs(2);
+
+async fn await_with_pre_shell_progress<F>(future: F, message: String) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    let start = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut displayed = false;
+
+    let result = loop {
+        tokio::select! {
+            result = &mut future => break result,
+            _ = tick.tick() => {
+                let elapsed = start.elapsed();
+                if elapsed >= PRE_SHELL_PROGRESS_AFTER {
+                    displayed = true;
+                    eprint!("\r\x1b[K{message} ({}s)", elapsed.as_secs());
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        }
+    };
+
+    if displayed {
+        eprint!("\r\x1b[K");
+        let _ = std::io::stderr().flush();
+    }
+
+    result
+}
 
 /// Bounds `resolve_stun_servers`'s DNS fallback per entry. `getaddrinfo` is
 /// already self-bounding (glibc's own `resolv.conf` timeout × attempts ×
@@ -1568,9 +1602,11 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     }
     let deploy_started = Instant::now();
-    let report = backend
-        .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
-        .await
+    let report = await_with_pre_shell_progress(
+        backend.install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers),
+        format!("isekai-ssh: redeploying isekai-helper to {}", candidate.target),
+    )
+    .await
         .map_err(|e| {
             let failure = classify_bootstrap_error(&e);
             let err = anyhow::Error::new(e);

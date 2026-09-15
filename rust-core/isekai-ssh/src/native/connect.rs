@@ -33,6 +33,8 @@
 //! every destination this project's users actually run through `isekai-ssh`
 //! has isekai routing enabled.
 
+use std::future::Future;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -68,6 +70,75 @@ use super::escape::{process_stdin_bytes, EscapeAction};
 use super::host_key_trust::FileBackedHostKeyVerifier;
 use super::keyboard_interactive;
 use super::private_key;
+
+const PRE_SHELL_PROGRESS_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn render_pre_shell_progress(message: &str, elapsed_secs: u64) {
+    eprint!("\r\x1b[K{message} ({elapsed_secs}s)");
+    let _ = std::io::stderr().flush();
+    #[cfg(test)]
+    test_progress::record(format!("\r\x1b[K{message} ({elapsed_secs}s)").as_bytes());
+}
+
+fn clear_pre_shell_progress() {
+    eprint!("\r\x1b[K");
+    let _ = std::io::stderr().flush();
+    #[cfg(test)]
+    test_progress::record(b"\r\x1b[K");
+}
+
+async fn await_with_pre_shell_progress<F>(future: F, message: String) -> F::Output
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    let start = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut displayed = false;
+
+    let result = loop {
+        tokio::select! {
+            result = &mut future => break result,
+            _ = tick.tick() => {
+                let elapsed = start.elapsed();
+                if elapsed >= PRE_SHELL_PROGRESS_AFTER {
+                    displayed = true;
+                    render_pre_shell_progress(&message, elapsed.as_secs());
+                }
+            }
+        }
+    };
+
+    if displayed {
+        clear_pre_shell_progress();
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod test_progress {
+    use std::sync::{Mutex, OnceLock};
+
+    static BYTES: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+    fn bytes() -> &'static Mutex<Vec<u8>> {
+        BYTES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) fn record(chunk: &[u8]) {
+        bytes().lock().unwrap().extend_from_slice(chunk);
+    }
+
+    pub(super) fn reset() {
+        bytes().lock().unwrap().clear();
+    }
+
+    pub(super) fn snapshot() -> Vec<u8> {
+        bytes().lock().unwrap().clone()
+    }
+}
 
 /// The concrete `russh` client handle this native path establishes — an
 /// already-authenticated, still-live SSH connection. `native/mux` shares a
@@ -1138,7 +1209,11 @@ where
         log_line_progress!("isekai-ssh: trying key {}", candidate.display());
         log_line_verbose!("isekai-ssh: starting authentication with key {}", candidate.display());
         let auth_started = Instant::now();
-        let auth_result = authenticate_session(&mut handle, username, &credential).await;
+        let auth_result = await_with_pre_shell_progress(
+            authenticate_session(&mut handle, username, &credential),
+            format!("isekai-ssh: authenticating with key {}", candidate.display()),
+        )
+        .await;
         let auth_elapsed_ms = auth_started.elapsed().as_millis();
         match auth_result {
             Ok(true) => {
@@ -2297,6 +2372,29 @@ mod tests {
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_err(), "a silently-refused passphrase prompt must fail cleanly, not hang or panic");
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_does_not_draw_progress_over_the_passphrase_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 216, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 211).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        test_progress::reset();
+        let passphrase_prompt = |_path: &Path, _attempt: u32| {
+            assert!(
+                test_progress::snapshot().is_empty(),
+                "the authenticate_session ticker must not leave a progress line active when the passphrase prompt starts"
+            );
+            Some("hunter2".to_string())
+        };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "the passphrase prompt path should still authenticate normally");
     }
 
     /// Simulates the holder-mode path (Phase 1b passphrase hand-off): the
