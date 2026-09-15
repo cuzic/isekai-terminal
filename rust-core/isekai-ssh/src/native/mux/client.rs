@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::log_file::log_line;
 
@@ -64,6 +65,7 @@ async fn abort_active(active_build: &mut Option<super::build_relay::ActiveBuild>
 /// must be free to fall back to an unmultiplexed direct connect rather than
 /// treat this as fatal.
 const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const HELLO_ACK_PROGRESS_AFTER: Duration = Duration::from_secs(2);
 
 /// How a client session ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -214,6 +216,46 @@ pub(crate) struct PtySessionRequest {
     pub(crate) token: Vec<u8>,
 }
 
+async fn wait_for_hello_ack_frame<E>(
+    frame_rx: &mut mpsc::Receiver<std::io::Result<Option<Frame>>>,
+    stderr: &mut E,
+    host: &str,
+) -> std::io::Result<Option<Frame>>
+where
+    E: AsyncWrite + Unpin,
+{
+    let start = tokio::time::Instant::now();
+    let timeout = tokio::time::sleep(HELLO_ACK_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut displayed = false;
+
+    let result = loop {
+        tokio::select! {
+            frame = frame_rx.recv() => break frame.unwrap_or(Ok(None)),
+            _ = tick.tick() => {
+                let elapsed = start.elapsed();
+                if elapsed >= HELLO_ACK_PROGRESS_AFTER {
+                    displayed = true;
+                    let _ = stderr
+                        .write_all(format!("\r\x1b[Kisekai-ssh: waiting for the shared connection to {host}... ({}s)", elapsed.as_secs()).as_bytes())
+                        .await;
+                    let _ = stderr.flush().await;
+                }
+            }
+            _ = &mut timeout => break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "HelloAck timeout")),
+        }
+    };
+
+    if displayed {
+        let _ = stderr.write_all(b"\r\x1b[K").await;
+        let _ = stderr.flush().await;
+    }
+
+    result
+}
+
 /// The body of [`run`] with the terminal streams plus an optional resize
 /// event channel injected, so tests can drive it against in-memory buffers.
 /// Sends a [`Frame::Hello`], waits for the owner's `HelloAck`/`Rejected`,
@@ -265,16 +307,16 @@ where
     // simply lets it run until the owner's connection naturally ends.
     let (mut frame_rx, _frame_reader_task) = spawn_frame_reader(conn_read);
 
-    match tokio::time::timeout(HELLO_ACK_TIMEOUT, frame_rx.recv()).await {
-        Ok(Some(Ok(Some(Frame::HelloAck { version })))) => {
+    match wait_for_hello_ack_frame(&mut frame_rx, &mut stderr, &host).await {
+        Ok(Some(Frame::HelloAck { version })) => {
             if version != MUX_PROTOCOL_VERSION {
                 return Ok(ClientOutcome::Rejected {
                     reason: format!("owner speaks mux protocol version {version}, we speak {MUX_PROTOCOL_VERSION}"),
                 });
             }
         }
-        Ok(Some(Ok(Some(Frame::Rejected { reason })))) => return Ok(ClientOutcome::Rejected { reason }),
-        Ok(Some(Ok(Some(other)))) => {
+        Ok(Some(Frame::Rejected { reason })) => return Ok(ClientOutcome::Rejected { reason }),
+        Ok(Some(other)) => {
             return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
         }
         // The owner connection dropped *during the handshake* — before any
@@ -288,7 +330,10 @@ where
         // e.g. a passphrase/keyboard-interactive prompt it can't answer) when
         // this tab's `try_claim`-losing connect races ahead of it — that must
         // degrade to an ordinary direct connect, not a scary "owner lost" exit.
-        Ok(Some(Ok(None))) | Ok(Some(Err(_))) | Ok(None) => {
+        Ok(None) => {
+            return Ok(ClientOutcome::Rejected { reason: "the owner connection was lost during the handshake".to_string() })
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::TimedOut => {
             return Ok(ClientOutcome::Rejected { reason: "the owner connection was lost during the handshake".to_string() })
         }
         // The owner accepted the connection but never answered at all
@@ -446,7 +491,34 @@ where
 mod tests {
     use super::*;
     use super::super::protocol::read_frame;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
     use tokio::io::duplex;
+
+    #[derive(Clone, Default)]
+    struct SharedWrite(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWrite {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl AsyncWrite for SharedWrite {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     /// Runs `run_inner` against an in-memory owner connection whose behavior a
     /// closure supplies, plus a canned stdin. Returns the client's outcome and
@@ -597,6 +669,90 @@ mod tests {
             ClientOutcome::Rejected { .. } => {}
             other => panic!("a silent owner past HELLO_ACK_TIMEOUT must be Rejected (safe to fall back), got {other:?}"),
         }
+    }
+
+    /// Fast owners should not flash a progress line: the ticker only becomes
+    /// visible after the wait is actually long enough for a human to wonder.
+    #[tokio::test]
+    async fn client_does_not_show_handshake_progress_before_two_seconds() {
+        let (outcome, _stdout, stderr) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+                write_frame(&mut w, &Frame::Exit(0)).await.unwrap();
+            })
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap(), ClientOutcome::Exited(0));
+        assert!(stderr.is_empty(), "a sub-2s HelloAck must not draw progress, got {stderr:?}");
+    }
+
+    /// Advances the paused clock one second at a time so the intermediate
+    /// progress updates are observable, matching the production interval.
+    #[tokio::test]
+    async fn client_updates_handshake_progress_once_per_second_for_a_silent_owner() {
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let _owner_task = tokio::spawn(async move {
+            let (mut r, _w) = tokio::io::split(owner_conn);
+            let _ = read_frame(&mut r).await;
+            std::future::pending::<()>().await;
+        });
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let stderr = SharedWrite::default();
+        let mut stderr_for_client = stderr.clone();
+
+        tokio::time::pause();
+        let client = run_inner(
+            cr,
+            &mut cw,
+            PtySessionRequest {
+                term: "xterm".to_string(),
+                cols: 80,
+                rows: 24,
+                host: "mybox".to_string(),
+                remote_command: None,
+                want_pty: true,
+                tty_exec: None,
+                token: b"tok".to_vec(),
+            },
+            &b""[..],
+            &mut stdout,
+            &mut stderr_for_client,
+            None,
+        );
+        tokio::pin!(client);
+
+        let (outcome, ()) = tokio::join!(
+            client,
+            async {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert!(stderr.bytes().is_empty(), "the first second should still be quiet");
+
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    String::from_utf8_lossy(&stderr.bytes()).contains("waiting for the shared connection to mybox... (2s)"),
+                    "the 2s tick should draw progress"
+                );
+
+                tokio::time::advance(Duration::from_secs(1)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    String::from_utf8_lossy(&stderr.bytes()).contains("waiting for the shared connection to mybox... (3s)"),
+                    "later ticks should refresh the elapsed seconds"
+                );
+
+                tokio::time::advance(HELLO_ACK_TIMEOUT).await;
+            }
+        );
+        let outcome = outcome.unwrap();
+        assert!(matches!(outcome, ClientOutcome::Rejected { .. }));
+        assert!(stderr.bytes().ends_with(b"\r\x1b[K"), "progress must be cleared at timeout");
     }
 
     /// A `Ctl` frame (relayed `#@isekai ctl-socket` message) is decoded and
