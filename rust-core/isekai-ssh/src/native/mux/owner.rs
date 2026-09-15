@@ -129,7 +129,7 @@ pub(crate) struct GatedHandle<H> {
     busy_since_ms: AtomicU64,
 }
 
-impl<H> GatedHandle<H> {
+impl<H: client::Handler> GatedHandle<H> {
     pub(crate) fn new(handle: Arc<Mutex<client::Handle<H>>>) -> Self {
         Self { handle, busy_since_ms: AtomicU64::new(HANDLE_NOT_BUSY) }
     }
@@ -169,7 +169,7 @@ struct GatedHandleGuard<'a, H> {
     guard: Option<MutexGuard<'a, client::Handle<H>>>,
 }
 
-impl<H> Deref for GatedHandleGuard<'_, H> {
+impl<H: client::Handler> Deref for GatedHandleGuard<'_, H> {
     type Target = client::Handle<H>;
 
     fn deref(&self) -> &Self::Target {
@@ -177,13 +177,13 @@ impl<H> Deref for GatedHandleGuard<'_, H> {
     }
 }
 
-impl<H> DerefMut for GatedHandleGuard<'_, H> {
+impl<H: client::Handler> DerefMut for GatedHandleGuard<'_, H> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.guard.as_mut().expect("tracked handle guard already dropped")
     }
 }
 
-impl<H> Drop for GatedHandleGuard<'_, H> {
+impl<H: client::Handler> Drop for GatedHandleGuard<'_, H> {
     fn drop(&mut self) {
         drop(self.guard.take());
         self.owner.busy_since_ms.store(HANDLE_NOT_BUSY, Ordering::Relaxed);
