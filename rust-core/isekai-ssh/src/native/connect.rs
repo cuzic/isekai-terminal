@@ -35,6 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -51,7 +52,7 @@ use super::mux::ctl_forward;
 use super::mux::handoff::HandoffCredentials;
 use super::mux::naming;
 
-use crate::log_file::log_line;
+use crate::log_file::{log_line, log_line_progress, log_line_verbose};
 use crate::wrapper::{
     bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery,
     print_bootstrap_failure_guidance, resolve_claimed_outcome, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation,
@@ -1086,13 +1087,17 @@ where
     // can't carry — see `RejectionReason`'s docs) survives past this
     // function's `?` into the caller's error context.
     let handler = verifying_handler(verifier).with_forward_routes(forward_routes).with_rejection_reason(&rejection);
+    log_line_verbose!("isekai-ssh: establishing SSH transport and checking the server host key...");
+    let establish_started = Instant::now();
     let mut handle = establish_over_stream(config, stream, handler).await.map_err(|e| {
+        log_line_verbose!("isekai-ssh: SSH transport establishment failed after {}ms", establish_started.elapsed().as_millis());
         let base = anyhow::Error::from(e);
         match rejection.take() {
             Some(reason) => base.context(reason),
             None => base,
         }
     })?;
+    log_line_verbose!("isekai-ssh: SSH transport established in {}ms", establish_started.elapsed().as_millis());
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let candidates = private_key::identity_file_candidates(&host_config.identity_file, &home);
@@ -1130,18 +1135,39 @@ where
             };
             (credential, false)
         };
-        log_line!("isekai-ssh: trying key {}", candidate.display());
-        match authenticate_session(&mut handle, username, &credential).await {
-            Ok(true) => return Ok(handle),
-            Ok(false) => continue,
-            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
+        log_line_progress!("isekai-ssh: trying key {}", candidate.display());
+        log_line_verbose!("isekai-ssh: starting authentication with key {}", candidate.display());
+        let auth_started = Instant::now();
+        let auth_result = authenticate_session(&mut handle, username, &credential).await;
+        let auth_elapsed_ms = auth_started.elapsed().as_millis();
+        match auth_result {
+            Ok(true) => {
+                log_line_verbose!("isekai-ssh: key {} was accepted in {}ms", candidate.display(), auth_elapsed_ms);
+                return Ok(handle);
+            }
+            Ok(false) => {
+                log_line_verbose!("isekai-ssh: key {} was rejected in {}ms", candidate.display(), auth_elapsed_ms);
+                continue;
+            }
+            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => {
+                log_line_verbose!("isekai-ssh: key {} was unusable after {}ms", candidate.display(), auth_elapsed_ms);
+                continue;
+            }
             // Unreachable in practice: a hand-off entry is already cleartext,
             // so `authenticate_session` would never re-report it as
             // encrypted. Guarded explicitly anyway rather than assumed, so a
             // future bug in the hand-off's own decrypt step fails safe (skips
             // this candidate) instead of looping.
-            Err(SessionError::EncryptedPrivateKey) if already_decrypted => continue,
+            Err(SessionError::EncryptedPrivateKey) if already_decrypted => {
+                log_line_verbose!(
+                    "isekai-ssh: handoff key {} unexpectedly required a passphrase after {}ms",
+                    candidate.display(),
+                    auth_elapsed_ms
+                );
+                continue;
+            }
             Err(SessionError::EncryptedPrivateKey) => {
+                log_line_verbose!("isekai-ssh: key {} requires a passphrase after {}ms", candidate.display(), auth_elapsed_ms);
                 let (private_key_pem, certificate_pem): (&[u8], Option<&[u8]>) = match &credential {
                     Credential::PublicKey { private_key_pem } => (private_key_pem, None),
                     Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
@@ -1155,7 +1181,10 @@ where
                     return Ok(handle);
                 }
             }
-            Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
+            Err(e) => {
+                log_line_verbose!("isekai-ssh: key {} authentication errored after {}ms", candidate.display(), auth_elapsed_ms);
+                return Err(anyhow::Error::new(e).context("SSH authentication request failed"));
+            }
         }
     }
 

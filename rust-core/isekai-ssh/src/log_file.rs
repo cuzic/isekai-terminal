@@ -285,6 +285,19 @@ pub(crate) fn dispatch(line: &str, fallback: impl FnOnce(&str)) {
     }
 }
 
+/// Writes a pre-shell progress boundary to the active diagnostic sink and to
+/// this process's stderr. This is intentionally narrower than [`dispatch`]:
+/// `--isekai-log-file` still captures the line, but the foreground user also
+/// sees long setup phases before any remote shell can be on screen.
+pub(crate) fn dispatch_progress(line: &str) {
+    if is_enabled() {
+        append_line(line);
+    } else {
+        let _ = append_holder_line(line);
+    }
+    eprintln!("{line}");
+}
+
 /// Drop-in replacement for `eprintln!` used throughout `wrapper.rs`: when no
 /// log file is configured, behaves exactly like `eprintln!` (prints to
 /// stderr, nothing else). When `--isekai-log-file` *is* active, the line
@@ -317,6 +330,19 @@ macro_rules! log_line_verbose {
     }};
 }
 pub(crate) use log_line_verbose;
+
+/// Pre-shell progress counterpart to [`log_line!`]. Use only before the
+/// remote shell/exec is established: unlike `log_line!`, an explicit
+/// `--isekai-log-file` tees this line to stderr as well as the file.
+macro_rules! log_line_progress {
+    () => {{
+        $crate::log_file::dispatch_progress("");
+    }};
+    ($($arg:tt)*) => {{
+        $crate::log_file::dispatch_progress(&format!($($arg)*));
+    }};
+}
+pub(crate) use log_line_progress;
 
 /// Relays `child_stderr` into the log file **instead of** this process's
 /// own stderr, until the child closes its stderr (normally, on exit) — the

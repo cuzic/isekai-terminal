@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
@@ -27,7 +27,7 @@ use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::log_file::{log_line, log_line_verbose};
+use crate::log_file::{log_line, log_line_progress, log_line_verbose};
 use crate::reconnect_backoff;
 
 mod config;
@@ -1557,16 +1557,17 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
 
     match confirmation {
         TofuConfirmation::AlwaysPrompt => {
-            log_line_verbose!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+            log_line_progress!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
         }
         TofuConfirmation::Silent => {
-            log_line_verbose!(
+            log_line_progress!(
                 "isekai-ssh: cached trust for {:?} looks stale; redeploying isekai-helper to {}...",
                 resolution.isekai.profile,
                 candidate.target
             );
         }
     }
+    let deploy_started = Instant::now();
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -1579,6 +1580,11 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             }
         })
         .with_context(|| format!("failed to deploy/start isekai-helper on {:?}", candidate.target))?;
+    log_line_progress!(
+        "isekai-ssh: deployed isekai-helper to {} in {}ms",
+        candidate.target,
+        deploy_started.elapsed().as_millis()
+    );
     let handshake = &report.handshake;
     let identity = handshake.cert_sha256().to_string();
 
