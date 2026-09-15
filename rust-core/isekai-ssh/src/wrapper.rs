@@ -1591,10 +1591,20 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
 
     match confirmation {
         TofuConfirmation::AlwaysPrompt => {
-            log_line_progress!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+            log_line_verbose!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
         }
         TofuConfirmation::Silent => {
-            log_line_progress!(
+            // Deliberately `log_line_verbose!`, not `log_line_progress!`: this
+            // is a one-shot status announcement, not the elapsed-time ticker
+            // itself (that's `await_with_pre_shell_progress` below). Teeing
+            // it unconditionally to stderr would leak the generic
+            // "looks stale" wording into an `Unreachable`-classified
+            // failure's stderr output, conflicting with the
+            // unreachable-specific message
+            // (`wrapper_stale_trust_auto_recovery_e2e.rs` asserts the two
+            // never appear together, so the user isn't told two different
+            // stories about why the redeploy happened).
+            log_line_verbose!(
                 "isekai-ssh: cached trust for {:?} looks stale; redeploying isekai-helper to {}...",
                 resolution.isekai.profile,
                 candidate.target
