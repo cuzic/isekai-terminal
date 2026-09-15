@@ -185,8 +185,18 @@ impl<H: client::Handler> DerefMut for GatedHandleGuard<'_, H> {
 
 impl<H: client::Handler> Drop for GatedHandleGuard<'_, H> {
     fn drop(&mut self) {
-        drop(self.guard.take());
+        // Clear `busy_since_ms` *before* releasing the mutex, not after: on
+        // the multi-thread runtime this owner actually runs on
+        // (`Builder::new_multi_thread`, `main.rs`), releasing the lock first
+        // lets another worker thread's `lock_tracked()` acquire it and store
+        // its own fresh busy timestamp before this `store` below executes —
+        // which would then clobber that new holder's timestamp back to
+        // `HANDLE_NOT_BUSY` while it's still genuinely holding the lock.
+        // Storing the reset first means any subsequent locker's own store
+        // can only ever happen after this one, since it can't acquire the
+        // lock until it's actually dropped next.
         self.owner.busy_since_ms.store(HANDLE_NOT_BUSY, Ordering::Relaxed);
+        drop(self.guard.take());
     }
 }
 
