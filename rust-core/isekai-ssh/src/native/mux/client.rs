@@ -520,20 +520,6 @@ mod tests {
         }
     }
 
-    /// Drains the current task's ready queue several times over. A single
-    /// `yield_now()` only guarantees *one* hop of wake propagation; the
-    /// client's own setup (spawning the frame-reader task, writing the
-    /// initial `Hello`) can need more than one hop to settle into the
-    /// steady "waiting on the next tick" state before a paused-clock test
-    /// starts asserting on exact per-second elapsed values. Cheap and
-    /// harmless to over-call: paused time never advances on its own, so
-    /// extra yields cannot skip past a tick the test hasn't advanced to yet.
-    async fn settle() {
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// Runs `run_inner` against an in-memory owner connection whose behavior a
     /// closure supplies, plus a canned stdin. Returns the client's outcome and
     /// the bytes it wrote to its local stdout/stderr.
@@ -740,37 +726,43 @@ mod tests {
         );
         tokio::pin!(client);
 
+        // `tokio::time::pause()` called mid-test (as opposed to
+        // `#[tokio::test(start_paused = true)]`) does not leave the paused
+        // clock sitting at a clean zero epoch: the interval's first
+        // "completes immediately" tick ends up a hair (sub-millisecond, but
+        // enough to matter) past whatever instant `start` captured, so its
+        // *scheduled* per-second deadlines (`MissedTickBehavior::Skip`
+        // reschedules relative to when a tick actually fired, not the
+        // original creation instant) land just *after* each of this test's
+        // exact-1s `advance()` boundaries rather than exactly on them.
+        // Advancing a few ms past each 1s mark absorbs that slop so the
+        // tick due "at 2s" is actually due by the time we check, instead of
+        // only becoming ready on the *next* advance (confirmed against a
+        // standalone tokio repro outside this workspace, not by guessing).
+        const TICK_STEP: Duration = Duration::from_millis(1005);
+
         let (outcome, ()) = tokio::join!(
             client,
             async {
-                // Let the client's own setup (spawning the frame-reader task,
-                // writing the initial `Hello`) fully settle into its steady
-                // "waiting on the next tick" state *before* the paused clock
-                // starts moving, so the ticker's internal `start` is captured
-                // at true t=0 rather than being skewed by however many poll
-                // rounds that setup happens to need.
-                settle().await;
-
-                tokio::time::advance(Duration::from_secs(1)).await;
-                settle().await;
+                tokio::time::advance(TICK_STEP).await;
+                tokio::task::yield_now().await;
                 assert!(stderr.bytes().is_empty(), "the first second should still be quiet");
 
-                tokio::time::advance(Duration::from_secs(1)).await;
-                settle().await;
+                tokio::time::advance(TICK_STEP).await;
+                tokio::task::yield_now().await;
                 assert!(
                     String::from_utf8_lossy(&stderr.bytes()).contains("waiting for the shared connection to mybox... (2s)"),
                     "the 2s tick should draw progress"
                 );
 
-                tokio::time::advance(Duration::from_secs(1)).await;
-                settle().await;
+                tokio::time::advance(TICK_STEP).await;
+                tokio::task::yield_now().await;
                 assert!(
                     String::from_utf8_lossy(&stderr.bytes()).contains("waiting for the shared connection to mybox... (3s)"),
                     "later ticks should refresh the elapsed seconds"
                 );
 
                 tokio::time::advance(HELLO_ACK_TIMEOUT).await;
-                settle().await;
             }
         );
         let outcome = outcome.unwrap();
