@@ -124,7 +124,7 @@ fn monotonic_elapsed_ms() -> u64 {
     elapsed.min((u64::MAX - 1) as u128) as u64
 }
 
-pub(crate) struct GatedHandle<H> {
+pub(crate) struct GatedHandle<H: client::Handler> {
     handle: Arc<Mutex<client::Handle<H>>>,
     busy_since_ms: AtomicU64,
 }
