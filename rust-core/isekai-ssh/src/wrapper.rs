@@ -1612,11 +1612,21 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     }
     let deploy_started = Instant::now();
-    let report = await_with_pre_shell_progress(
-        backend.install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers),
-        format!("isekai-ssh: redeploying isekai-helper to {}", candidate.target),
-    )
-    .await
+    let install_future = backend.install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers);
+    // Only `Silent` is guaranteed never to prompt (`default_bootstrap_backend`'s
+    // `silent` argument above installs a non-interactive host-key policy for
+    // it). `AlwaysPrompt` can block inside this same call on the interactive
+    // first-time host-key TOFU confirmation (`prompt_new_host_confirmation`,
+    // spawn_blocking on stdin/stderr) — the progress ticker must not tee over
+    // that prompt, mirroring how `native/connect.rs`'s equivalent ticker is
+    // deliberately not applied to TOFU/passphrase/keyboard-interactive prompts.
+    let install_result = match confirmation {
+        TofuConfirmation::AlwaysPrompt => install_future.await,
+        TofuConfirmation::Silent => {
+            await_with_pre_shell_progress(install_future, format!("isekai-ssh: redeploying isekai-helper to {}", candidate.target)).await
+        }
+    };
+    let report = install_result
         .map_err(|e| {
             let failure = classify_bootstrap_error(&e);
             let err = anyhow::Error::new(e);
