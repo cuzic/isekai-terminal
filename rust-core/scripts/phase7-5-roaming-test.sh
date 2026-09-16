@@ -110,19 +110,23 @@ helper_force_doze() {
     adb shell dumpsys battery unplug
     adb shell dumpsys deviceidle enable >/dev/null
     adb shell input keyevent KEYCODE_SLEEP
+    # deviceidleは画面OFF・非充電への状態遷移を観測してからACTIVEを抜けるため、
+    # keyevent直後だとレースでforce-idleが弾かれうる。遷移を待つ。
+    sleep 2
     local out
     out="$(adb shell dumpsys deviceidle force-idle 2>&1 || true)"
     echo "$out"
     local deep
-    deep="$(adb shell dumpsys deviceidle get deep 2>&1 || true)"
+    # `*IDLE*`のようなグロブだとIDLE_PENDING/IDLE_MAINTENANCEも通してしまう
+    # (前者はまだDeep Dozeに入っていない、後者はネットワーク制限が一時解除される
+    # メンテナンスウィンドウで、どちらもDoze検証としては不合格)。CRを除去した
+    # 上で厳密一致にする。
+    deep="$(adb shell dumpsys deviceidle get deep 2>&1 | tr -d '\r' | tail -n1)"
     echo "deviceidle deep state: $deep"
-    case "$deep" in
-        *IDLE*) ;;
-        *)
-            echo "WARNING: Deep Doze が IDLE になっていません。端末/OEM設定により force-idle が空振りした可能性があります。"
-            echo "WARNING: この状態の計測は Doze 条件を満たしていない可能性があります。"
-            ;;
-    esac
+    if [ "$deep" != "IDLE" ]; then
+        echo "ERROR: deep idle state is '$deep' (expected IDLE)。この状態の計測はDoze条件を満たしていません。計測を中止してください。"
+        return 1
+    fi
 }
 
 helper_unforce_doze() {
@@ -142,11 +146,20 @@ debug_clear_reconnect_policy() {
     _broadcast CLEAR_RECONNECT_POLICY
 }
 
+_pull_reconnect_log() {
+    local remote="$1" local_out="$2"
+    if adb exec-out run-as "$PKG" cat "files/$remote" > "$local_out" 2>"${local_out}.err"; then
+        echo "  ${local_out} ($(wc -l < "$local_out") 行)"
+    else
+        echo "  ERROR: ${remote} を取得できませんでした: $(cat "${local_out}.err")"
+    fi
+}
+
 debug_dump_reconnect_log() {
     local out_dir="${LOG_DIR}"
-    adb exec-out run-as "$PKG" cat files/debug-reconnect-events.log > "${out_dir}/rust-reconnect-events.log" 2>/dev/null
-    adb exec-out run-as "$PKG" cat files/debug-reconnect-kotlin-events.log > "${out_dir}/kotlin-reconnect-events.log" 2>/dev/null
-    echo "書き出し先: ${out_dir}/rust-reconnect-events.log , ${out_dir}/kotlin-reconnect-events.log"
+    echo "書き出し結果:"
+    _pull_reconnect_log "debug-reconnect-events.log" "${out_dir}/rust-reconnect-events.log"
+    _pull_reconnect_log "debug-reconnect-kotlin-events.log" "${out_dir}/kotlin-reconnect-events.log"
 }
 
 debug_clear_reconnect_log() {
