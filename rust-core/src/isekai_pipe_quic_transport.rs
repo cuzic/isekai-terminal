@@ -104,7 +104,6 @@ pub struct IsekaiPipeQuicConfig {
 pub(crate) struct IsekaiPipeQuicSession {
     config: IsekaiPipeQuicConfig,
     core: SessionCore,
-    reattach_wake: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) fn create_isekai_pipe_quic_session(config: IsekaiPipeQuicConfig) -> Arc<IsekaiPipeQuicSession> {
@@ -112,7 +111,6 @@ pub(crate) fn create_isekai_pipe_quic_session(config: IsekaiPipeQuicConfig) -> A
     Arc::new(IsekaiPipeQuicSession {
         config,
         core: SessionCore::new(),
-        reattach_wake: Arc::new(tokio::sync::Notify::new()),
     })
 }
 
@@ -127,7 +125,6 @@ impl IsekaiPipeQuicSession {
         app_pane_id: crate::tmux_locator::AppPaneId,
     ) -> Result<(), SshError> {
         let mut config = self.config.clone();
-        let reattach_wake = self.reattach_wake.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSH(isekai-helperを起動するための踏み台接続)のホスト鍵検証を
         // 本セッションのcallback(Kotlin側のKnownHostRepositoryを参照する既存のTOFU/
@@ -135,7 +132,7 @@ impl IsekaiPipeQuicSession {
         let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
             let (cols, rows) = (config.cols, config.rows);
-            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx, reattach_wake).await {
+            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
                     run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx, app_pane_id).await;
                     if let Some(key) = pool_key {
@@ -161,12 +158,11 @@ impl IsekaiPipeQuicSession {
         app_pane_id: crate::tmux_locator::AppPaneId,
     ) -> Result<(), SshError> {
         let mut config = self.config.clone();
-        let reattach_wake = self.reattach_wake.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
             let (cols, rows) = (config.cols, config.rows);
-            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx, reattach_wake).await {
+            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
                     run_ssh_channel_loop(
                         &pooled, cols, rows, false, false, cmd_rx, event_tx,
@@ -202,11 +198,6 @@ impl IsekaiPipeQuicSession {
             }
         });
         Ok(())
-    }
-
-    pub(crate) fn notify_network_restored_for_reattach(&self) {
-        crate::debug_reconnect::record("reattach network_wake transport=isekai_pipe_quic");
-        self.reattach_wake.notify_waiters();
     }
 }
 crate::session::impl_session_core_delegation!(IsekaiPipeQuicSession);
@@ -420,7 +411,6 @@ pub(crate) const QUIC_SERVER_NAME: &str = "isekai-pipe.local";
 async fn connect_isekai_pipe_quic_stream(
     ssh_host: &str,
     handshake: &IsekaiPipeHandshake,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let remote = resolve_direct_by_bootstrap_host(ssh_host, handshake).await?;
     let cert_sha256_hex = handshake.cert_sha256().to_string();
@@ -442,7 +432,7 @@ async fn connect_isekai_pipe_quic_stream(
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(finish_quic_stream("isekai_pipe_quic", conn, data_stream, proof, target, reattach_wake).await)
+    Ok(finish_quic_stream("isekai_pipe_quic", conn, data_stream, proof, target).await)
 }
 
 /// WU-R1: `connect_isekai_pipe_quic_stream`(このファイル)・
@@ -460,7 +450,6 @@ pub(crate) async fn finish_quic_stream(
     data_stream: quicmux::AnyByteStream,
     proof: isekai_protocol::hello::Proof,
     target: isekai_transport::RelayTarget,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> resume_client::ReattachableStream {
     info!("{tag}: ATTACH ok — handing off to SSH");
 
@@ -540,7 +529,7 @@ pub(crate) async fn finish_quic_stream(
     });
 
     let (data_read, data_write) = data_stream.split();
-    resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn, Some(reattach_wake))
+    resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn)
 }
 
 /// isekai-transportの`AppAckCounters`(atomicベース)とAndroid側の
@@ -619,10 +608,9 @@ pub(crate) fn spawn_control_stream_reestablishment_after_resume(
 async fn try_connect_isekai_pipe_quic(
     config: &IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let handshake = bootstrap_via_ssh(config, host_key_callback).await?;
-    connect_isekai_pipe_quic_stream(&config.ssh_host, &handshake, reattach_wake).await
+    connect_isekai_pipe_quic_stream(&config.ssh_host, &handshake).await
 }
 
 // ── SSH接続プーリング(isekai-pipe QUICファミリー) ────────────
@@ -695,9 +683,8 @@ async fn establish_fresh(
     config: &mut IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<PooledSshHandle, AcquireError> {
-    let stream = try_connect_isekai_pipe_quic(config, host_key_callback, reattach_wake)
+    let stream = try_connect_isekai_pipe_quic(config, host_key_callback)
         .await
         .map_err(AcquireError::DialFailed)?;
     let russh_config = Arc::new(client::Config {
@@ -725,10 +712,9 @@ async fn acquire_pooled_handle(
     config: &mut IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> AcquireOutcome {
     match IsekaiPipeQuicPoolKey::for_config(config) {
-        None => match establish_fresh(config, host_key_callback, event_tx, reattach_wake).await {
+        None => match establish_fresh(config, host_key_callback, event_tx).await {
             Ok(p) => AcquireOutcome::Attached(Arc::new(p), None),
             Err(AcquireError::DialFailed(m)) => AcquireOutcome::DialFailed(m),
             Err(AcquireError::PostDialFailed(m)) => AcquireOutcome::OtherFailed(m),
@@ -746,7 +732,7 @@ async fn acquire_pooled_handle(
                 }
             }
             crate::pool::AttachOutcome::Establisher => {
-                match establish_fresh(config, host_key_callback, event_tx, reattach_wake).await {
+                match establish_fresh(config, host_key_callback, event_tx).await {
                     Ok(p) => AcquireOutcome::Attached(
                         crate::pool::publish_success(&ISEKAI_PIPE_QUIC_POOL, &key, p), Some(key),
                     ),

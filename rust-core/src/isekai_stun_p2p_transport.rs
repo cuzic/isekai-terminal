@@ -77,7 +77,6 @@ pub struct IsekaiStunP2pConfig {
 pub(crate) struct IsekaiStunP2pSession {
     config: IsekaiStunP2pConfig,
     core: SessionCore,
-    reattach_wake: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) fn create_isekai_stun_p2p_session(config: IsekaiStunP2pConfig) -> Arc<IsekaiStunP2pSession> {
@@ -85,7 +84,6 @@ pub(crate) fn create_isekai_stun_p2p_session(config: IsekaiStunP2pConfig) -> Arc
     Arc::new(IsekaiStunP2pSession {
         config,
         core: SessionCore::new(),
-        reattach_wake: Arc::new(tokio::sync::Notify::new()),
     })
 }
 
@@ -94,7 +92,6 @@ impl IsekaiStunP2pSession {
     /// （穴あけが成立しなければ接続失敗として扱う。PLAN.md Phase 10 の設計判断参照）。
     pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
-        let reattach_wake = self.reattach_wake.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
         // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
@@ -102,7 +99,7 @@ impl IsekaiStunP2pSession {
         RUNTIME.spawn(async move {
             match tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                try_connect_isekai_stun_p2p(&config, host_key_callback, reattach_wake),
+                try_connect_isekai_stun_p2p(&config, host_key_callback),
             )
             .await
             {
@@ -123,11 +120,6 @@ impl IsekaiStunP2pSession {
             }
         });
         Ok(())
-    }
-
-    pub(crate) fn notify_network_restored_for_reattach(&self) {
-        crate::debug_reconnect::record("reattach network_wake transport=isekai_stun_p2p");
-        self.reattach_wake.notify_waiters();
     }
 }
 crate::session::impl_session_core_delegation!(IsekaiStunP2pSession);
@@ -161,7 +153,6 @@ async fn resolve_stun_servers(entries: &[String]) -> Result<Vec<SocketAddr>, Str
 async fn try_connect_isekai_stun_p2p(
     config: &IsekaiStunP2pConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     // 先頭のエントリが実際のSTUN+SSHランデブー穴あけ機構に使う「主」STUNサーバー、
     // 残り(あれば)はブートストラップ時の追加client_candidatesとしてのみ使う
@@ -214,7 +205,7 @@ async fn try_connect_isekai_stun_p2p(
     // 渡す前にArcから中身を取り出す。
     let raw_socket = Arc::try_unwrap(raw_socket)
         .map_err(|_| "内部エラー: raw_socketの参照が複数残っています".to_string())?;
-    connect_stun_p2p_stream(raw_socket, peer_addr, &handshake, reattach_wake).await
+    connect_stun_p2p_stream(raw_socket, peer_addr, &handshake).await
 }
 
 /// ProxyJump対応のSSH接続を張り、`--stun-server`/`--punch-peer`付きでisekai-helperを
@@ -246,7 +237,6 @@ async fn connect_stun_p2p_stream(
     socket: tokio::net::UdpSocket,
     peer_addr: SocketAddr,
     handshake: &IsekaiPipeHandshake,
-    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let cert_sha256_hex = handshake.cert_sha256().to_string();
     let session_secret = base64::engine::general_purpose::STANDARD
@@ -295,7 +285,6 @@ async fn connect_stun_p2p_stream(
         data_stream,
         proof,
         relay_target,
-        reattach_wake,
     ).await)
 }
 

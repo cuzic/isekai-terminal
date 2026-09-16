@@ -152,12 +152,24 @@ pub(crate) type ReattachFn<R, W> = Arc<
 /// リトライ回数・間隔（固定値。指数バックオフ）。
 const REATTACH_MAX_RETRIES: u32 = 5;
 const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const NETWORK_WAKE_BONUS_RETRIES: u32 = 3;
+const NETWORK_WAKE_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+static NETWORK_RESTORED_FOR_REATTACH: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
 
 /// 呼び出し元(russh)とpumpタスクの間を橋渡しするバッファサイズ。
 /// reattach中もある程度は素通しに書き込み続けられる猶予として、
 /// 単発のSSHパケットが十分収まるサイズにしてある。
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const RECV_CHUNK_SIZE: usize = 16 * 1024;
+
+fn network_restored_for_reattach() -> &'static tokio::sync::Notify {
+    NETWORK_RESTORED_FOR_REATTACH.get_or_init(tokio::sync::Notify::new)
+}
+
+pub(crate) fn notify_network_restored_for_reattach() {
+    crate::debug_reconnect::record("reattach network_wake");
+    network_restored_for_reattach().notify_one();
+}
 
 /// data stream を包み、QUIC connection が失われても（`RESUME` による reattach が
 /// 成功する限り）呼び出し元（russh）に I/O エラーを見せない。
@@ -193,7 +205,6 @@ impl ReattachableStream {
         write: W,
         resume_state: Arc<Mutex<ClientResumeState>>,
         reattach_fn: ReattachFn<R, W>,
-        network_wake: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
         let (caller_side, pump_side) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
         let terminal_error = Arc::new(Mutex::new(None));
@@ -203,7 +214,6 @@ impl ReattachableStream {
             write,
             resume_state,
             reattach_fn,
-            network_wake,
             terminal_error.clone(),
         ));
         Self { duplex: caller_side, terminal_error }
@@ -296,9 +306,9 @@ async fn next_pump_event(
 async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     resume_state: &Arc<Mutex<ClientResumeState>>,
     reattach_fn: &ReattachFn<R, W>,
-    network_wake: Option<&tokio::sync::Notify>,
 ) -> Result<(R, W), String> {
     let mut attempt = 0u32;
+    let mut network_wake_bonus_used = 0u32;
     loop {
         attempt += 1;
         let (session_id, client_sent_offset, client_delivered_offset) = {
@@ -310,7 +320,9 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
         };
 
         log::info!("reattach: attempt {attempt}/{REATTACH_MAX_RETRIES}");
-        crate::debug_reconnect::record(format!("reattach attempt_start attempt={attempt}"));
+        if crate::debug_reconnect::is_enabled() {
+            crate::debug_reconnect::record(format!("reattach attempt_start attempt={attempt}"));
+        }
         let outcome = match reattach_fn(session_id, client_sent_offset, client_delivered_offset).await {
             Ok(ReattachResult { read, mut write, helper_committed_offset }) => {
                 let to_replay = {
@@ -332,39 +344,48 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
         match outcome {
             Ok(halves) => {
                 log::info!("reattach: succeeded on attempt {attempt}");
-                crate::debug_reconnect::record(format!("reattach attempt_end attempt={attempt} result=success"));
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!("reattach attempt_end attempt={attempt} result=success"));
+                }
                 return Ok(halves);
             }
             Err(e) => {
                 log::warn!("reattach: attempt {attempt} failed: {e}");
-                crate::debug_reconnect::record(format!(
-                    "reattach attempt_end attempt={} result=failure error={}",
-                    attempt,
-                    e
-                ));
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!(
+                        "reattach attempt_end attempt={} result=failure error={}",
+                        attempt,
+                        e
+                    ));
+                }
                 if attempt >= REATTACH_MAX_RETRIES {
                     return Err(e);
                 }
-                wait_backoff_or_network_change(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1), network_wake).await;
+                if wait_backoff_or_network_change(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await
+                    && network_wake_bonus_used < NETWORK_WAKE_BONUS_RETRIES
+                {
+                    network_wake_bonus_used += 1;
+                    attempt = attempt.saturating_sub(1);
+                }
             }
         }
     }
 }
 
-async fn wait_backoff_or_network_change(backoff: std::time::Duration, network_wake: Option<&tokio::sync::Notify>) {
-    match network_wake {
-        Some(wake) => {
-            tokio::select! {
-                _ = tokio::time::sleep(backoff) => {}
-                _ = wake.notified() => {
-                    crate::debug_reconnect::record(format!(
-                        "reattach backoff_cut_short_by_network_change backoff_ms={}",
-                        backoff.as_millis()
-                    ));
-                }
+async fn wait_backoff_or_network_change(backoff: std::time::Duration) -> bool {
+    let wake = network_restored_for_reattach();
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => false,
+        _ = wake.notified() => {
+            tokio::time::sleep(NETWORK_WAKE_MIN_FLOOR).await;
+            if crate::debug_reconnect::is_enabled() {
+                crate::debug_reconnect::record(format!(
+                    "reattach backoff_cut_short_by_network_change backoff_ms={}",
+                    backoff.as_millis()
+                ));
             }
+            true
         }
-        None => tokio::time::sleep(backoff).await,
     }
 }
 
@@ -378,7 +399,6 @@ async fn write_with_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     write: &mut W,
     resume_state: &Arc<Mutex<ClientResumeState>>,
     reattach_fn: &ReattachFn<R, W>,
-    network_wake: Option<&tokio::sync::Notify>,
     helper_read_done: &mut bool,
 ) -> Result<(), String> {
     loop {
@@ -389,7 +409,7 @@ async fn write_with_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
             }
             Err(e) => {
                 log::warn!("reattach: data stream write failed ({e}), triggering reattach");
-                let (new_read, new_write) = attempt_reattach(resume_state, reattach_fn, network_wake).await?;
+                let (new_read, new_write) = attempt_reattach(resume_state, reattach_fn).await?;
                 *read = new_read;
                 *write = new_write;
                 *helper_read_done = false;
@@ -410,7 +430,6 @@ async fn run_pump<R: ByteHalfRead, W: ByteHalfWrite>(
     mut write: W,
     resume_state: Arc<Mutex<ClientResumeState>>,
     reattach_fn: ReattachFn<R, W>,
-    network_wake: Option<Arc<tokio::sync::Notify>>,
     terminal_error: Arc<Mutex<Option<String>>>,
 ) {
     let (mut pump_read, mut pump_write) = tokio::io::split(pump_side);
@@ -428,7 +447,6 @@ async fn run_pump<R: ByteHalfRead, W: ByteHalfWrite>(
                         &mut write,
                         &resume_state,
                         &reattach_fn,
-                        network_wake.as_deref(),
                         &mut helper_read_done,
                     )
                         .await
@@ -453,7 +471,7 @@ async fn run_pump<R: ByteHalfRead, W: ByteHalfWrite>(
             }
             PumpEvent::Failed { direction, message } => {
                 log::warn!("reattach: data stream {direction} failed ({message}), triggering reattach");
-                match attempt_reattach(&resume_state, &reattach_fn, network_wake.as_deref()).await {
+                match attempt_reattach(&resume_state, &reattach_fn).await {
                     Ok((new_read, new_write)) => {
                         read = new_read;
                         write = new_write;
@@ -581,7 +599,7 @@ mod tests {
                 Err::<ReattachResult<MockReadHalf, MockWriteHalf>, String>("reattach should not be called in this test".to_string())
             })
         });
-        let mut stream = ReattachableStream::new(read, write, resume_state.clone(), reattach_fn, None);
+        let mut stream = ReattachableStream::new(read, write, resume_state.clone(), reattach_fn);
 
         stream.write_all(b"hello helper").await.unwrap();
         let received = helper_write_rx.recv().await.unwrap();
@@ -618,7 +636,7 @@ mod tests {
         });
 
         let resume_state = resume_state_with_session();
-        let mut stream = ReattachableStream::new(read1, write1, resume_state, reattach_fn, None);
+        let mut stream = ReattachableStream::new(read1, write1, resume_state, reattach_fn);
 
         // caller視点ではエラーは一切見えない: write_allは(duplexへのbuffer完了として)
         // 成功し、実際の再送は裏で起きる。
@@ -641,7 +659,7 @@ mod tests {
         let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> =
             Arc::new(|_id, _sent, _delivered| Box::pin(async { Err("mock: helper unreachable".to_string()) }));
         let resume_state = resume_state_with_session();
-        let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn, None);
+        let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn);
 
         // helper側の読み取りを失敗させ、reattachループを起動する。
         read_tx.send(Err("mock: connection lost".to_string())).unwrap();
