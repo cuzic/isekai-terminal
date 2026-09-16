@@ -315,6 +315,14 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
 ) -> Result<(R, W), String> {
     let mut attempt = 0u32;
     let mut network_wake_bonus_used = 0u32;
+    // 最初の`reattach_fn`呼び出しより前にsubscribeし、ループ全体で使い回す。
+    // `wait_backoff_or_network_change`のたびに`subscribe()`し直すと、そのバックオフ
+    // 待機に入る"瞬間"のバージョンを既読扱いにしてしまい、直前の`reattach_fn`実行中
+    // (=圏外なら最悪15秒級、このループで最も長く支配的な区間)に届いた復帰通知を
+    // 取りこぼす(round1のB-3と同型の再発、opus-adversarial-consult round3で発覚)。
+    // `Receiver`を先に作っておけば、`reattach_fn`実行中の送信もバージョンとして
+    // 保持され、後続の`changed()`が即座に返る。
+    let mut network_wake = network_restored_sender().subscribe();
     loop {
         attempt += 1;
         let (session_id, client_sent_offset, client_delivered_offset) = {
@@ -367,7 +375,7 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
                 if attempt >= REATTACH_MAX_RETRIES {
                     return Err(e);
                 }
-                if wait_backoff_or_network_change(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await
+                if wait_backoff_or_network_change(&mut network_wake, REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await
                     && network_wake_bonus_used < NETWORK_WAKE_BONUS_RETRIES
                 {
                     network_wake_bonus_used += 1;
@@ -378,14 +386,14 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     }
 }
 
-async fn wait_backoff_or_network_change(backoff: std::time::Duration) -> bool {
-    // 呼び出しごとに新しい`Receiver`を作る——`subscribe()`時点の値を既読扱いに
-    // するので、直前の送信を過去のものとして無視し、この待機中の新しい変化だけを拾う。
-    let mut receiver = network_restored_sender().subscribe();
+async fn wait_backoff_or_network_change(
+    network_wake: &mut tokio::sync::watch::Receiver<u64>,
+    backoff: std::time::Duration,
+) -> bool {
     let started = tokio::time::Instant::now();
     tokio::select! {
         _ = tokio::time::sleep(backoff) => false,
-        _ = receiver.changed() => {
+        _ = network_wake.changed() => {
             // フロアは「打ち切った上で最低限これだけは待つ」下限であって、
             // バックオフに上乗せする追加の待ちではない(素のバックオフより
             // 遅くなってしまっては早期打ち切りの意味が無い)。
