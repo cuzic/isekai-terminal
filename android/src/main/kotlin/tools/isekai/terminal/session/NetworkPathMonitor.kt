@@ -4,6 +4,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import tools.isekai.terminal.util.DebugReconnectLog
 
 /**
  * PLAN.md Phase 7-7 の path broker 構想における `PathState`。
@@ -74,12 +75,16 @@ class NetworkPathMonitor(private val connectivityManager: ConnectivityManager) {
     private fun register(id: PathId, request: NetworkRequest) {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                DebugReconnectLog.record("network_callback path=$id callback=onAvailable network=$network")
                 states[id] = PathState.VALIDATED
+                DebugReconnectLog.record("network_aggregate anyPathAvailable=${isAnyPathAvailable()}")
                 onAggregateChanged(isAnyPathAvailable())
             }
 
             override fun onLost(network: Network) {
+                DebugReconnectLog.record("network_callback path=$id callback=onLost network=$network")
                 states[id] = PathState.FAILED
+                DebugReconnectLog.record("network_aggregate anyPathAvailable=${isAnyPathAvailable()}")
                 onAggregateChanged(isAnyPathAvailable())
             }
         }

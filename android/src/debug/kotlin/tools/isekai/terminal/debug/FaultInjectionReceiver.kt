@@ -3,10 +3,16 @@ package tools.isekai.terminal.debug
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.util.Log
+import tools.isekai.terminal.util.DebugReconnectLog
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.debugClearUdpFault
+import uniffi.isekai_terminal_core.debugClearReconnectLog
+import uniffi.isekai_terminal_core.debugClearReconnectPolicy
 import uniffi.isekai_terminal_core.debugCutUdpFault
+import uniffi.isekai_terminal_core.debugDumpReconnectLog
 import uniffi.isekai_terminal_core.debugRestoreUdpFault
+import uniffi.isekai_terminal_core.debugSetReconnectPolicy
 import uniffi.isekai_terminal_core.debugSetUdpFaultLatencyMs
 import uniffi.isekai_terminal_core.debugSetUdpFaultLossPermille
 
@@ -23,6 +29,9 @@ import uniffi.isekai_terminal_core.debugSetUdpFaultLossPermille
  *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CUT
  *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.RESTORE
  *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR
+ *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_RECONNECT_POLICY --ei tick_secs 300 --ei retry_interval_secs 300 --ei timeout_secs 3600
+ *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.DUMP_RECONNECT_LOG
+ *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG
  */
 /**
  * 実際の UDP フォルト注入 FFI 呼び出し先。native ライブラリ(Rust)に依存するため
@@ -35,6 +44,10 @@ interface FaultInjectorApi {
     fun cut()
     fun restore()
     fun clear()
+    fun setReconnectPolicy(tickSecs: UInt, retryIntervalSecs: UInt, timeoutSecs: UInt)
+    fun clearReconnectPolicy()
+    fun dumpReconnectLog(): String
+    fun clearReconnectLog()
 }
 
 object RealFaultInjectorApi : FaultInjectorApi {
@@ -43,6 +56,11 @@ object RealFaultInjectorApi : FaultInjectorApi {
     override fun cut() = debugCutUdpFault()
     override fun restore() = debugRestoreUdpFault()
     override fun clear() = debugClearUdpFault()
+    override fun setReconnectPolicy(tickSecs: UInt, retryIntervalSecs: UInt, timeoutSecs: UInt) =
+        debugSetReconnectPolicy(tickSecs, retryIntervalSecs, timeoutSecs)
+    override fun clearReconnectPolicy() = debugClearReconnectPolicy()
+    override fun dumpReconnectLog(): String = debugDumpReconnectLog()
+    override fun clearReconnectLog() = debugClearReconnectLog()
 }
 
 class FaultInjectionReceiver : BroadcastReceiver() {
@@ -71,6 +89,33 @@ class FaultInjectionReceiver : BroadcastReceiver() {
             "tools.isekai.terminal.debug.CLEAR" -> {
                 faultInjector.clear()
                 RemoteLogger.i("FaultInjection", "clear")
+            }
+            "tools.isekai.terminal.debug.SET_RECONNECT_POLICY" -> {
+                val tickSecs = intent.getIntExtra("tick_secs", 1).coerceAtLeast(1)
+                val retryIntervalSecs = intent.getIntExtra("retry_interval_secs", 1).coerceAtLeast(1)
+                val timeoutSecs = intent.getIntExtra("timeout_secs", 1).coerceAtLeast(1)
+                faultInjector.setReconnectPolicy(tickSecs.toUInt(), retryIntervalSecs.toUInt(), timeoutSecs.toUInt())
+                RemoteLogger.i(
+                    "FaultInjection",
+                    "reconnect policy tick=${tickSecs}s retry=${retryIntervalSecs}s timeout=${timeoutSecs}s",
+                )
+            }
+            "tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY" -> {
+                faultInjector.clearReconnectPolicy()
+                RemoteLogger.i("FaultInjection", "reconnect policy cleared")
+            }
+            "tools.isekai.terminal.debug.DUMP_RECONNECT_LOG" -> {
+                DebugReconnectLog.dumpToLogcat(context)
+                faultInjector.dumpReconnectLog()
+                    .lineSequence()
+                    .filter { it.isNotBlank() }
+                    .forEach { Log.i("ReconnectSpike", it) }
+                RemoteLogger.i("FaultInjection", "reconnect log dumped")
+            }
+            "tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG" -> {
+                DebugReconnectLog.clear(context)
+                faultInjector.clearReconnectLog()
+                RemoteLogger.i("FaultInjection", "reconnect log cleared")
             }
         }
     }
