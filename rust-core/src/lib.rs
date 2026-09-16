@@ -41,6 +41,7 @@ pub(crate) mod faulty_stream;
 pub(crate) mod test_callbacks;
 pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
+pub mod debug_reconnect;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
 pub mod reattach_persistence;
