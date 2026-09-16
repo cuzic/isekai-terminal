@@ -4,7 +4,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.util.DebugReconnectLog
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.debugClearUdpFault
@@ -96,8 +95,10 @@ class FaultInjectionReceiver : BroadcastReceiver() {
                 val tickSecs = intent.getIntExtra("tick_secs", 1).coerceAtLeast(1)
                 val retryIntervalSecs = intent.getIntExtra("retry_interval_secs", 1).coerceAtLeast(1)
                 val timeoutSecs = intent.getIntExtra("timeout_secs", 1).coerceAtLeast(1)
+                // 生きている全orchestratorへの即時反映はRust側のレジストリ
+                // (debug_reconnect.rs::for_each_live_orchestrator)が行うため、
+                // Kotlin側から個別のセッションを叩く必要は無い。
                 faultInjector.setReconnectPolicy(tickSecs.toUInt(), retryIntervalSecs.toUInt(), timeoutSecs.toUInt())
-                TerminalSession.debugApplyReconnectPolicyOverrideToActiveSessions()
                 RemoteLogger.i(
                     "FaultInjection",
                     "reconnect policy tick=${tickSecs}s retry=${retryIntervalSecs}s timeout=${timeoutSecs}s",
@@ -105,9 +106,13 @@ class FaultInjectionReceiver : BroadcastReceiver() {
             }
             "tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY" -> {
                 faultInjector.clearReconnectPolicy()
-                TerminalSession.debugApplyReconnectPolicyOverrideToActiveSessions()
                 RemoteLogger.i("FaultInjection", "reconnect policy cleared")
             }
+            // 注: DUMP_RECONNECT_LOG/CLEAR_RECONNECT_LOGのlogcat経由の経路は手動デバッグ用の
+            // 補助手段。実機スパイクでの正規の取得手順は
+            // `rust-core/scripts/phase7-5-roaming-test.sh`の`debug_dump_reconnect_log`
+            // (`adb exec-out run-as cat`経由、ファイルを直接取得しlogcatのリングバッファ
+            // 回転の影響を受けない)を使うこと。
             "tools.isekai.terminal.debug.DUMP_RECONNECT_LOG" -> {
                 DebugReconnectLog.dumpToLogcat(context)
                 faultInjector.dumpReconnectLog()
