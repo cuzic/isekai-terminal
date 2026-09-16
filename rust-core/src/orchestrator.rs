@@ -82,6 +82,14 @@ impl ActiveSession {
             s.notify_upstream_health_degraded();
         }
     }
+    fn notify_network_restored_for_reattach(&self) {
+        match self {
+            Self::IsekaiPipeQuic(s) => s.notify_network_restored_for_reattach(),
+            Self::IsekaiStunP2p(s) => s.notify_network_restored_for_reattach(),
+            Self::IsekaiLinkRelay(s) => s.notify_network_restored_for_reattach(),
+            _ => {}
+        }
+    }
     /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
     /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
     /// `force_return_to_wifi`と同じくno-op委譲。
@@ -269,13 +277,13 @@ fn is_private_or_link_local(ip: std::net::IpAddr) -> bool {
 /// (テストで短い値に差し替えられるようにする)で構造体化する。既定値はMVPとして
 /// ハードコード(設定UIは作らない): tssh の `aliveTimeout` 相当が60秒。
 #[derive(Debug, Clone, Copy)]
-struct ReconnectPolicy {
+pub(crate) struct ReconnectPolicy {
     /// UIへライブ通知する間隔。
-    tick: Duration,
+    pub(crate) tick: Duration,
     /// 実際に`connect_via`を試みる間隔(tickの整数倍)。
-    retry_interval: Duration,
+    pub(crate) retry_interval: Duration,
     /// これを超えて再接続できなければギブアップする。
-    timeout: Duration,
+    pub(crate) timeout: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -339,6 +347,8 @@ struct OrchestratorState {
     /// 新しい試行を重ねて発火しないためのガード(ホスト鍵確認プロンプトの
     /// 多重発生を防ぐ)。
     retry_attempt_in_flight: bool,
+    /// in-flight中に届いたnetwork restored wakeを、試行完了直後の再試行へ繋ぐ。
+    pending_wake: bool,
     /// `SessionOrchestrator::disconnect()`が呼ばれた際に立てる。ユーザーが
     /// 明示的に切断した場合は自動再接続しない(tsshの「唯一の例外」と同じ)。
     /// 読み取った直後にfalseへ戻す一度きりのフラグ。
@@ -529,6 +539,8 @@ impl SessionCallback for OrchestratorAdapter {
             s.reconnect_epoch += 1;
             s.reconnect_loop_active = false;
             s.retry_attempt_in_flight = false;
+            s.pending_wake = false;
+            crate::debug_reconnect::record("retry_attempt_in_flight off result=connected");
             s.current_target().map(|(host, _, _)| host).unwrap_or_default()
         };
         self.shared.callback.on_connection_state_changed(
@@ -759,7 +771,7 @@ impl DisconnectKind {
 /// ループ自身のtickに任せる。
 fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option<String>) {
     enum Action {
-        Suppress,
+        Suppress { wake_reconnect_loop: bool },
         StartLoop(LastConnectAttempt, u64),
         NotifyDisconnected(Option<ConnectionIssueHint>),
     }
@@ -769,13 +781,19 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         let was_connected = s.phase == ConnPhase::Connected;
         let user_initiated = s.user_initiated_disconnect;
         let graceful_exit = DisconnectKind::classify(&reason) == DisconnectKind::GracefulRemoteExit;
+        let wake_reconnect_loop = s.reconnect_loop_active && s.pending_wake;
         s.user_initiated_disconnect = false;
         s.phase = ConnPhase::Idle;
         s.retry_attempt_in_flight = false;
+        crate::debug_reconnect::record(format!(
+            "retry_attempt_in_flight off result=disconnected reason={}",
+            reason.as_deref().unwrap_or("none")
+        ));
 
         if s.reconnect_loop_active {
-            Action::Suppress
+            Action::Suppress { wake_reconnect_loop }
         } else if was_connected && !user_initiated && !graceful_exit {
+            s.pending_wake = false;
             match s.last_connect_attempt.clone() {
                 Some(attempt) => {
                     s.reconnect_loop_active = true;
@@ -790,6 +808,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
                 }
             }
         } else {
+            s.pending_wake = false;
             // #19: 一度もConnectedに至らず切断された(=接続試行そのものの失敗)場合
             // だけLocal Network Privacyヒントの対象にする。Connected後の正常終了/
             // ユーザー切断ではヒントを付けても意味がない。
@@ -820,7 +839,12 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
     shared.path_observer.lock().invalidate();
 
     match action {
-        Action::Suppress => {}
+        Action::Suppress { wake_reconnect_loop } => {
+            if wake_reconnect_loop {
+                crate::debug_reconnect::record("pending_wake notify_after_in_flight_result");
+                shared.reconnect_wake.notify_one();
+            }
+        }
         Action::StartLoop(attempt, epoch) => {
             spawn_reconnect_loop(shared.clone(), attempt, reason, epoch);
         }
@@ -969,6 +993,11 @@ fn spawn_reconnect_loop(
         });
 
         loop {
+            crate::debug_reconnect::record(format!(
+                "spawn_reconnect_loop tick_wait epoch={} elapsed_secs={}",
+                epoch,
+                elapsed.as_secs()
+            ));
             let woke_early = sleep_tick_or_network_restored(policy.tick, &shared.reconnect_wake).await;
 
             if shared.state.lock().reconnect_epoch != epoch {
@@ -978,6 +1007,7 @@ fn spawn_reconnect_loop(
             }
 
             if woke_early {
+                crate::debug_reconnect::record(format!("reconnect_wake epoch={epoch}"));
                 // ネットワーク復帰通知による早期起床: 通常のelapsed/tick_countの
                 // 会計には触れず、`retry_attempt_in_flight`が空いていれば
                 // 「今すぐ1回試す」ボーナス試行だけ行って、次のループでまた
@@ -986,8 +1016,17 @@ fn spawn_reconnect_loop(
                     let mut s = shared.state.lock();
                     if s.reconnect_epoch == epoch && !s.retry_attempt_in_flight {
                         s.retry_attempt_in_flight = true;
+                        s.pending_wake = false;
+                        crate::debug_reconnect::record(format!(
+                            "retry_attempt_in_flight on epoch={} source=network_wake",
+                            epoch
+                        ));
                         true
                     } else {
+                        if s.reconnect_epoch == epoch && s.retry_attempt_in_flight {
+                            s.pending_wake = true;
+                            crate::debug_reconnect::record(format!("pending_wake set epoch={epoch}"));
+                        }
                         false
                     }
                 };
@@ -1002,6 +1041,11 @@ fn spawn_reconnect_loop(
                             let mut s = shared.state.lock();
                             if s.reconnect_epoch == epoch {
                                 s.retry_attempt_in_flight = false;
+                                crate::debug_reconnect::record(format!(
+                                    "retry_attempt_in_flight off epoch={} result=sync_error source=network_wake error={:?}",
+                                    epoch,
+                                    e
+                                ));
                             }
                         }
                     }
@@ -1011,12 +1055,19 @@ fn spawn_reconnect_loop(
 
             elapsed = elapsed.saturating_add(policy.tick);
             tick_count += 1;
+            crate::debug_reconnect::record(format!(
+                "spawn_reconnect_loop tick epoch={} tick_count={} elapsed_secs={}",
+                epoch,
+                tick_count,
+                elapsed.as_secs()
+            ));
 
             if elapsed >= policy.timeout {
                 let mut s = shared.state.lock();
                 if s.reconnect_epoch == epoch {
                     s.reconnect_loop_active = false;
                     s.retry_attempt_in_flight = false;
+                    s.pending_wake = false;
                 }
                 drop(s);
                 log::warn!("orchestrator: reconnect loop gave up after {timeout_secs}s");
@@ -1039,8 +1090,16 @@ fn spawn_reconnect_loop(
             let should_attempt = {
                 let mut s = shared.state.lock();
                 let due = tick_count % ticks_per_retry == 0;
-                if s.reconnect_epoch == epoch && !s.retry_attempt_in_flight && due {
+                let pending_wake = s.pending_wake;
+                if s.reconnect_epoch == epoch && !s.retry_attempt_in_flight && (due || pending_wake) {
                     s.retry_attempt_in_flight = true;
+                    s.pending_wake = false;
+                    let source = if pending_wake { "pending_wake" } else { "tick" };
+                    crate::debug_reconnect::record(format!(
+                        "retry_attempt_in_flight on epoch={} source={}",
+                        epoch,
+                        source
+                    ));
                     true
                 } else {
                     false
@@ -1054,6 +1113,11 @@ fn spawn_reconnect_loop(
                         let mut s = shared.state.lock();
                         if s.reconnect_epoch == epoch {
                             s.retry_attempt_in_flight = false;
+                            crate::debug_reconnect::record(format!(
+                                "retry_attempt_in_flight off epoch={} result=sync_error source=tick error={:?}",
+                                epoch,
+                                e
+                            ));
                         }
                     }
                 }
@@ -1072,6 +1136,8 @@ pub struct SessionOrchestrator {
 #[uniffi::export]
 pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> Arc<SessionOrchestrator> {
     crate::init_logger();
+    let reconnect_policy =
+        crate::debug_reconnect::reconnect_policy_override().unwrap_or_else(ReconnectPolicy::default);
     let shared = Arc::new(OrchestratorShared {
         state: Mutex::new(OrchestratorState {
             phase: ConnPhase::Idle,
@@ -1084,9 +1150,10 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             reconnect_epoch: 0,
             reconnect_loop_active: false,
             retry_attempt_in_flight: false,
+            pending_wake: false,
             user_initiated_disconnect: false,
             last_connect_attempt: None,
-            reconnect_policy: ReconnectPolicy::default(),
+            reconnect_policy,
             background_state: BackgroundState::Foreground,
             tab_focused: false,
             app_foreground: true,
@@ -1132,6 +1199,7 @@ impl SessionOrchestrator {
             s.reconnect_epoch += 1;
             s.reconnect_loop_active = false;
             s.retry_attempt_in_flight = false;
+            s.pending_wake = false;
             // #20: 手動接続はフォアグラウンドの操作でしか起こり得ない。直前の
             // バックグラウンド遷移状態は無関係になる。
             s.background_state = BackgroundState::Foreground;
@@ -1533,7 +1601,10 @@ impl SessionOrchestrator {
                 // 単なる喪失通知(`is_satisfied=false`)は何もしない —
                 // 元々このphaseでは接続自体が無いので喪失に対して打てる手が無い。
                 if is_satisfied && self.shared.state.lock().reconnect_loop_active {
+                    crate::debug_reconnect::record("notify_network_path_changed satisfied phase=Idle action=reconnect_wake");
                     self.shared.reconnect_wake.notify_one();
+                } else if is_satisfied {
+                    crate::debug_reconnect::record("notify_network_path_changed satisfied phase=Idle action=ignored");
                 }
             }
             ConnPhase::Connecting => {
@@ -1543,6 +1614,14 @@ impl SessionOrchestrator {
                 }
             }
             ConnPhase::Connected if is_quic => {
+                if is_satisfied {
+                    crate::debug_reconnect::record(
+                        "notify_network_path_changed satisfied phase=Connected transport=quic action=reattach_wake"
+                    );
+                    if let Some(session) = self.shared.session.lock().clone() {
+                        session.notify_network_restored_for_reattach();
+                    }
+                }
                 log::info!("orchestrator: network path changed — QUIC session, letting transport handle it");
             }
             ConnPhase::Connected => {
@@ -1965,6 +2044,7 @@ mod tests {
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
                 retry_attempt_in_flight: false,
+                pending_wake: false,
                 user_initiated_disconnect: false,
                 last_connect_attempt: is_quic.then(test_quic_attempt),
                 reconnect_policy: ReconnectPolicy::default(),
@@ -2021,6 +2101,7 @@ mod tests {
             reconnect_epoch: 0,
             reconnect_loop_active: false,
             retry_attempt_in_flight: false,
+            pending_wake: false,
             user_initiated_disconnect: false,
             last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
             reconnect_policy: policy,
