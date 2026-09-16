@@ -61,6 +61,11 @@ list_scenarios() {
 --- ステップ0: 前提 ---
 step0_precheck            adb接続確認・ローカル自動テスト(faulty_udp_socket)を再実行
 step0_install_launch      debug APK インストール & 起動（要ユーザー事前登録: プロファイル2件・鍵インポート）
+helper_force_doze         dumpsys battery unplug → deviceidle force-idle（要ユーザー確認）
+helper_unforce_doze       deviceidle unforce → dumpsys battery reset（要ユーザー確認）
+debug_set_reconnect_policy tick retry timeout
+debug_dump_reconnect_log
+debug_clear_reconnect_log
 
 --- グループA: ライブフォルト注入のみ（ネットワーク切替なし） ---
 scenario_live_latency     接続中に遅延300msを注入 → シェルの反応が遅くなるが継続することを確認
@@ -97,6 +102,37 @@ step0_install_launch() {
     adb shell am start -n "${PKG}/.MainActivity"
     echo "この後、プロファイル一覧からテスト対象プロファイルをタップして手動接続してください。"
     echo "接続完了（シェルプロンプトが出る）を確認してから各シナリオ関数を呼んでください。"
+}
+
+helper_force_doze() {
+    echo "充電中判定を外してから Deep Doze を強制します。実行前にユーザー確認を取ってください。"
+    adb shell dumpsys battery unplug
+    adb shell dumpsys deviceidle force-idle
+}
+
+helper_unforce_doze() {
+    echo "Deep Doze 強制を解除し、battery 状態を必ず元に戻します。"
+    adb shell dumpsys deviceidle unforce
+    adb shell dumpsys battery reset
+}
+
+debug_set_reconnect_policy() {
+    local tick="${1:?tick secs required}"
+    local retry="${2:?retry interval secs required}"
+    local timeout="${3:?timeout secs required}"
+    _broadcast SET_RECONNECT_POLICY --ei tick_secs "$tick" --ei retry_interval_secs "$retry" --ei timeout_secs "$timeout"
+}
+
+debug_clear_reconnect_policy() {
+    _broadcast CLEAR_RECONNECT_POLICY
+}
+
+debug_dump_reconnect_log() {
+    _broadcast DUMP_RECONNECT_LOG
+}
+
+debug_clear_reconnect_log() {
+    _broadcast CLEAR_RECONNECT_LOG
 }
 
 # ── グループA: ライブフォルト注入のみ ──────────────────
