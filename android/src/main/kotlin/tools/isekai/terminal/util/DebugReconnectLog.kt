@@ -7,13 +7,18 @@ import java.io.File
 
 object DebugReconnectLog {
     private const val TAG = "ReconnectSpike"
+    private const val RUST_FILE_NAME = "debug-reconnect-events.log"
     private const val FILE_NAME = "debug-reconnect-kotlin-events.log"
 
     @Volatile
     private var appContext: Context? = null
 
     fun init(context: Context) {
-        if (BuildConfig.DEBUG) appContext = context.applicationContext
+        if (BuildConfig.DEBUG) {
+            val applicationContext = context.applicationContext
+            appContext = applicationContext
+            setRustLogPath(File(applicationContext.filesDir, RUST_FILE_NAME).absolutePath)
+        }
     }
 
     fun record(event: String) {
@@ -44,4 +49,17 @@ object DebugReconnectLog {
     }
 
     private fun file(context: Context): File = File(context.filesDir, FILE_NAME)
+
+    private fun setRustLogPath(path: String) {
+        runCatching {
+            Class.forName(
+                "uniffi.isekai_terminal_core.Isekai_terminal_coreKt",
+                false,
+                DebugReconnectLog::class.java.classLoader,
+            )
+                .methods
+                .firstOrNull { it.name == "debugSetReconnectLogPath" && it.parameterCount == 1 }
+                ?.invoke(null, path)
+        }
+    }
 }
