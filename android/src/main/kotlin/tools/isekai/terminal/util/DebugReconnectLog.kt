@@ -14,12 +14,15 @@ object DebugReconnectLog {
     private var appContext: Context? = null
 
     fun init(context: Context) {
-        if (BuildConfig.DEBUG) {
-            val applicationContext = context.applicationContext
-            appContext = applicationContext
-            setRustLogPath(File(applicationContext.filesDir, RUST_FILE_NAME).absolutePath)
-        }
+        if (BuildConfig.DEBUG) appContext = context.applicationContext
     }
+
+    /** Rust側ログの絶対パス。`MainActivity.onCreate()`から`debugSetReconnectLogPath`へ
+     *  直接渡す(`Application.onCreate()`はRobolectric JVMテストでも必ず生成されるため、
+     *  そこからuniffi経由のnative呼び出しをするとテストが壊れる——`setTerminalTheme`の
+     *  起動時復元と同じ理由でMainActivity側に置いている)。 */
+    fun rustLogPath(context: Context): String =
+        File(context.applicationContext.filesDir, RUST_FILE_NAME).absolutePath
 
     fun record(event: String) {
         if (!BuildConfig.DEBUG) return
@@ -49,17 +52,4 @@ object DebugReconnectLog {
     }
 
     private fun file(context: Context): File = File(context.filesDir, FILE_NAME)
-
-    private fun setRustLogPath(path: String) {
-        runCatching {
-            Class.forName(
-                "uniffi.isekai_terminal_core.Isekai_terminal_coreKt",
-                false,
-                DebugReconnectLog::class.java.classLoader,
-            )
-                .methods
-                .firstOrNull { it.name == "debugSetReconnectLogPath" && it.parameterCount == 1 }
-                ?.invoke(null, path)
-        }
-    }
 }
