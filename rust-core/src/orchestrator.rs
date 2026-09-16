@@ -777,7 +777,6 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         let user_initiated = s.user_initiated_disconnect;
         let graceful_exit = DisconnectKind::classify(&reason) == DisconnectKind::GracefulRemoteExit;
         let wake_reconnect_loop = s.reconnect_loop_active && s.pending_wake;
-        let was_reconnect_loop_active = s.reconnect_loop_active;
         s.user_initiated_disconnect = false;
         s.phase = ConnPhase::Idle;
         s.retry_attempt_in_flight = false;
@@ -796,7 +795,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
                     // #20: 自動ループが始まらない=以降フォアグラウンド復帰時の
                     // 自動再接続もこの切断イベントの責務ではなくなる。
                     s.background_state = BackgroundState::Foreground;
-                    (Action::NotifyDisconnected(None), was_reconnect_loop_active)
+                    (Action::NotifyDisconnected(None), false)
                 }
             }
         } else {
@@ -812,7 +811,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
             // #20: 自動ループが始まらない切断は、バックグラウンド遷移の追跡対象外に戻す
             // (ユーザー切断・正常終了・そもそも接続失敗だった場合を含む)。
             s.background_state = BackgroundState::Foreground;
-            (Action::NotifyDisconnected(issue_hint), was_reconnect_loop_active)
+            (Action::NotifyDisconnected(issue_hint), false)
         }
     };
     if retry_log {
@@ -968,13 +967,13 @@ fn spawn_reconnect_loop(
     epoch: u64,
 ) {
     RUNTIME.spawn(async move {
-        let policy = shared.state.lock().reconnect_policy;
-        let timeout_secs = policy.timeout.as_secs() as u32;
+        let mut policy = shared.state.lock().reconnect_policy;
+        let mut timeout_secs = policy.timeout.as_secs() as u32;
         // tickの整数倍でretry_intervalを表す(「何tickごとに1回試みるか」)。
         // 経過時間を`.as_secs()`で秒に丸めてから割り算すると、テスト用の
         // サブ秒ポリシー(tick=10msなど)で常に0になり判定が壊れるため、
         // tick単位のカウンタで比較する。
-        let ticks_per_retry = (policy.retry_interval.as_nanos() / policy.tick.as_nanos().max(1)).max(1);
+        let mut ticks_per_retry: u128;
         let mut elapsed = Duration::ZERO;
         let mut tick_count: u128 = 0;
 
@@ -991,6 +990,14 @@ fn spawn_reconnect_loop(
         });
 
         loop {
+            // #新規: debug_set_reconnect_policyによる実行中セッションへの反映を
+            // 次のtickから即座に効かせるため、tickごとに読み直す(固定値のまま
+            // だと`SessionOrchestrator::apply_reconnect_policy_override`相当の
+            // 即時反映がこのループには届かなかった)。
+            policy = shared.state.lock().reconnect_policy;
+            timeout_secs = policy.timeout.as_secs() as u32;
+            ticks_per_retry = (policy.retry_interval.as_nanos() / policy.tick.as_nanos().max(1)).max(1);
+
             if crate::debug_reconnect::is_enabled() {
                 crate::debug_reconnect::record(format!(
                     "spawn_reconnect_loop tick_wait epoch={} elapsed_secs={}",
@@ -1159,8 +1166,7 @@ pub struct SessionOrchestrator {
 #[uniffi::export]
 pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> Arc<SessionOrchestrator> {
     crate::init_logger();
-    let reconnect_policy =
-        crate::debug_reconnect::reconnect_policy_override().unwrap_or_else(ReconnectPolicy::default);
+    let reconnect_policy = crate::debug_reconnect::reconnect_policy_override().unwrap_or_default();
     let shared = Arc::new(OrchestratorShared {
         state: Mutex::new(OrchestratorState {
             phase: ConnPhase::Idle,
@@ -1189,7 +1195,9 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         reconnect_attempt: Box::new(connect_via),
         reconnect_wake: tokio::sync::Notify::new(),
     });
-    Arc::new(SessionOrchestrator { shared })
+    let orchestrator = Arc::new(SessionOrchestrator { shared });
+    crate::debug_reconnect::register_orchestrator(&orchestrator);
+    orchestrator
 }
 
 impl SessionOrchestrator {
@@ -1245,6 +1253,16 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(attempt.clone())?;
         build_and_store_session(&self.shared, attempt, adapter)
     }
+
+    /// Android実機スパイク用: `debug_set_reconnect_policy`/`debug_clear_reconnect_policy`
+    /// (`debug_reconnect.rs`)が、生きている全orchestratorへ即座に反映するために呼ぶ。
+    /// UniFFI経由では公開しない(呼び出し口はRust側のレジストリのみ、
+    /// `SessionOrchestratorInterface`を肥大化させてKotlin側のFakeOrchestrator実装
+    /// (テスト専用)を壊さないため)。
+    pub(crate) fn apply_reconnect_policy_override(&self) {
+        self.shared.state.lock().reconnect_policy =
+            crate::debug_reconnect::reconnect_policy_override().unwrap_or_default();
+    }
 }
 
 #[uniffi::export]
@@ -1287,11 +1305,6 @@ impl SessionOrchestrator {
     /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
     pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
         self.start_manual_connect(LastConnectAttempt::IsekaiLinkRelay(config))
-    }
-
-    pub fn debug_apply_reconnect_policy_override(&self) {
-        self.shared.state.lock().reconnect_policy =
-            crate::debug_reconnect::reconnect_policy_override().unwrap_or_else(ReconnectPolicy::default);
     }
 
     pub fn disconnect(&self) {
