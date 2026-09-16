@@ -154,7 +154,8 @@ const REATTACH_MAX_RETRIES: u32 = 5;
 const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const NETWORK_WAKE_BONUS_RETRIES: u32 = 3;
 const NETWORK_WAKE_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
-static NETWORK_RESTORED_FOR_REATTACH: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+static NETWORK_RESTORED_FOR_REATTACH: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::OnceLock::new();
 
 /// 呼び出し元(russh)とpumpタスクの間を橋渡しするバッファサイズ。
 /// reattach中もある程度は素通しに書き込み続けられる猶予として、
@@ -162,13 +163,18 @@ static NETWORK_RESTORED_FOR_REATTACH: std::sync::OnceLock<tokio::sync::Notify> =
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const RECV_CHUNK_SIZE: usize = 16 * 1024;
 
-fn network_restored_for_reattach() -> &'static tokio::sync::Notify {
-    NETWORK_RESTORED_FOR_REATTACH.get_or_init(tokio::sync::Notify::new)
+fn network_restored_sender() -> &'static tokio::sync::watch::Sender<u64> {
+    NETWORK_RESTORED_FOR_REATTACH.get_or_init(|| tokio::sync::watch::channel(0u64).0)
 }
 
+/// network復帰を、待機中の全`attempt_reattach`呼び出しへ同時に伝える。
+/// `Notify::notify_one()`だと複数ストリームが同時にreattach中の場合1本しか
+/// 起きない(消費者ごとの独立したエッジ検出ができない)ため、`watch`の
+/// バージョンカウンタで代用する——各待機者は自分の`Receiver`で
+/// `changed()`を見るので、1回の送信で全員が同時に起きる。
 pub(crate) fn notify_network_restored_for_reattach() {
     crate::debug_reconnect::record("reattach network_wake");
-    network_restored_for_reattach().notify_one();
+    network_restored_sender().send_modify(|v| *v = v.wrapping_add(1));
 }
 
 /// data stream を包み、QUIC connection が失われても（`RESUME` による reattach が
@@ -373,11 +379,21 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
 }
 
 async fn wait_backoff_or_network_change(backoff: std::time::Duration) -> bool {
-    let wake = network_restored_for_reattach();
+    // 呼び出しごとに新しい`Receiver`を作る——`subscribe()`時点の値を既読扱いに
+    // するので、直前の送信を過去のものとして無視し、この待機中の新しい変化だけを拾う。
+    let mut receiver = network_restored_sender().subscribe();
+    let started = tokio::time::Instant::now();
     tokio::select! {
         _ = tokio::time::sleep(backoff) => false,
-        _ = wake.notified() => {
-            tokio::time::sleep(NETWORK_WAKE_MIN_FLOOR).await;
+        _ = receiver.changed() => {
+            // フロアは「打ち切った上で最低限これだけは待つ」下限であって、
+            // バックオフに上乗せする追加の待ちではない(素のバックオフより
+            // 遅くなってしまっては早期打ち切りの意味が無い)。
+            let waited = started.elapsed();
+            let remaining = NETWORK_WAKE_MIN_FLOOR.saturating_sub(waited).min(backoff.saturating_sub(waited));
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
             if crate::debug_reconnect::is_enabled() {
                 crate::debug_reconnect::record(format!(
                     "reattach backoff_cut_short_by_network_change backoff_ms={}",
