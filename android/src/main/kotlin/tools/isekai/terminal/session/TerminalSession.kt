@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import uniffi.isekai_terminal_core.*
+import java.lang.ref.WeakReference
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -113,6 +114,16 @@ class TerminalSession(
         // 想定しない(大きなファイルは`--length`でチャンク化される)が、接続が死んでいる
         // 状態で呼ばれた場合でも呼び出し元をいつまでもsuspendさせないための保険。
         private const val FILE_PREVIEW_TIMEOUT_MS = 20_000L
+        private val activeSessions = mutableSetOf<WeakReference<TerminalSession>>()
+
+        fun debugApplyReconnectPolicyOverrideToActiveSessions() {
+            val sessions = synchronized(activeSessions) {
+                activeSessions.mapNotNull { it.get() }.also {
+                    activeSessions.removeAll { ref -> ref.get() == null }
+                }
+            }
+            sessions.forEach { it.debugApplyReconnectPolicyOverride() }
+        }
     }
 
     private val _state = MutableStateFlow(TerminalUiState())
@@ -398,6 +409,7 @@ class TerminalSession(
     private val orchestrator: SessionOrchestratorInterface = orchestratorFactory(callback)
 
     init {
+        synchronized(activeSessions) { activeSessions += WeakReference(this) }
         ioScope.launch {
             for (update in screenUpdateChannel) {
                 if (_state.value.connected) {
@@ -547,6 +559,14 @@ class TerminalSession(
      *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
     fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
 
+    fun debugApplyReconnectPolicyOverride() {
+        runCatching {
+            orchestrator.javaClass.methods
+                .firstOrNull { it.name == "debugApplyReconnectPolicyOverride" && it.parameterCount == 0 }
+                ?.invoke(orchestrator)
+        }
+    }
+
     /** `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`喪失、
      *  Rust側のQUICパスヘルスとは無関係な独自シグナル)が検知した「WiFiは繋がっている
      *  がupstreamが死んでいる」を、判断・rebind実行を一切せずRust側`RebindManager`へ
@@ -686,6 +706,7 @@ class TerminalSession(
     }
 
     override fun close() {
+        synchronized(activeSessions) { activeSessions.removeAll { it.get() == null || it.get() === this } }
         orchestrator.disconnect()
         screenUpdateChannel.close()
         ioScope.cancel()
