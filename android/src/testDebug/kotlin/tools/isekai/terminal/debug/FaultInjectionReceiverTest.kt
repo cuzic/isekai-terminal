@@ -117,6 +117,41 @@ class FaultInjectionReceiverTest {
     }
 
     @Test
+    fun setReconnectPolicy_missingExtrasDefaultToOne() {
+        val intent = Intent("tools.isekai.terminal.debug.SET_RECONNECT_POLICY")
+        receiver.onReceive(context, intent)
+        assertEquals(listOf("setReconnectPolicy(1,1,1)"), fake.calls)
+    }
+
+    @Test
+    fun setReconnectPolicy_zeroAndNegativeExtrasAreClampedToOne() {
+        val intent = Intent("tools.isekai.terminal.debug.SET_RECONNECT_POLICY")
+            .putExtra("tick_secs", 0)
+            .putExtra("retry_interval_secs", -5)
+            .putExtra("timeout_secs", -1)
+        receiver.onReceive(context, intent)
+        assertEquals(listOf("setReconnectPolicy(1,1,1)"), fake.calls)
+    }
+
+    @Test
+    fun clearReconnectPolicy_callsInjectorWithNoArgs() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY"))
+        assertEquals(listOf("clearReconnectPolicy()"), fake.calls)
+    }
+
+    @Test
+    fun dumpReconnectLog_callsInjector() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.DUMP_RECONNECT_LOG"))
+        assertEquals(listOf("dumpReconnectLog()"), fake.calls)
+    }
+
+    @Test
+    fun clearReconnectLog_callsInjectorWithNoArgs() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG"))
+        assertEquals(listOf("clearReconnectLog()"), fake.calls)
+    }
+
+    @Test
     fun unknownAction_doesNothing() {
         receiver.onReceive(context, Intent("tools.isekai.terminal.debug.NOT_A_REAL_ACTION"))
         assertTrue("unknown action must not call the injector", fake.calls.isEmpty())
