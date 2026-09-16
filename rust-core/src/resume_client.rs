@@ -704,4 +704,55 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert!(err.to_string().contains("mock: helper unreachable"));
     }
+
+    /// opus-adversarial-consult round3で発覚した回帰の再発防止テスト:
+    /// `reattach_fn`実行中(=Receiverがまだ無かった旧実装なら取りこぼす窓)に届いた
+    /// network復帰通知が、後続のバックオフを正しく早期打ち切りすることを検証する。
+    /// `subscribe()`を`attempt_reattach`の先頭(最初の`reattach_fn`呼び出しより前)へ
+    /// 巻き上げていないと、このテストは1回目のbackoff(1秒)をまるまる待ってしまい失敗する。
+    #[tokio::test(start_paused = true)]
+    async fn reattach_backoff_is_cut_short_by_wake_that_arrives_during_reattach_fn() {
+        let (read, write, _write_rx, read_tx, _fail) = mock_pair();
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_for_closure = attempt_count.clone();
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(move |_id, _sent, _delivered| {
+            let n = attempt_count_for_closure.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                if n == 1 {
+                    // 圏外中のdialタイムアウト相当(reattach_fn自体が2秒居座ってから
+                    // 失敗する)。この2秒の最中はReceiverが存在しない旧実装なら
+                    // network wakeを取りこぼす。
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    notify_network_restored_for_reattach();
+                    Err("mock: still unreachable on first attempt".to_string())
+                } else {
+                    Err("mock: still unreachable".to_string())
+                }
+            })
+        });
+        let resume_state = resume_state_with_session();
+        let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn);
+
+        read_tx.send(Err("mock: connection lost".to_string())).unwrap();
+
+        // attempt 1のreattach_fn(2秒)を終わらせ、その中でnetwork wakeが送られる
+        // ところまで仮想時間を進める。
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // 修正前(subscribe()をバックオフ直前で呼ぶ実装)なら、ここでattempt 2の
+        // backoff(1秒)をまるまる待ってしまう。修正後は、attempt 1実行中に届いた
+        // wakeを既にReceiverが保持しているため、フロア(500ms)だけでattempt 2へ
+        // 進むはず——600ms分だけ進めた時点でattempt_countが2になっていることを
+        // もって確認する。
+        tokio::time::advance(std::time::Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            2,
+            "network wakeによる早期打ち切りが効いていない(reattach_fn実行中の窓の取りこぼし再発)"
+        );
+    }
 }
