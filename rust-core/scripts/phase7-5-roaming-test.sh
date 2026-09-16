@@ -27,7 +27,7 @@ RUST_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$RUST_CORE_DIR/.." && pwd)"
 
 PKG="tools.isekai.terminal"
-LOG_TAGS="isekai-terminal-core:V IsekaiTerminalSSH:V IsekaiTerminalVM:V FaultInjection:V ActivityManager:I *:S"
+LOG_TAGS="isekai-terminal-core:V IsekaiTerminalSSH:V IsekaiTerminalVM:V FaultInjection:V ActivityManager:I ReconnectSpike:V *:S"
 LOG_DIR="${LOG_DIR:-/tmp/claude-1001/-home-cuzic-isekai-terminal/1366600f-e921-4fad-93ea-f62b10133c99/scratchpad/phase7-5-logs}"
 mkdir -p "$LOG_DIR"
 
@@ -105,9 +105,24 @@ step0_install_launch() {
 }
 
 helper_force_doze() {
-    echo "充電中判定を外してから Deep Doze を強制します。実行前にユーザー確認を取ってください。"
+    echo "充電中判定を外し、画面をOFFにしてから Deep Doze を強制します。実行前にユーザー確認を取ってください。"
+    echo "重要: 計測が終わったら必ず helper_unforce_doze を呼んでください。"
     adb shell dumpsys battery unplug
-    adb shell dumpsys deviceidle force-idle
+    adb shell dumpsys deviceidle enable >/dev/null
+    adb shell input keyevent KEYCODE_SLEEP
+    local out
+    out="$(adb shell dumpsys deviceidle force-idle 2>&1 || true)"
+    echo "$out"
+    local deep
+    deep="$(adb shell dumpsys deviceidle get deep 2>&1 || true)"
+    echo "deviceidle deep state: $deep"
+    case "$deep" in
+        *IDLE*) ;;
+        *)
+            echo "WARNING: Deep Doze が IDLE になっていません。端末/OEM設定により force-idle が空振りした可能性があります。"
+            echo "WARNING: この状態の計測は Doze 条件を満たしていない可能性があります。"
+            ;;
+    esac
 }
 
 helper_unforce_doze() {
@@ -128,7 +143,10 @@ debug_clear_reconnect_policy() {
 }
 
 debug_dump_reconnect_log() {
-    _broadcast DUMP_RECONNECT_LOG
+    local out_dir="${LOG_DIR}"
+    adb exec-out run-as "$PKG" cat files/debug-reconnect-events.log > "${out_dir}/rust-reconnect-events.log" 2>/dev/null
+    adb exec-out run-as "$PKG" cat files/debug-reconnect-kotlin-events.log > "${out_dir}/kotlin-reconnect-events.log" 2>/dev/null
+    echo "書き出し先: ${out_dir}/rust-reconnect-events.log , ${out_dir}/kotlin-reconnect-events.log"
 }
 
 debug_clear_reconnect_log() {
