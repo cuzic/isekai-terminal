@@ -65,11 +65,16 @@ pub struct IsekaiLinkRelayConfig {
 pub(crate) struct IsekaiLinkRelaySession {
     config: IsekaiLinkRelayConfig,
     core: SessionCore,
+    reattach_wake: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) fn create_isekai_link_relay_session(config: IsekaiLinkRelayConfig) -> Arc<IsekaiLinkRelaySession> {
     init_logger();
-    Arc::new(IsekaiLinkRelaySession { config, core: SessionCore::new() })
+    Arc::new(IsekaiLinkRelaySession {
+        config,
+        core: SessionCore::new(),
+        reattach_wake: Arc::new(tokio::sync::Notify::new()),
+    })
 }
 
 impl IsekaiLinkRelaySession {
@@ -77,6 +82,7 @@ impl IsekaiLinkRelaySession {
     /// （relayへの到達・認証・トンネル確立のいずれかが失敗すれば接続失敗として扱う）。
     pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
+        let reattach_wake = self.reattach_wake.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
         // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
@@ -84,7 +90,7 @@ impl IsekaiLinkRelaySession {
         RUNTIME.spawn(async move {
             match tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                try_connect_isekai_link_relay(&config, host_key_callback),
+                try_connect_isekai_link_relay(&config, host_key_callback, reattach_wake),
             )
             .await
             {
@@ -106,6 +112,11 @@ impl IsekaiLinkRelaySession {
         });
         Ok(())
     }
+
+    pub(crate) fn notify_network_restored_for_reattach(&self) {
+        crate::debug_reconnect::record("reattach network_wake transport=isekai_link_relay");
+        self.reattach_wake.notify_waiters();
+    }
 }
 crate::session::impl_session_core_delegation!(IsekaiLinkRelaySession);
 
@@ -114,6 +125,7 @@ crate::session::impl_session_core_delegation!(IsekaiLinkRelaySession);
 async fn try_connect_isekai_link_relay(
     config: &IsekaiLinkRelayConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
+    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let relay_addr: SocketAddr = tokio::net::lookup_host(&config.relay_addr)
         .await
@@ -134,7 +146,7 @@ async fn try_connect_isekai_link_relay(
         .map_err(|e| format!("isekai-helper が返したrelay公開アドレスが不正: {e}"))?;
     info!("isekai_link_relay: relay-assigned public address is {helper_addr}");
 
-    connect_relay_stream(helper_addr, &handshake).await
+    connect_relay_stream(helper_addr, &handshake, reattach_wake).await
 }
 
 /// ProxyJump対応のSSH接続を張り、`--relay`/`--relay-sni`/`--relay-jwt`付きでisekai-helperを
@@ -168,6 +180,7 @@ async fn bootstrap_via_ssh_with_relay(
 async fn connect_relay_stream(
     helper_addr: SocketAddr,
     handshake: &IsekaiPipeHandshake,
+    reattach_wake: Arc<tokio::sync::Notify>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let cert_sha256_hex = handshake.cert_sha256().to_string();
     let session_secret = base64::engine::general_purpose::STANDARD
@@ -191,7 +204,14 @@ async fn connect_relay_stream(
     // relayは常時経路に残る(常にトンネルを維持している)ため、STUN版のような
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
-    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_link_relay", conn, data_stream, proof, target).await)
+    Ok(isekai_pipe_quic_transport::finish_quic_stream(
+        "isekai_link_relay",
+        conn,
+        data_stream,
+        proof,
+        target,
+        reattach_wake,
+    ).await)
 }
 
 async fn run_over_stream(
