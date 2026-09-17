@@ -1,6 +1,6 @@
 # ADR: SSH接続プール(`pool.rs`)のstale handle再利用により`TransportPreference::Auto`の自動再接続が構造的に失敗する
 
-- **Status**: Draft(2026-09-16起草、2026-09-17 rev3。issue #120として先行報告済み、
+- **Status**: Draft(2026-09-16起草、2026-09-17 rev4。issue #120として先行報告済み、
   実機Spike 5の副産物として発見。opus-adversarial-consult round 1で根本原因の因果関係
   そのものが誤っていたことが判明し、rev2で全面的に書き直した——rev1は「90秒の猶予 >
   60秒の再接続タイムアウト」という枠組みだったが、実際は`try_attach`が毎回
@@ -8,7 +8,13 @@
   である限り、値に関わらず削除タイマーが永久に成熟しないライブロック**が真因だった。
   round 2レビューでrev2の§3.5「tombstone化」設計が前提としていた「アタッチとreleaseは
   必ず1対1で対応する」という不変条件が現状のコードでは4つの失敗分岐で崩れていることが
-  判明し、rev3でI1〜I3の明示的な不変条件セットへ書き直した)
+  判明し、rev3でI1〜I3の明示的な不変条件セットへ書き直した。round 3レビューは
+  「I1〜I3・Dead entry回収の議論は現在のコードから起きうる全ケースについて正しく
+  完全」と結論しつつ、(a)既存テスト`waiter_receives_establisher_failure_and_entry_is_removed`
+  がI3導入で壊れる指摘漏れ、(b)`refcount==0`でtombstone化する将来機構を禁じない
+  不変条件セットの穴(I4として追加)、(c)§3.2に残っていたI3前提条件化と矛盾する
+  rev2時代の記述、の3点(+軽微な指摘4点)を残し、rev4でこれらを反映して収束
+  ("convergence-level feedback"、追加の異論無しとの回答)した)
 - **対象**: `rust-core/src/pool.rs`(`try_attach`・`release`・`publish_failure`・
   `EntryState`)、`rust-core/src/transport/ssh_handler.rs`(`run_ssh_channel_loop`)、
   `rust-core/src/isekai_pipe_quic_transport.rs`(`ISEKAI_PIPE_QUIC_IDLE_GRACE`・
@@ -21,7 +27,9 @@
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle.md`)
   の指摘を反映、rev3はround 2
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle-round2.md`)
-  の指摘を反映
+  の指摘を反映、rev4はround 3
+  (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle-round3.md`、
+  "convergence-level feedback"との回答)の指摘を反映
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`、`.claude/rules/rust-ssot.md`
 
 ---
@@ -280,12 +288,20 @@ pub(crate) fn try_attach_with<K, T>(
     ハングした試行が後続の全リトライを60秒タイムアウトまで塞ぐ。案Aも
     この盲点は解決しない(ループがまだ終了していないため)。この盲点への
     対処(最初の`channel_open_session()`にタイムアウトを設け、タイムアウトも
-    失敗として扱いevictする)は、案A・案Bどちらとも独立した第3の改善として
-    別途検討する価値がある(§3.4参照)。
+    失敗として扱いevictする)は、§3.4項目2として**項目1(本節の案B)の
+    前提条件**に位置づけている——項目1単独では、この盲点のケースで
+    `try_lock`フォールバックがハングした保持者に「生きている」と
+    騙され続け、元の100%失敗がそのまま再現してしまうため(詳細は§3.4)。
   - 今回報告したバグそのものについては、セッションタスクは既に終了済み
     (`SendError`はそこから来る)なので`is_closed()`は確実に`true`を返す。
     上記の盲点は「別種の、より広いロバスト性」の話であり、今回のバグの
     修正としては案Bは完全。
+  - 生存確認は`try_attach`の時点でしか行わない。その直後(チェックと
+    実使用の間)にハンドルが死ぬ、あるいは`Establisher`が公開した直後の
+    ハンドルが即座に死んで`Waiter`に渡ってしまう、というケースは
+    残る——ただしこれは1回分の失敗した試行で済み、**次の再試行の
+    `try_attach`がそのエントリをtombstone化する**(まさに本修正の
+    設計そのもの)ため自己修復する。
 
 ### 3.3 案C(却下): 数値だけ動かす
 
@@ -424,16 +440,30 @@ armできなくなる。つまりR1(こっそりプーリングが壊れる)を�
   上記4つの失敗分岐それぞれに`release`呼び出しを追加する(呼び出し元は
   そのアーム内でまだ`key`を保持しているため、`acquire_pooled_handle`
   自身の中、および`run_russh_transport`の2つの`return`の直前に足すのが
-  最も安上がり)。これはtombstone設計全体を支える前提でありながら、
-  rev2には一言も書かれていなかった。あわせて`AttachOutcome`のdocコメント
+  最も安上がり。ただし`run_russh_transport`側は`match &pool_key`
+  [`lib.rs:1652`]が参照を束縛するため、追加する2箇所の`release`は
+  `key.clone()`が必要になる点に注意——借用チェッカー上の問題ではなく、
+  単に失敗パスで`String`を1〜2個複製するだけの些細なコスト)。これは
+  tombstone設計全体を支える前提でありながら、rev2には一言も
+  書かれていなかった。あわせて`AttachOutcome`のdocコメント
   (`pool.rs:56-59`、確立担当者は`publish_success`/`publish_failure`を
   呼ぶことしか要求していない)と`publish_failure`のdocコメント
   (`pool.rs:121-123`、「この後`Disconnected`等の通常のエラー経路で
   処理を続ける」=releaseは不要であるかのように読める)の両方を、
   「release呼び出しも必須」と明記するよう更新しないと、次にこのコードを
   触る人がこのリークを再導入しうる。
-- **I2 — tombstone化は`state`だけを書き換える。`refcount`にも
-  `idle_generation`にも一切触れない。** 特に`idle_generation`に
+- **I2 — tombstone化「そのもの」は`state`だけを書き換える。`refcount`にも
+  `idle_generation`にも一切触れない。** ここで言う「tombstone化」とは
+  「あるエントリを`Ready(dead)`から`Dead`または`Connecting`へ変える」
+  という操作それ自体を指す。案B(§3.2)の主経路のように、tombstone化が
+  `try_attach`内でアタッチと**同時に**起きる場合、そのアタッチ自身が
+  `refcount += 1`・`idle_generation`のインクリメントを行うのは通常通り
+  正しい(`pool.rs:82-83`)——これは「アタッチが触っている」のであって
+  「tombstone化が触っている」のではない、という区別である。I2が
+  禁じているのは、tombstone化という操作**単体**が`refcount`/
+  `idle_generation`を書き換えること(§1.4以降で説明するアイドル削除
+  タイマーの整合性を壊すため)であって、同じ操作の中で正当なアタッチが
+  同時に起きることまで禁じるものではない。特に`idle_generation`に
   触れないことが重要で、理由はDead entryの回収を扱う下記で説明する。
 - **I3 — `publish_failure`はエラーをブロードキャストしてtombstone化する
   だけにする。削除は例外なく通常の削除タイマーの仕事とする。** I1が
@@ -441,8 +471,22 @@ armできなくなる。つまりR1(こっそりプーリングが壊れる)を�
   (rev2の「またはrefcountが実際に0の場合のみ削除」という代替案は、
   I1無しでは「実質削除しない」に退化し、I1が成り立てば単に不要になる
   ——通常の削除タイマーが既にその仕事をする)。
+- **I4 — `try_attach`の外からtombstone化する経路は、その時点で自分が
+  アタッチトークンを保持している(`refcount ≥ 1`)ことを保証するか、
+  さもなくば自分で削除タイマーをarmすること。** I1〜I3だけでは、
+  `refcount == 0`のエントリをtombstone化して立ち去るケースを禁じて
+  いない——その場合`release`が二度と呼ばれずタイマーもarmされないため、
+  I1が成り立っていても不滅の`Dead` entryができてしまう。現在の設計にある
+  4つのtombstone経路(案B自身の`try_attach`内検知・I3の`publish_failure`・
+  §3.4項目2の初回使用時タイムアウト・任意で実装する場合の案A)は
+  いずれも自分がアタッチトークンを保持した状態(`refcount ≥ 1`)で
+  tombstone化するため、この時点では問題にならない。ただし将来
+  「プールを巡回して死んだアイドルエントリを掃除する」ような、
+  §3.1が案Aの構造的な弱点として指摘した「アイドル中に死ぬケース」を
+  能動的に処理する機構(バックグラウンドの健全性スイーパー等)を
+  追加する場合は、この条件を明示的に満たす実装にする必要がある。
 
-I1〜I3が揃えば、R1・R2はどちらも構造的に発生しえなくなり、`entry_id`の
+I1〜I4が揃えば、R1・R2はどちらも構造的に発生しえなくなり、`entry_id`の
 ような新しい識別子を導入する必要も無い——これはR3が本来目指していた
 性質そのものである。
 
@@ -489,8 +533,11 @@ tombstone-in-placeを選ぶ理由の1つとして記録しておく価値があ�
 実装者が項目1の段階で使われない`Dead`変種を作ってしまうか、
 逆に省略して項目2で詰まるかのどちらかになりうる。
 
-この設計は案A・案Bどちらの素朴な実装よりも小さく、並行性の議論が最も
-単純になるため、実装時はこれを採用する。
+I1〜I4を満たす実装は(4つの失敗分岐への`release`追加・2つのdocコメント
+更新・新しい`EntryState`列挙子・既存テスト1本の書き換え+新規テスト
+数本を要するため)もはや明らかに「最小の差分」とは言えないが、
+並行性の議論が最も単純になる(`entry_id`のような新しい識別子を
+一切必要としない)という点は変わらず成り立ち、実装時はこれを採用する。
 
 ### 3.6 既存テストとの整合性
 
@@ -503,7 +550,29 @@ tombstone-in-placeを選ぶ理由の1つとして記録しておく価値があ�
 - `reattaching_during_idle_grace_cancels_the_pending_removal`
   (`pool.rs:426-444`)は、まさに今回のバグの原因である
   「世代インクリメントによる削除タイマー無効化」という挙動自体を
-  固定するテストであり、修正後もこれは緑のまま維持する必要がある。
+  固定するテストであり、修正後もこれは緑のまま維持する必要がある
+  (生存確認述語に`|_| true`を渡せばそのまま緑を維持できる——この
+  挙動自体、再アタッチが保留中の削除を無効化することは変更しない、
+  変えるのは「死んだ値を返さない」という`try_attach`側の判断だけ)。
+- **既存テスト`waiter_receives_establisher_failure_and_entry_is_removed`
+  (`pool.rs:322-334`)は書き換えが必要**(round 3レビューで発見、
+  当初§3.6には書かれていなかった)。この既存テストの最後のアサーション
+  `assert!(pool.lock().get(&"k").is_none(), "failed entry should be
+  removed")`は、まさにI3が置き換える「失敗したら即座に削除する」という
+  挙動そのものを固定しており、I3実装後はこのアサーションのタイミングで
+  エントリは存在するがtombstone化(`Dead`)されている状態になるため、
+  そのままでは失敗する。修正はこのテストの見た目上の「退行」ではなく
+  意図した挙動変化なので注意——さらにこのテストが使っている
+  `PoolMap<&'static str, u32>`は**ローカル変数**であり(`RELEASE_TEST_POOL`
+  のような`'static`ではない)、`release`が`pool: &'static PoolMap<..>`を
+  要求する(`pool.rs:143-147`)ため、この局所プールのままでは「猶予後に
+  実際に削除される」ところまでは検証できない。書き換えの際は
+  (a)「tombstone化されるがまだ削除されない・エラーはブロードキャスト
+  される」ことをローカルプールで検証するテストと、(b)`RELEASE_TEST_POOL`
+  のような`'static`プールで「最後の`release`+猶予後に実際に削除される」
+  ことを検証するテストの2本に分けるのが自然。テスト名自体も
+  (`..._and_entry_is_removed`のままだと新しい契約と矛盾するので)
+  合わせて変更する。
 - その上で、新しい回帰テストを追加する。「失敗する再アタッチは削除を
   無期限に先送りしない」は**修正前**の不変条件の記述であり、案B適用後は
   失敗した再アタッチは削除を先送りするのではなく即座にエントリを
@@ -518,17 +587,15 @@ tombstone-in-placeを選ぶ理由の1つとして記録しておく価値があ�
     R1そのもの、静かに腐るタイプの回帰)。
   - out-of-band(`try_attach`の外)からのtombstone化の後、最後の
     `release`が実際にエントリを猶予後に消し去ること(§3.5の
-    「Dead entryは不滅にならない」性質、I1〜I3の検証)。
-  - `publish_failure`後も`refcount`が0まで到達可能であること(I1が
-    破られていた現状ではこのテストは落ちるはずで、破られている
-    ことそのものを固定できる)。
-  既存の`reattaching_during_idle_grace_cancels_the_pending_removal`
-  (`pool.rs:426-444`)は生存確認述語に`|_| true`を渡せばそのまま
-  緑を維持できる(この挙動自体——再アタッチが保留中の削除を無効化する
-  こと——は変更しない、変えるのは「死んだ値を返さない」という
-  `try_attach`側の判断だけ)。
+    「Dead entryは不滅にならない」性質、I1〜I4の検証)。
+  - `publish_failure`後も`refcount`が0まで到達可能であること。これは
+    **現状のコードに対する「赤いテスト」ではない**(現状は
+    `publish_failure`がエントリごと削除するため、観測すべき`refcount`
+    自体が存在せず「テストが失敗する」のではなく「テストが書けない」)
+    ——I1+I3を実装して初めて意味を持つ、新しい挙動を固定するための
+    テストとして追加する。
 
-## 4. 未決事項(rev1からの更新、rev3でさらに更新)
+## 4. 未決事項(rev1からの更新、rev3・rev4でさらに更新)
 
 - ~~`PooledSshHandle`の内部構造がrussh `client::Handle`の生存確認に
   使える既存APIを持つか~~ → **解決済み**: `Handle::is_closed()`が
@@ -549,14 +616,20 @@ tombstone-in-placeを選ぶ理由の1つとして記録しておく価値があ�
   実装時は`RUN_EXEC_TIMEOUT`を再利用するか、その隣に姉妹定数を
   立てるのが最も筋が良い。
 - ~~案A・案Bどちらの提案にも共通する未対処のレース~~ → **解決済み**:
-  §3.5でI1〜I3の不変条件セットとして解決策を明記した。
+  §3.5でI1〜I4の不変条件セットとして解決策を明記した(I4はround 3
+  レビューで追加、`refcount==0`でのtombstone化を将来にわたって禁じる
+  条件)。
+- ~~既存テストへの影響~~ → **解決済み**: §3.6で
+  `waiter_receives_establisher_failure_and_entry_is_removed`
+  (`pool.rs:322-334`)の書き換えが必要であることを明記した(round 3で
+  発見、当初漏れていた)。
 
 ## 5. 次のステップ
 
-rev3をopus-adversarial-consultの同じレビュアーへ再送し、round 2の指摘
-(I1〜I3の不変条件セット・項目2の前提条件への格上げ・F1〜F3/N1〜N5)を
-正しく反映できているか確認する。収束が確認できたら実装に着手する。
-実装は§3.4の順序(案B+tombstone化とI1〜I3 → 初回使用時タイムアウト
+rev4はopus-adversarial-consult round 3から「収束レベル
+(convergence-level feedback)、これ以上の異論無し」との回答を得た
+(round 1〜3の全指摘を反映済み)。実装に着手してよい状態と判断する。
+実装は§3.4の順序(案B+tombstone化とI1〜I4 → 初回使用時タイムアウト
 [`RUN_EXEC_TIMEOUT`再利用、両者は不可分の1セットとして同時に実装する] →
 案Aは任意)で進める。実装後は実機での再現テスト(issue #120のスクリプトを
 再利用)で修正を検証する。
