@@ -557,7 +557,7 @@ pub(crate) async fn connect_via_jump_or_direct(
 /// isekai-pipe QUIC系(ネストしたSSH)いずれの確立方法でも同じ形にまとめる
 /// (`run_ssh_channel_loop`から見れば、TCPの上かQUICトンネルの上かは区別不要なため)。
 pub(crate) struct PooledSshHandle {
-    pub(crate) handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
@@ -588,6 +588,23 @@ impl PooledSshHandle {
         ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
     ) -> Result<T, tokio::time::error::Elapsed> {
         with_shared_handle_timeout(&self.handle, timeout, f).await
+    }
+
+    /// `try_attach_with`の生存確認述語として渡す(`ADR_ANDROID_POOL_STALE_HANDLE.md`
+    /// §3.2)。`handle`フィールドをprivateにしたことで、この定義を経由せずに
+    /// 生存確認ロジックを複製することはコンパイルエラーになる(code-reviewで
+    /// 発見した「同一クロージャが4箇所に複製されていた」問題の再発防止)。
+    pub(crate) fn is_alive(&self) -> bool {
+        self.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+    }
+
+    /// `pooled.handle`を直接共有したい呼び出し元(`forward.rs`・
+    /// `file_preview_exec.rs`)向けのクローン取得。`with_handle_timeout`を
+    /// 経由しない生のawaitを増やさないよう、新規の呼び出し元は基本的に
+    /// `with_handle_timeout`を使うこと——これは既存の(このファイル内で
+    /// 完結する)委譲用途のためだけに残す。
+    pub(crate) fn handle_arc(&self) -> Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>> {
+        self.handle.clone()
     }
 }
 
@@ -937,7 +954,7 @@ async fn run_ssh_channel_loop_after_first_open(
                 // (タスク#61)自体がSSHの新しいチャネルを開く待ち時間を伴い得るため、
                 // このI/Oループ(`select!`)をブロックしないよう別taskへ`spawn`する
                 // (`TransportCommand::RunExec`のハンドラと同じ配慮)。
-                let runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let runner = SshHandleTmuxRunner { handle: pooled.handle_arc() };
                 let app_pane_for_push = app_pane_id.clone();
                 let path_for_push = path.clone();
                 tokio::spawn(async move {
@@ -957,7 +974,7 @@ async fn run_ssh_channel_loop_after_first_open(
                 // `spawn`する(`run_exec`の待ち時間でI/Oループをブロックしない)。
                 // ロケータ未登録なら`install_notify_hooks`が黙ってno-opになるのも
                 // `push_ctl_socket_to_tmux`と同じ(opportunistic機能)。
-                let notify_runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let notify_runner = SshHandleTmuxRunner { handle: pooled.handle_arc() };
                 let app_pane_for_notify = app_pane_id.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::tmux_notify::install_notify_hooks(
@@ -998,7 +1015,7 @@ async fn run_ssh_channel_loop_after_first_open(
     // 複製した「プールエントリと共有」のハンドルになる。複数タブが同じHandleに対して
     // 独立にforwardを追加/削除しても、`remote_forwards`(ポート→転送先の経路表)は
     // [pooled]から複製したものを共有するため経路表自体は一貫する。
-    let session = pooled.handle.clone();
+    let session = pooled.handle_arc();
     let remote_forwards = pooled.remote_forwards.clone();
     let mut active_forwards: HashMap<String, ActiveForward> = HashMap::new();
 
@@ -1786,9 +1803,7 @@ mod pooling_e2e_tests {
 
             // 1本目: 確立してプールへ登録する(本番の`run_russh_transport`が行うのと同じ手順)。
             let mut auth1 = auth.clone();
-            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, |p| {
-                p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
-            }) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
@@ -1815,9 +1830,7 @@ mod pooling_e2e_tests {
 
             // 次のアタッチはEstablisherに戻り、サーバーは2回目の認証を観測する。
             let mut auth2 = auth;
-            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, |p| {
-                p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
-            }) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),

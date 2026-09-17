@@ -1663,9 +1663,7 @@ pub(crate) async fn run_russh_transport(
                 }
             }
         }
-        Some(key) => match pool::try_attach_with(&pool::SSH_POOL, key, |p| {
-            p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
-        }) {
+        Some(key) => match pool::try_attach_with(&pool::SSH_POOL, key, transport::PooledSshHandle::is_alive) {
             pool::AttachOutcome::Ready(v) => {
                 transport::zeroize_ssh_auth(&mut config.auth);
                 v

@@ -1262,6 +1262,11 @@ impl SessionOrchestrator {
     pub(crate) fn apply_reconnect_policy_override(&self) {
         self.shared.state.lock().reconnect_policy =
             crate::debug_reconnect::reconnect_policy_override().unwrap_or_default();
+        // `spawn_reconnect_loop`が古いtick長のままsleep中の場合、これを起こさないと
+        // 新しいポリシーは現在のsleepが自然に終わるまで反映されない
+        // (code-reviewで発見、このメソッドのドキュメント上の「次のtickを待たず
+        // 即座に反映する」という約束を守るために必須)。
+        self.shared.reconnect_wake.notify_one();
     }
 }
 

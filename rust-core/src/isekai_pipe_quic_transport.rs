@@ -725,9 +725,7 @@ async fn acquire_pooled_handle(
             Err(AcquireError::DialFailed(m)) => AcquireOutcome::DialFailed(m),
             Err(AcquireError::PostDialFailed(m)) => AcquireOutcome::OtherFailed(m),
         },
-        Some(key) => match crate::pool::try_attach_with(&ISEKAI_PIPE_QUIC_POOL, &key, |p| {
-            p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
-        }) {
+        Some(key) => match crate::pool::try_attach_with(&ISEKAI_PIPE_QUIC_POOL, &key, PooledSshHandle::is_alive) {
             crate::pool::AttachOutcome::Ready(v) => {
                 zeroize_ssh_auth(&mut config.auth);
                 AcquireOutcome::Attached(v, Some(key))
