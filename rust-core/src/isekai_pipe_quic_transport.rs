@@ -37,7 +37,7 @@ use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPi
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, establish_ssh_handle_over_stream,
-    run_ssh_channel_loop, zeroize_ssh_auth, PooledSshHandle, TransportEvent,
+    run_ssh_channel_loop, zeroize_ssh_auth, FirstChannelOpen, PooledSshHandle, TransportEvent,
 };
 use crate::{init_logger, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
@@ -134,8 +134,11 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx, app_pane_id).await;
+                    let first_open = run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx, app_pane_id).await;
                     if let Some(key) = pool_key {
+                        if matches!(first_open, FirstChannelOpen::Failed | FirstChannelOpen::TimedOut) {
+                            crate::pool::mark_dead_if_same(&ISEKAI_PIPE_QUIC_POOL, &key, &pooled);
+                        }
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                     }
                 }
@@ -164,11 +167,14 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    run_ssh_channel_loop(
+                    let first_open = run_ssh_channel_loop(
                         &pooled, cols, rows, false, false, cmd_rx, event_tx,
                         app_pane_id.clone(),
                     ).await;
                     if let Some(key) = pool_key {
+                        if matches!(first_open, FirstChannelOpen::Failed | FirstChannelOpen::TimedOut) {
+                            crate::pool::mark_dead_if_same(&ISEKAI_PIPE_QUIC_POOL, &key, &pooled);
+                        }
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                     }
                 }
@@ -719,7 +725,9 @@ async fn acquire_pooled_handle(
             Err(AcquireError::DialFailed(m)) => AcquireOutcome::DialFailed(m),
             Err(AcquireError::PostDialFailed(m)) => AcquireOutcome::OtherFailed(m),
         },
-        Some(key) => match crate::pool::try_attach(&ISEKAI_PIPE_QUIC_POOL, &key) {
+        Some(key) => match crate::pool::try_attach_with(&ISEKAI_PIPE_QUIC_POOL, &key, |p| {
+            p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+        }) {
             crate::pool::AttachOutcome::Ready(v) => {
                 zeroize_ssh_auth(&mut config.auth);
                 AcquireOutcome::Attached(v, Some(key))
@@ -728,7 +736,10 @@ async fn acquire_pooled_handle(
                 zeroize_ssh_auth(&mut config.auth);
                 match crate::pool::wait_for_establish(rx).await {
                     Ok(v) => AcquireOutcome::Attached(v, Some(key)),
-                    Err(m) => AcquireOutcome::OtherFailed(m),
+                    Err(m) => {
+                        crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
+                        AcquireOutcome::OtherFailed(m)
+                    }
                 }
             }
             crate::pool::AttachOutcome::Establisher => {
@@ -738,10 +749,12 @@ async fn acquire_pooled_handle(
                     ),
                     Err(AcquireError::DialFailed(m)) => {
                         crate::pool::publish_failure(&ISEKAI_PIPE_QUIC_POOL, &key, m.clone());
+                        crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                         AcquireOutcome::DialFailed(m)
                     }
                     Err(AcquireError::PostDialFailed(m)) => {
                         crate::pool::publish_failure(&ISEKAI_PIPE_QUIC_POOL, &key, m.clone());
+                        crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                         AcquireOutcome::OtherFailed(m)
                     }
                 }

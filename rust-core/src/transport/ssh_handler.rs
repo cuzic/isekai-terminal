@@ -770,6 +770,12 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
 
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
 
+pub(crate) enum FirstChannelOpen {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
 /// [pooled]（既に認証済み）に対して新しいSSHチャネル(セッション/PTY/シェル)を1本開き、
 /// そのチャネルのI/Oループを回す。プールにヒットした2本目以降のタブも最初のタブも、
 /// この関数から始まる(呼び出し元が先に確立関数を呼ぶかプールから取得するかだけが違う)。
@@ -789,19 +795,46 @@ pub(crate) async fn run_ssh_channel_loop(
     rows: u32,
     agent_forward: bool,
     allow_non_loopback_forward_bind: bool,
+    cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
+    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    app_pane_id: crate::tmux_locator::AppPaneId,
+) -> FirstChannelOpen {
+    let channel = match tokio::time::timeout(RUN_EXEC_TIMEOUT, async {
+        pooled.handle.lock().await.channel_open_session().await
+    }).await {
+        Ok(Ok(c)) => { info!("ssh: session channel opened"); c }
+        Ok(Err(e)) => {
+            warn!("ssh: channel_open_session failed: {}", e);
+            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+            return FirstChannelOpen::Failed;
+        }
+        Err(_) => {
+            warn!("ssh: channel_open_session timed out after {:?}", RUN_EXEC_TIMEOUT);
+            event_tx.send(TransportEvent::Disconnected {
+                reason: Some(format!("channel_open_session timed out after {:?}", RUN_EXEC_TIMEOUT)),
+            }).await.ok();
+            return FirstChannelOpen::TimedOut;
+        }
+    };
+
+    run_ssh_channel_loop_after_first_open(
+        pooled, channel, cols, rows, agent_forward, allow_non_loopback_forward_bind,
+        cmd_rx, event_tx, app_pane_id,
+    ).await;
+    FirstChannelOpen::Succeeded
+}
+
+async fn run_ssh_channel_loop_after_first_open(
+    pooled: &PooledSshHandle,
+    mut channel: russh::Channel<client::Msg>,
+    cols: u32,
+    rows: u32,
+    agent_forward: bool,
+    allow_non_loopback_forward_bind: bool,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     app_pane_id: crate::tmux_locator::AppPaneId,
 ) {
-    let mut channel = match pooled.handle.lock().await.channel_open_session().await {
-        Ok(c) => { info!("ssh: session channel opened"); c }
-        Err(e) => {
-            warn!("ssh: channel_open_session failed: {}", e);
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
-            return;
-        }
-    };
-
     if agent_forward && pooled.agent_key.lock().is_some() {
         info!("ssh: requesting agent forwarding");
         if let Err(e) = channel.agent_forward(true).await {
@@ -1681,7 +1714,9 @@ mod pooling_e2e_tests {
 
             // 1本目: 確立してプールへ登録する(本番の`run_russh_transport`が行うのと同じ手順)。
             let mut auth1 = auth.clone();
-            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, |p| {
+                p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+            }) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
@@ -1708,7 +1743,9 @@ mod pooling_e2e_tests {
 
             // 次のアタッチはEstablisherに戻り、サーバーは2回目の認証を観測する。
             let mut auth2 = auth;
-            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, |p| {
+                p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+            }) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),

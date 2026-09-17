@@ -59,7 +59,7 @@ use tokio::runtime::Runtime;
 use russh::client;
 
 use crate::session::SessionCore;
-use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{FirstChannelOpen, TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -1663,7 +1663,9 @@ pub(crate) async fn run_russh_transport(
                 }
             }
         }
-        Some(key) => match pool::try_attach(&pool::SSH_POOL, key) {
+        Some(key) => match pool::try_attach_with(&pool::SSH_POOL, key, |p| {
+            p.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+        }) {
             pool::AttachOutcome::Ready(v) => {
                 transport::zeroize_ssh_auth(&mut config.auth);
                 v
@@ -1673,6 +1675,7 @@ pub(crate) async fn run_russh_transport(
                 match pool::wait_for_establish(rx).await {
                     Ok(v) => v,
                     Err(msg) => {
+                        pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);
                         log::warn!("ssh: {msg}");
                         event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
                         return;
@@ -1687,6 +1690,7 @@ pub(crate) async fn run_russh_transport(
                     Ok(p) => pool::publish_success(&pool::SSH_POOL, key, p),
                     Err(msg) => {
                         pool::publish_failure(&pool::SSH_POOL, key, msg.clone());
+                        pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);
                         log::warn!("ssh: {msg}");
                         event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
                         return;
@@ -1696,13 +1700,16 @@ pub(crate) async fn run_russh_transport(
         },
     };
 
-    run_ssh_channel_loop(
+    let first_open = run_ssh_channel_loop(
         &pooled, config.cols, config.rows,
         config.agent_forward, config.allow_non_loopback_forward_bind,
         cmd_rx, event_tx, app_pane_id,
     ).await;
 
     if let Some(key) = pool_key {
+        if matches!(first_open, FirstChannelOpen::Failed | FirstChannelOpen::TimedOut) {
+            pool::mark_dead_if_same(&pool::SSH_POOL, &key, &pooled);
+        }
         pool::release(&pool::SSH_POOL, key, pool::PLAIN_SSH_IDLE_GRACE);
     }
 }
