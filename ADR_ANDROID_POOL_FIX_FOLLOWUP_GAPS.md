@@ -1,6 +1,6 @@
 # ADR: pool.rs修正(issue #120/PR #119)実装後にコードレビューで見つかった残存ギャップ
 
-- **Status**: Draft(2026-09-17起草、rev3。`ADR_ANDROID_POOL_STALE_HANDLE.md`
+- **Status**: Draft(2026-09-17起草、rev4。`ADR_ANDROID_POOL_STALE_HANDLE.md`
   (rev4、収束済み)の実装(PR #119、コミット4793ebcd・c4eb37ac)がmainへ
   マージ前の`/code-review`で発見された指摘のうち、同ADRの設計範囲に
   直接関わる2件を切り出して検討する。opus-adversarial-consult round 1で
@@ -11,7 +11,12 @@
   判明し(レビュアー自身が「round 1での自分の見落とし」として指摘)、
   **Gap Bは「検討した結果、却下する」という結論に確定した**。Gap Aも
   3点の欠陥(A4の扱いの内部矛盾・動的ポート時の緩和策が原理的に
-  実装不能・アクセサのシグネチャがMSRV 1.75で書けない)を修正しrev3とした)
+  実装不能・アクセサのシグネチャがMSRV 1.75で書けない)を修正しrev3とした。
+  round 3レビューは両結論(Gap A修正・Gap B却下)を「正しい」と確認した
+  上で、§3.3の定理が過度に一般化されていた点・その定理が§2.6項目4/§3.5で
+  誤って逆方向に適用されていた点・§2.3のアクセサ実装を「確定」と書いて
+  いたが実際は未コンパイルの脆い案だった点など6件の指摘を残し、rev4で
+  反映して収束(「round 4で実質的な異論は無いと見込む」との回答)した)
 - **対象**: `rust-core/src/transport/ssh_handler.rs`・
   `rust-core/src/transport/forward.rs`・
   `rust-core/src/transport/file_preview_exec.rs`
@@ -23,7 +28,9 @@
   §3.4項目2)。opus-adversarial-consult round 1
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-followup-gaps.md`)・
   round 2
-  (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-followup-gaps-round2.md`)
+  (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-followup-gaps-round2.md`)・
+  round 3
+  (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-followup-gaps-round3.md`)
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`
 
 ---
@@ -84,11 +91,17 @@ A4(`teardown_forward`が`tokio::spawn`する検出用タスク)は、
 見えるが、「タイムアウト付きのawaitを、spawnされたタスクの**中**で
 行う」という対処を取れば、A4もA1〜A3・A5〜A7と全く同じ形で保護できる
 ——`teardown_forward`はタブのI/Oループを止めないために意図的に
-`spawn`している(呼び出し元の`ssh_handler.rs:1057,1070`はタブの
-`select!`ループの中、`:1107`はループ終了直後でawaitする相手が無い)
-ため、「detachさせず束縛して寿命管理する」という代替策は、タブの
-シェルループを止めてしまうか、あるいはキャンセル処理自体を諦めるかの
-どちらかにしかならず、実質的に選べない。したがって対処は
+`spawn`している(呼び出し元のうち`ssh_handler.rs:1057,1070`は
+タブの`select!`ループの中で、ここでawaitすればタブ自身のI/Oが
+止まってしまう。`:1107`は`active_forwards.drain()`ループの中で
+`await`できる相手[直後に`:1112`で`cancel_streamlocal_forward`を
+awaitしている]が無いわけではないが、ここでawaitすると
+`run_ssh_channel_loop`の返却、ひいては`pool::release`の呼び出しが
+その分遅れるだけで、下記の「spawnされたタスクの中で有界時間に収める」
+という対処を採ればその遅延を甘受する理由が無くなる)ため、
+「detachさせず束縛して寿命管理する」という代替策は、少なくとも
+`:1057,1070`ではタブのシェルループを止めてしまい、`:1107`でも
+本来不要な遅延を導入するだけで何の見返りも無い。したがって対処は
 「spawnされたタスクの中身自体に、下記§2.3のアクセサ経由で
 有界時間のawaitを行わせる」の一本に統一する(A4を特別扱いしない)。
 
@@ -101,51 +114,91 @@ A4(`teardown_forward`が`tokio::spawn`する検出用タスク)は、
 理由」として述べた「次に新しいプールが追加されたときに同じバグを
 静かに引き継ぐ」のと同じ構造の問題を生む。`PooledSshHandle`に
 「タイムアウト付きでロックして操作する」単一のアクセサを用意し、
-7箇所全て(既に保護済みの`:802`・`run_exec_on_handle`含む、二重の
-規約が生まれないよう合わせて寄せる)をそちらへ経由させることを推奨する。
+A1〜A7全てをそちらへ経由させることを推奨する(`:802`・
+`run_exec_on_handle`の扱いは末尾の注意点を参照——単純に「これらも
+含める」わけではない)。
 
-**シグネチャ(round 2レビューで確定、当初案は書けなかった)**:
-`rust-core/Cargo.toml`は`rust-version = "1.75"`を宣言しており、
-`AsyncFnOnce`(安定化は1.85)が使えない。したがって
-`PooledSshHandle::with_handle_timeout(|h| async { ... })`という
-素朴なクロージャ形は、`MutexGuard`を呼び出し境界を越えて借用する
-async blockをコンパイルできない。1.75で書ける形は次の通り
-(boxed futureを介したHRTB):
+**シグネチャの候補(round 2で提示した形はround 3レビューで
+「未コンパイルの案を確定と書いた」と指摘された。実装時にどちらを
+採るか決定する、§5参照)**: `rust-core/Cargo.toml`は
+`rust-version = "1.75"`を宣言しており、`AsyncFnOnce`(安定化は1.85)が
+使えない。したがって`PooledSshHandle::with_handle_timeout(|h| async
+{ ... })`という素朴なクロージャ形は、`MutexGuard`を呼び出し境界を
+越えて借用するasync blockをコンパイルできない。1.75で書ける候補が
+2つある:
 
-```rust
-impl PooledSshHandle {
-    pub(crate) async fn with_handle<T>(
-        &self,
-        timeout: Duration,
-        f: impl for<'a> FnOnce(
-            &'a mut client::Handle<RusshEventHandler>,
-        ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
-    ) -> Result<T, tokio::time::error::Elapsed> {
-        tokio::time::timeout(timeout, async {
-            let mut guard = self.handle.lock().await;
-            f(&mut guard).await
-        }).await
-    }
-}
-```
+- **候補1(関数形、コンパイルできれば望ましい)**: boxed futureを
+  介したHRTB。
 
-呼び出し側は`pooled.with_handle(RUN_EXEC_TIMEOUT, |h|
-Box::pin(async move { h.tcpip_forward(a, p).await })).await`という形に
-なる。1呼び出しごとに1回ヒープ確保が発生する見た目の悪さはあるが、
-`&mut self`を要求するrussh側メソッド(`tcpip_forward`・
-`streamlocal_forward`)と`&self`で足りるメソッド
-(`cancel_*`・`channel_open_direct_tcpip`)の両方を`DerefMut`経由で
-統一的に扱え、かつロック取得自体を含めて`timeout`で包むため
-§2.5.2で述べる「ロック取得中にタイムアウトした場合は何もリークしない」
-という性質も保たれる。
+  ```rust
+  impl PooledSshHandle {
+      pub(crate) async fn with_handle<T>(
+          &self,
+          timeout: Duration,
+          f: impl for<'a> FnOnce(
+              &'a mut client::Handle<RusshEventHandler>,
+          ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+      ) -> Result<T, tokio::time::error::Elapsed> {
+          tokio::time::timeout(timeout, async {
+              let mut guard = self.handle.lock().await;
+              f(&mut guard).await
+          }).await
+      }
+  }
+  ```
 
-**このアクセサ経由にする際の注意点(round 2レビューで追加)**:
-A5・A6・A7(1回の転送接続・1回のファイルプレビューという、単体の
-操作の失敗)がタイムアウトしても、`TransportEvent::Disconnected`を
-発行してはならない——これらの失敗はセッション全体の生死とは無関係な
-per-operationの失敗であり、現状も単に`warn!`して処理を続けている。
-セッションの生死に関わるのは`:802`(最初の`channel_open_session`)
-だけであり、この意味論を保ったままアクセサへ寄せる。
+  呼び出し側は`pooled.with_handle(RUN_EXEC_TIMEOUT, |h|
+  Box::pin(async move { h.tcpip_forward(a, p).await })).await`という
+  形になる。**この`for<'a> FnOnce(...) -> Pin<Box<...>>`という高階
+  トレイト境界(HRTB)は、インライン`|h| Box::pin(async move {...})`
+  クロージャに対して型推論が失敗しやすい既知の落とし穴であり
+  (`implementation is not general enough`等)、round 2レビューの
+  時点ではこの形を実際にコンパイルして確認していなかった**。動く
+  可能性はあるが、ADRの時点で「確定」と書けるものではない。
+- **候補2(マクロ形、確実にコンパイルできる)**:
+
+  ```rust
+  macro_rules! with_pooled_handle {
+      ($pooled:expr, $timeout:expr, |$h:ident| $body:block) => {
+          tokio::time::timeout($timeout, async {
+              let mut $h = $pooled.handle.lock().await;
+              $body
+          }).await
+      };
+  }
+  ```
+
+  呼び出し側は`with_pooled_handle!(pooled, RUN_EXEC_TIMEOUT, |h| {
+  h.tcpip_forward(a, p).await })`という形になる。関数呼び出しほど
+  発見しやすくはないが、HRTBもboxingも無くMSRV 1.75で確実に
+  コンパイルでき、「単一の集約点」という目的自体は同じく満たす。
+
+どちらも、ロック取得自体を含めて`timeout`で包むため、§2.5.2で述べる
+「ロック取得中にタイムアウトした場合は何もリークしない」という性質を
+保つ。実装時に候補1をまず試し、コンパイルが通らなければ候補2に
+切り替える、という順序を推奨する(§5)。
+
+**このアクセサ経由にする際の注意点1**: A5・A6・A7(1回の転送接続・
+1回のファイルプレビューという、単体の操作の失敗)がタイムアウトしても、
+`TransportEvent::Disconnected`を発行してはならない——これらの失敗は
+セッション全体の生死とは無関係なper-operationの失敗であり、現状も
+単に`warn!`して処理を続けている。セッションの生死に関わるのは`:802`
+(最初の`channel_open_session`)だけであり、この意味論を保ったまま
+アクセサへ寄せる。
+
+**このアクセサ経由にする際の注意点2(round 3レビューで追加)**:
+`run_exec_on_handle`(`ssh_handler.rs:685`の
+`tokio::time::timeout(RUN_EXEC_TIMEOUT, run_exec_on_handle_inner(handle,
+command)).await`)を素朴に「アクセサに置き換える」と、この
+タイムアウトが持つ本来の役割を弱めてしまう。この外側の`timeout`は
+ロック保持区間だけでなく、`run_exec_on_handle_inner`がロックを
+解放した後に行う`exec`リクエスト送信・`eof`・出力収集ループ全体
+(`ssh_handler.rs:694-699`以降、ロック無しで実行される)まで含めて
+`RUN_EXEC_TIMEOUT`で上限を設けている。したがって`run_exec_on_handle`
+については「**ロック保持区間だけを**アクセサ経由にし、外側の
+`RUN_EXEC_TIMEOUT`(exec全体の上限という別の役割を持つ)は撤去しない」
+という扱いにする——`:802`のように「アクセサ1つに丸ごと置き換える」の
+とは異なる。
 
 ### 2.4 (rev1で誤っていた論点、rev2で削除済み)「A1・A2のタイムアウトを
    tombstoneに繋ぐべきか」という非対称性の議論は、そもそも成立しない
@@ -209,6 +262,28 @@ dropされる。その後(タイムアウト後)にサーバーから確認応�
 無条件に成り立つ**(rev2時点ではGap Bの結論に依存する条件付きの
 判断だったが、Gap B却下によりその依存が消えた——詳細は§4.1)。
 
+**同じリークはA5・A6・A7にも同じ仕組みで生じる。ただし受容の根拠は
+`:802`とは異なる(round 3レビューで追加)**: `channel_open_direct_tcpip`
+(`russh-0.48.2/src/client/mod.rs:511-534`)は`channel_open_session`
+(`:468-478`)と同じ`wait_channel_confirmation`で終わるため、A5・A6・
+A7にタイムアウトを追加すれば、タイムアウトしたそれぞれの試行が
+同じ種類のリーク(`self.channels`・`enc.channels`のエントリ・sshdの
+チャネルスロット)を生む。`:802`の場合との違いは、A5・A6は
+**高頻度**であること——`-L`/`-D`フォワードに対して死んだ接続へ
+繰り返し新規TCP/SOCKS接続が来ると、受け付けるたびにタスクがspawnされ
+チャネルスロットを消費する一方、タブ自身のシェルチャネルは
+`channel.wait()`で単に待ち続けるだけで失敗を出さず、tombstone化の
+引き金を引かない(§2.6項目4の通り、A5・A6の失敗は意図的に
+tombstone化に接続しない)。したがって「いずれtombstone化されるので
+限定的」という`:802`の受容根拠(§2.5.2冒頭)はA5・A6には
+**適用できない**。正しい受容根拠は、リークが基盤のrusshセッション
+タスク自体の寿命でしか終わらないこと——keepalive
+(`keepalive_interval=60秒・keepalive_max=3`、
+`isekai_pipe_quic_transport.rs:691-694`・`lib.rs:1641-1645`)がその
+死んだセッションを最長約4分で検出しトランスポートを閉じれば、
+その上の全チャネルがサーバー側でも一括して片付く——という、時間で
+区切られた上限であり、複数の接続をまたいで蓄積するものではない。
+
 **2.5.3 `tcpip_forward`のタイムアウトは、`bind_port`が非ゼロの場合に
 限り緩和可能な、サーバー側の取り残されたフォワード登録を生みうる**
 
@@ -232,9 +307,11 @@ dropされる。その後(タイムアウト後)にサーバーから確認応�
 (ユーザーが動的ポート割当を要求した場合、`ssh_handler.rs:1043-1045`が
 明示的にこのケースを扱っている)では、サーバーが実際に選んだポート
 番号は、我々が受け取れなかった応答の中にしか含まれない
-(`tcpip_forward`は`Ok(bound_port)`として返す、RFC 4254 §7.1・
-OpenSSHの実装ともに`cancel-tcpip-forward`はポート0をワイルドカードとして
-扱わない)。つまり`bind_port == 0`の場合、そもそも何番のポートを
+(`tcpip_forward`は`Ok(bound_port)`として返す)。RFC 4254 §7.1は
+`cancel-tcpip-forward`側のポート0の意味を定義しておらず、OpenSSHも
+実際に割り当てられたポート番号で登録を照合するため、ポート0を
+ワイルドカードとして扱うとは考えにくい(この点は実機・実サーバーで
+未検証)。いずれにせよ`bind_port == 0`の場合、そもそも何番のポートを
 `cancel_tcpip_forward`すべきか知る手段が無く、**このケースの
 サーバー側取り残しはプロトコルレベルで回避不能**——受容する残存事項
 として記録する(実害は「動的ポートで`-R`を使ったタブの1つが
@@ -262,9 +339,10 @@ A3・A4(両方の`cancel_*`)自体をタイムアウトさせることは、
 
 ### 2.6 このギャップへの推奨対応
 
-1. §2.3の単一アクセサ方式で、A1〜A7全て(および既存の`:802`・
-   `run_exec_on_handle`)を統一的に保護する。A4を含め特別扱いは
-   しない(§2.2)。
+1. §2.3の単一アクセサ方式で、A1〜A7全てと既存の`:802`を統一的に
+   保護する。A4を含め特別扱いはしない(§2.2)。`run_exec_on_handle`は
+   ロック保持区間だけをアクセサへ寄せ、外側の`RUN_EXEC_TIMEOUT`
+   (exec全体の上限)はそのまま残す(§2.3注意点2)。
 2. A2(`tcpip_forward`)のタイムアウト経路では、`bind_port != 0`の
    場合に限りbest-effortで`cancel_tcpip_forward`を追加発火させる
    (§2.5.3、アクセサ経由で有界時間に収める)。`bind_port == 0`の
@@ -272,8 +350,19 @@ A3・A4(両方の`cancel_*`)自体をタイムアウトさせることは、
    除去だけで足りる。
 3. §2.5.2のチャネルリークは受容する(新規修正不要)——§3でGap Bを
    却下したことにより、この判断はもう条件付きではない(§4.1)。
-4. A5・A6の失敗を`mark_dead_if_same`に接続することは**しない**
-   ——理由はGap B(§3)と同じ一般論(§3.2の定理)がここにも当てはまる。
+4. A5・A6の失敗を`mark_dead_if_same`に接続することは**しない**。
+   理由は§3.3の定理(「Xが再試行をまたいで安定しているときだけ
+   ライブロックする」)そのものではない——A5・A6を接続することは
+   「出口を塞ぐ」側ではなく「新しい出口を作る」側なので、この定理を
+   根拠にするのは誤りである(round 2レビューで指摘、詳細は§3.5末尾)。
+   正しい理由は次の3つ: (a) A5・A6はspawnされたper-connectionタスクの
+   中で実行され、プールキーがスコープに無い(`forward.rs:85-95,155-165`
+   は`handle`と`event_tx`しか受け取らない)ため`mark_dead_if_same`に
+   渡すものが無い、(b) これらの失敗は転送された1本のTCP/SOCKS接続
+   単位の失敗であり、セッション全体の生死とは無関係、(c) 基盤の
+   ハンドルが本当に死んでいるなら、タブ自身のシェルチャネル
+   (`:802`→`FirstChannelOpen`)が別途失敗してtombstone化するため、
+   カバレッジは失われない。
 
 ## 3. Gap B: `mark_dead_if_same`の巻き添え範囲 —— **検討の結果、却下**
 
@@ -319,7 +408,7 @@ armされる。**一度も`ConnPhase::Connected`に到達していない新規�
 | 10タブ目(sshdの`MaxSessions 10`に達している状態)の初回試行 | `try_attach_with`→`Ready`→`channel_open_session`→`Err(ChannelOpenFailure)`→`FirstChannelOpen::Failed`→`mark_dead_if_same`→`EntryState::Dead` | 分類まで同じ、その後**tombstone化しない**、エントリは`Ready`のまま |
 | ユーザーがタブを開き直す/再接続をタップ | `try_attach_with`→`Dead`を見て**`Establisher`**→`establish_fresh`→新しい2本目のプールされたハンドル→10タブ目は**接続できる**✅ | `try_attach_with`→エントリは依然`Ready`(`is_closed()==false`、`try_lock()`成功)→**再び`Ready`**→再び拒否される |
 | 何度再試行しても | 成功する | 拒否され続ける |
-| 定常状態 | タブ1〜9はハンドル#1、タブ10〜18はハンドル#2——10タブごとに1回の余分なブートストラップというコストで、正確に必要な本数の接続を維持する | **10タブ目は永久に開けない**(このプールエントリが偶然別の理由でtombstone化されるか、`ISEKAI_PIPE_QUIC_IDLE_GRACE`が成熟するまで——元ADR §2.4が示した通り、アタッチの試行が来続ける限りこの猶予は決して成熟しない) |
+| 定常状態 | タブ1〜9はハンドル#1、タブ10〜18はハンドル#2——10タブごとに1回の余分なブートストラップというコストで、正確に必要な本数の接続を維持する | **10タブ目は永久に開けない**(タブ1〜9がアタッチし続けている限り`refcount`は0に到達せず、`pool.rs:181-184`の`if entry.refcount != 0 { return; }`により削除タイマーはそもそもarmすらされない——元ADR §2.4の「試行が来続けてタイマーを再武装し続ける」ライブロックを持ち出すまでもなく、このケースでは`refcount`が単に0にならないだけでエントリは消えない) |
 
 最後の行は、`AttachOrigin`案を却下した理由(§3.1、元ADR §2.4が
 「`always-connects.md`の最も鋭い形の違反」と呼んだ状況)と全く同じ
@@ -336,15 +425,18 @@ armされる。**一度も`ConnPhase::Connected`に到達していない新規�
 
 > `EntryState::Ready`なエントリが消える経路は、tombstone化(即座に
 > `Establisher`を生む)と、アイドル猶予切れによる削除
-> (`pool::release`のタイマー)の2つしか無い。元ADR §2.4が示した通り、
-> 後者は「アタッチの試行が来続ける限り(`try_attach_with`のたびに
-> `idle_generation`が進むため、`pool.rs:83`)決して成熟しない」。
-> したがって「条件Xのときはtombstone化しない」という形のルールは
-> **どんなXであっても**、条件Xを満たすエントリを「呼び出し元には
+> (`pool::release`のタイマー)の2つしか無い。したがって「条件Xの
+> ときはtombstone化しない」という形のルールは、**Xが再試行をまたいで
+> 安定している(=同じプールエントリへの再試行が再びXを満たして
+> 再び失敗する)限り**、条件Xを満たすエントリを「呼び出し元には
 > 二度と使えないと分かっているのに、プールからは永久に払い出され
-> 続ける」状態にする。Xがattach origin(`AttachOrigin`)であっても
-> エラーの種類(`RefusedByPeer`)であっても結論は変わらない
-> ——問題は「唯一使える出口を塞いだこと」自体にある。
+> 続ける」状態にする。`AttachOrigin`の`Ready`性(`is_closed()`が
+> `false`のまま安定)も、`RefusedByPeer`が着目する`MaxSessions`充満
+> (タブ1〜9が使い続ける限り安定)も、どちらもこの意味で安定であり、
+> それこそが両者が同型に壊れる理由である——Xが真に一過性
+> (次の試行では別の結果になる)であれば、この定理は適用されない。
+> 逆に言えば、将来また第3の案が提案されたときに最初に確認すべきは
+> 「そのXは再試行をまたいで安定しているか」である。
 
 これが、元ADRの「無条件にtombstone化する」というルールが場当たり的な
 簡略化ではなく、**唯一停止するルールだった**ことの理由である。
@@ -357,7 +449,7 @@ tombstone化し、プーリングの目的そのものを無に帰す」と述�
 これは実際の挙動を正しく追っていなかった。`mark_dead_if_same`が
 tombstone化するのは**プールの1スロット**であり、次の
 `Establisher`はそのスロットの値を新しいハンドル(2本目の接続)で
-置き換える(`pool.rs:117-129`の`publish_success`)。既存のタブ
+置き換える(`pool.rs:121-133`の`publish_success`)。既存のタブ
 1〜9は自分自身が保持する`Arc`をそのまま使い続けるため一切
 影響を受けない。つまりプーリングは「壊れる」のではなく
 「2本目の接続の上で再形成される」——タブ10以降が2本目のハンドルに
@@ -388,8 +480,9 @@ tombstone化するのは**プールの1スロット**であり、次の
 {Failed, TimedOut}`で無条件に呼ぶ、現状のPR #119の実装)は変更しない。
 
 **唯一の残存事項として受容するもの**: `MaxSessions`のような上限を
-持つホストでは、上限を超えるたびに1本余分なブートストラップが発生し、
-かつ上限に達した瞬間のタブは自動再試行の対象にならない
+持つホストでは、上限を超えるたびに(§3.4で見た通り、1タブごとではなく
+**約10タブに1回**)1本余分なブートストラップが発生し、かつ上限に
+達した瞬間のタブは自動再試行の対象にならない
 (`orchestrator.rs:786`の条件のため)ので、ユーザーが1回タブを
 開き直す必要がある。これが実際に問題として観測された場合の唯一正しい
 修正は、1つのキーに対して**複数のハンドルを保持できるプール**
@@ -398,9 +491,11 @@ tombstone化の抑制ではない。これは今回のADRの対象より大き�
 実際の報告が無い現時点では着手しない。
 
 §5(旧rev2)にあった「A5・A6の失敗を`mark_dead_if_same`に接続すべきか」
-という未決事項は、この§3.3の定理により**接続しない、で確定**する
-——A5・A6はそもそもプールキーを持たない per-connection の失敗であり、
-セッション単位の生死とは無関係でもある。
+という未決事項は**接続しない、で確定**する——理由は§3.3の定理では
+なく(A5・A6を接続することは「出口を塞ぐ」側ではなく「新しい出口を
+作る」側なので、この定理を根拠にするのは誤り)、§2.6項目4に挙げた
+3つの理由(プールキーがスコープに無い・per-connectionの失敗・
+シェルチャネル経由のカバレッジで十分)による。
 
 ## 4. Gap AとGap Bの相互作用
 
@@ -438,9 +533,12 @@ A5・A6(転送接続ごとにspawnされるタスク)はこの前提を破りう
 (`is_alive`述語)の実効性を損なう独立した経路であり、元ADRのI1〜I4に
 並ぶ第5の不変条件として明文化する価値がある:
 
-> **I5 — `PooledSshHandle::handle`のtokio Mutexを、await境界を
-> 越えて保持するdetached/spawnされたタスクを作ってはならない。
-> 保持する場合は§2.3のアクセサ経由で必ず有界時間に収めること。**
+> **I5 — spawnされたタスクが`PooledSshHandle::handle`のtokio Mutexを
+> 保持してawaitする場合、必ず§2.3のアクセサ経由で有界時間に収めること。**
+> (A5・A6のようにspawnされたタスクがこのMutexを短時間保持すること
+> 自体は正当かつ排除できないため、「作ってはならない」という禁止では
+> なく、「保持する場合は必ず有界にする」という、実際に満たせる形の
+> 要件として書く。)
 
 ### 4.4 `is_alive`のフェイルオープン自体は本ADRの対象外だが、
    Gap Aの根本原因であることは明記しておく
@@ -459,9 +557,11 @@ A5・A6(転送接続ごとにspawnされるタスク)はこの前提を破りう
 
 ## 5. 未決事項
 
-- §2.3のアクセサ(`with_handle`)の具体的な実装は本ADRで方向性を
-  固めたが、実装時に細部(エラー型・A2の`bind_port != 0`緩和策の
-  正確な配線)を詰める。
+- §2.3のアクセサの実装形は、候補1(HRTB+boxed future、書けるなら
+  最も自然)を先に試し、コンパイルが通らなければ候補2(マクロ、
+  確実に動く)へ切り替える、という実装時の判断に委ねる(round 3
+  レビューで、候補1は「確定」と書けるほど検証されていないと指摘された)。
+  エラー型・A2の`bind_port != 0`緩和策の正確な配線も実装時に詰める。
 - 本ADRが対象としない8件(orchestrator.rsの`pending_wake`関連3件・
   `resume_client.rs`のnetwork-wake関連2件・`rebind_driver.rs`/
   `orchestrator.rs`の同期ファイルI/O2件・`is_alive`のフェイルオープン
@@ -471,6 +571,9 @@ A5・A6(転送接続ごとにspawnされるタスク)はこの前提を破りう
 
 ## 6. 次のステップ
 
-rev3をopus-adversarial-consultの同じレビュアーへ再送し、収束を
-確認した上で実装に着手する(Gap Aのみが実装対象、Gap Bは
-「検討したが却下」として記録に残す)。
+rev4はopus-adversarial-consult round 3から「両結論(Gap A修正・
+Gap B却下)は正しく、round 4で実質的な異論は無いと見込む」との
+回答を得た。実装に着手してよい状態と判断する。実装対象はGap Aのみ
+(§2.6、単一アクセサでA1〜A7を統一的に保護し、A2は`bind_port != 0`
+限定でbest-effortな`cancel_tcpip_forward`を追加する)。Gap Bは
+「検討したが却下」として本ADRに記録として残す。
