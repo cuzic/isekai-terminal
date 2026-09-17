@@ -1,11 +1,14 @@
 # ADR: SSH接続プール(`pool.rs`)のstale handle再利用により`TransportPreference::Auto`の自動再接続が構造的に失敗する
 
-- **Status**: Draft(2026-09-16起草、2026-09-17 rev2。issue #120として先行報告済み、
+- **Status**: Draft(2026-09-16起草、2026-09-17 rev3。issue #120として先行報告済み、
   実機Spike 5の副産物として発見。opus-adversarial-consult round 1で根本原因の因果関係
   そのものが誤っていたことが判明し、rev2で全面的に書き直した——rev1は「90秒の猶予 >
   60秒の再接続タイムアウト」という枠組みだったが、実際は`try_attach`が毎回
   `idle_generation`を進めて削除タイマーを無効化するため、**猶予 > `retry_interval`(3秒)
-  である限り、値に関わらず削除タイマーが永久に成熟しないライブロック**が真因だった)
+  である限り、値に関わらず削除タイマーが永久に成熟しないライブロック**が真因だった。
+  round 2レビューでrev2の§3.5「tombstone化」設計が前提としていた「アタッチとreleaseは
+  必ず1対1で対応する」という不変条件が現状のコードでは4つの失敗分岐で崩れていることが
+  判明し、rev3でI1〜I3の明示的な不変条件セットへ書き直した)
 - **対象**: `rust-core/src/pool.rs`(`try_attach`・`release`・`publish_failure`・
   `EntryState`)、`rust-core/src/transport/ssh_handler.rs`(`run_ssh_channel_loop`)、
   `rust-core/src/isekai_pipe_quic_transport.rs`(`ISEKAI_PIPE_QUIC_IDLE_GRACE`・
@@ -16,6 +19,8 @@
   100%決定的な再現ログを含む)。`ANDROID_RECONNECT_SPIKE_PLAN.md`スパイク5の
   実施結果として発見。rev2はopus-adversarial-consult round 1
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle.md`)
+  の指摘を反映、rev3はround 2
+  (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle-round2.md`)
   の指摘を反映
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`、`.claude/rules/rust-ssot.md`
 
@@ -91,7 +96,7 @@ Some(entry) => {
 ### 2.3 `run_ssh_channel_loop`は成功/失敗を区別せず`()`を返す
 
 `run_ssh_channel_loop`(`transport/ssh_handler.rs:786`)の戻り値は`()`。
-たとえば`channel_open_session()`が失敗した場合(796-802行目)は
+たとえば`channel_open_session()`が失敗した場合(796-803行目)は
 `TransportEvent::Disconnected`イベントを送って`return`するが、これは
 「正常にチャネルを開いてI/Oループを終えた」場合と全く同じ戻り値になる。
 呼び出し元(`isekai_pipe_quic_transport.rs`の137/167行目)には、
@@ -133,7 +138,13 @@ Some(entry) => {
   `Duration::from_millis(30)`等はテスト専用の短縮値で無関係、本番経路ではない)。
   `30秒 > retry_interval(3秒)`なので、QUIC側と全く同じ理屈でライブロックする。
   プレーンSSHが既定transportでないため今まで報告されていなかっただけで、
-  これを防ぐ仕組みは何も無い。
+  これを防ぐ仕組みは何も無い。**本番の`pool::release`呼び出し箇所はこの
+  2つ(`lib.rs:1706`と`isekai_pipe_quic_transport.rs:139,172`)を含めて
+  全部で3箇所のみであることをコード全体のgrepで確認済み**(`run_ssh_channel_loop`
+  自体の呼び出し元は他に4箇所あるが、`quic_transport.rs:288`・
+  `isekai_stun_p2p_transport.rs:319`・`isekai_link_relay_transport.rs:234`・
+  `multipath_transport.rs:1084`はいずれもプールを介さず毎回新規ハンドルを
+  作る経路なので本バグの対象外)。
 - **`connect_auto`のプレーンSSHフォールバックはpool hit時にバイパスされる**:
   `connect_auto`(`isekai_pipe_quic_transport.rs:159-197`)がプレーンSSHへ
   フォールバックするのは`AcquireOutcome::DialFailed`のときだけで、これは
@@ -149,7 +160,12 @@ Some(entry) => {
   (=死んでから合計150秒以上)、その間にエントリが削除されており
   新規`Establisher`として成功する——実機で観測された「手動再接続は
   成功した」は、たまたま十分待ってから試したことの結果であり、
-  「90秒の壁」という単純な説明ではない。
+  「90秒の壁」という単純な説明ではない。**逆に言えば、90秒より短い間隔で
+  「再接続」を繰り返しタップし続けるユーザーは、そのタップ自体が
+  毎回削除タイマーを再無効化するため永久に回復できない**——
+  `always-connects.md`が禁じる「ユーザーの手動操作でしか回復しない」を
+  さらに悪化させ、「ユーザーが辛抱強く手動操作を繰り返すほど回復しなくなる」
+  という最も鋭い形の違反になっている。
 
 ## 3. 対応方針の検討
 
@@ -168,7 +184,7 @@ Some(entry) => {
 | A2 | 819 | `request_pty`/`request_shell`失敗 | **曖昧**。死んだセッションの場合もあれば、サーバーが単にPTY要求を拒否した健全なセッションの場合もある。しかも1つの`if`が2種類のリクエストの失敗を`.is_err()`だけでまとめており、どちらが・なぜ失敗したかすら区別できない。 |
 | A3 | 955 | `ChannelMsg::ExitStatus` → `break` | **正常終了、曖昧さ無し**(ユーザーが`exit`と入力した等)。 |
 | A4 | 960 | `channel.wait() == None`("channel closed by peer") → `break` | **本質的に曖昧、かつ今回報告したバグが実際に通る経路**。russhはセッション全体が死んだ場合もこのチャネルだけがサーバー側で閉じられた場合も同じ`None`を返す。 |
-| A5 | 1066 | `TransportCommand::Disconnect`または`cmd_rx`クローズ(`None`) → `break` | **性質の異なる2つが1つの腕に混在**。`Disconnect`は正常系だが、`cmd_rx`が閉じる(=`SessionCore`が消えた)ケースも同じ腕に落ちており区別できない。 |
+| A5 | 1066 | `TransportCommand::Disconnect`または`cmd_rx`クローズ(`None`) → `break` | **性質の異なる2つが1つの腕に混在**。`Disconnect`は正常系だが、`cmd_rx`が閉じる(=`SessionCore`が消えた)ケースも同じ腕に落ちており区別できない。加えて、もし§3.4項目3のように既存の`DisconnectKind::classify`(`orchestrator.rs:751-759`)を再利用して案Aを実装する場合、A5はどちらの場合も`Disconnected { reason: None }`を発生させ、`classify`の`_`腕で`TransportError`(再接続可能)に分類される——つまりユーザーが意図して切断した場合まで「失敗」としてevictされてしまう。実害は非対称性の議論(下記)により小さいが、「既存分類器の再利用はそのまま流用できる」という主張ほどクリーンではない点は記録しておく。 |
 
 **A4(今回のバグが実際に通る経路)が最も曖昧な分類になる**、というのが
 このアプローチの核心的な難点であり、rev1の§3.1「短所」はこれを
@@ -286,28 +302,60 @@ pub(crate) fn try_attach_with<K, T>(
   失敗と正常終了を区別しない)を一切直さないまま単に競争条件の窓を
   動かすだけ、という却下理由はそのまま維持しつつ、その根拠は強化される。
 
-### 3.4 推奨する対応順序(rev2で全面的に変更)
+### 3.4 推奨する対応順序(rev2で全面的に変更、rev3でround 2の指摘を反映)
 
 opus-adversarial-consult round 1の指摘により、rev1の「案Aを優先、案Bは
-追加防御線」という推奨は逆だったことが判明した。以下の順序を推奨する:
+追加防御線」という推奨は逆だったことが判明した。round 2の指摘により、
+下記項目1と項目2は独立した優先順位ではなく**項目2が項目1の前提条件**
+であることが判明した(項目2無しで項目1だけ実装すると、ハングした
+保持者がロックを握り続けるケースで元の100%失敗が再現してしまう——
+詳細は項目2の説明を参照)。以下の順序を推奨する:
 
-1. **案B + タイムスタンプ削除ではなく「その場でtombstone化」(採用)**:
+1. **案B: `try_attach`に`is_closed()`ベースの生存確認を追加し、
+   死んだエントリは削除ではなくその場でtombstone化する(採用、
+   ただし項目2とセットで初めて安全)**:
    `try_attach`が`is_closed()==true`のキャッシュ済みハンドルを拒否し、
-   そのエントリをその場で無効化(tombstone化)してから新規`Establisher`に
-   フォールバックする。無料・同期・分類リスク無し・両プール(QUIC/プレーンSSH)を
-   1箇所の変更で同時に直す。ただし素朴に`map.remove`でevictすると
-   下記§3.5のレース(R1・R2)を生むため、「削除」ではなく
-   「`EntryState::Ready`を`EntryState::Dead`へ置き換え、`refcount`は
-   触らない」という実装にする(詳細は§3.5)。
-2. **初回使用時タイムアウト(新規、案Aより価値が高い)**: プールhit直後の
-   最初の`channel_open_session()`にタイムアウトを設け、タイムアウトも
-   失敗としてtombstone化する。これにより§3.2で述べた「keepaliveによる
-   最大4分のサイレント死亡検出ラグ」の盲点を塞ぐ。案Aはこの盲点を
-   解決しないため、これは案Aの代替ではなく別の懸念に対する改善。
+   そのエントリをその場で無効化(tombstone化、詳細は§3.5)してから
+   新規`Establisher`にフォールバックする。無料・同期・分類ロジック不要。
+   ただし変更箇所は「`pool.rs`1箇所」だけでは済まない——本番の
+   アタッチ呼び出し箇所は`isekai_pipe_quic_transport.rs:722`
+   (`acquire_pooled_handle`)と`lib.rs:1666`(`run_russh_transport`)の
+   実質2箇所(§2.4のN1で数えた`release`呼び出し3箇所とは別に、
+   アタッチ側は2関数)だが、§3.5のI1(アタッチとreleaseの1対1対応)を
+   満たすには**さらに4つの失敗分岐**(`Waiter→Err`が2箇所、
+   `Establisher→Err`が2箇所)に`release`呼び出しを追加する必要がある
+   ——正確には「`pool.rs`1箇所 + 呼び出し側2関数 + I1のための失敗分岐4箇所」
+   という規模になる。プレーンSSHプールを守るために「デフォルト付きの
+   従来`try_attach`ラッパー」を`try_attach_with`と並存させてはならない
+   ——次に新しいプールが追加されたときにデフォルトのまま同じバグを
+   静かに引き継いでしまう。
+2. **初回使用時タイムアウト(新規。項目1の前提条件であり、案Aより価値が高い)**:
+   round 2レビューで判明した通り、`run_ssh_channel_loop`は
+   `pooled.handle.lock().await.channel_open_session().await`
+   (`ssh_handler.rs:796`、および同型のパターンが`:834`
+   `streamlocal_forward`・`:1010` `tcpip_forward`・`:1079`
+   `cancel_streamlocal_forward`にもある)という形で、**awaitの間
+   tokio Mutexを握ったまま**になる。§3.2の`is_closed()`実装は
+   ロック取得に失敗した場合「使用中=生きている」側へフォールバックする
+   設計なので、まさに§3.2が盲点として挙げた「サイレントに死んで
+   `channel_open_session()`がハングする」ケースでは、ハングした
+   保持者自身がロックを握り続け、後続の全リトライの`try_lock`が
+   失敗し続けて「生きている」と誤判定され、**元の100%決定的な失敗が
+   そのまま再現する**。したがって初回使用時タイムアウトは項目1の
+   「追加のロバスト性」ではなく、項目1の`try_lock`フォールバックを
+   安全にするための前提条件として扱う。タイムアウトは**リトライ経路
+   だけでなく`run_ssh_channel_loop`の`:796`自体**(=あらゆる保持者)に
+   適用しないと、ロック競合の窓そのものが塞がらない点に注意。
+   秒数値は新規に決めるまでもなく、`ssh_handler.rs:679-689`に既に
+   `RUN_EXEC_TIMEOUT=10秒`として定義され、`:695-700`でまさに同じ
+   `handle.lock().await.channel_open_session().await`を
+   `tokio::time::timeout`で包む前例がある——これを再利用するか、
+   隣に姉妹定数を立てるのが最も筋が良い(§4参照)。
 3. **案A(任意、優先度最低)**: やるとしても新しい`enum ChannelOutcome`は
    作らず、既存の`DisconnectKind::classify`(`orchestrator.rs:751-759`)を
    再利用する。A3(`ExitStatus`)だけをgracefulとして明示的に扱い、それ以外は
-   すべてfailed扱いにする。得られる利益は「3秒早く気付ける」程度に限られる。
+   すべてfailed扱いにする(A5の再利用に伴う細かい非対称性は§3.1のA5行
+   参照)。得られる利益は「3秒早く気付ける」程度に限られる。
 
 ### 3.5 案A・案Bどちらにも共通する未対処のレース(opus round 1で発見)
 
@@ -339,22 +387,109 @@ evictionを無条件の`map.remove`として書くと、あるタブの失敗が
 にのみ、できれば`Arc::ptr_eq`で対象の値そのものが死んでいる場合にのみ
 適用すべき**——別の成功したセッションを巻き込んで消してはならない。
 
-**R3 — この2つを同時に回避する設計: "削除"ではなく"その場でtombstone化"**:
-`map.remove`する代わりに、`EntryState::Dead`という新しい状態を追加し
-(または`Connecting`へスワップし直す)、**`refcount`には一切触れない**:
+**R3 — この2つを同時に回避する設計: "削除"ではなく"その場でtombstone化"**
+(rev2で提案、round 2レビューで前提条件の欠落が判明し、rev3でI1〜I3の
+明示的な不変条件セットとして書き直した)。
 
-- refcountの加算/減算は同じスロット上で継続するため、R1は`entry_id`の
-  ような仕組みを新設せずとも自然に消える。
-- `try_attach`が`Dead`を見たら`refcount += 1; state = Connecting(tx);
-  → Establisher`とする。
-- R2は「`Ready`状態のみtombstone化対象」という構造そのものによって
-  防がれる。
-- 1点注意: `publish_failure`(`pool.rs:124-135`)は現在`map.remove(key)`を
-  行っているため、tombstone化後の再確立フローに同じABA問題(R1)を
-  再導入しうる。`publish_failure`も同様に「削除ではなくtombstone化
-  (またはrefcountが実際に0の場合のみ削除)」に変更する必要がある。
+rev2は「refcountの加算/減算は同じスロット上で継続するため、R1は
+`entry_id`のような仕組みを新設せずとも自然に消える」と書いたが、
+これは**「あらゆる`AttachOutcome`が最終的に1回の`release`と対応する」**
+という前提の上でのみ成り立つ。この前提は今日のコードでは以下の
+4つの分岐で成り立っていない(本番のアタッチ経路2関数を全数監査した結果):
 
-この設計は案A・案Bどちらの実装よりも小さく、並行性の議論が最も
+| 分岐 | 発生箇所 | refcount | 対応する`release`は? |
+|---|---|---|---|
+| `Waiter(rx)`→`Err(m)`→`OtherFailed` | `isekai_pipe_quic_transport.rs`の`acquire_pooled_handle`(:722-748) | +1 | ❌ 無い(`connect`/`connect_auto`の`OtherFailed`/`DialFailed`腕は`release`を呼ばない) |
+| `Establisher`→`Err`→`publish_failure` | 同上 | +1 | ❌ 無い |
+| `Waiter(rx)`→`Err`(`:1673-1678`) | `lib.rs`の`run_russh_transport`(:1666-1706) | +1 | ❌ 無い |
+| `Establisher`→`Err`(`:1687-1694`) | 同上 | +1 | ❌ 無い |
+
+今日これが害を及ぼさないのは、**`publish_failure`(`pool.rs:124-135`)が
+`map.remove(key)`でエントリ全体を消し、上記の帳尻が合っていない`+1`ごと
+道連れにして捨てているから**であり、「アカウンティングが正しいから」
+ではなく「ぶっ壊して捨てているから」正しく見えているに過ぎない。
+
+したがって、rev2が書いていた「`publish_failure`も削除ではなく
+tombstone化(またはrefcountが実際に0の場合のみ削除)に変える」を
+そのまま実装すると、この4つの`+1`が**恒久的に相殺されずに残る**:
+`refcount`が二度と0に戻らなくなり、`release`が削除タイマーを一度も
+armできなくなる。つまりR1(こっそりプーリングが壊れる)を、
+「エントリが永久に不滅になる」というR1よりさらに気付きにくい退行に
+置き換えてしまう——このADR自身が§3.1で挙げた「クラッシュより発見しにくい
+最悪の種類」の失敗モードそのものである。
+
+**正しい設計は次の3つの不変条件として書く:**
+
+- **I1 — あらゆる`AttachOutcome`は例外なく1回の`release`と対応する。**
+  上記4つの失敗分岐それぞれに`release`呼び出しを追加する(呼び出し元は
+  そのアーム内でまだ`key`を保持しているため、`acquire_pooled_handle`
+  自身の中、および`run_russh_transport`の2つの`return`の直前に足すのが
+  最も安上がり)。これはtombstone設計全体を支える前提でありながら、
+  rev2には一言も書かれていなかった。あわせて`AttachOutcome`のdocコメント
+  (`pool.rs:56-59`、確立担当者は`publish_success`/`publish_failure`を
+  呼ぶことしか要求していない)と`publish_failure`のdocコメント
+  (`pool.rs:121-123`、「この後`Disconnected`等の通常のエラー経路で
+  処理を続ける」=releaseは不要であるかのように読める)の両方を、
+  「release呼び出しも必須」と明記するよう更新しないと、次にこのコードを
+  触る人がこのリークを再導入しうる。
+- **I2 — tombstone化は`state`だけを書き換える。`refcount`にも
+  `idle_generation`にも一切触れない。** 特に`idle_generation`に
+  触れないことが重要で、理由はDead entryの回収を扱う下記で説明する。
+- **I3 — `publish_failure`はエラーをブロードキャストしてtombstone化する
+  だけにする。削除は例外なく通常の削除タイマーの仕事とする。** I1が
+  成り立っていれば、これはもうrefcountの特別扱いを一切必要としない
+  (rev2の「またはrefcountが実際に0の場合のみ削除」という代替案は、
+  I1無しでは「実質削除しない」に退化し、I1が成り立てば単に不要になる
+  ——通常の削除タイマーが既にその仕事をする)。
+
+I1〜I3が揃えば、R1・R2はどちらも構造的に発生しえなくなり、`entry_id`の
+ような新しい識別子を導入する必要も無い——これはR3が本来目指していた
+性質そのものである。
+
+**「tombstone化されたDead entryはいつ回収されるのか」への明示的な答え**
+(この問いはR3の欠落と表裏一体だった): I1・I2が成り立つ前提で、
+Dead entryは**新しい仕組み無しに、通常の削除タイマーがそのまま回収する**。
+tombstone化は`idle_generation`を進めない(I2)ため、既にarmされていた
+タイマーはそのまま生き続け、発火時に`refcount == 0 &&
+idle_generation == my_generation`が成立して`map.remove`が実行される
+(`pool.rs:60-64`)。tombstone化の時点で`refcount > 0`だった場合
+(`publish_failure`のケースや、項目2の初回使用時タイムアウトでタブが
+まだトークンを保持しているケース)は、その最後の保持者の`release`が
+その時点でタイマーをarmし、そこから`idle_grace`後に削除される。
+`refcount`が0に至る経路は必ず`release`を通り、`release`は必ず
+タイマーをarmする(`pool.rs:154-165`)ので、**I1が成り立つ限り
+「refcount=0なのにタイマーが立っていないDead entry」という状態は
+存在しない**(I1が無ければ、それがまさに直前で示した不滅化の再来になる)。
+逆にtombstone化が`idle_generation`まで進めてしまっていたら、armされて
+いたタイマーを無効化し、誰かが偶然再アタッチするまでDead entryが
+宙に浮いたまま残ってしまう——I2はこの意味で「実装の細部」ではなく
+「回収の仕組みそのもの」である。`EntryState::Dead`にはペイロードを
+一切持たせないこと(`Arc<PooledSshHandle>`とその下のソケット/russh
+タスクハンドルをtombstone化の瞬間に確実にdropするため)。最悪ケースで
+残るのは`HashMap`のエントリ(ホスト×ユーザー×鍵×ポートの組み合わせ数で
+上限がある、`SshPoolKey`を保持するだけ)であり、生きた接続ではない
+——この規模感は書き留めておく価値がある。
+
+**副次的に得られる性質**: 同じ死んだエントリに対する複数タブの並行
+リトライは、追加の仕組み無しに自然に直列化される——3つのタブが同時に
+`try_attach`しても、`parking_lot`のマップロックの下で最初の1つだけが
+`Ready(dead) → Connecting → Establisher`を得て、残り2つは
+`Connecting → Waiter`を見る。したがって再確立は1回しか起きない。
+これは「削除してから再挿入する」という定式化にはない利点で、
+tombstone-in-placeを選ぶ理由の1つとして記録しておく価値がある。
+
+**`Dead`はI3(またはそれに類する経路)が無いと到達不能であることも
+明記しておく**: 項目1(案B単体)だけを見ると、`try_attach`が
+`is_closed()`を見て`Ready → Connecting`へ遷移させるのは全て同じ
+クリティカルセクション内なので、`EntryState::Dead`という状態が
+外から観測されることはない。`Dead`が実際に意味を持つのは、
+`try_attach`の外からエントリを無効化する経路——`publish_failure`
+(I3)や項目2の初回使用時タイムアウト、および(もし実装するなら)
+案A——が存在する場合に限られる。この点をADRに明記しておかないと、
+実装者が項目1の段階で使われない`Dead`変種を作ってしまうか、
+逆に省略して項目2で詰まるかのどちらかになりうる。
+
+この設計は案A・案Bどちらの素朴な実装よりも小さく、並行性の議論が最も
 単純になるため、実装時はこれを採用する。
 
 ### 3.6 既存テストとの整合性
@@ -369,11 +504,31 @@ evictionを無条件の`map.remove`として書くと、あるタブの失敗が
   (`pool.rs:426-444`)は、まさに今回のバグの原因である
   「世代インクリメントによる削除タイマー無効化」という挙動自体を
   固定するテストであり、修正後もこれは緑のまま維持する必要がある。
-- その上で、新しい回帰テストとして「**失敗する**再アタッチは削除を
-  無期限に先送りしない」ことを検証するテストを追加する。これが
-  今回のバグが破っている不変条件そのものであり、実機なしで検証できる。
+- その上で、新しい回帰テストを追加する。「失敗する再アタッチは削除を
+  無期限に先送りしない」は**修正前**の不変条件の記述であり、案B適用後は
+  失敗した再アタッチは削除を先送りするのではなく即座にエントリを
+  置き換えるため、この文言のテストは修正後の挙動とは異なるものを
+  検証してしまう。`PoolMap<&'static str, u32>`上で述語を渡すだけで
+  実機なしに書ける、より直接的なテストは以下の4つ:
+  - `try_attach_with`は`is_alive`が偽のとき`Ready`ではなく
+    `Establisher`を返し、死んだ値を決して渡さないこと。
+  - 別の保持者がまだ存在する状態で`Ready → Connecting → Ready`の
+    差し替えが起きても、`refcount`が正しく保たれ、遅れて`release`した
+    側が**新しい**方の値の削除を誤ってスケジュールしないこと(これが
+    R1そのもの、静かに腐るタイプの回帰)。
+  - out-of-band(`try_attach`の外)からのtombstone化の後、最後の
+    `release`が実際にエントリを猶予後に消し去ること(§3.5の
+    「Dead entryは不滅にならない」性質、I1〜I3の検証)。
+  - `publish_failure`後も`refcount`が0まで到達可能であること(I1が
+    破られていた現状ではこのテストは落ちるはずで、破られている
+    ことそのものを固定できる)。
+  既存の`reattaching_during_idle_grace_cancels_the_pending_removal`
+  (`pool.rs:426-444`)は生存確認述語に`|_| true`を渡せばそのまま
+  緑を維持できる(この挙動自体——再アタッチが保留中の削除を無効化する
+  こと——は変更しない、変えるのは「死んだ値を返さない」という
+  `try_attach`側の判断だけ)。
 
-## 4. 未決事項(rev1からの更新)
+## 4. 未決事項(rev1からの更新、rev3でさらに更新)
 
 - ~~`PooledSshHandle`の内部構造がrussh `client::Handle`の生存確認に
   使える既存APIを持つか~~ → **解決済み**: `Handle::is_closed()`が
@@ -383,12 +538,25 @@ evictionを無条件の`map.remove`として書くと、あるタブの失敗が
 - 案A実装時にどの早期return分岐が「failed」でどれが「graceful」かの
   一覧化 → §3.1で完了(A1〜A5)。ただし§3.4により案Aは優先度最低のため、
   この分類の精緻化自体が今すぐ必要というわけではない。
-- 新規: 初回使用時タイムアウト(§3.4項目2)の具体的な秒数値は未決定
-  (`TRANSPORT_STEP_TIMEOUT=15秒`など既存の値との整合性を実装時に検討する)。
+- ~~初回使用時タイムアウト(§3.4項目2)の具体的な秒数値・既存コードとの
+  整合性~~ → **解決済み**: `ssh_handler.rs:679-689`に既に
+  `RUN_EXEC_TIMEOUT=10秒`が定義されており、`:695-700`で**全く同じ**
+  `handle.lock().await.channel_open_session().await`パターンを
+  `tokio::time::timeout`で包む既存の前例がある(QUICダイヤル/RESUME
+  往復のタイムアウトである`isekai-transport`クレートの
+  `TRANSPORT_STEP_TIMEOUT`は用途が異なる別クレートの値であり、
+  こちらを参照先にするのは不適切——rev2はこれを誤って引用していた)。
+  実装時は`RUN_EXEC_TIMEOUT`を再利用するか、その隣に姉妹定数を
+  立てるのが最も筋が良い。
+- ~~案A・案Bどちらの提案にも共通する未対処のレース~~ → **解決済み**:
+  §3.5でI1〜I3の不変条件セットとして解決策を明記した。
 
 ## 5. 次のステップ
 
-rev2をopus-adversarial-consultの同じレビュアーへ再送し、収束を確認した
-上で実装に着手する。実装は§3.4の順序(案B+tombstone化 →
-初回使用時タイムアウト → 案Aは任意)で進める。実装後は実機での再現テスト
-(issue #120のスクリプトを再利用)で修正を検証する。
+rev3をopus-adversarial-consultの同じレビュアーへ再送し、round 2の指摘
+(I1〜I3の不変条件セット・項目2の前提条件への格上げ・F1〜F3/N1〜N5)を
+正しく反映できているか確認する。収束が確認できたら実装に着手する。
+実装は§3.4の順序(案B+tombstone化とI1〜I3 → 初回使用時タイムアウト
+[`RUN_EXEC_TIMEOUT`再利用、両者は不可分の1セットとして同時に実装する] →
+案Aは任意)で進める。実装後は実機での再現テスト(issue #120のスクリプトを
+再利用)で修正を検証する。
