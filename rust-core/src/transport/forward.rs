@@ -16,7 +16,9 @@ use tokio::net::TcpListener;
 
 use crate::ForwardState;
 
-use super::ssh_handler::{RusshEventHandler, TransportEvent};
+use super::ssh_handler::{
+    with_shared_handle_timeout, RusshEventHandler, TransportEvent, RUN_EXEC_TIMEOUT,
+};
 
 /// `addr` がループバック（127.0.0.0/8・::1）または文字列 "localhost"（大小無視）かどうか。
 /// `allow_non_loopback_forward_bind == false` の場合の bind 許可判定に使う。
@@ -71,8 +73,17 @@ pub(super) fn teardown_forward(
         ActiveForward::Remote { bind_addr, bound_port } => {
             remote_forwards.lock().remove(&bound_port);
             tokio::spawn(async move {
-                if let Err(e) = session.lock().await.cancel_tcpip_forward(bind_addr.clone(), bound_port as u32).await {
-                    warn!("remote-forward: cancel_tcpip_forward {}:{} failed: {}", bind_addr, bound_port, e);
+                match with_shared_handle_timeout(&session, RUN_EXEC_TIMEOUT, |handle| {
+                    let bind_addr = bind_addr.clone();
+                    Box::pin(async move { handle.cancel_tcpip_forward(bind_addr, bound_port as u32).await })
+                }).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("remote-forward: cancel_tcpip_forward {}:{} failed: {}", bind_addr, bound_port, e);
+                    }
+                    Err(_) => {
+                        warn!("remote-forward: cancel_tcpip_forward {}:{} timed out after {:?}", bind_addr, bound_port, RUN_EXEC_TIMEOUT);
+                    }
                 }
             });
         }
@@ -121,13 +132,22 @@ pub(super) async fn run_local_forward(
         tokio::spawn(async move {
             let originator_ip = peer_addr.ip().to_string();
             let originator_port = peer_addr.port() as u32;
-            let channel = match handle.lock().await
-                .channel_open_direct_tcpip(remote_host.as_str(), remote_port as u32, originator_ip.as_str(), originator_port)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
+            let channel = match with_shared_handle_timeout(&handle, RUN_EXEC_TIMEOUT, |handle| {
+                let remote_host = remote_host.clone();
+                let originator_ip = originator_ip.clone();
+                Box::pin(async move {
+                    handle
+                        .channel_open_direct_tcpip(remote_host.as_str(), remote_port as u32, originator_ip.as_str(), originator_port)
+                        .await
+                })
+            }).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     warn!("forward[{}]: channel_open_direct_tcpip to {}:{} failed: {}", fwd_id, remote_host, remote_port, e);
+                    return;
+                }
+                Err(_) => {
+                    warn!("forward[{}]: channel_open_direct_tcpip to {}:{} timed out after {:?}", fwd_id, remote_host, remote_port, RUN_EXEC_TIMEOUT);
                     return;
                 }
             };
@@ -196,13 +216,22 @@ pub(super) async fn run_dynamic_forward(
             };
             let originator_ip = peer_addr.ip().to_string();
             let originator_port = peer_addr.port() as u32;
-            let channel = match handle.lock().await
-                .channel_open_direct_tcpip(target_host.as_str(), target_port as u32, originator_ip.as_str(), originator_port)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
+            let channel = match with_shared_handle_timeout(&handle, RUN_EXEC_TIMEOUT, |handle| {
+                let target_host = target_host.clone();
+                let originator_ip = originator_ip.clone();
+                Box::pin(async move {
+                    handle
+                        .channel_open_direct_tcpip(target_host.as_str(), target_port as u32, originator_ip.as_str(), originator_port)
+                        .await
+                })
+            }).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     warn!("forward[{}]: channel_open_direct_tcpip to {}:{} failed: {}", fwd_id, target_host, target_port, e);
+                    return;
+                }
+                Err(_) => {
+                    warn!("forward[{}]: channel_open_direct_tcpip to {}:{} timed out after {:?}", fwd_id, target_host, target_port, RUN_EXEC_TIMEOUT);
                     return;
                 }
             };

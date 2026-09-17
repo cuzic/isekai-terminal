@@ -851,6 +851,16 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_log(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_policy(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_debug_dump_reconnect_log(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_log_path(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_policy(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs(
@@ -1160,6 +1170,16 @@ external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(`permille`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_log(uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_policy(uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_func_debug_dump_reconnect_log(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_log_path(`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_policy(`tickSecs`: Int,`retryIntervalSecs`: Int,`timeoutSecs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(uniffi_out_err: UniffiRustCallStatus, 
@@ -1338,6 +1358,21 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_log() != 61005) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_policy() != 52224) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_dump_reconnect_log() != 37039) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_log_path() != 17276) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_policy() != 20632) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
@@ -10049,6 +10084,52 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(
     
         FfiConverterUInt.lower(`permille`),_status)
+}
+    
+    
+ fun `debugClearReconnectLog`()
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_log(
+    
+        _status)
+}
+    
+    
+ fun `debugClearReconnectPolicy`()
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_policy(
+    
+        _status)
+}
+    
+    
+ fun `debugDumpReconnectLog`(): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_dump_reconnect_log(
+    
+        _status)
+}
+    )
+    }
+    
+ fun `debugSetReconnectLogPath`(`path`: kotlin.String)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_log_path(
+    
+        FfiConverterString.lower(`path`),_status)
+}
+    
+    
+ fun `debugSetReconnectPolicy`(`tickSecs`: kotlin.UInt, `retryIntervalSecs`: kotlin.UInt, `timeoutSecs`: kotlin.UInt)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_policy(
+    
+        FfiConverterUInt.lower(`tickSecs`),FfiConverterUInt.lower(`retryIntervalSecs`),FfiConverterUInt.lower(`timeoutSecs`),_status)
 }
     
     

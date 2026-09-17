@@ -81,7 +81,10 @@ pub(crate) struct IsekaiStunP2pSession {
 
 pub(crate) fn create_isekai_stun_p2p_session(config: IsekaiStunP2pConfig) -> Arc<IsekaiStunP2pSession> {
     init_logger();
-    Arc::new(IsekaiStunP2pSession { config, core: SessionCore::new() })
+    Arc::new(IsekaiStunP2pSession {
+        config,
+        core: SessionCore::new(),
+    })
 }
 
 impl IsekaiStunP2pSession {
@@ -276,7 +279,13 @@ async fn connect_stun_p2p_stream(
         // today (see `isekai_pipe_quic_transport.rs`'s equivalent site).
         local_bind_port_range: None,
     };
-    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_stun_p2p", conn, data_stream, proof, relay_target).await)
+    Ok(isekai_pipe_quic_transport::finish_quic_stream(
+        "isekai_stun_p2p",
+        conn,
+        data_stream,
+        proof,
+        relay_target,
+    ).await)
 }
 
 async fn run_over_stream(

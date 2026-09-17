@@ -160,7 +160,10 @@ fn dispatch<F, W, R, Q>(
     }
     for action in resp.actions {
         match action {
-            RebindAction::PublishState(state) => observer.on_state_changed(state),
+            RebindAction::PublishState(state) => {
+                crate::debug_reconnect::record(format!("rebind state={state:?}"));
+                observer.on_state_changed(state);
+            }
             RebindAction::StartQuietWatch => {
                 quiet_watch.start(quiet_source.clone(), input_tx.clone());
             }

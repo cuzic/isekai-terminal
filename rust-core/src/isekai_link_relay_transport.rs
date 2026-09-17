@@ -69,7 +69,10 @@ pub(crate) struct IsekaiLinkRelaySession {
 
 pub(crate) fn create_isekai_link_relay_session(config: IsekaiLinkRelayConfig) -> Arc<IsekaiLinkRelaySession> {
     init_logger();
-    Arc::new(IsekaiLinkRelaySession { config, core: SessionCore::new() })
+    Arc::new(IsekaiLinkRelaySession {
+        config,
+        core: SessionCore::new(),
+    })
 }
 
 impl IsekaiLinkRelaySession {
@@ -191,7 +194,13 @@ async fn connect_relay_stream(
     // relayは常時経路に残る(常にトンネルを維持している)ため、STUN版のような
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
-    Ok(isekai_pipe_quic_transport::finish_quic_stream("isekai_link_relay", conn, data_stream, proof, target).await)
+    Ok(isekai_pipe_quic_transport::finish_quic_stream(
+        "isekai_link_relay",
+        conn,
+        data_stream,
+        proof,
+        target,
+    ).await)
 }
 
 async fn run_over_stream(

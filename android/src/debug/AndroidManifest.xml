@@ -14,6 +14,10 @@
                 <action android:name="tools.isekai.terminal.debug.CUT" />
                 <action android:name="tools.isekai.terminal.debug.RESTORE" />
                 <action android:name="tools.isekai.terminal.debug.CLEAR" />
+                <action android:name="tools.isekai.terminal.debug.SET_RECONNECT_POLICY" />
+                <action android:name="tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY" />
+                <action android:name="tools.isekai.terminal.debug.DUMP_RECONNECT_LOG" />
+                <action android:name="tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG" />
             </intent-filter>
         </receiver>
         <receiver

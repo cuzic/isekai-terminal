@@ -7,7 +7,7 @@
 //! 開始できるようにする。判断ロジックは全てここ(Rust側)に閉じ、Kotlin側は一切関知しない
 //! (`.claude/rules/rust-ssot.md`)。
 //!
-//! ここに置くのはtransport非依存の汎用プリミティブ(`try_attach`/`wait_for_establish`/
+//! ここに置くのはtransport非依存の汎用プリミティブ(`try_attach_with`/`wait_for_establish`/
 //! `publish_success`/`publish_failure`/`release`)と、プレーンSSH用の`SshPoolKey`・
 //! `SSH_POOL`。isekai-pipe QUIC系のキー・プールstaticは`isekai_pipe_quic_transport.rs`に置く
 //! (この関心は`pool.rs`ではなく個々のtransportモジュールに閉じる方が自然なため)。
@@ -29,13 +29,15 @@ enum EntryState<T> {
     /// 確立中。`watch::Sender`経由で結果を待っているタブへブロードキャストする。
     Connecting(watch::Sender<Option<Result<Arc<T>, String>>>),
     Ready(Arc<T>),
+    /// 外部経路で死んだことが分かったエントリ。値は保持しない。
+    Dead,
 }
 
 pub(crate) struct PoolEntry<T> {
     state: EntryState<T>,
     refcount: u32,
     /// アイドルタイマーの世代。`release`が0への到達時にインクリメントしてタイマーを
-    /// spawnする。新規アタッチ(`try_attach`)や再度の0到達でも進む。タイマー発火時に
+    /// spawnする。新規アタッチ(`try_attach_with`)や再度の0到達でも進む。タイマー発火時に
     /// 世代が一致しなければ「その間に別のイベントが起きた」ことを意味するので何もしない
     /// (`AbortHandle`を持ち回らずに古いタイマーを無効化する)。
     idle_generation: u64,
@@ -47,22 +49,30 @@ pub(crate) fn new_pool_map<K, T>() -> PoolMap<K, T> {
     Mutex::new(HashMap::new())
 }
 
-/// [try_attach]の結果。
+/// [try_attach_with]の結果。
+///
+/// どの結果であっても、呼び出し元はこのアタッチに対応する[release]を必ず1回呼ぶ。
+/// [AttachOutcome::Establisher]の場合は、確立結果を[publish_success]または
+/// [publish_failure]で公開したうえで、失敗分岐でも[release]を呼ぶ必要がある。
 pub(crate) enum AttachOutcome<T> {
     /// 既存の確立済みエントリを再利用できる。
     Ready(Arc<T>),
     /// 別のタブが確立中。その完了を[wait_for_establish]で待つ。
     Waiter(watch::Receiver<Option<Result<Arc<T>, String>>>),
-    /// このタブが確立を担当する。成功したら[publish_success]、失敗したら
-    /// [publish_failure]を必ず呼ぶこと(呼ばないとエントリが`Connecting`のまま残り、
-    /// 待機中の他タブが永久に待ってしまう)。
+    /// このタブが確立を担当する。
     Establisher,
 }
 
 /// [key]に対応するエントリを検索し、無ければ`Connecting`のプレースホルダを作って
 /// 呼び出し元を確立担当にする。既存エントリがあれば参照カウントを増やし、アイドル
 /// タイマーを無効化する(新規アタッチなので古い削除タイマーは意味を失う)。
-pub(crate) fn try_attach<K, T>(pool: &PoolMap<K, T>, key: &K) -> AttachOutcome<T>
+/// `Ready`エントリは[is_alive]で生存確認し、死んでいれば同じスロットを
+/// `Connecting`へ差し替えて呼び出し元を確立担当にする。
+pub(crate) fn try_attach_with<K, T>(
+    pool: &PoolMap<K, T>,
+    key: &K,
+    is_alive: impl Fn(&T) -> bool,
+) -> AttachOutcome<T>
 where
     K: Hash + Eq + Clone,
 {
@@ -80,8 +90,13 @@ where
             entry.refcount += 1;
             entry.idle_generation = entry.idle_generation.wrapping_add(1);
             match &entry.state {
-                EntryState::Ready(v) => AttachOutcome::Ready(v.clone()),
                 EntryState::Connecting(tx) => AttachOutcome::Waiter(tx.subscribe()),
+                EntryState::Ready(v) if is_alive(v) => AttachOutcome::Ready(v.clone()),
+                EntryState::Ready(_) | EntryState::Dead => {
+                    let (tx, _rx) = watch::channel(None);
+                    entry.state = EntryState::Connecting(tx);
+                    AttachOutcome::Establisher
+                }
             }
         }
     }
@@ -118,9 +133,9 @@ where
     arc
 }
 
-/// 確立担当タブが接続確立に失敗した時に呼ぶ。エントリを削除し、待機中の全タブへ
-/// 同じエラーをブロードキャストする(呼び出し元自身はこの後`Disconnected`等の
-/// 通常のエラー経路で処理を続ける)。
+/// 確立担当タブが接続確立に失敗した時に呼ぶ。エントリをtombstone化し、待機中の全タブへ
+/// 同じエラーをブロードキャストする。呼び出し元自身も含め、この失敗したアタッチに
+/// 対応する[release]は別途必ず1回呼ぶ。
 pub(crate) fn publish_failure<K, T>(pool: &PoolMap<K, T>, key: &K, message: String)
 where
     K: Hash + Eq + Clone,
@@ -131,7 +146,24 @@ where
             let _ = tx.send(Some(Err(message)));
         }
     }
-    map.remove(key);
+    if let Some(entry) = map.get_mut(key) {
+        entry.state = EntryState::Dead;
+    }
+}
+
+/// 外部経路で既存エントリが死んだと分かった時に呼ぶ。refcount/idle_generationは触らず、
+/// 通常の[release]が最後の保持者から呼ばれることで削除タイマーをarmする。
+/// 既に別の確立が始まっていたり、新しい値へ置き換わっていたりする場合は触らない。
+pub(crate) fn mark_dead_if_same<K, T>(pool: &PoolMap<K, T>, key: &K, value: &Arc<T>)
+where
+    K: Hash + Eq + Clone,
+{
+    let mut map = pool.lock();
+    if let Some(entry) = map.get_mut(key) {
+        if matches!(&entry.state, EntryState::Ready(current) if Arc::ptr_eq(current, value)) {
+            entry.state = EntryState::Dead;
+        }
+    }
 }
 
 /// あるタブがチャネル(接続)の利用を終えた時に呼ぶ。参照カウントを減らし、0に
@@ -233,6 +265,20 @@ pub(crate) const PLAIN_SSH_IDLE_GRACE: Duration = Duration::from_secs(30);
 mod tests {
     use super::*;
 
+    fn alive(_: &u32) -> bool {
+        true
+    }
+
+    async fn wait_until_removed(key: &'static str) -> bool {
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !RELEASE_TEST_POOL.lock().contains_key(&key) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn password_auth() -> SshAuth {
         SshAuth::Password { password: "hunter2".into() }
     }
@@ -286,11 +332,11 @@ mod tests {
     #[tokio::test]
     async fn try_attach_first_caller_becomes_establisher_second_becomes_waiter() {
         let pool: PoolMap<&'static str, u32> = new_pool_map();
-        match try_attach(&pool, &"k") {
+        match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Establisher => {}
             _ => panic!("first attach should be Establisher"),
         }
-        match try_attach(&pool, &"k") {
+        match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(_) => {}
             _ => panic!("second attach while connecting should be Waiter"),
         }
@@ -300,7 +346,7 @@ mod tests {
         }
         let value = publish_success(&pool, &"k", 42u32);
         assert_eq!(*value, 42);
-        match try_attach(&pool, &"k") {
+        match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Ready(v) => assert_eq!(*v, 42),
             _ => panic!("attach after publish_success should be Ready"),
         }
@@ -309,8 +355,8 @@ mod tests {
     #[tokio::test]
     async fn waiter_receives_establisher_result() {
         let pool: PoolMap<&'static str, u32> = new_pool_map();
-        try_attach(&pool, &"k");
-        let rx = match try_attach(&pool, &"k") {
+        try_attach_with(&pool, &"k", alive);
+        let rx = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
@@ -320,28 +366,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiter_receives_establisher_failure_and_entry_is_removed() {
+    async fn waiter_receives_establisher_failure_and_entry_is_tombstoned() {
         let pool: PoolMap<&'static str, u32> = new_pool_map();
-        try_attach(&pool, &"k");
-        let rx = match try_attach(&pool, &"k") {
+        try_attach_with(&pool, &"k", alive);
+        let rx = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
         publish_failure(&pool, &"k", "boom".to_string());
         let err = wait_for_establish(rx).await.expect_err("waiter should see failure");
         assert_eq!(err, "boom");
-        assert!(pool.lock().get(&"k").is_none(), "failed entry should be removed");
+        let map = pool.lock();
+        let entry = map.get(&"k").expect("failed entry should remain as tombstone");
+        assert!(matches!(entry.state, EntryState::Dead));
+        assert_eq!(entry.refcount, 2);
     }
 
     #[tokio::test]
     async fn three_way_concurrent_waiters_all_observe_the_same_establisher_result() {
         let pool: PoolMap<&'static str, u32> = new_pool_map();
-        try_attach(&pool, &"k"); // establisher
-        let rx1 = match try_attach(&pool, &"k") {
+        try_attach_with(&pool, &"k", alive); // establisher
+        let rx1 = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
-        let rx2 = match try_attach(&pool, &"k") {
+        let rx2 = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
@@ -359,12 +408,12 @@ mod tests {
     #[tokio::test]
     async fn multiple_waiters_all_observe_the_same_establisher_failure() {
         let pool: PoolMap<&'static str, u32> = new_pool_map();
-        try_attach(&pool, &"k"); // establisher
-        let rx1 = match try_attach(&pool, &"k") {
+        try_attach_with(&pool, &"k", alive); // establisher
+        let rx1 = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
-        let rx2 = match try_attach(&pool, &"k") {
+        let rx2 = match try_attach_with(&pool, &"k", alive) {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
@@ -377,13 +426,31 @@ mod tests {
         assert_eq!(e2, "dial failed");
     }
 
+    #[tokio::test]
+    async fn try_attach_with_dead_ready_value_becomes_establisher_without_returning_it() {
+        let pool: PoolMap<&'static str, u32> = new_pool_map();
+        try_attach_with(&pool, &"k", alive);
+        publish_success(&pool, &"k", 1u32);
+
+        match try_attach_with(&pool, &"k", |_| false) {
+            AttachOutcome::Establisher => {}
+            AttachOutcome::Ready(_) => panic!("dead Ready value must not be returned"),
+            AttachOutcome::Waiter(_) => panic!("dead Ready value should make caller Establisher"),
+        }
+
+        let map = pool.lock();
+        let entry = map.get(&"k").expect("entry should remain in-place");
+        assert!(matches!(entry.state, EntryState::Connecting(_)));
+        assert_eq!(entry.refcount, 2);
+    }
+
     // ── release: アイドルタイマーのライフサイクル ────────────
 
     static RELEASE_TEST_POOL: LazyLock<PoolMap<&'static str, u32>> = LazyLock::new(new_pool_map);
 
     #[tokio::test]
     async fn release_to_zero_removes_entry_after_idle_grace_elapses() {
-        try_attach(&RELEASE_TEST_POOL, &"release-removes-after-grace");
+        try_attach_with(&RELEASE_TEST_POOL, &"release-removes-after-grace", alive);
         publish_success(&RELEASE_TEST_POOL, &"release-removes-after-grace", 1u32);
 
         release(&RELEASE_TEST_POOL, "release-removes-after-grace", Duration::from_millis(30));
@@ -395,21 +462,16 @@ mod tests {
         );
 
         // 猶予経過後は削除される(バックグラウンドタスクなので少し待ってポーリングする)。
-        let mut removed = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            if !RELEASE_TEST_POOL.lock().contains_key(&"release-removes-after-grace") {
-                removed = true;
-                break;
-            }
-        }
-        assert!(removed, "entry should be removed once the idle grace window elapses");
+        assert!(
+            wait_until_removed("release-removes-after-grace").await,
+            "entry should be removed once the idle grace window elapses"
+        );
     }
 
     #[tokio::test]
     async fn release_with_remaining_refcount_does_not_start_a_removal_timer() {
-        try_attach(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive");
-        try_attach(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive"); // refcount = 2
+        try_attach_with(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", alive);
+        try_attach_with(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", alive); // refcount = 2
         publish_success(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", 2u32);
 
         release(&RELEASE_TEST_POOL, "release-keeps-while-refcount-positive", Duration::from_millis(20));
@@ -424,13 +486,13 @@ mod tests {
 
     #[tokio::test]
     async fn reattaching_during_idle_grace_cancels_the_pending_removal() {
-        try_attach(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer");
+        try_attach_with(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", alive);
         publish_success(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", 3u32);
 
         release(&RELEASE_TEST_POOL, "release-reattach-cancels-timer", Duration::from_millis(30));
         // タイマー発火前に新規タブがアタッチ(=世代が進む)。
         tokio::time::sleep(Duration::from_millis(5)).await;
-        match try_attach(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer") {
+        match try_attach_with(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", alive) {
             AttachOutcome::Ready(_) => {}
             _ => panic!("reattach before removal should observe Ready"),
         }
@@ -440,6 +502,101 @@ mod tests {
         assert!(
             RELEASE_TEST_POOL.lock().contains_key(&"release-reattach-cancels-timer"),
             "a reattach before the grace window elapses must cancel the stale removal timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_failure_tombstone_is_removed_after_final_release() {
+        let key = "publish-failure-tombstone-removed";
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        let rx = match try_attach_with(&RELEASE_TEST_POOL, &key, alive) {
+            AttachOutcome::Waiter(rx) => rx,
+            _ => panic!("expected Waiter"),
+        };
+
+        publish_failure(&RELEASE_TEST_POOL, &key, "boom".to_string());
+        assert_eq!(wait_for_establish(rx).await.expect_err("waiter should see failure"), "boom");
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+
+        assert!(
+            wait_until_removed(key).await,
+            "publish_failure tombstone should be removed by the normal idle timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_dead_ready_preserves_refcount_for_late_release() {
+        let key = "dead-ready-replace-preserves-refcount";
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        publish_success(&RELEASE_TEST_POOL, &key, 1u32);
+
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        match try_attach_with(&RELEASE_TEST_POOL, &key, |_| false) {
+            AttachOutcome::Establisher => {}
+            _ => panic!("dead Ready should be replaced in-place by a new establisher"),
+        }
+        publish_success(&RELEASE_TEST_POOL, &key, 2u32);
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let map = RELEASE_TEST_POOL.lock();
+        let entry = map.get(&key).expect("new Ready entry must not be removed by late release");
+        assert_eq!(entry.refcount, 1);
+        match &entry.state {
+            EntryState::Ready(v) => assert_eq!(**v, 2),
+            _ => panic!("replacement entry should be Ready"),
+        }
+        drop(map);
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        assert!(
+            wait_until_removed(key).await,
+            "replacement entry should be removable after the final holder releases it"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_band_tombstone_is_removed_after_final_release() {
+        let key = "out-of-band-tombstone-removed";
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        let value = publish_success(&RELEASE_TEST_POOL, &key, 1u32);
+        mark_dead_if_same(&RELEASE_TEST_POOL, &key, &value);
+
+        {
+            let map = RELEASE_TEST_POOL.lock();
+            let entry = map.get(&key).expect("entry should remain as tombstone");
+            assert!(matches!(entry.state, EntryState::Dead));
+            assert_eq!(entry.refcount, 1);
+        }
+
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        assert!(
+            wait_until_removed(key).await,
+            "Dead entry should be removed by the normal idle timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_failure_refcount_can_reach_zero() {
+        let key = "publish-failure-refcount-zero";
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        try_attach_with(&RELEASE_TEST_POOL, &key, alive);
+        publish_failure(&RELEASE_TEST_POOL, &key, "boom".to_string());
+
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+
+        {
+            let map = RELEASE_TEST_POOL.lock();
+            let entry = map.get(&key).expect("entry should remain until idle grace elapses");
+            assert!(matches!(entry.state, EntryState::Dead));
+            assert_eq!(entry.refcount, 0);
+        }
+
+        assert!(
+            wait_until_removed(key).await,
+            "zero-refcount publish_failure tombstone should be removed"
         );
     }
 }

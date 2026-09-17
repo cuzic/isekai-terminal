@@ -31,7 +31,9 @@ import tools.isekai.terminal.ui.BackgroundReliabilityDialog
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.BatteryOptimization
+import tools.isekai.terminal.util.DebugReconnectLog
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.isekai_terminal_core.debugSetReconnectLogPath
 import uniffi.isekai_terminal_core.setCtlSocketForwardEnabled
 import uniffi.isekai_terminal_core.setTerminalTheme
 
@@ -101,6 +103,7 @@ class MainActivity : ComponentActivity() {
         restorePersistedTerminalTheme()
         restorePersistedScreenProtection()
         restorePersistedCtlSocketForward()
+        enableDebugReconnectLogIfDebugBuild()
         // タスク#57: 通知チャンネル(Android 8.0+で必須)。既に存在すれば無害なno-op。
         // 実行時権限(POST_NOTIFICATIONS, Android 13+)の要求は、機能を実際に有効にする
         // ProfileEditScreenのトグルON時に行う(アプリ起動直後にいきなり権限を求めない)。
@@ -134,6 +137,18 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
         val theme = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         theme.applyTo(::setTerminalTheme)
+    }
+
+    /**
+     * Android実機スパイク用の再接続計測ログ(`ANDROID_RECONNECT_SPIKE_PLAN.md`)を
+     * debugビルドでのみ有効化する。`Application.onCreate()`はRobolectric JVMテストでも
+     * 必ず生成されるため、そこでuniffi経由のnative呼び出しをするとテストが壊れる
+     * ([restorePersistedTerminalTheme]と同じ理由でMainActivity側に置いている)。
+     */
+    private fun enableDebugReconnectLogIfDebugBuild() {
+        if (BuildConfig.DEBUG) {
+            debugSetReconnectLogPath(DebugReconnectLog.rustLogPath(this))
+        }
     }
 
     /**

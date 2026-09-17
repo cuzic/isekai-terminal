@@ -27,7 +27,7 @@ RUST_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$RUST_CORE_DIR/.." && pwd)"
 
 PKG="tools.isekai.terminal"
-LOG_TAGS="isekai-terminal-core:V IsekaiTerminalSSH:V IsekaiTerminalVM:V FaultInjection:V ActivityManager:I *:S"
+LOG_TAGS="isekai-terminal-core:V IsekaiTerminalSSH:V IsekaiTerminalVM:V FaultInjection:V ActivityManager:I ReconnectSpike:V *:S"
 LOG_DIR="${LOG_DIR:-/tmp/claude-1001/-home-cuzic-isekai-terminal/1366600f-e921-4fad-93ea-f62b10133c99/scratchpad/phase7-5-logs}"
 mkdir -p "$LOG_DIR"
 
@@ -37,8 +37,17 @@ _broadcast() {
     # Android 8+ の implicit broadcast 制限により action 指定だけでは
     # manifest 登録レシーバーに届かないことがあるため、明示的に
     # コンポーネントを指定する（実機検証で判明した必須の対応）。
+    #
+    # さらに FaultInjectionReceiver は android:exported="false" のため、
+    # adb shell（shell UID）からの am broadcast はAMSに一切配送されない
+    # （2026-09-17、実機Android 15/API 35で確認——"Enqueued broadcast ...: 0"
+    # は配送先0件を意味していた）。`run-as <pkg>` でアプリ自身のUIDから
+    # 実行すると同一UID扱いで配送される。ただし `am broadcast` はuser指定を
+    # 省略するとUSER_CURRENT(-2)を使おうとし、これはshell UID以外だと
+    # INTERACT_ACROSS_USERS(_FULL) が無く弾かれるため、`--user 0` を明示する
+    # 必要がある。
     local action="$1"; shift
-    adb shell am broadcast -n "${PKG}/.debug.FaultInjectionReceiver" -a "${PKG}.debug.${action}" "$@"
+    adb shell run-as "$PKG" am broadcast --user 0 -n "${PKG}/.debug.FaultInjectionReceiver" -a "${PKG}.debug.${action}" "$@"
 }
 
 _start_logcat() {
@@ -61,6 +70,11 @@ list_scenarios() {
 --- ステップ0: 前提 ---
 step0_precheck            adb接続確認・ローカル自動テスト(faulty_udp_socket)を再実行
 step0_install_launch      debug APK インストール & 起動（要ユーザー事前登録: プロファイル2件・鍵インポート）
+helper_force_doze         dumpsys battery unplug → deviceidle force-idle（要ユーザー確認）
+helper_unforce_doze       deviceidle unforce → dumpsys battery reset（要ユーザー確認）
+debug_set_reconnect_policy tick retry timeout
+debug_dump_reconnect_log
+debug_clear_reconnect_log
 
 --- グループA: ライブフォルト注入のみ（ネットワーク切替なし） ---
 scenario_live_latency     接続中に遅延300msを注入 → シェルの反応が遅くなるが継続することを確認
@@ -97,6 +111,68 @@ step0_install_launch() {
     adb shell am start -n "${PKG}/.MainActivity"
     echo "この後、プロファイル一覧からテスト対象プロファイルをタップして手動接続してください。"
     echo "接続完了（シェルプロンプトが出る）を確認してから各シナリオ関数を呼んでください。"
+}
+
+helper_force_doze() {
+    echo "充電中判定を外し、画面をOFFにしてから Deep Doze を強制します。実行前にユーザー確認を取ってください。"
+    echo "重要: 計測が終わったら必ず helper_unforce_doze を呼んでください。"
+    adb shell dumpsys battery unplug
+    adb shell dumpsys deviceidle enable >/dev/null
+    adb shell input keyevent KEYCODE_SLEEP
+    # deviceidleは画面OFF・非充電への状態遷移を観測してからACTIVEを抜けるため、
+    # keyevent直後だとレースでforce-idleが弾かれうる。遷移を待つ。
+    sleep 2
+    local out
+    out="$(adb shell dumpsys deviceidle force-idle 2>&1 || true)"
+    echo "$out"
+    local deep
+    # `*IDLE*`のようなグロブだとIDLE_PENDING/IDLE_MAINTENANCEも通してしまう
+    # (前者はまだDeep Dozeに入っていない、後者はネットワーク制限が一時解除される
+    # メンテナンスウィンドウで、どちらもDoze検証としては不合格)。CRを除去した
+    # 上で厳密一致にする。
+    deep="$(adb shell dumpsys deviceidle get deep 2>&1 | tr -d '\r' | tail -n1)"
+    echo "deviceidle deep state: $deep"
+    if [ "$deep" != "IDLE" ]; then
+        echo "ERROR: deep idle state is '$deep' (expected IDLE)。この状態の計測はDoze条件を満たしていません。計測を中止してください。"
+        return 1
+    fi
+}
+
+helper_unforce_doze() {
+    echo "Deep Doze 強制を解除し、battery 状態を必ず元に戻します。"
+    adb shell dumpsys deviceidle unforce
+    adb shell dumpsys battery reset
+}
+
+debug_set_reconnect_policy() {
+    local tick="${1:?tick secs required}"
+    local retry="${2:?retry interval secs required}"
+    local timeout="${3:?timeout secs required}"
+    _broadcast SET_RECONNECT_POLICY --ei tick_secs "$tick" --ei retry_interval_secs "$retry" --ei timeout_secs "$timeout"
+}
+
+debug_clear_reconnect_policy() {
+    _broadcast CLEAR_RECONNECT_POLICY
+}
+
+_pull_reconnect_log() {
+    local remote="$1" local_out="$2"
+    if adb exec-out run-as "$PKG" cat "files/$remote" > "$local_out" 2>"${local_out}.err"; then
+        echo "  ${local_out} ($(wc -l < "$local_out") 行)"
+    else
+        echo "  ERROR: ${remote} を取得できませんでした: $(cat "${local_out}.err")"
+    fi
+}
+
+debug_dump_reconnect_log() {
+    local out_dir="${LOG_DIR}"
+    echo "書き出し結果:"
+    _pull_reconnect_log "debug-reconnect-events.log" "${out_dir}/rust-reconnect-events.log"
+    _pull_reconnect_log "debug-reconnect-kotlin-events.log" "${out_dir}/kotlin-reconnect-events.log"
+}
+
+debug_clear_reconnect_log() {
+    _broadcast CLEAR_RECONNECT_LOG
 }
 
 # ── グループA: ライブフォルト注入のみ ──────────────────

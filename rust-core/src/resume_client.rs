@@ -152,12 +152,30 @@ pub(crate) type ReattachFn<R, W> = Arc<
 /// リトライ回数・間隔（固定値。指数バックオフ）。
 const REATTACH_MAX_RETRIES: u32 = 5;
 const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const NETWORK_WAKE_BONUS_RETRIES: u32 = 3;
+const NETWORK_WAKE_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+static NETWORK_RESTORED_FOR_REATTACH: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::OnceLock::new();
 
 /// 呼び出し元(russh)とpumpタスクの間を橋渡しするバッファサイズ。
 /// reattach中もある程度は素通しに書き込み続けられる猶予として、
 /// 単発のSSHパケットが十分収まるサイズにしてある。
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const RECV_CHUNK_SIZE: usize = 16 * 1024;
+
+fn network_restored_sender() -> &'static tokio::sync::watch::Sender<u64> {
+    NETWORK_RESTORED_FOR_REATTACH.get_or_init(|| tokio::sync::watch::channel(0u64).0)
+}
+
+/// network復帰を、待機中の全`attempt_reattach`呼び出しへ同時に伝える。
+/// `Notify::notify_one()`だと複数ストリームが同時にreattach中の場合1本しか
+/// 起きない(消費者ごとの独立したエッジ検出ができない)ため、`watch`の
+/// バージョンカウンタで代用する——各待機者は自分の`Receiver`で
+/// `changed()`を見るので、1回の送信で全員が同時に起きる。
+pub(crate) fn notify_network_restored_for_reattach() {
+    crate::debug_reconnect::record("reattach network_wake");
+    network_restored_sender().send_modify(|v| *v = v.wrapping_add(1));
+}
 
 /// data stream を包み、QUIC connection が失われても（`RESUME` による reattach が
 /// 成功する限り）呼び出し元（russh）に I/O エラーを見せない。
@@ -196,7 +214,14 @@ impl ReattachableStream {
     ) -> Self {
         let (caller_side, pump_side) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
         let terminal_error = Arc::new(Mutex::new(None));
-        tokio::spawn(run_pump(pump_side, read, write, resume_state, reattach_fn, terminal_error.clone()));
+        tokio::spawn(run_pump(
+            pump_side,
+            read,
+            write,
+            resume_state,
+            reattach_fn,
+            terminal_error.clone(),
+        ));
         Self { duplex: caller_side, terminal_error }
     }
 
@@ -289,6 +314,15 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     reattach_fn: &ReattachFn<R, W>,
 ) -> Result<(R, W), String> {
     let mut attempt = 0u32;
+    let mut network_wake_bonus_used = 0u32;
+    // 最初の`reattach_fn`呼び出しより前にsubscribeし、ループ全体で使い回す。
+    // `wait_backoff_or_network_change`のたびに`subscribe()`し直すと、そのバックオフ
+    // 待機に入る"瞬間"のバージョンを既読扱いにしてしまい、直前の`reattach_fn`実行中
+    // (=圏外なら最悪15秒級、このループで最も長く支配的な区間)に届いた復帰通知を
+    // 取りこぼす(round1のB-3と同型の再発、opus-adversarial-consult round3で発覚)。
+    // `Receiver`を先に作っておけば、`reattach_fn`実行中の送信もバージョンとして
+    // 保持され、後続の`changed()`が即座に返る。
+    let mut network_wake = network_restored_sender().subscribe();
     loop {
         attempt += 1;
         let (session_id, client_sent_offset, client_delivered_offset) = {
@@ -300,6 +334,9 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
         };
 
         log::info!("reattach: attempt {attempt}/{REATTACH_MAX_RETRIES}");
+        if crate::debug_reconnect::is_enabled() {
+            crate::debug_reconnect::record(format!("reattach attempt_start attempt={attempt}"));
+        }
         let outcome = match reattach_fn(session_id, client_sent_offset, client_delivered_offset).await {
             Ok(ReattachResult { read, mut write, helper_committed_offset }) => {
                 let to_replay = {
@@ -321,15 +358,57 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
         match outcome {
             Ok(halves) => {
                 log::info!("reattach: succeeded on attempt {attempt}");
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!("reattach attempt_end attempt={attempt} result=success"));
+                }
                 return Ok(halves);
             }
             Err(e) => {
                 log::warn!("reattach: attempt {attempt} failed: {e}");
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!(
+                        "reattach attempt_end attempt={} result=failure error={}",
+                        attempt,
+                        e
+                    ));
+                }
                 if attempt >= REATTACH_MAX_RETRIES {
                     return Err(e);
                 }
-                tokio::time::sleep(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await;
+                if wait_backoff_or_network_change(&mut network_wake, REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await
+                    && network_wake_bonus_used < NETWORK_WAKE_BONUS_RETRIES
+                {
+                    network_wake_bonus_used += 1;
+                    attempt = attempt.saturating_sub(1);
+                }
             }
+        }
+    }
+}
+
+async fn wait_backoff_or_network_change(
+    network_wake: &mut tokio::sync::watch::Receiver<u64>,
+    backoff: std::time::Duration,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => false,
+        _ = network_wake.changed() => {
+            // フロアは「打ち切った上で最低限これだけは待つ」下限であって、
+            // バックオフに上乗せする追加の待ちではない(素のバックオフより
+            // 遅くなってしまっては早期打ち切りの意味が無い)。
+            let waited = started.elapsed();
+            let remaining = NETWORK_WAKE_MIN_FLOOR.saturating_sub(waited).min(backoff.saturating_sub(waited));
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+            if crate::debug_reconnect::is_enabled() {
+                crate::debug_reconnect::record(format!(
+                    "reattach backoff_cut_short_by_network_change backoff_ms={}",
+                    backoff.as_millis()
+                ));
+            }
+            true
         }
     }
 }
@@ -386,7 +465,14 @@ async fn run_pump<R: ByteHalfRead, W: ByteHalfWrite>(
         match next_pump_event(&mut pump_read, &mut read, &mut send_buf, &mut recv_buf, helper_read_done).await {
             PumpEvent::FromCaller(chunk) => {
                 if let Err(final_err) =
-                    write_with_reattach(chunk, &mut read, &mut write, &resume_state, &reattach_fn, &mut helper_read_done)
+                    write_with_reattach(
+                        chunk,
+                        &mut read,
+                        &mut write,
+                        &resume_state,
+                        &reattach_fn,
+                        &mut helper_read_done,
+                    )
                         .await
                 {
                     *terminal_error.lock().unwrap() = Some(final_err);
@@ -617,5 +703,56 @@ mod tests {
             .expect_err("5回リトライを使い切ったら read は実エラーを返すはず");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert!(err.to_string().contains("mock: helper unreachable"));
+    }
+
+    /// opus-adversarial-consult round3で発覚した回帰の再発防止テスト:
+    /// `reattach_fn`実行中(=Receiverがまだ無かった旧実装なら取りこぼす窓)に届いた
+    /// network復帰通知が、後続のバックオフを正しく早期打ち切りすることを検証する。
+    /// `subscribe()`を`attempt_reattach`の先頭(最初の`reattach_fn`呼び出しより前)へ
+    /// 巻き上げていないと、このテストは1回目のbackoff(1秒)をまるまる待ってしまい失敗する。
+    #[tokio::test(start_paused = true)]
+    async fn reattach_backoff_is_cut_short_by_wake_that_arrives_during_reattach_fn() {
+        let (read, write, _write_rx, read_tx, _fail) = mock_pair();
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_count_for_closure = attempt_count.clone();
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(move |_id, _sent, _delivered| {
+            let n = attempt_count_for_closure.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                if n == 1 {
+                    // 圏外中のdialタイムアウト相当(reattach_fn自体が2秒居座ってから
+                    // 失敗する)。この2秒の最中はReceiverが存在しない旧実装なら
+                    // network wakeを取りこぼす。
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    notify_network_restored_for_reattach();
+                    Err("mock: still unreachable on first attempt".to_string())
+                } else {
+                    Err("mock: still unreachable".to_string())
+                }
+            })
+        });
+        let resume_state = resume_state_with_session();
+        let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn);
+
+        read_tx.send(Err("mock: connection lost".to_string())).unwrap();
+
+        // attempt 1のreattach_fn(2秒)を終わらせ、その中でnetwork wakeが送られる
+        // ところまで仮想時間を進める。
+        for _ in 0..3 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // 修正前(subscribe()をバックオフ直前で呼ぶ実装)なら、ここでattempt 2の
+        // backoff(1秒)をまるまる待ってしまう。修正後は、attempt 1実行中に届いた
+        // wakeを既にReceiverが保持しているため、フロア(500ms)だけでattempt 2へ
+        // 進むはず——600ms分だけ進めた時点でattempt_countが2になっていることを
+        // もって確認する。
+        tokio::time::advance(std::time::Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            2,
+            "network wakeによる早期打ち切りが効いていない(reattach_fn実行中の窓の取りこぼし再発)"
+        );
     }
 }

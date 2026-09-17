@@ -9258,6 +9258,36 @@ public func debugSetUdpFaultLossPermille(permille: UInt32)  {try! rustCall() {
     )
 }
 }
+public func debugClearReconnectLog()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_log($0
+    )
+}
+}
+public func debugClearReconnectPolicy()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_debug_clear_reconnect_policy($0
+    )
+}
+}
+public func debugDumpReconnectLog() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_debug_dump_reconnect_log($0
+    )
+})
+}
+public func debugSetReconnectLogPath(path: String)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_log_path(
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+public func debugSetReconnectPolicy(tickSecs: UInt32, retryIntervalSecs: UInt32, timeoutSecs: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_debug_set_reconnect_policy(
+        FfiConverterUInt32.lower(tickSecs),
+        FfiConverterUInt32.lower(retryIntervalSecs),
+        FfiConverterUInt32.lower(timeoutSecs),$0
+    )
+}
+}
 public func createSessionOrchestrator(callback: OrchestratorCallback) -> SessionOrchestrator  {
     return try!  FfiConverterTypeSessionOrchestrator_lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(
@@ -9372,6 +9402,21 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_log() != 61005) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_debug_clear_reconnect_policy() != 52224) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_debug_dump_reconnect_log() != 37039) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_log_path() != 17276) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_debug_set_reconnect_policy() != 20632) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {

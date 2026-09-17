@@ -14,10 +14,11 @@ import org.robolectric.annotation.Config
 /**
  * Phase 8-4: 実機なしで `FaultInjectionReceiver` の intent 解釈ロジックを検証する。
  * native FFI (`uniffi.isekai_terminal_core.debug*`) は実機/エミュレータでしか動かないため、
- * [FaultInjectorApi] を fake に差し替えて、5つの broadcast action が正しい
+ * [FaultInjectorApi] を fake に差し替えて、9つの broadcast action が正しい
  * 引数で正しい呼び出しにマッピングされることだけを Robolectric 上で確認する。
- * `scripts/phase7-5-roaming-test.sh` が実機で送る `adb shell am broadcast` の
- * action/extra 名（`ms`, `permille`）と一致していることの回帰チェックを兼ねる。
+ * `rust-core/scripts/phase7-5-roaming-test.sh` が実機で送る `adb shell am broadcast` の
+ * action/extra 名（`ms`, `permille`, `tick_secs`, `retry_interval_secs`, `timeout_secs`）
+ * と一致していることの回帰チェックを兼ねる。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -39,6 +40,19 @@ class FaultInjectionReceiverTest {
         }
         override fun clear() {
             calls += "clear()"
+        }
+        override fun setReconnectPolicy(tickSecs: UInt, retryIntervalSecs: UInt, timeoutSecs: UInt) {
+            calls += "setReconnectPolicy($tickSecs,$retryIntervalSecs,$timeoutSecs)"
+        }
+        override fun clearReconnectPolicy() {
+            calls += "clearReconnectPolicy()"
+        }
+        override fun dumpReconnectLog(): String {
+            calls += "dumpReconnectLog()"
+            return ""
+        }
+        override fun clearReconnectLog() {
+            calls += "clearReconnectLog()"
         }
     }
 
@@ -90,6 +104,51 @@ class FaultInjectionReceiverTest {
     fun clear_callsInjectorWithNoArgs() {
         receiver.onReceive(context, Intent("tools.isekai.terminal.debug.CLEAR"))
         assertEquals(listOf("clear()"), fake.calls)
+    }
+
+    @Test
+    fun setReconnectPolicy_parsesExtrasAndCallsInjector() {
+        val intent = Intent("tools.isekai.terminal.debug.SET_RECONNECT_POLICY")
+            .putExtra("tick_secs", 300)
+            .putExtra("retry_interval_secs", 301)
+            .putExtra("timeout_secs", 3600)
+        receiver.onReceive(context, intent)
+        assertEquals(listOf("setReconnectPolicy(300,301,3600)"), fake.calls)
+    }
+
+    @Test
+    fun setReconnectPolicy_missingExtrasDefaultToOne() {
+        val intent = Intent("tools.isekai.terminal.debug.SET_RECONNECT_POLICY")
+        receiver.onReceive(context, intent)
+        assertEquals(listOf("setReconnectPolicy(1,1,1)"), fake.calls)
+    }
+
+    @Test
+    fun setReconnectPolicy_zeroAndNegativeExtrasAreClampedToOne() {
+        val intent = Intent("tools.isekai.terminal.debug.SET_RECONNECT_POLICY")
+            .putExtra("tick_secs", 0)
+            .putExtra("retry_interval_secs", -5)
+            .putExtra("timeout_secs", -1)
+        receiver.onReceive(context, intent)
+        assertEquals(listOf("setReconnectPolicy(1,1,1)"), fake.calls)
+    }
+
+    @Test
+    fun clearReconnectPolicy_callsInjectorWithNoArgs() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY"))
+        assertEquals(listOf("clearReconnectPolicy()"), fake.calls)
+    }
+
+    @Test
+    fun dumpReconnectLog_callsInjector() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.DUMP_RECONNECT_LOG"))
+        assertEquals(listOf("dumpReconnectLog()"), fake.calls)
+    }
+
+    @Test
+    fun clearReconnectLog_callsInjectorWithNoArgs() {
+        receiver.onReceive(context, Intent("tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG"))
+        assertEquals(listOf("clearReconnectLog()"), fake.calls)
     }
 
     @Test

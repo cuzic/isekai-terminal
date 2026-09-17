@@ -8,6 +8,8 @@
 //! (Epic M)のopt-inフラグ・パス命名は[`super::ctl_streamlocal`]。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
@@ -555,13 +557,55 @@ pub(crate) async fn connect_via_jump_or_direct(
 /// isekai-pipe QUIC系(ネストしたSSH)いずれの確立方法でも同じ形にまとめる
 /// (`run_ssh_channel_loop`から見れば、TCPの上かQUICトンネルの上かは区別不要なため)。
 pub(crate) struct PooledSshHandle {
-    pub(crate) handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
     /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
     /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
+}
+
+pub(crate) async fn with_shared_handle_timeout<T>(
+    handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    timeout: std::time::Duration,
+    f: impl for<'a> FnOnce(
+        &'a mut client::Handle<RusshEventHandler>,
+    ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async {
+        let mut handle = handle.lock().await;
+        f(&mut handle).await
+    }).await
+}
+
+impl PooledSshHandle {
+    pub(crate) async fn with_handle_timeout<T>(
+        &self,
+        timeout: std::time::Duration,
+        f: impl for<'a> FnOnce(
+            &'a mut client::Handle<RusshEventHandler>,
+        ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        with_shared_handle_timeout(&self.handle, timeout, f).await
+    }
+
+    /// `try_attach_with`の生存確認述語として渡す(`ADR_ANDROID_POOL_STALE_HANDLE.md`
+    /// §3.2)。`handle`フィールドをprivateにしたことで、この定義を経由せずに
+    /// 生存確認ロジックを複製することはコンパイルエラーになる(code-reviewで
+    /// 発見した「同一クロージャが4箇所に複製されていた」問題の再発防止)。
+    pub(crate) fn is_alive(&self) -> bool {
+        self.handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)
+    }
+
+    /// `pooled.handle`を直接共有したい呼び出し元(`forward.rs`・
+    /// `file_preview_exec.rs`)向けのクローン取得。`with_handle_timeout`を
+    /// 経由しない生のawaitを増やさないよう、新規の呼び出し元は基本的に
+    /// `with_handle_timeout`を使うこと——これは既存の(このファイル内で
+    /// 完結する)委譲用途のためだけに残す。
+    pub(crate) fn handle_arc(&self) -> Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>> {
+        self.handle.clone()
+    }
 }
 
 /// 未認証の`client::Handle`(TCP直結・踏み台経由・QUICトンネル経由いずれでも可)に対して
@@ -692,11 +736,11 @@ async fn run_exec_on_handle_inner(
     handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     command: &str,
 ) -> Result<ExecOutput, ExecError> {
-    let mut channel = handle
-        .lock()
+    let mut channel = with_shared_handle_timeout(handle, RUN_EXEC_TIMEOUT, |handle| {
+        Box::pin(async move { handle.channel_open_session().await })
+    })
         .await
-        .channel_open_session()
-        .await
+        .map_err(|_| ExecError::Timeout(RUN_EXEC_TIMEOUT))?
         .map_err(|e| ExecError::ChannelOpen(e.to_string()))?;
 
     channel
@@ -770,6 +814,12 @@ impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
 
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
 
+pub(crate) enum FirstChannelOpen {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
 /// [pooled]（既に認証済み）に対して新しいSSHチャネル(セッション/PTY/シェル)を1本開き、
 /// そのチャネルのI/Oループを回す。プールにヒットした2本目以降のタブも最初のタブも、
 /// この関数から始まる(呼び出し元が先に確立関数を呼ぶかプールから取得するかだけが違う)。
@@ -789,19 +839,46 @@ pub(crate) async fn run_ssh_channel_loop(
     rows: u32,
     agent_forward: bool,
     allow_non_loopback_forward_bind: bool,
+    cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
+    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    app_pane_id: crate::tmux_locator::AppPaneId,
+) -> FirstChannelOpen {
+    let channel = match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+        Box::pin(async move { handle.channel_open_session().await })
+    }).await {
+        Ok(Ok(c)) => { info!("ssh: session channel opened"); c }
+        Ok(Err(e)) => {
+            warn!("ssh: channel_open_session failed: {}", e);
+            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+            return FirstChannelOpen::Failed;
+        }
+        Err(_) => {
+            warn!("ssh: channel_open_session timed out after {:?}", RUN_EXEC_TIMEOUT);
+            event_tx.send(TransportEvent::Disconnected {
+                reason: Some(format!("channel_open_session timed out after {:?}", RUN_EXEC_TIMEOUT)),
+            }).await.ok();
+            return FirstChannelOpen::TimedOut;
+        }
+    };
+
+    run_ssh_channel_loop_after_first_open(
+        pooled, channel, cols, rows, agent_forward, allow_non_loopback_forward_bind,
+        cmd_rx, event_tx, app_pane_id,
+    ).await;
+    FirstChannelOpen::Succeeded
+}
+
+async fn run_ssh_channel_loop_after_first_open(
+    pooled: &PooledSshHandle,
+    mut channel: russh::Channel<client::Msg>,
+    cols: u32,
+    rows: u32,
+    agent_forward: bool,
+    allow_non_loopback_forward_bind: bool,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     app_pane_id: crate::tmux_locator::AppPaneId,
 ) {
-    let mut channel = match pooled.handle.lock().await.channel_open_session().await {
-        Ok(c) => { info!("ssh: session channel opened"); c }
-        Err(e) => {
-            warn!("ssh: channel_open_session failed: {}", e);
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
-            return;
-        }
-    };
-
     if agent_forward && pooled.agent_key.lock().is_some() {
         info!("ssh: requesting agent forwarding");
         if let Err(e) = channel.agent_forward(true).await {
@@ -831,8 +908,11 @@ pub(crate) async fn run_ssh_channel_loop(
         let path = new_ctl_socket_path();
         let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<CtlInbound>();
         pooled.ctl_forwards.lock().insert(path.clone(), ctl_tx);
-        match pooled.handle.lock().await.streamlocal_forward(path.clone()).await {
-            Ok(()) => {
+        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+            let path = path.clone();
+            Box::pin(async move { handle.streamlocal_forward(path).await })
+        }).await {
+            Ok(Ok(())) => {
                 info!("ctl-socket: forwarding {} (Epic M)", path);
                 let forward_event_tx = event_tx.clone();
                 // `setvar`/`getvar`(task #16)のこのタブ専用ストア(`VarScope::Tab`/
@@ -874,7 +954,7 @@ pub(crate) async fn run_ssh_channel_loop(
                 // (タスク#61)自体がSSHの新しいチャネルを開く待ち時間を伴い得るため、
                 // このI/Oループ(`select!`)をブロックしないよう別taskへ`spawn`する
                 // (`TransportCommand::RunExec`のハンドラと同じ配慮)。
-                let runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let runner = SshHandleTmuxRunner { handle: pooled.handle_arc() };
                 let app_pane_for_push = app_pane_id.clone();
                 let path_for_push = path.clone();
                 tokio::spawn(async move {
@@ -894,7 +974,7 @@ pub(crate) async fn run_ssh_channel_loop(
                 // `spawn`する(`run_exec`の待ち時間でI/Oループをブロックしない)。
                 // ロケータ未登録なら`install_notify_hooks`が黙ってno-opになるのも
                 // `push_ctl_socket_to_tmux`と同じ(opportunistic機能)。
-                let notify_runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let notify_runner = SshHandleTmuxRunner { handle: pooled.handle_arc() };
                 let app_pane_for_notify = app_pane_id.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::tmux_notify::install_notify_hooks(
@@ -907,8 +987,13 @@ pub(crate) async fn run_ssh_channel_loop(
                 });
                 Some(path)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("ctl-socket: streamlocal_forward {} failed: {}", path, e);
+                pooled.ctl_forwards.lock().remove(&path);
+                None
+            }
+            Err(_) => {
+                warn!("ctl-socket: streamlocal_forward {} timed out after {:?}", path, RUN_EXEC_TIMEOUT);
                 pooled.ctl_forwards.lock().remove(&path);
                 None
             }
@@ -930,7 +1015,7 @@ pub(crate) async fn run_ssh_channel_loop(
     // 複製した「プールエントリと共有」のハンドルになる。複数タブが同じHandleに対して
     // 独立にforwardを追加/削除しても、`remote_forwards`(ポート→転送先の経路表)は
     // [pooled]から複製したものを共有するため経路表自体は一貫する。
-    let session = pooled.handle.clone();
+    let session = pooled.handle_arc();
     let remote_forwards = pooled.remote_forwards.clone();
     let mut active_forwards: HashMap<String, ActiveForward> = HashMap::new();
 
@@ -1007,8 +1092,11 @@ pub(crate) async fn run_ssh_channel_loop(
                             reject_non_loopback_bind(&event_tx, id, &bind_addr).await;
                         } else {
                             info!("forward[{}]: add(remote) {}:{} -> {}:{}", id, bind_addr, bind_port, target_host, target_port);
-                            match session.lock().await.tcpip_forward(bind_addr.clone(), bind_port as u32).await {
-                                Ok(bound_port) => {
+                            match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+                                let bind_addr = bind_addr.clone();
+                                Box::pin(async move { handle.tcpip_forward(bind_addr, bind_port as u32).await })
+                            }).await {
+                                Ok(Ok(bound_port)) => {
                                     let bound_port = if bind_port == 0 { bound_port as u16 } else { bind_port };
                                     remote_forwards.lock().insert(bound_port, (target_host, target_port));
                                     if let Some(old) = active_forwards.insert(
@@ -1021,10 +1109,35 @@ pub(crate) async fn run_ssh_channel_loop(
                                         id, state: ForwardState::Listening,
                                     }).await.ok();
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!("forward[{}]: tcpip_forward {}:{} failed: {}", id, bind_addr, bind_port, e);
                                     event_tx.send(TransportEvent::ForwardStateChanged {
                                         id, state: ForwardState::Failed { reason: e.to_string() },
+                                    }).await.ok();
+                                }
+                                Err(_) => {
+                                    warn!("forward[{}]: tcpip_forward {}:{} timed out after {:?}", id, bind_addr, bind_port, RUN_EXEC_TIMEOUT);
+                                    if bind_port != 0 {
+                                        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+                                            let bind_addr = bind_addr.clone();
+                                            Box::pin(async move { handle.cancel_tcpip_forward(bind_addr, bind_port as u32).await })
+                                        }).await {
+                                            Ok(Ok(())) => {
+                                                debug!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout succeeded", id, bind_addr, bind_port);
+                                            }
+                                            Ok(Err(e)) => {
+                                                warn!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout failed: {}", id, bind_addr, bind_port, e);
+                                            }
+                                            Err(_) => {
+                                                warn!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout timed out after {:?}", id, bind_addr, bind_port, RUN_EXEC_TIMEOUT);
+                                            }
+                                        }
+                                    }
+                                    event_tx.send(TransportEvent::ForwardStateChanged {
+                                        id,
+                                        state: ForwardState::Failed {
+                                            reason: format!("tcpip_forward timed out after {:?}", RUN_EXEC_TIMEOUT),
+                                        },
                                     }).await.ok();
                                 }
                             }
@@ -1076,8 +1189,17 @@ pub(crate) async fn run_ssh_channel_loop(
     }
     if let Some(path) = ctl_socket_path {
         pooled.ctl_forwards.lock().remove(&path);
-        if let Err(e) = session.lock().await.cancel_streamlocal_forward(path.clone()).await {
-            debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
+        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+            let path = path.clone();
+            Box::pin(async move { handle.cancel_streamlocal_forward(path).await })
+        }).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
+            }
+            Err(_) => {
+                debug!("ctl-socket: cancel_streamlocal_forward {} timed out after {:?} (best-effort)", path, RUN_EXEC_TIMEOUT);
+            }
         }
         // タスク#59: このタブのctl-socketパスがもう有効ではないことをレジストリにも
         // 反映する(ロケータ自体は`unregister`しない——タブが閉じたわけではなく、
@@ -1681,7 +1803,7 @@ mod pooling_e2e_tests {
 
             // 1本目: 確立してプールへ登録する(本番の`run_russh_transport`が行うのと同じ手順)。
             let mut auth1 = auth.clone();
-            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
@@ -1708,7 +1830,7 @@ mod pooling_e2e_tests {
 
             // 次のアタッチはEstablisherに戻り、サーバーは2回目の認証を観測する。
             let mut auth2 = auth;
-            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
                 crate::pool::AttachOutcome::Establisher => {
                     let pooled = establish_ssh_handle(
                         &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
