@@ -229,6 +229,38 @@ round 2レビューで、**案A〜Eのどれを選んでも共通して必要に
 計測すると、コールバック自体は届いていてもin-flight中のpermit破棄で
 再接続が起きず、「コールバックが届いていない」と誤診断するおそれがある。
 
+**実施結果(2026-09-17、実機Sony XQ-DQ44、`feat/android-reconnect-spike-infra`の
+debug APK、`pending_wake`実装済み)**: 案Aの前提は**成立**。
+
+- 手順通りセルラー無効化(`svc data disable`、IMS専用ネットワークのみ残存し
+  INTERNET capability無し)・`ReconnectPolicy`をtick=300s/timeout=3600sへ上書き・
+  バックグラウンド化・`CUT`フォルト注入・`battery unplug`→`force-idle`
+  (`mState=IDLE mLightState=OVERRIDE`確認済み)の順で実施。
+- Deep Doze下でWi-Fiを**10回**ON/OFFトグル(各サイクル約13秒)。
+  `ローカル永続化ログ`(`debug_dump_reconnect_log`)を回収したところ、
+  `network_callback path=DIRECT callback=onLost/onAvailable`が**10往復(20件)
+  すべて1:1で記録**されており、OS側のトグル回数に対する取りこぼしは
+  **0件(配送率100%)**だった。
+- reattach層(5回の試行、`REATTACH_MAX_RETRIES`)を使い切りorchestratorの
+  reconnectループが`ConnPhase::Idle`のtick_wait状態(tick=300s)に入った後、
+  さらに3回Wi-Fiをトグルしたところ、**3回とも**
+  `notify_network_path_changed satisfied phase=Idle action=reconnect_wake`→
+  `loop_woke_early`→`retry_attempt_in_flight on epoch=3 source=network_wake`
+  という経路でループが即座に起床した。OS側の`onAvailable`記録時刻と
+  `loop_woke_early`記録時刻の差は**1〜14ミリ秒**(実質ゼロ、Rust内部の
+  伝播コスト以外の遅延は観測されず)。取りこぼし0/3、遅延は判定指標の
+  「数秒〜十数秒以内」を大幅に下回る。
+- 副産物: 起床自体は3回とも成功したものの、起床直後の再接続試行はいずれも
+  即座に`reason=Channel send error`で失敗した——これは
+  `ADR_ANDROID_POOL_STALE_HANDLE.md`(issue #120)で報告済みのSSHプール
+  stale handle再利用バグが同一試行内で再現したもの(90秒のidle graceが
+  経過する前だったため)。**案Aの「起床」自体は完全に機能しているが、
+  起床後に実際に再接続が成功するには別途この pool バグの修正が必要**
+  ——両ADRは独立ではなく直列に効く関係にあることが実機で確認できた。
+- 後片付け: `dumpsys deviceidle unforce`・`dumpsys battery reset`・
+  `svc data enable`・`CLEAR_RECONNECT_POLICY`・`RESTORE`+`CLEAR`
+  (フォルト解除)を実施済み。
+
 ### スパイク2: WakeLockはDoze中のネットワークアクセスを実際に解除するか(案Cの評価)
 
 **目的**: `PARTIAL_WAKE_LOCK`保持がDoze制限下のQUIC送受信に効くかを確認する。
