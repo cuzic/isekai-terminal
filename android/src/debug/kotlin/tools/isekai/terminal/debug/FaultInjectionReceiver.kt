@@ -23,16 +23,26 @@ import uniffi.isekai_terminal_core.debugSetUdpFaultLossPermille
  *
  * 例（Android 8+ の implicit broadcast 制限により、action 指定だけでは manifest
  * 登録レシーバーに届かないことがあるため `-n` でコンポーネントを明示すること。
- * 実機検証で action のみでは届かないことを確認済み）:
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_LATENCY --ei ms 300
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_LOSS --ei permille 200
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CUT
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.RESTORE
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_RECONNECT_POLICY --ei tick_secs 300 --ei retry_interval_secs 300 --ei timeout_secs 3600
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.DUMP_RECONNECT_LOG
- *   adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG
+ * さらにこのレシーバーは `android:exported="false"` のため、素の
+ * `adb shell am broadcast`（shell UID）では**一切配送されない**
+ * （2026-09-17、実機Android 15/API 35で確認——`am broadcast`自体は
+ * `Broadcast completed: result=0`を返すが、実際には配送先0件で
+ * `onReceive`が呼ばれない。ActivityManagerのログで
+ * `Enqueued broadcast ...: 0`の"0"が配送先0件を意味している）。
+ * `adb shell run-as <pkg> am broadcast --user 0 -n ...`で
+ * アプリ自身のUIDから送る必要がある（`--user 0`が無いと
+ * `am`既定のUSER_CURRENT(-2)解決に`INTERACT_ACROSS_USERS`権限が要ると
+ * 弾かれる）。`rust-core/scripts/phase7-5-roaming-test.sh`の`_broadcast()`は
+ * この形で実装済み、そちらを使うこと:
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_LATENCY --ei ms 300
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_LOSS --ei permille 200
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CUT
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.RESTORE
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.SET_RECONNECT_POLICY --ei tick_secs 300 --ei retry_interval_secs 300 --ei timeout_secs 3600
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR_RECONNECT_POLICY
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.DUMP_RECONNECT_LOG
+ *   adb shell run-as tools.isekai.terminal am broadcast --user 0 -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CLEAR_RECONNECT_LOG
  */
 /**
  * 実際の UDP フォルト注入 FFI 呼び出し先。native ライブラリ(Rust)に依存するため

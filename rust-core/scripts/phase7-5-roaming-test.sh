@@ -37,8 +37,17 @@ _broadcast() {
     # Android 8+ の implicit broadcast 制限により action 指定だけでは
     # manifest 登録レシーバーに届かないことがあるため、明示的に
     # コンポーネントを指定する（実機検証で判明した必須の対応）。
+    #
+    # さらに FaultInjectionReceiver は android:exported="false" のため、
+    # adb shell（shell UID）からの am broadcast はAMSに一切配送されない
+    # （2026-09-17、実機Android 15/API 35で確認——"Enqueued broadcast ...: 0"
+    # は配送先0件を意味していた）。`run-as <pkg>` でアプリ自身のUIDから
+    # 実行すると同一UID扱いで配送される。ただし `am broadcast` はuser指定を
+    # 省略するとUSER_CURRENT(-2)を使おうとし、これはshell UID以外だと
+    # INTERACT_ACROSS_USERS(_FULL) が無く弾かれるため、`--user 0` を明示する
+    # 必要がある。
     local action="$1"; shift
-    adb shell am broadcast -n "${PKG}/.debug.FaultInjectionReceiver" -a "${PKG}.debug.${action}" "$@"
+    adb shell run-as "$PKG" am broadcast --user 0 -n "${PKG}/.debug.FaultInjectionReceiver" -a "${PKG}.debug.${action}" "$@"
 }
 
 _start_logcat() {
