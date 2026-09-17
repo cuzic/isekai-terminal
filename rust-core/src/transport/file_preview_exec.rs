@@ -15,7 +15,9 @@ use std::sync::Arc;
 use log::{debug, warn};
 use russh::ChannelMsg;
 
-use super::ssh_handler::{RusshEventHandler, TransportEvent};
+use super::ssh_handler::{
+    with_shared_handle_timeout, RusshEventHandler, TransportEvent, RUN_EXEC_TIMEOUT,
+};
 
 pub(crate) async fn run_file_preview_exec(
     request_id: String,
@@ -23,13 +25,21 @@ pub(crate) async fn run_file_preview_exec(
     session: Arc<tokio::sync::Mutex<russh::client::Handle<RusshEventHandler>>>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
-    let mut channel = match session.lock().await.channel_open_session().await {
-        Ok(c) => c,
-        Err(e) => {
+    let mut channel = match with_shared_handle_timeout(&session, RUN_EXEC_TIMEOUT, |handle| {
+        Box::pin(async move { handle.channel_open_session().await })
+    }).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             warn!("file-preview[{}]: channel_open_session failed: {}", request_id, e);
             // execチャネル自体を開けなかった(接続断等)。stdoutは空・exit_statusはNoneで
             // 返す — `crate::file_preview::parse_result`が`exit_status != Some(0)`を
             // 汎用エラーとして扱う。
+            event_tx.send(TransportEvent::FilePreviewExecResult { request_id, stdout: Vec::new(), exit_status: None })
+                .await.ok();
+            return;
+        }
+        Err(_) => {
+            warn!("file-preview[{}]: channel_open_session timed out after {:?}", request_id, RUN_EXEC_TIMEOUT);
             event_tx.send(TransportEvent::FilePreviewExecResult { request_id, stdout: Vec::new(), exit_status: None })
                 .await.ok();
             return;

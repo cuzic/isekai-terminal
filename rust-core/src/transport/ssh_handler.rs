@@ -8,6 +8,8 @@
 //! (Epic M)のopt-inフラグ・パス命名は[`super::ctl_streamlocal`]。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
@@ -564,6 +566,31 @@ pub(crate) struct PooledSshHandle {
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
 
+pub(crate) async fn with_shared_handle_timeout<T>(
+    handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    timeout: std::time::Duration,
+    f: impl for<'a> FnOnce(
+        &'a mut client::Handle<RusshEventHandler>,
+    ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async {
+        let mut handle = handle.lock().await;
+        f(&mut handle).await
+    }).await
+}
+
+impl PooledSshHandle {
+    pub(crate) async fn with_handle_timeout<T>(
+        &self,
+        timeout: std::time::Duration,
+        f: impl for<'a> FnOnce(
+            &'a mut client::Handle<RusshEventHandler>,
+        ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        with_shared_handle_timeout(&self.handle, timeout, f).await
+    }
+}
+
 /// 未認証の`client::Handle`(TCP直結・踏み台経由・QUICトンネル経由いずれでも可)に対して
 /// 認証を行い、成功したら[PooledSshHandle]へラップする。`agent_forward`はプールキーの
 /// 一部でもあるため、プールエントリ全体に対して1回だけ`agent_key`を設定すればよい
@@ -692,11 +719,11 @@ async fn run_exec_on_handle_inner(
     handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     command: &str,
 ) -> Result<ExecOutput, ExecError> {
-    let mut channel = handle
-        .lock()
+    let mut channel = with_shared_handle_timeout(handle, RUN_EXEC_TIMEOUT, |handle| {
+        Box::pin(async move { handle.channel_open_session().await })
+    })
         .await
-        .channel_open_session()
-        .await
+        .map_err(|_| ExecError::Timeout(RUN_EXEC_TIMEOUT))?
         .map_err(|e| ExecError::ChannelOpen(e.to_string()))?;
 
     channel
@@ -799,8 +826,8 @@ pub(crate) async fn run_ssh_channel_loop(
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     app_pane_id: crate::tmux_locator::AppPaneId,
 ) -> FirstChannelOpen {
-    let channel = match tokio::time::timeout(RUN_EXEC_TIMEOUT, async {
-        pooled.handle.lock().await.channel_open_session().await
+    let channel = match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+        Box::pin(async move { handle.channel_open_session().await })
     }).await {
         Ok(Ok(c)) => { info!("ssh: session channel opened"); c }
         Ok(Err(e)) => {
@@ -864,8 +891,11 @@ async fn run_ssh_channel_loop_after_first_open(
         let path = new_ctl_socket_path();
         let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<CtlInbound>();
         pooled.ctl_forwards.lock().insert(path.clone(), ctl_tx);
-        match pooled.handle.lock().await.streamlocal_forward(path.clone()).await {
-            Ok(()) => {
+        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+            let path = path.clone();
+            Box::pin(async move { handle.streamlocal_forward(path).await })
+        }).await {
+            Ok(Ok(())) => {
                 info!("ctl-socket: forwarding {} (Epic M)", path);
                 let forward_event_tx = event_tx.clone();
                 // `setvar`/`getvar`(task #16)のこのタブ専用ストア(`VarScope::Tab`/
@@ -940,8 +970,13 @@ async fn run_ssh_channel_loop_after_first_open(
                 });
                 Some(path)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("ctl-socket: streamlocal_forward {} failed: {}", path, e);
+                pooled.ctl_forwards.lock().remove(&path);
+                None
+            }
+            Err(_) => {
+                warn!("ctl-socket: streamlocal_forward {} timed out after {:?}", path, RUN_EXEC_TIMEOUT);
                 pooled.ctl_forwards.lock().remove(&path);
                 None
             }
@@ -1040,8 +1075,11 @@ async fn run_ssh_channel_loop_after_first_open(
                             reject_non_loopback_bind(&event_tx, id, &bind_addr).await;
                         } else {
                             info!("forward[{}]: add(remote) {}:{} -> {}:{}", id, bind_addr, bind_port, target_host, target_port);
-                            match session.lock().await.tcpip_forward(bind_addr.clone(), bind_port as u32).await {
-                                Ok(bound_port) => {
+                            match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+                                let bind_addr = bind_addr.clone();
+                                Box::pin(async move { handle.tcpip_forward(bind_addr, bind_port as u32).await })
+                            }).await {
+                                Ok(Ok(bound_port)) => {
                                     let bound_port = if bind_port == 0 { bound_port as u16 } else { bind_port };
                                     remote_forwards.lock().insert(bound_port, (target_host, target_port));
                                     if let Some(old) = active_forwards.insert(
@@ -1054,10 +1092,35 @@ async fn run_ssh_channel_loop_after_first_open(
                                         id, state: ForwardState::Listening,
                                     }).await.ok();
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     warn!("forward[{}]: tcpip_forward {}:{} failed: {}", id, bind_addr, bind_port, e);
                                     event_tx.send(TransportEvent::ForwardStateChanged {
                                         id, state: ForwardState::Failed { reason: e.to_string() },
+                                    }).await.ok();
+                                }
+                                Err(_) => {
+                                    warn!("forward[{}]: tcpip_forward {}:{} timed out after {:?}", id, bind_addr, bind_port, RUN_EXEC_TIMEOUT);
+                                    if bind_port != 0 {
+                                        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+                                            let bind_addr = bind_addr.clone();
+                                            Box::pin(async move { handle.cancel_tcpip_forward(bind_addr, bind_port as u32).await })
+                                        }).await {
+                                            Ok(Ok(())) => {
+                                                debug!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout succeeded", id, bind_addr, bind_port);
+                                            }
+                                            Ok(Err(e)) => {
+                                                warn!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout failed: {}", id, bind_addr, bind_port, e);
+                                            }
+                                            Err(_) => {
+                                                warn!("forward[{}]: best-effort cancel_tcpip_forward {}:{} after timeout timed out after {:?}", id, bind_addr, bind_port, RUN_EXEC_TIMEOUT);
+                                            }
+                                        }
+                                    }
+                                    event_tx.send(TransportEvent::ForwardStateChanged {
+                                        id,
+                                        state: ForwardState::Failed {
+                                            reason: format!("tcpip_forward timed out after {:?}", RUN_EXEC_TIMEOUT),
+                                        },
                                     }).await.ok();
                                 }
                             }
@@ -1109,8 +1172,17 @@ async fn run_ssh_channel_loop_after_first_open(
     }
     if let Some(path) = ctl_socket_path {
         pooled.ctl_forwards.lock().remove(&path);
-        if let Err(e) = session.lock().await.cancel_streamlocal_forward(path.clone()).await {
-            debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
+        match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
+            let path = path.clone();
+            Box::pin(async move { handle.cancel_streamlocal_forward(path).await })
+        }).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
+            }
+            Err(_) => {
+                debug!("ctl-socket: cancel_streamlocal_forward {} timed out after {:?} (best-effort)", path, RUN_EXEC_TIMEOUT);
+            }
         }
         // タスク#59: このタブのctl-socketパスがもう有効ではないことをレジストリにも
         // 反映する(ロケータ自体は`unregister`しない——タブが閉じたわけではなく、
