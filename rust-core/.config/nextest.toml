@@ -17,5 +17,5 @@ retries = 0
 # `FaultyStream`を使い、russh内部タスクの`is_closed()`反映のスケジューリングに依存する
 # (本当にバグがあればリトライしても毎回失敗する=実バグは見逃さない)。
 [[profile.ci.overrides]]
-filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::(underlying_connection_loss_disconnects_all_sharing_tabs|dead_pooled_handle_is_not_reused_after_underlying_connection_loss)$/))'
+filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::(underlying_connection_loss_disconnects_all_sharing_tabs|dead_pooled_handle_is_not_reused_after_underlying_connection_loss|dead_pooled_handle_is_not_reused_after_silent_blackhole)$/))'
 retries = 2

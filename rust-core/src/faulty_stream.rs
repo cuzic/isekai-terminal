@@ -21,11 +21,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[derive(Clone)]
 pub(crate) struct FaultInjector {
     cut: Arc<AtomicBool>,
+    blackhole: Arc<AtomicBool>,
 }
 
 impl FaultInjector {
     pub(crate) fn new() -> Self {
-        Self { cut: Arc::new(AtomicBool::new(false)) }
+        Self { cut: Arc::new(AtomicBool::new(false)), blackhole: Arc::new(AtomicBool::new(false)) }
     }
 
     /// 即座にネットワーク切断状態にする。以降の read は EOF、write は
@@ -34,8 +35,21 @@ impl FaultInjector {
         self.cut.store(true, Ordering::Relaxed);
     }
 
+    /// サイレント遮断にする(UDPの`FaultySender::poll_send`が「送ったふりをして破棄」する
+    /// のと同じ故障の出方)。以降の read は永遠に`Pending`(EOFもエラーも返さない)、
+    /// write は成功したふりをして破棄する。`cut()`(EOF/`ConnectionReset`=TCP RST相当)と
+    /// 違い、上位層は相手からの応答が無いこと(keepalive等のタイムアウト)でしか死亡に
+    /// 気付けない。復旧(restore)は提供しない(必要になったら足す)。`cut()`が優先される。
+    pub(crate) fn blackhole(&self) {
+        self.blackhole.store(true, Ordering::Relaxed);
+    }
+
     fn is_cut(&self) -> bool {
         self.cut.load(Ordering::Relaxed)
+    }
+
+    fn is_blackholed(&self) -> bool {
+        self.blackhole.load(Ordering::Relaxed)
     }
 }
 
@@ -62,6 +76,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for FaultyStream<S> {
         if self.injector.is_cut() {
             return Poll::Ready(Ok(())); // EOF
         }
+        if self.injector.is_blackholed() {
+            // wakerを登録しないのは意図的: blackholeは復旧しない(永久に無応答)ので起こす必要が無い。
+            return Poll::Pending;
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -75,12 +93,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FaultyStream<S> {
         if self.injector.is_cut() {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)));
         }
+        if self.injector.is_blackholed() {
+            return Poll::Ready(Ok(buf.len())); // 送ったふりをして破棄
+        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.injector.is_cut() {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)));
+        }
+        if self.injector.is_blackholed() {
+            return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -118,6 +142,46 @@ mod tests {
         let n = faulty.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "cut 後の read は EOF を返す");
 
+        let err = faulty.write_all(b"x").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blackhole_swallows_writes_and_reads_never_complete() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let injector = FaultInjector::new();
+        let mut faulty = FaultyStream::new(server, injector.clone());
+
+        injector.blackhole();
+
+        // write は成功するが、相手には届かない。
+        faulty.write_all(b"lost").await.expect("blackholed write pretends to succeed");
+        faulty.flush().await.expect("blackholed flush pretends to succeed");
+        let mut peer_buf = [0u8; 4];
+        let peer_read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read(&mut peer_buf),
+        ).await;
+        assert!(peer_read.is_err(), "blackholed write must not reach the peer");
+
+        // 相手がデータを送っても、read は EOF もエラーも返さず永遠に完了しない。
+        client.write_all(b"ignored").await.unwrap();
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(3600), faulty.read(&mut buf)).await;
+        assert!(read.is_err(), "blackholed read must stay pending (no EOF, no error)");
+    }
+
+    #[tokio::test]
+    async fn cut_takes_precedence_over_blackhole() {
+        let (_client, server) = tokio::io::duplex(64);
+        let injector = FaultInjector::new();
+        let mut faulty = FaultyStream::new(server, injector.clone());
+
+        injector.blackhole();
+        injector.cut();
+
+        let mut buf = [0u8; 1];
+        assert_eq!(faulty.read(&mut buf).await.unwrap(), 0, "cut wins: EOF");
         let err = faulty.write_all(b"x").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
     }
