@@ -699,12 +699,31 @@ mod tests {
             }
         }
 
+        fn expect_waiters_see_failure(
+            waiters: &mut Vec<tokio::sync::watch::Receiver<Option<Result<Arc<ModelVal>, String>>>>,
+            expected: &str,
+            ctx: &str,
+        ) {
+            for rx in waiters.drain(..) {
+                let seen = rx.borrow().clone();
+                match seen {
+                    Some(Err(message)) => {
+                        assert_eq!(message, expected, "{ctx}: a waiter saw a different failure message")
+                    }
+                    _ => panic!("{ctx}: a waiter did not observe the published failure"),
+                }
+            }
+        }
+
         fn run_model(ops: &[Op]) {
             let pool: &'static PoolMap<u32, ModelVal> = &MODEL_POOL;
             let key = NEXT_KEY.fetch_add(1, Ordering::SeqCst);
             let mut state = ModelState::Absent;
             let mut holders: u32 = 0;
             let mut stale: Option<Arc<ModelVal>> = None;
+            // Connecting中にWaiterとして受け取った受信側。確立担当のpublish結果が全員に
+            // 配信されること(watchのブロードキャスト)も検証する。
+            let mut waiters = Vec::new();
 
             for (step, op) in ops.iter().enumerate() {
                 let ctx = format!("step {step} ({op:?})");
@@ -717,7 +736,10 @@ mod tests {
                             (ModelState::Absent | ModelState::Dead, AttachOutcome::Establisher) => {
                                 Some(ModelState::Connecting)
                             }
-                            (ModelState::Connecting, AttachOutcome::Waiter(_)) => None,
+                            (ModelState::Connecting, AttachOutcome::Waiter(rx)) => {
+                                waiters.push(rx);
+                                None
+                            }
                             (ModelState::Ready(v), AttachOutcome::Ready(got)) if v.is_alive() => {
                                 assert!(Arc::ptr_eq(v, &got), "{ctx}: returned a different value than the pooled one");
                                 None
@@ -739,12 +761,23 @@ mod tests {
                     Op::PublishOk => {
                         if matches!(state, ModelState::Connecting) {
                             let arc = publish_success(pool, &key, ModelVal { alive: AtomicBool::new(true) });
+                            for rx in waiters.drain(..) {
+                                let seen = rx.borrow().clone();
+                                match seen {
+                                    Some(Ok(v)) => assert!(
+                                        Arc::ptr_eq(&v, &arc),
+                                        "{ctx}: a waiter received a different value than the published one"
+                                    ),
+                                    _ => panic!("{ctx}: a waiter did not observe the published success"),
+                                }
+                            }
                             state = ModelState::Ready(arc);
                         }
                     }
                     Op::PublishFail => {
                         if matches!(state, ModelState::Connecting) {
                             publish_failure(pool, &key, "model failure".to_string());
+                            expect_waiters_see_failure(&mut waiters, "model failure", &ctx);
                             state = ModelState::Dead;
                         }
                     }
@@ -783,6 +816,7 @@ mod tests {
             // 必ず0まで到達する(=どの経路でもattachとreleaseが1対1で対応する)ことを確認する。
             if matches!(state, ModelState::Connecting) {
                 publish_failure(pool, &key, "model teardown".to_string());
+                expect_waiters_see_failure(&mut waiters, "model teardown", "teardown");
                 state = ModelState::Dead;
             }
             while holders > 0 {
@@ -790,6 +824,9 @@ mod tests {
                 holders -= 1;
             }
             check_against_model(key, &state, 0, "teardown");
+            // 共有staticのプールにエントリを残さない(`cargo test`の1プロセス実行でも蓄積しない)。
+            // `release`が起動した1時間のタイマーは、世代/refcount条件で何もせず終わる。
+            MODEL_POOL.lock().remove(&key);
         }
 
         proptest! {
