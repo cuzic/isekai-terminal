@@ -81,3 +81,30 @@ pub fn isekai_mux_config(multipath: bool) -> MuxClientConfig {
 pub fn system_quic_factory() -> AnyMuxFactory {
     AnyMuxFactory::noq(isekai_mux_config(true))
 }
+
+#[cfg(test)]
+mod timing_relations {
+    use super::*;
+
+    /// The keep-alive interval is documented as "1/3 of the idle timeout so a handful of
+    /// lost PINGs can be tolerated" (see the constants' docs). A change to only one of the two
+    /// would silently break that tolerance (e.g. keep-alive == idle timeout means a single lost
+    /// PING kills the connection).
+    #[test]
+    fn keep_alive_is_a_third_of_the_idle_timeout() {
+        assert_eq!(CLIENT_KEEP_ALIVE_INTERVAL * 3, CLIENT_MAX_IDLE_TIMEOUT);
+    }
+
+    /// `isekai_mux_config` must carry exactly these two values, for both multipath settings
+    /// (`isekai-terminal-core`'s Android factory builds its config through this function, so
+    /// there is no second copy of the numbers left to drift).
+    #[test]
+    fn mux_config_uses_the_named_timeouts() {
+        for multipath in [false, true] {
+            let config = isekai_mux_config(multipath);
+            assert_eq!(config.max_idle_timeout, CLIENT_MAX_IDLE_TIMEOUT);
+            assert_eq!(config.keep_alive_interval, CLIENT_KEEP_ALIVE_INTERVAL);
+            assert_eq!(config.multipath, multipath);
+        }
+    }
+}
