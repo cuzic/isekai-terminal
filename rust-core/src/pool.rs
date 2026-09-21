@@ -599,4 +599,206 @@ mod tests {
             "zero-refcount publish_failure tombstone should be removed"
         );
     }
+
+    // ── ランダム操作列によるモデルベーステスト ─────────────
+    //
+    // 個別のテストは「決めた順序の操作」しか見ない。ここでは`try_attach_with`/`publish_success`/
+    // `publish_failure`/`mark_dead_if_same`/`release`の**任意の操作列**を、単純な参照モデル
+    // (期待する状態・refcountを別に持つ)と突き合わせる。refcountのリークや、tombstone・
+    // 差し替え(Ready→Connecting)を跨いだ状態の食い違い(#120と同種の「エラー後に状態が
+    // 残る」バグ)を、操作の組み合わせから探す。
+    //
+    // 削除タイマーの満了は対象外: `release`のgraceを1時間にして発火させない(タイマー満了の
+    // 検証は上のgrace系テストが担当)。これによりモデルが決定論的になり、実時間に依存しない。
+    mod model_based {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::{Arc, LazyLock};
+        use std::time::Duration;
+
+        use proptest::prelude::*;
+
+        use crate::pool::{
+            mark_dead_if_same, new_pool_map, publish_failure, publish_success, release,
+            try_attach_with, AttachOutcome, EntryState, PoolMap,
+        };
+
+        struct ModelVal {
+            alive: AtomicBool,
+        }
+
+        impl ModelVal {
+            fn is_alive(&self) -> bool {
+                self.alive.load(Ordering::SeqCst)
+            }
+        }
+
+        static MODEL_POOL: LazyLock<PoolMap<u32, ModelVal>> = LazyLock::new(new_pool_map);
+        /// ケースごとに別のキーを使い、共有staticのプールでケース間が干渉しないようにする。
+        static NEXT_KEY: AtomicU32 = AtomicU32::new(1_000_000);
+        const NEVER_EXPIRES: Duration = Duration::from_secs(3600);
+
+        #[derive(Debug, Clone, Copy)]
+        enum Op {
+            Attach,
+            PublishOk,
+            PublishFail,
+            /// 現在のReadyの値を「死んだ」ことにする(`is_alive`がfalseを返す)。
+            Kill,
+            /// 現在のReadyの値に対して`mark_dead_if_same`を呼ぶ。
+            MarkDeadCurrent,
+            /// 既に置き換わった古い値に対して`mark_dead_if_same`を呼ぶ(何も起きてはならない)。
+            MarkDeadStale,
+            Release,
+        }
+
+        enum ModelState {
+            Absent,
+            Connecting,
+            Ready(Arc<ModelVal>),
+            Dead,
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                4 => Just(Op::Attach),
+                3 => Just(Op::Release),
+                2 => Just(Op::PublishOk),
+                1 => Just(Op::PublishFail),
+                1 => Just(Op::Kill),
+                1 => Just(Op::MarkDeadCurrent),
+                1 => Just(Op::MarkDeadStale),
+            ]
+        }
+
+        fn outcome_label(o: &AttachOutcome<ModelVal>) -> &'static str {
+            match o {
+                AttachOutcome::Ready(_) => "Ready",
+                AttachOutcome::Waiter(_) => "Waiter",
+                AttachOutcome::Establisher => "Establisher",
+            }
+        }
+
+        fn check_against_model(key: u32, state: &ModelState, holders: u32, ctx: &str) {
+            let map = MODEL_POOL.lock();
+            match map.get(&key) {
+                None => assert!(
+                    matches!(state, ModelState::Absent) && holders == 0,
+                    "{ctx}: entry is absent but the model expects one (holders={holders})"
+                ),
+                Some(entry) => {
+                    assert_eq!(entry.refcount, holders, "{ctx}: refcount diverged from the model");
+                    match (&entry.state, state) {
+                        (EntryState::Connecting(_), ModelState::Connecting) => {}
+                        (EntryState::Dead, ModelState::Dead) => {}
+                        (EntryState::Ready(actual), ModelState::Ready(expected)) => {
+                            assert!(Arc::ptr_eq(actual, expected), "{ctx}: a different Ready value than the model expects")
+                        }
+                        _ => panic!("{ctx}: entry state diverged from the model"),
+                    }
+                }
+            }
+        }
+
+        fn run_model(ops: &[Op]) {
+            let pool: &'static PoolMap<u32, ModelVal> = &MODEL_POOL;
+            let key = NEXT_KEY.fetch_add(1, Ordering::SeqCst);
+            let mut state = ModelState::Absent;
+            let mut holders: u32 = 0;
+            let mut stale: Option<Arc<ModelVal>> = None;
+
+            for (step, op) in ops.iter().enumerate() {
+                let ctx = format!("step {step} ({op:?})");
+                match op {
+                    Op::Attach => {
+                        let outcome = try_attach_with(pool, &key, ModelVal::is_alive);
+                        holders += 1;
+                        // 借用の都合で、状態の更新はmatchの外で行う。
+                        let next_state = match (&state, outcome) {
+                            (ModelState::Absent | ModelState::Dead, AttachOutcome::Establisher) => {
+                                Some(ModelState::Connecting)
+                            }
+                            (ModelState::Connecting, AttachOutcome::Waiter(_)) => None,
+                            (ModelState::Ready(v), AttachOutcome::Ready(got)) if v.is_alive() => {
+                                assert!(Arc::ptr_eq(v, &got), "{ctx}: returned a different value than the pooled one");
+                                None
+                            }
+                            (ModelState::Ready(v), AttachOutcome::Establisher) if !v.is_alive() => {
+                                // 死んだReadyは返さず、同じスロットを新しい確立へ差し替える。
+                                stale = Some(v.clone());
+                                Some(ModelState::Connecting)
+                            }
+                            (_, got) => panic!(
+                                "{ctx}: unexpected outcome {} for the model state (a dead value must never be returned as Ready)",
+                                outcome_label(&got)
+                            ),
+                        };
+                        if let Some(next) = next_state {
+                            state = next;
+                        }
+                    }
+                    Op::PublishOk => {
+                        if matches!(state, ModelState::Connecting) {
+                            let arc = publish_success(pool, &key, ModelVal { alive: AtomicBool::new(true) });
+                            state = ModelState::Ready(arc);
+                        }
+                    }
+                    Op::PublishFail => {
+                        if matches!(state, ModelState::Connecting) {
+                            publish_failure(pool, &key, "model failure".to_string());
+                            state = ModelState::Dead;
+                        }
+                    }
+                    Op::Kill => {
+                        if let ModelState::Ready(v) = &state {
+                            v.alive.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    Op::MarkDeadCurrent => {
+                        let current = match &state {
+                            ModelState::Ready(v) => Some(v.clone()),
+                            _ => None,
+                        };
+                        if let Some(v) = current {
+                            mark_dead_if_same(pool, &key, &v);
+                            stale = Some(v);
+                            state = ModelState::Dead;
+                        }
+                    }
+                    Op::MarkDeadStale => {
+                        if let Some(old) = &stale {
+                            mark_dead_if_same(pool, &key, old);
+                        }
+                    }
+                    Op::Release => {
+                        if holders > 0 {
+                            release(pool, key, NEVER_EXPIRES);
+                            holders -= 1;
+                        }
+                    }
+                }
+                check_against_model(key, &state, holders, &ctx);
+            }
+
+            // 後始末: 確立担当が残っていれば失敗を告げ、全保持者がreleaseしたときrefcountが
+            // 必ず0まで到達する(=どの経路でもattachとreleaseが1対1で対応する)ことを確認する。
+            if matches!(state, ModelState::Connecting) {
+                publish_failure(pool, &key, "model teardown".to_string());
+                state = ModelState::Dead;
+            }
+            while holders > 0 {
+                release(pool, key, NEVER_EXPIRES);
+                holders -= 1;
+            }
+            check_against_model(key, &state, 0, "teardown");
+        }
+
+        proptest! {
+            #[test]
+            fn pool_matches_reference_model_under_random_operations(
+                ops in proptest::collection::vec(op_strategy(), 1..60)
+            ) {
+                run_model(&ops);
+            }
+        }
+    }
 }
