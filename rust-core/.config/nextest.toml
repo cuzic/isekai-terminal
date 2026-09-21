@@ -13,6 +13,9 @@ retries = 0
 # も同種(`FaultyStream`で基盤TCPを切断しイベント伝播を待つ)で、開発機の高負荷下で
 # 実際に`expect_disconnected`のtimeoutが間に合わず落ちるのを確認したため同じ扱いにする
 # (該当timeoutは`Duration::from_secs(20)`まで既に緩めた上での追加保険)。
+# `dead_pooled_handle_is_not_reused_after_underlying_connection_loss`も同じ
+# `FaultyStream`を使い、russh内部タスクの`is_closed()`反映のスケジューリングに依存する
+# (本当にバグがあればリトライしても毎回失敗する=実バグは見逃さない)。
 [[profile.ci.overrides]]
-filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::underlying_connection_loss_disconnects_all_sharing_tabs$/))'
+filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::(underlying_connection_loss_disconnects_all_sharing_tabs|dead_pooled_handle_is_not_reused_after_underlying_connection_loss)$/))'
 retries = 2

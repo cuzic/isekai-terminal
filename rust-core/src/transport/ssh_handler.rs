@@ -1949,7 +1949,118 @@ mod pooling_e2e_tests {
             expect_disconnected(&mut rx_b, "tab B").await;
             expect_disconnected(&mut rx_c, "tab C").await;
 
+            // (このテストは意図的にSSH_POOLへ登録しない=fate sharingのみを見るので、以下は
+            // no-op。プールの挙動を見るテストは`dead_pooled_handle_is_not_reused_...`。)
             crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(10));
+        });
+    }
+
+    /// 基盤接続が死んだ後、プールが死んだHandleを再利用して**はいけない**ことを、実際の
+    /// russhの`Handle`で検証する(issue #120の回帰テスト)。
+    ///
+    /// `pool.rs`側の単体テスト(`try_attach_with_dead_ready_value_becomes_establisher_...`)は
+    /// `is_alive`を差し替えた述語で検証しているため、本番の`PooledSshHandle::is_alive`
+    /// (`handle.try_lock().map(|h| !h.is_closed()).unwrap_or(true)`)が実際に死んだ
+    /// `client::Handle`を「死んでいる」と判定できるか、は別途ここで確認する必要がある。
+    /// 本番と同じ順序を再現する: セッション終了→`release`(grace付き、refcount 0)→
+    /// grace内に次の`try_attach_with`(orchestratorの再接続が新規接続を試みる時点)。
+    ///
+    /// **カバー範囲の限定**: このテストは、誰もHandleのロックを握っていない状態で
+    /// `FaultyStream::cut()`(EOF/`ConnectionReset`=TCP RST相当)した場合のみを見る。
+    /// `is_alive`の`try_lock`失敗→「生存」扱い(`unwrap_or(true)`)の分岐と、UDPのサイレント
+    /// 遮断(`debugCutUdpFault`相当)で`is_closed()`が立つまでの時間は未検証
+    /// (`ADR_CONNECTION_RESILIENCE_SIMULATION.md` L0-2/L0-3)。
+    /// graceには本番の`SSH_POOL`と同じ`PLAIN_SSH_IDLE_GRACE`(30秒。QUICプールは90秒)を
+    /// 使う。この間に死んだ値が生き残っていることがバグの本質だったため、短いgraceだと
+    /// 削除タイマーがバグを覆い隠してしまう。
+    #[test]
+    fn dead_pooled_handle_is_not_reused_after_underlying_connection_loss() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(150);
+            let key = crate::pool::SshPoolKey::for_target(
+                &addr.ip().to_string(), addr.port(), "tester", &auth, false, &None,
+            ).expect("pubkey auth should produce a pool key");
+
+            let (hostkey_tx, mut hostkey_rx) = tokio::sync::mpsc::channel::<TransportEvent>(16);
+            tokio::spawn(async move {
+                while let Some(event) = hostkey_rx.recv().await {
+                    if let TransportEvent::HostKey(_, reply) = event {
+                        let _ = reply.send(true);
+                    }
+                }
+            });
+
+            // 1本目: 本番と同じくEstablisherとして確立し、プールへ登録する(refcount=1)。
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
+                crate::pool::AttachOutcome::Establisher => {}
+                _ => panic!("a brand new key must be the Establisher"),
+            }
+            let tcp = TokioTcpStream::connect(addr).await.expect("tcp connect should succeed");
+            let injector = FaultInjector::new();
+            let faulty = FaultyStream::new(tcp, injector.clone());
+            let mut auth1 = auth.clone();
+            let pooled = establish_ssh_handle_over_stream(
+                Arc::new(client::Config::default()), faulty, "tester", &mut auth1, false, &hostkey_tx,
+            ).await.expect("establish over the faulty-wrapped TCP stream should succeed");
+            let pooled = crate::pool::publish_success(&crate::pool::SSH_POOL, &key, pooled);
+            assert_eq!(auth_count.load(Ordering::SeqCst), 1);
+            assert!(pooled.is_alive(), "a freshly established handle must be reported alive");
+
+            let (_cmd, mut rx) = spawn_pooled_tab(pooled.clone()).await;
+
+            // 基盤接続を切断する。タブは`Disconnected`になり、本番ではここで
+            // `run_ssh_channel_loop`が戻って`release`が呼ばれる。
+            injector.cut();
+            expect_disconnected(&mut rx, "the only tab").await;
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), crate::pool::PLAIN_SSH_IDLE_GRACE);
+
+            // russh側がセッションループの終了を反映して`is_closed()`になるまでは
+            // 僅かに遅れうる(内部タスクのスケジューリング依存)。本番の再接続予算
+            // (`ReconnectPolicy::default().timeout`=60秒)を大きく下回る15秒以内に死亡と
+            // 判定されることを要求する。CPU競合下のflake対策で`nextest.toml`のretry対象。
+            // まだ`release`のgrace内なので、この間エントリは消えない。
+            assert!(
+                crate::pool::SSH_POOL.lock().contains_key(&key),
+                "the pool entry must still exist during the idle grace (otherwise Establisher would be trivially returned)"
+            );
+            let mut became_dead = false;
+            for _ in 0..750 {
+                if !pooled.is_alive() {
+                    became_dead = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                became_dead,
+                "PooledSshHandle::is_alive() must turn false after the underlying connection is lost"
+            );
+
+            // 死んだHandleは返さず、新規確立(Establisher)に落ちなければならない。
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
+                crate::pool::AttachOutcome::Establisher => {}
+                crate::pool::AttachOutcome::Ready(_) => {
+                    panic!("the pool returned a dead handle (issue #120 regression)")
+                }
+                crate::pool::AttachOutcome::Waiter(_) => {
+                    panic!("unexpected Waiter: no one else is establishing this key")
+                }
+            }
+
+            // 後始末: 確立担当として失敗を告げ(tombstone化)、最後のreleaseで削除させて
+            // 共有staticの`SSH_POOL`に残留エントリを残さない。
+            crate::pool::publish_failure(&crate::pool::SSH_POOL, &key, "test cleanup".to_string());
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(10));
+            for _ in 0..50 {
+                if !crate::pool::SSH_POOL.lock().contains_key(&key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
     }
 
