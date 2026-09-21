@@ -770,6 +770,14 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
 
+    /// `ISEKAI_PIPE_QUIC_IDLE_GRACE`のdocが述べる設計意図: QUIC接続の確立コスト(ヘルパー起動+
+    /// QUICハンドシェイク+ネスト認証)はプレーンSSHより高いので、猶予も長くする。片方だけを
+    /// 変更してこの関係が逆転する(=コストの高い接続のほうを先に手放す)ことを防ぐ。
+    #[test]
+    fn quic_pool_idle_grace_exceeds_plain_ssh_idle_grace() {
+        assert!(ISEKAI_PIPE_QUIC_IDLE_GRACE > crate::pool::PLAIN_SSH_IDLE_GRACE);
+    }
+
     // ── spawn_bootstrap_host_key_forwarder: 実SSH/QUIC不要のユニットテスト ──
     // Task #56: ブートストラップ用SSH接続のホスト鍵イベントが、以前のように無条件で
     // 承認されるのではなく、本セッションのcallback(Kotlin側のKnownHostRepositoryを

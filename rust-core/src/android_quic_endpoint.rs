@@ -22,10 +22,8 @@
 //! `isekai_transport::system::system_quic_factory`'s equivalent.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use quicmux::{AnyMuxFactory, MuxClientConfig};
+use quicmux::AnyMuxFactory;
 
 use crate::debug_fault;
 use crate::faulty_udp_socket::FaultyUdpSocket;
@@ -36,26 +34,17 @@ use crate::faulty_udp_socket::FaultyUdpSocket;
 /// `isekai-transport`'s relay/resume/STUN-P2P connection-establishment
 /// functions.
 pub(crate) fn factory() -> AnyMuxFactory {
-    let config = MuxClientConfig {
-        alpn: ALPN.to_vec(),
-        exporter_label: EXPORTER_LABEL.to_vec(),
-        max_idle_timeout: Duration::from_secs(15),
-        keep_alive_interval: Duration::from_secs(5),
-        max_concurrent_bidi_streams: 1,
-        max_concurrent_uni_streams: 0,
-        // `AnyMuxEndpoint::rebinder()` is meaningless without multipath
-        // negotiated (see `quicmux::noq_client_config`'s docs on why), but
-        // Android never calls `rebinder()` on an endpoint built through this
-        // factory in the first place — `multipath_transport.rs` handles
-        // physical-interface failover through its own mechanism, not
-        // `quicmux::AnyMuxRebinder` — so there is nothing on the Android side
-        // that could ever make multipath negotiation worth the (harmless,
-        // but non-zero) extra transport parameter.
-        multipath: false,
-        // The Android app never sends QUIC datagrams today — see
-        // `quicmux`'s `MuxClientConfig::datagram_send_buffer_size` docs.
-        datagram_send_buffer_size: None,
-    };
+    // idle timeout/keepalive/ストリーム上限等は`isekai-transport`の単一の定義に従う。
+    // かつてはここに同じ値(15秒/5秒等)をリテラルで複製しており、`system.rs`側だけを
+    // 変更すると片方だけ古い値になるリスクがあった。
+    //
+    // `multipath: false`: `AnyMuxEndpoint::rebinder()`はmultipathをネゴシエートしていないと
+    // 無意味だが(`quicmux::noq_client_config`のdoc参照)、Androidはこのfactoryで作った
+    // endpointに対して`rebinder()`を呼ぶことが元々無い(`multipath_transport.rs`が
+    // `quicmux::AnyMuxRebinder`ではない独自の仕組みで物理インタフェースのfailoverを扱う)ため、
+    // multipathネゴシエーションで増える(無害だが非ゼロの)transport parameterを
+    // 払う価値が無い。
+    let config = isekai_transport::system::isekai_mux_config(false);
 
     AnyMuxFactory::noq_with_socket_adapter(
         config,
