@@ -2064,6 +2064,141 @@ mod pooling_e2e_tests {
         });
     }
 
+    /// UDPサイレント遮断(`debugCutUdpFault`相当: 送ったふりをして破棄、EOFもエラーも出ない)
+    /// でも、本番のrussh設定(keepalive 60秒×3)で**いずれ**基盤接続が死亡判定され、プールが
+    /// 死んだHandleを再利用しないことを検証する(`ADR_CONNECTION_RESILIENCE_SIMULATION.md`
+    /// L0-2 / Q8)。`dead_pooled_handle_is_not_reused_after_underlying_connection_loss`
+    /// (EOF/RST版)と対になる。
+    ///
+    /// 死亡検出までの時間は実時間で数分かかるので、接続確立(実I/Oが要る)を済ませてから
+    /// `tokio::time::pause()`で仮想時間に切り替え、全タスクがidleになるたびに時計が自動で
+    /// 進む挙動(auto-advance)に任せる(`current_thread`ランタイム必須)。
+    ///
+    /// **russh 0.48.2の実装(`client/mod.rs`のkeepaliveタイマー)からの期待値**: タイマーは
+    /// `keepalive_interval`ごとに発火し、`alive_timeouts > keepalive_max`のときに
+    /// `KeepaliveTimeout`で切断する。無応答なら発火は60/120/180/240秒目(alive_timeouts 0→4)で、
+    /// 300秒目に切断される。よって死亡検出は **`interval × (max + 2)` = 300秒**前後。
+    /// これは再接続予算(60秒)より長いが、再接続ループはDisconnected通知の後に始まるので予算とは
+    /// 衝突しない。ただし**その間(最大300秒)、他タブが同じプールキーでアタッチすると
+    /// `is_alive()`が真のまま死んだHandleを掴む**(共有接続の設計上の限界。`try_lock`失敗の
+    /// 分岐は別途L0-3)。
+    #[test]
+    fn dead_pooled_handle_is_not_reused_after_silent_blackhole() {
+        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+        const KEEPALIVE_MAX: usize = 3;
+
+        crate::init_logger();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build current_thread test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(160);
+            let key = crate::pool::SshPoolKey::for_target(
+                &addr.ip().to_string(), addr.port(), "tester", &auth, false, &None,
+            ).expect("pubkey auth should produce a pool key");
+
+            let (hostkey_tx, mut hostkey_rx) = tokio::sync::mpsc::channel::<TransportEvent>(16);
+            tokio::spawn(async move {
+                while let Some(event) = hostkey_rx.recv().await {
+                    if let TransportEvent::HostKey(_, reply) = event {
+                        let _ = reply.send(true);
+                    }
+                }
+            });
+
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
+                crate::pool::AttachOutcome::Establisher => {}
+                _ => panic!("a brand new key must be the Establisher"),
+            }
+            // 本番のプレーンSSH(`lib.rs`の`run_russh_transport`)と同じkeepalive設定。
+            let russh_config = Arc::new(client::Config {
+                keepalive_interval: Some(KEEPALIVE_INTERVAL),
+                keepalive_max: KEEPALIVE_MAX,
+                ..client::Config::default()
+            });
+            let tcp = TokioTcpStream::connect(addr).await.expect("tcp connect should succeed");
+            let injector = FaultInjector::new();
+            let faulty = FaultyStream::new(tcp, injector.clone());
+            let mut auth1 = auth.clone();
+            let pooled = establish_ssh_handle_over_stream(
+                russh_config, faulty, "tester", &mut auth1, false, &hostkey_tx,
+            ).await.expect("establish over the faulty-wrapped TCP stream should succeed");
+            let pooled = crate::pool::publish_success(&crate::pool::SSH_POOL, &key, pooled);
+            let (_cmd, mut rx) = spawn_pooled_tab(pooled.clone()).await;
+
+            // 実I/Oが必要な確立・認証・チャネル開設は済んだので、ここから仮想時間にする。
+            tokio::time::pause();
+            let start = tokio::time::Instant::now();
+            injector.blackhole();
+
+            // タブがDisconnectedになるまでの(仮想)経過時間を測る。
+            let upper_bound = KEEPALIVE_INTERVAL * (KEEPALIVE_MAX as u32 + 3);
+            let detected = tokio::time::timeout(upper_bound, async {
+                loop {
+                    match rx.recv().await {
+                        Some(TransportEvent::Disconnected { .. }) | None => break,
+                        Some(_) => continue,
+                    }
+                }
+            }).await;
+            let elapsed = start.elapsed();
+            assert!(
+                detected.is_ok(),
+                "silent blackhole was not detected within {upper_bound:?} (virtual); the pooled connection would stay 'alive' forever"
+            );
+            // russh 0.48.2: 死亡検出は interval*(max+2)=300秒。ただし最後の受信データから
+            // タイマーが計られるので、確立直後の数msぶん早まりうる。実装が変わって大きくずれたら
+            // (例: keepaliveが効かなくなった/挙動が変わった)気付けるよう帯で固定する。
+            let expected = KEEPALIVE_INTERVAL * (KEEPALIVE_MAX as u32 + 2);
+            assert!(
+                elapsed >= expected - KEEPALIVE_INTERVAL && elapsed <= expected + KEEPALIVE_INTERVAL,
+                "silent-blackhole detection took {elapsed:?} (virtual); expected about {expected:?} \
+                 (keepalive_interval*(keepalive_max+2), russh 0.48.2). If russh was upgraded, re-derive this."
+            );
+
+            // 本番と同じ順序: セッション終了→release(grace付き)→grace内にtry_attach_with。
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), crate::pool::PLAIN_SSH_IDLE_GRACE);
+            assert!(
+                crate::pool::SSH_POOL.lock().contains_key(&key),
+                "the pool entry must still exist during the idle grace (otherwise Establisher would be trivially returned)"
+            );
+            let mut became_dead = false;
+            for _ in 0..750 {
+                if !pooled.is_alive() {
+                    became_dead = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                became_dead,
+                "PooledSshHandle::is_alive() must turn false once the tab observed Disconnected after a silent blackhole"
+            );
+            // ポーリング中にgraceで削除されていないこと(削除されていると、次のtry_attach_withが
+            // 死んだHandleの拒否ではなく単なるエントリ不在でEstablisherを返し、偽グリーンになる)。
+            // graceタイマーはグローバルな実時間のRUNTIME上で動くので通常は起きないが念のため確認する。
+            assert!(
+                crate::pool::SSH_POOL.lock().contains_key(&key),
+                "the pool entry must still exist after the is_alive polling"
+            );
+            match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
+                crate::pool::AttachOutcome::Establisher => {}
+                crate::pool::AttachOutcome::Ready(_) => {
+                    panic!("the pool returned a dead handle after a silent blackhole (issue #120 regression)")
+                }
+                crate::pool::AttachOutcome::Waiter(_) => {
+                    panic!("unexpected Waiter: no one else is establishing this key")
+                }
+            }
+
+            crate::pool::publish_failure(&crate::pool::SSH_POOL, &key, "test cleanup".to_string());
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(10));
+        });
+    }
+
     /// 個別チャネルの終了(リモートシェルプロセスの`exit`等)は、他タブに伝播
     /// "してはいけない"ことを検証する。`underlying_connection_loss_...`とは
     /// 対になるテストで、「伝播すべきもの」と「伝播してはいけないもの」の境界を
