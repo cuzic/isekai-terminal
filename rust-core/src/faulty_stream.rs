@@ -11,8 +11,8 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -22,17 +22,25 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub(crate) struct FaultInjector {
     cut: Arc<AtomicBool>,
     blackhole: Arc<AtomicBool>,
+    /// blackhole中に`poll_read`が`Pending`で待たせたreaderのwaker。後から`cut()`されたときに
+    /// 起こして(EOFを見せて)やるために保持する(blackhole自体は復旧しないので、起こすのは
+    /// `cut()`のときだけ)。
+    parked_reader: Arc<Mutex<Option<Waker>>>,
 }
 
 impl FaultInjector {
     pub(crate) fn new() -> Self {
-        Self { cut: Arc::new(AtomicBool::new(false)), blackhole: Arc::new(AtomicBool::new(false)) }
+        Self { cut: Arc::new(AtomicBool::new(false)), blackhole: Arc::new(AtomicBool::new(false)), parked_reader: Arc::new(Mutex::new(None)) }
     }
 
     /// 即座にネットワーク切断状態にする。以降の read は EOF、write は
     /// `ConnectionReset` を返すようになる。
     pub(crate) fn cut(&self) {
         self.cut.store(true, Ordering::Relaxed);
+        // blackhole中に待たされているreaderがいれば起こし、EOFを見せる。
+        if let Some(waker) = self.parked_reader.lock().unwrap().take() {
+            waker.wake();
+        }
     }
 
     /// サイレント遮断にする(UDPの`FaultySender::poll_send`が「送ったふりをして破棄」する
@@ -77,7 +85,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for FaultyStream<S> {
             return Poll::Ready(Ok(())); // EOF
         }
         if self.injector.is_blackholed() {
-            // wakerを登録しないのは意図的: blackholeは復旧しない(永久に無応答)ので起こす必要が無い。
+            // blackhole自体は復旧しない(永久に無応答)ので通常は起こされないが、後から`cut()`
+            // された場合にEOFを見せられるようwakerだけ保持する。
+            *self.injector.parked_reader.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -110,6 +120,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FaultyStream<S> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.injector.is_blackholed() {
+            // FINも相手に届かない(実際のUDP/TCPのブラックホールでは、こちらの切断すら相手には見えない)。
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -169,6 +183,43 @@ mod tests {
         let mut buf = [0u8; 8];
         let read = tokio::time::timeout(std::time::Duration::from_secs(3600), faulty.read(&mut buf)).await;
         assert!(read.is_err(), "blackholed read must stay pending (no EOF, no error)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blackholed_shutdown_does_not_reach_the_peer() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let injector = FaultInjector::new();
+        let mut faulty = FaultyStream::new(server, injector.clone());
+
+        injector.blackhole();
+        faulty.shutdown().await.expect("blackholed shutdown pretends to succeed");
+
+        let mut buf = [0u8; 1];
+        let peer_read = tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut buf)).await;
+        assert!(peer_read.is_err(), "the peer must not observe EOF from a blackholed shutdown");
+    }
+
+    #[tokio::test]
+    async fn cut_wakes_a_reader_parked_by_blackhole() {
+        let (_client, server) = tokio::io::duplex(64);
+        let injector = FaultInjector::new();
+        let mut faulty = FaultyStream::new(server, injector.clone());
+
+        injector.blackhole();
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            faulty.read(&mut buf).await
+        });
+        // readerが一度pollされてPendingで待つところまで進める。
+        tokio::task::yield_now().await;
+        injector.cut();
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("a reader parked by blackhole must be woken by a later cut()")
+            .expect("reader task must not panic")
+            .expect("read must not error");
+        assert_eq!(n, 0, "cut wins over blackhole: EOF");
     }
 
     #[tokio::test]

@@ -16,6 +16,9 @@ retries = 0
 # `dead_pooled_handle_is_not_reused_after_underlying_connection_loss`も同じ
 # `FaultyStream`を使い、russh内部タスクの`is_closed()`反映のスケジューリングに依存する
 # (本当にバグがあればリトライしても毎回失敗する=実バグは見逃さない)。
+# `dead_pooled_handle_is_not_reused_after_silent_blackhole`は仮想時間で決定論的に動く
+# 設計なので意図的にretry対象にしない(失敗=russhのkeepalive挙動が変わった、または
+# 断続的なis_aliveの競合であり、retryで「flaky pass」に埋もれさせてはいけない)。
 [[profile.ci.overrides]]
-filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::(underlying_connection_loss_disconnects_all_sharing_tabs|dead_pooled_handle_is_not_reused_after_underlying_connection_loss|dead_pooled_handle_is_not_reused_after_silent_blackhole)$/))'
+filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::(underlying_connection_loss_disconnects_all_sharing_tabs|dead_pooled_handle_is_not_reused_after_underlying_connection_loss)$/))'
 retries = 2

@@ -2177,6 +2177,13 @@ mod pooling_e2e_tests {
                 became_dead,
                 "PooledSshHandle::is_alive() must turn false once the tab observed Disconnected after a silent blackhole"
             );
+            // ポーリング中にgraceで削除されていないこと(削除されていると、次のtry_attach_withが
+            // 死んだHandleの拒否ではなく単なるエントリ不在でEstablisherを返し、偽グリーンになる)。
+            // graceタイマーはグローバルな実時間のRUNTIME上で動くので通常は起きないが念のため確認する。
+            assert!(
+                crate::pool::SSH_POOL.lock().contains_key(&key),
+                "the pool entry must still exist after the is_alive polling"
+            );
             match crate::pool::try_attach_with(&crate::pool::SSH_POOL, &key, PooledSshHandle::is_alive) {
                 crate::pool::AttachOutcome::Establisher => {}
                 crate::pool::AttachOutcome::Ready(_) => {
