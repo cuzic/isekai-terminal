@@ -13,6 +13,21 @@
 #   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 #
 # 出力: rust-core/target/<triple>/release/isekai-pipe と .sha256
+#
+# 【並列化してはいけない】2026-09-22、x86_64/aarch64の`cargo zigbuild`を
+# バックグラウンドで同時起動する変更を一度試み、実CIで
+# `Error: File exists (os error 17)`で失敗することを確認した。原因:
+# `cargo-zigbuild`の`ar`/`lib`リンカーラッパーのsymlink作成先ディレクトリ
+# (`wrapper_dir`)は**ターゲットtripleではなく`cargo-zigbuild`実行ファイル
+# パスのハッシュだけで決まる共有ディレクトリ**であり(cargo-zigbuild
+# `src/zig/wrapper.rs`の`wrapper_dir`/`symlink_wrapper`参照)、
+# `symlink_wrapper()`は`if !target.exists() { symlink(...) }`という
+# 存在確認してから作成する実装のため、2つのターゲット向けの呼び出しが
+# 同時にこのチェックを通過すると後発側が`AlreadyExists`で失敗する
+# (cargo自身のtarget/<triple>/以下は独立していて安全だが、
+# cargo-zigbuildが別に持つこの共有キャッシュはそうではない)。
+# `cargo-zigbuild`の内部実装(将来変わりうる)に依存する回避策は
+# 採らず、素直に逐次実行する。
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
