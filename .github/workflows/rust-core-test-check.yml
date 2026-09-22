@@ -228,6 +228,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
 
+      # zigのダウンロード元(ziglang.org)への依存とネットワーク時間を減らす
+      # (2026-09-22追加)。バージョン文字列をキーに含めるので、下のrunステップの
+      # バージョンを上げるときはこのキーも合わせて変える。
+      - name: Cache zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-0.16.0
+
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         # rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で埋め込む
         # isekai-pipe の x86_64/aarch64 musl静的バイナリ。iOS/Androidどちらのビルドにも
@@ -236,12 +245,16 @@ jobs:
         # ios-logic-linux-check.ymlは既に対応済みだったが、このワークフローだけ追従が漏れていた)。
         # `~/.cargo/bin`もキャッシュ対象なので、既にキャッシュヒットでcargo-zigbuildが
         # 入っていれば再インストールしない(2026-07-14、ci-github-actions-speedupで追加)。
+        # zig自体は上のCache zig toolchainステップでキャッシュヒットしていれば
+        # ダウンロード・展開をスキップする(2026-09-22追加)。
         run: |
           set -euo pipefail
-          curl -fL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          mkdir -p "$HOME/zig-toolchain"
-          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+          if [ ! -x "$HOME/zig-toolchain/zig" ]; then
+            curl -fL -o /tmp/zig.tar.xz \
+              "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+            mkdir -p "$HOME/zig-toolchain"
+            tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+          fi
           echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
           export PATH="$HOME/zig-toolchain:$PATH"
           if ! command -v cargo-zigbuild >/dev/null; then
