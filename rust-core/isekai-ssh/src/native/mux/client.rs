@@ -353,6 +353,14 @@ where
     let mut outbox: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     let mut idle_writer: Option<&mut CW> = Some(conn_write);
     let mut in_flight: Option<InFlightWrite<'_, CW>> = None;
+    // Set once a write to the owner fails. The *read* side, not the write
+    // side, decides the outcome from then on: an owner that sent its final
+    // `Frame::Exit` and closed the connection makes a trailing write (e.g.
+    // our `Shutdown` after local EOF) fail, yet the session ended cleanly —
+    // that `Exit` is still waiting in `frame_rx` (the pre-queue code ignored
+    // exactly this `Shutdown` write failure for the same reason). A genuinely
+    // dead owner shows up there as EOF → `OwnerLost` anyway.
+    let mut writer_dead = false;
 
     // Epic P Phase 2: at most one build in flight per tab (a second
     // `BuildRequest` while one is already running is logged and ignored —
@@ -364,7 +372,7 @@ where
 
     loop {
         // Start the next queued write whenever the writer is free.
-        if in_flight.is_none() {
+        if in_flight.is_none() && !writer_dead {
             if let Some(bytes) = outbox.pop_front() {
                 let writer = idle_writer.take().expect("the writer is idle whenever no write is in flight");
                 in_flight = Some(start_write(writer, bytes));
@@ -375,8 +383,9 @@ where
                 in_flight = None;
                 idle_writer = Some(writer);
                 if result.is_err() {
-                    abort_active(&mut active_build).await;
-                    return Ok(ClientOutcome::OwnerLost);
+                    writer_dead = true;
+                    outbox.clear();
+                    stdin_open = false;
                 }
             }
             n = stdin.read(&mut buf), if stdin_open && outbox.len() < MAX_QUEUED_OUTGOING_FRAMES => {
