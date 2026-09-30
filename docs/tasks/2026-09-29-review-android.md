@@ -71,7 +71,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   `DatagramSocket`を閉じない(`fromDatagramSocket`はdupを返す)。失敗経路でも閉じずfdリーク。
   - 方針: `DatagramSocket(null).use { ... }`でdup取得後に必ず元socketを閉じる。
     (`Network.bindSocket`を実ネットワークで要するためJVMテストは無し、静読で確認)
-- [ ] **AND-M5** (Medium) `TerminalTabsViewModel.kt:1059-1065` — tmux連携の予約がprofileId単位の
+- [x] **AND-M5** (Medium) `TerminalTabsViewModel.kt:1059-1065` — tmux連携の予約がprofileId単位の
   Setのため、同一タブの(手動/Rust自動)再接続でensure/フック再インストールがスキップされる。
   - 方針: 予約を「profileId→所有tabId」のマップにし、所有タブ自身の再接続は通す。所有タブを
     閉じたら解放する。
