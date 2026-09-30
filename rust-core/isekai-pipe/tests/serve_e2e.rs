@@ -1517,6 +1517,24 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
 /// the request's `session_id`/`bootstrap_attempt_id`, rather than emitting
 /// the bare `HandshakeJson` line every other test in this file expects
 /// (`spawn_helper` deliberately never passes this flag).
+/// Regression (review 2026-09-29, PIPE-01): `isekai-pipe serve`'s own
+/// argument front-end (`main.rs::parse_serve`) used to reject
+/// `--bind-port-range` as "unsupported option" even though the engine
+/// implemented it and `isekai-bootstrap` generates it for
+/// `#@isekai remote-bind-port-range` — the helper exited before printing a
+/// handshake, so every such bootstrap failed. Exercises the real compiled
+/// binary (the previous coverage only inspected the generated argv string).
+#[tokio::test]
+async fn serve_accepts_bind_port_range_and_binds_inside_it() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &["--bind-port-range", "47000-47999"]);
+    let port = helper
+        .handshake
+        .direct_by_bootstrap_host_port()
+        .expect("handshake should advertise the bound port");
+    assert!((47000..=47999).contains(&port), "bound port {port} outside --bind-port-range");
+}
+
 #[tokio::test]
 async fn bootstrap_request_file_wraps_handshake_in_a_bootstrap_report_v2() {
     let echo_addr = spawn_echo_server().await;

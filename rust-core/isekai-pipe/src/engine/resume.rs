@@ -8,6 +8,8 @@ use quicmux::ReplayBuffer;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, Notify};
 
+use super::attach_arbiter::LeaseId;
+
 pub const CONTROL_HELLO: u8 = 0x10;
 pub const CONTROL_ACK: u8 = 0x11;
 pub const APP_ACK: u8 = 0x12;
@@ -40,8 +42,21 @@ pub type OutputBuffer = ReplayBuffer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
     Inserted,
-    InsertedAfterEvicting(SessionId),
+    InsertedAfterEvicting(Evicted),
     Rejected,
+}
+
+/// A session this table just discarded (LRU eviction or park expiry),
+/// together with the `AttachArbiter` lease its `Established` slot was
+/// recorded under (`Session::lease`). The caller releases *exactly that*
+/// lease (`AttachRuntime::relay_ended` checks the lease matches) rather than
+/// whatever lease happens to hold `id`'s slot by the time it gets round to
+/// it (review 2026-09-29, PIPE-14). `lease` is `None` only for entries built
+/// without one (tests); the caller then falls back to a lookup by `id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Evicted {
+    pub id: SessionId,
+    pub lease: Option<LeaseId>,
 }
 
 /// resume 可能な 1 セッション分の状態。
@@ -82,6 +97,20 @@ pub struct Session {
     /// `preempt`を送った側はこれを待つことで、ポーリングせずに
     /// 「明け渡し完了」を知ることができる。
     pub reparked: Arc<Notify>,
+    /// The `AttachArbiter` lease backing this session's `Established` slot
+    /// (set once at attach time; a RESUME reuses the same slot/lease). Lets
+    /// eviction release precisely this lease — see [`Evicted`].
+    pub lease: Option<LeaseId>,
+    /// Set when this connection's control stream (the only source of
+    /// `APP_ACK`s, i.e. the only thing that frees `output_buffer` space)
+    /// failed to establish — see `engine/mod.rs::mark_app_ack_unavailable`.
+    pub app_ack_unavailable: bool,
+    /// Set once this session can never be resumed: `app_ack_unavailable` and
+    /// the replay buffer filled up. From then on the relay stops teeing S→C
+    /// bytes into `output_buffer` (nothing would ever trim it, so S→C used
+    /// to freeze for good once it filled — PIPE-09), and a dropped data
+    /// stream discards the session instead of parking it.
+    pub resume_disabled: bool,
 }
 
 impl Session {
@@ -95,6 +124,9 @@ impl Session {
             negotiated_resume_grace_secs: None,
             preempt: Arc::new(Notify::new()),
             reparked: Arc::new(Notify::new()),
+            lease: None,
+            app_ack_unavailable: false,
+            resume_disabled: false,
         }
     }
 }
@@ -198,14 +230,17 @@ impl SessionTable {
                 Some(evict_id) => {
                     if let Some(evicted) = inner.remove(&evict_id) {
                         // parked_tcp を drop することで TCP 接続も close される。
-                        drop(evicted.lock().await.parked_tcp.take());
+                        let mut evicted = evicted.lock().await;
+                        drop(evicted.parked_tcp.take());
+                        let evicted_lease = evicted.lease;
+                        drop(evicted);
                         log::warn!(
                             "session table full (max_sessions={}), evicted oldest parked session {} to make room for {}",
                             self.max_sessions,
                             hex_lower(&evict_id),
                             hex_lower(&id)
                         );
-                        evicted_id = Some(evict_id);
+                        evicted_id = Some(Evicted { id: evict_id, lease: evicted_lease });
                     }
                 }
                 None => {
@@ -220,7 +255,7 @@ impl SessionTable {
         }
         inner.insert(id, handle);
         match evicted_id {
-            Some(evict_id) => InsertOutcome::InsertedAfterEvicting(evict_id),
+            Some(evicted) => InsertOutcome::InsertedAfterEvicting(evicted),
             None => InsertOutcome::Inserted,
         }
     }
@@ -237,14 +272,15 @@ impl SessionTable {
     /// Returns `None` if nothing is currently parked (every tracked session
     /// is actively relaying) — the caller must reject the new attach in
     /// that case, same as `insert_existing`'s `Rejected` outcome.
-    pub async fn claim_oldest_parked(&self) -> Option<SessionId> {
+    pub async fn claim_oldest_parked(&self) -> Option<Evicted> {
         let mut inner = self.inner.lock().await;
         let evict_id = find_oldest_parked(&inner).await?;
         let evicted = inner.remove(&evict_id)?;
         // parked_tcp を drop することで TCP 接続も close される。
-        drop(evicted.lock().await.parked_tcp.take());
+        let mut evicted = evicted.lock().await;
+        drop(evicted.parked_tcp.take());
         log::warn!("session table full, evicted oldest parked session {} to admit a new attach", hex_lower(&evict_id));
-        Some(evict_id)
+        Some(Evicted { id: evict_id, lease: evicted.lease })
     }
 
     pub async fn get(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
@@ -253,6 +289,23 @@ impl SessionTable {
 
     pub async fn remove(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
         self.inner.lock().await.remove(id)
+    }
+
+    /// Removes `id`'s entry only if it is still *this* `handle`
+    /// (`Arc::ptr_eq`). A finishing session task must use this rather than
+    /// [`Self::remove`]: once its slot is released, a brand-new ATTACH for
+    /// the same `session_id` may already have registered a *new* entry, and
+    /// a plain remove-by-id would delete that one instead — leaving the new
+    /// session unresumable (review 2026-09-29, PIPE-07). Returns whether it
+    /// removed anything.
+    pub async fn remove_if_same(&self, id: &SessionId, handle: &Arc<Mutex<Session>>) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.get(id).is_some_and(|current| Arc::ptr_eq(current, handle)) {
+            inner.remove(id);
+            true
+        } else {
+            false
+        }
     }
 
     /// `parked_tcp` に入れられてから `max_parked` 以上経過したセッションを
@@ -276,7 +329,7 @@ impl SessionTable {
     /// `Established` slot だけが残り続け、以後そのターゲットへの新規ATTACHが
     /// 実際には誰も使っていないセッションのせいで`BUSY_OTHER_SESSION`のまま
     /// 永久に拒否される(`isekai-pipe serve`プロセスを再起動するまで回復しない)。
-    pub async fn sweep_expired_parked(&self, max_parked: std::time::Duration) -> Vec<SessionId> {
+    pub async fn sweep_expired_parked(&self, max_parked: std::time::Duration) -> Vec<Evicted> {
         let expired: Vec<SessionId> = {
             let inner = self.inner.lock().await;
             let mut expired = Vec::new();
@@ -298,9 +351,10 @@ impl SessionTable {
         for id in expired {
             if let Some(handle) = self.remove(&id).await {
                 // parked_tcp を drop することで TCP 接続も close される。
-                drop(handle.lock().await.parked_tcp.take());
+                let mut session = handle.lock().await;
+                drop(session.parked_tcp.take());
                 log::info!("session {} expired while parked, discarded", hex_lower(&id));
-                discarded.push(id);
+                discarded.push(Evicted { id, lease: session.lease });
             }
         }
         discarded
@@ -502,7 +556,7 @@ mod tests {
         newer.parked_since = Some(std::time::Instant::now());
         table.insert(newer_id, newer).await;
 
-        assert_eq!(table.claim_oldest_parked().await, Some(older_id));
+        assert_eq!(table.claim_oldest_parked().await.map(|e| e.id), Some(older_id));
         assert!(!table.contains(&older_id).await);
         assert!(table.contains(&newer_id).await, "the newer parked session must survive");
     }
@@ -539,7 +593,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            InsertOutcome::InsertedAfterEvicting(older_id),
+            InsertOutcome::InsertedAfterEvicting(Evicted { id: older_id, lease: None }),
             "立ち退き後に新規セッションは登録でき、立ち退かせたsession_idを呼び出し元へ返すはず \
              (呼び出し元がそのAttachArbiter leaseを解放できるように)"
         );
@@ -614,7 +668,7 @@ mod tests {
             .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
             .await;
 
-        assert_eq!(outcome, InsertOutcome::InsertedAfterEvicting(parked_id));
+        assert_eq!(outcome, InsertOutcome::InsertedAfterEvicting(Evicted { id: parked_id, lease: None }));
         assert!(
             table.contains(&active_id).await,
             "アクティブなセッションは残るはず"
@@ -624,5 +678,48 @@ mod tests {
             "parked セッションが立ち退くはず"
         );
         assert!(table.contains(&new_id).await);
+    }
+
+    /// PIPE-07: a finishing task must only remove its *own* entry — a newer
+    /// entry registered under the same session_id must survive.
+    #[tokio::test]
+    async fn remove_if_same_only_removes_the_matching_handle() {
+        let table = SessionTable::new();
+        let id = SessionTable::generate_session_id();
+        let old_handle = Arc::new(Mutex::new(Session::new(1024)));
+        let new_handle = table.insert(id, Session::new(1024)).await;
+
+        assert!(!table.remove_if_same(&id, &old_handle).await, "a stale handle must not remove the newer entry");
+        assert!(table.contains(&id).await);
+        assert!(table.remove_if_same(&id, &new_handle).await);
+        assert!(!table.contains(&id).await);
+    }
+
+    /// PIPE-14: eviction/sweep report the evicted session's own lease, so the
+    /// caller releases exactly that one.
+    #[tokio::test]
+    async fn eviction_and_sweep_report_the_evicted_sessions_lease() {
+        let table = SessionTable::new();
+        let swept_id = SessionTable::generate_session_id();
+        let mut swept = Session::new(1024);
+        swept.lease = Some(LeaseId::for_test(7));
+        swept.parked_tcp = Some(dummy_parked_tcp().await);
+        swept.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        table.insert(swept_id, swept).await;
+        assert_eq!(
+            table.sweep_expired_parked(std::time::Duration::from_secs(30)).await,
+            vec![Evicted { id: swept_id, lease: Some(LeaseId::for_test(7)) }]
+        );
+
+        let claimed_id = SessionTable::generate_session_id();
+        let mut claimed = Session::new(1024);
+        claimed.lease = Some(LeaseId::for_test(9));
+        claimed.parked_tcp = Some(dummy_parked_tcp().await);
+        claimed.parked_since = Some(std::time::Instant::now());
+        table.insert(claimed_id, claimed).await;
+        assert_eq!(
+            table.claim_oldest_parked().await,
+            Some(Evicted { id: claimed_id, lease: Some(LeaseId::for_test(9)) })
+        );
     }
 }

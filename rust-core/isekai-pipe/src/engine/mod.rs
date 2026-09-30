@@ -78,7 +78,12 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// one in-flight read/write) to notice `preempt` and return.
 const PREEMPT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Args {
+/// Upper bound on writing `RESUME_ACK` plus its replay bytes (PIPE-12) —
+/// mirrors the client side's own `REPLAY_WRITE_TIMEOUT` (15s,
+/// `resume_loop.rs`), which bounds the symmetric C→S replay write.
+const RESUME_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) struct Args {
     target: SocketAddr,
     service_name: String,
     bind: SocketAddr,
@@ -254,7 +259,43 @@ fn print_help() {
     println!("    -h, --help                     print this help message");
 }
 
-fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
+/// Value-taking options `isekai-pipe serve` (`main.rs::parse_serve`) forwards
+/// verbatim (option + its value) to [`parse_args_from`]. `--target`/
+/// `--service-name` are deliberately absent: `parse_serve` owns those itself
+/// (`--service`/`--target` → `ServiceSpec`) and appends them afterwards.
+///
+/// This list is the **single** source `parse_serve` consults — it used to
+/// keep its own hand-maintained allow-list, which silently fell behind this
+/// engine: `--bind-port-range`/`--relay-transport` were implemented here but
+/// rejected by `parse_serve` as "unsupported option", so every bootstrap that
+/// generated either flag (`isekai-bootstrap::install_script`) failed on every
+/// silent re-deploy too — a permanent connect failure
+/// (`.claude/rules/always-connects.md`). `serve_forwarded_options_tests`
+/// pins every entry as actually known to [`parse_args_from`].
+pub(crate) const SERVE_FORWARDED_VALUE_OPTIONS: &[&str] = &[
+    "--bind",
+    "--bind-port-range",
+    "--idle-timeout",
+    "--resume-window",
+    "--resume-buffer-size",
+    "--max-idle-lifetime",
+    "--max-sessions",
+    "--stun-server",
+    "--punch-peer",
+    "--relay",
+    "--relay-sni",
+    "--relay-transport",
+    "--relay-jwt",
+    "--relay-jwt-file",
+    "--bootstrap-request-file",
+    "--log-level",
+];
+
+/// Value-less flags `isekai-pipe serve` forwards verbatim — see
+/// [`SERVE_FORWARDED_VALUE_OPTIONS`].
+pub(crate) const SERVE_FORWARDED_FLAG_OPTIONS: &[&str] = &["--once"];
+
+pub(crate) fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut target: SocketAddr = "127.0.0.1:22".parse().unwrap();
     let mut service_name = "ssh".to_string();
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -455,7 +496,16 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
 /// ディレクトリは`trap ... EXIT`でも最終的に回収されるが、露出時間を最小化する)。
 fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) -> Result<String> {
     match (relay_jwt, relay_jwt_file) {
-        (Some(jwt), None) => Ok(jwt),
+        (Some(jwt), None) => {
+            // Still accepted for backward compatibility, but the token sits in
+            // argv for the whole process lifetime (`ps`, `/proc/<pid>/cmdline`)
+            // — make that visible (review 2026-09-29, PIPE-16).
+            log::warn!(
+                "--relay-jwt exposes the relay token to other local users via the process argv; \
+                 use --relay-jwt-file instead (isekai-bootstrap already does)"
+            );
+            Ok(jwt)
+        }
         (None, Some(path)) => {
             let mut content = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read --relay-jwt-file {path}"))?;
@@ -464,9 +514,16 @@ fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) 
             if let Err(e) = std::fs::remove_file(&path) {
                 log::warn!("failed to remove --relay-jwt-file {path} after reading: {e}");
             }
-            let trimmed = content.trim_end_matches(['\n', '\r']).to_string();
-            zeroize_string(&mut content);
-            Ok(trimmed)
+            // Trim in place rather than copying into a second `String`
+            // (PIPE-16): the old `.to_string()` copy was never zeroized, so
+            // the "zeroize the buffer we read" step only scrubbed a copy of a
+            // secret that still lived on elsewhere. Scrub the trailing bytes
+            // being cut off, then shorten — the one remaining buffer is the
+            // value handed to the caller.
+            let keep = content.trim_end_matches(['\n', '\r']).len();
+            let mut tail = content.split_off(keep);
+            zeroize_string(&mut tail);
+            Ok(content)
         }
         (None, None) | (Some(_), Some(_)) => {
             unreachable!("relay_jwt/relay_jwt_file exclusivity already validated in parse_args")
@@ -809,8 +866,8 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let attach_runtime = attach_runtime.clone();
                 if let Err(e) = tokio::spawn(async move {
                     let expired = sessions.sweep_expired_parked(max_parked).await;
-                    for id in expired {
-                        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
+                    for evicted in expired {
+                        release_evicted_slot(&attach_runtime, evicted).await;
                     }
                 })
                 .await
@@ -1033,6 +1090,20 @@ async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: iseka
     }
 }
 
+/// [`release_slot_for`] for a session `SessionTable` itself just discarded
+/// (`insert_existing`'s LRU eviction, `claim_oldest_parked`,
+/// `sweep_expired_parked`). Releases the exact lease recorded on the evicted
+/// `Session` — `relay_ended` ignores a lease that no longer backs the slot —
+/// instead of looking up "whatever lease holds this `session_id` now", which
+/// could be a *newer* attach of the same id (review 2026-09-29, PIPE-14).
+/// Falls back to the lookup only for entries that never recorded a lease.
+async fn release_evicted_slot(attach_runtime: &Arc<AttachRuntime>, evicted: resume::Evicted) {
+    match evicted.lease {
+        Some(lease) => attach_runtime.relay_ended(lease).await,
+        None => release_slot_for(attach_runtime, isekai_protocol::SessionId::from_bytes(evicted.id)).await,
+    }
+}
+
 /// Epic N-5 admission control. `AttachArbiter` used to hold a single global
 /// fencing slot per target (Epic N-4's world): a brand-new `session_id`
 /// could be blocked by whatever *other* session_id was occupying that slot,
@@ -1064,22 +1135,33 @@ async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: iseka
 /// tracked session is actively relaying, so the client's existing 180s
 /// `retry_while_busy_other_session` backoff (`resume_loop.rs`) remains a
 /// sensible response ("come back once something frees up").
+///
+/// **Must be called with [`AttachRuntime::admission_guard`] held, and the
+/// guard kept until [`AttachRuntime::hello_register`] has reserved the new
+/// session's arbiter slot** (review 2026-09-29, PIPE-11): the check below
+/// used to be check-then-act across separate locks, so several concurrent
+/// brand-new sessions could all see "below the cap" and all be admitted —
+/// exceeding `--max-sessions` and later tripping `insert_existing`'s
+/// `Rejected` path (PIPE-02).
+///
+/// Evicts in a loop, re-counting after each eviction: an evicted table entry
+/// whose arbiter slot was already gone frees no capacity at all, so a single
+/// eviction used to "admit" without actually making room.
 async fn admit_new_session(
     attach_runtime: &Arc<AttachRuntime>,
     sessions: &SessionTable,
     session_id: isekai_protocol::SessionId,
 ) -> Result<(), AttachRejectReason> {
-    if attach_runtime.has_session(session_id).await || attach_runtime.session_count().await < sessions.max_sessions()
-    {
+    if attach_runtime.has_session(session_id).await {
         return Ok(());
     }
-    match sessions.claim_oldest_parked().await {
-        Some(evicted_id) => {
-            release_slot_for(attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
-            Ok(())
+    while attach_runtime.session_count().await >= sessions.max_sessions() {
+        match sessions.claim_oldest_parked().await {
+            Some(evicted) => release_evicted_slot(attach_runtime, evicted).await,
+            None => return Err(AttachRejectReason::BusyOtherSession),
         }
-        None => Err(AttachRejectReason::BusyOtherSession),
     }
+    Ok(())
 }
 
 /// `EstablishedLease`と対になる、`SessionTable`側エントリのRAIIガード。
@@ -1107,11 +1189,14 @@ async fn admit_new_session(
 struct SessionTableEntryGuard {
     sessions: SessionTable,
     id: Option<[u8; 16]>,
+    /// The entry this guard owns — the Drop fallback removes the table entry
+    /// only while it is still this exact handle (`remove_if_same`, PIPE-07).
+    handle: Arc<Mutex<Session>>,
 }
 
 impl SessionTableEntryGuard {
-    fn new(sessions: SessionTable, id: [u8; 16]) -> Self {
-        Self { sessions, id: Some(id) }
+    fn new(sessions: SessionTable, id: [u8; 16], handle: Arc<Mutex<Session>>) -> Self {
+        Self { sessions, id: Some(id), handle }
     }
 
     /// 通常の後始末(`sessions.remove`済み、または`DataStreamDied`でpark済み
@@ -1141,8 +1226,9 @@ impl Drop for SessionTableEntryGuard {
             hex_lower(&id)
         );
         let sessions = self.sessions.clone();
+        let session_handle = self.handle.clone();
         handle.spawn(async move {
-            sessions.remove(&id).await;
+            sessions.remove_if_same(&id, &session_handle).await;
         });
     }
 }
@@ -1184,15 +1270,24 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
-    if let Err(reason) = admit_new_session(&attach_runtime, &sessions, hello.session_id).await {
-        reject_attach(&mut send, reason).await;
-        return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
-    }
+    // Admission check + slot reservation are atomic under the admission
+    // guard (PIPE-11) — see `admit_new_session`'s docs. The guard is dropped
+    // before waiting for the outcome, which can take up to the target
+    // connect timeout.
+    let hello_rx = {
+        let _admission = attach_runtime.admission_guard().await;
+        if let Err(reason) = admit_new_session(&attach_runtime, &sessions, hello.session_id).await {
+            drop(_admission);
+            reject_attach(&mut send, reason).await;
+            return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
+        }
+        attach_runtime.hello_register(key).await
+    };
     // `lease`(この`HelloOutcome::Ready`が返すもの)自体はここでは使わない —
     // `attach_runtime.activate()`は`key`から`PendingActivation`状態を引く
     // ので不要。実際に使う`EstablishedLease`は下で`activate()`の戻り値から
     // 得る(`Established`への遷移が実際に起きた瞬間に限ってガードを作るため)。
-    let attach_token = match attach_runtime.hello(key).await {
+    let attach_token = match attach_runtime.hello_wait(key, hello_rx).await {
         HelloOutcome::Reject(reason) => {
             reject_attach(&mut send, reason).await;
             return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
@@ -1260,28 +1355,31 @@ async fn handle_attach_stream(
     // がグローバルな`--resume-window`だけでなくこれも尊重できるようにする
     // (`Session::negotiated_resume_grace_secs`のdocs参照)。
     new_session.negotiated_resume_grace_secs = Some(negotiated_resume_grace_secs);
+    new_session.lease = lease.lease_id();
     let handle = Arc::new(Mutex::new(new_session));
     let session_id_bytes = *hello.session_id.as_bytes();
-    // `Rejected`(既存のギャップ、このガード追加の対象外)ではテーブルに
-    // エントリが実在しないので守るものが無く、`table_guard`は`None`のまま
-    // 中継を継続する(=このsessionはresume不能になるが、それは今回のスコープ
-    // 外の既存動作)。
+    // `Rejected`ではテーブルにエントリが実在しないので守るものが無く、
+    // `table_guard`は`None`のまま中継を継続する。このsessionはresume不能
+    // なので、`finish_or_park_session`はdata stream断でもparkせずslotを
+    // 解放する(PIPE-02)。admissionの原子化(PIPE-11)以降、ここに来るのは
+    // テーブルとarbiterが乖離した異常時だけのはず。
     let table_guard = match sessions.insert_existing(session_id_bytes, handle.clone()).await {
-        resume::InsertOutcome::InsertedAfterEvicting(evicted_id) => {
-            release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
-            Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes))
+        resume::InsertOutcome::InsertedAfterEvicting(evicted) => {
+            release_evicted_slot(&attach_runtime, evicted).await;
+            Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes, handle.clone()))
         }
-        resume::InsertOutcome::Inserted => Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes)),
+        resume::InsertOutcome::Inserted => {
+            Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes, handle.clone()))
+        }
         resume::InsertOutcome::Rejected => {
             // No `SessionTable` entry exists to guard, so relaying continues
-            // below (unchanged, existing behavior) — but this session is now
-            // silently unresumable for its entire lifetime: a client-side
-            // network blip that would normally RESUME instead permanently
-            // loses the connection, exactly the kind of "recovers only with
-            // manual intervention" state `.claude/rules/always-connects.md`
-            // treats as a bug. This was previously unobserved (the return
-            // value was discarded); logging it at least makes an operator
-            // able to notice a host is chronically hitting `--max-sessions`.
+            // below, but this session can never be resumed. It used to be
+            // parked anyway on a data-stream drop — into a handle nobody can
+            // reach (`sessions.get` misses it, so RESUME says UnknownToken,
+            // and no sweep/LRU ever sees it), permanently leaking its
+            // `Established` fencing slot (review 2026-09-29, PIPE-02,
+            // `.claude/rules/always-connects.md`). `finish_or_park_session`
+            // now releases the slot instead whenever `table_guard` is `None`.
             log::warn!(
                 "attach established but SessionTable rejected the entry (at capacity), \
                  session_id={} will not be resumable if its data stream drops",
@@ -1306,8 +1404,14 @@ async fn handle_attach_stream(
                     log::info!("control stream established, session_id={}", hex_lower(&session_id_bytes));
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
-                Ok(Err(e)) => log::info!("no resume support for this connection ({e:#})"),
-                Err(_) => log::info!("control stream not opened within timeout, continuing without resume support"),
+                Ok(Err(e)) => {
+                    log::info!("no resume support for this connection ({e:#})");
+                    mark_app_ack_unavailable(&handle).await;
+                }
+                Err(_) => {
+                    log::info!("control stream not opened within timeout, continuing without resume support");
+                    mark_app_ack_unavailable(&handle).await;
+                }
             }
         })
     };
@@ -1354,7 +1458,13 @@ async fn handle_resume_stream(
         .export_keying_material(EXPORTER_LABEL, b"")
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let request = quicmux::decode_resume_request(&mut recv, exporter).await.context("failed to decode RESUME frame")?;
+    // `handle_connection`'s `HELLO_TIMEOUT` only covers reading the frame
+    // type byte; bound the (unauthenticated) RESUME body too, so a peer
+    // trickling it cannot hold this task open indefinitely (PIPE-13).
+    let request = tokio::time::timeout(HELLO_TIMEOUT, quicmux::decode_resume_request(&mut recv, exporter))
+        .await
+        .context("RESUME frame not received within timeout")?
+        .context("failed to decode RESUME frame")?;
 
     let session_id: [u8; 16] = request.token.as_slice().try_into().map_err(|_| {
         anyhow!("resume token has unexpected length {} (expected 16)", request.token.len())
@@ -1430,9 +1540,19 @@ async fn handle_resume_stream(
     // resumeはfencing上の競合になり得ない)。
     let Some(lease_id) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
     else {
-        repark(&handle, tcp_read, tcp_write).await;
+        // The table still has this session but the arbiter no longer holds
+        // its slot — an inconsistent session no RESUME can ever succeed on
+        // (every later attempt lands right here again). It used to be
+        // reparked, pinning its sshd connection for up to `--resume-window`
+        // (10 days by default); discard it instead (review 2026-09-29,
+        // PIPE-08). Dropping `tcp_read`/`tcp_write` closes the target side.
+        sessions.remove_if_same(&session_id, &handle).await;
+        drop((tcp_read, tcp_write));
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
-        return Err(anyhow!("no established attach slot for session {}", hex_lower(&session_id)));
+        return Err(anyhow!(
+            "no established attach slot for session {}; discarded the inconsistent session",
+            hex_lower(&session_id)
+        ));
     };
 
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
@@ -1461,9 +1581,25 @@ async fn handle_resume_stream(
         replay_bytes.len()
     );
 
-    if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
-        repark(&handle, tcp_read, tcp_write).await;
-        return Err(anyhow!("failed to write RESUME_ACK: {e}"));
+    // Bounded (review 2026-09-29, PIPE-12): up to `--resume-buffer-size`
+    // bytes of replay go out here, and a peer that stops reading used to hold
+    // this task — with the TCP connection neither parked nor relaying, so
+    // every later RESUME found nothing to take — until the QUIC idle timeout.
+    match tokio::time::timeout(
+        RESUME_ACK_WRITE_TIMEOUT,
+        quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            repark(&handle, tcp_read, tcp_write).await;
+            return Err(anyhow!("failed to write RESUME_ACK: {e}"));
+        }
+        Err(_elapsed) => {
+            repark(&handle, tcp_read, tcp_write).await;
+            return Err(anyhow!("timed out writing RESUME_ACK + replay after {RESUME_ACK_WRITE_TIMEOUT:?}"));
+        }
     }
 
     // ここでようやくRAIIガードを作る — この行より前にある`repark`+早期return
@@ -1477,7 +1613,10 @@ async fn handle_resume_stream(
     // 戻っている。ここから`finish_or_park_session`が outcome を解決する
     // までの間にタスクがpanicすると、`EstablishedLease`と全く同じ理由で
     // このエントリも孤児化する(`SessionTableEntryGuard`docs参照)。
-    let table_guard = SessionTableEntryGuard::new(sessions.clone(), session_id);
+    let table_guard = SessionTableEntryGuard::new(sessions.clone(), session_id, handle.clone());
+    // `app_ack_unavailable` describes the previous connection's control
+    // stream; this connection gets its own chance to establish one below.
+    handle.lock().await.app_ack_unavailable = false;
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
@@ -1493,8 +1632,14 @@ async fn handle_resume_stream(
                     log::info!("resume: control stream re-established for session_id={}", hex_lower(&session_id));
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
-                Ok(Err(e)) => log::info!("resume: control stream re-establish failed ({e:#})"),
-                Err(_) => log::info!("resume: control stream not re-opened within timeout"),
+                Ok(Err(e)) => {
+                    log::info!("resume: control stream re-establish failed ({e:#})");
+                    mark_app_ack_unavailable(&handle).await;
+                }
+                Err(_) => {
+                    log::info!("resume: control stream not re-opened within timeout");
+                    mark_app_ack_unavailable(&handle).await;
+                }
             }
         })
     };
@@ -1511,6 +1656,23 @@ async fn handle_resume_stream(
     control_task.abort();
     finish_or_park_session(&sessions, lease, Some(table_guard), session_id, handle, outcome).await;
     Ok(())
+}
+
+/// Records that `handle`'s control stream — the only source of `APP_ACK`,
+/// i.e. the only thing that ever frees space in `output_buffer` — failed to
+/// establish (PIPE-09). The session stays resumable for as long as the
+/// replay buffer still holds everything sent so far; once it fills,
+/// `relay_buffered` gives resumability up (`Session::resume_disabled`)
+/// instead of stopping S→C for good, which is what used to happen after
+/// `--resume-buffer-size` bytes of output. Wakes a relay loop that is
+/// already waiting for buffer space.
+async fn mark_app_ack_unavailable(handle: &Arc<Mutex<Session>>) {
+    let notify = {
+        let mut session = handle.lock().await;
+        session.app_ack_unavailable = true;
+        session.output_space_available.clone()
+    };
+    notify.notify_waiters();
 }
 
 /// `handle_resume_stream` の各早期リターン経路で共通の後始末: 取り出した
@@ -1647,7 +1809,8 @@ async fn accept_control_stream(
 ///
 /// `table_guard`が`None`になるのは`insert_existing`が`InsertOutcome::Rejected`
 /// を返した場合だけ(このsessionは`SessionTable`に載っていない=守るエントリが
-/// 無い)。その場合の`sessions.remove`は空振りするだけで害はない。
+/// 無い)。そのsessionはresume不能なので、data stream断でもparkせず破棄する
+/// (PIPE-02)。
 async fn finish_or_park_session(
     sessions: &SessionTable,
     lease: EstablishedLease,
@@ -1656,62 +1819,80 @@ async fn finish_or_park_session(
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
-    match outcome {
+    let (tcp_read, tcp_write, preempted) = match outcome {
         RelayOutcome::TcpDied => {
-            log::info!(
-                "session {} target connection died, discarding",
-                hex_lower(&id)
-            );
-            lease.release().await;
-            sessions.remove(&id).await;
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
+            log::info!("session {} target connection died, discarding", hex_lower(&id));
+            discard_session(sessions, lease, table_guard, id, &handle).await;
+            return;
         }
-        RelayOutcome::DataStreamDied {
-            tcp_read,
-            tcp_write,
-        } => {
-            log::info!(
-                "session {} data stream died, parking for possible resume",
-                hex_lower(&id)
-            );
-            lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            let reparked = session.reparked.clone();
-            drop(session);
-            reparked.notify_waiters();
-            // park済み(=parked_sinceがSome)になったので、既存の
-            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
-            // 回収可能な状態になった — `table_guard`のDropフォールバックは
-            // もう不要。
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
-            // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
-            // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
-        }
-        RelayOutcome::Preempted {
-            tcp_read,
-            tcp_write,
-        } => {
-            log::info!(
-                "session {} preempted by a later resume attempt, parking for it",
-                hex_lower(&id)
-            );
-            lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            let reparked = session.reparked.clone();
-            drop(session);
-            reparked.notify_waiters();
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
-        }
+        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => (tcp_read, tcp_write, false),
+        RelayOutcome::Preempted { tcp_read, tcp_write } => (tcp_read, tcp_write, true),
+    };
+
+    // A session nobody can ever resume must not be parked: parking keeps its
+    // `Established` slot (`lease.keep()`) for a RESUME that can never
+    // succeed, and for a session missing from `SessionTable` (`table_guard`
+    // is `None` — `insert_existing` rejected it) no sweep/LRU can ever
+    // reclaim it either, so the slot leaked forever (review 2026-09-29,
+    // PIPE-02). `resume_disabled` (no control stream → no APP_ACK → no
+    // usable replay buffer, PIPE-09) is the same "can never resume" case.
+    let resume_disabled = handle.lock().await.resume_disabled;
+    if table_guard.is_none() || resume_disabled {
+        log::info!(
+            "session {} data stream ended but the session is not resumable (in_table={}, resume_disabled={}); \
+             discarding instead of parking",
+            hex_lower(&id),
+            table_guard.is_some(),
+            resume_disabled
+        );
+        drop((tcp_read, tcp_write));
+        discard_session(sessions, lease, table_guard, id, &handle).await;
+        // A RESUME preemptor waiting on `reparked` finds nothing parked and
+        // rejects promptly instead of waiting out `PREEMPT_WAIT_TIMEOUT`.
+        let reparked = handle.lock().await.reparked.clone();
+        reparked.notify_waiters();
+        return;
+    }
+
+    if preempted {
+        log::info!("session {} preempted by a later resume attempt, parking for it", hex_lower(&id));
+    } else {
+        log::info!("session {} data stream died, parking for possible resume", hex_lower(&id));
+    }
+    lease.keep();
+    let mut session = handle.lock().await;
+    session.parked_tcp = Some((tcp_read, tcp_write));
+    session.parked_since = Some(std::time::Instant::now());
+    let reparked = session.reparked.clone();
+    drop(session);
+    reparked.notify_waiters();
+    // park済み(=parked_sinceがSome)になったので、既存の
+    // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
+    // 回収可能な状態になった — `table_guard`のDropフォールバックは
+    // もう不要。sessions テーブルには既に登録済みなのでそのまま残し、
+    // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
+    if let Some(table_guard) = table_guard {
+        table_guard.disarm();
+    }
+}
+
+/// Tears a session down for good: drops its `SessionTable` entry (only if it
+/// is still *this* session's handle — PIPE-07), then releases its fencing
+/// slot. The order matters: removing first means that by the time the slot
+/// is free for a brand-new ATTACH of the same `session_id`, this task can no
+/// longer touch the new session's table entry (the old order — release,
+/// then remove-by-id — could delete it).
+async fn discard_session(
+    sessions: &SessionTable,
+    lease: EstablishedLease,
+    table_guard: Option<SessionTableEntryGuard>,
+    id: resume::SessionId,
+    handle: &Arc<Mutex<Session>>,
+) {
+    sessions.remove_if_same(&id, handle).await;
+    lease.release().await;
+    if let Some(table_guard) = table_guard {
+        table_guard.disarm();
     }
 }
 
@@ -1798,9 +1979,30 @@ enum RelayOutcome {
 
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
 /// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
-/// control stream が最終的に確立しなかった場合でも、この関数自体は
-/// Phase 7 と同じ双方向コピーとして機能する（バッファへの tee はしているが
-/// 誰も参照しないだけで、実害はない。上限付きなので無制限には増えない）。
+///
+/// **S→C は「replay バッファへ append してから送信」の順**(review
+/// 2026-09-29, PIPE-03)。以前は送信→append の順で、送信が途中で失敗すると
+/// 読み取った `n` バイトは replay に載らないまま(一部だけ peer に届いて
+/// いることもある)失われ、RESUME で `OffsetGone` になるか、再開後の
+/// ストリームからバイトが欠落して SSH の MAC 検証で即切断していた。
+/// 読み取り量は `remaining_capacity()` で頭打ちなので append は失敗しない。
+///
+/// **C→S は target への書き込みが進んだ分だけ `helper_committed_offset` を
+/// 進める**(cancel-safe な `write` を1回ずつ)。プリエンプション(下記)で
+/// 書き込みの途中から抜けても、client は committed offset から再送するので
+/// 重複も欠落も起きない。
+///
+/// **プリエンプション**(`Session::preempt`, PIPE-05): `Notified` をループの
+/// 外で1つだけ作って保持し(`enable()` 済み)、中継ループの待機中だけでなく
+/// S→C/C→S の書き込み中にも `select!` する。以前は周回ごとに作り直して
+/// いたため、ゾンビ接続でまさに起きる「書き込みが flow control で詰まって
+/// いる」最中の `notify_waiters()` を取りこぼし、プリエンプションが効かな
+/// かった。
+///
+/// control stream が確立しなかった(=`APP_ACK` が決して来ない)セッションは
+/// `Session::resume_disabled` が立ち、以後 replay への tee をやめる(PIPE-09)。
+/// 以前は docstring に「tee は誰も参照しないだけで実害はない」と書かれて
+/// いたが、実際には replay が満杯になった時点で S→C が永久に止まっていた。
 ///
 /// `tokio::join!` で両方向を独立に完了させる設計だと、片方向だけが
 /// data stream 側のエラーで終わり、もう片方向が TCP からの次のデータを
@@ -1818,16 +2020,40 @@ async fn relay_buffered(
     let mut c2s_buf = vec![0u8; 16 * 1024];
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
-    let output_space_available = session.lock().await.output_space_available.clone();
-    let preempt = session.lock().await.preempt.clone();
+    let (output_space_available, preempt) = {
+        let session = session.lock().await;
+        (session.output_space_available.clone(), session.preempt.clone())
+    };
+    // A later RESUME for this same session_id wants this connection to yield
+    // (`Session::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2) — most
+    // likely because this connection is a zombie (looks established here but
+    // the peer never actually receives anything) and the later attempt is
+    // the real live one. Created once and enabled up front so a
+    // `notify_waiters()` is never lost, whatever this loop is awaiting at the
+    // time (PIPE-05).
+    let preempted = preempt.notified();
+    tokio::pin!(preempted);
+    preempted.as_mut().enable();
 
     loop {
         let s2c_read_len = {
-            let session = session.lock().await;
-            session
-                .output_buffer
-                .remaining_capacity()
-                .min(s2c_buf.len())
+            let mut session = session.lock().await;
+            if !session.resume_disabled && session.app_ack_unavailable && session.output_buffer.is_full() {
+                // No APP_ACK will ever trim this buffer: stop teeing and give
+                // up resumability rather than freezing S→C forever (PIPE-09).
+                log::info!(
+                    "relay to {target}: replay buffer full and no control stream to acknowledge it; \
+                     continuing without resume support"
+                );
+                session.resume_disabled = true;
+                let capacity = session.output_buffer.capacity();
+                session.output_buffer = resume::OutputBuffer::new(capacity);
+            }
+            if session.resume_disabled {
+                s2c_buf.len()
+            } else {
+                session.output_buffer.remaining_capacity().min(s2c_buf.len())
+            }
         };
         tokio::select! {
             // `AnyByteStreamReadHalf::read`は`tokio::io::AsyncRead`と同じ規約
@@ -1837,11 +2063,29 @@ async fn relay_buffered(
             result = recv.read(&mut c2s_buf), if !c2s_done => {
                 match result {
                     Ok(n) if n > 0 => {
-                        if let Err(e) = tcp_write.write_all(&c2s_buf[..n]).await {
-                            log::warn!("relay to {target}: tcp write failed: {e}");
-                            return RelayOutcome::TcpDied;
+                        let mut written = 0;
+                        while written < n {
+                            tokio::select! {
+                                r = tcp_write.write(&c2s_buf[written..n]) => match r {
+                                    Ok(0) => {
+                                        log::warn!("relay to {target}: tcp write returned 0 bytes");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                    Ok(k) => {
+                                        written += k;
+                                        session.lock().await.helper_committed_offset += k as u64;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("relay to {target}: tcp write failed: {e}");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                },
+                                _ = &mut preempted => {
+                                    log::info!("relay to {target}: preempted (mid C->S write) by a later RESUME; parking for it");
+                                    return RelayOutcome::Preempted { tcp_read, tcp_write };
+                                }
+                            }
                         }
-                        session.lock().await.helper_committed_offset += n as u64;
                     }
                     Ok(_) => {
                         // client 側の half-close。S→C 方向はまだ継続する。
@@ -1860,14 +2104,7 @@ async fn relay_buffered(
             _ = tokio::time::sleep(Duration::from_millis(50)), if s2c_read_len == 0 => {
                 continue;
             }
-            // A later RESUME for this same session_id wants this connection
-            // to yield (`Session::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
-            // D-2) — most likely because this connection is a zombie (looks
-            // established here but the peer never actually receives
-            // anything) and the later attempt is the real live one. Give up
-            // the TCP connection the same way a dead data stream would, so
-            // `handle_resume_stream`'s waiting preemptor can grab it.
-            _ = preempt.notified() => {
+            _ = &mut preempted => {
                 log::info!("relay to {target}: preempted by a later RESUME for the same session; parking for it");
                 return RelayOutcome::Preempted { tcp_read, tcp_write };
             }
@@ -1880,15 +2117,35 @@ async fn relay_buffered(
                         return RelayOutcome::TcpDied;
                     }
                     Ok(n) => {
-                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
-                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
-                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        {
+                            let mut session = session.lock().await;
+                            if !session.resume_disabled && !session.output_buffer.append(&s2c_buf[..n]) {
+                                // Unreachable while the read stays bounded by
+                                // `remaining_capacity()` (the buffer only ever
+                                // gains room in between); kept as a defensive
+                                // check rather than silently sending bytes the
+                                // replay buffer doesn't hold.
+                                log::warn!(
+                                    "relay to {target}: output buffer had no room after bounded read; treating as data stream failure"
+                                );
+                                return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                            }
                         }
-                        if !session.lock().await.output_buffer.append(&s2c_buf[..n]) {
-                            log::warn!(
-                                "relay to {target}: output buffer had no room after bounded read; treating as data stream failure"
-                            );
-                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        tokio::select! {
+                            r = send.write_all(&s2c_buf[..n]) => {
+                                if let Err(e) = r {
+                                    log::info!("relay to {target}: data stream (S->C) write failed: {e}");
+                                    return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                                }
+                            }
+                            _ = &mut preempted => {
+                                // The bytes are already in the replay buffer
+                                // (append-first above), so the preemptor's
+                                // RESUME replays whatever this write did not
+                                // deliver.
+                                log::info!("relay to {target}: preempted (mid S->C write) by a later RESUME; parking for it");
+                                return RelayOutcome::Preempted { tcp_read, tcp_write };
+                            }
                         }
                     }
                     Err(e) => {
@@ -2107,5 +2364,189 @@ mod bind_port_range_tests {
         let socket =
             bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port.saturating_add(31)))).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), held_port);
+    }
+}
+
+#[cfg(test)]
+mod relay_jwt_file_tests {
+    use super::*;
+
+    /// PIPE-16: the file's trailing newline is trimmed in place (no second,
+    /// never-zeroized copy) and the file is removed after reading.
+    #[test]
+    fn relay_jwt_file_is_trimmed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_jwt");
+        std::fs::write(&path, "header.payload.sig\r\n").unwrap();
+        let jwt = resolve_relay_jwt(None, Some(path.to_str().unwrap().to_string())).unwrap();
+        assert_eq!(jwt, "header.payload.sig");
+        assert!(!path.exists(), "the token file must be unlinked after reading");
+    }
+}
+
+#[cfg(test)]
+mod serve_forwarded_options_tests {
+    use super::*;
+
+    /// Every option `main.rs::parse_serve` forwards must be one this engine
+    /// actually recognizes — otherwise `parse_serve` would accept a flag the
+    /// engine then rejects as `unknown argument` (the mirror image of the
+    /// drift that let `parse_serve` reject `--bind-port-range`/
+    /// `--relay-transport` while the engine supported both).
+    #[test]
+    fn every_forwarded_value_option_is_known_to_the_engine() {
+        for opt in SERVE_FORWARDED_VALUE_OPTIONS {
+            // Missing value on purpose: a known value-taking option fails
+            // with "<opt> requires a value", an unknown one with
+            // "unknown argument".
+            let Err(err) = parse_args_from([opt.to_string()]) else {
+                panic!("{opt} without a value unexpectedly parsed");
+            };
+            let msg = format!("{err:#}");
+            assert!(!msg.contains("unknown argument"), "{opt} is forwarded by serve but unknown to the engine: {msg}");
+            assert!(msg.contains("requires a value"), "{opt}: unexpected error {msg}");
+        }
+    }
+
+    #[test]
+    fn every_forwarded_flag_option_is_known_to_the_engine() {
+        for opt in SERVE_FORWARDED_FLAG_OPTIONS {
+            assert!(parse_args_from([opt.to_string()]).is_ok(), "{opt} is forwarded by serve but rejected by the engine");
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_lifecycle_tests {
+    use super::*;
+    use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
+
+    /// A target that accepts and holds every connection open.
+    async fn listening_target() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    /// Drives a real `AttachRuntime` to `Established` for `session_byte`,
+    /// returning the target connection's halves and the minted lease.
+    async fn established(
+        runtime: &Arc<AttachRuntime>,
+        session_byte: u8,
+    ) -> (tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf, EstablishedLease) {
+        let key = AttachKey {
+            session_id: isekai_protocol::SessionId::from_bytes([session_byte; 16]),
+            generation: ConnectionGeneration::INITIAL,
+            attempt_id: AttemptId::from_bytes([1; 16]),
+        };
+        let rx = runtime.hello_register(key).await;
+        let HelloOutcome::Ready { attach_token } = runtime.hello_wait(key, rx).await else {
+            panic!("expected Ready");
+        };
+        let (tcp, lease) = runtime.activate(key, attach_token).await.expect("activate");
+        let (r, w) = tcp.into_split();
+        (r, w, lease)
+    }
+
+    /// PIPE-02: a session `insert_existing` rejected (no table entry, so no
+    /// `table_guard`) must release its slot on a data-stream drop instead of
+    /// parking into a handle nobody can reach.
+    #[tokio::test]
+    async fn unresumable_session_releases_its_slot_instead_of_parking() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let sessions = SessionTable::new();
+        let (r, w, lease) = established(&runtime, 1).await;
+        let handle = Arc::new(Mutex::new(Session::new(1024)));
+        finish_or_park_session(
+            &sessions,
+            lease,
+            None,
+            [1; 16],
+            handle,
+            RelayOutcome::DataStreamDied { tcp_read: r, tcp_write: w },
+        )
+        .await;
+        assert!(runtime.is_vacant().await, "fencing slot must be released, not leaked");
+    }
+
+    /// PIPE-09: a session whose replay buffer gave up (`resume_disabled`)
+    /// is discarded, not parked, when its data stream drops.
+    #[tokio::test]
+    async fn resume_disabled_session_is_discarded_not_parked() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let sessions = SessionTable::new();
+        let (r, w, lease) = established(&runtime, 2).await;
+        let mut session = Session::new(1024);
+        session.resume_disabled = true;
+        let handle = sessions.insert([2; 16], session).await;
+        let guard = SessionTableEntryGuard::new(sessions.clone(), [2; 16], handle.clone());
+        finish_or_park_session(
+            &sessions,
+            lease,
+            Some(guard),
+            [2; 16],
+            handle,
+            RelayOutcome::DataStreamDied { tcp_read: r, tcp_write: w },
+        )
+        .await;
+        assert!(runtime.is_vacant().await);
+        assert!(!sessions.contains(&[2; 16]).await);
+    }
+
+    /// The normal case still parks: slot kept, entry kept, TCP parked.
+    #[tokio::test]
+    async fn resumable_session_is_parked_with_its_slot_kept() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let sessions = SessionTable::new();
+        let (r, w, lease) = established(&runtime, 3).await;
+        let handle = sessions.insert([3; 16], Session::new(1024)).await;
+        let guard = SessionTableEntryGuard::new(sessions.clone(), [3; 16], handle.clone());
+        finish_or_park_session(
+            &sessions,
+            lease,
+            Some(guard),
+            [3; 16],
+            handle.clone(),
+            RelayOutcome::DataStreamDied { tcp_read: r, tcp_write: w },
+        )
+        .await;
+        assert!(!runtime.is_vacant().await, "a parked session keeps its slot");
+        assert!(handle.lock().await.parked_tcp.is_some());
+    }
+
+    /// PIPE-07: a TcpDied cleanup must not delete a *newer* table entry that
+    /// was registered under the same session_id.
+    #[tokio::test]
+    async fn tcp_died_cleanup_leaves_a_newer_entry_for_the_same_id_alone() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let sessions = SessionTable::new();
+        let (_r, _w, lease) = established(&runtime, 4).await;
+        let old_handle = Arc::new(Mutex::new(Session::new(1024)));
+        let newer = sessions.insert([4; 16], Session::new(1024)).await;
+        let guard = SessionTableEntryGuard::new(sessions.clone(), [4; 16], old_handle.clone());
+        finish_or_park_session(&sessions, lease, Some(guard), [4; 16], old_handle, RelayOutcome::TcpDied).await;
+        let current = sessions.get(&[4; 16]).await.expect("newer entry must survive");
+        assert!(Arc::ptr_eq(&current, &newer));
+        assert!(runtime.is_vacant().await);
+    }
+
+    /// PIPE-11: admission counts and evicts under the cap; with every slot
+    /// held by an actively-relaying session it rejects.
+    #[tokio::test]
+    async fn admission_rejects_when_full_of_active_sessions() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let sessions = SessionTable::with_max_sessions(1);
+        let (_r, _w, _lease) = established(&runtime, 5).await;
+        let _guard = runtime.admission_guard().await;
+        let result = admit_new_session(&runtime, &sessions, isekai_protocol::SessionId::from_bytes([6; 16])).await;
+        assert!(matches!(result, Err(AttachRejectReason::BusyOtherSession)));
+        // An already-known session_id always passes.
+        assert!(admit_new_session(&runtime, &sessions, isekai_protocol::SessionId::from_bytes([5; 16])).await.is_ok());
     }
 }
