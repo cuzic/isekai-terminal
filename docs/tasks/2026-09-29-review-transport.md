@@ -34,7 +34,7 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: dial と attach handshake を `TRANSPORT_STEP_TIMEOUT` で個別に包み、`TransportError::TimedOut` を返す。
 - [x] **TR-M2** Medium `warm_standby.rs:205-218,271` — `ensure_warm` がロックを保持したまま probe と(タイムアウト無しの)dial を await し、promote を待たせる。
   - 方針: スロットを Arc で clone してロック外で probe・dial する。dial は `TRANSPORT_STEP_TIMEOUT` で包む(H1 と同じコミット)。
-- [ ] **TR-M3** Medium `isekai-transport/src/resume/app_ack.rs:116-191` — `AppAckTasks` を捨てるとタスクがリークする(send ループは stream が死んでも終わらない)。
+- [x] **TR-M3** Medium `isekai-transport/src/resume/app_ack.rs:116-191` — `AppAckTasks` を捨てるとタスクがリークする(send ループは stream が死んでも終わらない)。
   - 方針: recv ループが終わったら send ループも終わる自己終了にし、`#[must_use]` を付ける。Drop(abort) は付けない。
     `src/isekai_pipe_quic_transport.rs` が戻り値を捨てているので、Drop にすると即 abort されてしまうため。
     src 側(ハンドル保持と `spawn_app_ack_bridge` の終了条件)は fix-rust-core に連絡済み。
@@ -79,7 +79,7 @@ openssh-config / osc-color(quicsock は vendored)。
 - [ ] **TR-L5** `resume.rs:142,214-220,582-589` — CONTROL_ACK の session_id を、自分が送った値と照合していない → 照合し、不一致なら ControlHandshake エラーにする。
 - [ ] **TR-L6** `resume.rs:497-503,526-532` — GaveUpAfterGenerationRetries に原因の失敗が残らない → 最後の失敗を保持する。
 - [ ] **TR-L7** `race.rs:53` — Happy Eyeballs の遅延 250ms が punch の最低所要 ~750ms より短い → production 既定(`isekai-pipe-core` の 750ms)に揃える。
-- [ ] **TR-L8** `resume/app_ack.rs:169-170` — APP_ACK の offset の単調性を検証していない → 後退する値は無視する(送信済み範囲の検証は counters が送信量を知らないため、単調性の検証のみ)。
+- [x] **TR-L8** `resume/app_ack.rs:169-170` — APP_ACK の offset の単調性を検証していない → 後退する値は無視する(送信済み範囲の検証は counters が送信量を知らないため、単調性の検証のみ)。
 - [ ] **TR-L9** 秘密値を含む型の `derive(Debug)`: relay.rs `RelayTarget` / stun_p2p.rs / race.rs / resume.rs / isekai-protocol handshake.rs / isekai-auth file_provider.rs・oauth.rs・device_flow.rs → 秘密フィールドを伏せた手書き Debug にする。
   isekai-trust schema.rs は公開鍵のみなので誤検知([-])。
 - [x] **TR-L10a** `quicmux/src/qmux_backend.rs:181,308` — MuxClientConfig/MuxServerConfig の idle・keepalive・max_streams を無視している → qmux::Config に反映できるものは反映する。
