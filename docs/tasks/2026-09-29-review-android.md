@@ -41,7 +41,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
     `finally`でwipe。`guardedConnect`は`SshException`以外も捕捉。`RelayCredentialVault.decrypt`は
     平文レガシー値(`.`を含むJWT、Base64 NO_WRAPの字種外)をそのまま返し、真の復号失敗は
     意味のある例外にする。編集画面は復号失敗を空欄に落とす。
-- [ ] **AND-H4** (High) `TerminalTabsViewModel.kt:813-815` — `observeSummary`が`state`全体をcollect
+- [x] **AND-H4** (High) `TerminalTabsViewModel.kt:813-815` — `observeSummary`が`state`全体をcollect
   しており、端末の描画フレームごとにFGS通知を再postしている(Binder IPC + 通知レート制限)。
   - 方針: `state.map { it.connected }.distinctUntilChanged()`をcollectする。Service側も同一ラベルの
     再postを抑止する。

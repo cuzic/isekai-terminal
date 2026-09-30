@@ -30,7 +30,11 @@ class DumbAppExecutor : AppExecutor {
     override fun notifyConnected(host: String) { connectedHosts.add(host) }
     override fun notifyDisconnected() { disconnectedCount++ }
 
+    /** updateSessionsSummary() の呼び出し回数(AND-H4: フレームごとに呼ばれないことの検証用)。 */
+    var sessionsSummaryCallCount = 0
+
     override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
+        sessionsSummaryCallCount++
         lastSessionsSummary = connectedCount to totalCount
         if (totalCount <= 0) serviceStoppedCount++
     }
