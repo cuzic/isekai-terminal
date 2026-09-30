@@ -56,8 +56,9 @@
   - 方針: 共有Handleのagent確認経路を、そのHandleを現在使っているタブのうち生きているものへルーティングする(チャネルごとの送信先リストから生きているものを選ぶ)。
 - [x] **RC-22** Medium — `transport/file_preview_exec.rs:46-62` — stdout無制限・タイムアウトなし・タブ終了後も継続。
   - 方針: 出力上限と全体タイムアウトを設ける(`run_exec_on_handle`と同等)。
-- [ ] **RC-23** Medium/Low — `ssh_handler.rs:353-364, 832, 848-850` — ctl streamlocalで認証前に無制限`read_line`・タイムアウトなし、ctlキュー無制限、`CtlVarStore`無制限。
+- [x] **RC-23** Medium/Low — `ssh_handler.rs:353-364, 832, 848-850` — ctl streamlocalで認証前に無制限`read_line`・タイムアウトなし、ctlキュー無制限、`CtlVarStore`無制限。
   - 方針: 行長上限+読み取りタイムアウト、`CtlVarStore`の件数/サイズ上限。
+  - 注: ctlキュー(CtlForwardMapのUnboundedSender)自体の有界化は型変更が広く及ぶため見送り。1接続1メッセージで行長・読み取り時間が有界になったため、残る増幅は接続数に比例するのみ。
 - [ ] **RC-24** Medium — `multipath_transport.rs:88-95, 905, 928, 792-795, 647-649, 979-982` — Kotlinから所有権移譲されたraw fdが早期return経路でcloseされずリーク。
   - 方針: FFI境界を越えた直後に`OwnedFd`でラップし、どの経路でもdropでcloseされるようにする。
 - [x] **RC-25** Medium — `trzsz.rs:428-436, 381, 371` — ダウンロードのMD5を検証せず成功扱い。SIZE/NUMのパース失敗を0/1へ黙って変換。
