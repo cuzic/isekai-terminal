@@ -51,12 +51,14 @@
   - 対応: 削除処理を `remove_test_authorized_key` に関数化し、`cleanup`(EXIT trap)から `--keep` でない限り必ず呼ぶ。
     追記前にフラグを立て、`grep -vF` の終了コード1(残り0行)を許容、一時ファイルは同ディレクトリに作って mv する。
     切り出した関数を一時 HOME で実行し、テスト鍵のみ/他の鍵あり/フラグ未設定の3ケースを確認済み。
-- [ ] **CI-M5** (Medium) `.claude/hooks/cargo_check_on_edit.py:187-189,198-206`
+- [x] **CI-M5** (Medium) `.claude/hooks/cargo_check_on_edit.py:187-189,198-206`
   - 要約: ワークスペース判定が「crate の親より上で最初に見つかった Cargo.toml」で、`[workspace]` を確認していない。
     独立 workspace の `noq-multipath-spike` 編集で必ず誤報(exit 2)。付随(Low): 診断0件のときキャッシュを更新しないため、
     消えた警告の再発を「新規」と報告しない。
   - 修正方針: crate 自身のディレクトリから上に向かって `[workspace]` を持つ最初の Cargo.toml を選ぶ。
     ビルド成功・診断0件のときは空集合でキャッシュを更新する。Python の単体テストを追加。
+  - 対応: `find_workspace_manifest` を追加し、crate 自身のディレクトリから上へ `[workspace]`/`[workspace.*]` を持つ最初の Cargo.toml を選ぶようにした。
+    クリーンビルド(診断0件・exit 0)で空集合をキャッシュするようにした。`.claude/hooks/test_cargo_check_on_edit.py`(8件、cargo は実行しないモック)を追加し、ローカルの python3 で全件成功を確認済み。
 - [ ] **CI-M6** (Medium) `scripts/reserve-room-migration.sh:25-48`, `scripts/reserve-grdb-migration.sh`,
   `scripts/check-room-migrations.sh:67-73`, `scripts/check-grdb-migrations.sh`
   - 要約: 予約スクリプトが自 worktree のレジストリしか見ないため、並列 worktree 同士で同じ番号を取りうる。
@@ -103,9 +105,10 @@
 - [ ] **CI-INFO3** (Info) `.github/workflows/noq-738-repro-check.yml`
   - 要約: 自称「使い捨て」のワークフローがまだ残っている。
   - 修正方針: noq#738 の再現用として今後も使うかを確認してから削除する。
-- [ ] **CI-INFO4** (Info) `.claude/hooks/cargo_check_on_edit.py`(M5の付随)
+- [~] **CI-INFO4** (Info) `.claude/hooks/cargo_check_on_edit.py`(M5の付随)
   - 要約: 編集のたびにローカルで `cargo build` を実行し、「ローカルビルド禁止」の HARD RULE と矛盾している。
   - 修正方針: hook の有効/無効は `.claude/settings.json` 側の運用判断。
+  - 見送り: hook を無効化するかどうかは `.claude/settings.json` の運用判断(ユーザーの設定)で、このレビュー修正の範囲では変更しない。M5 の修正で誤報(spike の毎回 exit 2)はなくなった。
 
 ## iOS(Swift)
 
