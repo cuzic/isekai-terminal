@@ -85,7 +85,11 @@
 - [x] **PIPE-16** (Low) `engine/mod.rs::resolve_relay_jwt` のゼロクリア不完全 / `--relay-jwt` 継続受理
   - 方針: `trimmed` の別Stringを作らず in-place で truncate して返す。`--relay-jwt`(argv露出)は後方互換のため
     受理は続けるが、使われた場合は警告ログを出す。
-- [ ] **PIPE-17** (Low) `connect.rs` `run_connect` が非Send(既知)
+- [~] **PIPE-17** (Low) `connect.rs` `run_connect` が非Send(既知)
+  - 見送り理由: レビュー自身が「実害は無い」としている既知の型レベル制約。panic時のConnectOutcome書き込みは
+    既に `PanicOutcomeGuard`(Drop)で担保されている。Sendを回復するには `resume_loop` のreplayバッファを
+    `std::sync::Mutex` からガードをawait跨ぎで持たない形へ全面的に書き換える必要があり、ローカルでビルドできない
+    (prefer-gh-actions-over-local-cargo)状況で効果の無いリファクタを入れるリスクに見合わない。
 
 ## 他領域からの連携依頼
 
@@ -95,3 +99,18 @@
   - 方針: `#[serde(default)] session_established: bool` を追加(後方互換)。`run_resume_loop`(SSHバイトが流れる唯一の経路)
     に入った時点でプロセスグローバルなフラグを立て、`write_connect_outcome_for_wrapper` がそれを刻む。
     class自体(`Unreachable`→`RebootstrapAndRetry`)は変えない。isekai-ssh側の読み取りはfix-isekai-ssh担当。
+    (新フィールド追加に伴い、isekai-ssh側のテスト用 `ConnectOutcome` リテラル2箇所
+    [`wrapper.rs` / `native/connect.rs`]にだけ `session_established: false` を足した — コンパイルに必須のため境界外を最小限編集。)
+- [~] **SSH-07** (連携: isekai-ssh) サイレント再bootstrapが `init` で作ったrelay/`--via`トポロジを再現できない
+  - 見送り理由: `PersistentProfile`(isekai-pipe-core/profile.rs)にlaunch topology(relay addr/SNI/transport、viaチェーン)
+    を永続化するスキーマ変更と、それを読むisekai-ssh側の再bootstrap経路の両方が要る設計変更。`cached_relay_addr` を
+    direct/relayで共用している現行スキーマの移行方針(旧プロファイルの扱い)も含めてADR相当の判断が必要。
+- [~] **SSH-11** (連携: isekai-ssh) ssh(1)のConnectTimeoutでisekai-pipeが殺されるとoutcomeが書かれない
+  - 見送り理由: isekai-pipe側からは「ConnectTimeoutによる親消失」と「ユーザーのCtrl-Cによる親消失」を区別できない。
+    SSHブリッジ確立前の親消失を一律 `Unreachable` で書くと、ユーザーが接続中にCtrl-Cで中断した場合にもwrapperが
+    再bootstrap+再試行してしまう。wrapper側でssh(1)の終了ステータス/シグナルと組み合わせて判断する設計が必要
+    (PIPE-18の `session_established` はその判断材料として使える)。一度実装したが上記理由で取り下げた。
+- [x] **D8** (連携: isekai-ssh, isekai-pipe-core) runtime dirのowner未検査 / claimedファイル未削除 / rotate失敗無視
+  - 修正: `create_private_dir` が実ディレクトリかつ自uid所有であることを検査(symlink・他人所有を拒否)、
+    `claim_json` は読み取り後にclaimedコピーを削除、`RotatingLogFile` はrotate失敗時にバイト数をリセットして
+    毎write再試行するのをやめる(ログ書き込み自体は従来通り失敗させない)。

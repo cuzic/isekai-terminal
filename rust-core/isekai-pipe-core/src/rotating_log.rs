@@ -107,8 +107,13 @@ impl RotatingLogFile {
 
 impl std::io::Write for RotatingLogFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written >= LOG_ROTATE_MAX_BYTES {
-            let _ = self.rotate();
+        if self.written >= LOG_ROTATE_MAX_BYTES && self.rotate().is_err() {
+            // Logging must never fail the caller, so a failed rotation keeps
+            // appending to the current file — but restart the byte count so
+            // the next attempt waits another `LOG_ROTATE_MAX_BYTES` instead of
+            // retrying a (likely still failing) rename on every single write
+            // (isekai-ssh review D8).
+            self.written = 0;
         }
         let n = self.file.write(buf)?;
         self.written += n as u64;
