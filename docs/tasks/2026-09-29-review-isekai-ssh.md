@@ -35,9 +35,10 @@
   - 方針: profile ファイルが存在する(読めない/壊れている/transport がない)場合は `TofuConfirmation::Silent` で再 bootstrap する。`Ok(None)`(本当に未登録)のときだけ呼び出し元の tofu を使う。
 - [~] **SSH-09** Medium `native/console_stdin.rs:139-154,404-439` — Windows の常駐 stdin リーダーがパスフレーズ/TOFU 入力を横取りしうる。
   - 見送り理由: 実害の成立(どちらの reader が入力を受け取るか)は Windows 実機での確認が必要で、Linux から検証できない。コンソール入力の所有権を singleton チャネルに寄せる設計変更は `console_stdin`/`console`/`keyboard_interactive`/`russh_backend`/mux spawn 経路に跨る。CI では再現できず、誤るとキー入力が全損するため、実機検証を伴う別タスクとする。
-- [ ] **SSH-10** Medium `wrapper.rs:773-780`, `reconnect_backoff.rs:23,73`
+- [~] **SSH-10** Medium `wrapper.rs:773-780`, `reconnect_backoff.rs:23,73`
   - 要約: pre-handshake 失敗が最大 24h 再試行になり、非対話コマンドがハングする。stable 判定が attempt の経過時間基準になっている。
   - 方針: remote command ありの場合は SSH-02 の fail-safe で再試行しなくなるので、`rsync`/`git` の 24h ハングは解消する。stable 判定を handshake 成功時刻基準にする部分は、`session_established` が入った後のフォローアップにする(部分対応)。
+  - 状態: 部分対応。remote command の 24h ハングは SSH-02 で解消済み。stable 判定の基準変更は見送る。理由は、wrapper が handshake 成功時刻を知る手段が isekai-pipe 側の `ConnectOutcome.session_established`(PR #127、未マージ)以外にないため。その field がマージされたら SSH-02 の緩和と合わせてフォローアップする。
 - [~] **SSH-11** Medium `isekai-pipe/src/connect.rs:463-473,564-567` — `ssh(1)` の ConnectTimeout 等が先に諦めると outcome が残らない。
   - 見送り理由: outcome の書き手である isekai-pipe 側(担当外)の修正が必要。wrapper 側で「intent は claim されたが outcome がない」を Unreachable 扱いにすると、リモート終了コード 255 と区別できず再実行事故を招く。isekai-pipe 担当に共有する。
 - [x] **SSH-12** Medium `native/connect.rs:676`
@@ -54,7 +55,7 @@
   - 方針: `relay_loop` のすべての終了経路で `channel.close()` を送る(RemoteExitReported 以外)。誤ったコメントも修正する。
 - [x] **SSH-16** Medium `native/mux/client.rs:324`, `owner.rs:620`
   - 要約: 大量ペーストと echo 出力の双方向で相互デッドロックしうる。
-  - 方針: owner 側の client 向け writer を専用タスク+有界キューに分離し、relay loop が client への書き込みでブロックしないようにする(詳細は実装時に判断)。
+  - 対応: client 側(`run_inner`)の owner 向け書き込みをすべて FIFO キューに積み、`select!` 反復をまたいで生き続ける 1 本の in-flight write で送るようにした。owner 出力の読み取りは書き込み中も止まらない。ローカル stdin の読み取りだけを、キュー 64 フレームで一時停止する。片側だけ分離すれば循環待ちは切れるので、owner 側は変えていない。回帰テストは 2MiB paste × 2MiB echo。
 - [-] **SSH-17** Medium `native/mux/*` — 他ユーザーによる holder named pipe の成りすまし(サーバープロセス SID 検証・HMAC)。**transport 担当に委譲**(named pipe 所有者/SID の指摘は重複)。
 - [x] **SSH-18** Medium `helper_download.rs:402,440`(D1 前半)
   - 要約: helper ダウンロードの HTTP に timeout がない。
@@ -87,25 +88,25 @@
   - 見送り理由: `ssh(1)` の exit 255 は接続失敗と区別できず、区別するには stderr の文字列マッチが必要になる。これは `isekai-bootstrap-plan::classify_bootstrap_error` の「文字列マッチしない」設計原則に反する。誤分類の実害は、RedeployGate/backoff で有界な再試行と文言のずれだけ。
 - [x] **SSH-28** Low `native/mux/mod.rs:696-709,891-923`(C5-1)
   - 要約: spawn lock が対話セッション全体にわたって保持され、10s で stale 扱いされる。削除の TOCTOU で二重 leader になりうる。
-  - 方針: 実装時にコードを確認して判断する。
+  - 対応: spawn lock は、holder に到達できた時点(または到達できないと確定した時点)で、自タブのセッション開始前に解放するようにした。stale 判定の remove→create の TOCTOU は残るが、holder の単一性は channel の排他 `try_claim` が保証している。影響はプロンプト/spawn の重複だけで、そのことをコメントに明記した。
 - [x] **SSH-29** Low `native/mux/mod.rs:938,976-987`(C5-2)
   - 要約: token 書き込みが非 atomic で、async 内で `std::thread::sleep` している。
   - 方針: tmp+rename にし、`tokio::time::sleep` に変える。
 - [x] **SSH-30** Low `owner.rs:357-382`, `ctl_forward.rs:72-73`(C5-3)
   - 要約: handle lock を保持したままの channel open/ctl forward に timeout がない。
   - 方針: timeout を付ける。
-- [ ] **SSH-31** Low `client.rs:310`, `owner.rs:540`, `ctl_forward.rs:292`(C5-4)
+- [~] **SSH-31** Low `client.rs:310`, `owner.rs:540`, `ctl_forward.rs:292`(C5-4)
   - 要約: build relay の mpsc が無制限。
-  - 方針: 実装時に確認する。
+  - 見送り理由: 有界化すると、送信側(`build_exec::run_build` の `relay.send(..).await`)は `select!` の handler 内で待つことになり、abort(`relay.watch()`)を観測できなくなる。受信側が止まると build の abort がハングする(既存テスト `..._aborts_...` がこの形)。有界化するには `BuildRelay` trait の send を abort とレースさせる再設計が要る。実害は、ローカル build が出す出力量ぶんのメモリに限られる。
 - [x] **SSH-32** Low `mux/mod.rs:576-579`, `holder.rs:151`, `console.rs:604-615`(C5-5)
   - 要約: 平文秘密鍵と passphrase が zeroize されない。
   - 方針: `Zeroizing` で包む。
 - [x] **SSH-33** Low `owner.rs:614`, `client.rs:278,421`(C5-6)
   - 要約: 予期しないフレームを `{other:?}` で丸ごとログに出すため、Stdin/token が漏れうる。
   - 方針: フレーム種別名だけをログに出す。
-- [ ] **SSH-34** Low `mux/mod.rs:537 vs 604`(C5-7)
+- [~] **SSH-34** Low `mux/mod.rs:537 vs 604`(C5-7)
   - 要約: holder ログを claim 前に開いている。`rotating_log.rs` の rotate 失敗無視は isekai-pipe-core(担当外)。
-  - 方針: 実装時に確認する。
+  - 見送り理由: claim 前に開くのは `ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md` の意図的な設計。`prepare_with_tofu`(再デプロイ dial を含む)の失敗を holder ログに残すためで、claim 後に開くとまさにその診断が消える。claim 競争に負けた holder が数行を混入させるだけで、それ自体「負けた」という有用な診断になる。rotate 失敗の無視は isekai-pipe 担当が対応済み(PR #127、失敗時に byte counter をリセット)。
 - [x] **SSH-35** Low-Medium `native/connect.rs:1377`(C5-8)
   - 要約: `-T`(PTY なし)でも `~.` エスケープを処理するため、パイプ入力のバイナリが壊れる。
   - 方針: `ssh(1)` と同じく、PTY を要求しない場合はエスケープ処理を無効にする。
@@ -137,3 +138,18 @@
 - [x] **SSH-45** Low `wrapper.rs:1747-1784`(D9-2)
   - 要約: destination 以降の `--isekai-*` を wrapper が解釈してしまう。
   - 方針: destination 確定後の引数はすべてそのまま ssh 引数として扱う。
+
+## transport 担当からの委譲分(isekai-ssh 内のファイル)
+
+- [x] **SSH-46** `ctl_forward.rs` `handle_ctl_connection`
+  - 要約: preamble とメッセージ行の `read_line` に上限がなく、preamble の比較が定数時間でない。
+  - 対応: `read_bounded_line`(preamble は 4KiB、メッセージは `MAX_CTL_MESSAGE_LINE_LEN`)と `token_eq` を使うようにした。
+- [x] **SSH-47** `wrapper.rs` の relay token 取得
+  - 要約: 同期の token refresh(ureq と file lock)を async 内で直接呼んでいた。
+  - 対応: `spawn_blocking` で実行するようにした。`init.rs` の同じ呼び出しは単発の対話 CLI で、並行タスクがないため対象外とした。
+- [x] **SSH-48** `helper_download.rs` の HTTP timeout
+  - 対応: SSH-18 と同一。
+- [~] **SSH-49** `native/mux/naming.rs` の pipe 名にユーザー SID を含める
+  - 見送り理由: `local_ipc_mux::current_user_sid_string()` は transport 担当の PR #132 で追加され、まだ main にマージされていない。未マージの API に依存するとこのブランチがビルドできないため、#132 のマージ後にフォローアップする。なお #132 では `WindowsNamedPipeChannel::connect()` 自体がサーバー側 SID を検証するようになり、成りすましの主経路(SSH-17)はそちらで塞がる。
+- [~] **SSH-50** `native/agent_auth.rs` の `openssh-ssh-agent` pipe のサーバー所有者検証
+  - 見送り理由: SSH-49 と同じ理由。`local_ipc_mux::verify_named_pipe_server_is_current_user`(#132)がマージされた後にフォローアップする。
