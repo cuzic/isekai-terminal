@@ -264,7 +264,56 @@ pub fn default_helper_cache_dir() -> std::io::Result<PathBuf> {
     if let Some(home) = isekai_fs_guard::resolve_home_dir() {
         return Ok(home.join(".cache").join("isekai-ssh").join("helpers"));
     }
-    Ok(std::env::temp_dir().join("isekai-ssh-helpers"))
+    // Per-user name (review 2026-09-29, SSH-39): `/tmp` is shared, and a
+    // fixed `isekai-ssh-helpers` directory another local user created first
+    // would let them plant the binary this user then uploads and runs on
+    // their own remote hosts. `cache_is_trustworthy` additionally refuses a
+    // cache whose file/directory isn't this user's.
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        Ok(std::env::temp_dir().join(format!("isekai-ssh-helpers-{uid}")))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(std::env::temp_dir().join("isekai-ssh-helpers"))
+    }
+}
+
+/// Sidecar recording the sha256 of the bytes *this tool itself* wrote to
+/// `cache_file` — re-checked on every cache hit so a cached binary that was
+/// modified afterwards (another local user, disk corruption, a partial
+/// write) is never uploaded to a remote host and executed there (SSH-39).
+fn local_sha256_path(cache_file: &Path) -> PathBuf {
+    let mut name = cache_file.as_os_str().to_os_string();
+    name.push(".local-sha256");
+    PathBuf::from(name)
+}
+
+/// Whether an existing cache entry may be used as-is: its bytes still match
+/// the digest recorded when it was written, and (on Unix) both the file and
+/// its directory belong to the current user and aren't group/world-writable.
+/// A cache failing this is treated exactly like no cache at all (re-download).
+fn cache_is_trustworthy(cache_file: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(cache_file) else { return false };
+    let Ok(recorded) = std::fs::read_to_string(local_sha256_path(cache_file)) else { return false };
+    if recorded.trim() != hex_sha256(&bytes) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let owned_and_private = |path: &Path| {
+            std::fs::symlink_metadata(path).map(|m| m.uid() == uid && m.mode() & 0o022 == 0).unwrap_or(false)
+        };
+        if !owned_and_private(cache_file) || !cache_file.parent().is_some_and(owned_and_private) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Downloads `{asset_name}.sha256` (a plain hex digest, matching
@@ -312,7 +361,9 @@ fn verify_sha256_sidecar_if_present(agent: &ureq::Agent, sidecar_url: &str, byte
 pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSource, arch: &str, base_url: &str, api_base_url: &str) -> Result<PathBuf> {
     let asset_name = asset_name_for_arch(arch)?;
     let path = cache_path(cache_dir, source, &asset_name);
-    let cache_existed = path.exists();
+    // An entry that fails `cache_is_trustworthy` is treated as absent: it is
+    // re-downloaded, and never used as the network-failure fallback below.
+    let cache_existed = path.exists() && cache_is_trustworthy(&path);
     if cache_existed && (source.tag.is_some() || !is_stale(&path)) {
         log::debug!("isekai-ssh: using cached isekai-pipe binary at {}", path.display());
         return Ok(path);
@@ -498,6 +549,11 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
 
     let parent = path.parent().expect("cache_path always has a parent directory");
     std::fs::create_dir_all(parent).with_context(|| format!("isekai-ssh: failed to create helper cache directory {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
 
     if previously_cached.as_deref() == Some(bytes.as_slice()) {
         log::debug!("isekai-ssh: cached isekai-pipe binary at {} is already up to date", path.display());
@@ -517,6 +573,8 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
         log::info!("isekai-ssh: {verb} isekai-pipe binary ({} bytes) at {}", bytes.len(), path.display());
     }
 
+    std::fs::write(local_sha256_path(&path), hex_sha256(&bytes))
+        .with_context(|| format!("isekai-ssh: failed to record the cached binary's digest next to {}", path.display()))?;
     write_last_checked(&last_checked_path(&path), SystemTime::now())?;
     Ok(path)
 }
@@ -698,8 +756,23 @@ mod tests {
         let path = cache_path(cache_dir, source, &asset_name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
+        std::fs::write(local_sha256_path(&path), hex_sha256(bytes)).unwrap();
         write_last_checked(&last_checked_path(&path), SystemTime::now() - age).unwrap();
         path
+    }
+
+    /// SSH-39 regression: a cached binary modified after this tool wrote it
+    /// is not trusted (re-downloaded rather than uploaded and executed).
+    #[test]
+    fn a_tampered_cache_entry_is_not_trustworthy() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, b"genuine-bytes", Duration::from_secs(0));
+        assert!(cache_is_trustworthy(&path));
+        std::fs::write(&path, b"planted-bytes").unwrap();
+        assert!(!cache_is_trustworthy(&path), "bytes that no longer match the recorded digest must not be used");
+        std::fs::remove_file(local_sha256_path(&path)).unwrap();
+        assert!(!cache_is_trustworthy(&path), "an entry without a recorded digest must not be used either");
     }
 
     #[tokio::test]
@@ -771,6 +844,8 @@ mod tests {
         let path = cache_path(cache_dir.path(), &source, &asset_name_for_arch("x86_64").unwrap());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &old_bytes).unwrap();
+        // As `download_and_cache` itself records it (SSH-39).
+        std::fs::write(local_sha256_path(&path), hex_sha256(&old_bytes)).unwrap();
 
         let unreachable = "http://127.0.0.1:1";
         let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable, unreachable).await.unwrap();
