@@ -54,9 +54,9 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: `keep_alive_interval(10s)` を設定する。
 - [~] **TR-M11** Medium `isekai-protocol/src/ctl.rs:43,396-402` — ctl の行長上限が、行を読み終えた後にしか効いていない。
   - 見送り(担当境界): 実際の無制限 `read_line` は `isekai-ssh/src/ctl_forward.rs:318-325` と `src/transport/ssh_handler.rs:356-366` にあり、isekai-protocol 側には読み取りコードが無い(I/O-free crate)。fix-isekai-ssh に連絡済み。
-- [ ] **TR-M12** Medium `isekai-auth/src/file_provider.rs:370-402` — refresh にプロセス間ロックが無く、同じ refresh_token を再利用して token family ごと失効しうる。
+- [x] **TR-M12** Medium `isekai-auth/src/file_provider.rs:370-402` — refresh にプロセス間ロックが無く、同じ refresh_token を再利用して token family ごと失効しうる。
   - 方針: `isekai_fs_guard::with_exclusive_lock` で load→refresh→save を囲み、ロック取得後に再読込する。
-- [ ] **TR-M13** Medium `isekai-auth/src/oauth.rs:57-64` — ureq 3 の既定タイムアウトはすべて None。
+- [x] **TR-M13** Medium `isekai-auth/src/oauth.rs:57-64` — ureq 3 の既定タイムアウトはすべて None。
   - 方針: `timeout_global`(30 秒)を設定する。`isekai-ssh/src/wrapper.rs:1527` の `spawn_blocking` 化は fix-isekai-ssh の担当(連絡済み)。
 - [x] **TR-M14** Medium `isekai-trust/src/host_key_verifier.rs:145-150,176-181` / `store.rs:133-135` — 既知ホストが一致しても毎回書き込み、`last_seen_at` の保存に失敗すると Rejected になる。
   - 方針: 既知一致時の更新は best-effort にし、失敗しても Accepted を返して警告ログのみ出す(always-connects.md)。
@@ -80,7 +80,7 @@ openssh-config / osc-color(quicsock は vendored)。
 - [ ] **TR-L6** `resume.rs:497-503,526-532` — GaveUpAfterGenerationRetries に原因の失敗が残らない → 最後の失敗を保持する。
 - [ ] **TR-L7** `race.rs:53` — Happy Eyeballs の遅延 250ms が punch の最低所要 ~750ms より短い → production 既定(`isekai-pipe-core` の 750ms)に揃える。
 - [x] **TR-L8** `resume/app_ack.rs:169-170` — APP_ACK の offset の単調性を検証していない → 後退する値は無視する(送信済み範囲の検証は counters が送信量を知らないため、単調性の検証のみ)。
-- [ ] **TR-L9** 秘密値を含む型の `derive(Debug)`: relay.rs `RelayTarget` / stun_p2p.rs / race.rs / resume.rs / isekai-protocol handshake.rs / isekai-auth file_provider.rs・oauth.rs・device_flow.rs → 秘密フィールドを伏せた手書き Debug にする。
+- [x] **TR-L9** 秘密値を含む型の `derive(Debug)`: relay.rs `RelayTarget` / stun_p2p.rs / race.rs / resume.rs / isekai-protocol handshake.rs / isekai-auth file_provider.rs・oauth.rs・device_flow.rs → 秘密フィールドを伏せた手書き Debug にする。
   isekai-trust schema.rs は公開鍵のみなので誤検知([-])。
 - [x] **TR-L10a** `quicmux/src/qmux_backend.rs:181,308` — MuxClientConfig/MuxServerConfig の idle・keepalive・max_streams を無視している → qmux::Config に反映できるものは反映する。
 - [x] **TR-L10b** `quicmux/src/noq_backend.rs:400-402` — `NoqListener::bind` が port_range を無視している → `bind_with_port_range` を使う。
@@ -93,9 +93,9 @@ openssh-config / osc-color(quicsock は vendored)。
   注: 本項目は quicmux/src/resume.rs のため、「quicmux の resume*.rs は isekai-pipe 担当」の境界に該当する。isekai-pipe 側が触らない場合のみ対応する。
 - [ ] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
 - [ ] **TR-L16b** `h3-qmux/src/lib.rs:253` — peer の close code を捨てている → code を保持する。
-- [ ] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
-- [ ] **TR-L17b** `isekai-auth/src/file_provider.rs:101,140` — 巨大な expires_in で i64 がラップする → saturating/try_from にする。
-- [ ] **TR-L18** `isekai-auth/src/refresh.rs:22` / `oauth.rs:57` — token endpoint が http:// でも許容している → https を強制する(ループバックのみ例外)。
+- [x] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
+- [x] **TR-L17b** `isekai-auth/src/file_provider.rs:101,140` — 巨大な expires_in で i64 がラップする → saturating/try_from にする。
+- [x] **TR-L18** `isekai-auth/src/refresh.rs:22` / `oauth.rs:57` — token endpoint が http:// でも許容している → https を強制する(ループバックのみ例外)。
 - [ ] **TR-L19** `isekai-protocol/src/ctl_vars.rs:49-52` — CtlVarStore のキー数に上限が無い → 上限を設ける(超過時は set を拒否する)。
 - [~] **TR-L20a** ctl preamble の比較が非定数時間(`isekai-ssh/src/ctl_forward.rs:319`, `src/transport/ssh_handler.rs:360`) — 担当境界外。fix-isekai-ssh / fix-rust-core の担当。
 - [ ] **TR-L20b** `isekai-protocol` の自前 ct_eq(hello.rs:49, attach.rs:185,221) → `subtle` に統一する。
