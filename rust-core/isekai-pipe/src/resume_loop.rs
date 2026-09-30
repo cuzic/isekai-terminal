@@ -1307,6 +1307,21 @@ fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_alread
     }
 }
 
+/// Process-global "the SSH byte bridge has gone live" latch (PIPE-18) —
+/// set once `run_resume_loop` starts bridging stdin/stdout, never reset.
+/// One `isekai-pipe connect` process serves exactly one `ssh(1)` session,
+/// so a process-wide flag is the right scope. Read by
+/// `connect::write_connect_outcome_for_wrapper` to stamp
+/// `ConnectOutcome::session_established`, which lets `isekai-ssh`'s wrapper
+/// avoid re-running a remote command after a mid-session failure that the
+/// outcome `class` alone (e.g. the relay route's `Unreachable`) cannot
+/// distinguish from a pre-handshake one.
+static SSH_BRIDGE_WENT_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn ssh_bridge_went_live() -> bool {
+    SSH_BRIDGE_WENT_LIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1330,6 +1345,10 @@ pub(crate) async fn run_resume_loop(
         tethering_interface.is_none() || cross_family_target.is_none(),
         "tethering_interface and cross_family_target must never both be set until warm-standby is made switch-aware"
     );
+    // From here on stdin/stdout are bridged to the remote sshd — the one
+    // point every connect route (relay, relay fallback, STUN) passes through
+    // before any SSH byte can flow (PIPE-18).
+    SSH_BRIDGE_WENT_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     let session_id = established.session_id;
     let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);
