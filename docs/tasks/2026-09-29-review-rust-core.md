@@ -52,8 +52,9 @@
   - 方針: 切断時・新しいsessionへの差し替え時に保留中要求をすべてErrorで解決する。
 - [x] **RC-20** Medium — `orchestrator.rs:298-311` — 転送中に切断してもtrzsz状態(最大2GiBのdownload_buf・transfer_id・interactive_busy)がリセットされない。`on_trzsz_finished`/`download_chunk`がtransfer_idを照合しない(low)。
   - 方針: 切断時に転送状態をクリアし`Done{success:false}`を通知。download_chunk/finishedは`current_transfer_id`と一致しない場合は無視する。
-- [ ] **RC-21** Medium — `ssh_handler.rs:262-270` / `agent_forward.rs:160-176` — プール共有Handleのagent-forward署名確認が確立したタブのevent loopへ流れる。確立タブが閉じると以後全拒否。
+- [x] **RC-21** Medium — `ssh_handler.rs:262-270` / `agent_forward.rs:160-176` — プール共有Handleのagent-forward署名確認が確立したタブのevent loopへ流れる。確立タブが閉じると以後全拒否。
   - 方針: 共有Handleのagent確認経路を、そのHandleを現在使っているタブのうち生きているものへルーティングする(チャネルごとの送信先リストから生きているものを選ぶ)。
+  - 注: どのタブのsshが署名を要求したかはSSHプロトコル上判別できないため、生きているうち最も新しく開いたタブへ送る(確立タブが閉じても全拒否にはならない)。
 - [x] **RC-22** Medium — `transport/file_preview_exec.rs:46-62` — stdout無制限・タイムアウトなし・タブ終了後も継続。
   - 方針: 出力上限と全体タイムアウトを設ける(`run_exec_on_handle`と同等)。
 - [x] **RC-23** Medium/Low — `ssh_handler.rs:353-364, 832, 848-850` — ctl streamlocalで認証前に無制限`read_line`・タイムアウトなし、ctlキュー無制限、`CtlVarStore`無制限。
