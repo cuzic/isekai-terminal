@@ -66,13 +66,13 @@
 
 ## Low / Low-Medium
 
-- [ ] **SSH-21** Low-Medium `install_script.rs:384-491`(A12-1)
+- [x] **SSH-21** Low-Medium `install_script.rs:384-491`(A12-1)
   - 要約: ログインシェルが fish/csh/tcsh だと POSIX sh 前提のスクリプトが動かない。
   - 方針: スクリプトを base64 化し、`exec /bin/sh -c 'eval "$(printf %s <b64> | base64 -d)"'` という 1 行・改行なし・単一引用のみのラッパーで渡す。
-- [ ] **SSH-22** Low-Medium `install_script.rs:474-476`(A12-2)
+- [x] **SSH-22** Low-Medium `install_script.rs:474-476`(A12-2)
   - 要約: handshake poll が timeout すると、起動済み helper が孤児化する。
   - 方針: timeout 分岐で `kill` してから pid ファイルを消す。
-- [ ] **SSH-23** Low-Medium `install_script.rs:413-419,437-438`(A12-3)
+- [x] **SSH-23** Low-Medium `install_script.rs:413-419,437-438`(A12-3)
   - 要約: `/proc` がない環境では reuse 判定がディスク上ファイルの sha256 になり、古い稼働プロセスを再利用しうる。
   - 方針: state ファイルに起動時の sha256 を記録し、reuse は「記録 sha == 期待 sha」を条件にする。
 - [~] **SSH-24** Low-Medium `install_script.rs:436-446`(A12-4)— alive-but-broken な helper を強制再起動する手段(`force_relaunch`)がない。
@@ -122,7 +122,7 @@
 - [ ] **SSH-40** Low `helper_download.rs:415-429`(D5)
   - 要約: latest download と tag 取得の間の競合で、新 tag に旧 binary を紐付けうる。
   - 方針: 先に tag を取得し、その tag の URL からダウンロードする。
-- [ ] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
+- [x] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
   - 要約: `mv` 前の sha 照合がない、IPv6 アドレスを未クォートで埋め込んでいる、`mktemp -d` 失敗時に `/relay_jwt` へ書く、宛先の前に `--` がない。
   - 方針: それぞれ修正する。
 - [ ] **SSH-42** Low `types.rs`(D7)
