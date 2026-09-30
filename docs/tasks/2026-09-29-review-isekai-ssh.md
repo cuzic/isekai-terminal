@@ -46,7 +46,7 @@
 - [x] **SSH-13** Medium `russh_backend.rs:475-481`
   - 要約: bootstrap 時の TOFU プロンプトにホスト名が出ず、jump/target のどちらを承認しているか分からない。
   - 方針: 対話ポリシーを leg ごとの `host:port` 付きクロージャで構築し、プロンプトに表示する。
-- [ ] **SSH-14** Medium/Low `native/connect.rs:806-813`
+- [x] **SSH-14** Medium/Low `native/connect.rs:806-813`
   - 要約: silent 時の keyboard-interactive がエラーにせず空回答を送り、PAM の faillock を積む。
   - 方針: silent 時は keyboard-interactive 認証自体を試みない。
 - [ ] **SSH-15** Medium `native/mux/owner.rs:603-623,773-782`
