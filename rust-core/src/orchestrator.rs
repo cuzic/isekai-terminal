@@ -462,6 +462,25 @@ pub(crate) struct OrchestratorShared {
     reconnect_wake: tokio::sync::Notify,
 }
 
+impl Drop for OrchestratorShared {
+    /// RC-34: タブ(orchestrator)が完全に破棄されたら、プロセス全体の
+    /// `TMUX_LOCATOR_REGISTRY`からこのタブのエントリを取り除く。レジストリのロックが
+    /// たまたま他で握られていても破棄処理自体を止めないよう`try_lock`し、取れなければ
+    /// 非同期に後始末する。
+    fn drop(&mut self) {
+        let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
+        match registry.try_lock() {
+            Some(mut reg) => reg.unregister(&self.app_pane_id),
+            None => {
+                let app_pane_id = self.app_pane_id.clone();
+                RUNTIME.spawn(async move {
+                    crate::tmux_locator::TMUX_LOCATOR_REGISTRY.lock().unregister(&app_pane_id);
+                });
+            }
+        }
+    }
+}
+
 // ── OrchestratorAdapter ───────────────────────────────────
 // Translates old SessionCallback events → structured OrchestratorCallback
 
@@ -2097,17 +2116,18 @@ impl SessionOrchestrator {
         // 引き継いで登録した上で、ロケータが分かった今すぐ改めてtmuxへ
         // 書き込み直す(bの場合は直接pushで既に成功済みのはずだが、再送は
         // 無害なのでどちらの由来でも同じ経路で扱う)。
+        // RC-31(2026-09-29 コードレビュー): 取り出し→登録→フック設定を1回のロック区間で
+        // 行う。以前は3回別々にロックしており、取り出しと登録の間に割り込んだ
+        // `push_ctl_socket_to_tmux`が書いた新しいパスを、取り出し済みの古い値で
+        // 上書きし得た。
         let recovered_ctl_socket_path = {
             let mut reg = registry.lock();
-            reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
-                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string))
+            let recovered = reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
+                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string));
+            reg.register(self.shared.app_pane_id.clone(), outcome.locator.clone(), recovered.clone());
+            reg.set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
+            recovered
         };
-        registry.lock().register(
-            self.shared.app_pane_id.clone(),
-            outcome.locator.clone(),
-            recovered_ctl_socket_path.clone(),
-        );
-        registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         // tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
         // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
         // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが

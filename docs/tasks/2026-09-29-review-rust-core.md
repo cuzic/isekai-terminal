@@ -78,11 +78,12 @@
   - 方針: `start_manual_connect`/`connect_via`の`Err`経路で`phase=Idle`へ戻す。
 - [ ] **RC-30** Low — `TerminalSession.kt:425, 480` — Kotlinが自前状態でconnectをガードし、disconnect時に`connected=false`を自分で書いている(SSOT漏れ)。
   - 方針: Rust側でRC-03/RC-13を直し、Rustが判断・通知できるようにする。Kotlin側のミラー状態除去はandroid/の担当。
-- [ ] **RC-31** Low — `orchestrator.rs` `ensure_tmux_tab_window` — `TMUX_LOCATOR_REGISTRY`を3回別々にロックし、間に入った`push_ctl_socket_to_tmux`の新しいパスを古い値で上書きしうる。
+- [x] **RC-31** Low — `orchestrator.rs` `ensure_tmux_tab_window` — `TMUX_LOCATOR_REGISTRY`を3回別々にロックし、間に入った`push_ctl_socket_to_tmux`の新しいパスを古い値で上書きしうる。
   - 方針: take→register→set hooksを1回のロック区間で行う。
-- [ ] **RC-32** Low — `tmux_window_claim.rs:16-35` — claimが明示releaseでしか解放されずTTL/owner生存確認がない。
+- [~] **RC-32** Low — `tmux_window_claim.rs:16-35` — claimが明示releaseでしか解放されずTTL/owner生存確認がない。
+  - 見送り: owner_idはKotlin側が発行する識別子で、Rust側はその生存を知る手段が無い。解決するにはclaimをSessionOrchestrator等のRustオブジェクトの寿命に結び付けるUniFFI APIの再設計(とandroid/ios側の呼び出し変更)が必要で、担当境界(rust-core/src)内だけでは直せない。プロセス再起動では解消する(ファイル冒頭doc参照)。
 - [ ] **RC-33** Low(sec/design) — `transport/ctl_streamlocal.rs:25-35` — `VarScope::Global`のctl変数が異なるリモートホスト間で共有される。
-- [ ] **RC-34** Low — `tmux_locator.rs:489-494, 549-551` — `TMUX_LOCATOR_REGISTRY`/`pending_ctl_socket_paths`のエントリが削除されない。
+- [x] **RC-34** Low — `tmux_locator.rs:489-494, 549-551` — `TMUX_LOCATOR_REGISTRY`/`pending_ctl_socket_paths`のエントリが削除されない。
   - 方針: orchestrator破棄(Drop)時にそのAppPaneIdのエントリを削除する。
 - [ ] **RC-35** Low — `forward.rs:69, 121, 188` / `ssh_handler.rs:295` / `socks.rs:40-148` — フォワード削除/タブ切断で受理済みrelayタスクが残る。SOCKSネゴシエーションにタイムアウトなし。
   - 方針: relayタスクをフォワードごとの`JoinSet`/abort tokenで管理し削除時にabort。SOCKSハンドシェイクにタイムアウト。
