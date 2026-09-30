@@ -48,12 +48,12 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 
 ## Medium
 
-- [ ] **AND-M1a** (Medium) `TerminalTabsViewModel.kt:1111-1138` — trzszアップロードにフロー制御・
+- [x] **AND-M1a** (Medium) `TerminalTabsViewModel.kt:1111-1138` — trzszアップロードにフロー制御・
   キャンセル確認が無く、Rust側の容量64の`try_send`を溢れさせてチャンクを取りこぼしうる。
   - 方針(Kotlin側): Rustが報告するack済みバイト数(`TrzszUiState.InProgress.transferred`、
     upload時はリモートの`SUCC`で進む)に対する送信先行量をウィンドウで制限し、転送が
     Done/消滅したら読み出しを止める。
-- [ ] **AND-M1b** (Medium) 同上のRust側 — `session.rs`の`try_send`失敗黙殺、bounded+awaitのAPIや
+- [~] **AND-M1b** (Medium) 同上のRust側 — 見送り(Rust側新API要: rust-coreは別担当。Kotlin側はAND-M1aのack駆動ウィンドウで取りこぼしを実質防止済み) — `session.rs`の`try_send`失敗黙殺、bounded+awaitのAPIや
   「次チャンク要求」コールバックによるRust主導のフロー制御。
 - [ ] **AND-M2** (Medium) `TerminalSessionService.kt:41-45` / `session/AndroidAppExecutor.kt:57-66` —
   最後のタブを閉じても`stopSelf()`だけで`stopForeground`されず、`BIND_AUTO_CREATE`でbindされた
