@@ -82,7 +82,7 @@
     `relay_ended`(lease一致検査あり)を呼ぶ。
 - [x] **PIPE-15** (Low) `quicmux/src/resume.rs::ReplayBuffer::advance_start` が1バイトずつpop
   - 方針: `drain(..k)` に置き換える。
-- [ ] **PIPE-16** (Low) `engine/mod.rs::resolve_relay_jwt` のゼロクリア不完全 / `--relay-jwt` 継続受理
+- [x] **PIPE-16** (Low) `engine/mod.rs::resolve_relay_jwt` のゼロクリア不完全 / `--relay-jwt` 継続受理
   - 方針: `trimmed` の別Stringを作らず in-place で truncate して返す。`--relay-jwt`(argv露出)は後方互換のため
     受理は続けるが、使われた場合は警告ログを出す。
 - [ ] **PIPE-17** (Low) `connect.rs` `run_connect` が非Send(既知)

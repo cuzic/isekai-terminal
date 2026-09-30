@@ -496,7 +496,16 @@ pub(crate) fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<
 /// ディレクトリは`trap ... EXIT`でも最終的に回収されるが、露出時間を最小化する)。
 fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) -> Result<String> {
     match (relay_jwt, relay_jwt_file) {
-        (Some(jwt), None) => Ok(jwt),
+        (Some(jwt), None) => {
+            // Still accepted for backward compatibility, but the token sits in
+            // argv for the whole process lifetime (`ps`, `/proc/<pid>/cmdline`)
+            // — make that visible (review 2026-09-29, PIPE-16).
+            log::warn!(
+                "--relay-jwt exposes the relay token to other local users via the process argv; \
+                 use --relay-jwt-file instead (isekai-bootstrap already does)"
+            );
+            Ok(jwt)
+        }
         (None, Some(path)) => {
             let mut content = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read --relay-jwt-file {path}"))?;
@@ -505,9 +514,16 @@ fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) 
             if let Err(e) = std::fs::remove_file(&path) {
                 log::warn!("failed to remove --relay-jwt-file {path} after reading: {e}");
             }
-            let trimmed = content.trim_end_matches(['\n', '\r']).to_string();
-            zeroize_string(&mut content);
-            Ok(trimmed)
+            // Trim in place rather than copying into a second `String`
+            // (PIPE-16): the old `.to_string()` copy was never zeroized, so
+            // the "zeroize the buffer we read" step only scrubbed a copy of a
+            // secret that still lived on elsewhere. Scrub the trailing bytes
+            // being cut off, then shorten — the one remaining buffer is the
+            // value handed to the caller.
+            let keep = content.trim_end_matches(['\n', '\r']).len();
+            let mut tail = content.split_off(keep);
+            zeroize_string(&mut tail);
+            Ok(content)
         }
         (None, None) | (Some(_), Some(_)) => {
             unreachable!("relay_jwt/relay_jwt_file exclusivity already validated in parse_args")
@@ -2348,6 +2364,23 @@ mod bind_port_range_tests {
         let socket =
             bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port.saturating_add(31)))).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), held_port);
+    }
+}
+
+#[cfg(test)]
+mod relay_jwt_file_tests {
+    use super::*;
+
+    /// PIPE-16: the file's trailing newline is trimmed in place (no second,
+    /// never-zeroized copy) and the file is removed after reading.
+    #[test]
+    fn relay_jwt_file_is_trimmed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_jwt");
+        std::fs::write(&path, "header.payload.sig\r\n").unwrap();
+        let jwt = resolve_relay_jwt(None, Some(path.to_str().unwrap().to_string())).unwrap();
+        assert_eq!(jwt, "header.payload.sig");
+        assert!(!path.exists(), "the token file must be unlinked after reading");
     }
 }
 
