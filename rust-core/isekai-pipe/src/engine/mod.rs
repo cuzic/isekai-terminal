@@ -6,6 +6,7 @@ mod resume;
 mod serve_fsm;
 #[cfg(test)]
 mod serve_shell_differential_tests;
+mod standby_hold;
 #[cfg(test)]
 mod sweep_resume_race_tests;
 #[cfg(test)]
@@ -584,8 +585,9 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
         .map_err(|e| anyhow!("failed to build private key: {e}"))?;
 
-    // data stream（Phase 7）+ control stream（Phase 8、resume 用）の 2 本を許可する
-    // （HELPER_PROTOCOL.md §7.1）。3 本目以降は Phase 7 と同様 reset される。
+    // data stream（Phase 7）+ control stream（Phase 8、resume 用）の 2 本に加えて、
+    // warm standby の hold stream(isekai_protocol::standby)用に 1 本を許可する
+    // （HELPER_PROTOCOL.md §7.1）。上限を超えた分は Phase 7 と同様 reset される。
     // Phase 9-1: multipath 対応。既存 quinn クライアント（Phase 7/8）は
     // open_path() を呼ばないため path0 のみで従来通り動作し、後方互換に
     // 影響しない（Phase 9-0 の compat_check.rs で実証済み）。preferred_address は
@@ -597,7 +599,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         exporter_label: EXPORTER_LABEL.to_vec(),
         max_idle_timeout: Duration::from_secs(args.idle_timeout),
         keep_alive_interval: Duration::from_secs((args.idle_timeout / 3).max(1)),
-        max_concurrent_bidi_streams: 2,
+        max_concurrent_bidi_streams: 3,
         max_concurrent_uni_streams: 0,
         multipath: true,
         // `isekai-pipe serve`'s SSH tunnel never sends QUIC datagrams today
@@ -942,6 +944,7 @@ async fn handle_connection(
         let rest_len = match type_byte[0] {
             FRAME_ATTACH_HELLO => ATTACH_HELLO_FRAME_LEN - 1,
             FRAME_ATTACH_CANCEL => CANCEL_ATTACH_FRAME_LEN - 1,
+            isekai_protocol::standby::FRAME_STANDBY_HOLD => isekai_protocol::standby::STANDBY_HOLD_FRAME_LEN - 1,
             // quicmux::FRAME_RESUME(0x01)のボディは可変長(token/auth_blobが
             // それぞれ長さ接頭辞つき)なので、ここでは読まない —
             // handle_resume_streamがquicmux::decode_resume_request経由で
@@ -968,6 +971,12 @@ async fn handle_connection(
                 .await
         }
         quicmux::FRAME_RESUME => {
+            handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime).await
+        }
+        isekai_protocol::standby::FRAME_STANDBY_HOLD => {
+            // warm standby(isekai-transport/src/warm_standby.rs): HELLO_TIMEOUTの
+            // 対象外として保持し、2本目のstreamで届くRESUMEを通常のRESUMEと同じく処理する。
+            let (send, recv) = standby_hold::hold_until_resume_stream(&conn, send, recv, &rest, &session_secret).await?;
             handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime).await
         }
         FRAME_ATTACH_CANCEL => {
