@@ -11,7 +11,7 @@
 
 ## High
 
-- [ ] **CI-H1** (High) `.github/workflows/android-test-check.yml:81-82`, `rust-core-test-check.yml:87-88,270-271,333-334`,
+- [x] **CI-H1** (High) `.github/workflows/android-test-check.yml:81-82`, `rust-core-test-check.yml:87-88,270-271,333-334`,
   `android-uniffi-drift-check.yml:74-75`, `.github/actions/pr-path-gate/action.yml:86-101,124-127`
   - 要約: pr-path-gate を実行する `changes` job が失敗/キャンセル/タイムアウトすると、`needs: changes` の
     required job(`android-unit-test`/`rust-core-test-linux`/`android-uniffi-drift`)が **skipped** になり、
@@ -19,6 +19,7 @@
   - 修正方針: required job の `if:` を `!cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true')`
     にし、gate job が成功しなかった場合は重いテストを実行する(fail-open)。job の `name:`(required の
     context 名)は変更しない。
+  - 対応: 3ワークフロー計5 job の `if:` を上記に変更。pr-path-gate の action.yml に呼び出し側の条件付け規約を追記。
 
 ## Medium
 

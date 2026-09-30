@@ -72,7 +72,12 @@ jobs:
 
   drift-check:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # `changes`(pr-path-gate)jobが失敗・タイムアウトした場合、単純な
+    # `needs.changes.outputs.relevant == 'true'`だとこのjobは`skipped`になり、
+    # branch protection上はskipped=緑としてrequired checkを素通りしてしまう。
+    # gateが成功しなかったときは重いテストを実行する側に倒す(fail-open)。
+    # ワークフロー自体がキャンセルされた場合(concurrencyのcancel-in-progress等)は走らせない。
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: android-uniffi-drift
