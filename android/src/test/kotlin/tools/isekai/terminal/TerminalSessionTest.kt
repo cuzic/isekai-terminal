@@ -96,7 +96,7 @@ class TerminalSessionTest {
 
     @Test
     fun initialState_logEmpty() {
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 接続 ──────────────────────────────────────────────────────
@@ -287,8 +287,28 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateData("hello ".toByteArray())
         fakeOrchestrator.simulateData("world".toByteArray())
 
-        withTimeout(3000) { session.log.first { it.contains("world") } }
-        assertEquals("hello world", session.log.value)
+        assertEquals("hello world", session.logSnapshot())
+    }
+
+    /** AND-L8: チャンク境界でUTF-8のマルチバイト文字が分断されても化けない。 */
+    @Test
+    fun onData_multibyteCharSplitAcrossChunks_isDecodedIntact() {
+        val bytes = "あいう".toByteArray(Charsets.UTF_8) // 9バイト
+        fakeOrchestrator.simulateData(bytes.copyOfRange(0, 2))
+        fakeOrchestrator.simulateData(bytes.copyOfRange(2, 7))
+        fakeOrchestrator.simulateData(bytes.copyOfRange(7, 9))
+        assertEquals("あいう", session.logSnapshot())
+    }
+
+    /** AND-L8: 上限を超えたら直近分だけを保持する。 */
+    @Test
+    fun onData_exceedingLimit_keepsMostRecentTail() {
+        val chunk = "x".repeat(50_000).toByteArray()
+        repeat(4) { fakeOrchestrator.simulateData(chunk) }
+        fakeOrchestrator.simulateData("END".toByteArray())
+        val log = session.logSnapshot()
+        assertTrue(log.length <= 200_000)
+        assertTrue(log.endsWith("END"))
     }
 
     @Test
@@ -297,10 +317,10 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
         fakeOrchestrator.simulateData("hello".toByteArray())
-        withTimeout(3000) { session.log.first { it.isNotEmpty() } }
+        assertEquals("hello", session.logSnapshot())
 
         session.clearLog()
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 送信 ──────────────────────────────────────────────────────
@@ -382,6 +402,65 @@ class TerminalSessionTest {
         session.respondAgentSignRequest(false)
 
         assertFalse(withTimeout(3000) { resultDeferred.await() })
+    }
+
+    /** AND-L2: 署名要求が同時に届いた場合、応答不能になった先行分は即座に拒否し、
+     *  後続分の保留・表示は先行分の後始末で消えない(後続は正しく承認できる)。 */
+    @Test
+    fun onAgentSignRequest_concurrentRequests_secondRemainsApprovable() = runBlocking {
+        session.connect(testConfig())
+        val first = async(Dispatchers.IO) { fakeOrchestrator.simulateAgentSignRequest("SHA256:first") }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:first" } }
+        val second = async(Dispatchers.IO) { fakeOrchestrator.simulateAgentSignRequest("SHA256:second") }
+
+        assertFalse("先行分は応答不能になるため即座に拒否される", withTimeout(3000) { first.await() })
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:second" } }
+
+        session.respondAgentSignRequest(true)
+
+        assertTrue(withTimeout(3000) { second.await() })
+        assertNull(session.state.value.agentSignRequestFingerprint)
+    }
+
+    /** AND-L6: 「信頼」直後の再接続のhost key checkは、信頼の書き込み完了後に行われる。 */
+    @Test
+    fun onHostKey_afterTrustNewHostKey_waitsForTrustWriteBeforeChecking() = runBlocking {
+        val writeStarted = java.util.concurrent.CountDownLatch(1)
+        val releaseWrite = java.util.concurrent.CountDownLatch(1)
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val trusted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val checker = object : tools.isekai.terminal.session.HostKeyChecker {
+            override fun check(host: String, port: Int, fingerprint: String): HostKeyDecision {
+                events += "check"
+                return if (trusted.get()) {
+                    HostKeyDecision.Trust(isNew = false)
+                } else {
+                    HostKeyDecision.Unconfirmed(NewHostKeyPrompt(host, port, fingerprint))
+                }
+            }
+            override fun trustUpdated(host: String, port: Int, fingerprint: String) {
+                writeStarted.countDown()
+                releaseWrite.await()
+                trusted.set(true)
+                events += "trust"
+            }
+        }
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(checker, orchestratorFactory = { cb -> orch.also { it.callback = cb } })
+        s.connect(testConfig())
+        assertFalse(orch.simulateHostKey(fingerprint = "SHA256:new"))
+        withTimeout(3000) { s.state.first { it.newHostKeyPrompt != null } }
+        events.clear()
+
+        s.trustNewHostKey()
+        assertTrue(writeStarted.await(3, java.util.concurrent.TimeUnit.SECONDS))
+        val check = async(Dispatchers.IO) { orch.simulateHostKey(fingerprint = "SHA256:new") }
+        delay(100)
+        releaseWrite.countDown()
+
+        assertTrue("書き込み完了後のcheckなので信頼済みとして通る", withTimeout(3000) { check.await() })
+        assertEquals(listOf("trust", "check"), events.toList())
+        s.close()
     }
 
     @Test

@@ -7,6 +7,7 @@ import tools.isekai.terminal.util.RemoteLogger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
@@ -116,6 +117,15 @@ class TerminalSession(
         // 想定しない(大きなファイルは`--length`でチャンク化される)が、接続が死んでいる
         // 状態で呼ばれた場合でも呼び出し元をいつまでもsuspendさせないための保険。
         private const val FILE_PREVIEW_TIMEOUT_MS = 20_000L
+
+        // AND-L8: ログの保持上限。超えたら[LOG_TRIM_TO_CHARS]まで先頭から切り詰める
+        // (毎回ではなく閾値超過時のみなので追記は償却O(チャンク長))。
+        private const val LOG_MAX_CHARS = 200_000
+        private const val LOG_TRIM_TO_CHARS = 180_000
+
+        // AND-L6: host key信頼の書き込み完了を[onHostKey]で待つ上限(RealHostKeyCheckerの
+        // check自体のタイムアウト3秒と同程度)。
+        private const val TRUST_WRITE_WAIT_TIMEOUT_MS = 3_000L
     }
 
     private val _state = MutableStateFlow(TerminalUiState())
@@ -127,8 +137,22 @@ class TerminalSession(
         _state.update { ConnectionStateMapper.reduce(it, msg) }
     }
 
-    private val _log = MutableStateFlow("")
-    val log: StateFlow<String> = _log.asStateFlow()
+    /**
+     * AND-L8: 受信データのログ(直近[LOG_MAX_CHARS]文字)。以前は`MutableStateFlow<String>`へ
+     * 受信チャンクごとに`current + text`で最大200KBの文字列を再構築しており(受信のたびに
+     * O(n))、チャンク境界でUTF-8のマルチバイト文字が分断されて化けていた。読み手は
+     * ログ表示操作時の[logSnapshot]だけなので、追記は[StringBuilder]へ償却O(チャンク長)で
+     * 行い、境界をまたぐマルチバイトはストリーミング[java.nio.charset.CharsetDecoder]で保持する。
+     */
+    private val logBuffer = StringBuilder()
+    private val logDecoder = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(java.nio.charset.CodingErrorAction.REPLACE)
+        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPLACE)
+    /** 前回のチャンク末尾で未完結だったマルチバイト文字のバイト(最大3バイト)。 */
+    private var logPendingBytes = ByteArray(0)
+
+    /** 現在のログ内容のスナップショット。 */
+    fun logSnapshot(): String = synchronized(logBuffer) { logBuffer.toString() }
 
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
@@ -300,6 +324,11 @@ class TerminalSession(
 
         override fun onHostKey(host: String, port: UShort, fingerprint: String): Boolean {
             RemoteLogger.i("IsekaiTerminalSSH", "host key fingerprint: $fingerprint")
+            // AND-L6: ユーザーが直前に「信頼」した鍵の書き込み(非同期)がまだDBへ反映されて
+            // いないうちに再接続のcheckが走ると、再び確認ダイアログになりうる。この
+            // callbackはRustの`spawn_blocking`スレッドから同期で呼ばれるため、ここで
+            // 書き込み完了を(上限付きで)待ってからcheckする。
+            awaitPendingTrustWrite()
             return try {
                 when (val decision = hostKeyChecker.check(host, port.toInt(), fingerprint)) {
                     is HostKeyDecision.Trust -> {
@@ -407,7 +436,10 @@ class TerminalSession(
             // AND-H1: close済みのペインでは確認UIがもう存在しないため即座に拒否する。
             if (closed.get()) return false
             val deferred = CompletableDeferred<Boolean>()
-            pendingAgentSignRequest.set(deferred)
+            // AND-L2: 確認UIは1件しか出せないため、先行する未応答の要求があればそれは
+            // もう誰にも応答されない(以前は25秒後のタイムアウトでサイレント拒否になった上、
+            // その`finally`が後続のdeferredまで消していた)。先行分は即座に拒否で返す。
+            pendingAgentSignRequest.getAndSet(deferred)?.complete(false)
             dispatch(UiMsg.AgentSignRequested(keyFingerprint))
             return try {
                 runBlocking {
@@ -419,8 +451,12 @@ class TerminalSession(
                     }
                 }
             } finally {
-                pendingAgentSignRequest.set(null)
-                dispatch(UiMsg.AgentSignRequestCleared)
+                // AND-L2: 署名要求が同時に届いて後続が`pendingAgentSignRequest`を上書き
+                // していた場合、先行分のタイムアウトで後続のdeferred・表示中fingerprintまで
+                // 消さない(自分がまだ保留中の要求である場合だけ片付ける)。
+                if (pendingAgentSignRequest.compareAndSet(deferred, null)) {
+                    dispatch(UiMsg.AgentSignRequestCleared)
+                }
             }
         }
 
@@ -657,12 +693,23 @@ class TerminalSession(
 
     // ── Host key ──────────────────────────────────────────────────────
 
+    /** AND-L6: 直近の信頼書き込みJob。[onHostKey]がcheck前に完了を待つ。 */
+    private val pendingTrustWrite = AtomicReference<Job?>(null)
+
+    private fun launchTrustWrite(host: String, port: Int, fingerprint: String) {
+        pendingTrustWrite.set(ioScope.launch { hostKeyChecker.trustUpdated(host, port, fingerprint) })
+    }
+
+    private fun awaitPendingTrustWrite() {
+        val job = pendingTrustWrite.get() ?: return
+        if (job.isCompleted) return
+        runBlocking { withTimeoutOrNull(TRUST_WRITE_WAIT_TIMEOUT_MS) { job.join() } }
+    }
+
     fun trustUpdatedHostKey() {
         val w = _state.value.hostKeyChangedWarning ?: return
         dispatch(UiMsg.HostKeyChangedWarningCleared)
-        ioScope.launch {
-            hostKeyChecker.trustUpdated(w.host, w.port, w.newFingerprint)
-        }
+        launchTrustWrite(w.host, w.port, w.newFingerprint)
     }
 
     fun dismissHostKeyWarning() {
@@ -676,9 +723,7 @@ class TerminalSession(
     fun trustNewHostKey() {
         val p = _state.value.newHostKeyPrompt ?: return
         dispatch(UiMsg.NewHostKeyPromptCleared)
-        ioScope.launch {
-            hostKeyChecker.trustUpdated(p.host, p.port, p.fingerprint)
-        }
+        launchTrustWrite(p.host, p.port, p.fingerprint)
     }
 
     fun dismissNewHostKeyPrompt() {
@@ -752,13 +797,26 @@ class TerminalSession(
 
     // ── Log ───────────────────────────────────────────────────────────
 
-    fun clearLog() { _log.value = "" }
+    fun clearLog() {
+        synchronized(logBuffer) {
+            logBuffer.setLength(0)
+            logPendingBytes = ByteArray(0)
+            logDecoder.reset()
+        }
+    }
 
     private fun appendLog(bytes: ByteArray) {
-        val text = bytes.toString(Charsets.UTF_8)
-        _log.update { current ->
-            if (current.length + text.length > 200_000) (current + text).takeLast(180_000)
-            else current + text
+        synchronized(logBuffer) {
+            val input = java.nio.ByteBuffer.wrap(if (logPendingBytes.isEmpty()) bytes else logPendingBytes + bytes)
+            val out = java.nio.CharBuffer.allocate(input.remaining() + 1)
+            // endOfInput=false: 末尾の未完結マルチバイト列は消費されずinputに残る。
+            logDecoder.decode(input, out, false)
+            out.flip()
+            logBuffer.append(out)
+            logPendingBytes = ByteArray(input.remaining()).also { input.get(it) }
+            if (logBuffer.length > LOG_MAX_CHARS) {
+                logBuffer.delete(0, logBuffer.length - LOG_TRIM_TO_CHARS)
+            }
         }
     }
 
