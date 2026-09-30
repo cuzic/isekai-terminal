@@ -637,19 +637,15 @@ async fn run_authenticated_session(
 
     // Same silent-aware seam again, for keyboard-interactive (PAM/OTP/2FA):
     // a silent/automated retry must never block waiting on a live server
-    // prompt it can't answer.
-    let kbi_responder: Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync> = if silent {
-        Arc::new(|prompts: &[KeyboardInteractivePrompt]| {
-            log_line!(
-                "isekai-ssh: server requested keyboard-interactive authentication in a silent/automated retry \
-                 — refusing without prompting. Run this connection from an interactive terminal once."
-            );
-            vec![String::new(); prompts.len()]
-        })
-    } else {
-        Arc::new(keyboard_interactive::console_responder)
-    };
-    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder, handoff };
+    // prompt it can't answer — and must not even *start* that exchange
+    // (review 2026-09-29, SSH-14). It used to answer every server prompt
+    // with an empty string instead, which PAM counts as a real failed
+    // password attempt: a holder (always silent) reconnecting in the
+    // background could quietly push the account into `pam_faillock`/
+    // fail2ban lockout. `None` skips the method entirely.
+    let kbi_responder: Option<Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync>> =
+        if silent { None } else { Some(Arc::new(keyboard_interactive::console_responder)) };
+    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: kbi_responder.as_deref(), handoff };
 
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
@@ -874,7 +870,10 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
 /// signature from growing further.
 struct InteractivePrompts<'a> {
     passphrase: &'a (dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
-    keyboard_interactive: &'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync),
+    /// `None` = never attempt keyboard-interactive at all (silent/automated
+    /// mode, SSH-14) — distinct from a responder that answers with nothing,
+    /// which still costs the account a failed PAM attempt.
+    keyboard_interactive: Option<&'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync)>,
     /// Already-decrypted identities (Phase 1b passphrase hand-off, see
     /// `super::mux::handoff`'s docs) — `connect_and_authenticate`'s candidate
     /// loop consults this *before* the on-disk `SessionError::EncryptedPrivateKey`
@@ -1047,13 +1046,18 @@ where
     // since it's the one method that's neither "prove possession of a key
     // file" nor silent — matches `ssh(1)`'s own `PreferredAuthentications`
     // ordering (publickey before keyboard-interactive/password).
-    if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| {
-        (prompts.keyboard_interactive)(server_prompts)
-    })
-    .await
-    .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
-    {
-        return Ok(handle);
+    if let Some(kbi_responder) = prompts.keyboard_interactive {
+        if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| kbi_responder(server_prompts))
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
+        {
+            return Ok(handle);
+        }
+    } else {
+        log_line!(
+            "isekai-ssh: skipping keyboard-interactive authentication in a silent/automated connection \
+             — run this connection from an interactive terminal once if the server needs it."
+        );
     }
 
     Err(anyhow!(
@@ -1399,7 +1403,7 @@ mod tests {
         EMPTY.get_or_init(HandoffCredentials::default)
     }
     fn no_interactive_prompts() -> InteractivePrompts<'static> {
-        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() }
+        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() }
     }
 
     struct AcceptAllHostKeys;
@@ -1458,18 +1462,22 @@ mod tests {
     #[derive(Clone)]
     struct KeyboardInteractiveOnlyServer {
         accepted_answer: String,
+        /// How many keyboard-interactive *responses* (i.e. real answered
+        /// attempts, each one a PAM failure if wrong) the server received.
+        responses_seen: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl server::Server for KeyboardInteractiveOnlyServer {
         type Handler = KeyboardInteractiveOnlyHandler;
         fn new_client(&mut self, _: Option<SocketAddr>) -> KeyboardInteractiveOnlyHandler {
-            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone() }
+            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone(), responses_seen: self.responses_seen.clone() }
         }
     }
 
     #[derive(Clone)]
     struct KeyboardInteractiveOnlyHandler {
         accepted_answer: String,
+        responses_seen: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -1486,6 +1494,7 @@ mod tests {
                     prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
                 }),
                 Some(resp) => {
+                    self.responses_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
                     let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
                     Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
@@ -1629,7 +1638,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(
@@ -2138,7 +2147,7 @@ mod tests {
         let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
 
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() };
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
     }
@@ -2184,7 +2193,7 @@ mod tests {
             prompted.store(true, std::sync::atomic::Ordering::SeqCst);
             no_passphrase_prompt(path, attempt)
         };
-        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: &no_kbi_responder, handoff: &resolved };
+        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: &resolved };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "a hand-off credential must authenticate directly: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
@@ -2271,14 +2280,14 @@ mod tests {
 
     #[tokio::test]
     async fn connect_and_authenticate_falls_through_to_keyboard_interactive_when_nothing_else_is_configured() {
-        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 220).await;
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string(), responses_seen: Default::default() }, 220).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         // No identity_file configured and no agent on Linux, so this proves
         // the fall-through all the way to keyboard-interactive.
         let host_config = openssh_config::HostConfig::default();
         let kbi_responder = |_prompts: &[KeyboardInteractivePrompt]| vec!["hunter2".to_string()];
-        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: Some(&kbi_responder), handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "keyboard-interactive with the right answer must authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
@@ -2290,13 +2299,28 @@ mod tests {
         // seam: the kbi responder always returns empty answers (never blocks
         // on a live server prompt it can't answer), so the overall attempt
         // fails cleanly rather than hanging.
-        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 221).await;
+        let responses_seen: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let addr = spawn_server(
+            KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string(), responses_seen: responses_seen.clone() },
+            221,
+        )
+        .await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        // SSH-14: silent mode is `keyboard_interactive: None` — the method is
+        // skipped entirely rather than answered with empty strings (each of
+        // which PAM counts as a failed password attempt).
+        let silent_prompts =
+            InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: None, handoff: empty_handoff() };
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &silent_prompts).await;
         assert!(result.is_err(), "a silently-refused keyboard-interactive prompt must fail cleanly, not hang or panic");
+        assert_eq!(
+            responses_seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "silent mode must never send a keyboard-interactive response (a PAM failed attempt)"
+        );
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
