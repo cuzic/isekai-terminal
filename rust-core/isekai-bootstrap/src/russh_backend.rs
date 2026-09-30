@@ -40,10 +40,11 @@
 //!   `~/.ssh/config`/agent internally, invisibly to this crate), so
 //!   `RusshBackend` resolves `~/.ssh/config` (via the `openssh-config`
 //!   crate) and a private key file for *each* hop itself, the same way
-//!   `isekai-ssh`'s own native connect path does. SSH agent support is a
-//!   documented follow-up — `isekai-ssh::native::agent_auth` already proves
-//!   the pattern; wiring it in here is mechanical, just deferred to keep
-//!   this first commit reviewable.
+//!   `isekai-ssh`'s own native connect path does. On Windows the target hop
+//!   additionally falls back to the SSH agent (`IdentityAgent`, default
+//!   `\\.\pipe\openssh-ssh-agent`) once every identity file failed — see
+//!   `try_agent_auth` (review 2026-09-29, SSH-04). The jump hop is still
+//!   single-credential (see `connect_and_authenticate`).
 //! - Host-key verification uses the *same* `isekai-trust`
 //!   `SshHostKeyTrustStore` (`known_ssh_hosts.toml`) `isekai-ssh`'s own
 //!   native connect path already reads/writes, so a host trusted via
@@ -78,7 +79,12 @@ pub struct RusshBackend {
     /// Called only for a host key never seen before (see
     /// `FileBackedHostKeyVerifier`'s docs below) — defaults to a real
     /// blocking stdin prompt; tests inject a fixed answer.
-    confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ///
+    /// Takes the `host:port` being verified as its first argument (review
+    /// 2026-09-29, SSH-13): the jump leg and the target leg share this one
+    /// policy, and a prompt showing only a fingerprint left the user unable
+    /// to tell *which* host's key they were approving.
+    confirm_new_host: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
     /// Test-only: see `with_identity_file`/`with_identity_files`' docs.
     /// `None` in every production code path. When `Some`, its entries replace
     /// the per-hop `~/.ssh/config` `IdentityFile`/default-probe candidate
@@ -109,8 +115,16 @@ impl RusshBackend {
     /// answer, so tests never block on real stdin.
     #[doc(hidden)]
     pub fn with_confirm_new_host(mut self, f: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
-        self.confirm_new_host = f;
+        self.confirm_new_host = Arc::new(move |_host_port: &str, fingerprint: &str| f(fingerprint));
         self
+    }
+
+    /// Binds this backend's new-host policy to one leg's `host_port`, in the
+    /// single-argument shape `FileBackedHostKeyVerifier` expects.
+    fn confirm_new_host_for(&self, host_port: &str) -> Arc<dyn Fn(&str) -> bool + Send + Sync> {
+        let confirm = self.confirm_new_host.clone();
+        let host_port = host_port.to_string();
+        Arc::new(move |fingerprint: &str| confirm(&host_port, fingerprint))
     }
 
     /// Production API for `TofuConfirmation::Silent` callers
@@ -139,9 +153,9 @@ impl RusshBackend {
     /// genuinely-unautomatable step (`isekai-ssh init`/`doctor --fix` run
     /// interactively once).
     pub fn with_unattended_new_host_policy(mut self) -> Self {
-        self.confirm_new_host = Arc::new(|fingerprint| {
+        self.confirm_new_host = Arc::new(|host_port: &str, fingerprint: &str| {
             eprintln!(
-                "isekai-ssh: unknown SSH host key (fingerprint {fingerprint}) in a silent/automated \
+                "isekai-ssh: unknown SSH host key for {host_port:?} (fingerprint {fingerprint}) in a silent/automated \
                  context — refusing without prompting. Run `isekai-ssh init`/`doctor --fix` from an \
                  interactive terminal once to confirm it."
             );
@@ -241,8 +255,8 @@ impl RusshBackend {
         let target_host_port = format!("{}:{}", target_resolved.hostname, target_resolved.port);
         let target_verifier = Arc::new(FileBackedHostKeyVerifier::new(
             self.store_path.clone(),
-            target_host_port,
-            self.confirm_new_host.clone(),
+            target_host_port.clone(),
+            self.confirm_new_host_for(&target_host_port),
             "isekai-bootstrap",
         ));
 
@@ -253,8 +267,8 @@ impl RusshBackend {
                 let jump_host_port = format!("{}:{}", jump_resolved.hostname, jump_resolved.port);
                 let jump_verifier = Arc::new(FileBackedHostKeyVerifier::new(
                     self.store_path.clone(),
-                    jump_host_port,
-                    self.confirm_new_host.clone(),
+                    jump_host_port.clone(),
+                    self.confirm_new_host_for(&jump_host_port),
                     "isekai-bootstrap",
                 ));
                 // The jump hop authenticates with only the *first readable*
@@ -266,8 +280,14 @@ impl RusshBackend {
                 // documented follow-up, kept out of this `russh_backend.rs`-
                 // local change. Unreadable candidates are skipped (not fatal);
                 // only "no readable identity at all" is an error.
-                let ResolvedHop { hostname, port, username, identity_paths } = jump_resolved;
-                let jump_credential = first_readable_identity(&identity_paths).ok_or_else(|| {
+                //
+                // Among the readable candidates, one that actually decodes
+                // *without a passphrase* is preferred (review 2026-09-29,
+                // SSH-04): picking a passphrase-protected key just because it
+                // was listed first guaranteed a jump-auth failure even when a
+                // perfectly usable key came right after it.
+                let ResolvedHop { hostname, port, username, identity_paths, .. } = jump_resolved;
+                let jump_credential = first_usable_identity(&identity_paths).ok_or_else(|| {
                     BootstrapError::NoCredential {
                         host: spec.host.clone(),
                         detail: format!("no readable identity file for jump host (tried: {})", identity_paths_display(&identity_paths)),
@@ -353,9 +373,26 @@ impl RusshBackend {
                     break;
                 }
                 Ok(false) => continue,
-                Err(russh_stream_session::SessionError::InvalidPrivateKey(_)) => continue,
+                // Any per-key *parse* problem — malformed, passphrase-protected
+                // (this backend has no passphrase prompt: it runs in the
+                // silent re-deploy path too, `always-connects.md`), or a bad
+                // paired certificate — just moves on to the next candidate
+                // and then the agent (review 2026-09-29, SSH-04). Previously
+                // only `InvalidPrivateKey` did; an `id_ed25519` with a
+                // passphrase aborted the whole bootstrap as
+                // `AuthenticationRequired` (never retried), permanently
+                // breaking silent re-deploy for users who normally log in
+                // through their agent.
+                Err(
+                    russh_stream_session::SessionError::InvalidPrivateKey(_)
+                    | russh_stream_session::SessionError::EncryptedPrivateKey
+                    | russh_stream_session::SessionError::InvalidCertificate(_),
+                ) => continue,
                 Err(e) => return Err(BootstrapError::Session(e)),
             }
+        }
+        if !authed {
+            authed = try_agent_auth(&mut session.handle, &target_resolved.username, target_resolved.identity_agent.as_deref()).await?;
         }
         if !authed {
             // Distinguish "every readable key was rejected" (auth failure)
@@ -390,6 +427,9 @@ struct ResolvedHop {
     port: u16,
     username: String,
     identity_paths: Vec<PathBuf>,
+    /// This hop's raw `IdentityAgent` value (`None` = platform default) —
+    /// consulted by [`try_agent_auth`] after every identity file failed.
+    identity_agent: Option<PathBuf>,
 }
 
 /// Resolves `~/.ssh/config` for `host` (the literal `HostSpec`/`JumpSpec`
@@ -424,7 +464,7 @@ async fn resolve_hop(
         }
     };
 
-    Ok(ResolvedHop { hostname, port, username, identity_paths })
+    Ok(ResolvedHop { hostname, port, username, identity_paths, identity_agent: host_config.identity_agent.clone() })
 }
 
 /// Reads one candidate identity file into a [`Credential::PublicKey`], or
@@ -446,8 +486,107 @@ fn read_identity_credential(path: &Path) -> Option<Credential> {
 /// don't), or `None` if none are readable. Used for the jump hop, which — via
 /// `connect_via_jump_or_direct`/`JumpHost` — can only carry a single
 /// credential (see the jump-hop note in `connect_and_authenticate`).
-fn first_readable_identity(paths: &[PathBuf]) -> Option<Credential> {
-    paths.iter().find_map(|p| read_identity_credential(p))
+///
+/// Prefers the first candidate that decodes as an OpenSSH private key
+/// *without a passphrase* (SSH-04); only if none does, falls back to the
+/// first merely-readable one (so the eventual auth error still names a real
+/// file rather than "no identity").
+fn first_usable_identity(paths: &[PathBuf]) -> Option<Credential> {
+    let usable = paths.iter().find_map(|p| {
+        let mut credential = read_identity_credential(p)?;
+        let decodes_unencrypted = match &credential {
+            Credential::PublicKey { private_key_pem } => {
+                russh_keys::ssh_key::PrivateKey::from_openssh(private_key_pem).is_ok_and(|key| !key.is_encrypted())
+            }
+            _ => false,
+        };
+        if decodes_unencrypted {
+            Some(credential)
+        } else {
+            credential.zeroize();
+            None
+        }
+    });
+    usable.or_else(|| paths.iter().find_map(|p| read_identity_credential(p)))
+}
+
+/// SSH-agent fallback for the target hop, tried only after every identity
+/// file failed (review 2026-09-29, SSH-04) — the `RusshBackend` counterpart
+/// of `isekai-ssh::native::connect::try_agent_auth`. A user whose keys are
+/// passphrase-protected and normally unlocked through the Windows OpenSSH
+/// agent otherwise had no way at all to pass this (possibly silent)
+/// re-deploy's authentication.
+///
+/// Every agent-side failure (not running, `IdentityAgent none`, listing
+/// failed) is treated as "the agent offered nothing" rather than a hard
+/// error: this is a best-effort last resort for a background re-deploy, and
+/// the caller's own "no identity was accepted" error is the more actionable
+/// message. A signer failure *during* an attempt is surfaced, though —
+/// russh wedges the session in that case (see
+/// `isekai-ssh::native::agent_auth::try_each_identity`'s docs), so moving on
+/// to the next identity would hang instead.
+#[cfg(windows)]
+async fn try_agent_auth<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    identity_agent: Option<&Path>,
+) -> Result<bool, BootstrapError> {
+    let Some(pipe_name) = agent_pipe_name(identity_agent, |key| std::env::var(key).ok()) else {
+        return Ok(false);
+    };
+    let mut agent = match russh_keys::agent::client::AgentClient::connect_named_pipe(&pipe_name).await {
+        Ok(agent) => agent,
+        Err(e) => {
+            log::debug!("isekai-bootstrap: no SSH agent at {pipe_name} ({e}); skipping agent authentication");
+            return Ok(false);
+        }
+    };
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(e) => {
+            log::debug!("isekai-bootstrap: could not list SSH agent identities from {pipe_name} ({e}); skipping");
+            return Ok(false);
+        }
+    };
+    for identity in identities {
+        if russh_stream_session::authenticate_with_signer(handle, username, identity, &mut agent)
+            .await
+            .map_err(BootstrapError::Session)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Non-Windows builds use [`OpenSshBackend`](crate::OpenSshBackend) (real
+/// `ssh(1)`, which already talks to `ssh-agent` itself) in production, so
+/// no agent transport is wired up for `RusshBackend` there.
+#[cfg(not(windows))]
+async fn try_agent_auth<H: client::Handler>(
+    _handle: &mut client::Handle<H>,
+    _username: &str,
+    _identity_agent: Option<&Path>,
+) -> Result<bool, BootstrapError> {
+    Ok(false)
+}
+
+/// Resolves a hop's raw `IdentityAgent` value into the agent named pipe to
+/// try, or `None` when no agent should be used — same semantics as
+/// `isekai-ssh::native::agent_auth::resolve_agent_target` (`none` disables,
+/// `SSH_AUTH_SOCK` reads that env var, unset means the Windows OpenSSH
+/// default pipe). Pure (env lookup injected) so it is testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn agent_pipe_name(identity_agent: Option<&Path>, env_lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    const DEFAULT_WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+    match identity_agent {
+        None => Some(DEFAULT_WINDOWS_AGENT_PIPE.to_string()),
+        Some(path) => match path.to_str() {
+            Some(s) if s.eq_ignore_ascii_case("none") => None,
+            Some(s) if s.eq_ignore_ascii_case("SSH_AUTH_SOCK") => env_lookup("SSH_AUTH_SOCK").filter(|v| !v.is_empty()),
+            _ => Some(path.display().to_string()),
+        },
+    }
 }
 
 /// Renders a candidate-paths list for a "no readable identity file" error.
@@ -472,10 +611,10 @@ fn identity_paths_display(paths: &[PathBuf]) -> String {
 /// `TofuConfirmation::Silent` re-deploy) install
 /// [`with_unattended_new_host_policy`](RusshBackend::with_unattended_new_host_policy)
 /// instead of relying on this function to infer silence from stdin.
-fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
+fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
     use std::io::Write as _;
     eprint!(
-        "The authenticity of the bootstrap host can't be established.\n\
+        "The authenticity of the bootstrap host '{host_port}' can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
          Are you sure you want to continue connecting (yes/no)? "
     );
@@ -737,9 +876,34 @@ mod tests {
         // (unlike the never-checked-in `IsTerminal`-gated version of this
         // fix, which incorrectly refused legitimate piped answers too; see
         // `prompt_new_host_confirmation`'s doc comment).
-        let backend = RusshBackend { store_path: PathBuf::new(), confirm_new_host: Arc::new(|_| panic!("must not be reached")), identity_file_override: None }
-            .with_unattended_new_host_policy();
-        assert!(!(backend.confirm_new_host)("SHA256:deadbeef"));
+        let backend =
+            RusshBackend { store_path: PathBuf::new(), confirm_new_host: Arc::new(|_, _| panic!("must not be reached")), identity_file_override: None }
+                .with_unattended_new_host_policy();
+        assert!(!(backend.confirm_new_host)("example.com:22", "SHA256:deadbeef"));
+        assert!(!(backend.confirm_new_host_for("example.com:22"))("SHA256:deadbeef"));
+    }
+
+    /// SSH-13 regression: each leg's verifier must hand the policy *its own*
+    /// `host:port`, so a jump-host prompt and a target prompt are
+    /// distinguishable.
+    #[test]
+    fn confirm_new_host_for_passes_the_legs_own_host_port() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen_in_policy = seen.clone();
+        let backend = RusshBackend {
+            store_path: PathBuf::new(),
+            confirm_new_host: Arc::new(move |host_port: &str, fingerprint: &str| {
+                seen_in_policy.lock().unwrap().push((host_port.to_string(), fingerprint.to_string()));
+                true
+            }),
+            identity_file_override: None,
+        };
+        assert!((backend.confirm_new_host_for("bastion:22"))("SHA256:jump"));
+        assert!((backend.confirm_new_host_for("target:2222"))("SHA256:target"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("bastion:22".to_string(), "SHA256:jump".to_string()), ("target:2222".to_string(), "SHA256:target".to_string())]
+        );
     }
 
     #[test]
@@ -764,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn first_readable_identity_skips_missing_and_returns_the_first_present() {
+    fn first_usable_identity_skips_missing_and_returns_the_first_present() {
         // Regression for the "only the first *existing* IdentityFile is ever
         // considered" bug: a missing earlier candidate must be skipped so a
         // later present one is still found (and, in the auth loop, a rejected
@@ -774,7 +938,7 @@ mod tests {
         let present = dir.path().join("id_rsa");
         std::fs::write(&present, b"rsa bytes\n").unwrap();
 
-        let cred = first_readable_identity(&[missing, present.clone()]).expect("the present candidate must be returned");
+        let cred = first_usable_identity(&[missing, present.clone()]).expect("the present candidate must be returned");
         match &cred {
             Credential::PublicKey { private_key_pem } => {
                 assert_eq!(*private_key_pem, std::fs::read(&present).unwrap(), "the missing candidate is skipped, the present one returned");
@@ -784,12 +948,59 @@ mod tests {
     }
 
     #[test]
-    fn first_readable_identity_returns_none_when_nothing_is_readable() {
+    fn first_usable_identity_returns_none_when_nothing_is_readable() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            first_readable_identity(&[dir.path().join("a"), dir.path().join("b")]).is_none(),
+            first_usable_identity(&[dir.path().join("a"), dir.path().join("b")]).is_none(),
             "no readable candidate means no credential to offer"
         );
+    }
+
+    /// SSH-04 regression: the jump hop must not pick a passphrase-protected
+    /// key just because it is listed first when a usable one follows it.
+    #[test]
+    fn first_usable_identity_prefers_an_unencrypted_key_over_an_earlier_encrypted_one() {
+        use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey};
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted_path = dir.path().join("id_encrypted");
+        let plain_path = dir.path().join("id_plain");
+        let encrypted = PrivateKey::from(Ed25519Keypair::from_seed(&[7u8; 32]))
+            .encrypt(&mut rand::rngs::OsRng, "passphrase")
+            .expect("encrypt a test key");
+        std::fs::write(&encrypted_path, encrypted.to_openssh(Default::default()).unwrap().as_bytes()).unwrap();
+        let plain = PrivateKey::from(Ed25519Keypair::from_seed(&[8u8; 32]));
+        let plain_pem = plain.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+        std::fs::write(&plain_path, &plain_pem).unwrap();
+
+        let cred = first_usable_identity(&[encrypted_path.clone(), plain_path]).expect("a usable key exists");
+        match &cred {
+            Credential::PublicKey { private_key_pem } => assert_eq!(*private_key_pem, plain_pem, "the unencrypted key must win"),
+            _ => panic!("expected Credential::PublicKey"),
+        }
+
+        // Only encrypted keys: still falls back to the first readable one,
+        // so the eventual auth error names a real file.
+        let cred = first_usable_identity(&[encrypted_path.clone()]).expect("falls back to the first readable candidate");
+        match &cred {
+            Credential::PublicKey { private_key_pem } => assert_eq!(*private_key_pem, std::fs::read(&encrypted_path).unwrap()),
+            _ => panic!("expected Credential::PublicKey"),
+        }
+    }
+
+    /// SSH-04: same `IdentityAgent` semantics as the native connect path's
+    /// `agent_auth::resolve_agent_target`.
+    #[test]
+    fn agent_pipe_name_follows_identity_agent_semantics() {
+        let no_env = |_: &str| None;
+        assert_eq!(agent_pipe_name(None, no_env).as_deref(), Some(r"\\.\pipe\openssh-ssh-agent"));
+        assert_eq!(agent_pipe_name(Some(Path::new("none")), no_env), None);
+        assert_eq!(agent_pipe_name(Some(Path::new("NONE")), no_env), None);
+        assert_eq!(agent_pipe_name(Some(Path::new(r"\\.\pipe\custom")), no_env).as_deref(), Some(r"\\.\pipe\custom"));
+        assert_eq!(
+            agent_pipe_name(Some(Path::new("SSH_AUTH_SOCK")), |_| Some(r"\\.\pipe\from-env".to_string())).as_deref(),
+            Some(r"\\.\pipe\from-env")
+        );
+        assert_eq!(agent_pipe_name(Some(Path::new("SSH_AUTH_SOCK")), no_env), None);
     }
 
     // `normalize_uname_arch`/`parse_uname_output`'s own tests live with the

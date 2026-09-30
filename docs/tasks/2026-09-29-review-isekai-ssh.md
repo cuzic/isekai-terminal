@@ -1,0 +1,161 @@
+# isekai-ssh / isekai-bootstrap / isekai-bootstrap-plan コードレビュー指摘(2026-09-29)
+
+- 元レビュー: 2026-09-29 読み取り専用レビュー(isekai-ssh / isekai-bootstrap / isekai-bootstrap-plan / isekai-trust / isekai-auth)
+- 担当ファイル境界: `rust-core/isekai-ssh/**`, `rust-core/isekai-bootstrap/**`, `rust-core/isekai-bootstrap-plan/**`
+  - `isekai-trust` / `isekai-auth` / `isekai-protocol` / `local-ipc-mux` は transport 担当に委譲。
+  - `isekai-pipe` / `isekai-pipe-core` は isekai-pipe 担当(`fix/review-2026-09-isekai-pipe`)の領域。
+- 起票時点で origin/main(0ac06820)と行番号を突き合わせ、全指摘がまだ有効であることを確認した(委譲分を除く)。
+- 状態: `[ ]` 未着手 / `[x]` 修正済み / `[-]` 対応不要(理由) / `[~]` 見送り(理由)
+
+## High
+
+- [x] **SSH-01** High `isekai-ssh/src/wrapper.rs:1432-1435,1595-1600`
+  - 要約: direct-launch route で `HostName` が DNS 名や角括弧なし IPv6 のとき、`helper_addr` に `host:port` をそのまま保存している。消費側は `SocketAddr` パースしかしないため、毎回 `Unreachable` になり、再 bootstrap しても同じ文字列を書き戻して永久に失敗する。
+  - 方針: bootstrap 時に host を `SocketAddr` に解決する(IP リテラルはそのまま、名前は `lookup_host` + timeout)。IPv6 は `SocketAddr::to_string()` の角括弧付き形式で保存する。解決に失敗した場合は `JumpHostUnreachable`(再試行可)に分類する。
+- [x] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
+  - 要約: relay route の resume window 枯渇、cross-family fallback、panic は `Unreachable` として書かれる。B5 ガード(remote command は再実行しない)が `Unknown` / `MidSessionDisconnect` にしか掛かっていないため、`isekai-ssh host -- ./deploy.sh` がサイレントに再実行される。
+  - 方針: fail-safe として、remote command があるときは `StaleTrust`/`Unreachable`/`Unknown` のどれでも**再実行しない**。サイレント再デプロイ(自己修復)だけ行い、「再実行してください」と案内して終了する。こうすれば次回の起動は正常に繋がり、always-connects に沿う。isekai-pipe 担当が `ConnectOutcome.session_established`(serde default)を追加中なので、それがマージされたら「`session_established == false` のときだけ再実行する」ように緩めるフォローアップを行う。
+- [x] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
+  - 要約: Windows holder は SSH handle がどう死んでも `Ok(0)` を返し、recovery を飛ばす。根本原因の候補は russh keepalive(60s×3)で、これが isekai-pipe の resume window(既定 864000s)より先に SSH 層を殺す。すると resume 可能だったセッションまで切れ、スリープ復帰後に新しいリモートシェルになる。
+  - 方針: native 経路の russh keepalive を無効化し、liveness は isekai-pipe の QUIC/resume 層に一任する(`ssh(1)` 既定の `ServerAliveInterval 0` と同等)。holder の serve 終了時には、SSH handle が閉じたかどうかをログに残す。holder 自身が再接続しても channel は復元できないので、`Ok(0)` 終了(クライアントが OwnerLost → 新 holder)は維持し、その理由を doc に明記する。
+- [x] **SSH-04** High `isekai-bootstrap/src/russh_backend.rs:270,355-356`
+  - 要約: `EncryptedPrivateKey`/`InvalidCertificate` が hard error になり、後続の鍵が試されない。jump hop は最初に読めたファイルが暗号化鍵でもそれを使う。agent fallback もなく、`AuthenticationRequired`(再試行不可)に分類されるため、Windows のサイレント再デプロイが永久に失敗する。
+  - 方針: 鍵のパース系エラー(Invalid/Encrypted/InvalidCertificate)はすべて `continue` する。jump hop はパスフレーズなしでデコードできる最初の鍵を選ぶ。target hop は、全 identity 失敗後に Windows の ssh-agent(`IdentityAgent` を尊重)で fallback する。
+- [x] **SSH-05** High `isekai-ssh/src/native/mux/owner.rs:397-414`
+  - 要約: channel open の失敗 1 回(`MaxSessions` 超過などの正常な拒否を含む)で `shutdown` が通知され、holder と全タブが道連れになる。
+  - 方針: `ChannelOpenFailure`/`RequestDenied`(サーバーが応答した=transport は生きている)か `is_closed()==false` の場合は、その client だけ `Rejected` にして holder は維持する。
+
+## Medium
+
+- [-] **SSH-06** Medium `isekai-trust/src/host_key_verifier.rs:145-149` — `last_seen_at` の保存失敗で Rejected になる。**transport 担当に委譲**(isekai-trust は担当外)。
+- [~] **SSH-07** Medium `wrapper.rs:1525-1556` / `init.rs:54-67` — `init` で作った profile(relay/--via/STUN)をサイレント復旧で再現できない。
+  - 見送り理由: 修正には launch topology(relay addr/SNI/transport/via)を `PersistentProfile`(`isekai-pipe-core/src/profile.rs`、担当外)へ永続化する schema 変更が必要。`cached_relay_addr` は direct/relay 共用のフィールドで、今の schema では route 種別を区別できない。isekai-pipe 担当/設計判断に回す。
+- [x] **SSH-08** Medium `wrapper.rs:537-544`
+  - 要約: 破損/読めない profile が first-contact の `[y/N]` プロンプトに落ち、パイプ入力を食う。
+  - 方針: profile ファイルが存在する(読めない/壊れている/transport がない)場合は `TofuConfirmation::Silent` で再 bootstrap する。`Ok(None)`(本当に未登録)のときだけ呼び出し元の tofu を使う。
+- [~] **SSH-09** Medium `native/console_stdin.rs:139-154,404-439` — Windows の常駐 stdin リーダーがパスフレーズ/TOFU 入力を横取りしうる。
+  - 見送り理由: 実害の成立(どちらの reader が入力を受け取るか)は Windows 実機での確認が必要で、Linux から検証できない。コンソール入力の所有権を singleton チャネルに寄せる設計変更は `console_stdin`/`console`/`keyboard_interactive`/`russh_backend`/mux spawn 経路に跨る。CI では再現できず、誤るとキー入力が全損するため、実機検証を伴う別タスクとする。
+- [~] **SSH-10** Medium `wrapper.rs:773-780`, `reconnect_backoff.rs:23,73`
+  - 要約: pre-handshake 失敗が最大 24h 再試行になり、非対話コマンドがハングする。stable 判定が attempt の経過時間基準になっている。
+  - 方針: remote command ありの場合は SSH-02 の fail-safe で再試行しなくなるので、`rsync`/`git` の 24h ハングは解消する。stable 判定を handshake 成功時刻基準にする部分は、`session_established` が入った後のフォローアップにする(部分対応)。
+  - 状態: 部分対応。remote command の 24h ハングは SSH-02 で解消済み。stable 判定の基準変更は見送る。理由は、wrapper が handshake 成功時刻を知る手段が isekai-pipe 側の `ConnectOutcome.session_established`(PR #127、未マージ)以外にないため。その field がマージされたら SSH-02 の緩和と合わせてフォローアップする。
+- [~] **SSH-11** Medium `isekai-pipe/src/connect.rs:463-473,564-567` — `ssh(1)` の ConnectTimeout 等が先に諦めると outcome が残らない。
+  - 見送り理由: outcome の書き手である isekai-pipe 側(担当外)の修正が必要。wrapper 側で「intent は claim されたが outcome がない」を Unreachable 扱いにすると、リモート終了コード 255 と区別できず再実行事故を招く。isekai-pipe 担当に共有する。
+- [x] **SSH-12** Medium `native/connect.rs:676`
+  - 要約: 非 mux 直結経路の 1 秒 grace が、resume 中の child を kill する。
+  - 方針: SSH-03 で keepalive による SSH 層の早期死は除去される。残る「child 側が outcome を書き終える前」の窓も、grace を 5s に延ばして縮める。
+- [x] **SSH-13** Medium `russh_backend.rs:475-481`
+  - 要約: bootstrap 時の TOFU プロンプトにホスト名が出ず、jump/target のどちらを承認しているか分からない。
+  - 方針: 対話ポリシーを leg ごとの `host:port` 付きクロージャで構築し、プロンプトに表示する。
+- [x] **SSH-14** Medium/Low `native/connect.rs:806-813`
+  - 要約: silent 時の keyboard-interactive がエラーにせず空回答を送り、PAM の faillock を積む。
+  - 方針: silent 時は keyboard-interactive 認証自体を試みない。
+- [x] **SSH-15** Medium `native/mux/owner.rs:603-623,773-782`
+  - 要約: タブを閉じてもリモートシェルが残る(`Channel` に Drop 実装がない)。
+  - 方針: `relay_loop` のすべての終了経路で `channel.close()` を送る(RemoteExitReported 以外)。誤ったコメントも修正する。
+- [x] **SSH-16** Medium `native/mux/client.rs:324`, `owner.rs:620`
+  - 要約: 大量ペーストと echo 出力の双方向で相互デッドロックしうる。
+  - 対応: client 側(`run_inner`)の owner 向け書き込みをすべて FIFO キューに積み、`select!` 反復をまたいで生き続ける 1 本の in-flight write で送るようにした。owner 出力の読み取りは書き込み中も止まらない。ローカル stdin の読み取りだけを、キュー 64 フレームで一時停止する。片側だけ分離すれば循環待ちは切れるので、owner 側は変えていない。回帰テストは 2MiB paste × 2MiB echo。
+- [-] **SSH-17** Medium `native/mux/*` — 他ユーザーによる holder named pipe の成りすまし(サーバープロセス SID 検証・HMAC)。**transport 担当に委譲**(named pipe 所有者/SID の指摘は重複)。
+- [x] **SSH-18** Medium `helper_download.rs:402,440`(D1 前半)
+  - 要約: helper ダウンロードの HTTP に timeout がない。
+  - 方針: ureq Agent に global/connect timeout を設定する。`isekai-auth/src/oauth.rs` 側は **transport 担当に委譲**。
+- [-] **SSH-19** Medium `isekai-auth/src/file_provider.rs:370-402`(D2)— token refresh にプロセス間 lock がない。**transport 担当に委譲**。
+- [x] **SSH-20** Medium `wrapper.rs:1103-1119`(D9 の一部)
+  - 要約: ctl-socket 有効かつ `--isekai-tty` なしだと `-t` が付かず、PTY なしシェルになる。
+  - 方針: ctl-socket の login shell command を付ける場合も、`RequestTty::Auto` なら `-t` を付ける。
+
+## Low / Low-Medium
+
+- [~] **SSH-21** Low-Medium `install_script.rs:384-491`(A12-1)
+  - 要約: ログインシェルが fish/csh/tcsh だと POSIX sh 前提のスクリプトが動かない。
+  - 試した方針: スクリプトを base64 化し、`exec /bin/sh -c 'eval "$(printf %s <b64> | base64 -d)"'` という 1 行のラッパーで渡した。Linux の単体テストは通過した。
+  - 見送り理由: Windows CI の e2e ハーネス(mock sshd が Git for Windows の `sh -c <command>` で実行する)で、このラッパーが `unexpected EOF while looking for matching '` として壊れた。wrapper/init/doctor の bootstrap e2e 11 件が全滅したため、差し戻した。本番の remote は Linux の sshd でこのハーネスの問題は当たらないが、テスト基盤と両立するラッパーの設計(Windows の引数クォートと MSYS の再パースの調査を含む)と、fish/csh 実機での検証が必要なので別タスクとする。
+- [x] **SSH-22** Low-Medium `install_script.rs:474-476`(A12-2)
+  - 要約: handshake poll が timeout すると、起動済み helper が孤児化する。
+  - 方針: timeout 分岐で `kill` してから pid ファイルを消す。
+- [x] **SSH-23** Low-Medium `install_script.rs:413-419,437-438`(A12-3)
+  - 要約: `/proc` がない環境では reuse 判定がディスク上ファイルの sha256 になり、古い稼働プロセスを再利用しうる。
+  - 方針: state ファイルに起動時の sha256 を記録し、reuse は「記録 sha == 期待 sha」を条件にする。
+- [~] **SSH-24** Low-Medium `install_script.rs:436-446`(A12-4)— alive-but-broken な helper を強制再起動する手段(`force_relaunch`)がない。
+  - 見送り理由: `BootstrapBackend::install_and_start` の API 拡張(全 backend/テストダブル)に加えて、「いつ force するか」の方針決定(RedeployGate 何回目で、等)が必要な設計判断。SSH-23 で「古いビルドの再利用」ケースは塞がる。
+- [x] **SSH-25** Low `wrapper.rs:1427-1429`(A13-1)
+  - 要約: `max_by_key` は同順位で最後の要素を返すため、first-match-wins 規約と逆になる。
+  - 方針: 同順位では先頭を選ぶ。複数 candidate を順に試す fallback は bootstrap 全体の再構成になるため、このタスクには含めない。
+- [x] **SSH-26** Low `helper_download.rs:256-271` / `wrapper.rs:1498-1520`(A13-2)
+  - 要約: キャッシュが空のときのダウンロード失敗が `RemoteBinaryMissing`(再試行不可)になる。
+  - 方針: 自動ダウンロード(明示 `--isekai-helper-binary` なし)の失敗は、ネットワーク起因として再試行可能に分類する。
+- [~] **SSH-27** Low `openssh.rs:105`(A13-3)— BatchMode での host key/認証失敗(exit 255)が `JumpHostUnreachable` に誤分類される。
+  - 見送り理由: `ssh(1)` の exit 255 は接続失敗と区別できず、区別するには stderr の文字列マッチが必要になる。これは `isekai-bootstrap-plan::classify_bootstrap_error` の「文字列マッチしない」設計原則に反する。誤分類の実害は、RedeployGate/backoff で有界な再試行と文言のずれだけ。
+- [x] **SSH-28** Low `native/mux/mod.rs:696-709,891-923`(C5-1)
+  - 要約: spawn lock が対話セッション全体にわたって保持され、10s で stale 扱いされる。削除の TOCTOU で二重 leader になりうる。
+  - 対応: spawn lock は、holder に到達できた時点(または到達できないと確定した時点)で、自タブのセッション開始前に解放するようにした。stale 判定の remove→create の TOCTOU は残るが、holder の単一性は channel の排他 `try_claim` が保証している。影響はプロンプト/spawn の重複だけで、そのことをコメントに明記した。
+- [x] **SSH-29** Low `native/mux/mod.rs:938,976-987`(C5-2)
+  - 要約: token 書き込みが非 atomic で、async 内で `std::thread::sleep` している。
+  - 方針: tmp+rename にし、`tokio::time::sleep` に変える。
+- [x] **SSH-30** Low `owner.rs:357-382`, `ctl_forward.rs:72-73`(C5-3)
+  - 要約: handle lock を保持したままの channel open/ctl forward に timeout がない。
+  - 方針: timeout を付ける。
+- [~] **SSH-31** Low `client.rs:310`, `owner.rs:540`, `ctl_forward.rs:292`(C5-4)
+  - 要約: build relay の mpsc が無制限。
+  - 見送り理由: 有界化すると、送信側(`build_exec::run_build` の `relay.send(..).await`)は `select!` の handler 内で待つことになり、abort(`relay.watch()`)を観測できなくなる。受信側が止まると build の abort がハングする(既存テスト `..._aborts_...` がこの形)。有界化するには `BuildRelay` trait の send を abort とレースさせる再設計が要る。実害は、ローカル build が出す出力量ぶんのメモリに限られる。
+- [x] **SSH-32** Low `mux/mod.rs:576-579`, `holder.rs:151`, `console.rs:604-615`(C5-5)
+  - 要約: 平文秘密鍵と passphrase が zeroize されない。
+  - 方針: `Zeroizing` で包む。
+- [x] **SSH-33** Low `owner.rs:614`, `client.rs:278,421`(C5-6)
+  - 要約: 予期しないフレームを `{other:?}` で丸ごとログに出すため、Stdin/token が漏れうる。
+  - 方針: フレーム種別名だけをログに出す。
+- [~] **SSH-34** Low `mux/mod.rs:537 vs 604`(C5-7)
+  - 要約: holder ログを claim 前に開いている。`rotating_log.rs` の rotate 失敗無視は isekai-pipe-core(担当外)。
+  - 見送り理由: claim 前に開くのは `ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md` の意図的な設計。`prepare_with_tofu`(再デプロイ dial を含む)の失敗を holder ログに残すためで、claim 後に開くとまさにその診断が消える。claim 競争に負けた holder が数行を混入させるだけで、それ自体「負けた」という有用な診断になる。rotate 失敗の無視は isekai-pipe 担当が対応済み(PR #127、失敗時に byte counter をリセット)。
+- [x] **SSH-35** Low-Medium `native/connect.rs:1377`(C5-8)
+  - 要約: `-T`(PTY なし)でも `~.` エスケープを処理するため、パイプ入力のバイナリが壊れる。
+  - 方針: `ssh(1)` と同じく、PTY を要求しない場合はエスケープ処理を無効にする。
+- [x] **SSH-36** Low `escape.rs:40-43,61-69`(C5-9)
+  - 要約: `~`+Enter で改行が落ち、`~.` の後の同一 read バイトが送信される。
+  - 方針: エスケープ状態機械を修正し、テストを追加する。
+- [x] **SSH-37** Low `console.rs:391-403`(C5-10)
+  - 要約: resize watcher スレッドが attempt ごとにリークする。
+  - 方針: 実装時に確認する。
+- [-] **SSH-38** Low `cli.rs:417`(D3 前半)— token endpoint の https 強制。`isekai-auth` の refresh 経路と一体の設計なので **transport 担当に委譲**。early-refresh 窓の失敗(`file_provider.rs`)も委譲。
+- [x] **SSH-39** Low `helper_download.rs:247,107`(D4)
+  - 要約: キャッシュが `/tmp/isekai-ssh-helpers` に fallback し、所有者/権限を確認していない。キャッシュ済みバイトも再検証しない。
+  - 方針: fallback を uid 付きディレクトリにし、0700 と所有者を確認する。キャッシュ書き込み時の sha256 を sidecar に保存し、読み出し時に照合する。
+- [x] **SSH-40** Low `helper_download.rs:415-429`(D5)
+  - 要約: latest download と tag 取得の間の競合で、新 tag に旧 binary を紐付けうる。
+  - 方針: 先に tag を取得し、その tag の URL からダウンロードする。
+- [x] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
+  - 要約: `mv` 前の sha 照合がない、IPv6 アドレスを未クォートで埋め込んでいる、`mktemp -d` 失敗時に `/relay_jwt` へ書く、宛先の前に `--` がない。
+  - 対応:
+    - `mv` 前の sha 照合を追加した(`sha_matches_or_unknown`)。
+    - `--stun-server` の値をシェルクォートした。
+    - `mktemp -d` の行に `|| exit 1` を足した。
+    - `openssh.rs` の宛先の前に `--` を入れた。
+  - 部分見送り: `--relay` の値のクォートは差し戻した。当初の `mktemp` ブロック書き換え(`if [ -z "$tmpdir" ] ...` と trap 内の `"$tmpdir"`)と同じコミット群で Windows CI の relay 系 bootstrap e2e(init_e2e 3 件と relay directive)が status 2 で失敗し、切り分けの過程で両方とも最小形に戻したため。その後 `mktemp` 側だけを最小形で戻したら緑になったので、`--relay` のクォート単体が原因かは未確定。実害は、remote の cwd に IPv6 のグロブに一致するファイルがある場合だけ。
+- [x] **SSH-42** Low `types.rs`(D7)
+  - 要約: `RelayLaunchSpec.relay_jwt` の Debug が redact されていない。
+  - 方針: 手書き Debug で redact する。`TokenSet`/`TokenResponse`/`DeviceAuthorization`(isekai-auth)と `HelperTrust.cached_session_secret`(isekai-trust)は **transport 担当に委譲**。
+- [x] **SSH-43** Low `log_file.rs:128-135`(D8 の isekai-ssh 部分)
+  - 要約: 既存ログファイルの権限を 0600 に絞り直さない。
+  - 方針: open 後に 0600 を再設定する。runtime dir の所有者検証と intent/outcome の掃除は `isekai-pipe-core`(担当外)なので isekai-pipe 担当へ。
+- [x] **SSH-44** Low `wrapper.rs:2286-2289,2328`(D9-1)
+  - 要約: Unix の ProxyCommand クォートで `\`・先頭 `~`・`%` が未処理。
+  - 方針: bare 許可文字から `~` と(非 Windows では)`\` を外し、`%` を `%%` にエスケープする。
+- [x] **SSH-45** Low `wrapper.rs:1747-1784`(D9-2)
+  - 要約: destination 以降の `--isekai-*` を wrapper が解釈してしまう。
+  - 方針: destination 確定後の引数はすべてそのまま ssh 引数として扱う。
+
+## transport 担当からの委譲分(isekai-ssh 内のファイル)
+
+- [x] **SSH-46** `ctl_forward.rs` `handle_ctl_connection`
+  - 要約: preamble とメッセージ行の `read_line` に上限がなく、preamble の比較が定数時間でない。
+  - 対応: `read_bounded_line`(preamble は 4KiB、メッセージは `MAX_CTL_MESSAGE_LINE_LEN`)と `token_eq` を使うようにした。
+- [x] **SSH-47** `wrapper.rs` の relay token 取得
+  - 要約: 同期の token refresh(ureq と file lock)を async 内で直接呼んでいた。
+  - 対応: `spawn_blocking` で実行するようにした。`init.rs` の同じ呼び出しは単発の対話 CLI で、並行タスクがないため対象外とした。
+- [x] **SSH-48** `helper_download.rs` の HTTP timeout
+  - 対応: SSH-18 と同一。
+- [~] **SSH-49** `native/mux/naming.rs` の pipe 名にユーザー SID を含める
+  - 見送り理由: `local_ipc_mux::current_user_sid_string()` は transport 担当の PR #132 で追加され、まだ main にマージされていない。未マージの API に依存するとこのブランチがビルドできないため、#132 のマージ後にフォローアップする。なお #132 では `WindowsNamedPipeChannel::connect()` 自体がサーバー側 SID を検証するようになり、成りすましの主経路(SSH-17)はそちらで塞がる。
+- [~] **SSH-50** `native/agent_auth.rs` の `openssh-ssh-agent` pipe のサーバー所有者検証
+  - 見送り理由: SSH-49 と同じ理由。`local_ipc_mux::verify_named_pipe_server_is_current_user`(#132)がマージされた後にフォローアップする。

@@ -58,6 +58,10 @@ pub(crate) fn should_forward(plan: &WrapperPlan, resolution: &WrapperResolution)
     )
 }
 
+/// Upper bound on a ctl-forward request/cancel made while holding the shared
+/// handle's lock (SSH-30).
+const HANDLE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Requests a fresh per-tab streamlocal forward on the shared handle and
 /// registers its route in `routes`. Returns the forward on success; on any
 /// failure logs and returns `None` (opportunistic — never fails the session).
@@ -68,13 +72,21 @@ pub(crate) async fn request<H: client::Handler>(
 ) -> Option<CtlForward> {
     let remote_path = format!("{}{}.sock", crate::ctl_forward::REMOTE_SOCK_PREFIX, crate::ctl_forward::new_ctl_token());
     let channels = routes.register(&remote_path);
+    // Bounded (review 2026-09-29, SSH-30): the shared handle's lock is held
+    // for the whole request, so an unanswered one used to stall every other
+    // tab's channel open behind it indefinitely.
     let result = {
         let mut guard = handle.lock().await;
-        guard.streamlocal_forward(remote_path.clone()).await
+        tokio::time::timeout(HANDLE_REQUEST_TIMEOUT, guard.streamlocal_forward(remote_path.clone())).await
     };
-    if let Err(e) = result {
+    let failure = match result {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!("no answer within {HANDLE_REQUEST_TIMEOUT:?}")),
+    };
+    if let Some(reason) = failure {
         routes.unregister(&remote_path);
-        log_line!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e}");
+        log_line!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {reason}");
         return None;
     }
     Some(CtlForward { remote_path, channels })
@@ -84,7 +96,10 @@ pub(crate) async fn request<H: client::Handler>(
 /// drops the local route so a late channel is closed rather than routed. The
 /// mutex is held only for the brief `cancel_streamlocal_forward` request.
 pub(crate) async fn cancel<H: client::Handler>(handle: &Mutex<client::Handle<H>>, routes: &ForwardRoutes, remote_path: &str) {
-    let _ = handle.lock().await.cancel_streamlocal_forward(remote_path.to_string()).await;
+    {
+        let guard = handle.lock().await;
+        let _ = tokio::time::timeout(HANDLE_REQUEST_TIMEOUT, guard.cancel_streamlocal_forward(remote_path.to_string())).await;
+    }
     routes.unregister(remote_path);
 }
 

@@ -133,6 +133,16 @@ impl Sink {
             options.mode(0o600);
         }
         let file = options.open(path)?;
+        // `mode(0o600)` above only applies when the file is *created*; a
+        // pre-existing log (e.g. written by an older build, or created with a
+        // looser umask) kept whatever permissions it had (review 2026-09-29,
+        // SSH-43). Re-tighten it on every open — best-effort, since a log we
+        // can write to but not chmod (not our file) shouldn't block logging.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         // `OnceLock::set` failing (already initialized) would mean the
         // caller opened this sink twice — a caller bug, not a runtime
         // condition to handle gracefully — so the second file handle is
@@ -333,5 +343,23 @@ pub async fn redirect_child_stderr(mut child_stderr: tokio::process::ChildStderr
             Ok(n) => n,
         };
         LOG_FILE.append_bytes(&buf[..n]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// SSH-43 regression: opening a pre-existing, looser-permissioned log
+    /// re-tightens it to 0600 (the create-time `mode` alone never did).
+    #[test]
+    fn open_retightens_an_existing_logs_permissions_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isekai-ssh.log");
+        std::fs::write(&path, b"old line\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Sink::new().open(&path, None).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

@@ -377,7 +377,13 @@ pub(crate) fn spawn_resize_watcher() -> Option<tokio::sync::mpsc::UnboundedRecei
         };
         tokio::spawn(async move {
             loop {
-                sig.recv().await;
+                // Also end as soon as the receiver is dropped (review
+                // 2026-09-29, SSH-37), not only on the next SIGWINCH after
+                // that — one watcher is spawned per connect attempt.
+                tokio::select! {
+                    _ = sig.recv() => {}
+                    _ = tx.closed() => break,
+                }
                 let (cols, rows) = terminal_size();
                 if tx.send((cols, rows)).is_err() {
                     break;
@@ -392,6 +398,14 @@ pub(crate) fn spawn_resize_watcher() -> Option<tokio::sync::mpsc::UnboundedRecei
             let mut last = (0u32, 0u32);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(200));
+                // One of these threads is spawned per connect attempt; it
+                // used to notice its receiver was gone only when a resize
+                // happened to occur afterwards (the failed `send` below),
+                // so every reconnect leaked a thread polling the console
+                // forever (review 2026-09-29, SSH-37).
+                if tx.is_closed() {
+                    break;
+                }
                 let current = terminal_size();
                 if current != last {
                     last = current;
