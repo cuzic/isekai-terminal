@@ -40,7 +40,7 @@
   - 方針: remote command ありの場合は SSH-02 の fail-safe で再試行しなくなるので、`rsync`/`git` の 24h ハングは解消する。stable 判定を handshake 成功時刻基準にする部分は、`session_established` が入った後のフォローアップにする(部分対応)。
 - [~] **SSH-11** Medium `isekai-pipe/src/connect.rs:463-473,564-567` — `ssh(1)` の ConnectTimeout 等が先に諦めると outcome が残らない。
   - 見送り理由: outcome の書き手である isekai-pipe 側(担当外)の修正が必要。wrapper 側で「intent は claim されたが outcome がない」を Unreachable 扱いにすると、リモート終了コード 255 と区別できず再実行事故を招く。isekai-pipe 担当に共有する。
-- [ ] **SSH-12** Medium `native/connect.rs:676`
+- [x] **SSH-12** Medium `native/connect.rs:676`
   - 要約: 非 mux 直結経路の 1 秒 grace が、resume 中の child を kill する。
   - 方針: SSH-03 で keepalive による SSH 層の早期死は除去される。残る「child 側が outcome を書き終える前」の窓も、grace を 5s に延ばして縮める。
 - [ ] **SSH-13** Medium `russh_backend.rs:475-481`

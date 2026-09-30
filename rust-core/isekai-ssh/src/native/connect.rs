@@ -591,6 +591,11 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
     }
 }
 
+/// How long [`connect_attempt`] lets a failed attempt's `isekai-pipe connect`
+/// child finish exiting (and writing its `ConnectOutcome`) before
+/// `kill_on_drop` takes over.
+const CHILD_OUTCOME_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The real [`ConnectRecoveryOps`] backed by an actual `isekai-pipe connect`
 /// child, the on-disk `ConnectOutcome` side channel, and
 /// `bootstrap_and_register`.
@@ -694,7 +699,14 @@ async fn connect_attempt(
         // (finishing that write) before `kill_on_drop` takes over. Timing out
         // is fine — we fall through to the kill regardless; the point is only
         // to *let* a nearly-done child finish, never to wait on a hung one.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+        //
+        // 5s rather than the original 1s (review 2026-09-29, SSH-12): with
+        // the SSH-level keepalive gone (`native_ssh_client_config`), the SSH
+        // layer normally only errors *because* the child is already exiting,
+        // but that exit path (classify + write the outcome file + flush the
+        // log) can exceed 1s on a loaded Windows box — and losing the
+        // outcome turns a recoverable failure into `NoRecoverableSignal`.
+        let _ = tokio::time::timeout(CHILD_OUTCOME_GRACE, child.wait()).await;
     }
 
     // On success `child` (the isekai-pipe connect process) was kept alive for
