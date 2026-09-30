@@ -433,7 +433,7 @@ fn revalidate_and_cache(
         }
         log::info!("isekai-ssh: latest release changed to {latest_tag:?}; re-downloading isekai-pipe binary");
         let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
-        write_cached_tag(&tag_path, &latest_tag)?;
+        record_tag_if_unchanged(&agent, api_base_url, &source.repo, Some(&latest_tag), &tag_path);
         return Ok(downloaded);
     }
 
@@ -442,14 +442,39 @@ fn revalidate_and_cache(
     // *next* check can take the cheap path above — a failure here doesn't
     // fail the overall download, it just means the next check re-downloads
     // once more before catching up.
+    let tag_before = fetch_latest_tag(&agent, api_base_url, &source.repo)
+        .map_err(|e| log::debug!("isekai-ssh: could not look up the latest release tag before downloading ({e:#})"))
+        .ok();
     let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
-    match fetch_latest_tag(&agent, api_base_url, &source.repo) {
-        Ok(latest_tag) => {
-            let _ = write_cached_tag(&cached_tag_path(&path), &latest_tag);
-        }
-        Err(e) => log::debug!("isekai-ssh: downloaded isekai-pipe binary, but could not also record its release tag ({e:#})"),
-    }
+    record_tag_if_unchanged(&agent, api_base_url, &source.repo, tag_before.as_deref(), &cached_tag_path(&path));
     Ok(downloaded)
+}
+
+/// Records `tag_before` as the cached binary's release tag only if "latest"
+/// still resolves to that same tag *after* the download (review 2026-09-29,
+/// SSH-40). The download itself goes through GitHub's `/releases/latest/
+/// download/` redirect, which is resolved independently of the tag lookup:
+/// a release cut in between used to pair the *new* tag with the *old*
+/// binary, and since the cheap freshness check then saw a matching tag, the
+/// stale binary was kept — and silently re-deployed everywhere — until the
+/// next release. Not recording anything just means the next check
+/// re-downloads once more, the safe direction.
+fn record_tag_if_unchanged(agent: &ureq::Agent, api_base_url: &str, repo: &str, tag_before: Option<&str>, tag_path: &Path) {
+    let Some(tag_before) = tag_before else {
+        return;
+    };
+    match fetch_latest_tag(agent, api_base_url, repo) {
+        Ok(tag_after) if tag_after == tag_before => {
+            if let Err(e) = write_cached_tag(tag_path, tag_before) {
+                log::debug!("isekai-ssh: could not record the downloaded binary's release tag ({e:#})");
+            }
+        }
+        Ok(tag_after) => log::info!(
+            "isekai-ssh: latest release moved from {tag_before:?} to {tag_after:?} during the download; \
+             not recording a tag so the next check re-downloads"
+        ),
+        Err(e) => log::debug!("isekai-ssh: downloaded isekai-pipe binary, but could not confirm its release tag ({e:#})"),
+    }
 }
 
 fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str, base_url: &str) -> Result<PathBuf> {
@@ -601,6 +626,36 @@ mod tests {
     /// other routes below use).
     fn latest_tag_route(tag: &str) -> (String, Vec<u8>) {
         ("/repos/cuzic/isekai-terminal/releases/latest".to_string(), format!(r#"{{"tag_name":"{tag}"}}"#).into_bytes())
+    }
+
+    /// SSH-40 regression: if "latest" moved on while the binary was being
+    /// downloaded, the (possibly old) binary must not be recorded under the
+    /// new tag — otherwise the cheap freshness check would keep the stale
+    /// binary until the *next* release.
+    #[tokio::test]
+    async fn record_tag_if_unchanged_skips_a_tag_that_moved_during_the_download() {
+        let mut routes = std::collections::HashMap::new();
+        let (tag_route, tag_body) = latest_tag_route("isekai-pipe-v2.0.0");
+        routes.insert(tag_route, tag_body);
+        let addr = spawn_mock_release_server(routes);
+        let api = format!("http://{addr}");
+        let dir = tempfile::tempdir().unwrap();
+        let tag_path = dir.path().join("asset.release-tag");
+        let repo = ReleaseSource::DEFAULT_REPO.to_string();
+
+        let (tag_path_for_task, api_for_task, repo_for_task) = (tag_path.clone(), api.clone(), repo.clone());
+        tokio::task::spawn_blocking(move || {
+            record_tag_if_unchanged(&http_agent(), &api_for_task, &repo_for_task, Some("isekai-pipe-v1.0.0"), &tag_path_for_task)
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_cached_tag(&tag_path), None, "a tag that changed mid-download must not be recorded");
+
+        let tag_path_for_task = tag_path.clone();
+        tokio::task::spawn_blocking(move || record_tag_if_unchanged(&http_agent(), &api, &repo, Some("isekai-pipe-v2.0.0"), &tag_path_for_task))
+            .await
+            .unwrap();
+        assert_eq!(read_cached_tag(&tag_path).as_deref(), Some("isekai-pipe-v2.0.0"));
     }
 
     #[tokio::test]
