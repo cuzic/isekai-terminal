@@ -126,7 +126,12 @@
   - 方針: 先に tag を取得し、その tag の URL からダウンロードする。
 - [x] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
   - 要約: `mv` 前の sha 照合がない、IPv6 アドレスを未クォートで埋め込んでいる、`mktemp -d` 失敗時に `/relay_jwt` へ書く、宛先の前に `--` がない。
-  - 方針: それぞれ修正する。
+  - 対応:
+    - `mv` 前の sha 照合を追加した(`sha_matches_or_unknown`)。
+    - `--stun-server` の値をシェルクォートした。
+    - `mktemp -d` の行に `|| exit 1` を足した。
+    - `openssh.rs` の宛先の前に `--` を入れた。
+  - 部分見送り: `--relay` の値のクォートは差し戻した。当初の `mktemp` ブロック書き換え(`if [ -z "$tmpdir" ] ...` と trap 内の `"$tmpdir"`)と同じコミット群で Windows CI の relay 系 bootstrap e2e(init_e2e 3 件と relay directive)が status 2 で失敗し、切り分けの過程で両方とも最小形に戻したため。その後 `mktemp` 側だけを最小形で戻したら緑になったので、`--relay` のクォート単体が原因かは未確定。実害は、remote の cwd に IPv6 のグロブに一致するファイルがある場合だけ。
 - [x] **SSH-42** Low `types.rs`(D7)
   - 要約: `RelayLaunchSpec.relay_jwt` の Debug が redact されていない。
   - 方針: 手書き Debug で redact する。`TokenSet`/`TokenResponse`/`DeviceAuthorization`(isekai-auth)と `HelperTrust.cached_session_secret`(isekai-trust)は **transport 担当に委譲**。
