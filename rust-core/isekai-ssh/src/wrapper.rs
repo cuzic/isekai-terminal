@@ -724,11 +724,33 @@ async fn run_ssh_with_connect_failure_recovery(
                 // `RetryConnectLightweight` — exactly the B5 guard's
                 // scenario. Apply it here too for `Unknown` specifically
                 // (opus review round 2, SHOULD-FIX R2-4).
-                if outcome.class == isekai_pipe_core::ConnectOutcomeClass::Unknown && plan.remote_command().is_some() {
-                    log_line!(
-                        "isekai-ssh: connection lost while running a remote command; not auto-retrying \
-                         (rerunning it could repeat a non-idempotent action)."
-                    );
+                //
+                // Review 2026-09-29 (SSH-02): that "no SSH bytes ever flowed"
+                // premise does not hold for every `StaleTrust`/`Unreachable`
+                // either — the Relay route's resume-window exhaustion, the
+                // cross-family fallback and the panic guard in `isekai-pipe
+                // connect` all write `Unreachable` *after* the session was
+                // live, so `isekai-ssh host -- ./deploy.sh` interrupted
+                // mid-run used to be silently re-run from scratch. Until the
+                // outcome itself records whether the session was ever
+                // established, a remote command is never re-run from here
+                // for *any* class. The deployment is still healed (one
+                // silent re-deploy), so the user's own rerun connects —
+                // `always-connects.md` is about the next invocation
+                // connecting, not about repeating a non-idempotent command.
+                if plan.remote_command().is_some() {
+                    if redeploy_gate.try_consume() {
+                        log_rebootstrap_and_retry_decision(
+                            &outcome.class,
+                            &resolution.isekai.profile,
+                            &outcome.detail,
+                            "refreshing automatically (the remote command itself will not be re-run)...",
+                        );
+                        if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+                            print_bootstrap_failure_guidance(&bootstrap_err);
+                        }
+                    }
+                    log_remote_command_not_rerun();
                     return Ok(exit_code);
                 }
                 // `StaleTrust`/`Unreachable`/`Unknown` have no lightweight
@@ -855,6 +877,18 @@ async fn run_ssh_with_connect_failure_recovery(
             }
         }
     }
+}
+
+/// Shared by the Unix (`run_ssh_with_connect_failure_recovery`) and
+/// Windows-native (`native::connect::drive_connect_recovery`) recovery loops
+/// for the SSH-02 remote-command guard: the connection failed while a
+/// one-shot remote command may already have been running, so it is not
+/// re-run automatically.
+pub(crate) fn log_remote_command_not_rerun() {
+    log_line!(
+        "isekai-ssh: the connection failed while running a remote command; not re-running it automatically \
+         (it may already have started, and re-running could repeat a non-idempotent action). Run it again to retry."
+    );
 }
 
 /// Human-readable lead-in for the `eprintln!`s below, branching on

@@ -451,10 +451,31 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                 // `RetryConnectLightweight` — exactly the B5 guard's
                 // scenario. Apply it here too for `Unknown` specifically
                 // (opus review round 2, SHOULD-FIX R2-4).
-                if outcome.class == isekai_pipe_core::ConnectOutcomeClass::Unknown && ops.has_remote_command() {
-                    log_line!(
-                        "isekai-ssh: connection lost while running a remote command; not auto-retrying (rerunning it could repeat a non-idempotent action)."
-                    );
+                //
+                // Review 2026-09-29 (SSH-02): the premise above ("no SSH bytes
+                // ever flowed") does not actually hold for every
+                // `StaleTrust`/`Unreachable` either — the Relay route's
+                // resume-window exhaustion, the cross-family fallback and the
+                // panic guard in `isekai-pipe connect` all write `Unreachable`
+                // *after* the session was live. Until the outcome itself says
+                // whether the session was ever established, a remote command
+                // is never re-run from here for *any* class: the deployment is
+                // still healed (one silent re-deploy, so the user's own rerun
+                // connects — `always-connects.md`), but the command itself is
+                // left for the user to rerun.
+                if ops.has_remote_command() {
+                    if redeploy_gate.try_consume() {
+                        crate::wrapper::log_rebootstrap_and_retry_decision(
+                            &outcome.class,
+                            &outcome.profile,
+                            &outcome.detail,
+                            "re-deploying the helper automatically (the remote command itself will not be re-run)...",
+                        );
+                        if let Err(e) = ops.rebootstrap_and_rebuild_intent().await {
+                            log_line!("isekai-ssh: automatic re-deploy failed: {e:#}");
+                        }
+                    }
+                    crate::wrapper::log_remote_command_not_rerun();
                     return Err(first_error);
                 }
                 if redeploy_gate.try_consume() {
@@ -2824,6 +2845,32 @@ mod tests {
         assert_eq!(ops.attempt_calls, 1);
         assert_eq!(ops.rebootstrap_calls, 0);
         assert_eq!(ops.build_intent_calls.get(), 0);
+    }
+
+    /// SSH-02 regression: a remote command is never re-run after an
+    /// `Unreachable`/`StaleTrust`/`Unknown` signal either (the Relay route
+    /// writes `Unreachable` for a *post*-handshake resume-window
+    /// exhaustion), but the deployment is still healed with exactly one
+    /// silent re-deploy so the user's own rerun connects.
+    #[tokio::test]
+    async fn recovery_heals_but_does_not_rerun_a_remote_command_on_a_pre_handshake_class() {
+        tokio::time::pause();
+        for class in [
+            isekai_pipe_core::ConnectOutcomeClass::Unreachable,
+            isekai_pipe_core::ConnectOutcomeClass::StaleTrust,
+            isekai_pipe_core::ConnectOutcomeClass::Unknown,
+        ] {
+            let mut ops = FakeRecoveryOps {
+                attempt_results: [Err("connection lost".to_string())].into_iter().collect(),
+                outcome: Some(fake_outcome(class.clone())),
+                has_remote_command: true,
+                ..Default::default()
+            };
+            let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+            assert!(result.is_err(), "{class:?}: the remote command must not be silently re-run");
+            assert_eq!(ops.attempt_calls, 1, "{class:?}: no second attempt");
+            assert_eq!(ops.rebootstrap_calls, 1, "{class:?}: the deployment must still be healed once");
+        }
     }
 
     /// Once the lightweight-retry cap is exceeded, the loop falls back to a

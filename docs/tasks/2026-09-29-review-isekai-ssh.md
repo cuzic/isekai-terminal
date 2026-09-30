@@ -12,7 +12,7 @@
 - [x] **SSH-01** High `isekai-ssh/src/wrapper.rs:1432-1435,1595-1600`
   - 要約: direct-launch route で `HostName` が DNS 名や角括弧なし IPv6 のとき、`helper_addr` に `host:port` をそのまま保存している。消費側は `SocketAddr` パースしかしないため、毎回 `Unreachable` になり、再 bootstrap しても同じ文字列を書き戻して永久に失敗する。
   - 方針: bootstrap 時に host を `SocketAddr` に解決する(IP リテラルはそのまま、名前は `lookup_host` + timeout)。IPv6 は `SocketAddr::to_string()` の角括弧付き形式で保存する。解決に失敗した場合は `JumpHostUnreachable`(再試行可)に分類する。
-- [ ] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
+- [x] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
   - 要約: relay route の resume window 枯渇、cross-family fallback、panic は `Unreachable` として書かれる。B5 ガード(remote command は再実行しない)が `Unknown` / `MidSessionDisconnect` にしか掛かっていないため、`isekai-ssh host -- ./deploy.sh` がサイレントに再実行される。
   - 方針: fail-safe として、remote command があるときは `StaleTrust`/`Unreachable`/`Unknown` のどれでも**再実行しない**。サイレント再デプロイ(自己修復)だけ行い、「再実行してください」と案内して終了する。こうすれば次回の起動は正常に繋がり、always-connects に沿う。isekai-pipe 担当が `ConnectOutcome.session_established`(serde default)を追加中なので、それがマージされたら「`session_established == false` のときだけ再実行する」ように緩めるフォローアップを行う。
 - [ ] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
