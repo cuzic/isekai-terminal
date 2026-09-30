@@ -5,16 +5,16 @@
 # tsshd/QUIC へ移行する価値があるか（接続移行オーバーヘッドの基準値）を判断する。
 #
 # Usage: ./scripts/measure_latency.sh [host] [port] [user] [iterations]
-#   host  : 接続先 (default: 100.100.45.36 = Tailscale 上の Linux サーバー)
+#   host  : 接続先 (default: $ISEKAI_E2E_SSH_HOST、未設定なら 100.100.45.36 = Tailscale 上の Linux サーバー)
 #   port  : SSH ポート (default: 22)
-#   user  : ログインユーザー (default: cuzic)
+#   user  : ログインユーザー (default: $ISEKAI_E2E_SSH_USER、未設定なら実行ユーザー名)
 #   iters : SSH 往復計測の試行回数 (default: 30)
 
 set -euo pipefail
 
-HOST="${1:-100.100.45.36}"
+HOST="${1:-${ISEKAI_E2E_SSH_HOST:-100.100.45.36}}"
 PORT="${2:-22}"
-USER_NAME="${3:-cuzic}"
+USER_NAME="${3:-${ISEKAI_E2E_SSH_USER:-$(whoami)}}"
 ITERS="${4:-30}"
 TMPFILE="$(mktemp "${TMPDIR:-/tmp}/ssh_latency_XXXXXX.txt")"
 trap 'rm -f "$TMPFILE"' EXIT
@@ -42,7 +42,7 @@ fi
 # --- 2. SSH 往復レイテンシ（既存接続の多重化を避けるため毎回新規接続）---
 echo ""
 echo "--- SSH Round-trip Latency (connect + 'echo ok' + teardown) ---"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -o ControlMaster=no)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes -o ControlMaster=no)
 : > "$TMPFILE"
 fail=0
 for i in $(seq 1 "$ITERS"); do

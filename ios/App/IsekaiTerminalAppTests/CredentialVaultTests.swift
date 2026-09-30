@@ -81,6 +81,28 @@ final class CredentialVaultTests: XCTestCase {
         XCTAssertEqual(try vault.retrieve(metadata: metadata), secret)
     }
 
+    /// 2026-09-29レビューIOS-I4: ローテーション中にblobの書き込みが失敗しても、旧KEK/旧blobの
+    /// ままで秘密材料を取り出せる(以前は旧KEKを先に削除していたため、ここで永久に失われた)。
+    func testRotateKeyFailureKeepsSecretRetrievable() throws {
+        let dir = tempDir.appendingPathComponent("rotate-fail")
+        let rotatingVault = try CredentialVault(
+            blobDirectory: dir,
+            keychainService: "test.credentialvault.rotatefail.\(UUID().uuidString)"
+        )
+        let metadata = uniqueMetadata(tag: "rotate-fail")
+        let secret = Data("must-survive".utf8)
+        try rotatingVault.store(secret: secret, metadata: metadata)
+
+        // ディレクトリを読み取り専用(r-x)にして、ステージングファイルの書き込みを失敗させる。
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        }
+
+        XCTAssertThrowsError(try rotatingVault.rotateKey(metadata: metadata))
+        XCTAssertEqual(try rotatingVault.retrieve(metadata: metadata), secret)
+    }
+
     func testCleanupOrphanBlobsRemovesUnknownFiles() throws {
         let kept = uniqueMetadata(tag: "kept")
         let orphan = uniqueMetadata(tag: "orphan")

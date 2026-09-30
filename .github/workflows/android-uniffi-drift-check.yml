@@ -72,7 +72,12 @@ jobs:
 
   drift-check:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # `changes`(pr-path-gate)jobが失敗・タイムアウトした場合、単純な
+    # `needs.changes.outputs.relevant == 'true'`だとこのjobは`skipped`になり、
+    # branch protection上はskipped=緑としてrequired checkを素通りしてしまう。
+    # gateが成功しなかったときは重いテストを実行する側に倒す(fail-open)。
+    # ワークフロー自体がキャンセルされた場合(concurrencyのcancel-in-progress等)は走らせない。
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: android-uniffi-drift
@@ -101,15 +106,15 @@ jobs:
             android-uniffi-drift-${{ runner.os }}-
 
       - name: Install zig (mlugg/setup-zig)
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2 (v2.2.1)
         with:
-          version: latest
+          version: 0.16.0
 
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           set -euo pipefail
           if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild --locked
+            cargo install cargo-zigbuild --locked --version 0.23.4
           fi
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh

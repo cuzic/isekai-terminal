@@ -21,28 +21,14 @@ fi
 
 OWNER="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REGISTRY="$ROOT/ios/migration_registry.toml"
-BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-TODAY="$(date +%Y-%m-%d)"
+# shellcheck source=lib/migration-reservation.sh
+source "$ROOT/scripts/lib/migration-reservation.sh"
 
-CURRENT=$(grep -E '^current = ' "$REGISTRY" | head -1 | sed -E 's/^current = ([0-9]+).*/\1/')
-RESERVED_MAX=$(grep -E '^version = ' "$REGISTRY" | sed -E 's/^version = ([0-9]+).*/\1/' | sort -n | tail -1 || true)
+# 自worktreeだけでなく origin/main と他の全worktreeの予約も見て番号を決める
+# (lib/migration-reservation.sh 参照)。
+reserve_migration_version "$ROOT" "ios/migration_registry.toml" "$OWNER" "GRDB"
+NEXT="$RESERVED_VERSION"
 
-NEXT=$((CURRENT + 1))
-if [ -n "${RESERVED_MAX:-}" ] && [ "$RESERVED_MAX" -ge "$NEXT" ]; then
-  NEXT=$((RESERVED_MAX + 1))
-fi
-
-cat >> "$REGISTRY" <<EOF
-
-[[reserved]]
-version = $NEXT
-owner = "$OWNER"
-branch = "$BRANCH"
-reserved_at = "$TODAY"
-EOF
-
-echo "Reserved GRDB migration version $NEXT for '$OWNER' (branch: $BRANCH)."
 echo
 echo "Next steps:"
 echo "  1. In ProfileDatabase.swift's migrator, add:"

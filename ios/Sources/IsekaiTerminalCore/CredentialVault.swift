@@ -77,10 +77,42 @@ public final class CredentialVault {
     }
 
     /// KEKを再生成し、既存のblobを新しいKEKで暗号化し直す(鍵ローテーション)。
+    ///
+    /// 途中のどこで失敗しても秘密材料を失わない順序で行う(2026-09-29レビューIOS-I4。
+    /// 以前は旧KEKを先に削除してから`store`していたため、blobの書き込みに失敗すると
+    /// `store`のロールバックが新KEKも消し、旧KEKで暗号化されたままのblobが永久に
+    /// 復号不能になっていた):
+    /// 1. 新KEKで封緘した新blobをステージングファイルへ書く(失敗しても旧KEK/旧blobは無傷)。
+    /// 2. KeychainのKEKを`SecItemUpdate`で新KEKへ差し替える(失敗しても旧KEK/旧blobは無傷)。
+    /// 3. ステージングファイルで旧blobを置き換える。失敗したらKeychainを旧KEKへ戻す。
     public func rotateKey(metadata: Metadata) throws {
         let plaintext = try retrieve(metadata: metadata)
-        try keychain.deleteKey(keyId: metadata.keyId)
-        try store(secret: plaintext, metadata: metadata)
+        let oldKey = try keychain.getExistingKey(keyId: metadata.keyId)
+        let newKey = SymmetricKey(size: .bits256)
+        let newEnvelope = try seal(secret: plaintext, using: newKey, metadata: metadata)
+
+        let path = blobPath(for: metadata.keyId)
+        // `cleanupOrphanBlobs`は拡張子を1つ落とした名前(`<hash>.cvault`)で照合するため、
+        // 異常終了で残ったステージングファイルも次回起動時に孤立ファイルとして掃除される。
+        let staging = path.appendingPathExtension("rotating")
+        try atomicWrite(newEnvelope, to: staging)
+
+        do {
+            try keychain.replaceKey(newKey, keyId: metadata.keyId)
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+
+        do {
+            _ = try FileManager.default.replaceItemAt(path, withItemAt: staging)
+        } catch {
+            if (try? keychain.replaceKey(oldKey, keyId: metadata.keyId)) != nil {
+                try? FileManager.default.removeItem(at: staging)
+            }
+            // Keychainを戻せなかった場合はステージングファイル(新KEKで封緘済み)を残す。
+            throw error
+        }
     }
 
     /// アプリ起動時に呼び、`knownKeyIds`に含まれないblobファイル(孤立ファイル)を削除する。
@@ -154,13 +186,41 @@ public final class CredentialVault {
 struct KeychainKEKStore {
     let service: String
 
+    /// 既存のKEKを返し、Keychainに**存在しない**(`errSecItemNotFound`)場合に限り新規生成する。
+    ///
+    /// 端末ロック中(`deviceLocked`)などの一時的な読み出し失敗を「鍵なし」とみなして
+    /// 新しいKEKで上書きすると、旧KEKで暗号化済みのデータ(特に全プロファイル共通の
+    /// relay JWT用KEK)が復号不能になるため、それ以外のエラーはそのまま伝播する
+    /// (2026-09-29レビューIOS-I5)。
     func getOrCreateKey(keyId: String) throws -> SymmetricKey {
-        if let existing = try? getExistingKey(keyId: keyId) {
-            return existing
+        do {
+            return try getExistingKey(keyId: keyId)
+        } catch CredentialVault.VaultError.keychainError(let status) where status == errSecItemNotFound {
+            let key = SymmetricKey(size: .bits256)
+            try storeKey(key, keyId: keyId)
+            return key
         }
-        let key = SymmetricKey(size: .bits256)
-        try storeKey(key, keyId: keyId)
-        return key
+    }
+
+    /// 既存のKEKを新しい値へ置き換える。`storeKey`(削除→追加)と違い、`SecItemUpdate`は
+    /// 失敗しても旧KEKを消さない(鍵ローテーションで使う)。
+    func replaceKey(_ key: SymmetricKey, keyId: String) throws {
+        let keyData = key.withUnsafeBytes { Data($0) }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: keyId,
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: keyData,
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecInteractionNotAllowed {
+            throw CredentialVault.VaultError.deviceLocked
+        }
+        guard status == errSecSuccess else {
+            throw CredentialVault.VaultError.keychainError(status)
+        }
     }
 
     func getExistingKey(keyId: String) throws -> SymmetricKey {

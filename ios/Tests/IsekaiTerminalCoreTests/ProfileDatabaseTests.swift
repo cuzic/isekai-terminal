@@ -98,6 +98,31 @@ final class ProfileDatabaseTests: XCTestCase {
         XCTAssertNil(fetched?.keyEntryId)
     }
 
+    /// 2026-09-29レビューIOS-L5: `jumpKeyEntryId`にはFK制約が無いため、`deleteKeyEntry`が
+    /// 明示的にNULLへ戻す(鍵削除後に踏み台プロファイルの参照がぶら下がらない)。
+    /// 他の鍵を参照しているプロファイルには影響しない。
+    func testDeletingKeyEntrySetsProfileJumpKeyEntryIdToNull() throws {
+        let db = try ProfileDatabase.inMemory()
+        try db.insert(keyEntry: KeyEntry(id: "jump-key", displayName: "Jump Key", keyType: "ed25519", publicKey: "AAAA..."))
+        try db.insert(keyEntry: KeyEntry(id: "other-key", displayName: "Other Key", keyType: "ed25519", publicKey: "BBBB..."))
+        var viaDeleted = ConnectionProfile(
+            displayName: "Via bastion", host: "inner.example.com", port: 22, username: "user",
+            jumpHost: "bastion.example.com", jumpUsername: "user", jumpKeyEntryId: "jump-key"
+        )
+        var viaOther = ConnectionProfile(
+            displayName: "Via other", host: "inner2.example.com", port: 22, username: "user",
+            jumpHost: "bastion.example.com", jumpUsername: "user", jumpKeyEntryId: "other-key"
+        )
+        try db.insert(profile: &viaDeleted)
+        try db.insert(profile: &viaOther)
+
+        try db.deleteKeyEntry(id: "jump-key")
+
+        XCTAssertNil(try db.fetchProfile(id: viaDeleted.id!)?.jumpKeyEntryId)
+        XCTAssertEqual(try db.fetchProfile(id: viaOther.id!)?.jumpKeyEntryId, "other-key")
+        XCTAssertNil(try db.fetchKeyEntry(id: "jump-key"))
+    }
+
     // MARK: - Phase 1E-1: トランスポート/jump host等のフィールド拡張(v2 migration)
 
     func testNewProfileDefaultsForTransportAndJumpFields() throws {

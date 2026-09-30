@@ -26,6 +26,8 @@ on:
       - "*.gradle.kts"
       - "gradle.properties"
       - "settings.gradle.kts"
+      # NDKバージョンの参照元(下の「Install the NDK version pinned by the F-Droid recipe」)。
+      - "fdroid/**"
       - ".github/workflows/android-test-check.yml"
   # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
   # protectionのrequired status checkにする際、path-filter付きpull_requestは
@@ -74,12 +76,18 @@ jobs:
             ^[^/]+\.gradle\.kts$
             ^gradle\.properties$
             ^settings\.gradle\.kts$
+            ^fdroid/
             ^\.github/workflows/android-test-check\.yml$
             ^\.github/actions/pr-path-gate/
 
   test:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # `changes`(pr-path-gate)jobが失敗・タイムアウトした場合、単純な
+    # `needs.changes.outputs.relevant == 'true'`だとこのjobは`skipped`になり、
+    # branch protection上はskipped=緑としてrequired checkを素通りしてしまう。
+    # gateが成功しなかったときは重いテストを実行する側に倒す(fail-open)。
+    # ワークフロー自体がキャンセルされた場合(concurrencyのcancel-in-progress等)は走らせない。
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: android-unit-test
@@ -127,11 +135,14 @@ jobs:
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
             "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          # ziglang.org/download/index.json 公表の0.16.0 x86_64-linux tarballのsha256
+          # (ダウンロードしたバイト列から再計算して一致を確認済み)。改ざん・破損を検出する。
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
           mkdir -p "$HOME/zig-toolchain"
           tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
           echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
           export PATH="$HOME/zig-toolchain:$PATH"
-          cargo install cargo-zigbuild --locked
+          cargo install cargo-zigbuild --locked --version 0.23.4
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 

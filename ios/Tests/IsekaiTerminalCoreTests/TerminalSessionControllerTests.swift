@@ -21,6 +21,19 @@ final class TerminalSessionControllerTests: XCTestCase {
         return (controller, trustStore)
     }
 
+    /// 2026-09-29レビューIOS-I1: Rust側`SessionOrchestrator`がcallbackを強参照で保持しても、
+    /// 弱参照プロキシ経由なので、controllerへの参照が無くなれば解放される
+    /// (以前は循環参照でタブを閉じても認証情報ごと生き残っていた)。
+    func testControllerIsReleasedWhenNoLongerReferenced() throws {
+        weak var weakController: TerminalSessionController?
+        do {
+            let (controller, _) = try makeController()
+            weakController = controller
+            XCTAssertNotNil(weakController)
+        }
+        XCTAssertNil(weakController)
+    }
+
     func testFirstConnectionShowsPromptAndRejectsUntilTrusted() async throws {
         let (controller, trustStore) = try makeController()
 
@@ -323,6 +336,33 @@ final class TerminalSessionControllerTests: XCTestCase {
 
         let result = await resultTask.value
         XCTAssertFalse(result)
+    }
+
+    /// 2026-09-29レビューIOS-L2: 同時に2件の署名要求が来ても、1件目が2件目に上書きされず
+    /// 順に表示され、それぞれの応答が正しい要求に返る。
+    func testConcurrentAgentSignRequestsArePresentedOneAtATime() async throws {
+        let (controller, _) = try makeController()
+
+        let first = Task.detached { controller.onAgentSignRequest(keyFingerprint: "SHA256:first") }
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.pendingAgentSignRequest?.fingerprint == "SHA256:first"
+        }
+        let second = Task.detached { controller.onAgentSignRequest(keyFingerprint: "SHA256:second") }
+
+        // 2件目は1件目の応答前には表示されない(1件目を上書きしない)。
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(controller.uiState.pendingAgentSignRequest?.fingerprint, "SHA256:first")
+
+        controller.respondToAgentSignRequest(approved: true)
+        let firstResult = await first.value
+        XCTAssertTrue(firstResult)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.pendingAgentSignRequest?.fingerprint == "SHA256:second"
+        }
+        controller.respondToAgentSignRequest(approved: false)
+        let secondResult = await second.value
+        XCTAssertFalse(secondResult)
     }
 
     // MARK: - Phase 1A-9(#30): isekai-helper/QUIC最小縦切り(transportPreference分岐)
