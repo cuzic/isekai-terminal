@@ -44,10 +44,13 @@
   - 要約: Swift バインディングの drift-check が `git diff --exit-code` のみで、未追跡の新規生成物・新規 `.sha256` を検知できない。
   - 修正方針: Kotlin 側と同様に `git status --porcelain` でも同じパスを確認する。
   - 対応: 両ワークフローの drift-check に `git status --porcelain` の確認を追加し、失敗時に該当ファイル一覧を出すようにした。
-- [ ] **CI-M4** (Medium) `scripts/device_verify.sh:198,337-339,78-100`
+- [x] **CI-M4** (Medium) `scripts/device_verify.sh:198,337-339,78-100`
   - 要約: 失敗時にテスト用公開鍵が `~/.ssh/authorized_keys` に残る(EXIT trap で戻さない)。削除時の `grep -v` が
     0行一致で exit 1 して `set -e` で中断する。
   - 修正方針: 削除処理を関数化し、EXIT trap(`cleanup`)から呼ぶ(`--keep` 指定時は残す)。`grep -vF` の終了コード1を許容する。
+  - 対応: 削除処理を `remove_test_authorized_key` に関数化し、`cleanup`(EXIT trap)から `--keep` でない限り必ず呼ぶ。
+    追記前にフラグを立て、`grep -vF` の終了コード1(残り0行)を許容、一時ファイルは同ディレクトリに作って mv する。
+    切り出した関数を一時 HOME で実行し、テスト鍵のみ/他の鍵あり/フラグ未設定の3ケースを確認済み。
 - [ ] **CI-M5** (Medium) `.claude/hooks/cargo_check_on_edit.py:187-189,198-206`
   - 要約: ワークスペース判定が「crate の親より上で最初に見つかった Cargo.toml」で、`[workspace]` を確認していない。
     独立 workspace の `noq-multipath-spike` 編集で必ず誤報(exit 2)。付随(Low): 診断0件のときキャッシュを更新しないため、
@@ -91,9 +94,10 @@
 - [ ] **CI-INFO1** (Info) `scripts/measure_latency.sh:47,16-18`, `scripts/device_verify.sh:30`
   - 要約: `StrictHostKeyChecking=no`、個人用 Tailscale IP とユーザー名が既定値としてハードコードされている。
   - 修正方針: `StrictHostKeyChecking=accept-new` に変更。既定値は環境変数で上書きできるようにする。
-- [ ] **CI-INFO2** (Info) `scripts/device_verify.sh:143`
+- [x] **CI-INFO2** (Info) `scripts/device_verify.sh:143`
   - 要約: `./gradlew installDebug` をローカルで実行する(ローカルビルド禁止方針と矛盾)。
   - 修正方針: 既定を「インストール済み前提」に切り替え、ローカルビルドは明示的な `--install-local` 指定時だけにする。GHA でのビルドは android-ci-deploy スキルを案内する。
+  - 対応: 既定をインストール済みアプリの使用に変更し、`--apk PATH`(GHA ビルド済み APK を adb install)と `--install-local`(明示時のみ gradle)を追加。`--skip-install` は互換のため受け付ける。
 - [ ] **CI-INFO3** (Info) `.github/workflows/noq-738-repro-check.yml`
   - 要約: 自称「使い捨て」のワークフローがまだ残っている。
   - 修正方針: noq#738 の再現用として今後も使うかを確認してから削除する。
