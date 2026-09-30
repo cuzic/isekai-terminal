@@ -102,18 +102,60 @@ where
     }
 }
 
-/// [AttachOutcome::Waiter]を受け取ったタブが、確立担当タブの結果を待つ。
-pub(crate) async fn wait_for_establish<T>(
-    mut rx: watch::Receiver<Option<Result<Arc<T>, String>>>,
-) -> Result<Arc<T>, String> {
-    loop {
-        if let Some(result) = rx.borrow_and_update().clone() {
-            return result;
-        }
-        if rx.changed().await.is_err() {
-            return Err("pool: establishing task ended without a result".to_string());
-        }
+/// RC-16(2026-09-29 コードレビュー): 確立担当(Establisher)が接続確立(TCP connect・
+/// KEX・認証・踏み台のdirect-tcpip・QUIC系ならbootstrap/ハンドシェイク)全体に使える
+/// 時間の上限。以前は上限が無く、TCPは受け付けるがSSHハンドシェイクで止まるサーバー
+/// (SYN-ACK後に経路がblack-holeされた場合等)でエントリが`Connecting`のまま残り、
+/// 同じhost/user/鍵の後続タブ・3秒ごとの再接続試行が全て`Waiter`として永久に
+/// 待ち続けた。ホスト鍵確認ダイアログでユーザーが考える時間を奪わないよう、OpenSSHの
+/// 既定`LoginGraceTime`(サーバー側がこれ以上待たない)と同じ120秒にしてある。
+pub(crate) const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 確立処理`fut`を[ESTABLISH_TIMEOUT]で打ち切る。打ち切った場合は`Err`を返すので、
+/// Establisherは通常の失敗と同じく[publish_failure]する(待機中のタブも解放される)。
+pub(crate) async fn with_establish_timeout<T>(
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    with_timeout(ESTABLISH_TIMEOUT, fut).await
+}
+
+async fn with_timeout<T>(
+    timeout: Duration,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("connection establishment timed out after {}s", timeout.as_secs())),
     }
+}
+
+/// [AttachOutcome::Waiter]を受け取ったタブが、確立担当タブの結果を待つ。
+///
+/// RC-16: Establisher側は[ESTABLISH_TIMEOUT]で必ず結果を公開するが、万一
+/// Establisherのタスク自体が結果を公開せずに止まった場合(`watch::Sender`は
+/// マップ内に残るため`changed()`はエラーにならない)にも永久に待たないよう、
+/// 待機側にも少し長めの上限を設ける(多重防御)。
+pub(crate) async fn wait_for_establish<T>(
+    rx: watch::Receiver<Option<Result<Arc<T>, String>>>,
+) -> Result<Arc<T>, String> {
+    wait_for_establish_with_timeout(rx, ESTABLISH_TIMEOUT + Duration::from_secs(30)).await
+}
+
+async fn wait_for_establish_with_timeout<T>(
+    mut rx: watch::Receiver<Option<Result<Arc<T>, String>>>,
+    timeout: Duration,
+) -> Result<Arc<T>, String> {
+    with_timeout(timeout, async move {
+        loop {
+            if let Some(result) = rx.borrow_and_update().clone() {
+                return result;
+            }
+            if rx.changed().await.is_err() {
+                return Err("pool: establishing task ended without a result".to_string());
+            }
+        }
+    })
+    .await
 }
 
 /// 確立担当タブが接続確立に成功した時に呼ぶ。エントリを`Ready`にし、待機中の全タブへ
@@ -327,6 +369,18 @@ mod tests {
         let a = SshPoolKey::for_target("host", 22, "user", &key_auth(1), false, &Some(jump_a)).unwrap();
         let b = SshPoolKey::for_target("host", 22, "user", &key_auth(1), false, &Some(jump_b)).unwrap();
         assert!(a != b);
+    }
+
+    /// RC-16: 確立処理が止まっても打ち切られてエラーになり、待機側も永久には待たない。
+    #[tokio::test(start_paused = true)]
+    async fn establish_and_wait_are_bounded_by_timeouts() {
+        let stalled = with_establish_timeout(std::future::pending::<Result<(), String>>());
+        let err = stalled.await.expect_err("stalled establishment must time out");
+        assert!(err.contains("timed out"), "{err}");
+
+        let (_tx, rx) = watch::channel::<Option<Result<Arc<u32>, String>>>(None);
+        let err = wait_for_establish_with_timeout(rx, Duration::from_secs(5)).await.expect_err("waiter must time out");
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[tokio::test]

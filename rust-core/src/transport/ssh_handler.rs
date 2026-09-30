@@ -142,6 +142,12 @@ pub(crate) type CtlForwardMap =
 /// transport task → session_event_loop: SSH 状態通知
 pub(crate) enum TransportEvent {
     HostKey(String, tokio::sync::oneshot::Sender<bool>),
+    /// RC-07(2026-09-29 コードレビュー): ProxyJumpの**踏み台ホスト**のホスト鍵確認。
+    /// 以前は踏み台の鍵も`HostKey`として流れ、接続先(target)の`host:port`で検証・
+    /// pinされていた(踏み台の鍵がtargetの鍵としてTOFU登録され、以後本物のtargetの
+    /// 鍵が「変更された」扱いになる/利用者がmismatch警告の承認に慣らされる)。
+    /// 踏み台自身の識別子(`host`/`port`)を持たせて別経路で検証させる。
+    JumpHostKey { host: String, port: u16, fingerprint: String, reply: tokio::sync::oneshot::Sender<bool> },
     Connected,
     Stdout(Vec<u8>),
     Resized { cols: u32, rows: u32 },
@@ -229,6 +235,28 @@ pub(crate) struct RusshEventHandler {
     /// (SSH接続プーリングで複数タブが同じ`Handle`を共有していても、パスがタブごとに
     /// 一意なので誤配送しない)。
     pub(crate) ctl_forwards: CtlForwardMap,
+    /// `Some((host, port))`ならこのハンドラはProxyJumpの踏み台ホスト用で、ホスト鍵確認を
+    /// `TransportEvent::JumpHostKey`として踏み台自身の識別子付きで送る(RC-07)。
+    jump_identity: Option<(String, u16)>,
+    /// RC-21: agent-forwardの署名確認を届ける先の候補(このHandleを共有している各タブの
+    /// `event_tx`)。`run_ssh_channel_loop`がタブごとに登録する。
+    pub(crate) agent_routes: AgentRoutes,
+}
+
+/// RC-21(2026-09-29 コードレビュー): SSH接続プーリングで1つの`client::Handle`を複数タブが
+/// 共有する場合、`RusshEventHandler::event_tx`は**確立したタブ**のものに固定される。
+/// 以前はagent-forwardの署名確認を常にそこへ送っていたため、別タブの`ssh`由来の確認が
+/// 確立タブのUIに出る上、確立タブを閉じた後は(送信失敗=拒否扱いで)共有接続上の全ての
+/// 署名要求が黙って拒否され続けた。Handleを使っているタブの`event_tx`を登録しておき、
+/// 生きているもののうち最後に登録された(=最も新しく開いた)タブへ送る。
+pub(crate) type AgentRoutes = Arc<Mutex<Vec<tokio::sync::mpsc::Sender<TransportEvent>>>>;
+
+/// [AgentRoutes]から、まだ受信側(タブのevent loop)が生きている最も新しい送り先を選ぶ。
+/// 閉じたものはここで取り除く。
+pub(crate) fn pick_agent_route(routes: &AgentRoutes) -> Option<tokio::sync::mpsc::Sender<TransportEvent>> {
+    let mut routes = routes.lock();
+    routes.retain(|tx| !tx.is_closed());
+    routes.last().cloned()
 }
 
 impl RusshEventHandler {
@@ -240,7 +268,14 @@ impl RusshEventHandler {
             agent_key: Arc::new(Mutex::new(None)),
             remote_forwards: Arc::new(Mutex::new(HashMap::new())),
             ctl_forwards: Arc::new(Mutex::new(HashMap::new())),
+            jump_identity: None,
+            agent_routes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// ProxyJumpの踏み台ホスト用(RC-07)。ホスト鍵を踏み台自身の`host:port`で検証させる。
+    pub(crate) fn for_jump_host(event_tx: tokio::sync::mpsc::Sender<TransportEvent>, host: &str, port: u16) -> Self {
+        RusshEventHandler { jump_identity: Some((host.to_string(), port)), ..Self::new(event_tx) }
     }
 }
 
@@ -254,7 +289,16 @@ impl client::Handler for RusshEventHandler {
     ) -> Result<bool, Self::Error> {
         let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.event_tx.send(TransportEvent::HostKey(fp, reply_tx)).await.ok();
+        let event = match &self.jump_identity {
+            Some((host, port)) => TransportEvent::JumpHostKey {
+                host: host.clone(),
+                port: *port,
+                fingerprint: fp,
+                reply: reply_tx,
+            },
+            None => TransportEvent::HostKey(fp, reply_tx),
+        };
+        self.event_tx.send(event).await.ok();
         Ok(reply_rx.await.unwrap_or(false))
     }
 
@@ -267,7 +311,8 @@ impl client::Handler for RusshEventHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let key = self.agent_key.lock().clone();
-        let event_tx = self.event_tx.clone();
+        // RC-21: 確立したタブに固定せず、現在Handleを使っている生きたタブへ送る。
+        let event_tx = pick_agent_route(&self.agent_routes).unwrap_or_else(|| self.event_tx.clone());
         tokio::spawn(agent_forward::serve_agent_channel(channel, key, event_tx));
         Ok(())
     }
@@ -340,7 +385,7 @@ impl client::Handler for RusshEventHandler {
         };
         let socket_path = socket_path.to_string();
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+            use tokio::io::{AsyncWriteExt as _, BufReader};
 
             let (read_half, mut write_half) = tokio::io::split(channel.into_stream());
             let mut reader = BufReader::new(read_half);
@@ -352,20 +397,26 @@ impl client::Handler for RusshEventHandler {
             // decode_ctl_messageに渡り「expected value at line 1 column 1」で
             // 常に失敗する(実機検証、2026-07-28: isekai-terminal-core側だけ
             // この検証が抜けていた)。
-            let mut secret_line = String::new();
-            if let Err(e) = reader.read_line(&mut secret_line).await {
-                warn!("ctl-socket[{socket_path}]: failed to read ctl connection preamble: {e}");
-                return;
-            }
+            // RC-23(2026-09-29 コードレビュー): 以前は認証(preamble照合)前から長さ無制限・
+            // タイムアウト無しで`read_line`しており、同じリモートユーザーの任意プロセスが
+            // 改行の来ない巨大な行や放置接続で端末のメモリ/タスクを消費できた。
+            // preambleはsocketパス程度の長さしかないので小さな上限、本文はプロトコル上の
+            // 1行上限で打ち切り、どちらも読み取りにタイムアウトを設ける。
+            let secret_line = match read_ctl_line(&mut reader, CTL_PREAMBLE_MAX_LEN).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("ctl-socket[{socket_path}]: failed to read ctl connection preamble: {e}");
+                    return;
+                }
+            };
             if secret_line.trim_end_matches('\n') != socket_path {
                 warn!("ctl-socket[{socket_path}]: ctl connection preamble did not match this tab's expected secret");
                 return;
             }
 
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
-                Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
+            match read_ctl_line(&mut reader, isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN).await {
+                Ok(line) if line.is_empty() => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
+                Ok(line) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
                     Ok(
                         msg @ (isekai_protocol::CtlMessage::ClipboardPullRequest {}
                         | isekai_protocol::CtlMessage::GetVarRequest { .. }),
@@ -408,6 +459,81 @@ impl client::Handler for RusshEventHandler {
             }
         });
         Ok(())
+    }
+}
+
+/// RC-23: ctl接続の先頭行(secret preamble=このタブのsocketパス)の長さ上限。
+const CTL_PREAMBLE_MAX_LEN: usize = 4096;
+/// RC-23: ctl接続の1行の読み取りタイムアウト。
+const CTL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// RC-23: `setvar`で1つのストアに保持する変数の件数上限。
+const MAX_CTL_VARS_PER_STORE: usize = 256;
+
+/// ctl接続から1行(改行込み)を、`limit`バイトと[CTL_READ_TIMEOUT]を上限に読む。
+/// EOFなら空文字列を返す。上限を超えた行・タイムアウトはエラー。
+async fn read_ctl_line<R>(reader: &mut R, limit: usize) -> std::io::Result<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let mut line = String::new();
+    let read = (&mut *reader).take(limit as u64 + 1).read_line(&mut line);
+    let n = tokio::time::timeout(CTL_READ_TIMEOUT, read)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "ctl line read timed out"))??;
+    if n > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ctl line exceeds {limit} bytes")));
+    }
+    Ok(line)
+}
+
+#[cfg(test)]
+mod agent_route_tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_newest_live_tab_and_prunes_closed_ones() {
+        let routes: AgentRoutes = Arc::new(Mutex::new(Vec::new()));
+        let (tab_a, rx_a) = tokio::sync::mpsc::channel::<TransportEvent>(1);
+        let (tab_b, rx_b) = tokio::sync::mpsc::channel::<TransportEvent>(1);
+        routes.lock().push(tab_a.clone());
+        routes.lock().push(tab_b.clone());
+
+        assert!(pick_agent_route(&routes).unwrap().same_channel(&tab_b));
+        // 新しいタブ(B)が閉じたら、まだ生きている確立タブ(A)へ送る。
+        drop(rx_b);
+        assert!(pick_agent_route(&routes).unwrap().same_channel(&tab_a));
+        // 確立タブ(A)が閉じても、他に生きたタブが無ければNone(呼び出し側の既定へ)。
+        drop(rx_a);
+        assert!(pick_agent_route(&routes).is_none());
+        assert!(routes.lock().is_empty(), "閉じた送り先は取り除かれる");
+    }
+}
+
+#[cfg(test)]
+mod read_ctl_line_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_a_line_within_the_limit_and_rejects_oversized_lines() {
+        let mut ok = tokio::io::BufReader::new(&b"hello\nrest"[..]);
+        assert_eq!(read_ctl_line(&mut ok, 16).await.unwrap(), "hello\n");
+
+        let long = vec![b'x'; 100];
+        let mut too_long = tokio::io::BufReader::new(&long[..]);
+        let err = read_ctl_line(&mut too_long, 16).await.expect_err("RC-23: oversized line must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut eof = tokio::io::BufReader::new(&b""[..]);
+        assert_eq!(read_ctl_line(&mut eof, 16).await.unwrap(), "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_on_an_idle_connection() {
+        let (_keep_open, idle) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(idle);
+        let err = read_ctl_line(&mut reader, 16).await.expect_err("RC-23: idle connection must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
 
@@ -489,6 +615,7 @@ pub(crate) struct EstablishedSession {
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
+    pub(crate) agent_routes: AgentRoutes,
     /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
@@ -507,16 +634,17 @@ pub(crate) async fn connect_via_jump_or_direct(
         let agent_key = handler.agent_key.clone();
         let remote_forwards = handler.remote_forwards.clone();
         let ctl_forwards = handler.ctl_forwards.clone();
+        let agent_routes = handler.agent_routes.clone();
         let handle = client::connect(russh_config, addr.as_str(), handler)
             .await
             .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
         info!("ssh: TCP connected to {}", addr);
-        return Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: None });
+        return Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, agent_routes, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
     info!("ssh(jump): TCP connecting to {}", jump_addr);
-    let jump_handler = RusshEventHandler::new(event_tx.clone());
+    let jump_handler = RusshEventHandler::for_jump_host(event_tx.clone(), &jump.host, jump.port);
     let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), jump_handler)
         .await
         .map_err(|e| format!("jump host TCP connect to {jump_addr} failed: {e}"))?;
@@ -537,12 +665,13 @@ pub(crate) async fn connect_via_jump_or_direct(
     let agent_key = target_handler.agent_key.clone();
     let remote_forwards = target_handler.remote_forwards.clone();
     let ctl_forwards = target_handler.ctl_forwards.clone();
+    let agent_routes = target_handler.agent_routes.clone();
     let handle = client::connect_stream(russh_config, stream, target_handler)
         .await
         .map_err(|e| format!("SSH handshake over jump tunnel to {target_host}:{target_port} failed: {e}"))?;
     info!("ssh: connected to {}:{} via jump {}", target_host, target_port, jump_addr);
 
-    Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: Some(jump_handle) })
+    Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, agent_routes, _jump_handle: Some(jump_handle) })
 }
 
 // ── SSH接続プーリング用: 認証済みHandleの確立とチャネルの追加 ──
@@ -561,6 +690,8 @@ pub(crate) struct PooledSshHandle {
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
+    /// RC-21: このHandleを共有しているタブの`event_tx`(agent-forward確認の送り先)。
+    agent_routes: AgentRoutes,
     /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
     /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
@@ -617,6 +748,7 @@ async fn finish_establishing_handle(
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     ctl_forwards: CtlForwardMap,
+    agent_routes: AgentRoutes,
     jump_handle: Option<client::Handle<RusshEventHandler>>,
     username: &str,
     auth: &mut SshAuth,
@@ -652,6 +784,7 @@ async fn finish_establishing_handle(
         agent_key,
         remote_forwards,
         ctl_forwards,
+        agent_routes,
         _jump_handle: jump_handle,
     })
 }
@@ -671,7 +804,7 @@ pub(crate) async fn establish_ssh_handle(
     let established = connect_via_jump_or_direct(jump, russh_config, host, port, event_tx.clone()).await?;
     finish_establishing_handle(
         established.handle, established.agent_key, established.remote_forwards, established.ctl_forwards,
-        established._jump_handle, username, auth, agent_forward,
+        established.agent_routes, established._jump_handle, username, auth, agent_forward,
     ).await
 }
 
@@ -694,10 +827,11 @@ where
     let agent_key = handler.agent_key.clone();
     let remote_forwards = handler.remote_forwards.clone();
     let ctl_forwards = handler.ctl_forwards.clone();
+    let agent_routes = handler.agent_routes.clone();
     let handle = client::connect_stream(russh_config, stream, handler)
         .await
         .map_err(|e| e.to_string())?;
-    finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, None, username, auth, agent_forward).await
+    finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, agent_routes, None, username, auth, agent_forward).await
 }
 
 // ── タスク#61: 既存の接続上での短命exec ──────────────────
@@ -843,6 +977,9 @@ pub(crate) async fn run_ssh_channel_loop(
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     app_pane_id: crate::tmux_locator::AppPaneId,
 ) -> FirstChannelOpen {
+    // RC-21: このタブをagent-forward確認の送り先候補に登録する(タブのevent loopが
+    // 終わって受信側が閉じれば`pick_agent_route`が自動的に取り除く)。
+    pooled.agent_routes.lock().push(event_tx.clone());
     let channel = match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
         Box::pin(async move { handle.channel_open_session().await })
     }).await {
@@ -926,7 +1063,13 @@ async fn run_ssh_channel_loop_after_first_open(
                     while let Some(CtlInbound { msg, reply }) = ctl_rx.recv().await {
                         match (msg, reply) {
                             (isekai_protocol::CtlMessage::SetVar { scope, key, value }, _) => {
-                                ctl_var_store(scope, &tab_vars).set(key, value);
+                                // RC-23: 変数の件数に上限を設ける(既存キーの上書きは常に許可)。
+                                let store = ctl_var_store(scope, &tab_vars);
+                                if store.get(&key).is_none() && store.len() >= MAX_CTL_VARS_PER_STORE {
+                                    warn!("ctl-socket: setvar ignored, store already holds {} variables", MAX_CTL_VARS_PER_STORE);
+                                } else {
+                                    store.set(key, value);
+                                }
                             }
                             (isekai_protocol::CtlMessage::GetVarRequest { scope, key }, Some(reply)) => {
                                 let value = ctl_var_store(scope, &tab_vars).get(&key);

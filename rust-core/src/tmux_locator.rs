@@ -558,6 +558,17 @@ impl TmuxLocatorRegistry {
         self.pending_ctl_socket_paths.remove(app_pane)
     }
 
+    /// `app_pane`のタブが完全に破棄された(`SessionOrchestrator`が解放された)ときに、
+    /// そのエントリと一時退避パスを削除する。
+    ///
+    /// RC-34(2026-09-29 コードレビュー): 以前は削除経路が無く、`AppPaneId`は
+    /// orchestratorごとに新しく発行されるため、タブを開閉するたびにプロセス全体の
+    /// レジストリへエントリが溜まり続けていた。
+    pub(crate) fn unregister(&mut self, app_pane: &AppPaneId) {
+        self.by_app_pane.remove(app_pane);
+        self.pending_ctl_socket_paths.remove(app_pane);
+    }
+
 }
 
 // ── タスク#59: プロセス全体で共有するレジストリ + ctl-socketパスの伝播 ──
@@ -1158,5 +1169,19 @@ mod tests {
         registry.register(a.clone(), locator("tag-a"), None);
         assert_eq!(registry.locator_for(&a), Some(&locator("tag-a")));
         assert_eq!(registry.locator_for(&b), None);
+    }
+
+    #[test]
+    fn unregister_removes_entry_and_pending_path() {
+        // RC-34: タブ破棄時にエントリ・一時退避パスの両方が消えること。
+        let mut registry = TmuxLocatorRegistry::new();
+        let a = pane("tab-a", "pane-a");
+        let b = pane("tab-b", "pane-b");
+        registry.register(a.clone(), locator("tag-a"), Some("/tmp/a.sock".to_string()));
+        registry.note_pending_ctl_socket_path(b.clone(), "/tmp/b.sock".to_string());
+        registry.unregister(&a);
+        registry.unregister(&b);
+        assert_eq!(registry.locator_for(&a), None);
+        assert_eq!(registry.take_pending_ctl_socket_path(&b), None);
     }
 }

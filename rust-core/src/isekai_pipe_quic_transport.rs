@@ -241,19 +241,26 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 ) {
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(fp, reply) = ev {
-                let accepted = match &callback {
-                    Some(cb) => {
-                        let cb = Arc::clone(cb);
-                        tokio::task::spawn_blocking(move || cb.on_host_key(fp)).await.unwrap_or(false)
-                    }
-                    None => {
-                        warn!("bootstrap host key check: no session callback available, rejecting for safety");
-                        false
-                    }
-                };
-                let _ = reply.send(accepted);
-            }
+            // RC-07: 踏み台経由のbootstrapでは踏み台自身の鍵(`JumpHostKey`)も届く。
+            // 踏み台の`host:port`で検証させる(targetの識別子で検証・pinしない)。
+            let (check, reply): (Box<dyn FnOnce(&dyn SessionCallback) -> bool + Send>, _) = match ev {
+                TransportEvent::HostKey(fp, reply) => (Box::new(move |cb: &dyn SessionCallback| cb.on_host_key(fp)), reply),
+                TransportEvent::JumpHostKey { host, port, fingerprint, reply } => {
+                    (Box::new(move |cb: &dyn SessionCallback| cb.on_jump_host_key(host, port, fingerprint)), reply)
+                }
+                _ => continue,
+            };
+            let accepted = match &callback {
+                Some(cb) => {
+                    let cb = Arc::clone(cb);
+                    tokio::task::spawn_blocking(move || check(cb.as_ref())).await.unwrap_or(false)
+                }
+                None => {
+                    warn!("bootstrap host key check: no session callback available, rejecting for safety");
+                    false
+                }
+            };
+            let _ = reply.send(accepted);
         }
     });
 }
@@ -490,7 +497,9 @@ pub(crate) async fn finish_quic_stream(
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
                     let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                    // APP_ACKタスクはcontrol stream終了で自己終了する(isekai-transport側)ため、
+                    // ハンドルは保持せず明示的に手放す。
+                    let _ = isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
                     spawn_app_ack_bridge(resume_state, counters);
                 }
                 Ok(Err(e)) => {
@@ -545,25 +554,56 @@ pub(crate) async fn finish_quic_stream(
 /// 既に使っている`ClientResumeState`ベースのreplay/offset管理と直接には
 /// つながらない — 200ms間隔(APP_ACK自体の送信間隔と同じ)でどちらの方向も
 /// 同期する(isekai-terminal-core/isekai-transport crate共有化 Phase 1c)。
+///
+/// RC-14(2026-09-29 コードレビュー): 以前は終了条件の無い`loop`で、セッション終了後も
+/// `ClientResumeState`(最大4MiBのreplay buffer)を握り続け、resumeのたびに新しい
+/// bridgeが1本ずつ増えていた。現在は(1)`ClientResumeState`を`Weak`で持ち、
+/// `ReattachableStream`(pumpタスクとreattach_fn)が破棄されたら終了し、
+/// (2)`ack_bridge_generation`で世代を持ち、resume後に新しいbridgeが立ったら
+/// 古いbridgeは終了する。
 pub(crate) fn spawn_app_ack_bridge(
     resume_state: Arc<std::sync::Mutex<ClientResumeState>>,
     counters: Arc<isekai_transport::resume::AppAckCounters>,
 ) {
+    let my_generation = {
+        let mut st = resume_state.lock().unwrap();
+        st.ack_bridge_generation = st.ack_bridge_generation.wrapping_add(1);
+        st.ack_bridge_generation
+    };
+    let resume_state = Arc::downgrade(&resume_state);
     RUNTIME.spawn(async move {
         let mut last_delivered_synced = 0u64;
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let current_delivered = {
-                let mut st = resume_state.lock().unwrap();
-                st.replay_buffer.advance_start(counters.c2h_helper_committed_offset());
-                st.client_delivered_offset
-            };
-            if current_delivered > last_delivered_synced {
-                counters.advance_h2c_client_delivered_offset(current_delivered - last_delivered_synced);
-                last_delivered_synced = current_delivered;
+            if !sync_app_ack_once(&resume_state, &counters, my_generation, &mut last_delivered_synced) {
+                return;
             }
         }
     });
+}
+
+/// [spawn_app_ack_bridge]の1周期分。bridgeを続けるべきなら`true`、終了すべき
+/// (`ClientResumeState`が既に破棄された・新しいbridgeに置き換わった)なら`false`。
+fn sync_app_ack_once(
+    resume_state: &std::sync::Weak<std::sync::Mutex<ClientResumeState>>,
+    counters: &isekai_transport::resume::AppAckCounters,
+    my_generation: u64,
+    last_delivered_synced: &mut u64,
+) -> bool {
+    let Some(resume_state) = resume_state.upgrade() else { return false };
+    let current_delivered = {
+        let mut st = resume_state.lock().unwrap();
+        if st.ack_bridge_generation != my_generation {
+            return false;
+        }
+        st.replay_buffer.advance_start(counters.c2h_helper_committed_offset());
+        st.client_delivered_offset
+    };
+    if current_delivered > *last_delivered_synced {
+        counters.advance_h2c_client_delivered_offset(current_delivered - *last_delivered_synced);
+        *last_delivered_synced = current_delivered;
+    }
+    true
 }
 
 /// RESUME成功後に`conn`(reconnect_and_resumeが返した新しいconnection)上で
@@ -598,7 +638,9 @@ pub(crate) fn spawn_control_stream_reestablishment_after_resume(
             Ok(Ok(control)) => {
                 info!("{log_prefix}: control stream re-established after resume, session_id={}", control.session_id);
                 let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                // APP_ACKタスクはcontrol stream終了で自己終了する(isekai-transport側)ため、
+                // ハンドルは保持せず明示的に手放す。
+                let _ = isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
                 spawn_app_ack_bridge(resume_state, counters);
             }
             Ok(Err(e)) => {
@@ -686,6 +728,26 @@ enum AcquireError {
 /// フルで行う。プールにヒットしなかった場合、またはこのタブがプールの確立担当に
 /// なった場合にのみ呼ばれる。
 async fn establish_fresh(
+    config: &mut IsekaiPipeQuicConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<PooledSshHandle, AcquireError> {
+    // RC-16: bootstrap(SSH)+QUICハンドシェイク+ネスト認証の全体に上限を設ける。
+    // 止まったままだとプールエントリが`Connecting`のまま残り、後続タブ・再接続が
+    // 永久に待つ。打ち切りは(Autoなら通常SSHへフォールバックできるよう)ダイヤル失敗扱い。
+    match tokio::time::timeout(crate::pool::ESTABLISH_TIMEOUT, establish_fresh_inner(config, host_key_callback, event_tx)).await {
+        Ok(r) => r,
+        Err(_) => {
+            zeroize_ssh_auth(&mut config.auth);
+            Err(AcquireError::DialFailed(format!(
+                "isekai-pipe QUIC connection establishment timed out after {}s",
+                crate::pool::ESTABLISH_TIMEOUT.as_secs()
+            )))
+        }
+    }
+}
+
+async fn establish_fresh_inner(
     config: &mut IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
@@ -804,6 +866,31 @@ mod tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
         fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    /// RC-14: APP_ACK bridgeは`ClientResumeState`が破棄されたら、また新しいbridgeに
+    /// 置き換えられたら終了すること(以前は終了条件が無くリークしていた)。
+    #[test]
+    fn app_ack_bridge_stops_when_state_dropped_or_superseded() {
+        let state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(1024)));
+        state.lock().unwrap().replay_buffer.append(b"0123456789");
+        let counters = isekai_transport::resume::AppAckCounters::new();
+        counters.set_c2h_helper_committed_offset(4);
+        let weak = Arc::downgrade(&state);
+        let mut last = 0u64;
+
+        state.lock().unwrap().ack_bridge_generation = 1;
+        assert!(sync_app_ack_once(&weak, &counters, 1, &mut last), "current bridge keeps running");
+        assert_eq!(state.lock().unwrap().replay_buffer.replay_from(4).unwrap(), b"456789");
+
+        // resume後に新しいbridgeが立った → 古い世代は終了する。
+        state.lock().unwrap().ack_bridge_generation = 2;
+        assert!(!sync_app_ack_once(&weak, &counters, 1, &mut last), "superseded bridge must stop");
+        assert!(sync_app_ack_once(&weak, &counters, 2, &mut last));
+
+        // セッション(ReattachableStream)が破棄された → 終了する。
+        drop(state);
+        assert!(!sync_app_ack_once(&weak, &counters, 2, &mut last), "bridge must stop once the state is dropped");
     }
 
     /// 既知ホストと異なる鍵(ホスト鍵変更/MITMシナリオ)を返した場合、ブートストラップ
