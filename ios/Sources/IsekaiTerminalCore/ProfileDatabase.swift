@@ -530,7 +530,17 @@ public final class ProfileDatabase {
     }
 
     public func deleteKeyEntry(id: String) throws {
-        _ = try dbQueue.write { db in try KeyEntry.deleteOne(db, key: id) }
+        try dbQueue.write { db in
+            // `keyEntryId`は`ON DELETE SET NULL`の外部キーだが、`jumpKeyEntryId`(v2で追加)には
+            // FK制約が無い。鍵の削除で踏み台プロファイルの参照がぶら下がらないよう、同じ
+            // トランザクション内で明示的にNULLへ戻す(スキーマ変更=migrationを伴わない対処、
+            // 2026-09-29レビューIOS-L5)。
+            try db.execute(
+                sql: "UPDATE connection_profile SET jumpKeyEntryId = NULL WHERE jumpKeyEntryId = ?",
+                arguments: [id]
+            )
+            _ = try KeyEntry.deleteOne(db, key: id)
+        }
     }
 
     // MARK: - ConnectionProfile CRUD
