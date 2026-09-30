@@ -52,7 +52,7 @@
 - [x] **SSH-15** Medium `native/mux/owner.rs:603-623,773-782`
   - 要約: タブを閉じてもリモートシェルが残る(`Channel` に Drop 実装がない)。
   - 方針: `relay_loop` のすべての終了経路で `channel.close()` を送る(RemoteExitReported 以外)。誤ったコメントも修正する。
-- [ ] **SSH-16** Medium `native/mux/client.rs:324`, `owner.rs:620`
+- [x] **SSH-16** Medium `native/mux/client.rs:324`, `owner.rs:620`
   - 要約: 大量ペーストと echo 出力の双方向で相互デッドロックしうる。
   - 方針: owner 側の client 向け writer を専用タスク+有界キューに分離し、relay loop が client への書き込みでブロックしないようにする(詳細は実装時に判断)。
 - [-] **SSH-17** Medium `native/mux/*` — 他ユーザーによる holder named pipe の成りすまし(サーバープロセス SID 検証・HMAC)。**transport 担当に委譲**(named pipe 所有者/SID の指摘は重複)。
