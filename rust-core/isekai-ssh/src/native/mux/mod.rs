@@ -657,21 +657,31 @@ where
                 drop(spawn_lock);
                 return connect::run_prepared(prepared, None, resolved_handoff).await.map(DispatchOutcome::Done);
             }
-            let result = match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
-                Ok(conn) => run_as_client_over(prepared, conn, &token_path, resolved_handoff).await,
-                Err(e) => {
-                    log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
-                    connect::run_prepared(prepared, None, resolved_handoff).await.map(DispatchOutcome::Done)
-                }
-            };
+            let holder_conn = connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await;
             // Held across the whole spawn+wait window (not just the spawn
             // call itself) so a follower's own retry loop above has the
             // leader's holder to find for as long as the leader is willing to
             // wait for it — releasing any earlier would let a follower give up
             // and redundantly spawn its own holder while this one might still
             // be about to come up.
+            //
+            // …but released *before* this tab's own session runs (review
+            // 2026-09-29, SSH-28). It used to be dropped only after
+            // `run_as_client_over` returned — i.e. held for this tab's entire
+            // interactive session — so after `HOLDER_STARTUP_TIMEOUT` every
+            // other tab saw a "stale" lock that a live leader still owned,
+            // reclaimed it, and when *this* session finally ended its `Drop`
+            // deleted whichever lock file was there by then (possibly another
+            // leader's). Once the holder is reachable (or definitely isn't),
+            // the lock has nothing left to coordinate.
             drop(spawn_lock);
-            result
+            match holder_conn {
+                Ok(conn) => run_as_client_over(prepared, conn, &token_path, resolved_handoff).await,
+                Err(e) => {
+                    log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
+                    connect::run_prepared(prepared, None, resolved_handoff).await.map(DispatchOutcome::Done)
+                }
+            }
         }
         // A transient local-pipe busy/I/O condition — *not necessarily* "no
         // holder to reach": a holder can already exist but not yet be
@@ -803,7 +813,7 @@ where
     // same as the Unix `ssh(1)` path forcing `-t` in `apply_ctl_socket_forward`.
     let want_pty = tty_exec.is_some() || connect::wants_pty(prepared.plan().remote_command(), prepared.plan().request_tty);
     let remote_command = prepared.plan().remote_command().map(|cmd| cmd.join(" "));
-    let token = match read_owner_token_or_fall_back(token_path) {
+    let token = match read_owner_token_or_fall_back(token_path).await {
         ClientToken::Ready(token) => token,
         // The holder released its claim (or hadn't finished writing the token
         // file) in the race between our successful connect and now. A mux
@@ -857,6 +867,17 @@ impl SpawnLock {
             return Self { path, acquired: true };
         }
         if Self::is_stale(&path, stale_after) {
+            // Residual TOCTOU (review 2026-09-29, SSH-28): two tabs can both
+            // judge the same lock stale and the second's `remove_file` can
+            // delete the first's freshly re-created one, yielding two
+            // leaders. That is contained rather than prevented — the lock is
+            // only a best-effort de-duplication of passphrase prompts and
+            // spawns; the actual single-holder guarantee is the channel's own
+            // exclusive `try_claim`, which the losing holder simply fails.
+            // Since the leader now releases the lock as soon as its holder is
+            // reachable, a *live* leader's lock no longer ages into "stale"
+            // during its interactive session, which was what made this race
+            // routine rather than rare.
             let _ = std::fs::remove_file(&path);
             if Self::create_new(&path) {
                 return Self { path, acquired: true };
@@ -899,13 +920,26 @@ fn write_owner_token(path: &Path) -> Result<Vec<u8>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating mux token dir {}", parent.display()))?;
     }
-    std::fs::write(path, &token).with_context(|| format!("writing mux token file {}", path.display()))?;
+    // Written to a sibling temp file (restricted *before* it gets the real
+    // name) and renamed into place — atomic on both platforms (review
+    // 2026-09-29, SSH-29). A plain `fs::write` let a client racing the
+    // holder's start-up read a half-written token, which it could only see
+    // as a token mismatch (`Rejected`), needlessly dropping that tab to an
+    // unmultiplexed connect.
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_name);
+    std::fs::write(&tmp_path, &token).with_context(|| format!("writing mux token file {}", tmp_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting permissions on mux token file {}", path.display()))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on mux token file {}", tmp_path.display()))?;
     }
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::Error::new(e).context(format!("installing mux token file {}", path.display()))
+    })?;
     Ok(token)
 }
 
@@ -924,8 +958,8 @@ enum ClientToken {
 /// Reads the owner's token, degrading to [`ClientToken::FallBack`] (logging the
 /// cause) rather than erroring when it can't be read — so a lost/racing owner
 /// never turns a would-be client into a hard connect failure.
-fn read_owner_token_or_fall_back(path: &Path) -> ClientToken {
-    match read_owner_token(path) {
+async fn read_owner_token_or_fall_back(path: &Path) -> ClientToken {
+    match read_owner_token(path).await {
         Ok(token) => ClientToken::Ready(token),
         Err(e) => {
             log_line!("isekai-ssh: could not read the mux owner's auth token ({e:#}); connecting directly");
@@ -937,14 +971,17 @@ fn read_owner_token_or_fall_back(path: &Path) -> ClientToken {
 /// Reads the owner's token, retrying briefly to cover the small window where a
 /// client's claim failed but the freshly-elected owner hasn't finished writing
 /// the token file yet.
-fn read_owner_token(path: &Path) -> Result<Vec<u8>> {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(2);
+///
+/// Async (review 2026-09-29, SSH-29): the retry wait used to be a blocking
+/// `std::thread::sleep` inside async code, stalling a runtime worker thread
+/// for up to the whole 2s window.
+async fn read_owner_token(path: &Path) -> Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         match std::fs::read(path) {
             Ok(token) => return Ok(token),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Err(e) => return Err(anyhow::Error::new(e).context(format!("reading mux token file {}", path.display()))),
         }
@@ -1095,36 +1132,39 @@ mod tests {
     /// file in the claim race) must degrade to a fall-back single-process
     /// connect, not a hard error — the always-connects principle for a mux
     /// hiccup. Guards `run_as_client`'s token-read step.
-    #[test]
-    fn a_missing_owner_token_falls_back_instead_of_erroring() {
+    #[tokio::test]
+    async fn a_missing_owner_token_falls_back_instead_of_erroring() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such.token");
         assert!(
-            matches!(read_owner_token_or_fall_back(&missing), ClientToken::FallBack),
+            matches!(read_owner_token_or_fall_back(&missing).await, ClientToken::FallBack),
             "a token that can't be read must fall back to a direct connect, never fail"
         );
     }
 
     /// The happy path still yields the real token so a client relays to the
     /// owner rather than needlessly falling back.
-    #[test]
-    fn a_present_owner_token_is_used_rather_than_falling_back() {
+    #[tokio::test]
+    async fn a_present_owner_token_is_used_rather_than_falling_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mux.token");
         let written = write_owner_token(&path).unwrap();
-        match read_owner_token_or_fall_back(&path) {
+        match read_owner_token_or_fall_back(&path).await {
             ClientToken::Ready(token) => assert_eq!(token, written, "the token used must be the one on disk"),
             ClientToken::FallBack => panic!("a readable token must be used, not fall back to a direct connect"),
         }
     }
 
-    #[test]
-    fn token_write_then_read_round_trips_and_is_restricted() {
+    #[tokio::test]
+    async fn token_write_then_read_round_trips_and_is_restricted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("mux.token");
         let written = write_owner_token(&path).unwrap();
         assert_eq!(written.len(), 32, "token must be 32 bytes");
-        let read = read_owner_token(&path).unwrap();
+        // SSH-29: written via temp file + rename — nothing left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("mux.token")], "only the final token file may remain");
+        let read = read_owner_token(&path).await.unwrap();
         assert_eq!(written, read, "the token read back must match what was written");
         #[cfg(unix)]
         {
