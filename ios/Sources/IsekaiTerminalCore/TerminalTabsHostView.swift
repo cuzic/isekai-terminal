@@ -80,8 +80,15 @@ public final class TerminalTabsModel: ObservableObject {
 
     private func handleDidEnterBackground() {
         endBackgroundTaskIfNeeded()
+        // expirationHandlerはmain thread上で同期的に呼ばれ、handlerから戻るまでに
+        // `endBackgroundTask`しないとシステムのwatchdogにアプリをkillされうる。
+        // 以前は`Task { @MainActor in }`で非同期に投げるだけで、handlerから戻る時点では
+        // まだ終了していなかった(2026-09-29レビューIOS-I6)。main thread上であることは
+        // UIKitが保証するので`MainActor.assumeIsolated`で同期的に処理する。
         backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "isekai-terminal-sessions") { [weak self] in
-            Task { @MainActor in self?.handleBackgroundBudgetExpired() }
+            MainActor.assumeIsolated {
+                self?.handleBackgroundBudgetExpired()
+            }
         }
         // `beginBackgroundTask`の猶予見積もり(`backgroundTimeRemaining`)を`budget_ms`として
         // 各タブへ渡す。実際の期限管理(タイマー)はこのクラスの責務のまま
