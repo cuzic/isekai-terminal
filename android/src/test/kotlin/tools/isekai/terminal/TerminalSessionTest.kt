@@ -444,6 +444,39 @@ class TerminalSessionTest {
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
     }
 
+    /** AND-M8a: Rustの状態callback(Connected)より先に画面callbackが届いても(別スレッドで
+     *  到着順が保証されない)、接続中の初回フレームを捨てない。 */
+    @Test
+    fun onScreenUpdate_arrivingBeforeConnectedCallback_isNotDropped() = runBlocking {
+        session.connect(testConfig())
+        assertTrue(session.state.value.isConnecting)
+
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "first-frame", null, null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        fakeOrchestrator.simulateScreenUpdate(update)
+        fakeOrchestrator.simulateConnected()
+
+        val s = awaitState { it.connected && it.screenUpdate != null }
+        assertEquals(update, s.screenUpdate)
+    }
+
+    /** AND-M8a: 再接続中の切断操作は、Rustへ再接続ループの中止も転送し、
+     *  「切断済み」かつReconnectingという不整合な表示にしない。 */
+    @Test
+    fun disconnect_duringReconnecting_forwardsCancelAndClearsReconnecting() = runBlocking {
+        session.connect(testConfig())
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        fakeOrchestrator.simulateReconnecting()
+        awaitState { it.isReconnecting }
+
+        session.disconnect()
+
+        assertTrue(fakeOrchestrator.cancelReconnectCalled)
+        assertTrue(fakeOrchestrator.disconnectCalled)
+        assertFalse(session.state.value.isReconnecting)
+        assertEquals("切断済み", session.state.value.statusMsg)
+    }
+
     @Test
     fun onScreenUpdate_manyRapidFires_allConsumedEventually() = runBlocking {
         session.connect(testConfig())

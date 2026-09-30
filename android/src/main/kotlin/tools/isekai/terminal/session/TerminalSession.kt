@@ -274,7 +274,7 @@ class TerminalSession(
         }
 
         override fun onScreenUpdate(update: ScreenUpdate) {
-            if (!_state.value.connected) return
+            if (!acceptsScreenUpdates(_state.value)) return
             screenUpdateChannel.trySend(update)
         }
 
@@ -424,7 +424,7 @@ class TerminalSession(
     init {
         ioScope.launch {
             for (update in screenUpdateChannel) {
-                if (_state.value.connected) {
+                if (acceptsScreenUpdates(_state.value)) {
                     val scrollbackLen = live(0u) { it.scrollbackLen() }.toInt()
                     _state.update { it.copy(screenUpdate = update, scrollbackLen = scrollbackLen) }
                     maybeFireBell(update)
@@ -436,6 +436,17 @@ class TerminalSession(
     }
 
     // ── Connection ───────────────────────────────────────────────────
+
+    /**
+     * AND-M8a: 画面更新を受け付けるか。以前は`connected`だけで判定しており、Rustの状態
+     * callback(`Connected`)と画面callbackは別スレッドから届き到着順が保証されないため、
+     * Connected直後の初回フレームが状態callbackより先着すると捨てられ、次の更新まで画面が
+     * 空になりえた。古い世代(切り替え前のセッション)からの遅延フレームはRust側
+     * (`OrchestratorAdapter::is_current`)で既に破棄されるため、接続中(`isConnecting`)の
+     * フレームも受け付けてよい。明示的な切断・Rustからの`Disconnected`/`Reconnecting`
+     * 後は受け付けない(画面はそれらの遷移で`null`へ戻される)。
+     */
+    private fun acceptsScreenUpdates(state: TerminalUiState): Boolean = state.connected || state.isConnecting
 
     /** 各 connectXxx() 共通のガード(接続済み/接続中なら無視)とエラー処理。
      *  Rust側`SessionOrchestrator::begin_connect`が拒否するのは`Connecting`中の
@@ -508,8 +519,16 @@ class TerminalSession(
     fun resize(cols: UInt, rows: UInt) = live(Unit) { it.resize(cols, rows) }
 
     fun disconnect() {
-        _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
-        live(Unit) { it.disconnect() }
+        // AND-M8a: 以前は`isReconnecting`を落とさず「切断済み」かつReconnectingという不整合な
+        // 表示になりえた。自動再接続ループが回っていればRust側で止める(動いていなければRust側で
+        // 無音、判断はRust)ようユーザーの切断意図をそのまま転送し、表示も合わせて落とす。
+        // Rustの`disconnect()`が全フェーズで必ず`Disconnected`を通知する保証がまだ無いため、
+        // 楽観的な表示更新自体は残す(AND-M8b、Rust側対応待ち)。
+        _state.update { it.copy(connected = false, isConnecting = false, isReconnecting = false, statusMsg = "切断済み") }
+        live(Unit) {
+            it.cancelReconnect()
+            it.disconnect()
+        }
     }
 
     /** 自動再接続ループ([isReconnecting]中)を中止する。判断はRust側

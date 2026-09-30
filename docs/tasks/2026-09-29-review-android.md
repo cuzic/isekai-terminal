@@ -85,13 +85,13 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   `super.sendKeyEvent`で同じViewへ再注入されるループ。
   - 方針: commit/finish後に`editable.clear()`、Ctrl経路でcomposing spanを除去、`beforeLength`を
     coerce、onKeyDownからは`super.sendKeyEvent`に回さない専用入口を使う。
-- [ ] **AND-M8a** (Medium) `session/TerminalSession.kt:255,403,479-482` — (a) 画面更新を
+- [x] **AND-M8a** (Medium) `session/TerminalSession.kt:255,403,479-482` — (a) 画面更新を
   `connected`ミラーでゲートしており、Connected直後の初回フレームが状態callbackより先着すると
   捨てられる、(b) `disconnect()`の楽観的ミラー書き換えが`isReconnecting`を落とさず不整合表示になる。
   - 方針(Kotlin側): ゲートを「接続中または接続済み」に緩めて初回フレームの取りこぼしを防ぐ。
     `disconnect()`はRustへ`cancelReconnect()`(ループが動いていなければRust側で無音)も転送し、
     ミラーの`isReconnecting`も落とす。
-- [ ] **AND-M8b** (Medium) 同上の根本対応 — ScreenUpdateの有効/無効と切断状態の反映を完全に
+- [~] **AND-M8b** (Medium) 同上の根本対応 — 見送り(Rust側対応要: `disconnect()`の`reconnect_epoch`扱いを含むRust側の保証が入るまで、Kotlinの楽観的な切断表示とゲートは残す。rust-coreは別担当) — ScreenUpdateの有効/無効と切断状態の反映を完全に
   Rustへ委ねるには、Rust側が「`disconnect()`後は必ず`Disconnected`を通知し、以後フレームを
   送らない」ことを全フェーズ(Connecting/Reconnecting含む、`reconnect_epoch`)で保証する必要がある。
 
