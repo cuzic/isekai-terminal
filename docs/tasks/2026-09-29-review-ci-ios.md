@@ -85,9 +85,11 @@
   - 対応: zig 0.16.0 tarball(3ワークフロー)と Swift 6.3.3 tarball を、固定した sha256 で `sha256sum -c` 検証してから展開する。
     値は ziglang.org の index.json 公表値と、実際にダウンロードしたバイト列から再計算した値の一致を確認済み(Swift は再計算値)。
     `mlugg/setup-zig` 経由の箇所は action 自身が minisign 署名を検証する。署名(minisign/PGP)そのものの検証は、sha256 固定で十分と判断して行わない。
-- [ ] **CI-L3** (Low) `release-build.yml:32-36,186-191`
+- [x] **CI-L3** (Low) `release-build.yml:32-36,186-191`
   - 要約: 任意のコミットに `isekai-{ssh,pipe}-v*` タグを打てば `releases/latest` が更新される。
   - 修正方針: publish-release でタグのコミットが `origin/main` の祖先であることを検証してから公開する。
+  - 対応: publish-release の先頭で full checkout と `origin/main` の fetch を行い、タグのコミットが `origin/main` の祖先でなければ公開せず失敗させる。
+    「required check が緑であること」までは要求しない(main への push では paths フィルタにより一部の required ワークフローがそもそも走らないため、check-run の有無で判定できない)。
 - [ ] **CI-L4** (Low) `rust-core/scripts/ios-fixture/start-sshd-fixture.sh:21-22`
   - 要約: 相対パスの FIXTURE_DIR で `cd` 後のパスが二重になる。
   - 修正方針: `mkdir -p` 後に絶対パス化する。

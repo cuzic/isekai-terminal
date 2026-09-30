@@ -193,6 +193,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      # `releases/latest`は全ホストへのサイレント再bootstrap(`helper_download.rs`)の
+      # 配布元なので、mainに入っていない任意のコミット(PRブランチ・ローカルの実験
+      # コミット等)に打ったタグからは公開しない(2026-09-29レビューCI-L3)。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require the tagged commit to be on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF ($GITHUB_SHA) is not an ancestor of origin/main; refusing to publish a release from a commit that is not on main." >&2
+            exit 1
+          fi
+          echo "$GITHUB_SHA is on origin/main."
+
       - name: Download all built binaries
         uses: actions/download-artifact@v4
         with:
