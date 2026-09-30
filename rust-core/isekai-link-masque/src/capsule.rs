@@ -24,6 +24,12 @@ const COMPRESSION_ASSIGN: u64 = 0x11;
 const COMPRESSION_ACK: u64 = 0x12;
 const COMPRESSION_CLOSE: u64 = 0x13;
 
+/// Upper bound on a single capsule's declared payload length. Every capsule
+/// this crate understands is a few dozen bytes at most; without a cap, a
+/// declared length of up to 2^62 would keep [`CapsuleReader`] buffering (and
+/// [`Capsule::decode`] answering "incomplete") forever instead of failing.
+pub const MAX_CAPSULE_PAYLOAD_LEN: usize = 64 * 1024;
+
 /// A parsed capsule. `Unknown` preserves the type so callers can log it;
 /// `axum-masque-rs`'s own server treats unrecognized capsule types as a
 /// policy violation (see `bound_udp/service.rs`), so callers should treat
@@ -91,6 +97,9 @@ impl Capsule {
         };
         let payload_len =
             usize::try_from(length).map_err(|_| CapsuleDecodeError::LengthOverflow)?;
+        if payload_len > MAX_CAPSULE_PAYLOAD_LEN {
+            return Err(CapsuleDecodeError::TooLarge { declared: payload_len, max: MAX_CAPSULE_PAYLOAD_LEN });
+        }
         if after_length.len() < payload_len {
             return Ok(None); // incomplete payload; wait for more bytes
         }
@@ -133,6 +142,8 @@ impl Capsule {
 pub enum CapsuleDecodeError {
     #[error("capsule payload length exceeds usize range")]
     LengthOverflow,
+    #[error("capsule declares a {declared}-byte payload, exceeding the {max}-byte limit")]
+    TooLarge { declared: usize, max: usize },
     #[error("CompressionAssign/Ack/Close capsule missing context id")]
     MissingContextId,
     #[error("CompressionAssign capsule missing ip_version byte")]
@@ -259,6 +270,17 @@ mod tests {
             Capsule::decode(&raw),
             Err(CapsuleDecodeError::MissingContextId)
         );
+    }
+
+    #[test]
+    fn decode_rejects_an_oversized_declared_length_instead_of_waiting_forever() {
+        let mut raw = encode_var_int(COMPRESSION_ACK);
+        raw.extend_from_slice(&encode_var_int((MAX_CAPSULE_PAYLOAD_LEN + 1) as u64));
+        assert!(matches!(Capsule::decode(&raw), Err(CapsuleDecodeError::TooLarge { .. })));
+
+        let mut raw = encode_var_int(COMPRESSION_ACK);
+        raw.extend_from_slice(&encode_var_int((1u64 << 62) - 1));
+        assert!(matches!(Capsule::decode(&raw), Err(CapsuleDecodeError::TooLarge { .. }) | Err(CapsuleDecodeError::LengthOverflow)));
     }
 
     #[test]
