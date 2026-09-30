@@ -91,7 +91,8 @@
   - -L/-Dは中継タスクを待受タスクのJoinSetで所有し、削除・切断時のabortで一緒に止まるようにした。-R(サーバー起点、russh Handlerのコールバックでspawn)の受理済み中継は、どのフォワードに属するかをHandler側で追跡する仕組みが無く、今回は削除時にcancel_tcpip_forwardで新規接続が止まる既存挙動のまま。
 - [x] **RC-36** Low — `file_preview.rs:127-161` — パス先頭の`-`がオプションとして解釈される。
   - 方針: パス引数の前に`--`を入れる(リモートCLIが`--`に対応しているか確認)か、`-`始まりのパスに`./`を前置する。
-- [ ] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
+- [x] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
+  - 部分対応: helper_bootstrap.rsのrun_execにタイムアウト(300s)とstdout上限(1MiB)を追加(接続確立全体もRC-16で上限あり)。固定.tmpパス/アップロード後sha256検証はisekai-protocol/src/bootstrap.rs(担当境界外)のコマンド生成にあるため未対応——transport担当へ要連絡。sha256sum無し環境でのバージョン一致再利用は#67で意図的な仕様。
 - [ ] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
 - [ ] **RC-39** Low — `isekai_stun_p2p_transport.rs:270-279` — STUN P2Pのreattachが穴あけ無しの新ソケットからdialする。
 - [ ] **RC-40** Low — `quic_transport.rs:135-146, 210` — 旧tsshd QUIC transportは証明書検証有効時に空RootCertStoreで必ず失敗。handshake JSONを`format!`で組み立て`ssh_host`を未エスケープ。
