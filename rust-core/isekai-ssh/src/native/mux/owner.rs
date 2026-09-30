@@ -405,12 +405,22 @@ where
                 ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
             }
             let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
-            // A failed *channel open* (as opposed to a protocol
-            // version/token mismatch, both handled earlier and never
-            // reaching here) is evidence the shared handle itself is dead,
-            // not just this one client — see `serve_clients`'s `shutdown`
-            // branch and `handle_died`'s doc comment.
-            shutdown.notify_waiters();
+            // A failed channel open is evidence the shared handle itself is
+            // dead *only* when the server didn't answer it (review
+            // 2026-09-29, SSH-05). An explicit `SSH_MSG_CHANNEL_OPEN_FAILURE`
+            // or a refused channel request (e.g. sshd's `MaxSessions`,
+            // default 10, being exceeded — an entirely normal policy
+            // rejection) proves the connection is alive and well: tearing the
+            // holder down for it used to drop *every other* tab's live shell
+            // with it (each seeing `OwnerLost` and reconnecting into a brand
+            // new remote shell). This client alone gets `Rejected` (falling
+            // back to an unmultiplexed direct connect); the holder keeps
+            // serving everyone else.
+            if channel_open_failure_implies_dead_handle(&e) || handle.lock().await.is_closed() {
+                // See `serve_clients`'s `shutdown` branch and
+                // `handle_died`'s doc comment.
+                shutdown.notify_waiters();
+            }
             return Err(e);
         }
     };
@@ -447,6 +457,24 @@ where
     }
 
     result
+}
+
+/// Whether a per-client channel-open failure (`relay_client`) should be
+/// treated as proof the *shared* SSH connection is dead (SSH-05). `false`
+/// when the server demonstrably answered — a `ChannelOpenFailure` (any
+/// reason code) or a `RequestDenied` for the pty/shell/exec request — since
+/// a peer that replies is by definition still connected; `true` for
+/// everything else (send failures, disconnects, ...), preserving the
+/// original fast-path for a genuinely dead handle.
+fn channel_open_failure_implies_dead_handle(err: &anyhow::Error) -> bool {
+    let server_answered = |e: &russh::Error| matches!(e, russh::Error::ChannelOpenFailure(_) | russh::Error::RequestDenied);
+    !err.chain().any(|cause| {
+        cause.downcast_ref::<russh::Error>().is_some_and(server_answered)
+            || matches!(
+                cause.downcast_ref::<russh_stream_session::SessionError>(),
+                Some(russh_stream_session::SessionError::Channel(e)) if server_answered(e)
+            )
+    })
 }
 
 /// Why [`relay_loop`]'s main loop ended (Epic R PR2, B1/B2). Round 0/1/2 of
@@ -2390,5 +2418,26 @@ mod tests {
         );
 
         assert!(relay.await.unwrap().is_err(), "a failed ctl-socket login-shell open must fail the client relay");
+    }
+
+    /// SSH-05 regression: a channel-open failure the *server answered*
+    /// (`MaxSessions` exceeded, a refused pty/exec request) must not be read
+    /// as the shared connection being dead — that used to tear down the whole
+    /// holder and every other tab's live shell. Anything else keeps the
+    /// original dead-handle fast path.
+    #[test]
+    fn channel_open_failure_implies_dead_handle_only_when_the_server_did_not_answer() {
+        let rejected = anyhow::Error::new(russh_stream_session::SessionError::Channel(russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::ResourceShortage,
+        )))
+        .context("isekai-ssh mux owner: failed to open a session channel for the client");
+        assert!(!channel_open_failure_implies_dead_handle(&rejected), "a server-sent CHANNEL_OPEN_FAILURE proves the connection is alive");
+
+        let denied = anyhow::Error::new(russh::Error::RequestDenied).context("pty request refused");
+        assert!(!channel_open_failure_implies_dead_handle(&denied), "a refused channel request proves the connection is alive");
+
+        let dead = anyhow::Error::new(russh_stream_session::SessionError::Channel(russh::Error::Disconnect)).context("open failed");
+        assert!(channel_open_failure_implies_dead_handle(&dead), "a transport-level failure still means the shared handle is gone");
+        assert!(channel_open_failure_implies_dead_handle(&anyhow!("opaque failure")));
     }
 }

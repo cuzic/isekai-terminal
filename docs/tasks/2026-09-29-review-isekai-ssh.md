@@ -21,7 +21,7 @@
 - [x] **SSH-04** High `isekai-bootstrap/src/russh_backend.rs:270,355-356`
   - 要約: `EncryptedPrivateKey`/`InvalidCertificate` が hard error になり、後続の鍵が試されない。jump hop は最初に読めたファイルが暗号化鍵でもそれを使う。agent fallback もなく、`AuthenticationRequired`(再試行不可)に分類されるため、Windows のサイレント再デプロイが永久に失敗する。
   - 方針: 鍵のパース系エラー(Invalid/Encrypted/InvalidCertificate)はすべて `continue` する。jump hop はパスフレーズなしでデコードできる最初の鍵を選ぶ。target hop は、全 identity 失敗後に Windows の ssh-agent(`IdentityAgent` を尊重)で fallback する。
-- [ ] **SSH-05** High `isekai-ssh/src/native/mux/owner.rs:397-414`
+- [x] **SSH-05** High `isekai-ssh/src/native/mux/owner.rs:397-414`
   - 要約: channel open の失敗 1 回(`MaxSessions` 超過などの正常な拒否を含む)で `shutdown` が通知され、holder と全タブが道連れになる。
   - 方針: `ChannelOpenFailure`/`RequestDenied`(サーバーが応答した=transport は生きている)か `is_closed()==false` の場合は、その client だけ `Rejected` にして holder は維持する。
 
