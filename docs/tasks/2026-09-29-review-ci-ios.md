@@ -181,9 +181,11 @@
 - [ ] **IOS-L2** (Low) `TerminalSessionController.swift:1012-1033`
   - 要約: agent-sign の保留スロットが1つしかなく、2件目の要求が1件目を上書きする(1件目は30秒ブロックののち拒否)。
   - 修正方針: FIFO キューにし、先頭を表示する。応答・タイムアウトで次の要求を表示する。
-- [ ] **IOS-L3** (Low・不確実) `ios/Sources/IsekaiTerminalCore/RemoteClipboardBridge.swift:36-52`
+- [x] **IOS-L3** (Low・不確実) `ios/Sources/IsekaiTerminalCore/RemoteClipboardBridge.swift:36-52`
   - 要約: UIPasteboard を Rust スレッドから触っている。
   - 修正方針: write は main へ非同期ディスパッチ、pull は main で同期実行する(呼び出し元が main なら直接実行)。
+  - 対応: write は `performOnMain`(main 以外からは main へ非同期に投げる)で行う。pull は `readOnMain`(main で読み、最大5秒セマフォで待つ。超過したら nil = 取得不可)で行い、main が塞がっていても Rust 側をデッドロックさせない。
+    `RemoteClipboardBridgeTests`(3件、実際の UIPasteboard には触れない)を追加。
 - [ ] **IOS-L4** (Low) `ios/Sources/IsekaiTerminalCore/TerminalIMEInputView.swift:84,207-211`
   - 要約: composing 中に `insertText` が来ると marked text を確定送信したうえで insertText も送り、二重送信されうる(pinyin 系で要実機確認)。
     `markedTextLog` と `buffer` が際限なく伸びる。
