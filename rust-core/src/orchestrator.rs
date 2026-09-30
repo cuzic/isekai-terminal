@@ -548,6 +548,13 @@ impl SessionCallback for OrchestratorAdapter {
         self.shared.callback.on_host_key(host, port, fingerprint)
     }
 
+    /// RC-07: 踏み台ホストの鍵は踏み台自身の`host:port`で検証する(targetの
+    /// `current_target()`で検証・pinしない)。
+    fn on_jump_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
+        if !self.is_current() { return false; }
+        self.shared.callback.on_host_key(host, port, fingerprint)
+    }
+
     fn on_connected(&self) {
         if !self.is_current() { return; }
         let (effects, retry_log) = {
@@ -2895,6 +2902,29 @@ mod tests {
         let stale = OrchestratorAdapter::new(shared.clone());
         let _fresh = OrchestratorAdapter::new(shared.clone());
         assert!(!stale.on_host_key("aa:bb:cc".to_string()));
+    }
+
+    #[test]
+    fn jump_host_key_is_checked_under_the_jump_hosts_own_identity() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        let mut config = test_ssh_config();
+        config.host = "target.example.com".to_string();
+        config.port = 22;
+        shared.state.lock().set_last_connect_attempt(LastConnectAttempt::Ssh(config));
+        adapter.on_jump_host_key("bastion.example.com".to_string(), 2222, "SHA256:jump".to_string());
+        adapter.on_host_key("SHA256:target".to_string());
+        let keys = cb.host_keys.lock().unwrap();
+        assert_eq!(keys[0], ("bastion.example.com".to_string(), 2222, "SHA256:jump".to_string()), "RC-07");
+        assert_eq!(keys[1], ("target.example.com".to_string(), 22, "SHA256:target".to_string()));
+    }
+
+    #[test]
+    fn jump_host_key_returns_false_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connecting, false);
+        let stale = OrchestratorAdapter::new(shared.clone());
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(!stale.on_jump_host_key("bastion.example.com".to_string(), 22, "SHA256:jump".to_string()));
+        assert!(cb.host_keys.lock().unwrap().is_empty());
     }
 
     // ── OrchestratorAdapter (SessionCallback) の単純委譲群 ──────

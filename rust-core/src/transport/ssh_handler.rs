@@ -140,6 +140,12 @@ pub(crate) type CtlForwardMap =
 /// transport task → session_event_loop: SSH 状態通知
 pub(crate) enum TransportEvent {
     HostKey(String, tokio::sync::oneshot::Sender<bool>),
+    /// RC-07(2026-09-29 コードレビュー): ProxyJumpの**踏み台ホスト**のホスト鍵確認。
+    /// 以前は踏み台の鍵も`HostKey`として流れ、接続先(target)の`host:port`で検証・
+    /// pinされていた(踏み台の鍵がtargetの鍵としてTOFU登録され、以後本物のtargetの
+    /// 鍵が「変更された」扱いになる/利用者がmismatch警告の承認に慣らされる)。
+    /// 踏み台自身の識別子(`host`/`port`)を持たせて別経路で検証させる。
+    JumpHostKey { host: String, port: u16, fingerprint: String, reply: tokio::sync::oneshot::Sender<bool> },
     Connected,
     Stdout(Vec<u8>),
     Resized { cols: u32, rows: u32 },
@@ -227,6 +233,9 @@ pub(crate) struct RusshEventHandler {
     /// (SSH接続プーリングで複数タブが同じ`Handle`を共有していても、パスがタブごとに
     /// 一意なので誤配送しない)。
     pub(crate) ctl_forwards: CtlForwardMap,
+    /// `Some((host, port))`ならこのハンドラはProxyJumpの踏み台ホスト用で、ホスト鍵確認を
+    /// `TransportEvent::JumpHostKey`として踏み台自身の識別子付きで送る(RC-07)。
+    jump_identity: Option<(String, u16)>,
 }
 
 impl RusshEventHandler {
@@ -238,7 +247,13 @@ impl RusshEventHandler {
             agent_key: Arc::new(Mutex::new(None)),
             remote_forwards: Arc::new(Mutex::new(HashMap::new())),
             ctl_forwards: Arc::new(Mutex::new(HashMap::new())),
+            jump_identity: None,
         }
+    }
+
+    /// ProxyJumpの踏み台ホスト用(RC-07)。ホスト鍵を踏み台自身の`host:port`で検証させる。
+    pub(crate) fn for_jump_host(event_tx: tokio::sync::mpsc::Sender<TransportEvent>, host: &str, port: u16) -> Self {
+        RusshEventHandler { jump_identity: Some((host.to_string(), port)), ..Self::new(event_tx) }
     }
 }
 
@@ -252,7 +267,16 @@ impl client::Handler for RusshEventHandler {
     ) -> Result<bool, Self::Error> {
         let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.event_tx.send(TransportEvent::HostKey(fp, reply_tx)).await.ok();
+        let event = match &self.jump_identity {
+            Some((host, port)) => TransportEvent::JumpHostKey {
+                host: host.clone(),
+                port: *port,
+                fingerprint: fp,
+                reply: reply_tx,
+            },
+            None => TransportEvent::HostKey(fp, reply_tx),
+        };
+        self.event_tx.send(event).await.ok();
         Ok(reply_rx.await.unwrap_or(false))
     }
 
@@ -514,7 +538,7 @@ pub(crate) async fn connect_via_jump_or_direct(
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
     info!("ssh(jump): TCP connecting to {}", jump_addr);
-    let jump_handler = RusshEventHandler::new(event_tx.clone());
+    let jump_handler = RusshEventHandler::for_jump_host(event_tx.clone(), &jump.host, jump.port);
     let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), jump_handler)
         .await
         .map_err(|e| format!("jump host TCP connect to {jump_addr} failed: {e}"))?;
