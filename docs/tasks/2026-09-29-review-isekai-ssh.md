@@ -18,7 +18,7 @@
 - [x] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
   - 要約: Windows holder は SSH handle がどう死んでも `Ok(0)` を返し、recovery を飛ばす。根本原因の候補は russh keepalive(60s×3)で、これが isekai-pipe の resume window(既定 864000s)より先に SSH 層を殺す。すると resume 可能だったセッションまで切れ、スリープ復帰後に新しいリモートシェルになる。
   - 方針: native 経路の russh keepalive を無効化し、liveness は isekai-pipe の QUIC/resume 層に一任する(`ssh(1)` 既定の `ServerAliveInterval 0` と同等)。holder の serve 終了時には、SSH handle が閉じたかどうかをログに残す。holder 自身が再接続しても channel は復元できないので、`Ok(0)` 終了(クライアントが OwnerLost → 新 holder)は維持し、その理由を doc に明記する。
-- [ ] **SSH-04** High `isekai-bootstrap/src/russh_backend.rs:270,355-356`
+- [x] **SSH-04** High `isekai-bootstrap/src/russh_backend.rs:270,355-356`
   - 要約: `EncryptedPrivateKey`/`InvalidCertificate` が hard error になり、後続の鍵が試されない。jump hop は最初に読めたファイルが暗号化鍵でもそれを使う。agent fallback もなく、`AuthenticationRequired`(再試行不可)に分類されるため、Windows のサイレント再デプロイが永久に失敗する。
   - 方針: 鍵のパース系エラー(Invalid/Encrypted/InvalidCertificate)はすべて `continue` する。jump hop はパスフレーズなしでデコードできる最初の鍵を選ぶ。target hop は、全 identity 失敗後に Windows の ssh-agent(`IdentityAgent` を尊重)で fallback する。
 - [ ] **SSH-05** High `isekai-ssh/src/native/mux/owner.rs:397-414`
