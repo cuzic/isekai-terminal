@@ -85,10 +85,10 @@
   - 方針: 自動ダウンロード(明示 `--isekai-helper-binary` なし)の失敗は、ネットワーク起因として再試行可能に分類する。
 - [~] **SSH-27** Low `openssh.rs:105`(A13-3)— BatchMode での host key/認証失敗(exit 255)が `JumpHostUnreachable` に誤分類される。
   - 見送り理由: `ssh(1)` の exit 255 は接続失敗と区別できず、区別するには stderr の文字列マッチが必要になる。これは `isekai-bootstrap-plan::classify_bootstrap_error` の「文字列マッチしない」設計原則に反する。誤分類の実害は、RedeployGate/backoff で有界な再試行と文言のずれだけ。
-- [ ] **SSH-28** Low `native/mux/mod.rs:696-709,891-923`(C5-1)
+- [x] **SSH-28** Low `native/mux/mod.rs:696-709,891-923`(C5-1)
   - 要約: spawn lock が対話セッション全体にわたって保持され、10s で stale 扱いされる。削除の TOCTOU で二重 leader になりうる。
   - 方針: 実装時にコードを確認して判断する。
-- [ ] **SSH-29** Low `native/mux/mod.rs:938,976-987`(C5-2)
+- [x] **SSH-29** Low `native/mux/mod.rs:938,976-987`(C5-2)
   - 要約: token 書き込みが非 atomic で、async 内で `std::thread::sleep` している。
   - 方針: tmp+rename にし、`tokio::time::sleep` に変える。
 - [ ] **SSH-30** Low `owner.rs:357-382`, `ctl_forward.rs:72-73`(C5-3)
