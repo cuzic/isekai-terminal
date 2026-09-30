@@ -100,7 +100,7 @@
 - [ ] **SSH-32** Low `mux/mod.rs:576-579`, `holder.rs:151`, `console.rs:604-615`(C5-5)
   - 要約: 平文秘密鍵と passphrase が zeroize されない。
   - 方針: `Zeroizing` で包む。
-- [ ] **SSH-33** Low `owner.rs:614`, `client.rs:278,421`(C5-6)
+- [x] **SSH-33** Low `owner.rs:614`, `client.rs:278,421`(C5-6)
   - 要約: 予期しないフレームを `{other:?}` で丸ごとログに出すため、Stdin/token が漏れうる。
   - 方針: フレーム種別名だけをログに出す。
 - [ ] **SSH-34** Low `mux/mod.rs:537 vs 604`(C5-7)
