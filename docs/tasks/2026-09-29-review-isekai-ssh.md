@@ -116,7 +116,7 @@
   - 要約: resize watcher スレッドが attempt ごとにリークする。
   - 方針: 実装時に確認する。
 - [-] **SSH-38** Low `cli.rs:417`(D3 前半)— token endpoint の https 強制。`isekai-auth` の refresh 経路と一体の設計なので **transport 担当に委譲**。early-refresh 窓の失敗(`file_provider.rs`)も委譲。
-- [ ] **SSH-39** Low `helper_download.rs:247,107`(D4)
+- [x] **SSH-39** Low `helper_download.rs:247,107`(D4)
   - 要約: キャッシュが `/tmp/isekai-ssh-helpers` に fallback し、所有者/権限を確認していない。キャッシュ済みバイトも再検証しない。
   - 方針: fallback を uid 付きディレクトリにし、0700 と所有者を確認する。キャッシュ書き込み時の sha256 を sidecar に保存し、読み出し時に照合する。
 - [x] **SSH-40** Low `helper_download.rs:415-429`(D5)
