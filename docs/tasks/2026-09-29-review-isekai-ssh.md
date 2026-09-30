@@ -112,7 +112,7 @@
 - [x] **SSH-36** Low `escape.rs:40-43,61-69`(C5-9)
   - 要約: `~`+Enter で改行が落ち、`~.` の後の同一 read バイトが送信される。
   - 方針: エスケープ状態機械を修正し、テストを追加する。
-- [ ] **SSH-37** Low `console.rs:391-403`(C5-10)
+- [x] **SSH-37** Low `console.rs:391-403`(C5-10)
   - 要約: resize watcher スレッドが attempt ごとにリークする。
   - 方針: 実装時に確認する。
 - [-] **SSH-38** Low `cli.rs:417`(D3 前半)— token endpoint の https 強制。`isekai-auth` の refresh 経路と一体の設計なので **transport 担当に委譲**。early-refresh 窓の失敗(`file_provider.rs`)も委譲。
