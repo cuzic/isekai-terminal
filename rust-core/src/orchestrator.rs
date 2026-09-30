@@ -212,6 +212,26 @@ enum LastConnectAttempt {
 }
 
 impl LastConnectAttempt {
+    /// 自動再接続・フォアグラウンド復帰で使い回すために保存する形。
+    ///
+    /// RC-24(2026-09-29 コードレビュー): マルチパスの`wifi_fd`/`cellular_fd`はKotlinから
+    /// 所有権を1回限り受け取る生fdで、最初の接続試行がcloseする。以前はそのままの値を
+    /// 保存して再接続にも渡していたため、既にcloseされた(あるいは別のファイルに
+    /// 再利用された)fd番号を再びソケットとして開き、drop時に無関係なfdをcloseし得た
+    /// (Androidではfdsanによるabortの原因になる)。再接続では物理pathを使わない
+    /// (日和見的ポリシー: 使えない物理pathは黙って外す)。
+    fn for_reuse(&self) -> LastConnectAttempt {
+        match self {
+            LastConnectAttempt::MultipathIsekaiPipeQuic(config) => {
+                let mut config = config.clone();
+                config.wifi_fd = None;
+                config.cellular_fd = None;
+                LastConnectAttempt::MultipathIsekaiPipeQuic(config)
+            }
+            other => other.clone(),
+        }
+    }
+
     fn host_port_is_quic(&self) -> (String, u16, bool) {
         match self {
             Self::Ssh(c) => (c.host.clone(), c.port, false),
@@ -1400,7 +1420,7 @@ impl SessionOrchestrator {
             // `last_connect_attempt`が担う。以前は呼び出し側が別途
             // `last_connect_attempt`を書いており、このロックを一度解放した後に
             // 書かれるまでの間だけ両者が食い違って見え得た(SSOT違反)。
-            s.last_connect_attempt = Some(attempt);
+            s.last_connect_attempt = Some(attempt.for_reuse());
             s.phase = ConnPhase::Connecting;
             // 新しい手動接続が始まった以上、直前のdisconnect()由来のフラグや
             // 実行中だったかもしれない自動再接続ループは無関係になる。
