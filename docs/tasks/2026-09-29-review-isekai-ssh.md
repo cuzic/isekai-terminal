@@ -56,7 +56,7 @@
   - 要約: 大量ペーストと echo 出力の双方向で相互デッドロックしうる。
   - 方針: owner 側の client 向け writer を専用タスク+有界キューに分離し、relay loop が client への書き込みでブロックしないようにする(詳細は実装時に判断)。
 - [-] **SSH-17** Medium `native/mux/*` — 他ユーザーによる holder named pipe の成りすまし(サーバープロセス SID 検証・HMAC)。**transport 担当に委譲**(named pipe 所有者/SID の指摘は重複)。
-- [ ] **SSH-18** Medium `helper_download.rs:402,440`(D1 前半)
+- [x] **SSH-18** Medium `helper_download.rs:402,440`(D1 前半)
   - 要約: helper ダウンロードの HTTP に timeout がない。
   - 方針: ureq Agent に global/connect timeout を設定する。`isekai-auth/src/oauth.rs` 側は **transport 担当に委譲**。
 - [-] **SSH-19** Medium `isekai-auth/src/file_provider.rs:370-402`(D2)— token refresh にプロセス間 lock がない。**transport 担当に委譲**。

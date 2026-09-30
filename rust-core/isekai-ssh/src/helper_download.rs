@@ -68,6 +68,26 @@ use crate::native::bootstrap_backend::NativeBootstrapBackend;
 /// magnitude under that.
 const DEFAULT_FRESHNESS_TTL_SECS: u64 = 5 * 60;
 
+/// Connect timeout for every release-download HTTP request.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-request ceiling for every release-download HTTP request — generous
+/// enough for a tens-of-MB `isekai-pipe` asset over a slow link, but finite.
+const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The `ureq` agent every request in this module uses. ureq 3's defaults
+/// have **no** timeout at all (review 2026-09-29, SSH-18): a stalled GitHub
+/// connection hung the whole (possibly silent, background) re-bootstrap
+/// forever, so it never reached the retry/backoff logic
+/// `.claude/rules/always-connects.md` relies on.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+        .timeout_global(Some(HTTP_GLOBAL_TIMEOUT))
+        .build()
+        .into()
+}
+
 fn freshness_ttl() -> Duration {
     std::env::var("ISEKAI_SSH_HELPER_CACHE_TTL_SECS")
         .ok()
@@ -399,7 +419,7 @@ fn revalidate_and_cache(
         return download_and_cache(cache_dir, source, asset_name, base_url);
     }
 
-    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let agent = http_agent();
     if cache_existed {
         let latest_tag = fetch_latest_tag(&agent, api_base_url, &source.repo)?;
         let tag_path = cached_tag_path(&path);
@@ -437,7 +457,7 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
     let path = cache_path(cache_dir, source, asset_name);
     let previously_cached = std::fs::read(&path).ok();
 
-    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let agent = http_agent();
     let mut response = agent
         .get(&url)
         .call()
