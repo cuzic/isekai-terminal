@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -37,6 +39,7 @@ import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.RebindFdSource
 import tools.isekai.terminal.session.TerminalSession
+import tools.isekai.terminal.session.TrzszUploadPump
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
@@ -414,8 +417,13 @@ class TerminalTabsViewModel(
      * `@isekai_ctl_sock`が永久に正しいウィンドウへ届かなくなる二次被害があった)。
      * `putIfAbsent`でコルーチン起動前に同期的に「予約」し、RPCが失敗した場合のみ
      * 解放して別タブに再挑戦の機会を残す。
+     *
+     * AND-M5: 以前はprofileIdだけのSetだったため、予約したタブ自身が(手動でもRust自動でも)
+     * 再接続した際にも「既に予約済み」としてスキップされ、新しいSSHセッション上で
+     * tmuxウィンドウへの再attach・通知フック・ctl-socket登録が行われなかった。
+     * 「profileId→予約した(所有)tabId」のマップにし、所有タブ自身の再接続は通す。
      */
-    private val tmuxClaimedProfileIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    private val tmuxClaimedProfileOwners = java.util.concurrent.ConcurrentHashMap<Long, String>()
 
     private val _activeTabId = MutableStateFlow<String?>(null)
     val activeTabId: StateFlow<String?> = _activeTabId.asStateFlow()
@@ -662,13 +670,8 @@ class TerminalTabsViewModel(
         val tab = _tabs.value.find { it.tabId == tabId } ?: return
         RemoteLogger.i("IsekaiTerminalTabsVM", "closeTab id=$tabId")
         tab.panes.forEach { pane -> closePaneSession(pane) }
-        // このタブがtmux連携を保有していた場合は解放する。他タブが同じプロファイルを
-        // 参照し続けている場合に誤って解放してしまわないよう、profile自体が閉じられて
-        // いる(このタブが最後の1枚だった)場合のみ解放する。
-        tab.profile?.let { profile ->
-            val remainingForProfile = _tabs.value.any { it.tabId != tabId && it.profile?.id == profile.id }
-            if (!remainingForProfile) tmuxClaimedProfileIds.remove(profile.id)
-        }
+        // このタブがtmux連携を所有していた場合だけ解放する(他タブの予約は触らない)。
+        tab.profile?.let { profile -> tmuxClaimedProfileOwners.remove(profile.id, tabId) }
 
         _tabs.update { list -> list.filterNot { it.tabId == tabId } }
         if (_activeTabId.value == tabId) {
@@ -811,24 +814,48 @@ class TerminalTabsViewModel(
     }
 
     private suspend fun observeSummary(pane: PaneState) {
-        pane.session.state.collect { updateSessionsSummary() }
+        // AND-H4: `state`全体は`ScreenUpdate`(=端末の描画フレーム)ごとに変わるため、
+        // そのままcollectすると描画フレームごとにFGS通知を再post(メインスレッドの
+        // Binder IPC + 通知レート制限で本当に必要な更新まで捨てられうる)していた。
+        // 集約通知に効くのは接続有無だけなので、その変化時だけ再計算する。
+        pane.session.state.map { it.connected }.distinctUntilChanged().collect { updateSessionsSummary() }
     }
 
     private suspend fun observeDownloads(pane: PaneState) {
         pane.session.pendingDownloadFile.collect { pending ->
             pending ?: return@collect
-            executor.saveDownloadFile(pending.first, pending.second)
+            // AND-M6: 保存失敗(容量不足等のIOException、MediaStoreのSecurityException等)は
+            // viewModelScope上で未捕捉だとプロセスごと落ちるため、ログに落として続行する。
+            try {
+                executor.saveDownloadFile(pending.first, pending.second)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                RemoteLogger.e("IsekaiTerminalDownload", "failed to save download '${pending.first}': ${e.message}", e)
+            }
             pane.session.consumeDownloadFile()
         }
     }
 
     private suspend fun observeConnectionTransitions(tab: TabState, pane: PaneState) {
         var prevConnected = false
+        var prevAlive = false
         pane.uiState.collect { state ->
             val connected = state.connected
+            // AND-H2a: Rustの`Reconnecting`は`connected=false`に畳み込まれる
+            // ([tools.isekai.terminal.session.ConnectionStateMapper])。Rustが自動再接続
+            // ループを回している間にKotlinが「切断された」と判断して物理マルチパスの
+            // NetworkRequest・upstream監視を畳むと、Reconnecting→Connected(Rust自動再接続)の
+            // 後にそれらが二度と復活しなかった。リソースの解放は「論理セッションが終わった」
+            // (=接続済みでも再接続中でもない)立ち下がりに限定する。
+            // 本来はRust側から「論理セッション終了」「transport再確立」を区別したイベントを
+            // 受けて判断すべき(AND-H2b、Rust側新API要)。
+            val alive = connected || state.isReconnecting
             if (connected && !prevConnected) {
                 executor.notifyConnected(state.currentHost ?: "")
-                if (pane.upstreamFailoverEnabledForCurrentSession) {
+                // 接続試行ごとにprofileから導出済みのフラグ([ConnectionCoordinator.connectPane])を
+                // 見て、まだ監視が無い場合だけ登録する(Rust自動再接続後の再Connectedでも復活する)。
+                if (pane.upstreamFailoverEnabledForCurrentSession && pane.upstreamFailoverMonitorHandle == null) {
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
@@ -852,19 +879,21 @@ class TerminalTabsViewModel(
                 tab.profile?.let { persistReattachRecord(tab.tabId, it) }
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
-                pane.physicalMultipathHandle?.close()
-                pane.physicalMultipathHandle = null
-                pane.upstreamFailoverMonitorHandle?.close()
-                pane.upstreamFailoverMonitorHandle = null
-                pane.upstreamFailoverEnabledForCurrentSession = false
-                // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
+                // タスク#60: 切断中/再接続中は古い`tmux:N`ラベルを表示し続けない(再接続後の
                 // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
-                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
+                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。UI表示のみ。
                 if (pane.paneId == tab.primaryPane.paneId) {
                     tab.tmuxWindowLabel.value = null
                 }
             }
+            if (!alive && prevAlive) {
+                pane.physicalMultipathHandle?.close()
+                pane.physicalMultipathHandle = null
+                pane.upstreamFailoverMonitorHandle?.close()
+                pane.upstreamFailoverMonitorHandle = null
+            }
             prevConnected = connected
+            prevAlive = alive
         }
     }
 
@@ -1043,7 +1072,7 @@ class TerminalTabsViewModel(
      *
      * この判定だけではTOCTOUレースが残る(`tmuxWindowLabel`は非同期RPCが完了する
      * まで書かれないため、同一プロファイルの2タブがほぼ同時に`connected`へ遷移
-     * すると両方この判定をすり抜ける、実機検証2026-07-27)。[tmuxClaimedProfileIds]
+     * すると両方この判定をすり抜ける、実機検証2026-07-27)。[tmuxClaimedProfileOwners]
      * への同期的な`add`(コルーチン起動前)で実際に排他する。
      */
     private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
@@ -1056,7 +1085,8 @@ class TerminalTabsViewModel(
             )
             return
         }
-        if (!tmuxClaimedProfileIds.add(profile.id)) {
+        val owner = tmuxClaimedProfileOwners.putIfAbsent(profile.id, tab.tabId)
+        if (owner != null && owner != tab.tabId) {
             RemoteLogger.i(
                 "IsekaiTerminalTmux",
                 "ensureTmuxTabWindow[${tab.tabId}]: skipped, another tab already claimed profile ${profile.id}",
@@ -1077,7 +1107,7 @@ class TerminalTabsViewModel(
                         "window=${info.windowIndex} tag=${info.tag} isNew=${info.isNewWindow}",
                 )
             } catch (e: Exception) {
-                tmuxClaimedProfileIds.remove(profile.id)
+                tmuxClaimedProfileOwners.remove(profile.id, tab.tabId)
                 RemoteLogger.w("IsekaiTerminalTmux", "ensureTmuxTabWindow failed (non-fatal): ${e.message}")
             }
         }
@@ -1116,18 +1146,18 @@ class TerminalTabsViewModel(
             try {
                 val file = executor.openUploadFile(uri) ?: return@launch
                 pane.session.trzszAcceptUpload(file.name, file.size.toULong(), 0u)
-                file.stream.use { inp ->
-                    val buf = ByteArray(64 * 1024)
-                    var pending: ByteArray? = null
-                    while (true) {
-                        val n = inp.read(buf)
-                        if (n == -1) {
-                            pane.session.trzszSendChunk(pending ?: ByteArray(0), true)
-                            break
-                        }
-                        pending?.let { pane.session.trzszSendChunk(it, false) }
-                        pending = buf.copyOf(n)
-                    }
+                // AND-M1a: ack済みバイト数(Rust報告)に対する先行送信量を制限し、転送が
+                // 終了/キャンセルされたら読み出しを止める([TrzszUploadPump]参照)。
+                val result = file.stream.use { inp ->
+                    TrzszUploadPump.pump(
+                        input = inp,
+                        trzszState = pane.session.state.map { it.trzszState },
+                        sendChunk = { data, isLast -> pane.session.trzszSendChunk(data, isLast) },
+                    )
+                }
+                if (result == TrzszUploadPump.Result.TIMED_OUT) {
+                    RemoteLogger.w("TrzszUpload", "no ack progress, cancelling upload")
+                    pane.session.trzszCancel()
                 }
             } catch (e: Exception) {
                 RemoteLogger.e("TrzszUpload", "exception: $e")

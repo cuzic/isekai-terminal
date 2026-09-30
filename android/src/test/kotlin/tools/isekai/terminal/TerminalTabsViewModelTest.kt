@@ -507,6 +507,49 @@ class TerminalTabsViewModelTest {
         assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
     }
 
+    /** AND-H2a: Rustの自動再接続(Reconnecting→Connected)中はupstream監視・物理マルチパスの
+     *  handleを畳まず、再Connected後もupstream監視が生きている。論理セッションが終わった
+     *  (Disconnected)時点で初めて解放する。 */
+    @Test
+    fun rustAutoReconnect_keepsUpstreamMonitorAndPhysicalMultipathUntilSessionEnds() = runBlocking {
+        val id = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+        assertFalse("再接続中はupstream監視を畳まない", executor.upstreamFailoverHandles[0].closed)
+        assertFalse("再接続中は物理マルチパスのNetworkRequestを畳まない", executor.physicalMultipathHandles[0].closed)
+
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
+        assertEquals("再Connectedで監視を二重登録しない", 1, executor.upstreamFailoverHandles.size)
+        assertFalse(executor.upstreamFailoverHandles[0].closed)
+
+        orchestrators[0].simulateDisconnected("bye")
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.connected) delay(10) }
+        assertTrue(executor.upstreamFailoverHandles[0].closed)
+        assertTrue(executor.physicalMultipathHandles[0].closed)
+    }
+
+    /** AND-H2a: 再接続ループが最終的に諦めた(Reconnecting→Disconnected)場合も解放する。 */
+    @Test
+    fun rustAutoReconnect_givingUp_releasesHandles() = runBlocking {
+        val id = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+
+        orchestrators[0].simulateDisconnected("gave up")
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+
+        assertTrue(executor.upstreamFailoverHandles[0].closed)
+        assertTrue(executor.physicalMultipathHandles[0].closed)
+    }
+
     /** クラッシュ観点レビュー(2026-07-31): `ConnectivityManager`コールバックスレッドから
      *  同期的に呼ばれる`notifyUpstreamHealthDegraded`が(本番の生成バインディングが実際
      *  投げ得る)`InternalException`を投げても、`TerminalTabsViewModel.forwardToRust`が
@@ -607,6 +650,28 @@ class TerminalTabsViewModelTest {
         assertFalse(orchestrators[0].connectCalled)
     }
 
+    /** AND-H3: relay JWTの復号失敗は接続コルーチンから漏れてアプリをクラッシュさせず、
+     *  このペインの接続前エラーとして表示される。例外経路でも復号済み秘密鍵PEMは消去される。 */
+    @Test
+    fun connectTab_relayJwtDecryptFails_showsErrorWithoutCrashAndWipesKey() = runBlocking {
+        val pem = byteArrayOf(1, 2, 3, 4)
+        executor.keyPem = pem
+        executor.decryptRelayJwtError = IllegalStateException("keystore entry missing")
+        val p = keyProfile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_LINK_RELAY_QUIC.name,
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "ciphertext",
+        )
+        val id = vm.openTab(p)
+
+        withTimeout(3000) { while (tab(id).primaryPane.preConnectError.value == null) delay(10) }
+
+        assertTrue(tab(id).primaryPane.preConnectError.value!!.contains("keystore entry missing"))
+        assertFalse(orchestrators[0].connectIsekaiLinkRelayCalled)
+        assertTrue("例外経路でも復号済みPEMをゼロ化する", pem.all { it == 0.toByte() })
+    }
+
     @Test
     fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
         val id = vm.openTab(multipathProfile("a"), "pass")
@@ -654,6 +719,41 @@ class TerminalTabsViewModelTest {
             0u, 80u, 24u, emptyList(), 0u, 0u, null, null, null, null, applicationCursorMode, false, false,
             MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(),
             emptyList(), kittyKeyboardFlags, null)
+
+    /** AND-M6: ダウンロード保存の例外(容量不足等)でアプリがクラッシュせず、保留中の
+     *  ダウンロードは消費される(同じファイルの保存を無限に再試行しない)。 */
+    @Test
+    fun downloadSaveFailure_doesNotCrashAndConsumesPendingFile() = runBlocking {
+        executor.saveDownloadError = java.io.IOException("No space left on device")
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+
+        orchestrators[0].simulateDownloadComplete("big.bin", byteArrayOf(1, 2, 3))
+
+        withTimeout(3000) { while (tab(id).primaryPane.session.pendingDownloadFile.value != null) delay(10) }
+        assertEquals(1, executor.saveDownloadCallCount)
+    }
+
+    /** AND-H4: 端末の描画フレーム(ScreenUpdate)ごとにFGS通知の集約を再計算・再postしない。 */
+    @Test
+    fun screenUpdates_doNotRepostSessionsSummaryPerFrame() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (executor.lastSessionsSummary != (1 to 1)) delay(10) }
+        val before = executor.sessionsSummaryCallCount
+
+        for (i in 1..20) {
+            orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false, kittyKeyboardFlags = i.toUShort()))
+            withTimeout(3000) {
+                while (tab(id).primaryPane.session.state.value.screenUpdate?.kittyKeyboardFlags != i.toUShort()) delay(5)
+            }
+        }
+
+        assertEquals(before, executor.sessionsSummaryCallCount)
+    }
 
     @Test
     fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {
@@ -946,6 +1046,46 @@ class TerminalTabsViewModelTest {
             "fake-tag",
             Repositories.tmuxTabLocators.findTagForProfile(p.id),
         )
+    }
+
+    /** AND-M5: tmux連携を予約した(所有する)タブ自身が再接続(Rust自動再接続を含む)した場合は、
+     *  新しいSSHセッション上で改めてensureTmuxTabWindowを呼ぶ(ウィンドウ再attach・通知フック
+     *  再インストール)。以前はprofileId単位の予約に自分自身がブロックされていた。 */
+    @Test
+    fun maybeEnsureTmuxTabWindow_sameTabReconnects_callsEnsureAgain() = runBlocking {
+        val p = savedProfile("web")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value == null) delay(10) }
+
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value != null) delay(10) }
+        orchestrators[0].simulateConnected()
+
+        withTimeout(3000) { while (orchestrators[0].ensureTmuxTabWindowCalls.size < 2) delay(10) }
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value == null) delay(10) }
+        assertEquals(2, orchestrators[0].ensureTmuxTabWindowCalls.size)
+    }
+
+    /** AND-M5: 所有タブを閉じたら予約を解放し、同じプロファイルの別タブが次の接続で
+     *  tmux連携できる。 */
+    @Test
+    fun maybeEnsureTmuxTabWindow_ownerTabClosed_releasesClaimForNewTab() = runBlocking {
+        val p = savedProfile("web")
+        val idA = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        withTimeout(3000) { while (tab(idA).tmuxWindowLabel.value == null) delay(10) }
+
+        vm.closeTab(idA)
+        vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected()
+
+        awaitEnsureTmuxTabWindowCalled(orchestrators[1])
     }
 
     @Test

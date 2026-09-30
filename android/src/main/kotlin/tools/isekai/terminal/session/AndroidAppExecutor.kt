@@ -55,7 +55,14 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     }
 
     override fun ensureServiceRunning() {
-        app.startService(Intent(app, TerminalSessionService::class.java))
+        try {
+            app.startService(Intent(app, TerminalSessionService::class.java))
+        } catch (e: IllegalStateException) {
+            // AND-L7: バックグラウンドからの`startService`はAndroid O+で
+            // IllegalStateException(バックグラウンド起動制限)になりうる。接続自体は
+            // 続行できるため、ログだけ残して握り潰す(bindは下で試みる)。
+            RemoteLogger.w("IsekaiTerminalVM", "startService failed (background start restricted?)", e)
+        }
         if (!isServiceBound) {
             isServiceBound = app.bindService(
                 Intent(app, TerminalSessionService::class.java),
@@ -75,6 +82,10 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
 
     override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         terminalService?.updateSessionsSummary(connectedCount, totalCount)
+        // AND-M2: 最後のタブが閉じられたらbindも解除する。BIND_AUTO_CREATEでbindした
+        // ままだと、サービス側で`stopSelf()`してもbound serviceとして生き残り破棄されない。
+        // 次に[ensureServiceRunning]が呼ばれれば改めてbindし直す。
+        if (totalCount <= 0) release()
     }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
@@ -180,6 +191,9 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
             try { app.unbindService(serviceConnection) } catch (_: Exception) {}
             isServiceBound = false
         }
+        // 自発的なunbindでは`onServiceDisconnected`が呼ばれないため、ここで参照を捨てる
+        // (再bindされるまでの通知更新は無視される)。
+        terminalService = null
     }
 
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {
@@ -192,11 +206,19 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
                 }
                 val resolver = app.contentResolver
                 val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                uri?.let {
-                    resolver.openOutputStream(it)?.use { out -> out.write(data) }
+                    ?: throw java.io.IOException("MediaStore insert failed for '$safeName'")
+                try {
+                    val out = resolver.openOutputStream(uri)
+                        ?: throw java.io.IOException("cannot open output stream for $uri")
+                    out.use { it.write(data) }
                     values.clear()
                     values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(it, values, null, null)
+                    resolver.update(uri, values, null, null)
+                } catch (e: Exception) {
+                    // AND-M6: 書き込み途中で失敗した場合、IS_PENDING=1の中途半端な行を
+                    // MediaStoreに残さない。
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw e
                 }
             } else {
                 val dir = Environment.getExternalStoragePublicDirectory(

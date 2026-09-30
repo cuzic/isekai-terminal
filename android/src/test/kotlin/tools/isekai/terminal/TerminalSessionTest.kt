@@ -96,7 +96,7 @@ class TerminalSessionTest {
 
     @Test
     fun initialState_logEmpty() {
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 接続 ──────────────────────────────────────────────────────
@@ -287,8 +287,28 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateData("hello ".toByteArray())
         fakeOrchestrator.simulateData("world".toByteArray())
 
-        withTimeout(3000) { session.log.first { it.contains("world") } }
-        assertEquals("hello world", session.log.value)
+        assertEquals("hello world", session.logSnapshot())
+    }
+
+    /** AND-L8: チャンク境界でUTF-8のマルチバイト文字が分断されても化けない。 */
+    @Test
+    fun onData_multibyteCharSplitAcrossChunks_isDecodedIntact() {
+        val bytes = "あいう".toByteArray(Charsets.UTF_8) // 9バイト
+        fakeOrchestrator.simulateData(bytes.copyOfRange(0, 2))
+        fakeOrchestrator.simulateData(bytes.copyOfRange(2, 7))
+        fakeOrchestrator.simulateData(bytes.copyOfRange(7, 9))
+        assertEquals("あいう", session.logSnapshot())
+    }
+
+    /** AND-L8: 上限を超えたら直近分だけを保持する。 */
+    @Test
+    fun onData_exceedingLimit_keepsMostRecentTail() {
+        val chunk = "x".repeat(50_000).toByteArray()
+        repeat(4) { fakeOrchestrator.simulateData(chunk) }
+        fakeOrchestrator.simulateData("END".toByteArray())
+        val log = session.logSnapshot()
+        assertTrue(log.length <= 200_000)
+        assertTrue(log.endsWith("END"))
     }
 
     @Test
@@ -297,10 +317,10 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
         fakeOrchestrator.simulateData("hello".toByteArray())
-        withTimeout(3000) { session.log.first { it.isNotEmpty() } }
+        assertEquals("hello", session.logSnapshot())
 
         session.clearLog()
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 送信 ──────────────────────────────────────────────────────
@@ -384,6 +404,65 @@ class TerminalSessionTest {
         assertFalse(withTimeout(3000) { resultDeferred.await() })
     }
 
+    /** AND-L2: 署名要求が同時に届いた場合、応答不能になった先行分は即座に拒否し、
+     *  後続分の保留・表示は先行分の後始末で消えない(後続は正しく承認できる)。 */
+    @Test
+    fun onAgentSignRequest_concurrentRequests_secondRemainsApprovable() = runBlocking {
+        session.connect(testConfig())
+        val first = async(Dispatchers.IO) { fakeOrchestrator.simulateAgentSignRequest("SHA256:first") }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:first" } }
+        val second = async(Dispatchers.IO) { fakeOrchestrator.simulateAgentSignRequest("SHA256:second") }
+
+        assertFalse("先行分は応答不能になるため即座に拒否される", withTimeout(3000) { first.await() })
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:second" } }
+
+        session.respondAgentSignRequest(true)
+
+        assertTrue(withTimeout(3000) { second.await() })
+        assertNull(session.state.value.agentSignRequestFingerprint)
+    }
+
+    /** AND-L6: 「信頼」直後の再接続のhost key checkは、信頼の書き込み完了後に行われる。 */
+    @Test
+    fun onHostKey_afterTrustNewHostKey_waitsForTrustWriteBeforeChecking() = runBlocking {
+        val writeStarted = java.util.concurrent.CountDownLatch(1)
+        val releaseWrite = java.util.concurrent.CountDownLatch(1)
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val trusted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val checker = object : tools.isekai.terminal.session.HostKeyChecker {
+            override fun check(host: String, port: Int, fingerprint: String): HostKeyDecision {
+                events += "check"
+                return if (trusted.get()) {
+                    HostKeyDecision.Trust(isNew = false)
+                } else {
+                    HostKeyDecision.Unconfirmed(NewHostKeyPrompt(host, port, fingerprint))
+                }
+            }
+            override fun trustUpdated(host: String, port: Int, fingerprint: String) {
+                writeStarted.countDown()
+                releaseWrite.await()
+                trusted.set(true)
+                events += "trust"
+            }
+        }
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(checker, orchestratorFactory = { cb -> orch.also { it.callback = cb } })
+        s.connect(testConfig())
+        assertFalse(orch.simulateHostKey(fingerprint = "SHA256:new"))
+        withTimeout(3000) { s.state.first { it.newHostKeyPrompt != null } }
+        events.clear()
+
+        s.trustNewHostKey()
+        assertTrue(writeStarted.await(3, java.util.concurrent.TimeUnit.SECONDS))
+        val check = async(Dispatchers.IO) { orch.simulateHostKey(fingerprint = "SHA256:new") }
+        delay(100)
+        releaseWrite.countDown()
+
+        assertTrue("書き込み完了後のcheckなので信頼済みとして通る", withTimeout(3000) { check.await() })
+        assertEquals(listOf("trust", "check"), events.toList())
+        s.close()
+    }
+
     @Test
     fun respondAgentSignRequest_withoutPendingRequest_isNoop() {
         // 保留中の要求が無い状態で呼んでも何も起きない（二重応答やタイミングずれのガード）。
@@ -442,6 +521,39 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
+    }
+
+    /** AND-M8a: Rustの状態callback(Connected)より先に画面callbackが届いても(別スレッドで
+     *  到着順が保証されない)、接続中の初回フレームを捨てない。 */
+    @Test
+    fun onScreenUpdate_arrivingBeforeConnectedCallback_isNotDropped() = runBlocking {
+        session.connect(testConfig())
+        assertTrue(session.state.value.isConnecting)
+
+        val update = ScreenUpdate(0u, 80u, 24u, emptyList(), 0u, 0u, "first-frame", null, null, null, false, false, false, MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(), emptyList(), 0u, null)
+        fakeOrchestrator.simulateScreenUpdate(update)
+        fakeOrchestrator.simulateConnected()
+
+        val s = awaitState { it.connected && it.screenUpdate != null }
+        assertEquals(update, s.screenUpdate)
+    }
+
+    /** AND-M8a: 再接続中の切断操作は、Rustへ再接続ループの中止も転送し、
+     *  「切断済み」かつReconnectingという不整合な表示にしない。 */
+    @Test
+    fun disconnect_duringReconnecting_forwardsCancelAndClearsReconnecting() = runBlocking {
+        session.connect(testConfig())
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        fakeOrchestrator.simulateReconnecting()
+        awaitState { it.isReconnecting }
+
+        session.disconnect()
+
+        assertTrue(fakeOrchestrator.cancelReconnectCalled)
+        assertTrue(fakeOrchestrator.disconnectCalled)
+        assertFalse(session.state.value.isReconnecting)
+        assertEquals("切断済み", session.state.value.statusMsg)
     }
 
     @Test
@@ -800,6 +912,49 @@ class TerminalSessionTest {
     @Test
     fun close_whenIdle_doesNotThrow() {
         session.close()
+    }
+
+    /** AND-H1: close()はUniFFIオブジェクト自体を解放(AutoCloseable.close=destroy)し、
+     *  callback↔Rust Arcの循環を断つ。二重closeでも1回しか解放しない。 */
+    @Test
+    fun close_releasesNativeOrchestratorExactlyOnce() {
+        session.close()
+        session.close()
+        assertEquals(1, fakeOrchestrator.closeCallCount)
+    }
+
+    /** AND-H1: close後にUIから遅れて届いた操作は、destroy済みハンドルに当たって
+     *  IllegalStateExceptionでクラッシュせず無音で無視される。 */
+    @Test
+    fun operationsAfterClose_areSilentlyIgnored() {
+        session.close()
+        session.send("late".toByteArray())
+        session.resize(80u, 24u)
+        session.disconnect()
+        assertTrue(fakeOrchestrator.sentBytes.isEmpty())
+        assertNull(session.scrollbackCells(0, 10))
+    }
+
+    /** AND-H1: close時に確認待ちのagent署名要求があれば、Rustスレッドを25秒ブロックし
+     *  続けずに即座に拒否で返す。 */
+    @Test
+    fun close_withPendingAgentSignRequest_deniesImmediately() = runBlocking {
+        session.connect(testConfig())
+        val resultDeferred = async(Dispatchers.IO) {
+            fakeOrchestrator.simulateAgentSignRequest("SHA256:pending")
+        }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:pending" } }
+
+        session.close()
+
+        assertFalse(withTimeout(3000) { resultDeferred.await() })
+    }
+
+    /** AND-H1: close済みのペインへ届いた署名要求は待たずに拒否する。 */
+    @Test
+    fun agentSignRequest_afterClose_isDeniedWithoutBlocking() {
+        session.close()
+        assertFalse(fakeOrchestrator.simulateAgentSignRequest("SHA256:late"))
     }
 
     // ── ViewModel 相当カバレッジ（JVM で検証）────────────────────────

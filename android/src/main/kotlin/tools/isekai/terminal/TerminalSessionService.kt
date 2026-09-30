@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import tools.isekai.terminal.util.RemoteLogger
 
 /**
  * ターミナルセッションを保持する Foreground Service。
@@ -24,6 +25,8 @@ class TerminalSessionService : Service() {
 
     private val binder = SessionBinder()
     private var sessionLabel: String = "接続なし"
+    /** 現在[sessionLabel]の通知が表示中か(stopForeground後は再postが必要)。 */
+    private var isNotificationPosted = false
 
     fun notifyConnected(host: String) {
         updateNotification("接続中: $host")
@@ -40,6 +43,12 @@ class TerminalSessionService : Service() {
      */
     fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         if (totalCount <= 0) {
+            // AND-M2: `stopSelf()`だけでは、Activity/ViewModel側がbind(BIND_AUTO_CREATE)
+            // している間サービスは破棄されず、フォアグラウンド状態と最後のラベルの常駐通知が
+            // プロセス終了まで残り続けていた。先にフォアグラウンドを解除して通知を消す
+            // (bind解除は[tools.isekai.terminal.session.AndroidAppExecutor]側が行う)。
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isNotificationPosted = false
             stopSelf()
             return
         }
@@ -76,12 +85,27 @@ class TerminalSessionService : Service() {
             return START_NOT_STICKY
         }
         val label = intent.getStringExtra(EXTRA_SESSION_LABEL) ?: "SSH セッション"
-        startForegroundWithNotification(label)
+        try {
+            startForegroundWithNotification(label)
+        } catch (e: IllegalStateException) {
+            // AND-L7: Android 12+でバックグラウンドから起動された場合の
+            // `ForegroundServiceStartNotAllowedException`(IllegalStateExceptionのサブクラス)等。
+            // 未捕捉だとアプリごとクラッシュするため、前面化を諦めて自分を停止する
+            // (セッション自体はプロセスが生きている限り継続する)。
+            RemoteLogger.w("IsekaiTerminalService", "startForeground failed, stopping service", e)
+            isNotificationPosted = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
     fun updateNotification(label: String) {
+        // AND-H4: 同じ内容の再postは無駄なBinder IPCで、通知のエンキューレート制限
+        // (約5回/秒)に当たると本当に必要な更新まで捨てられうるため抑止する。
+        if (label == sessionLabel && isNotificationPosted) return
         sessionLabel = label
+        isNotificationPosted = true
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(label))
     }
@@ -100,6 +124,8 @@ class TerminalSessionService : Service() {
     // ── 通知 ──────────────────────────────────────────────
 
     private fun startForegroundWithNotification(label: String) {
+        sessionLabel = label
+        isNotificationPosted = true
         val notification = buildNotification(label)
         // Android 14+: foregroundServiceType は Manifest で宣言（specialUse）
         startForeground(NOTIFICATION_ID, notification)

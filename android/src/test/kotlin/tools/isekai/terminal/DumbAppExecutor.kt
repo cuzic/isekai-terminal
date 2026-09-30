@@ -30,7 +30,11 @@ class DumbAppExecutor : AppExecutor {
     override fun notifyConnected(host: String) { connectedHosts.add(host) }
     override fun notifyDisconnected() { disconnectedCount++ }
 
+    /** updateSessionsSummary() の呼び出し回数(AND-H4: フレームごとに呼ばれないことの検証用)。 */
+    var sessionsSummaryCallCount = 0
+
     override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
+        sessionsSummaryCallCount++
         lastSessionsSummary = connectedCount to totalCount
         if (totalCount <= 0) serviceStoppedCount++
     }
@@ -57,10 +61,21 @@ class DumbAppExecutor : AppExecutor {
         keyPemError?.let { throw it }
         return keyPem
     }
-    override fun decryptRelayJwt(ciphertext: String): String = ciphertext
+    /** AND-H3: relay JWT復号失敗(Keystoreエントリ欠落等)を注入する。 */
+    var decryptRelayJwtError: Throwable? = null
+    override fun decryptRelayJwt(ciphertext: String): String {
+        decryptRelayJwtError?.let { throw it }
+        return ciphertext
+    }
     override suspend fun openUploadFile(uri: Uri): UploadFile =
         UploadFile(uri.lastPathSegment ?: "fake", 0L, ByteArrayInputStream(ByteArray(0)))
-    override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}
+    /** AND-M6: 保存失敗(IOException等)を注入する。 */
+    var saveDownloadError: Throwable? = null
+    var saveDownloadCallCount = 0
+    override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {
+        saveDownloadCallCount++
+        saveDownloadError?.let { throw it }
+    }
     override fun release() { released = true }
 
     /** [AppExecutor]が返すhandle/sourceのclose記録用フェイク。テストから`.closed`を検証する。 */
