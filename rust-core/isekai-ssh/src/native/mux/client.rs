@@ -21,6 +21,44 @@ use crate::log_file::log_line;
 
 use super::protocol::{spawn_frame_reader, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
+/// Most encoded frames [`run_inner`] queues for the owner before it stops
+/// reading more local stdin (SSH-16). Only local stdin is throttled by this —
+/// the owner's output keeps being read regardless, which is the whole point.
+const MAX_QUEUED_OUTGOING_FRAMES: usize = 64;
+
+/// A write of one already-encoded frame to the owner connection that
+/// survives across `select!` iterations (so it is never cancelled half-way,
+/// which would desync the stream), handing the writer back when done.
+type InFlightWrite<'a, CW> = std::pin::Pin<Box<dyn std::future::Future<Output = (&'a mut CW, std::io::Result<()>)> + 'a>>;
+
+fn start_write<'a, CW: AsyncWrite + Unpin + 'a>(writer: &'a mut CW, bytes: Vec<u8>) -> InFlightWrite<'a, CW> {
+    Box::pin(async move {
+        let result = write_encoded(&mut *writer, &bytes).await;
+        (writer, result)
+    })
+}
+
+async fn write_encoded<CW: AsyncWrite + Unpin>(writer: &mut CW, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(bytes).await?;
+    writer.flush().await
+}
+
+/// Resolves when the in-flight write (if any) completes; pending forever
+/// when there is none, so its `select!` branch is simply inert.
+async fn finish_in_flight<'a, CW>(in_flight: &mut Option<InFlightWrite<'a, CW>>) -> (&'a mut CW, std::io::Result<()>) {
+    match in_flight {
+        Some(write) => write.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Encodes `frame` exactly as [`write_frame`] would put it on the wire.
+async fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, frame).await?;
+    Ok(bytes)
+}
+
 /// How long to wait for an in-flight build's task to actually observe an
 /// abort signal and kill its child (`ActiveBuild::abort_and_wait`) before
 /// giving up — every call site here runs right before the process exits, so
@@ -302,6 +340,20 @@ where
     let mut buf = [0u8; 8192];
     let mut stdin_open = true;
 
+    // Review 2026-09-29 (SSH-16): every client→owner write goes through this
+    // queue plus a single persistent in-flight write, instead of being
+    // awaited inline in the `select!` handlers. An inline `write_frame` of a
+    // big paste blocked this whole loop — including reading the owner's
+    // frames — whenever the owner wasn't reading; the owner, meanwhile,
+    // could itself be blocked writing that paste's *echo* back to us (its
+    // frame reader backpressures at 16 frames), so neither side ever made
+    // progress again: a silent, permanent hang of the tab. Now the owner's
+    // output is always drained while our writes are pending, and only local
+    // stdin reading pauses (at `MAX_QUEUED_OUTGOING_FRAMES`).
+    let mut outbox: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    let mut idle_writer: Option<&mut CW> = Some(conn_write);
+    let mut in_flight: Option<InFlightWrite<'_, CW>> = None;
+
     // Epic P Phase 2: at most one build in flight per tab (a second
     // `BuildRequest` while one is already running is logged and ignored —
     // see the `Frame::Ctl` arm below). `build_out_tx` is kept alive here for
@@ -311,21 +363,39 @@ where
     let mut active_build: Option<super::build_relay::ActiveBuild> = None;
 
     loop {
+        // Start the next queued write whenever the writer is free.
+        if in_flight.is_none() {
+            if let Some(bytes) = outbox.pop_front() {
+                let writer = idle_writer.take().expect("the writer is idle whenever no write is in flight");
+                in_flight = Some(start_write(writer, bytes));
+            }
+        }
         tokio::select! {
-            n = stdin.read(&mut buf), if stdin_open => {
+            (writer, result) = finish_in_flight(&mut in_flight) => {
+                in_flight = None;
+                idle_writer = Some(writer);
+                if result.is_err() {
+                    abort_active(&mut active_build).await;
+                    return Ok(ClientOutcome::OwnerLost);
+                }
+            }
+            n = stdin.read(&mut buf), if stdin_open && outbox.len() < MAX_QUEUED_OUTGOING_FRAMES => {
                 match n {
                     Ok(0) | Err(_) => {
                         // Local stdin EOF: tell the owner to send channel EOF,
                         // but keep receiving any in-flight remote output.
                         stdin_open = false;
-                        let _ = write_frame(conn_write, &Frame::Shutdown).await;
+                        if let Ok(bytes) = encode_frame(&Frame::Shutdown).await {
+                            outbox.push_back(bytes);
+                        }
                     }
-                    Ok(n) => {
-                        if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
+                    Ok(n) => match encode_frame(&Frame::Stdin(buf[..n].to_vec())).await {
+                        Ok(bytes) => outbox.push_back(bytes),
+                        Err(_) => {
                             abort_active(&mut active_build).await;
                             return Ok(ClientOutcome::OwnerLost);
                         }
-                    }
+                    },
                 }
             }
             // A build task's `BuildOutputChunk`/`BuildFinished` bytes, relayed
@@ -345,9 +415,12 @@ where
                         isekai_protocol::decode_ctl_message(&bytes),
                         Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
                     );
-                    if write_frame(conn_write, &Frame::Ctl(bytes)).await.is_err() {
-                        abort_active(&mut active_build).await;
-                        return Ok(ClientOutcome::OwnerLost);
+                    match encode_frame(&Frame::Ctl(bytes)).await {
+                        Ok(encoded) => outbox.push_back(encoded),
+                        Err(_) => {
+                            abort_active(&mut active_build).await;
+                            return Ok(ClientOutcome::OwnerLost);
+                        }
                     }
                     if is_finished {
                         active_build = None;
@@ -432,9 +505,12 @@ where
             }
             resize = super::super::console::recv_resize(&mut resize_rx) => {
                 if let Some((cols, rows)) = resize {
-                    if write_frame(conn_write, &Frame::Resize { cols: cols as u16, rows: rows as u16 }).await.is_err() {
-                        abort_active(&mut active_build).await;
-                        return Ok(ClientOutcome::OwnerLost);
+                    match encode_frame(&Frame::Resize { cols: cols as u16, rows: rows as u16 }).await {
+                        Ok(encoded) => outbox.push_back(encoded),
+                        Err(_) => {
+                            abort_active(&mut active_build).await;
+                            return Ok(ClientOutcome::OwnerLost);
+                        }
                     }
                 }
             }
@@ -505,6 +581,45 @@ mod tests {
         assert_eq!(outcome.unwrap(), ClientOutcome::Exited(7));
         assert_eq!(stdout, b"out", "Stdout frames must land on local stdout");
         assert_eq!(stderr, b"err", "Stderr frames must land on local stderr, not stdout");
+    }
+
+    /// SSH-16 regression: a big paste (client→owner) while the owner is busy
+    /// writing a big echo back (owner→client) must not deadlock. The owner
+    /// here writes 2 MiB of output *before* it reads any input, over a 64 KiB
+    /// duplex — the old inline `write_frame` of the paste blocked the client
+    /// loop (so it stopped reading output) exactly while the owner was
+    /// blocked writing that output, and neither side ever moved again.
+    #[tokio::test]
+    async fn client_does_not_deadlock_on_a_big_paste_against_a_big_echo() {
+        const PASTE: usize = 2 << 20;
+        const ECHO: usize = 2 << 20;
+        let paste: &'static [u8] = Box::leak(vec![b'p'; PASTE].into_boxed_slice());
+        let run = drive_client(paste, |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await.unwrap().unwrap(); // Hello
+                write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+                // Write the whole echo first, without reading anything.
+                for _ in 0..(ECHO / 8192) {
+                    write_frame(&mut w, &Frame::Stdout(vec![b'e'; 8192])).await.unwrap();
+                }
+                // Only now drain the client's paste, up to its Shutdown.
+                let mut received = 0usize;
+                loop {
+                    match read_frame(&mut r).await.unwrap().unwrap() {
+                        Frame::Stdin(data) => received += data.len(),
+                        Frame::Shutdown => break,
+                        other => panic!("unexpected client frame {}", other.kind()),
+                    }
+                }
+                assert_eq!(received, PASTE, "the whole paste must arrive, in order, before Shutdown");
+                write_frame(&mut w, &Frame::Exit(0)).await.unwrap();
+            })
+        });
+        let (outcome, stdout, _stderr) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), run).await.expect("client and owner deadlocked");
+        assert_eq!(outcome.unwrap(), ClientOutcome::Exited(0));
+        assert_eq!(stdout.len(), ECHO, "all of the owner's output must have been relayed");
     }
 
     /// The owner connection drops *before ever sending HelloAck* (e.g. a
