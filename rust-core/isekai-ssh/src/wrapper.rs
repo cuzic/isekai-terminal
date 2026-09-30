@@ -2416,9 +2416,17 @@ fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String
     let force_posix_quoting = cfg!(windows) && is_posix_shell_ssh(openssh_path);
     format!(
         "{} connect --profile {} --service ssh --stdio",
-        quote_proxy_command_path(pipe_path, force_posix_quoting),
-        quote_proxy_command_arg(profile),
+        escape_ssh_percent_tokens(&quote_proxy_command_path(pipe_path, force_posix_quoting)),
+        escape_ssh_percent_tokens(&quote_proxy_command_arg(profile)),
     )
+}
+
+/// `ssh(1)` expands `%h`/`%p`/`%r`/... tokens in `ProxyCommand` *before*
+/// handing it to the shell, and shell quoting does nothing to stop that — a
+/// literal `%` in the pipe path or profile has to be written `%%` (review
+/// 2026-09-29, SSH-44).
+fn escape_ssh_percent_tokens(value: &str) -> String {
+    value.replace('%', "%%")
 }
 
 /// Characters that never need shell/argv escaping in *any* of the quoting
@@ -2428,8 +2436,13 @@ fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String
 /// without picking a quoting convention at all. Deliberately excludes `'`/
 /// `"`/`$`/`` ` ``/`;`/`|`/`&`/`<`/`>`/`(`/`)`/`{`/`}`/`\` (and, of course,
 /// whitespace) — every character either convention treats specially.
+///
+/// A *leading* `~` is excluded too (review 2026-09-29, SSH-44): `sh` would
+/// tilde-expand it. (A `~` elsewhere — Windows 8.3 short names like
+/// `PROGRA~1` — is harmless and stays allowed.)
 fn is_safe_bare_word(value: &str, extra_allowed: &[char]) -> bool {
     !value.is_empty()
+        && !value.starts_with('~')
         && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '~') || extra_allowed.contains(&c))
 }
 
@@ -2470,7 +2483,12 @@ fn quote_proxy_command_path(pipe_path: &Path, force_posix_quoting: bool) -> Stri
                 }
             }
         }
-        if is_safe_bare_word(&path_str, &['\\', '/']) {
+        // A backslash is only a harmless path separator for Win32-OpenSSH's
+        // own `ProxyCommand` splitter; to the `/bin/sh -c` a Unix `ssh(1)`
+        // uses it is an escape character, so a bare Unix path containing
+        // one would be silently mangled (review 2026-09-29, SSH-44).
+        let path_chars: &[char] = if cfg!(windows) { &['\\', '/'] } else { &['/'] };
+        if is_safe_bare_word(&path_str, path_chars) {
             return path_str;
         }
     }
@@ -3276,6 +3294,22 @@ mod tests {
     /// argument-splitting convention on Windows (see `proxy_command`'s
     /// module docs for why quoting there is a real, version-dependent
     /// minefield this avoids rather than picks a side on).
+    /// SSH-44 regression: `%` is doubled (ssh's own `ProxyCommand` token
+    /// expansion runs before the shell), a leading `~` is never left bare,
+    /// and on Unix a backslash in the path is quoted rather than left for
+    /// `sh` to eat.
+    #[test]
+    fn proxy_command_escapes_percent_leading_tilde_and_unix_backslashes() {
+        assert_eq!(
+            proxy_command(Path::new("/usr/local/bin/isekai-pipe"), "100%host", Path::new("/usr/bin/ssh")),
+            "/usr/local/bin/isekai-pipe connect --profile '100%%host' --service ssh --stdio"
+        );
+        assert!(!is_safe_bare_word("~/bin/isekai-pipe", &['/']));
+        assert_eq!(quote_proxy_command_arg("~prod"), shell_quote("~prod"));
+        #[cfg(unix)]
+        assert_eq!(quote_proxy_command_path(Path::new(r"/opt/odd\name/isekai-pipe"), false), shell_quote(r"/opt/odd\name/isekai-pipe"));
+    }
+
     #[test]
     fn proxy_command_emits_safe_path_and_profile_bare() {
         assert_eq!(

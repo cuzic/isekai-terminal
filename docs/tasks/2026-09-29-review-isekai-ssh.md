@@ -131,7 +131,7 @@
 - [x] **SSH-43** Low `log_file.rs:128-135`(D8 の isekai-ssh 部分)
   - 要約: 既存ログファイルの権限を 0600 に絞り直さない。
   - 方針: open 後に 0600 を再設定する。runtime dir の所有者検証と intent/outcome の掃除は `isekai-pipe-core`(担当外)なので isekai-pipe 担当へ。
-- [ ] **SSH-44** Low `wrapper.rs:2286-2289,2328`(D9-1)
+- [x] **SSH-44** Low `wrapper.rs:2286-2289,2328`(D9-1)
   - 要約: Unix の ProxyCommand クォートで `\`・先頭 `~`・`%` が未処理。
   - 方針: bare 許可文字から `~` と(非 Windows では)`\` を外し、`%` を `%%` にエスケープする。
 - [ ] **SSH-45** Low `wrapper.rs:1747-1784`(D9-2)
