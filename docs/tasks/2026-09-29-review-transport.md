@@ -62,9 +62,9 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: 既知一致時の更新は best-effort にし、失敗しても Accepted を返して警告ログのみ出す(always-connects.md)。
 - [ ] **TR-M15** Medium `isekai-protocol/src/bootstrap.rs:178-185` — helper アップロードの一時ファイル名が固定(`isekai-pipe.tmp`)で、並行 bootstrap で壊れたバイナリが mv されうる。
   - 方針: 一時ファイル名を `.tmp.$$` で一意にし、失敗時は削除する。
-- [ ] **TR-M16** Medium `local-ipc-mux/src/windows_named_pipe.rs:205` / `framing.rs:75-81` — accept 中の `connect()` エラー1回(open 直後に close したクライアント等)で holder が落ちる。
+- [x] **TR-M16** Medium `local-ipc-mux/src/windows_named_pipe.rs:205` / `framing.rs:75-81` — accept 中の `connect()` エラー1回(open 直後に close したクライアント等)で holder が落ちる。
   - 方針: 一時的なエラーのときはそのインスタンスを捨てて作り直し、local-ipc-mux 内で再試行する(呼び出し側の owner.rs は変更不要)。
-- [ ] **TR-M17** Medium `local-ipc-mux/src/windows_named_pipe.rs:218-241`(+ `isekai-ssh/src/native/mux/naming.rs`) — 接続先 named pipe サーバーの所有者を検証しないため、別ユーザーに成りすまされる(isekai-ssh レビューの C4 と重複)。
+- [x] **TR-M17** Medium `local-ipc-mux/src/windows_named_pipe.rs:218-241`(+ `isekai-ssh/src/native/mux/naming.rs`) — 接続先 named pipe サーバーの所有者を検証しないため、別ユーザーに成りすまされる(isekai-ssh レビューの C4 と重複)。
   - 方針: `connect()` で `GetNamedPipeServerProcessId`→`OpenProcessToken`→`TokenUser` の SID が自プロセスの SID と一致することを検証し、不一致なら拒否する。
     名前への SID 付与(naming.rs)は fix-isekai-ssh の担当(連絡済み)。
 - [ ] **TR-M18** Medium `openssh-config/src/lib.rs:428-437` — `Match host` を元の destination で判定している(OpenSSH はそれまでに設定された HostName で判定する)。`Match user` は User 未設定時に false になる(OpenSSH はローカルユーザー名で判定する)。
@@ -115,7 +115,7 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L26d** `isekai-netmon/src/linux.rs:141-154` — EAGAIN 以外のエラーでも即座にリトライし、busy loop になる → バックオフする。致命的なエラーでは終了する。
 - [ ] **TR-L27a** `openssh-config/src/lib.rs:190-241` — `%` トークンを展開しない → HostName 等の基本トークン(%h %p %r %u %n %%)を展開する。
 - [ ] **TR-L27b** `openssh-config/src/lib.rs:492-548` — Host 照合が大文字小文字を区別する → 区別しないようにする。
-- [ ] **TR-L28** `local-ipc-mux/src/framing.rs:35-58` — read_frame がキャンセル非安全であることが doc に無い → 追記する。
+- [x] **TR-L28** `local-ipc-mux/src/framing.rs:35-58` — read_frame がキャンセル非安全であることが doc に無い → 追記する。
 - [ ] **TR-L29a** `russh-stream-session/src/lib.rs:386,393,402-410` — connect/handshake にタイムアウトが無い → タイムアウトを付ける。
 - [ ] **TR-L29b** `russh-stream-session/src/lib.rs:572-576` — keyboard-interactive の回答をゼロ化しない → zeroize する。
 - [ ] **TR-L29c** `russh-stream-session/src/lib.rs:214-253` — ForwardRoutes のキューが無制限 → bounded にする。

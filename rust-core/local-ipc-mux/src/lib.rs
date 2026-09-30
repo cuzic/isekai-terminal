@@ -114,7 +114,9 @@ mod pipe_classify;
 #[cfg(windows)]
 mod windows_named_pipe;
 #[cfg(windows)]
-pub use windows_named_pipe::{PipeConnection, WindowsNamedPipeChannel};
+pub use windows_named_pipe::{
+    current_user_sid_string, verify_named_pipe_server_is_current_user, PipeConnection, WindowsNamedPipeChannel,
+};
 
 pub mod in_memory;
 pub use in_memory::InMemoryChannel;
