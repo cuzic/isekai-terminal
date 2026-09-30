@@ -46,9 +46,9 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: payload の上限を 64KiB にし(`CapsuleDecodeError::TooLarge`)、recv_response と COMPRESSION_ACK 待ちを 15 秒で包む。
 - [x] **TR-M7** Medium `quicmux/src/qmux_backend.rs:254-263,296` — QMux listener が一時的な accept エラー1回で恒久停止する。TLS accept にもタイムアウトが無い。
   - 方針: TCP accept のエラーはバックオフして継続する。TLS と QMux handshake はタスク内でタイムアウト付きにする。
-- [ ] **TR-M8** Medium(潜在) `h3-qmux/src/lib.rs:68-110,173,188` — `StreamIdAllocator` が、peer 起点の stream が id 昇順で届くことを前提にしている。
+- [x] **TR-M8** Medium(潜在) `h3-qmux/src/lib.rs:68-110,173,188` — `StreamIdAllocator` が、peer 起点の stream が id 昇順で届くことを前提にしている。
   - 方針: 実 id を qmux から取得できるならそれを使う。できなければ、サーバー用途(peer 起点 stream の accept)を明示的にエラーにする。
-- [ ] **TR-M9** Medium `h3-qmux/src/lib.rs:550-596` — `SendStream` の状態機械が、エラー後や Writing 中の finish/reset で偽の成功を返す。
+- [x] **TR-M9** Medium `h3-qmux/src/lib.rs:550-596` — `SendStream` の状態機械が、エラー後や Writing 中の finish/reset で偽の成功を返す。
   - 方針: `Failed(err)` 状態を追加する。Writing 中の finish/reset は、書き込みを完了させてから実行する。
 - [x] **TR-M10** Medium `relay_client.rs:100-105` — relay 上りの QUIC に keep-alive が無い(noq の既定 idle は 30 秒、keep-alive は off)。
   - 方針: `keep_alive_interval(10s)` を設定する。
@@ -91,8 +91,8 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L14** `relay_client.rs:321-325` — RelayUdpSocket を drop しても外側の接続を閉じない → socket の drop を検知して driver タスクを終了させる(H2 と同じコミット)。
 - [ ] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
   注: 本項目は quicmux/src/resume.rs のため、「quicmux の resume*.rs は isekai-pipe 担当」の境界に該当する。isekai-pipe 側が触らない場合のみ対応する。
-- [ ] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
-- [ ] **TR-L16b** `h3-qmux/src/lib.rs:253` — peer の close code を捨てている → code を保持する。
+- [x] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
+- [x] **TR-L16b** `h3-qmux/src/lib.rs:253` — peer の close code を捨てている → code を保持する。
 - [x] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
 - [x] **TR-L17b** `isekai-auth/src/file_provider.rs:101,140` — 巨大な expires_in で i64 がラップする → saturating/try_from にする。
 - [x] **TR-L18** `isekai-auth/src/refresh.rs:22` / `oauth.rs:57` — token endpoint が http:// でも許容している → https を強制する(ループバックのみ例外)。
