@@ -1490,8 +1490,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
 
     let launch = match &resolution.isekai.bootstrap_relay {
         Some(relay_target) => {
-            let relay_jwt = isekai_auth::FileTokenProvider::from_default_path()
-                .and_then(|provider| provider.get_relay_jwt())
+            // On a blocking thread: `get_relay_jwt` may do a synchronous
+            // (`ureq`) token refresh plus file locking, which must not stall
+            // a tokio worker thread (review 2026-09-29, transport hand-off).
+            let relay_jwt = tokio::task::spawn_blocking(|| {
+                isekai_auth::FileTokenProvider::from_default_path().and_then(|provider| provider.get_relay_jwt())
+            })
+            .await
+            .context("isekai-ssh: the relay token lookup task panicked")?
                 .map_err(|e| {
                     anyhow::Error::new(e)
                         .context("failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first")
