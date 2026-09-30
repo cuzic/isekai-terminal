@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import tools.isekai.terminal.util.RemoteLogger
 
 /**
  * ターミナルセッションを保持する Foreground Service。
@@ -84,7 +85,18 @@ class TerminalSessionService : Service() {
             return START_NOT_STICKY
         }
         val label = intent.getStringExtra(EXTRA_SESSION_LABEL) ?: "SSH セッション"
-        startForegroundWithNotification(label)
+        try {
+            startForegroundWithNotification(label)
+        } catch (e: IllegalStateException) {
+            // AND-L7: Android 12+でバックグラウンドから起動された場合の
+            // `ForegroundServiceStartNotAllowedException`(IllegalStateExceptionのサブクラス)等。
+            // 未捕捉だとアプリごとクラッシュするため、前面化を諦めて自分を停止する
+            // (セッション自体はプロセスが生きている限り継続する)。
+            RemoteLogger.w("IsekaiTerminalService", "startForeground failed, stopping service", e)
+            isNotificationPosted = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
