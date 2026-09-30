@@ -110,11 +110,17 @@ jobs:
 
       - name: Build IsekaiTerminalCoreLogic FFI (rust-core native Linux build + UniFFI bindings + drift check)
         run: |
+          set -euo pipefail
           bash rust-core/scripts/build-linux-swift-ffi.sh
-          git diff --exit-code -- ios/Sources/IsekaiTerminalCoreLogic/generated ios/Sources/IsekaiTerminalCoreFFILinux || {
-            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated or ios/Sources/IsekaiTerminalCoreFFILinux is stale. Run rust-core/scripts/build-linux-swift-ffi.sh and commit the result." >&2
+          # 未追跡の新規生成物・新規`.sha256`サイドカーも検知するため
+          # `git status --porcelain`でも確認する(ios-rust-core-check.ymlと同じ)。
+          GENERATED_PATHS=(ios/Sources/IsekaiTerminalCoreLogic/generated ios/Sources/IsekaiTerminalCoreFFILinux)
+          if ! git diff --exit-code -- "${GENERATED_PATHS[@]}" \
+            || [ -n "$(git status --porcelain -- "${GENERATED_PATHS[@]}")" ]; then
+            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated or ios/Sources/IsekaiTerminalCoreFFILinux is stale (or has uncommitted new files). Run rust-core/scripts/build-linux-swift-ffi.sh and commit the result, including the .sha256 sidecars." >&2
+            git status --porcelain -- "${GENERATED_PATHS[@]}"
             exit 1
-          }
+          fi
 
       - name: swift test (IsekaiTerminalCoreLogic)
         working-directory: ios

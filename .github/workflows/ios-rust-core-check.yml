@@ -91,11 +91,18 @@ jobs:
 
       - name: Generate Swift bindings and check for drift
         run: |
+          set -euo pipefail
           bash rust-core/scripts/generate-swift-bindings.sh
-          git diff --exit-code -- ios/Sources/IsekaiTerminalCoreLogic/generated || {
-            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
+          # `git diff --exit-code`だけでは、新規の生成物や新しい`.sha256`サイドカー
+          # (未追跡ファイル)のコミット漏れを検知できないため、`git status --porcelain`
+          # でも同じパスを確認する(android-uniffi-drift-check.ymlの「Check for drift」と同じ)。
+          GENERATED_DIR=ios/Sources/IsekaiTerminalCoreLogic/generated
+          if ! git diff --exit-code -- "$GENERATED_DIR" \
+            || [ -n "$(git status --porcelain -- "$GENERATED_DIR")" ]; then
+            echo "::error::$GENERATED_DIR is stale (or has uncommitted new files). Run rust-core/scripts/generate-swift-bindings.sh and commit the result, including the .sha256 sidecars." >&2
+            git status --porcelain -- "$GENERATED_DIR"
             exit 1
-          }
+          fi
 
       - name: Build XCFramework
         run: bash rust-core/scripts/build-ios-xcframework.sh

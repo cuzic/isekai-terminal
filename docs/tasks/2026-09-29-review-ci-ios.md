@@ -40,9 +40,10 @@
   - 対応: `setup-zig` の `version: latest` を全箇所 0.16.0 に、`cargo install cargo-zigbuild` を全箇所 `--locked --version 0.23.4` に固定。
   - 見送り(部分): `rust-toolchain.toml` による rustc の固定は `[~]`。rust-core ワークスペース全体(他領域のCI・ローカル・
     Android の cargo ビルド)の挙動を変え、MSRV の選定も要るため、担当境界(ci-ios)外の設計判断として残す。
-- [ ] **CI-M3** (Medium) `ios-rust-core-check.yml`(「Generate Swift bindings and check for drift」)、`ios-logic-linux-check.yml:94-99`
+- [x] **CI-M3** (Medium) `ios-rust-core-check.yml`(「Generate Swift bindings and check for drift」)、`ios-logic-linux-check.yml:94-99`
   - 要約: Swift バインディングの drift-check が `git diff --exit-code` のみで、未追跡の新規生成物・新規 `.sha256` を検知できない。
   - 修正方針: Kotlin 側と同様に `git status --porcelain` でも同じパスを確認する。
+  - 対応: 両ワークフローの drift-check に `git status --porcelain` の確認を追加し、失敗時に該当ファイル一覧を出すようにした。
 - [ ] **CI-M4** (Medium) `scripts/device_verify.sh:198,337-339,78-100`
   - 要約: 失敗時にテスト用公開鍵が `~/.ssh/authorized_keys` に残る(EXIT trap で戻さない)。削除時の `grep -v` が
     0行一致で exit 1 して `set -e` で中断する。
