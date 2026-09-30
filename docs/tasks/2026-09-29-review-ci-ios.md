@@ -156,9 +156,11 @@
   - 修正方針: `getOrCreateKey` で新規作成するのは `errSecItemNotFound` のときだけにし、それ以外のエラーは伝播する。
   - 対応: `getOrCreateKey` が新規作成するのは `keychainError(errSecItemNotFound)` のときだけにし、`deviceLocked` などのエラーはそのまま伝播するようにした(`CredentialVault.store` と `RelayCredentialVault.encrypt` の両方に効く)。
     Keychain の一時エラーはシミュレータで再現できないため、自動テストはない。
-- [ ] **IOS-I6** (Medium) `ios/Sources/IsekaiTerminalCore/TerminalTabsHostView.swift:83-85`
+- [x] **IOS-I6** (Medium) `ios/Sources/IsekaiTerminalCore/TerminalTabsHostView.swift:83-85`
   - 要約: `beginBackgroundTask` の expirationHandler が非同期に `endBackgroundTask` している。
   - 修正方針: handler(main thread で呼ばれる)内で `MainActor.assumeIsolated` を使い、同期的に終了処理を行う。
+  - 対応: handler 内で `MainActor.assumeIsolated` を使い、`handleBackgroundBudgetExpired()`(各タブへの通知と `endBackgroundTask`)を同期実行するようにした。
+    システムの期限切れはシミュレータのテストから起こせないため、確認は ios-app-build(コンパイル)による。
 - [ ] **IOS-I7** (Low-Medium) `TerminalSessionController.swift:181-195,735,948-950,969,982-986,791-795`
   - 要約: 転送状態(`downloadTempURL` 等)がロックなしで複数スレッドから触られる。
   - 修正方針: 転送状態を1つの struct にまとめ、`NSLock` で保護する。
