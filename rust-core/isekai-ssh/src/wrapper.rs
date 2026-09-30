@@ -1890,6 +1890,14 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
+        // Everything after the destination is the remote command, exactly as
+        // `ssh(1)` treats it (review 2026-09-29, SSH-45): `isekai-ssh host --
+        // grep --isekai-log-file x` must send `--isekai-log-file` to the
+        // remote `grep`, not swallow it (and its value) as a wrapper option.
+        if find_destination_index(&ssh_args).is_some() {
+            ssh_args.push(arg);
+            continue;
+        }
         match arg.as_str() {
             "--isekai-bootstrap" => isekai.bootstrap = true,
             "--isekai-no-bootstrap" => isekai.no_bootstrap = true,
@@ -3118,6 +3126,21 @@ mod tests {
             plan.ssh_args,
             s(&["-p", "2222", "user@production", "uptime"])
         );
+    }
+
+    /// SSH-45 regression: `--isekai-*` after the destination belongs to the
+    /// remote command, not to the wrapper.
+    #[test]
+    fn isekai_flags_after_the_destination_are_part_of_the_remote_command() {
+        let plan = parse_wrapper(s(&["--isekai-no-bootstrap", "production", "grep", "--isekai-log-file", "x"])).unwrap();
+        assert!(plan.isekai.no_bootstrap, "a wrapper flag before the destination still applies");
+        assert_eq!(plan.isekai.log_file, None, "a flag after the destination must not be consumed");
+        assert_eq!(plan.ssh_args, s(&["production", "grep", "--isekai-log-file", "x"]));
+        assert_eq!(plan.remote_command(), Some(&s(&["grep", "--isekai-log-file", "x"])[..]));
+
+        let plan = parse_wrapper(s(&["-p", "2222", "--", "production", "--isekai-tty"])).unwrap();
+        assert!(plan.isekai.tty.is_none());
+        assert_eq!(plan.destination, "production");
     }
 
     #[test]

@@ -134,6 +134,6 @@
 - [x] **SSH-44** Low `wrapper.rs:2286-2289,2328`(D9-1)
   - 要約: Unix の ProxyCommand クォートで `\`・先頭 `~`・`%` が未処理。
   - 方針: bare 許可文字から `~` と(非 Windows では)`\` を外し、`%` を `%%` にエスケープする。
-- [ ] **SSH-45** Low `wrapper.rs:1747-1784`(D9-2)
+- [x] **SSH-45** Low `wrapper.rs:1747-1784`(D9-2)
   - 要約: destination 以降の `--isekai-*` を wrapper が解釈してしまう。
   - 方針: destination 確定後の引数はすべてそのまま ssh 引数として扱う。
