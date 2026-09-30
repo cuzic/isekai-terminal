@@ -32,7 +32,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   Rust状態ミラーのエッジから推論している。
   - 方針: Rust側から「論理セッション終了」「transport再確立」を区別したイベント
     (例: `onSessionEnded`/`onTransportReestablished`)を出す必要がある。
-- [ ] **AND-H3** (High) `ConnectionCoordinator.kt:69-129` / `session/TerminalSession.kt:445-449` /
+- [x] **AND-H3** (High) `ConnectionCoordinator.kt:69-129` / `session/TerminalSession.kt:445-449` /
   `ProfileEditScreen.kt:200` / `RelayCredentialVault.kt` — 接続コルーチンに例外処理が無く、
   relay JWT復号失敗(Keystoreエントリ欠落・平文レガシー値)やUniFFIの`InternalException`で
   アプリ全体がクラッシュする。例外時は復号済みPEMのwipeもスキップされる。編集画面は
