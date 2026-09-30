@@ -41,7 +41,7 @@
   - 方針: `Weak`で`ClientResumeState`を持ち、strong参照が消えたら終了。さらにbridge世代番号を持たせ、resume後に新しいbridgeが立ったら古いbridgeは終了する。
 - [x] **RC-15** Medium — `rebind_driver.rs:101-111` — ループタスクが自身の`input_tx`クローンを保持しており`input_rx.recv()`がNoneにならず終了しない → Endpoint/UDP fdリーク。
   - 方針: ループへ渡す送信端を`WeakSender`にする(必要時のみupgrade)。
-- [ ] **RC-16** Medium — `pool.rs:106-117` / `lib.rs:1641-1644` — 接続確立に全体タイムアウトがなく、handshake停止でエントリが`Connecting`のまま、後続タブ・再接続が永久待ち。
+- [x] **RC-16** Medium — `pool.rs:106-117` / `lib.rs:1641-1644` — 接続確立に全体タイムアウトがなく、handshake停止でエントリが`Connecting`のまま、後続タブ・再接続が永久待ち。
   - 方針: 確立処理(TCP/KEX/認証/jump)に全体タイムアウトを設け、失敗として`publish_failure`する。ホスト鍵確認のユーザー応答待ちにも上限を設ける。
 - [x] **RC-17** Medium — `orchestrator.rs:524-527, 540-541→767-773` — 世代チェックと状態更新が別ロック区間で、古いcallbackが新しい接続試行を上書きしうる。
   - 方針: `on_connected`/`handle_unexpected_disconnect`で世代チェックと状態更新を同一ロック区間で行う(世代を引数で渡す)。
