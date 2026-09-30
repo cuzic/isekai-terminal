@@ -364,6 +364,7 @@ where
         // guard is dropped at the end of this block, before any `ctl_forward`
         // cleanup below re-locks the handle.
         let guard = handle.lock().await;
+        let open = async {
         if ctl.is_some() || tty_exec.is_some() {
             ctl_forward::open_login_shell(
                 &guard,
@@ -379,6 +380,15 @@ where
             .context("isekai-ssh mux owner: failed to open a login shell for the client")
         } else {
             open_channel(&guard, &session_kind).await.context("isekai-ssh mux owner: failed to open a session channel for the client")
+        }
+        };
+        // Bounded (review 2026-09-29, SSH-30): the handle lock is held for
+        // this whole open, so an open that never gets an answer (a stalled
+        // transport mid-resume) used to block every other tab's channel open
+        // and ctl forward behind it forever.
+        match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, open).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(ChannelOpenTimedOut)),
         }
     };
     // `HelloAck` is deliberately sent only *after* the channel-open above
@@ -459,6 +469,23 @@ where
     result
 }
 
+/// How long [`relay_client`] waits for a per-client channel open (while
+/// holding the shared handle's lock) before giving up on it.
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A per-client channel open that got no answer within
+/// [`CHANNEL_OPEN_TIMEOUT`].
+#[derive(Debug)]
+struct ChannelOpenTimedOut;
+
+impl std::fmt::Display for ChannelOpenTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "isekai-ssh mux owner: opening a session channel for the client timed out after {CHANNEL_OPEN_TIMEOUT:?}")
+    }
+}
+
+impl std::error::Error for ChannelOpenTimedOut {}
+
 /// Whether a per-client channel-open failure (`relay_client`) should be
 /// treated as proof the *shared* SSH connection is dead (SSH-05). `false`
 /// when the server demonstrably answered — a `ChannelOpenFailure` (any
@@ -467,6 +494,12 @@ where
 /// everything else (send failures, disconnects, ...), preserving the
 /// original fast-path for a genuinely dead handle.
 fn channel_open_failure_implies_dead_handle(err: &anyhow::Error) -> bool {
+    // A timed-out open proves nothing either way — the transport may just be
+    // mid-resume. `handle_died`'s own poll still catches a real death; tearing
+    // every tab down on a slow answer would defeat the resume (SSH-30).
+    if err.chain().any(|cause| cause.is::<ChannelOpenTimedOut>()) {
+        return false;
+    }
     let server_answered = |e: &russh::Error| matches!(e, russh::Error::ChannelOpenFailure(_) | russh::Error::RequestDenied);
     !err.chain().any(|cause| {
         cause.downcast_ref::<russh::Error>().is_some_and(server_answered)
@@ -2550,6 +2583,9 @@ mod tests {
 
         let denied = anyhow::Error::new(russh::Error::RequestDenied).context("pty request refused");
         assert!(!channel_open_failure_implies_dead_handle(&denied), "a refused channel request proves the connection is alive");
+
+        let timed_out = anyhow::Error::new(ChannelOpenTimedOut);
+        assert!(!channel_open_failure_implies_dead_handle(&timed_out), "a slow answer (e.g. mid-resume) must not tear the holder down");
 
         let dead = anyhow::Error::new(russh_stream_session::SessionError::Channel(russh::Error::Disconnect)).context("open failed");
         assert!(channel_open_failure_implies_dead_handle(&dead), "a transport-level failure still means the shared handle is gone");
