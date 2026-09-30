@@ -91,7 +91,7 @@
 - [x] **SSH-29** Low `native/mux/mod.rs:938,976-987`(C5-2)
   - 要約: token 書き込みが非 atomic で、async 内で `std::thread::sleep` している。
   - 方針: tmp+rename にし、`tokio::time::sleep` に変える。
-- [ ] **SSH-30** Low `owner.rs:357-382`, `ctl_forward.rs:72-73`(C5-3)
+- [x] **SSH-30** Low `owner.rs:357-382`, `ctl_forward.rs:72-73`(C5-3)
   - 要約: handle lock を保持したままの channel open/ctl forward に timeout がない。
   - 方針: timeout を付ける。
 - [ ] **SSH-31** Low `client.rs:310`, `owner.rs:540`, `ctl_forward.rs:292`(C5-4)
