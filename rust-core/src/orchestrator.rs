@@ -1797,7 +1797,8 @@ impl SessionOrchestrator {
     pub fn trzsz_accept_upload(&self, file_name: String, file_size: u64, mode: u32) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
-            if let Some(s) = self.shared.session.lock().as_ref() {
+            let session = self.shared.session.lock().clone();
+            if let Some(s) = session {
                 s.trzsz_accept_upload(tid, file_name, file_size, mode);
             }
         }
@@ -1806,7 +1807,11 @@ impl SessionOrchestrator {
     pub fn trzsz_send_chunk(&self, data: Vec<u8>, is_last: bool) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
-            if let Some(s) = self.shared.session.lock().as_ref() {
+            // RC-06: `trzsz_send_chunk`はキューが空くまで呼び出し元(Kotlinの
+            // IOスレッド)を待たせる。`session`ロックを握ったまま待つと他の
+            // orchestrator操作(send/disconnect等)まで塞ぐので、cloneしてから呼ぶ。
+            let session = self.shared.session.lock().clone();
+            if let Some(s) = session {
                 s.trzsz_send_chunk(tid, data, is_last);
             }
         }

@@ -17,7 +17,7 @@
   - 方針: cancel/timeout時に`session_generation`を進め(進行中attemptの遅延callbackを無視させ)、attempt sessionをdisconnect、`phase=Idle`へ。timeout側のDisconnected通知はepoch一致時のみ。
 - [-] **RC-05** High — `pool.rs:79-86, 143-166` — Ready handleの生存確認・evictなしで死んだ接続を再利用。
   - 対応不要: mainで既に修正済み(#120/#121: `try_attach_with`が`PooledSshHandle::is_alive`で生存確認し死んでいれば同じスロットを`Connecting`へ差し替え、`mark_dead_if_same`で最初のchannel open失敗/timeoutをtombstone化。#122で仮想時間テスト、#124でモデルベーステスト済み)。
-- [ ] **RC-06** High — `session.rs:364-367, 1317-1321` / `trzsz.rs:580-586` — trzszアップロードchunkを容量64のチャネルへ`try_send`し満杯時に黙って破棄(2層)。
+- [x] **RC-06** High — `session.rs:364-367, 1317-1321` / `trzsz.rs:580-586` — trzszアップロードchunkを容量64のチャネルへ`try_send`し満杯時に黙って破棄(2層)。
   - 方針: (a) Kotlin→`SessionCmd`はruntime外スレッドからなら`blocking_send`でバックプレッシャー(orchestrator側はsessionロックを解放してから呼ぶ)、(b) event loop→transportの`SendStdin`は捨てずにローカルキューへ積み、`reserve()`アームで順序通り流す。キューが閾値を超えたら`session_cmd_rx`の受信を止めて上流へ背圧を伝える。
 - [ ] **RC-07** High(sec) — `transport/ssh_handler.rs:517, 249-257` / `orchestrator.rs:512-520` — ProxyJump時、jump hostのホスト鍵イベントがtargetの`host:port`で検証/pinされる。
   - 方針: `TransportEvent::HostKey`に検証対象の`(host, port)`を持たせ、`RusshEventHandler`をjump/targetそれぞれの識別子付きで構築する。
@@ -34,7 +34,7 @@
   - 方針: 行長上限・WaitingKotlin中のバッファ上限・`ZlibDecoder`に`take(limit)`で展開上限を設け、超過時は転送失敗にする。
 - [ ] **RC-12** Medium(sec) — `lib.rs:691-706` — bracketed paste時に本文中の`ESC[201~`を除去せずに括る → 貼り付けでコマンド注入。
   - 方針: bracketed paste時は本文中のESC(0x1B)を除去する(xterm等と同様)。
-- [ ] **RC-13** Medium — `orchestrator.rs:913` / `session.rs:1172-1178` — 生きている旧sessionをdisconnectせずに差し替え(旧接続・フォワード残存)、`session_cmd_rx`クローズ後に`select!`がbusy-spin。
+- [x] **RC-13** Medium — `orchestrator.rs:913` / `session.rs:1172-1178` — 生きている旧sessionをdisconnectせずに差し替え(旧接続・フォワード残存)、`session_cmd_rx`クローズ後に`select!`がbusy-spin。
   - 方針: `build_and_store_session`で旧sessionを取り出してdisconnectする。`session_cmd_rx`がNoneを返したらそのアームを以後無効化する。
 - [x] **RC-14** Medium — `isekai_pipe_quic_transport.rs:548-567` — `spawn_app_ack_bridge`が無限ループ(resumeごとに追加、4MiB replay bufferを保持し続ける)。
   - 方針: `Weak`で`ClientResumeState`を持ち、strong参照が消えたら終了。さらにbridge世代番号を持たせ、resume後に新しいbridgeが立ったら古いbridgeは終了する。
