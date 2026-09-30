@@ -78,7 +78,12 @@ pub struct RusshBackend {
     /// Called only for a host key never seen before (see
     /// `FileBackedHostKeyVerifier`'s docs below) — defaults to a real
     /// blocking stdin prompt; tests inject a fixed answer.
-    confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ///
+    /// Takes the `host:port` being verified as its first argument (review
+    /// 2026-09-29, SSH-13): the jump leg and the target leg share this one
+    /// policy, and a prompt showing only a fingerprint left the user unable
+    /// to tell *which* host's key they were approving.
+    confirm_new_host: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
     /// Test-only: see `with_identity_file`/`with_identity_files`' docs.
     /// `None` in every production code path. When `Some`, its entries replace
     /// the per-hop `~/.ssh/config` `IdentityFile`/default-probe candidate
@@ -109,8 +114,16 @@ impl RusshBackend {
     /// answer, so tests never block on real stdin.
     #[doc(hidden)]
     pub fn with_confirm_new_host(mut self, f: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
-        self.confirm_new_host = f;
+        self.confirm_new_host = Arc::new(move |_host_port: &str, fingerprint: &str| f(fingerprint));
         self
+    }
+
+    /// Binds this backend's new-host policy to one leg's `host_port`, in the
+    /// single-argument shape `FileBackedHostKeyVerifier` expects.
+    fn confirm_new_host_for(&self, host_port: &str) -> Arc<dyn Fn(&str) -> bool + Send + Sync> {
+        let confirm = self.confirm_new_host.clone();
+        let host_port = host_port.to_string();
+        Arc::new(move |fingerprint: &str| confirm(&host_port, fingerprint))
     }
 
     /// Production API for `TofuConfirmation::Silent` callers
@@ -139,9 +152,9 @@ impl RusshBackend {
     /// genuinely-unautomatable step (`isekai-ssh init`/`doctor --fix` run
     /// interactively once).
     pub fn with_unattended_new_host_policy(mut self) -> Self {
-        self.confirm_new_host = Arc::new(|fingerprint| {
+        self.confirm_new_host = Arc::new(|host_port: &str, fingerprint: &str| {
             eprintln!(
-                "isekai-ssh: unknown SSH host key (fingerprint {fingerprint}) in a silent/automated \
+                "isekai-ssh: unknown SSH host key for {host_port:?} (fingerprint {fingerprint}) in a silent/automated \
                  context — refusing without prompting. Run `isekai-ssh init`/`doctor --fix` from an \
                  interactive terminal once to confirm it."
             );
@@ -241,8 +254,8 @@ impl RusshBackend {
         let target_host_port = format!("{}:{}", target_resolved.hostname, target_resolved.port);
         let target_verifier = Arc::new(FileBackedHostKeyVerifier::new(
             self.store_path.clone(),
-            target_host_port,
-            self.confirm_new_host.clone(),
+            target_host_port.clone(),
+            self.confirm_new_host_for(&target_host_port),
             "isekai-bootstrap",
         ));
 
@@ -253,8 +266,8 @@ impl RusshBackend {
                 let jump_host_port = format!("{}:{}", jump_resolved.hostname, jump_resolved.port);
                 let jump_verifier = Arc::new(FileBackedHostKeyVerifier::new(
                     self.store_path.clone(),
-                    jump_host_port,
-                    self.confirm_new_host.clone(),
+                    jump_host_port.clone(),
+                    self.confirm_new_host_for(&jump_host_port),
                     "isekai-bootstrap",
                 ));
                 // The jump hop authenticates with only the *first readable*
@@ -472,10 +485,10 @@ fn identity_paths_display(paths: &[PathBuf]) -> String {
 /// `TofuConfirmation::Silent` re-deploy) install
 /// [`with_unattended_new_host_policy`](RusshBackend::with_unattended_new_host_policy)
 /// instead of relying on this function to infer silence from stdin.
-fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
+fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
     use std::io::Write as _;
     eprint!(
-        "The authenticity of the bootstrap host can't be established.\n\
+        "The authenticity of the bootstrap host '{host_port}' can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
          Are you sure you want to continue connecting (yes/no)? "
     );
@@ -737,9 +750,34 @@ mod tests {
         // (unlike the never-checked-in `IsTerminal`-gated version of this
         // fix, which incorrectly refused legitimate piped answers too; see
         // `prompt_new_host_confirmation`'s doc comment).
-        let backend = RusshBackend { store_path: PathBuf::new(), confirm_new_host: Arc::new(|_| panic!("must not be reached")), identity_file_override: None }
-            .with_unattended_new_host_policy();
-        assert!(!(backend.confirm_new_host)("SHA256:deadbeef"));
+        let backend =
+            RusshBackend { store_path: PathBuf::new(), confirm_new_host: Arc::new(|_, _| panic!("must not be reached")), identity_file_override: None }
+                .with_unattended_new_host_policy();
+        assert!(!(backend.confirm_new_host)("example.com:22", "SHA256:deadbeef"));
+        assert!(!(backend.confirm_new_host_for("example.com:22"))("SHA256:deadbeef"));
+    }
+
+    /// SSH-13 regression: each leg's verifier must hand the policy *its own*
+    /// `host:port`, so a jump-host prompt and a target prompt are
+    /// distinguishable.
+    #[test]
+    fn confirm_new_host_for_passes_the_legs_own_host_port() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen_in_policy = seen.clone();
+        let backend = RusshBackend {
+            store_path: PathBuf::new(),
+            confirm_new_host: Arc::new(move |host_port: &str, fingerprint: &str| {
+                seen_in_policy.lock().unwrap().push((host_port.to_string(), fingerprint.to_string()));
+                true
+            }),
+            identity_file_override: None,
+        };
+        assert!((backend.confirm_new_host_for("bastion:22"))("SHA256:jump"));
+        assert!((backend.confirm_new_host_for("target:2222"))("SHA256:target"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("bastion:22".to_string(), "SHA256:jump".to_string()), ("target:2222".to_string(), "SHA256:target".to_string())]
+        );
     }
 
     #[test]
