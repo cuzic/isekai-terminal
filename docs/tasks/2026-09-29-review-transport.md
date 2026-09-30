@@ -12,7 +12,7 @@ openssh-config / osc-color(quicsock は vendored)。
 
 ## High
 
-- [ ] **TR-H1** High `isekai-transport/src/warm_standby.rs:204-219,308-313` — warm standby 接続は実サーバー
+- [x] **TR-H1** High `isekai-transport/src/warm_standby.rs:204-219,308-313` — warm standby 接続は実サーバー
   (`isekai-pipe/src/engine/mod.rs:927-952`)の `HELLO_TIMEOUT`(5秒)で閉じられ、promote はほぼ機能しない。
   probe は stream を開いて即 FIN するので、サーバー側でも EOF として close される。テストのモックはこれを検出できない。
   - 方針: `isekai_protocol::standby` に認証付き `STANDBY_HOLD`(0x34)/`READY`/`PING`/`PONG` を新設する。
@@ -32,7 +32,7 @@ openssh-config / osc-color(quicsock は vendored)。
 
 - [ ] **TR-M1** Medium `isekai-transport/src/relay.rs:174-230,294-313` — 初回 ATTACH(connect・open_bi・HELLO 送信・応答待ち)全体にタイムアウトが無い。
   - 方針: dial と attach handshake を `TRANSPORT_STEP_TIMEOUT` で個別に包み、`TransportError::TimedOut` を返す。
-- [ ] **TR-M2** Medium `warm_standby.rs:205-218,271` — `ensure_warm` がロックを保持したまま probe と(タイムアウト無しの)dial を await し、promote を待たせる。
+- [x] **TR-M2** Medium `warm_standby.rs:205-218,271` — `ensure_warm` がロックを保持したまま probe と(タイムアウト無しの)dial を await し、promote を待たせる。
   - 方針: スロットを Arc で clone してロック外で probe・dial する。dial は `TRANSPORT_STEP_TIMEOUT` で包む(H1 と同じコミット)。
 - [ ] **TR-M3** Medium `isekai-transport/src/resume/app_ack.rs:116-191` — `AppAckTasks` を捨てるとタスクがリークする(send ループは stream が死んでも終わらない)。
   - 方針: recv ループが終わったら send ループも終わる自己終了にし、`#[must_use]` を付ける。Drop(abort) は付けない。
@@ -72,7 +72,7 @@ openssh-config / osc-color(quicsock は vendored)。
 
 ## Low
 
-- [ ] **TR-L1** `warm_standby.rs:258-263` — `promote` がキャンセルされると `promoting` が true のまま残る → RAII ガードで戻す(H1 と同じコミット)。
+- [x] **TR-L1** `warm_standby.rs:258-263` — `promote` がキャンセルされると `promoting` が true のまま残る → RAII ガードで戻す(H1 と同じコミット)。
 - [ ] **TR-L2** `isekai-transport/src/multipath.rs:189-191,226-231` — 同じ PathId にヘルスモニタが二重に起動しうる → 起動済みの PathId を集合で管理して重複を防ぐ。
 - [ ] **TR-L3** `path_health_fsm.rs:111-116` / `path_health.rs:204-208` — NoViablePath が毎チェック繰り返し通知される → エッジトリガー(状態が変化したときだけ通知)にする。
 - [ ] **TR-L4** `path_health.rs:210-217` — RTT/ロス劣化で Degraded になっても NoViablePath を通知しない(doc と矛盾) → 通知する。

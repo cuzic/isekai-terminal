@@ -20,6 +20,7 @@ pub mod hello;
 pub mod offset;
 pub mod resume;
 pub mod session_id;
+pub mod standby;
 pub mod version;
 
 pub use attach::{
