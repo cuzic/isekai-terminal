@@ -42,7 +42,9 @@ impl QuietWatchRuntime {
         QuietWatchRuntime { handle: None }
     }
 
-    fn start<Q>(&mut self, quiet_source: Arc<Q>, input_tx: tokio::sync::mpsc::Sender<RebindEvent>)
+    /// RC-15: 送信端は`WeakSender`で持つ(強参照を持ち続けると、Driverの入力チャネルが
+    /// 永遠に閉じずループが終了しなくなる)。
+    fn start<Q>(&mut self, quiet_source: Arc<Q>, input_tx: tokio::sync::mpsc::WeakSender<RebindEvent>)
     where
         Q: QuietTrafficSource + 'static,
     {
@@ -53,7 +55,8 @@ impl QuietWatchRuntime {
                 interval.tick().await;
                 let event =
                     if quiet_source.is_quiet() { RebindEvent::TrafficQuietDetected } else { RebindEvent::TrafficBusyDetected };
-                if input_tx.send(event).await.is_err() {
+                let Some(tx) = input_tx.upgrade() else { break };
+                if tx.send(event).await.is_err() {
                     break;
                 }
             }
@@ -64,6 +67,13 @@ impl QuietWatchRuntime {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+    }
+}
+
+impl Drop for QuietWatchRuntime {
+    /// Driverのループが終了したら、ポーリングタスクも止める(RC-15)。
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -99,7 +109,13 @@ where
     Q: QuietTrafficSource + 'static,
 {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<RebindEvent>(16);
-    let loop_input_tx = input_tx.clone();
+    // RC-15(2026-09-29 コードレビュー): 以前はループ自身が`input_tx`の強参照を持って
+    // いたため`input_rx.recv()`が決してNoneにならず、全ての`RebindDriverHandle`が
+    // 破棄されてもループが終わらなかった。ループはexecutor(=noq Endpoint・Kotlinから
+    // 受け取ったUDP fdを握るrebind listener)とobserverを所有しているため、マルチ
+    // パスセッションごとにそれらがリークしていた。ループ内部からの自己送信は
+    // 弱参照経由にし、外部ハンドルが全て無くなったらループを終了させる。
+    let loop_input_tx = input_tx.downgrade();
 
     tokio::spawn(async move {
         let mut manager = RebindManager::new();
@@ -145,7 +161,7 @@ fn dispatch<F, W, R, Q>(
     executor: &Arc<R>,
     quiet_source: &Arc<Q>,
     observer: &Arc<dyn RebindStateObserver>,
-    input_tx: &tokio::sync::mpsc::Sender<RebindEvent>,
+    input_tx: &tokio::sync::mpsc::WeakSender<RebindEvent>,
 ) where
     F: PlatformFdSource + 'static,
     W: WifiProbeExecutor + 'static,
@@ -177,7 +193,10 @@ fn dispatch<F, W, R, Q>(
                 spawn_acquire_and_rebind(fd_source.clone(), executor.clone(), FdKind::Wifi);
             }
             RebindAction::StartWifiProbe => {
-                spawn_probe(fd_source.clone(), probe.clone(), input_tx.clone());
+                // 外部ハンドルが全て破棄済み(=セッション終了済み)なら疎通確認は不要。
+                if let Some(tx) = input_tx.upgrade() {
+                    spawn_probe(fd_source.clone(), probe.clone(), tx);
+                }
             }
         }
     }
@@ -426,7 +445,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut watch = QuietWatchRuntime::new();
 
-        watch.start(quiet_source.clone(), tx);
+        watch.start(quiet_source.clone(), tx.downgrade());
         assert_eq!(rx.recv().await, Some(RebindEvent::TrafficQuietDetected));
 
         quiet_source.quiet.store(false, Ordering::SeqCst);
@@ -441,7 +460,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut watch = QuietWatchRuntime::new();
 
-        watch.start(quiet_source.clone(), tx);
+        watch.start(quiet_source.clone(), tx.downgrade());
         assert_eq!(rx.recv().await, Some(RebindEvent::TrafficQuietDetected));
         watch.stop();
 
@@ -459,13 +478,29 @@ mod tests {
         let (tx2, mut rx2) = tokio::sync::mpsc::channel(4);
         let mut watch = QuietWatchRuntime::new();
 
-        watch.start(quiet_source.clone(), tx1);
+        watch.start(quiet_source.clone(), tx1.downgrade());
         assert_eq!(rx1.recv().await, Some(RebindEvent::TrafficQuietDetected));
 
-        watch.start(quiet_source.clone(), tx2);
+        watch.start(quiet_source.clone(), tx2.downgrade());
         assert_eq!(rx2.recv().await, Some(RebindEvent::TrafficQuietDetected));
 
         tokio::time::sleep(QUIET_POLL_INTERVAL + Duration::from_millis(200)).await;
         assert!(rx1.try_recv().is_err(), "古いchannelへはもう送られないはず");
+    }
+
+    /// RC-15: 外部の`RebindDriverHandle`が全て破棄されたらDriverのループは終了し、
+    /// 所有していたexecutor(本番ではnoq Endpointとfdを握るrebind listenerへの送信端)を
+    /// 解放する。以前はループ自身が送信端の強参照を持っていたため永遠に終わらなかった。
+    #[tokio::test]
+    async fn driver_loop_exits_once_all_handles_are_dropped() {
+        let fd_source = Arc::new(FakeFdSource::new(true));
+        let probe = Arc::new(FakeProbe::new(true));
+        let executor = Arc::new(FakeExecutor::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let handle = spawn_rebind_driver(fd_source, probe, executor.clone(), quiet_source, observer);
+        assert!(Arc::strong_count(&executor) >= 2);
+        drop(handle);
+        wait_until(|| Arc::strong_count(&executor) == 1).await;
     }
 }
