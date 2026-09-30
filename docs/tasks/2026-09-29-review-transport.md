@@ -74,8 +74,12 @@ openssh-config / osc-color(quicsock は vendored)。
 
 - [x] **TR-L1** `warm_standby.rs:258-263` — `promote` がキャンセルされると `promoting` が true のまま残る → RAII ガードで戻す(H1 と同じコミット)。
 - [x] **TR-L2** `isekai-transport/src/multipath.rs:189-191,226-231` — 同じ PathId にヘルスモニタが二重に起動しうる → 起動済みの PathId を集合で管理して重複を防ぐ。
-- [x] **TR-L3** `path_health_fsm.rs:111-116` / `path_health.rs:204-208` — NoViablePath が毎チェック繰り返し通知される → エッジトリガー(状態が変化したときだけ通知)にする。
-- [x] **TR-L4** `path_health.rs:210-217` — RTT/ロス劣化で Degraded になっても NoViablePath を通知しない(doc と矛盾) → 通知する。
+- [x] **TR-L3** `path_health_fsm.rs:111-116` / `path_health.rs:204-208` — NoViablePath が毎チェック繰り返し通知される。
+  対応: 通知は「全パスが非 Validated になった」エピソードごとに1回だけ送る(`PathHealthTracker` で重複を排除し、Validated に戻ったら再アームする)。
+  FSM 側はレベルトリガーのまま残した。他のパスが後から劣化したケースも判定できるようにするため。
+- [x] **TR-L4** `path_health.rs:210-217` — RTT/ロス劣化で Degraded になっても NoViablePath を通知しない(doc と矛盾)。
+  対応: doc の方を実装に合わせて修正した。RTT/ロス劣化では通知しない挙動は、実機で検証済みの Phase 9-5 の意図的な設計である。
+  NoViablePath は Android のセルラー・フェイルオーバーを駆動するため、混雑しているだけの Wi-Fi で誤フェイルオーバーさせないようにしている。
 - [x] **TR-L5** `resume.rs:142,214-220,582-589` — CONTROL_ACK の session_id を、自分が送った値と照合していない → 照合し、不一致なら ControlHandshake エラーにする。
 - [x] **TR-L6** `resume.rs:497-503,526-532` — GaveUpAfterGenerationRetries に原因の失敗が残らない → 最後の失敗を保持する。
 - [x] **TR-L7** `race.rs:53` — Happy Eyeballs の遅延 250ms が punch の最低所要 ~750ms より短い → production 既定(`isekai-pipe-core` の 750ms)に揃える。
@@ -89,8 +93,8 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L13a** `noq_backend.rs:32` — `candidate_ports` が start>end で underflow する → 空集合を返す。
 - [x] **TR-L13b** `noq_backend.rs:52-66` — ポート範囲の bind を最大 65536 回同期的に試行する → 試行回数に上限を設ける。
 - [x] **TR-L14** `relay_client.rs:321-325` — RelayUdpSocket を drop しても外側の接続を閉じない → socket の drop を検知して driver タスクを終了させる(H2 と同じコミット)。
-- [ ] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
-  注: 本項目は quicmux/src/resume.rs のため、「quicmux の resume*.rs は isekai-pipe 担当」の境界に該当する。isekai-pipe 側が触らない場合のみ対応する。
+- [~] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
+  見送り(担当境界): `quicmux/src/resume*.rs` は isekai-pipe 担当(fix-isekai-pipe)の領域。
 - [x] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
 - [x] **TR-L16b** `h3-qmux/src/lib.rs:253` — peer の close code を捨てている → code を保持する。
 - [x] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
@@ -102,20 +106,30 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L21a** `isekai-stun/src/lib.rs:103-105` — XOR-MAPPED のデコード失敗時に MAPPED-ADDRESS へフォールバックしない → フォールバックする。
 - [x] **TR-L21b** `isekai-stun/src/lib.rs:211` — 無関係なデータグラムで試行回数を消費する → transaction id が一致しない応答は読み捨て、同じ試行内で待ち続ける。
 - [x] **TR-L21c** `isekai-stun/src/lib.rs:205` — 送信元の比較が v4-mapped v6 を考慮していない → to_canonical で比較する。
-- [x] **TR-L22** `isekai-trust/src/normalize.rs:48` — 裸の IPv6 を誤って分割する。大文字小文字も正規化していない → 修正する。
+- [x] **TR-L22** `isekai-trust/src/normalize.rs:48` — 裸の IPv6 を誤って分割する。大文字小文字も正規化していない。
+  対応: IPv6 は `[v6]:port` に正規化する。大文字小文字は意図的に畳み込まない(doc に明記)。
+  このキーで保存済みの trust エントリがあり、畳み込むと大文字を含むホストのエントリがすべて孤立して TOFU がやり直しになるため。
 - [x] **TR-L23** `isekai-protocol/src/bootstrap.rs:113` — validate_remote_path が先頭 `-` を許している(オプション注入) → 拒否する。
 - [~] **TR-L24** `isekai-trust/src/host_key_verifier.rs:97` — TOFU プロンプトの spawn_blocking がキャンセル後も残る。
   見送り: std の stdin 読み取りはキャンセルできない。現状キャンセルする呼び出し元も無い(latent)。回避には stdin 読み取りスレッドの共有化が必要で、isekai-ssh 側の設計変更になる。
-- [x] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している → symlink_metadata+uid 検証を行い、秘密ファイルの group/world 読み取りを拒否する。
+- [x] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している。
+  対応: 所有者が自分または root であることを検証する。symlink は dotfiles 運用を考慮して辿り、辿った先を検証する。
+  group/world から読める秘密ファイルは、拒否すると接続できなくなるだけなので、自分の所有であれば 0600 に是正する。
 - [x] **TR-L25b** `isekai-fs-guard/src/lib.rs:298-302` — persist の前に fsync していない → sync_all する。
 - [x] **TR-L25c** `isekai-fs-guard/src/windows_acl.rs:234-263` — inherit-only ACE を誤検知して fail-closed になる → INHERIT_ONLY_ACE を無視する。
 - [x] **TR-L26a** `isekai-netmon/src/macos.rs:80-90,109-114` — run 開始前の stop が失われ、join が永久に待つ → 停止フラグと run ループの再確認で防ぐ。
-- [x] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms) → 維持するか、detach にするかを検討する。
+- [x] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms)。
+  対応: join をやめて detach にした。worker は自分の fd を所有しており、1 tick(100ms)以内に自分で閉じて終了する。
 - [x] **TR-L26c** `isekai-netmon/src/linux.rs:86` — socket に CLOEXEC が無い → SOCK_CLOEXEC を付ける。
 - [x] **TR-L26d** `isekai-netmon/src/linux.rs:141-154` — EAGAIN 以外のエラーでも即座にリトライし、busy loop になる → バックオフする。致命的なエラーでは終了する。
 - [x] **TR-L27a** `openssh-config/src/lib.rs:190-241` — `%` トークンを展開しない → HostName 等の基本トークン(%h %p %r %u %n %%)を展開する。
 - [x] **TR-L27b** `openssh-config/src/lib.rs:492-548` — Host 照合が大文字小文字を区別する → 区別しないようにする。
 - [x] **TR-L28** `local-ipc-mux/src/framing.rs:35-58` — read_frame がキャンセル非安全であることが doc に無い → 追記する。
-- [ ] **TR-L29a** `russh-stream-session/src/lib.rs:386,393,402-410` — connect/handshake にタイムアウトが無い → タイムアウトを付ける。
-- [ ] **TR-L29b** `russh-stream-session/src/lib.rs:572-576` — keyboard-interactive の回答をゼロ化しない → zeroize する。
-- [ ] **TR-L29c** `russh-stream-session/src/lib.rs:214-253` — ForwardRoutes のキューが無制限 → bounded にする。
+- [x] **TR-L29a** `russh-stream-session/src/lib.rs:386,393,402-410` — connect/handshake にタイムアウトが無い。
+  対応: TCP connect と jump の direct-tcpip open を 30 秒で包んだ。
+  SSH handshake 自体には付けていない。対話的な初回 TOFU プロンプトを含むため人間の応答を待つ場合があり、停止した peer は呼び出し側の russh Config の inactivity/keepalive で抑える。
+- [~] **TR-L29b** `russh-stream-session/src/lib.rs:572-576` — keyboard-interactive の回答をゼロ化しない。
+  見送り: 回答の `Vec<String>` は russh の `authenticate_keyboard_interactive_respond` が所有権ごと受け取り、以後触る手段が無い。こちら側に残るコピーも無いので、zeroize しても効果が無い(russh 側の変更が必要)。
+- [~] **TR-L29c** `russh-stream-session/src/lib.rs:214-253` — ForwardRoutes のキューが無制限。
+  見送り(担当境界): bounded 化すると `register` の戻り値の型が変わり、isekai-ssh の `CtlForward`(`native/mux/ctl_forward.rs`)と `build_relay.rs` の変更が必要になる。
+  実害も小さい。channel を作れるのはリモート上で owner 権限(0600)の forward ソケットに接続できる者だけ。
