@@ -80,7 +80,7 @@
 - [x] **SSH-25** Low `wrapper.rs:1427-1429`(A13-1)
   - 要約: `max_by_key` は同順位で最後の要素を返すため、first-match-wins 規約と逆になる。
   - 方針: 同順位では先頭を選ぶ。複数 candidate を順に試す fallback は bootstrap 全体の再構成になるため、このタスクには含めない。
-- [ ] **SSH-26** Low `helper_download.rs:256-271` / `wrapper.rs:1498-1520`(A13-2)
+- [x] **SSH-26** Low `helper_download.rs:256-271` / `wrapper.rs:1498-1520`(A13-2)
   - 要約: キャッシュが空のときのダウンロード失敗が `RemoteBinaryMissing`(再試行不可)になる。
   - 方針: 自動ダウンロード(明示 `--isekai-helper-binary` なし)の失敗は、ネットワーク起因として再試行可能に分類する。
 - [~] **SSH-27** Low `openssh.rs:105`(A13-3)— BatchMode での host key/認証失敗(exit 255)が `JumpHostUnreachable` に誤分類される。
