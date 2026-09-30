@@ -23,7 +23,7 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-H2** High `isekai-link-masque/src/relay_client.rs:358-366` — `send_datagram` のエラーは TooLarge を含めて何でも break し、`serve --relay` の送信方向が恒久停止する。
   - 方針: TooLarge はそのデータグラムだけ捨てて継続し、NotAvailable/ConnectionError のときだけ終了する。
     内側 endpoint の MTU 上限は不要と判断した。noq の PMTUD(既定で有効、上限 1452)のプローブが捨てられても、プローブ損失として処理されるだけなので正常に動く。
-- [ ] **TR-H3** High `isekai-netmon/src/linux.rs:91-95,143-150` / `windows.rs:81-87` — 無関係な netlink メッセージ(veth・docker・経路変更・RA)でも `InterfaceChange` を送り、再接続を引き起こす。debounce も無い。
+- [x] **TR-H3** High `isekai-netmon/src/linux.rs:91-95,143-150` / `windows.rs:81-87` — 無関係な netlink メッセージ(veth・docker・経路変更・RA)でも `InterfaceChange` を送り、再接続を引き起こす。debounce も無い。
   - 方針: nlmsghdr/ifaddrmsg/rtmsg/ifinfomsg を解析する。対象は ①ループバック以外のアドレス追加・削除(集合の差分で判定)、
     ②main テーブルの default route の追加・削除、③ループバック以外の IF で IFF_RUNNING が変化したとき。これを 300ms debounce する。
     Windows は通知を受けたら IP アドレス集合と既定経路のスナップショットを取り直し、変化した場合のみ送る。こちらも debounce する。
@@ -109,10 +109,10 @@ openssh-config / osc-color(quicsock は vendored)。
 - [ ] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している → symlink_metadata+uid 検証を行い、秘密ファイルの group/world 読み取りを拒否する。
 - [ ] **TR-L25b** `isekai-fs-guard/src/lib.rs:298-302` — persist の前に fsync していない → sync_all する。
 - [ ] **TR-L25c** `isekai-fs-guard/src/windows_acl.rs:234-263` — inherit-only ACE を誤検知して fail-closed になる → INHERIT_ONLY_ACE を無視する。
-- [ ] **TR-L26a** `isekai-netmon/src/macos.rs:80-90,109-114` — run 開始前の stop が失われ、join が永久に待つ → 停止フラグと run ループの再確認で防ぐ。
-- [ ] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms) → 維持するか、detach にするかを検討する。
-- [ ] **TR-L26c** `isekai-netmon/src/linux.rs:86` — socket に CLOEXEC が無い → SOCK_CLOEXEC を付ける。
-- [ ] **TR-L26d** `isekai-netmon/src/linux.rs:141-154` — EAGAIN 以外のエラーでも即座にリトライし、busy loop になる → バックオフする。致命的なエラーでは終了する。
+- [x] **TR-L26a** `isekai-netmon/src/macos.rs:80-90,109-114` — run 開始前の stop が失われ、join が永久に待つ → 停止フラグと run ループの再確認で防ぐ。
+- [x] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms) → 維持するか、detach にするかを検討する。
+- [x] **TR-L26c** `isekai-netmon/src/linux.rs:86` — socket に CLOEXEC が無い → SOCK_CLOEXEC を付ける。
+- [x] **TR-L26d** `isekai-netmon/src/linux.rs:141-154` — EAGAIN 以外のエラーでも即座にリトライし、busy loop になる → バックオフする。致命的なエラーでは終了する。
 - [ ] **TR-L27a** `openssh-config/src/lib.rs:190-241` — `%` トークンを展開しない → HostName 等の基本トークン(%h %p %r %u %n %%)を展開する。
 - [ ] **TR-L27b** `openssh-config/src/lib.rs:492-548` — Host 照合が大文字小文字を区別する → 区別しないようにする。
 - [ ] **TR-L28** `local-ipc-mux/src/framing.rs:35-58` — read_frame がキャンセル非安全であることが doc に無い → 追記する。

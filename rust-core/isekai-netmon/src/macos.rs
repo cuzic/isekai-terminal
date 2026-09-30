@@ -10,8 +10,13 @@
 //!
 //! `SCNetworkReachability` callbacks are only ever delivered by pumping a
 //! `CFRunLoop`, so this backend owns a dedicated background thread whose
-//! entire job is running that run loop; `Drop` asks it to stop
-//! (`CFRunLoop::stop`, safe to call cross-thread by design) and joins it.
+//! entire job is running that run loop; `Drop` sets a stop flag, asks it to
+//! stop (`CFRunLoop::stop`, safe to call cross-thread by design) and joins
+//! it. The thread runs the loop in bounded slices ([`RUN_SLICE`]) and
+//! re-checks the flag between them: a bare `CFRunLoop::run_current()` could
+//! miss a `stop()` that arrived after `new()` returned but before the run
+//! actually started (CoreFoundation resets the stop request when a run
+//! begins), leaving `Drop`'s `join()` waiting forever.
 //!
 //! **Not verified against a real macOS machine** — this development
 //! environment is Linux-only. Verified so far: `cargo check --target
@@ -20,11 +25,13 @@
 //! macOS SDK) and execution could not be attempted here.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::runloop::{kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop};
 use system_configuration::network_reachability::SCNetworkReachability;
 use tokio::sync::mpsc;
 
@@ -37,9 +44,14 @@ use crate::{NetworkChangeCause, NetworkChangeEvent, NetworkChangeMonitor};
 /// for this monitor's entire lifetime.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest single `CFRunLoop` run between stop-flag checks — also the
+/// upper bound on how long `Drop` can block joining the thread.
+const RUN_SLICE: Duration = Duration::from_millis(250);
+
 pub struct MacosNetworkChangeMonitor {
     receiver: mpsc::UnboundedReceiver<NetworkChangeEvent>,
     run_loop: CFRunLoop,
+    stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -47,6 +59,8 @@ impl MacosNetworkChangeMonitor {
     pub fn new() -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (setup_tx, setup_rx) = std_mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
 
         let worker = std::thread::Builder::new()
             .name("isekai-netmon-macos".to_string())
@@ -84,10 +98,21 @@ impl MacosNetworkChangeMonitor {
                     return;
                 }
 
-                // Blocks this thread, delivering `reachability`'s callback
-                // on every network-path change, until `Drop` calls
-                // `run_loop.stop()` from another thread.
-                CFRunLoop::run_current();
+                // Delivers `reachability`'s callback on every network-path
+                // change, in bounded slices so a stop request can never be
+                // lost (see module docs).
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    // SAFETY: `kCFRunLoopDefaultMode` is an Apple-provided
+                    // constant; `reachability` is scheduled in the common
+                    // modes, which include the default mode.
+                    let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, RUN_SLICE, false);
+                    if started.elapsed() < Duration::from_millis(10) {
+                        // Returned immediately (stopped/finished): don't spin.
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                drop(reachability);
             })
             .map_err(|e| format!("failed to spawn the network-reachability thread: {e}"))?;
 
@@ -95,7 +120,7 @@ impl MacosNetworkChangeMonitor {
             .recv_timeout(STARTUP_TIMEOUT)
             .map_err(|e| format!("timed out waiting for the network-reachability thread to start: {e}"))??;
 
-        Ok(Self { receiver: event_rx, run_loop, worker: Some(worker) })
+        Ok(Self { receiver: event_rx, run_loop, stop, worker: Some(worker) })
     }
 }
 
@@ -108,6 +133,7 @@ impl NetworkChangeMonitor for MacosNetworkChangeMonitor {
 
 impl Drop for MacosNetworkChangeMonitor {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
         self.run_loop.stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
