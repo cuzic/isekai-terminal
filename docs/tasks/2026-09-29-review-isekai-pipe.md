@@ -89,7 +89,7 @@
 
 ## 他領域からの連携依頼
 
-- [ ] **PIPE-18** (連携: isekai-ssh A2) `isekai-pipe-core/src/outcome.rs::ConnectOutcome`
+- [x] **PIPE-18** (連携: isekai-ssh A2) `isekai-pipe-core/src/outcome.rs::ConnectOutcome`
   - 要約: relay経路のresume window枯渇・cross-family fallback・panicはSSHバイトが流れた後でも `Unreachable` を書くため、
     wrapperがpre-handshake失敗とmid-session失敗を区別できず `isekai-ssh host -- cmd` のリモートコマンドを再実行し得る。
   - 方針: `#[serde(default)] session_established: bool` を追加(後方互換)。`run_resume_loop`(SSHバイトが流れる唯一の経路)

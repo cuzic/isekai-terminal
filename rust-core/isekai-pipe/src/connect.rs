@@ -588,6 +588,7 @@ fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
         profile: profile.to_string(),
         class,
         detail: format!("{err:#}"),
+        session_established: crate::resume_loop::ssh_bridge_went_live(),
     };
     if let Err(e) = isekai_pipe_core::write_connect_outcome(&runtime_dir, &outcome) {
         log::warn!("isekai-pipe connect: failed to record a connect outcome: {e}");
