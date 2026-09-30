@@ -1470,15 +1470,19 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         if e.downcast_ref::<BootstrapFailure>().is_some() {
             return e;
         }
-        let e = if helper_binary_was_explicit {
-            e
-        } else {
-            e.context(
-                "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host) and \
-                 auto-download failed; auto-bootstrap needs a local isekai-helper binary to upload",
-            )
-        };
-        e.context(BootstrapFailure::RemoteBinaryMissing)
+        if helper_binary_was_explicit {
+            // An explicit `--isekai-helper-binary` that can't be read is a
+            // local configuration problem, not something a retry fixes.
+            return e.context(BootstrapFailure::RemoteBinaryMissing);
+        }
+        // Auto-download failed (review 2026-09-29, SSH-26): overwhelmingly a
+        // transient network/GitHub failure, so classified retryable instead
+        // of the permanent `RemoteBinaryMissing` it used to share.
+        e.context(
+            "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host) and \
+             auto-download failed; auto-bootstrap needs a local isekai-helper binary to upload",
+        )
+        .context(BootstrapFailure::HelperDownloadFailed)
     })?;
     let helper_sha256 = isekai_trust::hex_sha256(&helper_binary);
 
