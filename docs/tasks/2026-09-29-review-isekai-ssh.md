@@ -43,7 +43,7 @@
 - [x] **SSH-12** Medium `native/connect.rs:676`
   - 要約: 非 mux 直結経路の 1 秒 grace が、resume 中の child を kill する。
   - 方針: SSH-03 で keepalive による SSH 層の早期死は除去される。残る「child 側が outcome を書き終える前」の窓も、grace を 5s に延ばして縮める。
-- [ ] **SSH-13** Medium `russh_backend.rs:475-481`
+- [x] **SSH-13** Medium `russh_backend.rs:475-481`
   - 要約: bootstrap 時の TOFU プロンプトにホスト名が出ず、jump/target のどちらを承認しているか分からない。
   - 方針: 対話ポリシーを leg ごとの `host:port` 付きクロージャで構築し、プロンプトに表示する。
 - [ ] **SSH-14** Medium/Low `native/connect.rs:806-813`
