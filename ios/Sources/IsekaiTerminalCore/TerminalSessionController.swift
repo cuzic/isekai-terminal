@@ -143,6 +143,48 @@ private final class AgentSignResultBox: @unchecked Sendable {
     var approved = false
 }
 
+/// `SessionOrchestrator`(Rust)に渡す`OrchestratorCallback`の弱参照プロキシ。
+///
+/// Rust側はcallbackを強参照で保持し続けるため、`TerminalSessionController`自身を渡すと
+/// 循環参照になり、タブを閉じてもcontrollerが解放されない(2026-09-29レビューIOS-I1)。
+/// このプロキシは`target`を弱参照で持ち、各コールバックをそのまま転送するだけ。
+/// `target`が既に解放されていれば何もしない(同期的に値を返すコールバックは、
+/// 「拒否/取得不可」を意味する`false`/`nil`を返す)。
+final class WeakOrchestratorCallback: OrchestratorCallback, @unchecked Sendable {
+    // weak参照の読み書き自体はSwiftランタイムがスレッド安全に扱う。
+    private weak var target: TerminalSessionController?
+
+    init(target: TerminalSessionController) {
+        self.target = target
+    }
+
+    func onConnectionStateChanged(state: ConnectionPublicState) { target?.onConnectionStateChanged(state: state) }
+    func onScreenUpdate(update: ScreenUpdate) { target?.onScreenUpdate(update: update) }
+    func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool {
+        target?.onHostKey(host: host, port: port, fingerprint: fingerprint) ?? false
+    }
+    func onData(data: Data) { target?.onData(data: data) }
+    func onTrzszStateChanged(state: TrzszPublicState) { target?.onTrzszStateChanged(state: state) }
+    func onDownloadComplete(fileName: String?, data: Data) { target?.onDownloadComplete(fileName: fileName, data: data) }
+    func onNoViablePath() { target?.onNoViablePath() }
+    func onForwardStateChanged(id: String, state: ForwardState) { target?.onForwardStateChanged(id: id, state: state) }
+    func onAgentSignRequest(keyFingerprint: String) -> Bool {
+        target?.onAgentSignRequest(keyFingerprint: keyFingerprint) ?? false
+    }
+    func onClipboardWrite(payload: ClipboardPayload) { target?.onClipboardWrite(payload: payload) }
+    func onClipboardPullRequest() -> ClipboardPayload? { target?.onClipboardPullRequest() }
+    func onRequestWifiFd() -> PlatformFd? { target?.onRequestWifiFd() }
+    func onRequestCellularFd() -> PlatformFd? { target?.onRequestCellularFd() }
+    func onRebindStateChanged(state: RebindPublicState) { target?.onRebindStateChanged(state: state) }
+    func onNotify(kind: NotifyKind) { target?.onNotify(kind: kind) }
+    func onPromptJump(target promptTarget: PromptJumpTarget?) { target?.onPromptJump(target: promptTarget) }
+    func onPromptOutputCopyReady(text: String?) { target?.onPromptOutputCopyReady(text: text) }
+    func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {
+        target?.onFilePreviewResult(requestId: requestId, outcome: outcome)
+    }
+    func onForegroundResume(didReconnect: Bool) { target?.onForegroundResume(didReconnect: didReconnect) }
+}
+
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
 /// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
 let defaultStunServer = "stun.l.google.com:19302"
@@ -226,12 +268,24 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         self.relayVault = relayVault
         self.trustStore = trustStore
         self.clientIdentityStore = clientIdentityStore
-        self.orchestrator = createSessionOrchestrator(callback: self)
+        // Rust側の`SessionOrchestrator`はcallbackを強参照で保持し続けるため、`self`を直接
+        // 渡すと「controller → orchestrator → callback(controller)」の循環参照になり、
+        // タブを閉じてもdeinitされず認証情報・scrollback・NWPathMonitorが生き残っていた
+        // (2026-09-29レビューIOS-I1)。弱参照プロキシを渡して循環を断つ。
+        self.orchestrator = createSessionOrchestrator(callback: WeakOrchestratorCallback(target: self))
         startNetworkPathMonitoring()
     }
 
     deinit {
         networkPathMonitor.cancel()
+        // 閉じ忘れ(closeTabを経由しない解放)でもRust側のセッションを残さない。deinitは
+        // Rustのコールバックスレッド上(`WeakOrchestratorCallback`が一時的に強参照を
+        // 取っている最中に最後の参照が外れた場合)で走りうるため、Rust側のロックと
+        // 競合しないよう、切断とorchestrator自体の解放は別スレッドで行う。
+        let orchestrator = self.orchestrator
+        DispatchQueue.global(qos: .utility).async {
+            orchestrator?.disconnect()
+        }
     }
 
     /// Phase 1C(#26): `NWPathMonitor`の生イベントをそのまま`orchestrator`へ転送する。
