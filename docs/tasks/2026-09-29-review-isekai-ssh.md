@@ -119,7 +119,7 @@
 - [ ] **SSH-39** Low `helper_download.rs:247,107`(D4)
   - 要約: キャッシュが `/tmp/isekai-ssh-helpers` に fallback し、所有者/権限を確認していない。キャッシュ済みバイトも再検証しない。
   - 方針: fallback を uid 付きディレクトリにし、0700 と所有者を確認する。キャッシュ書き込み時の sha256 を sidecar に保存し、読み出し時に照合する。
-- [ ] **SSH-40** Low `helper_download.rs:415-429`(D5)
+- [x] **SSH-40** Low `helper_download.rs:415-429`(D5)
   - 要約: latest download と tag 取得の間の競合で、新 tag に旧 binary を紐付けうる。
   - 方針: 先に tag を取得し、その tag の URL からダウンロードする。
 - [x] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
