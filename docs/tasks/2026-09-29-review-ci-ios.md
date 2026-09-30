@@ -88,9 +88,10 @@
 - [ ] **CI-L4** (Low) `rust-core/scripts/ios-fixture/start-sshd-fixture.sh:21-22`
   - 要約: 相対パスの FIXTURE_DIR で `cd` 後のパスが二重になる。
   - 修正方針: `mkdir -p` 後に絶対パス化する。
-- [ ] **CI-L5** (Low) `android-test-check.yml:70-78`
+- [x] **CI-L5** (Low) `android-test-check.yml:70-78`
   - 要約: NDK バージョンの参照元 `fdroid/tools.isekai.terminal.yml` が pr-path-gate のパターンにない。
   - 修正方針: `^fdroid/` を patterns と push.paths に追加。
+  - 対応: `^fdroid/` を pr-path-gate の patterns に、`fdroid/**` を push.paths に追加。
 - [ ] **CI-L6** (Low) `scripts/lib/adb_ui.py:193-196,220-224`
   - 要約: `input text` のエスケープが不完全(`*?~#!{[`、改行、`%`)。
   - 修正方針: デバイス側シェルへは単一引用符でクォートする共通関数に置き換え、表現不能な入力(改行・`%s`)は明示的にエラーにする。単体テストを追加。

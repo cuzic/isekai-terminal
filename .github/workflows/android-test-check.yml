@@ -26,6 +26,8 @@ on:
       - "*.gradle.kts"
       - "gradle.properties"
       - "settings.gradle.kts"
+      # NDKバージョンの参照元(下の「Install the NDK version pinned by the F-Droid recipe」)。
+      - "fdroid/**"
       - ".github/workflows/android-test-check.yml"
   # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
   # protectionのrequired status checkにする際、path-filter付きpull_requestは
@@ -74,6 +76,7 @@ jobs:
             ^[^/]+\.gradle\.kts$
             ^gradle\.properties$
             ^settings\.gradle\.kts$
+            ^fdroid/
             ^\.github/workflows/android-test-check\.yml$
             ^\.github/actions/pr-path-gate/
 
