@@ -106,9 +106,9 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L23** `isekai-protocol/src/bootstrap.rs:113` — validate_remote_path が先頭 `-` を許している(オプション注入) → 拒否する。
 - [~] **TR-L24** `isekai-trust/src/host_key_verifier.rs:97` — TOFU プロンプトの spawn_blocking がキャンセル後も残る。
   見送り: std の stdin 読み取りはキャンセルできない。現状キャンセルする呼び出し元も無い(latent)。回避には stdin 読み取りスレッドの共有化が必要で、isekai-ssh 側の設計変更になる。
-- [ ] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している → symlink_metadata+uid 検証を行い、秘密ファイルの group/world 読み取りを拒否する。
-- [ ] **TR-L25b** `isekai-fs-guard/src/lib.rs:298-302` — persist の前に fsync していない → sync_all する。
-- [ ] **TR-L25c** `isekai-fs-guard/src/windows_acl.rs:234-263` — inherit-only ACE を誤検知して fail-closed になる → INHERIT_ONLY_ACE を無視する。
+- [x] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している → symlink_metadata+uid 検証を行い、秘密ファイルの group/world 読み取りを拒否する。
+- [x] **TR-L25b** `isekai-fs-guard/src/lib.rs:298-302` — persist の前に fsync していない → sync_all する。
+- [x] **TR-L25c** `isekai-fs-guard/src/windows_acl.rs:234-263` — inherit-only ACE を誤検知して fail-closed になる → INHERIT_ONLY_ACE を無視する。
 - [x] **TR-L26a** `isekai-netmon/src/macos.rs:80-90,109-114` — run 開始前の stop が失われ、join が永久に待つ → 停止フラグと run ループの再確認で防ぐ。
 - [x] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms) → 維持するか、detach にするかを検討する。
 - [x] **TR-L26c** `isekai-netmon/src/linux.rs:86` — socket に CLOEXEC が無い → SOCK_CLOEXEC を付ける。
