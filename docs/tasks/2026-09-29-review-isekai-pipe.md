@@ -9,7 +9,7 @@
 
 ## High
 
-- [ ] **PIPE-01** (High) `isekai-pipe/src/main.rs::parse_serve`
+- [x] **PIPE-01** (High) `isekai-pipe/src/main.rs::parse_serve`
   - 要約: `parse_serve` の許可リストに `--bind-port-range` / `--relay-transport` が無く、
     bootstrap(`isekai-bootstrap/src/install_script.rs`)が生成する起動引数を `EX_USAGE` で拒否する。
     サイレント再デプロイでも同じ引数で同じ失敗を繰り返す(always-connects違反)。mainでも有効。

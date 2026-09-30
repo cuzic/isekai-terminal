@@ -78,7 +78,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// one in-flight read/write) to notice `preempt` and return.
 const PREEMPT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Args {
+pub(crate) struct Args {
     target: SocketAddr,
     service_name: String,
     bind: SocketAddr,
@@ -254,7 +254,43 @@ fn print_help() {
     println!("    -h, --help                     print this help message");
 }
 
-fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
+/// Value-taking options `isekai-pipe serve` (`main.rs::parse_serve`) forwards
+/// verbatim (option + its value) to [`parse_args_from`]. `--target`/
+/// `--service-name` are deliberately absent: `parse_serve` owns those itself
+/// (`--service`/`--target` → `ServiceSpec`) and appends them afterwards.
+///
+/// This list is the **single** source `parse_serve` consults — it used to
+/// keep its own hand-maintained allow-list, which silently fell behind this
+/// engine: `--bind-port-range`/`--relay-transport` were implemented here but
+/// rejected by `parse_serve` as "unsupported option", so every bootstrap that
+/// generated either flag (`isekai-bootstrap::install_script`) failed on every
+/// silent re-deploy too — a permanent connect failure
+/// (`.claude/rules/always-connects.md`). `serve_forwarded_options_tests`
+/// pins every entry as actually known to [`parse_args_from`].
+pub(crate) const SERVE_FORWARDED_VALUE_OPTIONS: &[&str] = &[
+    "--bind",
+    "--bind-port-range",
+    "--idle-timeout",
+    "--resume-window",
+    "--resume-buffer-size",
+    "--max-idle-lifetime",
+    "--max-sessions",
+    "--stun-server",
+    "--punch-peer",
+    "--relay",
+    "--relay-sni",
+    "--relay-transport",
+    "--relay-jwt",
+    "--relay-jwt-file",
+    "--bootstrap-request-file",
+    "--log-level",
+];
+
+/// Value-less flags `isekai-pipe serve` forwards verbatim — see
+/// [`SERVE_FORWARDED_VALUE_OPTIONS`].
+pub(crate) const SERVE_FORWARDED_FLAG_OPTIONS: &[&str] = &["--once"];
+
+pub(crate) fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut target: SocketAddr = "127.0.0.1:22".parse().unwrap();
     let mut service_name = "ssh".to_string();
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -2107,5 +2143,37 @@ mod bind_port_range_tests {
         let socket =
             bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port.saturating_add(31)))).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), held_port);
+    }
+}
+
+#[cfg(test)]
+mod serve_forwarded_options_tests {
+    use super::*;
+
+    /// Every option `main.rs::parse_serve` forwards must be one this engine
+    /// actually recognizes — otherwise `parse_serve` would accept a flag the
+    /// engine then rejects as `unknown argument` (the mirror image of the
+    /// drift that let `parse_serve` reject `--bind-port-range`/
+    /// `--relay-transport` while the engine supported both).
+    #[test]
+    fn every_forwarded_value_option_is_known_to_the_engine() {
+        for opt in SERVE_FORWARDED_VALUE_OPTIONS {
+            // Missing value on purpose: a known value-taking option fails
+            // with "<opt> requires a value", an unknown one with
+            // "unknown argument".
+            let Err(err) = parse_args_from([opt.to_string()]) else {
+                panic!("{opt} without a value unexpectedly parsed");
+            };
+            let msg = format!("{err:#}");
+            assert!(!msg.contains("unknown argument"), "{opt} is forwarded by serve but unknown to the engine: {msg}");
+            assert!(msg.contains("requires a value"), "{opt}: unexpected error {msg}");
+        }
+    }
+
+    #[test]
+    fn every_forwarded_flag_option_is_known_to_the_engine() {
+        for opt in SERVE_FORWARDED_FLAG_OPTIONS {
+            assert!(parse_args_from([opt.to_string()]).is_ok(), "{opt} is forwarded by serve but rejected by the engine");
+        }
     }
 }
