@@ -183,11 +183,7 @@ impl AttachToken {
     }
 
     pub fn ct_eq(&self, other: &AttachToken) -> bool {
-        let mut diff = 0u8;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            diff |= a ^ b;
-        }
-        diff == 0
+        subtle::ConstantTimeEq::ct_eq(&self.0[..], &other.0[..]).into()
     }
 }
 
@@ -219,11 +215,7 @@ impl AttachProof {
     }
 
     pub fn ct_eq(&self, other: &AttachProof) -> bool {
-        let mut diff = 0u8;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            diff |= a ^ b;
-        }
-        diff == 0
+        subtle::ConstantTimeEq::ct_eq(&self.0[..], &other.0[..]).into()
     }
 }
 
