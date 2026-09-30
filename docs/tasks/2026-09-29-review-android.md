@@ -106,11 +106,11 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   `finally { set(null) }`が2件目のdeferredを消す。
   - 方針: `compareAndSet(deferred, null)`にし、表示中fingerprintも自分の分だけ消す。
     加えて、UIは1件しか出せず応答不能になった先行分は即座に拒否で返す(従来も25秒後にサイレント拒否だった)。
-- [ ] **AND-L3** (Low) `KeyManager.kt:13` / `KeystoreKek.kt:74` — `KeyEntry.kekAlias`に実際とは違う
+- [x] **AND-L3** (Low) `KeyManager.kt:13` / `KeystoreKek.kt:74` — `KeyEntry.kekAlias`に実際とは違う
   エイリアス(`tssh_kek_v2`)が記録される。エントリ欠落時に意味の薄いTypeCastException。
   - 方針: `KeyManager.KEK_ALIAS`を`KeystoreKek`の実エイリアスに揃え、`loadKey`は欠落時に
     明示的な例外を投げる。
-- [ ] **AND-L4** (Low) `KeyImportViewModel.kt:35` / `KeyListViewModel.kt` — 鍵インポートのサイズ上限・
+- [x] **AND-L4** (Low) `KeyImportViewModel.kt:35` / `KeyListViewModel.kt` — 鍵インポートのサイズ上限・
   PEM妥当性・パスフレーズ付き鍵の検証が無く、平文PEMのゼロ化も無い。
   - 方針: 上限付き読み出し、PEM/OpenSSH形式の検証とパスフレーズ付き鍵(未対応)の拒否、
     保存後の`fill(0)`。

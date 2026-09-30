@@ -31,25 +31,38 @@ class KeyImportViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val app = getApplication<Application>()
+                // AND-L4: サイズ上限付きで読み、PEM/OpenSSH形式・パスフレーズ無しであることを
+                // 検証してから保存する。平文PEMは保存後(失敗時も)ゼロ化する。
                 val pemBytes = withContext(Dispatchers.IO) {
-                    app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    app.contentResolver.openInputStream(uri)?.use { PrivateKeyImportValidator.readBounded(it) }
                         ?: throw IllegalStateException("ファイルを読み込めませんでした")
                 }
-                RemoteLogger.i("IsekaiTerminalKey", "read PEM: ${pemBytes.size} bytes")
-                withContext(Dispatchers.IO) {
-                    val path = KeyManager.saveEncryptedKey(app, pemBytes)
-                    val hint = KeyManager.extractPublicKeyHint(pemBytes)
-                    RemoteLogger.i("IsekaiTerminalKey", "encrypted key saved → $path")
-                    val id = Repositories.keys.save(
-                        KeyEntry(
-                            label = label,
-                            publicKey = hint,
-                            encryptedPrivateKeyPath = path,
-                            kekAlias = KeyManager.KEK_ALIAS,
-                            createdAt = System.currentTimeMillis(),
+                try {
+                    RemoteLogger.i("IsekaiTerminalKey", "read PEM: ${pemBytes.size} bytes")
+                    when (val v = PrivateKeyImportValidator.validate(pemBytes)) {
+                        is PrivateKeyImportValidator.Result.Error -> {
+                            _errorMsg.value = v.message
+                            return@launch
+                        }
+                        PrivateKeyImportValidator.Result.Ok -> {}
+                    }
+                    withContext(Dispatchers.IO) {
+                        val path = KeyManager.saveEncryptedKey(app, pemBytes)
+                        val hint = KeyManager.extractPublicKeyHint(pemBytes)
+                        RemoteLogger.i("IsekaiTerminalKey", "encrypted key saved → $path")
+                        val id = Repositories.keys.save(
+                            KeyEntry(
+                                label = label,
+                                publicKey = hint,
+                                encryptedPrivateKeyPath = path,
+                                kekAlias = KeyManager.KEK_ALIAS,
+                                createdAt = System.currentTimeMillis(),
+                            )
                         )
-                    )
-                    RemoteLogger.i("IsekaiTerminalKey", "key saved to DB: id=$id label='$label'")
+                        RemoteLogger.i("IsekaiTerminalKey", "key saved to DB: id=$id label='$label'")
+                    }
+                } finally {
+                    pemBytes.fill(0)
                 }
                 onSaved()
             } catch (e: Exception) {
