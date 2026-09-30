@@ -25,7 +25,15 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// 確定済みテキストの現在値。テストからの観測用。
     public private(set) var committedText: String = ""
     /// `setMarkedText`に渡された値をそのまま記録する。テストからの観測用。
+    /// 長時間の入力で際限なく伸びないよう、直近`markedTextLogLimit`件だけを保持する
+    /// (確定処理が参照するのは最後の1件のみ、2026-09-29レビューIOS-L4)。
     public private(set) var markedTextLog: [String?] = []
+    static let markedTextLogLimit = 64
+    /// `buffer`(UITextInputプロトコル用の内部トラッキング)の上限。超えたら末尾
+    /// `bufferRetainedLength`文字だけを残す。実際の端末内容はサーバー側が持つので、
+    /// 古い部分を捨ててもターミナルへの送信内容には影響しない(IOS-L4)。
+    static let bufferTrimThreshold = 4096
+    static let bufferRetainedLength = 1024
 
     /// Phase 1A-7: ターミナル統合用。テキスト確定時・Backspace時に、実際にSSHへ
     /// 送信すべきバイト列を通知する(`terminal_commit_text_bytes`/固定バイトで計算)。
@@ -83,6 +91,7 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
         // 新しいテキストを追加する(実際のIME/UIKitの挙動に合わせる)。
         commitMarkedTextIfNeeded()
         buffer += text
+        trimBufferIfNeeded()
         committedText = buffer
         _selectedTextRange = IndexedTextRange(range: NSRange(location: (buffer as NSString).length, length: 0))
 
@@ -193,6 +202,9 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
 
     public func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
         markedTextLog.append(markedText)
+        if markedTextLog.count > Self.markedTextLogLimit {
+            markedTextLog.removeFirst(markedTextLog.count - Self.markedTextLogLimit)
+        }
         if let markedText, !markedText.isEmpty {
             markedRange = NSRange(location: (buffer as NSString).length, length: (markedText as NSString).length)
         } else {
@@ -202,6 +214,13 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
 
     public func unmarkText() {
         commitMarkedTextIfNeeded()
+    }
+
+    /// 変換中(marked textあり)でなければ、`buffer`が閾値を超えた時に末尾だけを残して切り詰める
+    /// (変換中は`markedRange`が`buffer`の長さを基準にしているので触らない)。
+    private func trimBufferIfNeeded() {
+        guard markedRange == nil, buffer.count > Self.bufferTrimThreshold else { return }
+        buffer = String(buffer.suffix(Self.bufferRetainedLength))
     }
 
     private func commitMarkedTextIfNeeded() {

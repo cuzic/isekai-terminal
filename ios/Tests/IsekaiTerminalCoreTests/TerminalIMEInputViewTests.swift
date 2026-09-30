@@ -135,4 +135,37 @@ final class TerminalIMEInputViewTests: XCTestCase {
         let view = TerminalIMEInputView()
         XCTAssertTrue(view.canBecomeFirstResponder)
     }
+
+    // MARK: - 2026-09-29レビューIOS-L4: 内部トラッキングが際限なく伸びない
+
+    func testMarkedTextLogKeepsOnlyRecentEntriesAndStillCommitsLatest() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        for i in 0..<(TerminalIMEInputView.markedTextLogLimit * 3) {
+            view.setMarkedText("か\(i)", selectedRange: NSRange(location: 1, length: 0))
+        }
+        view.unmarkText()
+
+        XCTAssertEqual(view.markedTextLog.count, TerminalIMEInputView.markedTextLogLimit)
+        let last = "か\(TerminalIMEInputView.markedTextLogLimit * 3 - 1)"
+        XCTAssertEqual(view.markedTextLog.last, last)
+        XCTAssertEqual(sent, [terminalCommitTextBytes(text: last, bracketedPasteMode: false)])
+    }
+
+    func testInsertTextTrimsInternalBufferButSendsEverything() {
+        let view = TerminalIMEInputView()
+        var sentCount = 0
+        view.onSendBytes = { _ in sentCount += 1 }
+
+        let total = TerminalIMEInputView.bufferTrimThreshold + 10
+        for _ in 0..<total {
+            view.insertText("a")
+        }
+
+        XCTAssertEqual(sentCount, total)
+        XCTAssertLessThanOrEqual(view.committedText.count, TerminalIMEInputView.bufferTrimThreshold)
+        XCTAssertTrue(view.hasText)
+    }
 }
