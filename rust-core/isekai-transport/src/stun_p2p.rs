@@ -264,7 +264,10 @@ pub(crate) async fn connect_stun_p2p_with_round(
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, AttemptFailure> {
-    let bind_addr = quicmux::BindSpec::any_ipv4().local_addr;
+    // The same socket later carries the QUIC connection to `peer_addr`, so
+    // its family must match the peer's (an IPv4 socket can't reach an IPv6
+    // peer).
+    let bind_addr = quicmux::BindSpec::unspecified_for(target.peer_addr).local_addr;
     let socket = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|source| AttemptFailure::RetryablePreAttach {
         source: TransportError::Mux(quicmux::MuxError::Bind { addr: bind_addr, source }),
     })?;
