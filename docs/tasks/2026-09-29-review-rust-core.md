@@ -93,7 +93,7 @@
 - [x] **RC-36** Low — `file_preview.rs:127-161` — パス先頭の`-`がオプションとして解釈される。
   - 方針: パス引数の前に`--`を入れる(リモートCLIが`--`に対応しているか確認)か、`-`始まりのパスに`./`を前置する。
 - [x] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
-  - 部分対応: helper_bootstrap.rsのrun_execにタイムアウト(300s)とstdout上限(1MiB)を追加(接続確立全体もRC-16で上限あり)。固定.tmpパス/アップロード後sha256検証はisekai-protocol/src/bootstrap.rs(担当境界外)のコマンド生成にあるため未対応——transport担当へ要連絡。sha256sum無し環境でのバージョン一致再利用は#67で意図的な仕様。
+  - 部分対応: helper_bootstrap.rsのrun_execにタイムアウト(300s)とstdout上限(1MiB)を追加(接続確立全体もRC-16で上限あり)。固定.tmpパスはisekai-protocol側(担当境界外)で transport担当の PR #132 がランダム接尾辞の一時ファイルへ修正済み(シグネチャ不変のためこちらの変更は不要)。mv前のsha256検証はisekai-protocolのAPI変更が必要なため未対応。sha256sum無し環境でのバージョン一致再利用は#67で意図的な仕様。
 - [~] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
   - 見送り: Android APKはデバッグ/リリースとも常にcargo build --releaseでRustをビルドする(android/build.gradle.kts)ため、cfg(debug_assertions)で外すと実機デバッグ用フォルト注入まで使えなくなる。またUniFFIのKotlinバインディングはロード時に全export関数のチェックサムを照合するので、ビルド種別でexportを出し分けるとリリースでロードに失敗する。Gradleのビルド種別に応じたcargo feature+バインディング整合の設計変更(android/側の変更を伴う)が必要。既定値では素通しで、注入はプロセス内コードからしか呼べない。ECN/dst_ip欠落はFaultyUdpSocketの受信経路をquinn-udpのメタ情報ごと透過させる改修が必要で別途扱う。
 - [~] **RC-39** Low — `isekai_stun_p2p_transport.rs:270-279` — STUN P2Pのreattachが穴あけ無しの新ソケットからdialする。
