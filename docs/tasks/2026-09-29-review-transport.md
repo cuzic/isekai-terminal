@@ -60,7 +60,7 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: `timeout_global`(30 秒)を設定する。`isekai-ssh/src/wrapper.rs:1527` の `spawn_blocking` 化は fix-isekai-ssh の担当(連絡済み)。
 - [x] **TR-M14** Medium `isekai-trust/src/host_key_verifier.rs:145-150,176-181` / `store.rs:133-135` — 既知ホストが一致しても毎回書き込み、`last_seen_at` の保存に失敗すると Rejected になる。
   - 方針: 既知一致時の更新は best-effort にし、失敗しても Accepted を返して警告ログのみ出す(always-connects.md)。
-- [ ] **TR-M15** Medium `isekai-protocol/src/bootstrap.rs:178-185` — helper アップロードの一時ファイル名が固定(`isekai-pipe.tmp`)で、並行 bootstrap で壊れたバイナリが mv されうる。
+- [x] **TR-M15** Medium `isekai-protocol/src/bootstrap.rs:178-185` — helper アップロードの一時ファイル名が固定(`isekai-pipe.tmp`)で、並行 bootstrap で壊れたバイナリが mv されうる。
   - 方針: 一時ファイル名を `.tmp.$$` で一意にし、失敗時は削除する。
 - [x] **TR-M16** Medium `local-ipc-mux/src/windows_named_pipe.rs:205` / `framing.rs:75-81` — accept 中の `connect()` エラー1回(open 直後に close したクライアント等)で holder が落ちる。
   - 方針: 一時的なエラーのときはそのインスタンスを捨てて作り直し、local-ipc-mux 内で再試行する(呼び出し側の owner.rs は変更不要)。
@@ -96,14 +96,14 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
 - [x] **TR-L17b** `isekai-auth/src/file_provider.rs:101,140` — 巨大な expires_in で i64 がラップする → saturating/try_from にする。
 - [x] **TR-L18** `isekai-auth/src/refresh.rs:22` / `oauth.rs:57` — token endpoint が http:// でも許容している → https を強制する(ループバックのみ例外)。
-- [ ] **TR-L19** `isekai-protocol/src/ctl_vars.rs:49-52` — CtlVarStore のキー数に上限が無い → 上限を設ける(超過時は set を拒否する)。
+- [x] **TR-L19** `isekai-protocol/src/ctl_vars.rs:49-52` — CtlVarStore のキー数に上限が無い → 上限を設ける(超過時は set を拒否する)。
 - [~] **TR-L20a** ctl preamble の比較が非定数時間(`isekai-ssh/src/ctl_forward.rs:319`, `src/transport/ssh_handler.rs:360`) — 担当境界外。fix-isekai-ssh / fix-rust-core の担当。
-- [ ] **TR-L20b** `isekai-protocol` の自前 ct_eq(hello.rs:49, attach.rs:185,221) → `subtle` に統一する。
+- [x] **TR-L20b** `isekai-protocol` の自前 ct_eq(hello.rs:49, attach.rs:185,221) → `subtle` に統一する。
 - [ ] **TR-L21a** `isekai-stun/src/lib.rs:103-105` — XOR-MAPPED のデコード失敗時に MAPPED-ADDRESS へフォールバックしない → フォールバックする。
 - [ ] **TR-L21b** `isekai-stun/src/lib.rs:211` — 無関係なデータグラムで試行回数を消費する → transaction id が一致しない応答は読み捨て、同じ試行内で待ち続ける。
 - [ ] **TR-L21c** `isekai-stun/src/lib.rs:205` — 送信元の比較が v4-mapped v6 を考慮していない → to_canonical で比較する。
 - [ ] **TR-L22** `isekai-trust/src/normalize.rs:48` — 裸の IPv6 を誤って分割する。大文字小文字も正規化していない → 修正する。
-- [ ] **TR-L23** `isekai-protocol/src/bootstrap.rs:113` — validate_remote_path が先頭 `-` を許している(オプション注入) → 拒否する。
+- [x] **TR-L23** `isekai-protocol/src/bootstrap.rs:113` — validate_remote_path が先頭 `-` を許している(オプション注入) → 拒否する。
 - [~] **TR-L24** `isekai-trust/src/host_key_verifier.rs:97` — TOFU プロンプトの spawn_blocking がキャンセル後も残る。
   見送り: std の stdin 読み取りはキャンセルできない。現状キャンセルする呼び出し元も無い(latent)。回避には stdin 読み取りスレッドの共有化が必要で、isekai-ssh 側の設計変更になる。
 - [ ] **TR-L25a** `isekai-fs-guard/src/lib.rs:78-86,268-282` — Unix で所有者 uid を見ず、symlink を辿り、world-readable を許容している → symlink_metadata+uid 検証を行い、秘密ファイルの group/world 読み取りを拒否する。
