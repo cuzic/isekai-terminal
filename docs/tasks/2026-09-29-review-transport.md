@@ -76,9 +76,9 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L2** `isekai-transport/src/multipath.rs:189-191,226-231` — 同じ PathId にヘルスモニタが二重に起動しうる → 起動済みの PathId を集合で管理して重複を防ぐ。
 - [x] **TR-L3** `path_health_fsm.rs:111-116` / `path_health.rs:204-208` — NoViablePath が毎チェック繰り返し通知される → エッジトリガー(状態が変化したときだけ通知)にする。
 - [x] **TR-L4** `path_health.rs:210-217` — RTT/ロス劣化で Degraded になっても NoViablePath を通知しない(doc と矛盾) → 通知する。
-- [ ] **TR-L5** `resume.rs:142,214-220,582-589` — CONTROL_ACK の session_id を、自分が送った値と照合していない → 照合し、不一致なら ControlHandshake エラーにする。
-- [ ] **TR-L6** `resume.rs:497-503,526-532` — GaveUpAfterGenerationRetries に原因の失敗が残らない → 最後の失敗を保持する。
-- [ ] **TR-L7** `race.rs:53` — Happy Eyeballs の遅延 250ms が punch の最低所要 ~750ms より短い → production 既定(`isekai-pipe-core` の 750ms)に揃える。
+- [x] **TR-L5** `resume.rs:142,214-220,582-589` — CONTROL_ACK の session_id を、自分が送った値と照合していない → 照合し、不一致なら ControlHandshake エラーにする。
+- [x] **TR-L6** `resume.rs:497-503,526-532` — GaveUpAfterGenerationRetries に原因の失敗が残らない → 最後の失敗を保持する。
+- [x] **TR-L7** `race.rs:53` — Happy Eyeballs の遅延 250ms が punch の最低所要 ~750ms より短い → production 既定(`isekai-pipe-core` の 750ms)に揃える。
 - [x] **TR-L8** `resume/app_ack.rs:169-170` — APP_ACK の offset の単調性を検証していない → 後退する値は無視する(送信済み範囲の検証は counters が送信量を知らないため、単調性の検証のみ)。
 - [x] **TR-L9** 秘密値を含む型の `derive(Debug)`: relay.rs `RelayTarget` / stun_p2p.rs / race.rs / resume.rs / isekai-protocol handshake.rs / isekai-auth file_provider.rs・oauth.rs・device_flow.rs → 秘密フィールドを伏せた手書き Debug にする。
   isekai-trust schema.rs は公開鍵のみなので誤検知([-])。
