@@ -59,13 +59,19 @@
     ビルド成功・診断0件のときは空集合でキャッシュを更新する。Python の単体テストを追加。
   - 対応: `find_workspace_manifest` を追加し、crate 自身のディレクトリから上へ `[workspace]`/`[workspace.*]` を持つ最初の Cargo.toml を選ぶようにした。
     クリーンビルド(診断0件・exit 0)で空集合をキャッシュするようにした。`.claude/hooks/test_cargo_check_on_edit.py`(8件、cargo は実行しないモック)を追加し、ローカルの python3 で全件成功を確認済み。
-- [ ] **CI-M6** (Medium) `scripts/reserve-room-migration.sh:25-48`, `scripts/reserve-grdb-migration.sh`,
+- [x] **CI-M6** (Medium) `scripts/reserve-room-migration.sh:25-48`, `scripts/reserve-grdb-migration.sh`,
   `scripts/check-room-migrations.sh:67-73`, `scripts/check-grdb-migrations.sh`
   - 要約: 予約スクリプトが自 worktree のレジストリしか見ないため、並列 worktree 同士で同じ番号を取りうる。
     check 側は `[[reserved]]` の重複を検査しない。付随(Low): NEXT > CURRENT+1 のとき、案内が
     `Migration($CURRENT, $NEXT)` という check 違反のコードを表示する。
   - 修正方針: 予約時に `origin/main`(best-effort fetch)と全 worktree のレジストリも見て最大値を取る共通ヘルパーを導入。
     check 側に `[[reserved]]` の重複版数の検出を追加。案内文を `Migration(NEXT-1, NEXT)` に直し、先行予約がある場合の注意を出す。
+  - 対応: 共通ヘルパー `scripts/lib/migration-reservation.sh` を追加。自 worktree・`origin/main`(best-effort fetch、`MIGRATION_RESERVE_OFFLINE=1` で省略可)・
+    登録済みの全 worktree(未コミットの予約を含む)の current/reserved の最大値+1を予約し、先行予約の出所を表示する。
+    案内文は `Migration(NEXT-1, NEXT)` に修正。check-room/grdb に `[[reserved]]` の重複版数の検出を追加。
+    一時リポジトリ(bare origin + 別 clone の予約 push + 未コミット予約のある worktree)で、23/24 を避けて 25 を予約することと、重複予約の検出を確認済み。
+    既存レジストリに対して両 check スクリプトが OK を返すことも確認済み。
+    残る限界: 別マシンで同時に予約して、どちらもまだ push していないケースは原理的に検出できない(main 上の重複検出が最後の砦)。
 
 ## Low
 

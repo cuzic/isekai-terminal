@@ -20,32 +20,19 @@ fi
 
 OWNER="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REGISTRY="$ROOT/android/migration_registry.toml"
-BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-TODAY="$(date +%Y-%m-%d)"
+# shellcheck source=lib/migration-reservation.sh
+source "$ROOT/scripts/lib/migration-reservation.sh"
 
-CURRENT=$(grep -E '^current = ' "$REGISTRY" | head -1 | sed -E 's/^current = ([0-9]+).*/\1/')
-RESERVED_MAX=$(grep -E '^version = ' "$REGISTRY" | sed -E 's/^version = ([0-9]+).*/\1/' | sort -n | tail -1 || true)
+# 自worktreeだけでなく origin/main と他の全worktreeの予約も見て番号を決める
+# (lib/migration-reservation.sh 参照)。
+reserve_migration_version "$ROOT" "android/migration_registry.toml" "$OWNER" "Room"
+NEXT="$RESERVED_VERSION"
+PREV=$((NEXT - 1))
 
-NEXT=$((CURRENT + 1))
-if [ -n "${RESERVED_MAX:-}" ] && [ "$RESERVED_MAX" -ge "$NEXT" ]; then
-  NEXT=$((RESERVED_MAX + 1))
-fi
-
-cat >> "$REGISTRY" <<EOF
-
-[[reserved]]
-version = $NEXT
-owner = "$OWNER"
-branch = "$BRANCH"
-reserved_at = "$TODAY"
-EOF
-
-echo "Reserved Room migration version $NEXT for '$OWNER' (branch: $BRANCH)."
 echo
 echo "Next steps:"
 echo "  1. In AppDatabase.kt, add:"
-echo "       internal val MIGRATION_${CURRENT}_${NEXT} = object : Migration($CURRENT, $NEXT) { ... }"
+echo "       internal val MIGRATION_${PREV}_${NEXT} = object : Migration($PREV, $NEXT) { ... }"
 echo "     and add it to the .addMigrations(...) chain."
 echo "  2. Bump @Database(version = $NEXT, ...)."
 echo "  3. After merging, delete this [[reserved]] entry from android/migration_registry.toml"

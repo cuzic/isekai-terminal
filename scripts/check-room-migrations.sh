@@ -11,6 +11,7 @@
 #     (各マイグレーションは必ず Y = X + 1 であること前提)。
 #  3. android/migration_registry.toml の [[reserved]] に current 以下の版が残っていないこと
 #     (マージ後の削除し忘れの検出)。
+#  4. android/migration_registry.toml の [[reserved]] に同じ版数が重複していないこと(並列予約の衝突の検出)。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -61,6 +62,16 @@ if [ "$FROM_SORTED" != "$EXPECTED" ]; then
   echo "--- expected 1..$((DB_VERSION - 1)) ---" >&2
   echo "$EXPECTED" >&2
   fail "Migration(X, Y) chain in AppDatabase.kt is not a contiguous 1..$((DB_VERSION - 1)) sequence with no gaps/duplicates."
+fi
+
+# reserved に同じ版数が2回以上現れていないか確認する(並列worktree/別マシンが同じ番号を
+# 予約し、それぞれ単独ではCIが緑のままマージされたケースの検出。strict: falseのbranch
+# protectionでは両PRが個別に緑になりうるため、main上のこのチェックが最後の砦になる)。
+DUPLICATES=$(grep -E '^version = ' "$REGISTRY" | sed -E 's/^version = ([0-9]+).*/\1/' | sort -n | uniq -d || true)
+if [ -n "$DUPLICATES" ]; then
+  echo "$DUPLICATES" >&2
+  fail "android/migration_registry.toml has duplicate [[reserved]] versions (the same number was reserved twice); \
+re-reserve one of them with the reserve script."
 fi
 
 # reserved の中に current 以下(=既にマージ済みのはずの版)が残っていないか確認する。
