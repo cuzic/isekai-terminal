@@ -508,29 +508,7 @@ fi
 "#
     );
 
-    Ok(InstallScript { command: wrap_for_any_login_shell(&command), stdin_chunks: [request_bytes, jwt_bytes, encoded.into_bytes()] })
-}
-
-/// Wraps a POSIX `sh` script so it runs under `/bin/sh` whatever the
-/// remote account's *login* shell is (review 2026-09-29, SSH-21).
-///
-/// Both backends hand the command string to the remote `sshd`, which runs it
-/// via the user's login shell (`$SHELL -c '<command>'`). The script is POSIX
-/// `sh` (functions, `$(...)`, `[ ]`, heredoc-free multi-line `if`), so a
-/// `fish`/`csh`/`tcsh` login shell failed to parse it — `HandshakeMissing`,
-/// classified as retryable `JumpHostUnreachable`, so the silent re-deploy
-/// looped forever without a chance of ever succeeding.
-///
-/// The wrapper is a single line containing only `exec`, `/bin/sh -c`, one
-/// single-quoted argument, and inside it nothing but base64 text — no
-/// newlines, backslashes, `!` or nested quotes — which every one of those
-/// login shells parses identically; `sh` then decodes and `eval`s the real
-/// script. `base64 -d` is already a hard requirement of the script itself
-/// (it decodes the uploaded binary with it). stdin is untouched (`printf |
-/// base64 -d` reads its own pipe), so the script's stdin framing is intact.
-fn wrap_for_any_login_shell(script: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
-    format!("exec /bin/sh -c 'eval \"$(printf %s {encoded} | base64 -d)\"'")
+    Ok(InstallScript { command, stdin_chunks: [request_bytes, jwt_bytes, encoded.into_bytes()] })
 }
 
 /// Parses what the install script printed on stdout back into the
@@ -595,48 +573,9 @@ fn normalize_uname_arch(uname_m: &str) -> Result<String, BootstrapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     fn out(status: Option<i32>, stdout: &str) -> SshOutput {
         SshOutput { status, stdout: stdout.as_bytes().to_vec(), stderr: Vec::new() }
-    }
-
-    /// SSH-21: the wrapper must be a single line that a `fish`/`csh`/`tcsh`
-    /// login shell parses exactly like `sh` does — so nothing but one pair of
-    /// single quotes around base64 text (no newline, backslash, `!`), and it
-    /// must decode back to the exact original script.
-    #[test]
-    fn wrap_for_any_login_shell_is_a_shell_neutral_single_line_that_round_trips() {
-        let script = "umask 077\nif [ -n \"$x\" ]; then echo 'a b'; fi\nf() {{ echo \"$1\"; }}\n";
-        let wrapped = wrap_for_any_login_shell(script);
-        assert!(!wrapped.contains('\n') && !wrapped.contains('\\') && !wrapped.contains('!'), "{wrapped}");
-        assert_eq!(wrapped.matches('\'').count(), 2, "exactly one single-quoted argument: {wrapped}");
-        let encoded = wrapped
-            .strip_prefix("exec /bin/sh -c 'eval \"$(printf %s ")
-            .and_then(|rest| rest.strip_suffix(" | base64 -d)\"'"))
-            .expect("unexpected wrapper shape");
-        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
-        assert_eq!(decoded, script.as_bytes());
-    }
-
-    /// SSH-21, end to end: the wrapped script runs under a real `sh`, sees
-    /// its own stdin untouched, and exits with the script's own status.
-    #[cfg(unix)]
-    #[test]
-    fn wrapped_script_runs_under_sh_with_stdin_intact() {
-        use std::io::Write as _;
-        let script = "read line\nif [ \"$line\" = \"hello\" ]; then echo ok-$(printf %s \"$line\"); fi\nexit 3\n";
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(wrap_for_any_login_shell(script))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok-hello\n");
-        assert_eq!(output.status.code(), Some(3));
     }
 
     #[test]

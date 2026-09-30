@@ -67,9 +67,10 @@
 
 ## Low / Low-Medium
 
-- [x] **SSH-21** Low-Medium `install_script.rs:384-491`(A12-1)
+- [~] **SSH-21** Low-Medium `install_script.rs:384-491`(A12-1)
   - 要約: ログインシェルが fish/csh/tcsh だと POSIX sh 前提のスクリプトが動かない。
-  - 方針: スクリプトを base64 化し、`exec /bin/sh -c 'eval "$(printf %s <b64> | base64 -d)"'` という 1 行・改行なし・単一引用のみのラッパーで渡す。
+  - 試した方針: スクリプトを base64 化し、`exec /bin/sh -c 'eval "$(printf %s <b64> | base64 -d)"'` という 1 行のラッパーで渡した。Linux の単体テストは通過した。
+  - 見送り理由: Windows CI の e2e ハーネス(mock sshd が Git for Windows の `sh -c <command>` で実行する)で、このラッパーが `unexpected EOF while looking for matching '` として壊れた。wrapper/init/doctor の bootstrap e2e 11 件が全滅したため、差し戻した。本番の remote は Linux の sshd でこのハーネスの問題は当たらないが、テスト基盤と両立するラッパーの設計(Windows の引数クォートと MSYS の再パースの調査を含む)と、fish/csh 実機での検証が必要なので別タスクとする。
 - [x] **SSH-22** Low-Medium `install_script.rs:474-476`(A12-2)
   - 要約: handshake poll が timeout すると、起動済み helper が孤児化する。
   - 方針: timeout 分岐で `kill` してから pid ファイルを消す。
