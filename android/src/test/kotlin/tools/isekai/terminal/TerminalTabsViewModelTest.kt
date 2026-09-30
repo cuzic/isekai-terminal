@@ -733,6 +733,26 @@ class TerminalTabsViewModelTest {
             MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(),
             emptyList(), kittyKeyboardFlags, null)
 
+    /** AND-H4: 端末の描画フレーム(ScreenUpdate)ごとにFGS通知の集約を再計算・再postしない。 */
+    @Test
+    fun screenUpdates_doNotRepostSessionsSummaryPerFrame() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (executor.lastSessionsSummary != (1 to 1)) delay(10) }
+        val before = executor.sessionsSummaryCallCount
+
+        for (i in 1..20) {
+            orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false, kittyKeyboardFlags = i.toUShort()))
+            withTimeout(3000) {
+                while (tab(id).primaryPane.session.state.value.screenUpdate?.kittyKeyboardFlags != i.toUShort()) delay(5)
+            }
+        }
+
+        assertEquals(before, executor.sessionsSummaryCallCount)
+    }
+
     @Test
     fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {
         val id = vm.openTab(profile("a"), "pass")

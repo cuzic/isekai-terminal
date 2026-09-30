@@ -18,6 +18,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -811,7 +813,11 @@ class TerminalTabsViewModel(
     }
 
     private suspend fun observeSummary(pane: PaneState) {
-        pane.session.state.collect { updateSessionsSummary() }
+        // AND-H4: `state`全体は`ScreenUpdate`(=端末の描画フレーム)ごとに変わるため、
+        // そのままcollectすると描画フレームごとにFGS通知を再post(メインスレッドの
+        // Binder IPC + 通知レート制限で本当に必要な更新まで捨てられうる)していた。
+        // 集約通知に効くのは接続有無だけなので、その変化時だけ再計算する。
+        pane.session.state.map { it.connected }.distinctUntilChanged().collect { updateSessionsSummary() }
     }
 
     private suspend fun observeDownloads(pane: PaneState) {
