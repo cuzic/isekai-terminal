@@ -148,7 +148,9 @@ impl HolderSpawner for DetachedProcessSpawner {
             // slow holder start-up delays only *this* thread, never the
             // caller — the caller has already moved on to
             // `connect_with_retry` by the time this thread even starts.
-            let bytes = bytes.to_vec();
+            // Decrypted private-key material: wiped once the writer thread
+            // is done with it (review 2026-09-29, SSH-32).
+            let bytes = zeroize::Zeroizing::new(bytes.to_vec());
             let mut stdin = child.stdin.take().expect("stdin was requested as piped above");
             std::thread::spawn(move || {
                 // Write-then-drop: the holder's read side sees EOF right

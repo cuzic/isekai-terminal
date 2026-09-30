@@ -97,7 +97,7 @@
 - [ ] **SSH-31** Low `client.rs:310`, `owner.rs:540`, `ctl_forward.rs:292`(C5-4)
   - 要約: build relay の mpsc が無制限。
   - 方針: 実装時に確認する。
-- [ ] **SSH-32** Low `mux/mod.rs:576-579`, `holder.rs:151`, `console.rs:604-615`(C5-5)
+- [x] **SSH-32** Low `mux/mod.rs:576-579`, `holder.rs:151`, `console.rs:604-615`(C5-5)
   - 要約: 平文秘密鍵と passphrase が zeroize されない。
   - 方針: `Zeroizing` で包む。
 - [x] **SSH-33** Low `owner.rs:614`, `client.rs:278,421`(C5-6)

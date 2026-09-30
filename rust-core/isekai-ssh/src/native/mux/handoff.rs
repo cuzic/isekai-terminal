@@ -98,9 +98,10 @@ pub(crate) fn resolve_handoff_credentials(
 
         let mut decrypted_pem = None;
         for attempt in 1..=3 {
-            let Some(passphrase) = prompt_passphrase(candidate, attempt) else { break };
+            // Wiped when this attempt's scope ends (review 2026-09-29, SSH-32).
+            let Some(passphrase) = prompt_passphrase(candidate, attempt).map(Zeroizing::new) else { break };
             let Ok(parsed) = PrivateKey::from_openssh(&private_key_pem) else { break };
-            match parsed.decrypt(&passphrase) {
+            match parsed.decrypt(passphrase.as_bytes()) {
                 Ok(cleartext) => match cleartext.to_openssh(Default::default()) {
                     Ok(pem) => {
                         decrypted_pem = Some(Zeroizing::new(pem.as_bytes().to_vec()));
