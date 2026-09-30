@@ -76,8 +76,9 @@
   - 方針: `apply_network_lost`をロック内で「期待するphase/epochのままか」を再確認してから実行する形にする。
 - [x] **RC-29** Low(latent) — `orchestrator.rs:1153-1156, 847` — transportの`connect()`が同期`Err`を返すと`phase`が`Connecting`で固着。
   - 方針: `start_manual_connect`/`connect_via`の`Err`経路で`phase=Idle`へ戻す。
-- [ ] **RC-30** Low — `TerminalSession.kt:425, 480` — Kotlinが自前状態でconnectをガードし、disconnect時に`connected=false`を自分で書いている(SSOT漏れ)。
+- [~] **RC-30** Low — `TerminalSession.kt:425, 480` — Kotlinが自前状態でconnectをガードし、disconnect時に`connected=false`を自分で書いている(SSOT漏れ)。
   - 方針: Rust側でRC-03/RC-13を直し、Rustが判断・通知できるようにする。Kotlin側のミラー状態除去はandroid/の担当。
+  - Rust側はRC-03(ループ中のdisconnectをRust側で止めDisconnectedを通知)・RC-13(Connected中のconnectで旧セッションを確実に切断)で対応済み。Kotlin側(TerminalSession.kt)のミラー状態ガード・connected=false自書きの除去はandroid/の担当境界のため見送り(Rust側の変更により除去可能になった)。
 - [x] **RC-31** Low — `orchestrator.rs` `ensure_tmux_tab_window` — `TMUX_LOCATOR_REGISTRY`を3回別々にロックし、間に入った`push_ctl_socket_to_tmux`の新しいパスを古い値で上書きしうる。
   - 方針: take→register→set hooksを1回のロック区間で行う。
 - [~] **RC-32** Low — `tmux_window_claim.rs:16-35` — claimが明示releaseでしか解放されずTTL/owner生存確認がない。
@@ -93,9 +94,12 @@
   - 方針: パス引数の前に`--`を入れる(リモートCLIが`--`に対応しているか確認)か、`-`始まりのパスに`./`を前置する。
 - [x] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
   - 部分対応: helper_bootstrap.rsのrun_execにタイムアウト(300s)とstdout上限(1MiB)を追加(接続確立全体もRC-16で上限あり)。固定.tmpパス/アップロード後sha256検証はisekai-protocol/src/bootstrap.rs(担当境界外)のコマンド生成にあるため未対応——transport担当へ要連絡。sha256sum無し環境でのバージョン一致再利用は#67で意図的な仕様。
-- [ ] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
-- [ ] **RC-39** Low — `isekai_stun_p2p_transport.rs:270-279` — STUN P2Pのreattachが穴あけ無しの新ソケットからdialする。
-- [ ] **RC-40** Low — `quic_transport.rs:135-146, 210` — 旧tsshd QUIC transportは証明書検証有効時に空RootCertStoreで必ず失敗。handshake JSONを`format!`で組み立て`ssh_host`を未エスケープ。
+- [~] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
+  - 見送り: Android APKはデバッグ/リリースとも常にcargo build --releaseでRustをビルドする(android/build.gradle.kts)ため、cfg(debug_assertions)で外すと実機デバッグ用フォルト注入まで使えなくなる。またUniFFIのKotlinバインディングはロード時に全export関数のチェックサムを照合するので、ビルド種別でexportを出し分けるとリリースでロードに失敗する。Gradleのビルド種別に応じたcargo feature+バインディング整合の設計変更(android/側の変更を伴う)が必要。既定値では素通しで、注入はプロセス内コードからしか呼べない。ECN/dst_ip欠落はFaultyUdpSocketの受信経路をquinn-udpのメタ情報ごと透過させる改修が必要で別途扱う。
+- [~] **RC-39** Low — `isekai_stun_p2p_transport.rs:270-279` — STUN P2Pのreattachが穴あけ無しの新ソケットからdialする。
+  - 見送り: 穴あけ済みソケット(または再度のSTUN rendezvous)を経由してreattachする設計変更が必要で、NAT種別ごとの挙動を実機で検証しないと正しさを確認できない。現状でもreattach失敗時はorchestratorの自動再接続(新規rendezvous込み)にフォールバックする。
+- [x] **RC-40** Low — `quic_transport.rs:135-146, 210` — 旧tsshd QUIC transportは証明書検証有効時に空RootCertStoreで必ず失敗。handshake JSONを`format!`で組み立て`ssh_host`を未エスケープ。
+  - 部分対応: handshake JSONをserde_jsonでエスケープするよう修正。証明書検証有効時に空RootCertStoreで必ず失敗する件は、tsshdが自己署名証明書を使う以上ルート証明書ストアでは解決せず、isekai-pipeと同様の証明書pinning(プロトコル側の変更)か新規依存(webpki-roots等、Cargo.lock更新が必要)が要るため見送り。旧tsshd transportはレガシーで、ネストしたSSHのホスト鍵検証が引き続き保護している。
 - [x] **RC-41** Low-Medium — `terminal.rs:3144` — REPのclampが`cols*rows`で大きなCPU増幅が残る。
   - 方針: `cols`へclampする。
 - [x] **RC-42** Low — `terminal.rs:2769` — SGRのコロン区切りサブパラメータを捨てて誤適用(`4:0`→下線ON、`38:2::R:G:B`の色消失)。
