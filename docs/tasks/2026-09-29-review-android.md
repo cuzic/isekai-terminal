@@ -67,9 +67,10 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 - [~] **AND-M3b** (Medium) 見送り(Rust側新API要: 生のavailable/lostをtransport種別付きで受けるUniFFIメソッドがRust側に必要。rust-coreは別担当) — `session/AndroidAppExecutor.kt:80-91` — 「どちらか一方でも生きていれば
   onLostを鳴らさない」集約判断がKotlin側にある(rust-ssot)。
   - 方針: 生のavailable/lost(transport種別付き)をRustへ渡す新UniFFI APIを追加し集約はRust側で行う。
-- [ ] **AND-M4** (Medium) `session/PhysicalPathProvider.kt:156-172` — `bindAndDetach`が元の
+- [x] **AND-M4** (Medium) `session/PhysicalPathProvider.kt:156-172` — `bindAndDetach`が元の
   `DatagramSocket`を閉じない(`fromDatagramSocket`はdupを返す)。失敗経路でも閉じずfdリーク。
   - 方針: `DatagramSocket(null).use { ... }`でdup取得後に必ず元socketを閉じる。
+    (`Network.bindSocket`を実ネットワークで要するためJVMテストは無し、静読で確認)
 - [ ] **AND-M5** (Medium) `TerminalTabsViewModel.kt:1059-1065` — tmux連携の予約がprofileId単位の
   Setのため、同一タブの(手動/Rust自動)再接続でensure/フック再インストールがスキップされる。
   - 方針: 予約を「profileId→所有tabId」のマップにし、所有タブ自身の再接続は通す。所有タブを
