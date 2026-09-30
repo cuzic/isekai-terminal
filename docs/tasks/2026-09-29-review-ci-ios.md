@@ -90,9 +90,10 @@
   - 修正方針: publish-release でタグのコミットが `origin/main` の祖先であることを検証してから公開する。
   - 対応: publish-release の先頭で full checkout と `origin/main` の fetch を行い、タグのコミットが `origin/main` の祖先でなければ公開せず失敗させる。
     「required check が緑であること」までは要求しない(main への push では paths フィルタにより一部の required ワークフローがそもそも走らないため、check-run の有無で判定できない)。
-- [ ] **CI-L4** (Low) `rust-core/scripts/ios-fixture/start-sshd-fixture.sh:21-22`
+- [x] **CI-L4** (Low) `rust-core/scripts/ios-fixture/start-sshd-fixture.sh:21-22`
   - 要約: 相対パスの FIXTURE_DIR で `cd` 後のパスが二重になる。
   - 修正方針: `mkdir -p` 後に絶対パス化する。
+  - 対応: `mkdir -p` の直後に `FIXTURE_DIR` を絶対パスへ正規化した。相対パス `relfixture` を渡して、ローカルで起動→fixture.json の絶対パス→停止まで動くことを確認済み。
 - [x] **CI-L5** (Low) `android-test-check.yml:70-78`
   - 要約: NDK バージョンの参照元 `fdroid/tools.isekai.terminal.yml` が pr-path-gate のパターンにない。
   - 修正方針: `^fdroid/` を patterns と push.paths に追加。
