@@ -11,9 +11,9 @@
   - 方針: `helper_committed_offset`が`[start_offset, end_offset]`外なら回復不能エラーとしてreattachを即失敗させる(リトライ予算を消費しない)。
 - [x] **RC-02** High — `resume_client.rs:349-362` — `write_all`部分成功→失敗時、chunkがreplay未登録のまま新接続へ全量再送され、helperがcommit済みの先頭部分が重複。
   - 方針: chunkを書き込み**前に**replay_bufferへ積み、reattach時の再送は`helper_committed_offset`からの差分のみにする。
-- [ ] **RC-03** High — `orchestrator.rs` `disconnect()` — `reconnect_epoch`を進めず、再接続ループ中のタブclose/切断でもループが最大60s継続し、成功すると閉じたタブへConnectedを通知する。
+- [x] **RC-03** High — `orchestrator.rs` `disconnect()` — `reconnect_epoch`を進めず、再接続ループ中のタブclose/切断でもループが最大60s継続し、成功すると閉じたタブへConnectedを通知する。
   - 方針: `disconnect()`で`reconnect_epoch`を進めループ系フラグをクリア、ループ中なら進行中attemptの世代も無効化し`Disconnected`をRust側から通知(Kotlinに`cancelReconnect`併用を要求しない)。
-- [ ] **RC-04** High — `orchestrator.rs` `cancel_reconnect`/ループのtimeout — 進行中attemptの`session_generation`を無効化せず、後から成功するとDisconnected通知後にConnectedへ戻る/失敗すると二重Disconnected。
+- [x] **RC-04** High — `orchestrator.rs` `cancel_reconnect`/ループのtimeout — 進行中attemptの`session_generation`を無効化せず、後から成功するとDisconnected通知後にConnectedへ戻る/失敗すると二重Disconnected。
   - 方針: cancel/timeout時に`session_generation`を進め(進行中attemptの遅延callbackを無視させ)、attempt sessionをdisconnect、`phase=Idle`へ。timeout側のDisconnected通知はepoch一致時のみ。
 - [-] **RC-05** High — `pool.rs:79-86, 143-166` — Ready handleの生存確認・evictなしで死んだ接続を再利用。
   - 対応不要: mainで既に修正済み(#120/#121: `try_attach_with`が`PooledSshHandle::is_alive`で生存確認し死んでいれば同じスロットを`Connecting`へ差し替え、`mark_dead_if_same`で最初のchannel open失敗/timeoutをtombstone化。#122で仮想時間テスト、#124でモデルベーステスト済み)。
@@ -42,13 +42,14 @@
   - 方針: ループへ渡す送信端を`WeakSender`にする(必要時のみupgrade)。
 - [ ] **RC-16** Medium — `pool.rs:106-117` / `lib.rs:1641-1644` — 接続確立に全体タイムアウトがなく、handshake停止でエントリが`Connecting`のまま、後続タブ・再接続が永久待ち。
   - 方針: 確立処理(TCP/KEX/認証/jump)に全体タイムアウトを設け、失敗として`publish_failure`する。ホスト鍵確認のユーザー応答待ちにも上限を設ける。
-- [ ] **RC-17** Medium — `orchestrator.rs:524-527, 540-541→767-773` — 世代チェックと状態更新が別ロック区間で、古いcallbackが新しい接続試行を上書きしうる。
+- [x] **RC-17** Medium — `orchestrator.rs:524-527, 540-541→767-773` — 世代チェックと状態更新が別ロック区間で、古いcallbackが新しい接続試行を上書きしうる。
   - 方針: `on_connected`/`handle_unexpected_disconnect`で世代チェックと状態更新を同一ロック区間で行う(世代を引数で渡す)。
-- [ ] **RC-18** Medium — `orchestrator.rs:959-969, 1016-1029` — 再接続ループがepochチェック外で`Reconnecting`/`Disconnected`を通知し、Connected後にReconnecting/Disconnectedが届きうる。
+- [x] **RC-18** Medium — `orchestrator.rs:959-969, 1016-1029` — 再接続ループがepochチェック外で`Reconnecting`/`Disconnected`を通知し、Connected後にReconnecting/Disconnectedが届きうる。
   - 方針: timeout時のDisconnectedはepoch一致時のみ通知。Reconnecting通知後にepochを再確認し、Connectedへ遷移済みなら正しい状態を再通知する。
-- [ ] **RC-19** Medium — `orchestrator.rs:1606, 683` — `pending_file_previews`が切断/世代変更で解放されず、Kotlinが永久待ち。
+  - 注: Kotlin callbackをロック外で呼ぶ規約上、通知と状態確認を完全にアトミックにはできないため、通知後にepochを再確認し正しい状態(Connected/Disconnected)を再通知して上書きする方式にした(競合時のみ同じ状態が2回届きうる)。
+- [x] **RC-19** Medium — `orchestrator.rs:1606, 683` — `pending_file_previews`が切断/世代変更で解放されず、Kotlinが永久待ち。
   - 方針: 切断時・新しいsessionへの差し替え時に保留中要求をすべてErrorで解決する。
-- [ ] **RC-20** Medium — `orchestrator.rs:298-311` — 転送中に切断してもtrzsz状態(最大2GiBのdownload_buf・transfer_id・interactive_busy)がリセットされない。`on_trzsz_finished`/`download_chunk`がtransfer_idを照合しない(low)。
+- [x] **RC-20** Medium — `orchestrator.rs:298-311` — 転送中に切断してもtrzsz状態(最大2GiBのdownload_buf・transfer_id・interactive_busy)がリセットされない。`on_trzsz_finished`/`download_chunk`がtransfer_idを照合しない(low)。
   - 方針: 切断時に転送状態をクリアし`Done{success:false}`を通知。download_chunk/finishedは`current_transfer_id`と一致しない場合は無視する。
 - [ ] **RC-21** Medium — `ssh_handler.rs:262-270` / `agent_forward.rs:160-176` — プール共有Handleのagent-forward署名確認が確立したタブのevent loopへ流れる。確立タブが閉じると以後全拒否。
   - 方針: 共有Handleのagent確認経路を、そのHandleを現在使っているタブのうち生きているものへルーティングする(チャネルごとの送信先リストから生きているものを選ぶ)。
@@ -67,9 +68,9 @@
 
 ## Low
 
-- [ ] **RC-28** Low — `orchestrator.rs:1524-1560` — `notify_network_path_changed`が古いphaseスナップショットで`apply_network_lost`する。
+- [x] **RC-28** Low — `orchestrator.rs:1524-1560` — `notify_network_path_changed`が古いphaseスナップショットで`apply_network_lost`する。
   - 方針: `apply_network_lost`をロック内で「期待するphase/epochのままか」を再確認してから実行する形にする。
-- [ ] **RC-29** Low(latent) — `orchestrator.rs:1153-1156, 847` — transportの`connect()`が同期`Err`を返すと`phase`が`Connecting`で固着。
+- [x] **RC-29** Low(latent) — `orchestrator.rs:1153-1156, 847` — transportの`connect()`が同期`Err`を返すと`phase`が`Connecting`で固着。
   - 方針: `start_manual_connect`/`connect_via`の`Err`経路で`phase=Idle`へ戻す。
 - [ ] **RC-30** Low — `TerminalSession.kt:425, 480` — Kotlinが自前状態でconnectをガードし、disconnect時に`connected=false`を自分で書いている(SSOT漏れ)。
   - 方針: Rust側でRC-03/RC-13を直し、Rustが判断・通知できるようにする。Kotlin側のミラー状態除去はandroid/の担当。
