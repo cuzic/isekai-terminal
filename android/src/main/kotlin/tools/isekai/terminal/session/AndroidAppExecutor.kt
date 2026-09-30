@@ -55,7 +55,14 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     }
 
     override fun ensureServiceRunning() {
-        app.startService(Intent(app, TerminalSessionService::class.java))
+        try {
+            app.startService(Intent(app, TerminalSessionService::class.java))
+        } catch (e: IllegalStateException) {
+            // AND-L7: バックグラウンドからの`startService`はAndroid O+で
+            // IllegalStateException(バックグラウンド起動制限)になりうる。接続自体は
+            // 続行できるため、ログだけ残して握り潰す(bindは下で試みる)。
+            RemoteLogger.w("IsekaiTerminalVM", "startService failed (background start restricted?)", e)
+        }
         if (!isServiceBound) {
             isServiceBound = app.bindService(
                 Intent(app, TerminalSessionService::class.java),

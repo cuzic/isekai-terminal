@@ -120,7 +120,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 - [x] **AND-L6** (Low) `session/TerminalSession.kt:584-606` — host key信頼の書き込みが非同期で、
   直後の再接続がDB反映前にcheckして再プロンプトになりうる。
   - 方針: 書き込みJobを保持し、`onHostKey`(Rustのblockingスレッド)で完了を待ってからcheckする。
-- [ ] **AND-L7** (Low) `TerminalSessionService.kt:78-80,102-106` / `session/AndroidAppExecutor.kt` —
+- [x] **AND-L7** (Low) `TerminalSessionService.kt:78-80,102-106` / `session/AndroidAppExecutor.kt` —
   FGS起動(`startService`/`startForeground`)の例外未捕捉。
   - 方針: 両方をtry/catchしてログに落とす(`startForeground`失敗時は`stopSelf`)。
 - [x] **AND-L8** (Low) `session/TerminalSession.kt:680-686` — `appendLog`がチャンク境界でUTF-8を
