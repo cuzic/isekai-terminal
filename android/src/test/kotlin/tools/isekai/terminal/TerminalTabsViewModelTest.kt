@@ -1046,6 +1046,46 @@ class TerminalTabsViewModelTest {
         )
     }
 
+    /** AND-M5: tmux連携を予約した(所有する)タブ自身が再接続(Rust自動再接続を含む)した場合は、
+     *  新しいSSHセッション上で改めてensureTmuxTabWindowを呼ぶ(ウィンドウ再attach・通知フック
+     *  再インストール)。以前はprofileId単位の予約に自分自身がブロックされていた。 */
+    @Test
+    fun maybeEnsureTmuxTabWindow_sameTabReconnects_callsEnsureAgain() = runBlocking {
+        val p = savedProfile("web")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value == null) delay(10) }
+
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value != null) delay(10) }
+        orchestrators[0].simulateConnected()
+
+        withTimeout(3000) { while (orchestrators[0].ensureTmuxTabWindowCalls.size < 2) delay(10) }
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value == null) delay(10) }
+        assertEquals(2, orchestrators[0].ensureTmuxTabWindowCalls.size)
+    }
+
+    /** AND-M5: 所有タブを閉じたら予約を解放し、同じプロファイルの別タブが次の接続で
+     *  tmux連携できる。 */
+    @Test
+    fun maybeEnsureTmuxTabWindow_ownerTabClosed_releasesClaimForNewTab() = runBlocking {
+        val p = savedProfile("web")
+        val idA = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        withTimeout(3000) { while (tab(idA).tmuxWindowLabel.value == null) delay(10) }
+
+        vm.closeTab(idA)
+        vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected()
+
+        awaitEnsureTmuxTabWindowCalled(orchestrators[1])
+    }
+
     @Test
     fun maybeEnsureTmuxTabWindow_reconnectingProfile_passesRoomPersistedTagAsExistingTag() = runBlocking {
         val p = savedProfile("web")
