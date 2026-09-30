@@ -78,7 +78,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 - [x] **AND-M6** (Medium) `TerminalTabsViewModel.kt:817-823` / `session/AndroidAppExecutor.kt:185-209` —
   ダウンロード保存の例外が未捕捉でプロセスが落ち、`IS_PENDING=1`の行がMediaStoreに残る。
   - 方針: collect側でtry/catchしてログに落とし、executor側は失敗時に挿入した行を`delete`する。
-- [ ] **AND-M7** (Medium) `input/TerminalInputConnection.kt` / `input/TerminalInputView.kt:97-100` —
+- [x] **AND-M7** (Medium) `input/TerminalInputConnection.kt` / `input/TerminalInputView.kt:97-100` —
   (a) `BaseInputConnection(fullEditor=true)`のEditableが送信済みテキストで無限に肥大、
   (b) Ctrlトグル経路でcomposing spanが残りショートカット無効化・古い文字の再送、
   (c) `deleteSurroundingText`の`beforeLength`が無制限、(d) onKeyDown由来の未処理キーが
