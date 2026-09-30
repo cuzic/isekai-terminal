@@ -29,9 +29,9 @@
 
 ## Medium
 
-- [ ] **RC-10** Medium — `trzsz.rs:219-250` — `::TRZSZ:TRANSFER:`後の行がパース不能だと`tail_buf`に保持し続け、以後VTEへ一切flushされず端末フリーズ+無制限成長(二乗再走査)。
+- [x] **RC-10** Medium — `trzsz.rs:219-250` — `::TRZSZ:TRANSFER:`後の行がパース不能だと`tail_buf`に保持し続け、以後VTEへ一切flushされず端末フリーズ+無制限成長(二乗再走査)。
   - 方針: magic後の最初の行が改行まで揃ってなおパース不能ならVTEへflushする。改行待ちの候補にもサイズ上限を設け、超えたらflush。
-- [ ] **RC-11** Medium — `trzsz.rs:274-277, 496-500, 681-687` — フレーム行長・WaitingKotlin中のバッファ・zlib展開出力に上限なし(zip bomb)。
+- [x] **RC-11** Medium — `trzsz.rs:274-277, 496-500, 681-687` — フレーム行長・WaitingKotlin中のバッファ・zlib展開出力に上限なし(zip bomb)。
   - 方針: 行長上限・WaitingKotlin中のバッファ上限・`ZlibDecoder`に`take(limit)`で展開上限を設け、超過時は転送失敗にする。
 - [x] **RC-12** Medium(sec) — `lib.rs:691-706` — bracketed paste時に本文中の`ESC[201~`を除去せずに括る → 貼り付けでコマンド注入。
   - 方針: bracketed paste時は本文中のESC(0x1B)を除去する(xterm等と同様)。
@@ -60,7 +60,7 @@
   - 方針: 行長上限+読み取りタイムアウト、`CtlVarStore`の件数/サイズ上限。
 - [ ] **RC-24** Medium — `multipath_transport.rs:88-95, 905, 928, 792-795, 647-649, 979-982` — Kotlinから所有権移譲されたraw fdが早期return経路でcloseされずリーク。
   - 方針: FFI境界を越えた直後に`OwnedFd`でラップし、どの経路でもdropでcloseされるようにする。
-- [ ] **RC-25** Medium — `trzsz.rs:428-436, 381, 371` — ダウンロードのMD5を検証せず成功扱い。SIZE/NUMのパース失敗を0/1へ黙って変換。
+- [x] **RC-25** Medium — `trzsz.rs:428-436, 381, 371` — ダウンロードのMD5を検証せず成功扱い。SIZE/NUMのパース失敗を0/1へ黙って変換。
   - 方針: 受信データのMD5を計算して照合し、不一致なら失敗。SIZE/NUMのパース失敗は転送失敗にする。
 - [x] **RC-26** Medium — `sixel.rs:229-231` — Sixel色指定パラメータVecが無制限に伸びる。
   - 方針: `params.len() >= 5`以降はpushしない(使うのは先頭4〜5個のみ)。

@@ -99,6 +99,18 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// プロトコル機構を持たない(自己申告)ため、二重に防御する。
 const MAX_DECLARED_TRZSZ_SIZE: u64 = 1 << 40; // 1 TiB
 
+/// RC-10(2026-09-29 コードレビュー): `::TRZSZ:TRANSFER:`を検出した後、トリガー行の
+/// 改行を待つ間に保持する候補の上限。正当なトリガー行は数十バイトしかない。
+const MAX_TRIGGER_CANDIDATE_BYTES: usize = 1024;
+/// RC-11: 転送中のプロトコル1行(`#TYPE:payload\n`)の長さ上限。trzszの既定の
+/// バッファサイズ(10MiB)のDATAをbase64化しても十分収まる値にしてある。
+const MAX_FRAME_LINE_BYTES: usize = 48 * 1024 * 1024;
+/// RC-11: 1フレームのzlib展開後サイズの上限(展開爆弾対策)。
+const MAX_FRAME_DECODED_BYTES: usize = 32 * 1024 * 1024;
+/// RC-11: Kotlinのファイル選択待ち(WaitingKotlin)中にバッファするサーバー出力の上限。
+/// この間サーバーが送ってくるのはCFG程度のはず。
+const MAX_WAITING_KOTLIN_BUFFER_BYTES: usize = 1024 * 1024;
+
 // ── FSM 内部状態 ──────────────────────────────────────────
 
 enum TrzszFsmState {
@@ -142,6 +154,8 @@ enum TransferPhase {
     },
     Download {
         step: DownloadStep,
+        /// RC-25: 受信したDATAの逐次MD5(サーバーのMD5フレームと照合する)。
+        md5_ctx: md5::Context,
     },
 }
 
@@ -211,6 +225,17 @@ impl TrzszTransferFsm {
         format!("trzsz-{id}")
     }
 
+    /// magicを含まない`tail_buf`のうち、末尾のmagic prefixになり得る部分だけを残して
+    /// 残りをVTEへ流す。
+    fn flush_non_magic_tail(&mut self, actions: &mut Vec<TrzszEffect>) {
+        let keep = magic_suffix_len(&self.tail_buf);
+        if self.tail_buf.len() > keep {
+            let flush_end = self.tail_buf.len() - keep;
+            actions.push(TrzszEffect::FlushVte(self.tail_buf[..flush_end].to_vec()));
+            self.tail_buf.drain(..flush_end);
+        }
+    }
+
     /// Normal 状態でバイト列を処理して actions を返す
     fn process_normal_bytes(&mut self, bytes: &[u8]) -> Vec<TrzszEffect> {
         self.tail_buf.extend_from_slice(bytes);
@@ -244,18 +269,25 @@ impl TrzszTransferFsm {
                     suggested_name: None,
                     expected_size: None,
                 });
+            } else if let Some(nl) = candidate.iter().position(|&b| b == b'\n') {
+                // RC-10: 改行まで揃っているのにトリガーとして解釈できない行(未知のモード
+                // 文字・`:`不足・非UTF-8、あるいは単にmagic文字列を含むログ等)。以前は
+                // これを`tail_buf`に保持し続けたため、以後の出力が一切VTEへ流れず端末が
+                // 固まり、バッファが際限なく伸びていた。通常の出力としてVTEへ流す。
+                // (`rfind`で最後のmagicから切り出しているので、残りにmagicは無い。)
+                actions.push(TrzszEffect::FlushVte(candidate[..=nl].to_vec()));
+                self.tail_buf = candidate[nl + 1..].to_vec();
+                self.flush_non_magic_tail(&mut actions);
+            } else if candidate.len() > MAX_TRIGGER_CANDIDATE_BYTES {
+                // RC-10: 改行が来ないまま長すぎる候補もトリガーではない。
+                actions.push(TrzszEffect::FlushVte(candidate));
             } else {
                 // まだ不完全（次の feed を待つ）
                 self.tail_buf = candidate;
             }
         } else {
             // magic なし: 末尾の magic prefix になり得る部分だけ残す
-            let keep = magic_suffix_len(&self.tail_buf);
-            if self.tail_buf.len() > keep {
-                let flush_end = self.tail_buf.len() - keep;
-                actions.push(TrzszEffect::FlushVte(self.tail_buf[..flush_end].to_vec()));
-                self.tail_buf.drain(..flush_end);
-            }
+            self.flush_non_magic_tail(&mut actions);
         }
 
         actions
@@ -273,7 +305,21 @@ impl TrzszTransferFsm {
         {
             proto_buf.extend_from_slice(bytes);
             loop {
-                let Some(nl) = proto_buf.iter().position(|&b| b == b'\n') else { break; };
+                let Some(nl) = proto_buf.iter().position(|&b| b == b'\n') else {
+                    // RC-11: 改行の来ない巨大な行でメモリを使い切らせない。
+                    if proto_buf.len() > MAX_FRAME_LINE_BYTES {
+                        log::warn!("trzsz: protocol line exceeds {} bytes, aborting", MAX_FRAME_LINE_BYTES);
+                        effects.push(TrzszEffect::SendStdin(vec![0x03])); // Ctrl+C
+                        effects.push(TrzszEffect::OnFinished {
+                            transfer_id: transfer_id.clone(),
+                            success: false,
+                            message: Some("trzsz: protocol frame too large".to_string()),
+                        });
+                        proto_buf.clear();
+                        terminal = Some(false);
+                    }
+                    break;
+                };
                 let raw: Vec<u8> = proto_buf.drain(..=nl).collect();
                 let mut line = &raw[..raw.len() - 1];
                 if line.last() == Some(&b'\r') {
@@ -362,13 +408,18 @@ impl TrzszTransferFsm {
                             }
                         }
                     }
-                    TransferPhase::Download { step } => match typ.as_str() {
+                    TransferPhase::Download { step, md5_ctx } => match typ.as_str() {
                         "CFG" if *step == DownloadStep::WaitCfg => {
                             // CFG 受信 → NUM から始まるファイル受信シーケンスへ
                             *step = DownloadStep::WaitNum;
                         }
                         "NUM" if *step == DownloadStep::WaitNum => {
-                            let n = payload.parse::<u64>().unwrap_or(1);
+                            // RC-25: 以前はパース失敗を黙って1にしていた。
+                            let Ok(n) = payload.trim().parse::<u64>() else {
+                                push_protocol_failure(&mut effects, transfer_id, &format!("invalid NUM frame: {payload:?}"));
+                                terminal = Some(false);
+                                break;
+                            };
                             effects.push(TrzszEffect::SendStdin(frame_int("SUCC", n)));
                             *step = DownloadStep::WaitName;
                         }
@@ -378,7 +429,13 @@ impl TrzszTransferFsm {
                             *step = DownloadStep::WaitSize;
                         }
                         "SIZE" if *step == DownloadStep::WaitSize => {
-                            let n = payload.parse::<u64>().unwrap_or(0);
+                            // RC-25: 以前はパース失敗を黙って0にしており、以後のDATAも
+                            // MD5も受け付けられずタイムアウトまで固まっていた。
+                            let Ok(n) = payload.trim().parse::<u64>() else {
+                                push_protocol_failure(&mut effects, transfer_id, &format!("invalid SIZE frame: {payload:?}"));
+                                terminal = Some(false);
+                                break;
+                            };
                             if n > MAX_DECLARED_TRZSZ_SIZE {
                                 // サーバーが明らかに異常な(またはu64::MAX付近の)SIZEを
                                 // 申告してきた。以降DATAを受け取ってもOOMするだけなので、
@@ -406,7 +463,14 @@ impl TrzszTransferFsm {
                             }
                         }
                         "DATA" if *step == DownloadStep::Receiving => {
-                            let Some(data) = decode_bytes(&payload) else { continue; };
+                            // RC-11: 展開上限超過・壊れたDATAは黙って読み飛ばさず転送失敗にする
+                            // (読み飛ばすとデータが欠けたまま進むかタイムアウトまで固まる)。
+                            let Some(data) = decode_bytes(&payload) else {
+                                push_protocol_failure(&mut effects, transfer_id, "invalid or oversized DATA frame");
+                                terminal = Some(false);
+                                break;
+                            };
+                            md5_ctx.consume(&data);
                             let len = data.len() as u64;
                             *transferred += len;
                             let is_last = matches!(*total, Some(t) if *transferred >= t);
@@ -426,13 +490,22 @@ impl TrzszTransferFsm {
                             }
                         }
                         "MD5" if *step == DownloadStep::WaitMd5 => {
-                            effects.push(TrzszEffect::SendStdin(frame("SUCC", &payload)));
-                            effects.push(TrzszEffect::OnFinished {
-                                transfer_id: transfer_id.clone(),
-                                success: true,
-                                message: None,
-                            });
-                            terminal = Some(true);
+                            // RC-25: 以前はサーバーのMD5をそのままSUCCで返すだけで照合して
+                            // おらず、壊れた/欠けたダウンロードも成功扱いにしていた。
+                            let expected = decode_bytes(&payload);
+                            let actual = md5_ctx.clone().finalize();
+                            if expected.as_deref() == Some(&actual.0[..]) {
+                                effects.push(TrzszEffect::SendStdin(frame("SUCC", &payload)));
+                                effects.push(TrzszEffect::OnFinished {
+                                    transfer_id: transfer_id.clone(),
+                                    success: true,
+                                    message: None,
+                                });
+                                terminal = Some(true);
+                            } else {
+                                push_protocol_failure(&mut effects, transfer_id, "MD5 mismatch: downloaded data is corrupted");
+                                terminal = Some(false);
+                            }
                         }
                         _ => {}
                     },
@@ -493,9 +566,16 @@ impl TimedStateMachine for TrzszTransferFsm {
                         return resp;
                     }
                 }
-                TrzszFsmState::WaitingKotlin { proto_buf, .. } => {
+                TrzszFsmState::WaitingKotlin { proto_buf, transfer_id, .. } => {
                     // ACT 送信済み、CFG 等のサーバー応答をバッファリング
                     log::debug!("trzsz: WaitingKotlin buffering {} server bytes", bytes.len());
+                    // RC-11: ユーザーがファイルを選ぶ間(最大120秒)に届くのはCFG程度のはず。
+                    // 上限を超えて送り続けてくるなら転送を中断する。
+                    if proto_buf.len().saturating_add(bytes.len()) > MAX_WAITING_KOTLIN_BUFFER_BYTES {
+                        let tid = transfer_id.clone();
+                        return self.abort_transfer(tid, "trzsz: too much server output while waiting for the user")
+                            .with_kill_timer(TrzszTimer::Transfer);
+                    }
                     proto_buf.extend_from_slice(&bytes);
                     return Response::consume();
                 }
@@ -560,6 +640,7 @@ impl TimedStateMachine for TrzszTransferFsm {
                             total: None,
                             phase: TransferPhase::Download {
                                 step: DownloadStep::WaitCfg,
+                                md5_ctx: md5::Context::new(),
                             },
                         };
                         let resp = self.on_transferring_bytes(&[]);
@@ -681,10 +762,26 @@ fn encode_bytes(buf: &[u8]) -> String {
 fn decode_bytes(s: &str) -> Option<Vec<u8>> {
     use std::io::Read;
     let raw = BASE64.decode(s.trim()).ok()?;
-    let mut dec = flate2::read::ZlibDecoder::new(&raw[..]);
+    // RC-11: 展開後サイズに上限を設ける(zlib展開爆弾で1フレームから数GBを
+    // 展開させられないように)。上限+1まで読んで超えていたら失敗にする。
+    let dec = flate2::read::ZlibDecoder::new(&raw[..]);
     let mut out = Vec::new();
-    dec.read_to_end(&mut out).ok()?;
+    dec.take(MAX_FRAME_DECODED_BYTES as u64 + 1).read_to_end(&mut out).ok()?;
+    if out.len() > MAX_FRAME_DECODED_BYTES {
+        return None;
+    }
     Some(out)
+}
+
+/// 転送中のプロトコル違反で転送を失敗させる(サーバー側の`trz`/`tsz`をCtrl+Cで止める)。
+fn push_protocol_failure(effects: &mut Vec<TrzszEffect>, transfer_id: &str, message: &str) {
+    log::warn!("trzsz: {message}, aborting");
+    effects.push(TrzszEffect::SendStdin(vec![0x03])); // Ctrl+C
+    effects.push(TrzszEffect::OnFinished {
+        transfer_id: transfer_id.to_string(),
+        success: false,
+        message: Some(format!("trzsz: {message}")),
+    });
 }
 
 /// `#TYPE:payload` 形式の 1 行をパースする（先頭の tmux junk は無視）
@@ -1186,9 +1283,71 @@ mod tests {
         assert!(contains_subseq(&stdin_bytes(&r), b"#SUCC:5\n"));
 
         // MD5 → 完了
-        let r = fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("MD5", b"digest")));
+        let r = fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("MD5", &md5::compute(b"hello").0)));
         assert!(r.actions.iter().any(|a| matches!(a, TrzszEffect::OnFinished { success: true, .. })));
         assert!(matches!(fsm.state, TrzszFsmState::Normal));
+    }
+
+    /// RC-25: サーバーのMD5と受信データが一致しなければ失敗にする。
+    #[test]
+    fn test_download_md5_mismatch_fails_the_transfer() {
+        let mut fsm = TrzszTransferFsm::new();
+        let resp = feed(&mut fsm, trigger("S"));
+        let tid = request_tid(&resp).unwrap();
+        accept_download_and_cfg(&mut fsm, &tid);
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_int("NUM", 1)));
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("NAME", b"a.txt")));
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_int("SIZE", 5)));
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("DATA", b"hello")));
+        let r = fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("MD5", b"digest")));
+        assert!(r.actions.iter().any(|a| matches!(a, TrzszEffect::OnFinished { success: false, .. })));
+        assert!(matches!(fsm.state, TrzszFsmState::Recovering));
+    }
+
+    /// RC-25: SIZEがパースできなければ0扱いにせず失敗にする。
+    #[test]
+    fn test_download_invalid_size_fails_immediately() {
+        let mut fsm = TrzszTransferFsm::new();
+        let resp = feed(&mut fsm, trigger("S"));
+        let tid = request_tid(&resp).unwrap();
+        accept_download_and_cfg(&mut fsm, &tid);
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_int("NUM", 1)));
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("NAME", b"a.txt")));
+        let r = fsm.on_event(TrzszEvent::StdoutBytes(frame("SIZE", "not-a-number")));
+        assert!(r.actions.iter().any(|a| matches!(a, TrzszEffect::OnFinished { success: false, .. })));
+    }
+
+    /// RC-11: 展開上限を超えるDATA(zlib展開爆弾)は展開せずに失敗させる。
+    #[test]
+    fn test_decode_bytes_rejects_oversized_output() {
+        let big = vec![0u8; MAX_FRAME_DECODED_BYTES + 1];
+        assert!(decode_bytes(&encode_bytes(&big)).is_none());
+        let ok = vec![0u8; 1024];
+        assert_eq!(decode_bytes(&encode_bytes(&ok)).unwrap(), ok);
+    }
+
+    /// RC-10: 解釈できないトリガー行は端末出力として流れ、その後の出力も止まらない。
+    #[test]
+    fn test_malformed_trigger_line_is_flushed_and_output_continues() {
+        let mut fsm = TrzszTransferFsm::new();
+        let r = feed(&mut fsm, b"before ::TRZSZ:TRANSFER:X:1:2\nafter".to_vec());
+        let out = vte_bytes(&r);
+        assert!(contains_subseq(&out, b"::TRZSZ:TRANSFER:X:1:2\n"));
+        assert!(contains_subseq(&out, b"after"));
+        let r = feed(&mut fsm, b" more output\n".to_vec());
+        assert!(contains_subseq(&vte_bytes(&r), b"more output"));
+        assert!(fsm.tail_buf.len() < TRZSZ_MAGIC.len());
+    }
+
+    /// RC-10: 改行が来ないまま長すぎる候補もいずれ流れる。
+    #[test]
+    fn test_overlong_trigger_candidate_is_flushed() {
+        let mut fsm = TrzszTransferFsm::new();
+        let mut bytes = b"::TRZSZ:TRANSFER:".to_vec();
+        bytes.extend(std::iter::repeat(b'z').take(MAX_TRIGGER_CANDIDATE_BYTES + 10));
+        let r = feed(&mut fsm, bytes);
+        assert!(!vte_bytes(&r).is_empty());
+        assert!(fsm.tail_buf.is_empty());
     }
 
     // download: SIZEがサニティ上限を超える場合は中断する(#60: OOM対策)。
