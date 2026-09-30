@@ -663,6 +663,28 @@ class TerminalTabsViewModelTest {
         assertTrue(tab(id).primaryPane.session.state.value.connected)
     }
 
+    /** AND-H3: relay JWTの復号失敗は接続コルーチンから漏れてアプリをクラッシュさせず、
+     *  このペインの接続前エラーとして表示される。例外経路でも復号済み秘密鍵PEMは消去される。 */
+    @Test
+    fun connectTab_relayJwtDecryptFails_showsErrorWithoutCrashAndWipesKey() = runBlocking {
+        val pem = byteArrayOf(1, 2, 3, 4)
+        executor.keyPem = pem
+        executor.decryptRelayJwtError = IllegalStateException("keystore entry missing")
+        val p = keyProfile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_LINK_RELAY_QUIC.name,
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "ciphertext",
+        )
+        val id = vm.openTab(p)
+
+        withTimeout(3000) { while (tab(id).primaryPane.preConnectError.value == null) delay(10) }
+
+        assertTrue(tab(id).primaryPane.preConnectError.value!!.contains("keystore entry missing"))
+        assertFalse(orchestrators[0].connectIsekaiLinkRelayCalled)
+        assertTrue("例外経路でも復号済みPEMをゼロ化する", pem.all { it == 0.toByte() })
+    }
+
     @Test
     fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
         val id = vm.openTab(multipathProfile("a"), "pass")

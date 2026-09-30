@@ -57,7 +57,12 @@ class DumbAppExecutor : AppExecutor {
         keyPemError?.let { throw it }
         return keyPem
     }
-    override fun decryptRelayJwt(ciphertext: String): String = ciphertext
+    /** AND-H3: relay JWT復号失敗(Keystoreエントリ欠落等)を注入する。 */
+    var decryptRelayJwtError: Throwable? = null
+    override fun decryptRelayJwt(ciphertext: String): String {
+        decryptRelayJwtError?.let { throw it }
+        return ciphertext
+    }
     override suspend fun openUploadFile(uri: Uri): UploadFile =
         UploadFile(uri.lastPathSegment ?: "fake", 0L, ByteArrayInputStream(ByteArray(0)))
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}

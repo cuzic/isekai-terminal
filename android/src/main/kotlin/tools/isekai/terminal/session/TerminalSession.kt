@@ -498,6 +498,11 @@ class TerminalSession(
             connect()
         } catch (e: SshException) {
             dispatch(UiMsg.ConnectFailed(e.message))
+        } catch (e: Exception) {
+            // AND-H3: UniFFIの`InternalException`(Rust panic由来)等、宣言外の例外も
+            // 呼び出し元(viewModelScope)へ漏らさずエラー表示に落とす。
+            RemoteLogger.e("IsekaiTerminalSSH", "connect failed unexpectedly: ${e.message}", e)
+            dispatch(UiMsg.ConnectFailed(e.message ?: e.javaClass.simpleName))
         }
     }
 
