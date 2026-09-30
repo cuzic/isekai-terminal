@@ -130,6 +130,28 @@ class TerminalSession(
     private val transferAccepted = AtomicBoolean(false)
 
     /**
+     * AND-H1: [close]済みか。[close]はUniFFIオブジェクト([SessionOrchestrator])を
+     * 明示的に`close()`(=`destroy()`)する。生成バインディングはdestroy後の呼び出しで
+     * `IllegalStateException`("object has already been destroyed")を投げるため、
+     * close後にUI(Composeの再コンポジション等)から遅れて届く操作は[live]で無音に落とす。
+     * セッション/接続の状態ではなく「このKotlinラッパー自体の寿命」を表すフラグであり、
+     * rust-ssotのミラー状態には当たらない。
+     */
+    private val closed = AtomicBoolean(false)
+
+    /** close済みなら[default]を返し、そうでなければ[block]を実行する。closeと並行した
+     *  呼び出しがdestroy済みハンドルに当たった場合(`IllegalStateException`)も、
+     *  close済みであれば[default]に落とす(close前の本物の異常は握り潰さない)。 */
+    private inline fun <T> live(default: T, block: (SessionOrchestratorInterface) -> T): T {
+        if (closed.get()) return default
+        return try {
+            block(orchestrator)
+        } catch (e: IllegalStateException) {
+            if (closed.get()) default else throw e
+        }
+    }
+
+    /**
      * #25: 直近フィードバック(振動等)を発火した`ScreenUpdate.bellGeneration`。
      * `bellGeneration`はRust側`Terminal`ごとに(#24)0始まりで単調増加するカウンタなので、
      * これより大きい値を受け取った時だけ1回発火させるdedupe用の記憶として使う。
@@ -362,6 +384,8 @@ class TerminalSession(
         // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
         override fun onAgentSignRequest(keyFingerprint: String): Boolean {
             RemoteLogger.i("IsekaiTerminalSSH", "agent sign request: $keyFingerprint")
+            // AND-H1: close済みのペインでは確認UIがもう存在しないため即座に拒否する。
+            if (closed.get()) return false
             val deferred = CompletableDeferred<Boolean>()
             pendingAgentSignRequest.set(deferred)
             _state.update { it.copy(agentSignRequestFingerprint = keyFingerprint) }
@@ -401,7 +425,8 @@ class TerminalSession(
         ioScope.launch {
             for (update in screenUpdateChannel) {
                 if (_state.value.connected) {
-                    _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
+                    val scrollbackLen = live(0u) { it.scrollbackLen() }.toInt()
+                    _state.update { it.copy(screenUpdate = update, scrollbackLen = scrollbackLen) }
                     maybeFireBell(update)
                     maybeFireNotify(update)
                     maybeApplyPanel(update)
@@ -422,6 +447,7 @@ class TerminalSession(
      *  ようにする」UI側の二重サブミット防止であり、`ConnectionCoordinator.connectPane`の
      *  同種チェックとあわせて意図的に残す。 */
     private inline fun guardedConnect(connect: () -> Unit) {
+        if (closed.get()) return
         if (_state.value.let { it.connected || it.isConnecting }) return
         // #25: 新しい論理セッションを開始する直前に、直近発火済みBEL世代の記憶を
         // 同期的にリセットする([lastFiredBellGeneration]のdocコメント参照)。ここで
@@ -449,45 +475,45 @@ class TerminalSession(
         }
     }
 
-    fun connect(config: SshConfig) = guardedConnect { orchestrator.connect(config) }
+    fun connect(config: SshConfig) = guardedConnect { live(Unit) { it.connect(config) } }
 
-    fun connectQuic(config: QuicConfig) = guardedConnect { orchestrator.connectQuic(config) }
+    fun connectQuic(config: QuicConfig) = guardedConnect { live(Unit) { it.connectQuic(config) } }
 
     /** Phase 7: 自作ヘルパー経由 QUIC。フォールバック無し（明示選択時）。 */
     fun connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig) =
-        guardedConnect { orchestrator.connectIsekaiPipeQuic(config) }
+        guardedConnect { live(Unit) { it.connectIsekaiPipeQuic(config) } }
 
     /** Phase 7: 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする。 */
     fun connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig) =
-        guardedConnect { orchestrator.connectIsekaiPipeQuicAuto(config) }
+        guardedConnect { live(Unit) { it.connectIsekaiPipeQuicAuto(config) } }
 
     /** Phase 9: 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパス。フォールバック無し。 */
     fun connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) =
-        guardedConnect { orchestrator.connectMultipathIsekaiPipeQuic(config) }
+        guardedConnect { live(Unit) { it.connectMultipathIsekaiPipeQuic(config) } }
 
     /** Phase 10: STUN+SSHランデブーによる直接P2P QUIC。relay無し・フォールバック無し。 */
     fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) =
-        guardedConnect { orchestrator.connectIsekaiStunP2p(config) }
+        guardedConnect { live(Unit) { it.connectIsekaiStunP2p(config) } }
 
     /** Phase 10: MASQUE relay経由のP2P QUIC。フォールバック無し。 */
     fun connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) =
-        guardedConnect { orchestrator.connectIsekaiLinkRelay(config) }
+        guardedConnect { live(Unit) { it.connectIsekaiLinkRelay(config) } }
 
-    fun send(bytes: ByteArray) = orchestrator.send(bytes)
-    fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
+    fun send(bytes: ByteArray) = live(Unit) { it.send(bytes) }
+    fun resize(cols: UInt, rows: UInt) = live(Unit) { it.resize(cols, rows) }
 
     fun disconnect() {
         _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
-        orchestrator.disconnect()
+        live(Unit) { it.disconnect() }
     }
 
     /** 自動再接続ループ([isReconnecting]中)を中止する。判断はRust側
      *  (`SessionOrchestrator::cancelReconnect`)で行い、結果は通常の
      *  `onConnectionStateChanged`経由で[_state]に反映される。 */
-    fun cancelReconnect() = orchestrator.cancelReconnect()
+    fun cancelReconnect() = live(Unit) { it.cancelReconnect() }
 
     fun scrollbackCells(offset: Int, rows: Int): List<CellData>? =
-        orchestrator.scrollbackCells(offset.toUInt(), rows.toUInt())
+        live(null) { it.scrollbackCells(offset.toUInt(), rows.toUInt()) }
 
     /** タスク#66: スクロールバック検索バーUI用。マッチ計算(部分一致検索・combining
      *  character境界処理・大小文字無視)は全て`SessionOrchestrator::search_scrollback`
@@ -496,38 +522,38 @@ class TerminalSession(
      *  複製しない)。未接続時は空リストを返す。返る`ScrollbackSearchMatch.row`は
      *  [scrollbackCells]と同じ規約(タスク#37のドキュメント参照)。 */
     fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
-        orchestrator.searchScrollback(query, caseSensitive)
+        live(emptyList()) { it.searchScrollback(query, caseSensitive) }
 
     /** タスク#13(OSC 133)「前のプロンプトへジャンプ」。既存のスクロールバック検索
      *  ([searchScrollback])とは独立した機能。`fromScrollOffset`/`fromShowingScrollback`
      *  は呼び出し時点でKotlin側が表示している位置(タスク#79と同じ規約)をそのまま渡す。
      *  結果は[promptJumpEvent]で非同期に届く。 */
     fun jumpToPreviousPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
-        orchestrator.jumpToPreviousPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+        live(Unit) { it.jumpToPreviousPrompt(fromScrollOffset.toUInt(), fromShowingScrollback) }
 
     /** [jumpToPreviousPrompt]の「次」版。 */
     fun jumpToNextPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
-        orchestrator.jumpToNextPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+        live(Unit) { it.jumpToNextPrompt(fromScrollOffset.toUInt(), fromShowingScrollback) }
 
     /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
      *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
      *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
     fun clickToPromptCursor(row: Int, col: Int) =
-        orchestrator.clickToPromptCursor(row.toUInt(), col.toUInt())
+        live(Unit) { it.clickToPromptCursor(row.toUInt(), col.toUInt()) }
 
     /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
      *  [promptOutputCopyEvent]で非同期に届く。 */
-    fun copyLastCommandOutput() = orchestrator.copyLastCommandOutput()
+    fun copyLastCommandOutput() = live(Unit) { it.copyLastCommandOutput() }
 
     /** Phase 12: このタブだけの配色テーマを差し替える(per-session theme)。
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
-        orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
+        live(Unit) { it.setSessionTheme(ansi16, defaultFg, defaultBg) }
 
     /** `AI_INTEGRATION_DESIGN.md` §3: このタブのAIパネル機能(presentDocument/
      *  presentForm)opt-inを設定する。`setTheme`と同じくRust側は値を保持しないため、
      *  接続のたびに(再接続を含め)呼び出し側が送り直す必要がある。 */
-    fun setAiPanelEnabled(enabled: Boolean) = orchestrator.setAiPanelEnabled(enabled)
+    fun setAiPanelEnabled(enabled: Boolean) = live(Unit) { it.setAiPanelEnabled(enabled) }
 
     /**
      * タスク#60: tmux session groupのensure/attach + タブ用ウィンドウのcreate-or-select。
@@ -535,8 +561,12 @@ class TerminalSession(
      * そのまま委譲する薄いパススルー(`.claude/rules/rust-ssot.md`)。呼び出し元
      * ([TerminalTabsViewModel])はprimary paneについてのみ呼ぶこと(split pane非対応)。
      */
-    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Boolean) =
-        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, enableNotifications)
+    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?, enableNotifications: Boolean): TmuxTabWindowInfo {
+        // close済みなら呼び出し元(opportunisticなtmux連携、例外はログのみで無視される)へ
+        // 明示的な例外で返す。
+        check(!closed.get()) { "session already closed" }
+        return orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag, enableNotifications)
+    }
 
     // ── Network ───────────────────────────────────────────────────────
 
@@ -545,19 +575,19 @@ class TerminalSession(
      *  瞬断で即切断しないよう debounce する）の判断はセッション状態の SSOT を持つ Rust 側
      *  （`SessionOrchestrator::notify_network_path_changed`）が行う。
      *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
-    fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
+    fun notifyNetworkPathChanged(isSatisfied: Boolean) = live(Unit) { it.notifyNetworkPathChanged(isSatisfied) }
 
     /** `UpstreamHealthMonitor`(ConnectivityManagerの`NET_CAPABILITY_VALIDATED`喪失、
      *  Rust側のQUICパスヘルスとは無関係な独自シグナル)が検知した「WiFiは繋がっている
      *  がupstreamが死んでいる」を、判断・rebind実行を一切せずRust側`RebindManager`へ
      *  そのまま転送するだけ(`rust-ssot.md`準拠)。マルチパス以外のtransportや
      *  `enableUpstreamFailover`が無効な場合はRust側で無視される。 */
-    fun notifyUpstreamHealthDegraded() = orchestrator.notifyUpstreamHealthDegraded()
+    fun notifyUpstreamHealthDegraded() = live(Unit) { it.notifyUpstreamHealthDegraded() }
 
     /** #11: 「今すぐWiFiに戻す」。疎通確認だけは省略されないが、静けさ待ち・セルラー
      *  最小滞在はバイパスされる(`RebindManager::handle_manual_force_return`参照)。
      *  マルチパス以外のtransportや未接続時はRust側で無視される。 */
-    fun forceReturnToWifi() = orchestrator.forceReturnToWifi()
+    fun forceReturnToWifi() = live(Unit) { it.forceReturnToWifi() }
 
     /** #60: このペインがOS/UI上でフォーカスを得た(=タブ切替やsplit pane切替で
      *  「アクティブなタブかつフォーカス中のペイン」になった)/失ったことをそのまま
@@ -565,7 +595,7 @@ class TerminalSession(
      *  `CSI I`/`CSI O`がリモートへ送られるかどうかの判断はRust側(`Terminal`)が持つ
      *  (rust-ssot)。呼び出し元([TerminalScreenBody]の`isActive && hasFocus`)は
      *  生の可視性/フォーカス状態を渡すだけでよい。 */
-    fun notifyFocusChange(focused: Boolean) = orchestrator.notifyFocusChange(focused)
+    fun notifyFocusChange(focused: Boolean) = live(Unit) { it.notifyFocusChange(focused) }
 
     /** アプリ全体がバックグラウンドへ遷移した(`ProcessLifecycleOwner.onStop`相当)ことを
      *  そのままRust側へ転送する。`budgetMs`はAndroidではForeground Service経由で
@@ -573,11 +603,11 @@ class TerminalSession(
      *  未使用)。tmux通知の抑制判断(`SessionOrchestrator::on_notify`)を含む「今アプリが
      *  前景か」の生の事実として使われる(`rust-ssot.md`、実機検証2026-07-28で
      *  これが未配線のためtmux通知が常に抑制されるバグを修正)。 */
-    fun notifyDidEnterBackground() = orchestrator.notifyDidEnterBackground(0u)
+    fun notifyDidEnterBackground() = live(Unit) { it.notifyDidEnterBackground(0u) }
 
     /** アプリがフォアグラウンドへ復帰した(`ProcessLifecycleOwner.onStart`相当)ことを
      *  そのままRust側へ転送する。[notifyDidEnterBackground]と対称。 */
-    fun notifyWillEnterForeground() = orchestrator.notifyWillEnterForeground()
+    fun notifyWillEnterForeground() = live(Unit) { it.notifyWillEnterForeground() }
 
     // ── Host key ──────────────────────────────────────────────────────
 
@@ -624,27 +654,27 @@ class TerminalSession(
     fun trzszAcceptDownload() {
         if (_state.value.trzszState !is TrzszUiState.WaitingUser) return
         if (!transferAccepted.compareAndSet(false, true)) return
-        orchestrator.trzszAcceptDownload()
+        live(Unit) { it.trzszAcceptDownload() }
     }
 
     fun trzszAcceptUpload(fileName: String, fileSize: ULong, mode: UInt) {
         if (_state.value.trzszState !is TrzszUiState.WaitingUser) return
         if (!transferAccepted.compareAndSet(false, true)) return
-        orchestrator.trzszAcceptUpload(fileName, fileSize, mode)
+        live(Unit) { it.trzszAcceptUpload(fileName, fileSize, mode) }
     }
 
     fun trzszSendChunk(data: ByteArray, isLast: Boolean) {
-        orchestrator.trzszSendChunk(data, isLast)
+        live(Unit) { it.trzszSendChunk(data, isLast) }
     }
 
     fun trzszCancel() {
         if (_state.value.trzszState == null) return
         transferAccepted.set(false)
         _state.update { it.copy(trzszState = null) }
-        orchestrator.trzszCancel()
+        live(Unit) { it.trzszCancel() }
     }
 
-    fun trzszDismiss() = orchestrator.trzszDismiss()
+    fun trzszDismiss() = live(Unit) { it.trzszDismiss() }
 
     fun consumeDownloadFile() { _pendingDownloadFile.value = null }
 
@@ -663,8 +693,9 @@ class TerminalSession(
     suspend fun filePreviewRequest(kind: FilePreviewRequestKind): FilePreviewOutcome {
         val requestId = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<FilePreviewOutcome>()
+        if (closed.get()) return FilePreviewOutcome.Error("session closed")
         pendingFilePreviewRequests[requestId] = deferred
-        orchestrator.filePreviewRequest(requestId, kind)
+        live(Unit) { it.filePreviewRequest(requestId, kind) }
         return try {
             withTimeoutOrNull(FILE_PREVIEW_TIMEOUT_MS) { deferred.await() }
                 ?: FilePreviewOutcome.Error("file preview request timed out")
@@ -685,9 +716,40 @@ class TerminalSession(
         }
     }
 
+    /**
+     * ペイン/タブを閉じる時に呼ぶ。冪等。
+     *
+     * AND-H1: 以前は`orchestrator.disconnect()`しか呼んでおらず、UniFFIオブジェクト自体を
+     * 解放していなかった。Rust側`SessionOrchestrator`は`callback`(=このクラスの匿名inner
+     * object)のハンドルを寿命いっぱい保持し、Kotlin側の静的ハンドルマップはRustがハンドルを
+     * 落とすまでcallbackを保持するため、callback→this→orchestrator→Rust→callbackの循環が
+     * GCルートから到達可能なまま残り、Cleaner経由の解放が永遠に起きなかった
+     * (閉じたペインごとにRust側Terminal/scrollback/tokioタスクとKotlin側状態がプロセス寿命
+     * いっぱいリーク)。ここで明示的に`close()`(=`destroy()`)して循環を断つ。
+     */
     override fun close() {
-        orchestrator.disconnect()
+        if (!closed.compareAndSet(false, true)) return
+        // Rustの`spawn_blocking`スレッドで確認待ちの署名要求があれば即座に拒否して解放する
+        // (放置するとRustスレッドが最大25秒ブロックされ続ける)。
+        pendingAgentSignRequest.getAndSet(null)?.complete(false)
+        pendingFilePreviewRequests.values.forEach { it.complete(FilePreviewOutcome.Error("session closed")) }
+        pendingFilePreviewRequests.clear()
+        try {
+            // 自動再接続ループが回っていればRust側で止める(動いていなければRust側で無音)。
+            // 止めないとdestroy後もループが新しいセッションを張り直しうる。
+            orchestrator.cancelReconnect()
+            orchestrator.disconnect()
+        } catch (e: Exception) {
+            RemoteLogger.w("IsekaiTerminalSSH", "close: disconnect failed (ignored)", e)
+        }
         screenUpdateChannel.close()
         ioScope.cancel()
+        (orchestrator as? AutoCloseable)?.let {
+            try {
+                it.close()
+            } catch (e: Exception) {
+                RemoteLogger.w("IsekaiTerminalSSH", "close: orchestrator destroy failed (ignored)", e)
+            }
+        }
     }
 }

@@ -802,6 +802,49 @@ class TerminalSessionTest {
         session.close()
     }
 
+    /** AND-H1: close()はUniFFIオブジェクト自体を解放(AutoCloseable.close=destroy)し、
+     *  callback↔Rust Arcの循環を断つ。二重closeでも1回しか解放しない。 */
+    @Test
+    fun close_releasesNativeOrchestratorExactlyOnce() {
+        session.close()
+        session.close()
+        assertEquals(1, fakeOrchestrator.closeCallCount)
+    }
+
+    /** AND-H1: close後にUIから遅れて届いた操作は、destroy済みハンドルに当たって
+     *  IllegalStateExceptionでクラッシュせず無音で無視される。 */
+    @Test
+    fun operationsAfterClose_areSilentlyIgnored() {
+        session.close()
+        session.send("late".toByteArray())
+        session.resize(80u, 24u)
+        session.disconnect()
+        assertTrue(fakeOrchestrator.sentBytes.isEmpty())
+        assertNull(session.scrollbackCells(0, 10))
+    }
+
+    /** AND-H1: close時に確認待ちのagent署名要求があれば、Rustスレッドを25秒ブロックし
+     *  続けずに即座に拒否で返す。 */
+    @Test
+    fun close_withPendingAgentSignRequest_deniesImmediately() = runBlocking {
+        session.connect(testConfig())
+        val resultDeferred = async(Dispatchers.IO) {
+            fakeOrchestrator.simulateAgentSignRequest("SHA256:pending")
+        }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:pending" } }
+
+        session.close()
+
+        assertFalse(withTimeout(3000) { resultDeferred.await() })
+    }
+
+    /** AND-H1: close済みのペインへ届いた署名要求は待たずに拒否する。 */
+    @Test
+    fun agentSignRequest_afterClose_isDeniedWithoutBlocking() {
+        session.close()
+        assertFalse(fakeOrchestrator.simulateAgentSignRequest("SHA256:late"))
+    }
+
     // ── ViewModel 相当カバレッジ（JVM で検証）────────────────────────
 
     @Test

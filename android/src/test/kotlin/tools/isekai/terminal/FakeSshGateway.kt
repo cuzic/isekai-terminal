@@ -8,8 +8,13 @@ import uniffi.isekai_terminal_core.*
  * テスト用フェイク SessionOrchestrator。
  * Rust/ネイティブを一切呼ばず、コールバックを直接発火できる。
  */
-class FakeOrchestrator : SessionOrchestratorInterface {
+class FakeOrchestrator : SessionOrchestratorInterface, AutoCloseable {
     var callback: OrchestratorCallback? = null
+
+    /** AND-H1: 本番の生成クラス`SessionOrchestrator`と同じく[AutoCloseable]を実装し、
+     *  `TerminalSession.close()`が明示的にネイティブハンドルを解放することを検証できるようにする。 */
+    var closeCallCount = 0
+    override fun close() { closeCallCount++ }
 
     var connectCalled = false
     var connectQuicCalled = false
@@ -103,7 +108,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun notifyWillEnterForeground() { notifyWillEnterForegroundCallCount++ }
     override fun notifyBackgroundBudgetExpired() {}
     override fun notifyMemoryWarning() {}
-    override fun send(data: ByteArray) { sentBytes.add(data) }
+    override fun send(data: ByteArray) {
+        // 本番の生成バインディングはdestroy後の呼び出しでIllegalStateExceptionを投げる。
+        check(closeCallCount == 0) { "FakeOrchestrator object has already been destroyed" }
+        sentBytes.add(data)
+    }
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u
     override fun scrollbackCells(offset: UInt, rows: UInt): List<CellData> = emptyList()

@@ -13,7 +13,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 
 ## High
 
-- [ ] **AND-H1** (High) `session/TerminalSession.kt:688-692` — `close()`が`orchestrator.disconnect()`のみで
+- [x] **AND-H1** (High) `session/TerminalSession.kt:688-692` — `close()`が`orchestrator.disconnect()`のみで
   UniFFIオブジェクトを`destroy()`/`close()`しない。callback↔Rust Arcの循環でCleanerが永遠に発火せず、
   閉じたペインごとにRust側セッションとKotlin側`TerminalSession`がプロセス寿命いっぱいリークする。
   pending中のagent署名要求もRustスレッドを25秒ブロックし続ける。
