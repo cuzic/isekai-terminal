@@ -24,12 +24,11 @@ use quicmux::{AnyMuxFactory, MuxClientConfig};
 /// identical ATTACH-protocol bytes once the session is established.
 pub const QMUX_ALPN: &[u8] = b"isekai-pipe/1+qmux01";
 
-/// The `qmux`-backed [`quicmux::AnyMuxFactory`] for this relay leg. Every
-/// [`quicmux::MuxClientConfig`] field besides `alpn`/`exporter_label`/
-/// `datagram_send_buffer_size` is ignored by the `qmux` backend (see that
-/// type's own field docs), so the idle-timeout/keepalive/stream-limit/
-/// multipath values here are copied from `system::isekai_mux_config`'s
-/// equivalents purely for consistency, not because this backend reads them.
+/// The `qmux`-backed [`quicmux::AnyMuxFactory`] for this relay leg. The
+/// `qmux` backend applies the idle timeout and stream limits here (its
+/// keep-alive cadence is derived from the negotiated idle timeout; the
+/// `keep_alive_interval`/`multipath` values are unused by it), matching
+/// `system::isekai_mux_config`'s equivalents.
 pub fn qmux_relay_factory() -> AnyMuxFactory {
     AnyMuxFactory::qmux(MuxClientConfig {
         alpn: QMUX_ALPN.to_vec(),

@@ -111,6 +111,28 @@ fn apply_datagram_config(config: &mut qmux::Config, datagram_send_buffer_size: O
     }
 }
 
+/// Applies the backend-agnostic idle-timeout/stream-limit knobs
+/// ([`MuxClientConfig`]/[`MuxServerConfig`]) to a `qmux::Config` — these used
+/// to be silently ignored, leaving qmux's own defaults (30s idle, 100
+/// streams) in force whatever the caller asked for. `keep_alive_interval`
+/// has no qmux equivalent: qmux derives its keep-alive `QX_PING` cadence from
+/// the negotiated idle timeout internally.
+fn apply_limits(config: &mut qmux::Config, max_idle_timeout: std::time::Duration, bidi: u32, uni: u32) {
+    config.max_idle_timeout = u64::try_from(max_idle_timeout.as_millis()).unwrap_or(u64::MAX);
+    config.max_streams_bidi = u64::from(bidi);
+    config.max_streams_uni = u64::from(uni);
+}
+
+/// How long [`QmuxIncoming::accept`] may spend on the TLS + QMux handshake of
+/// one inbound TCP connection before giving up on it, so a peer that opens a
+/// TCP connection and then stalls (slowloris) can't pin a task and an fd
+/// forever.
+const SERVER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Back-off after a TCP `accept` error (e.g. `EMFILE` when out of fds)
+/// before trying again — a transient error must not end the listener.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A `qmux`-backed [`crate::AnyMuxFactory`] variant. Stateless — every
 /// [`QmuxFactory::create_endpoint`] call just records the requested local
 /// bind address; the actual TCP connect + TLS handshake + QMux session
@@ -144,8 +166,13 @@ pub struct QmuxEndpoint {
 
 impl QmuxEndpoint {
     pub(crate) async fn connect(&self, remote: RemoteSpec) -> Result<QmuxConnection, MuxError> {
-        let socket = tokio::net::TcpSocket::new_v4().map_err(|source| MuxError::Bind { addr: self.local_addr, source })?;
-        socket.bind(self.local_addr).map_err(|source| MuxError::Bind { addr: self.local_addr, source })?;
+        // The local bind must match the remote's address family (an IPv4
+        // socket can never reach an IPv6 peer); an unspecified bind of the
+        // other family is re-targeted rather than failing.
+        let local_addr = crate::types::BindSpec::adapt_to_remote(self.local_addr, remote.addr);
+        let socket = if local_addr.is_ipv6() { tokio::net::TcpSocket::new_v6() } else { tokio::net::TcpSocket::new_v4() }
+            .map_err(|source| MuxError::Bind { addr: local_addr, source })?;
+        socket.bind(local_addr).map_err(|source| MuxError::Bind { addr: local_addr, source })?;
         let tcp = socket.connect(remote.addr).await.map_err(|e| MuxError::ConnectSetup(e.to_string()))?;
 
         let mismatch = Arc::new(Mutex::new(None));
@@ -180,6 +207,12 @@ impl QmuxEndpoint {
 
         let mut config = qmux::Config::new(qmux::Version::QMux01);
         apply_datagram_config(&mut config, self.config.datagram_send_buffer_size);
+        apply_limits(
+            &mut config,
+            self.config.max_idle_timeout,
+            self.config.max_concurrent_bidi_streams,
+            self.config.max_concurrent_uni_streams,
+        );
         let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
         let session = qmux::Session::connect(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
 
@@ -196,6 +229,7 @@ pub struct QmuxListener {
     acceptor: tokio_rustls::TlsAcceptor,
     exporter_label: Vec<u8>,
     datagram_send_buffer_size: Option<usize>,
+    limits: ServerLimits,
     /// `accept()` checks this before/while waiting on the next TCP
     /// connection — a `tokio::net::TcpListener` has no `close()`/`shutdown()`
     /// of its own to call from a `&self` method, so this plus `close_notify`
@@ -229,6 +263,11 @@ impl QmuxListener {
         Ok(Self {
             listener,
             acceptor,
+            limits: ServerLimits {
+                max_idle_timeout: config.max_idle_timeout,
+                bidi: config.max_concurrent_bidi_streams,
+                uni: config.max_concurrent_uni_streams,
+            },
             exporter_label: config.exporter_label,
             datagram_send_buffer_size: config.datagram_send_buffer_size,
             closed: Arc::new(AtomicBool::new(false)),
@@ -245,22 +284,45 @@ impl QmuxListener {
     /// [`QmuxEndpoint::connect`]), so [`QmuxIncoming::accept`] is where all
     /// of it happens, with no intermediate "accepted, not yet
     /// handshaken" state worth exposing.
+    ///
+    /// Returns `None` only once [`QmuxListener::close`] was called. A TCP
+    /// `accept` error (e.g. `EMFILE`/`ENFILE` when out of file descriptors,
+    /// `ECONNABORTED`) is transient for a listener — it used to end the
+    /// whole listener (`None`), which the server loop treats as shutdown; now
+    /// it backs off briefly and keeps accepting.
     pub(crate) async fn accept(&self) -> Option<QmuxIncoming> {
-        if self.closed.load(Ordering::Acquire) {
-            return None;
-        }
-        tokio::select! {
-            _ = self.close_notify.notified() => None,
-            result = self.listener.accept() => match result {
-                Ok((tcp, peer_addr)) => Some(QmuxIncoming {
-                    tcp,
-                    peer_addr,
-                    acceptor: self.acceptor.clone(),
-                    exporter_label: self.exporter_label.clone(),
-                    datagram_send_buffer_size: self.datagram_send_buffer_size,
-                }),
-                Err(_) => None,
-            },
+        loop {
+            // Register interest *before* checking the flag, so a `close()`
+            // landing between the check and the wait can't be missed
+            // (`notify_waiters` only wakes already-registered waiters).
+            let notified = self.close_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            tokio::select! {
+                _ = &mut notified => return None,
+                result = self.listener.accept() => match result {
+                    Ok((tcp, peer_addr)) => {
+                        return Some(QmuxIncoming {
+                            tcp,
+                            peer_addr,
+                            acceptor: self.acceptor.clone(),
+                            exporter_label: self.exporter_label.clone(),
+                            datagram_send_buffer_size: self.datagram_send_buffer_size,
+                            limits: self.limits,
+                        })
+                    }
+                    Err(e) => {
+                        log::warn!("quicmux: qmux listener accept failed ({e}); retrying");
+                        tokio::select! {
+                            _ = &mut notified => return None,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
+                    }
+                },
+            }
         }
     }
 
@@ -289,10 +351,28 @@ pub struct QmuxIncoming {
     acceptor: tokio_rustls::TlsAcceptor,
     exporter_label: Vec<u8>,
     datagram_send_buffer_size: Option<usize>,
+    limits: ServerLimits,
+}
+
+/// The [`MuxServerConfig`] knobs [`apply_limits`] carries over to each
+/// accepted session.
+#[derive(Debug, Clone, Copy)]
+struct ServerLimits {
+    max_idle_timeout: std::time::Duration,
+    bidi: u32,
+    uni: u32,
 }
 
 impl QmuxIncoming {
+    /// TLS + QMux handshake for one inbound connection, bounded by
+    /// [`SERVER_HANDSHAKE_TIMEOUT`].
     pub(crate) async fn accept(self) -> Result<QmuxConnection, MuxError> {
+        tokio::time::timeout(SERVER_HANDSHAKE_TIMEOUT, self.accept_inner())
+            .await
+            .map_err(|_| MuxError::Handshake("TLS/QMux handshake timed out".to_string()))?
+    }
+
+    async fn accept_inner(self) -> Result<QmuxConnection, MuxError> {
         let mut tls_stream = self.acceptor.accept(self.tcp).await.map_err(|e| MuxError::Handshake(e.to_string()))?;
 
         // Captured now, symmetric to the client side — see this module's
@@ -307,6 +387,7 @@ impl QmuxIncoming {
 
         let mut config = qmux::Config::new(qmux::Version::QMux01);
         apply_datagram_config(&mut config, self.datagram_send_buffer_size);
+        apply_limits(&mut config, self.limits.max_idle_timeout, self.limits.bidi, self.limits.uni);
         let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
         let session = qmux::Session::accept(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
 

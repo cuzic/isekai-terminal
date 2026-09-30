@@ -44,6 +44,9 @@ mod linux;
 
 mod clock_skew;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod snapshot;
+
 pub use clock_skew::ClockSkewWatchdog;
 
 use async_trait::async_trait;

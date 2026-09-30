@@ -24,10 +24,14 @@
 //!   deterministic numbering rule locally on both ends: `index << 2 |
 //!   direction_bit | initiator_bit`, counting "the Nth stream I opened" and
 //!   "the Nth stream I accepted" separately per (direction, initiator)
-//!   category. Both peers converge on the same id for a given logical
-//!   stream without observing it on the wire because `qmux::Session`
-//!   delivers each category's streams to `open_*`/`accept_*` in the same
-//!   strictly-increasing order the wire protocol itself enforces.
+//!   category. For streams *we* open this is exact (our own open order is
+//!   the id order). For *peer*-opened streams it is not guaranteed:
+//!   `qmux::Session` delivers them to `accept_*` in first-frame arrival
+//!   order, so a later stream can overtake an earlier one. Peer-opened uni
+//!   stream ids are never used for routing (h3 control/QPACK streams), so
+//!   that's harmless; for peer-opened *bidi* streams (request streams, whose
+//!   id is the datagram routing key) only the first one is accepted — see
+//!   `poll_accept_bidi`.
 #![deny(missing_docs)]
 
 use std::{
@@ -169,6 +173,22 @@ where
         let (send, recv) = ready!(self.incoming_bi.poll_next_unpin(cx))
             .expect("self.incoming_bi BoxStream never returns None")
             .map_err(convert_connection_error)?;
+        // `qmux` delivers peer-initiated streams in *first-frame arrival*
+        // order (a later stream whose first frame overtakes an earlier one's
+        // is delivered first — no implicit in-order opening), so the
+        // locally reconstructed id of the second and later peer-initiated
+        // bidi stream may not be its real wire id, and h3-datagram's
+        // quarter-stream-id routing would silently mis-route. Only the first
+        // one is guaranteed (it is always index 0). Fail closed rather than
+        // hand out a possibly wrong id — this crate's own use is client-only
+        // (the peer never opens bidi streams) and a single-request server.
+        if self.ids.remote_bidi.load(Ordering::Relaxed) >= 1 {
+            return Poll::Ready(Err(ConnectionErrorIncoming::InternalError(
+                "h3-qmux: more than one peer-initiated bidi stream is unsupported (qmux exposes no stream ids, \
+                 so a correct id cannot be reconstructed)"
+                    .to_string(),
+            )));
+        }
         // One bidi stream = one id, shared by both halves.
         let id = self.ids.next_remote_bidi();
         Poll::Ready(Ok(Self::BidiStream {
@@ -244,13 +264,22 @@ where
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn close(&mut self, code: Code, reason: &[u8]) {
-        self.session.close(code.value() as u32, &String::from_utf8_lossy(reason));
+        self.session.close(code_to_u32(code.value()), &String::from_utf8_lossy(reason));
     }
+}
+
+/// An h3 error code (a QUIC varint, up to 2^62) narrowed to qmux's `u32`
+/// codes. A value that doesn't fit used to be silently truncated (`as u32`)
+/// into an unrelated code; it now maps to `H3_INTERNAL_ERROR`.
+fn code_to_u32(code: u64) -> u32 {
+    u32::try_from(code).unwrap_or(Code::H3_INTERNAL_ERROR.value() as u32)
 }
 
 fn convert_connection_error(e: qmux::Error) -> h3::quic::ConnectionErrorIncoming {
     match e {
-        qmux::Error::ConnectionClosed { .. } => ConnectionErrorIncoming::ApplicationClose { error_code: 0 },
+        // Keep the peer's close code (it used to be replaced by 0, i.e.
+        // H3_NO_ERROR-ish, hiding why the peer closed).
+        qmux::Error::ConnectionClosed { code, .. } => ConnectionErrorIncoming::ApplicationClose { error_code: code.into() },
         qmux::Error::IdleTimeout | qmux::Error::HandshakeTimeout => ConnectionErrorIncoming::Timeout,
         other => ConnectionErrorIncoming::Undefined(Arc::new(other)),
     }
@@ -323,7 +352,7 @@ where
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn close(&mut self, code: Code, reason: &[u8]) {
-        self.session.close(code.value() as u32, &String::from_utf8_lossy(reason));
+        self.session.close(code_to_u32(code.value()), &String::from_utf8_lossy(reason));
     }
 }
 
@@ -477,7 +506,7 @@ impl quic::RecvStream for RecvStream {
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn stop_sending(&mut self, error_code: u64) {
-        let error_code = error_code as u32;
+        let error_code = code_to_u32(error_code);
         if let Some(stream) = self.stream.as_mut() {
             stream.stop(error_code);
         } else {
@@ -513,6 +542,11 @@ enum SendStreamState<B: Buf + Send + 'static> {
     Idle(qmux::SendStream),
     Writing(WriteFuture),
     Finishing(qmux::SendStream),
+    /// A write failed, or the stream was reset while a write was in flight:
+    /// every later operation reports this error instead of the old
+    /// behavior of pretending to succeed (`Ok` from `poll_ready`/
+    /// `poll_finish` with nothing actually sent).
+    Failed(String),
     /// Transient state only observed re-entrantly inside `poll_ready`/etc.
     Invalid,
     _Marker(std::marker::PhantomData<B>),
@@ -527,6 +561,32 @@ where
     fn new(stream: qmux::SendStream, stream_id: quic::StreamId) -> SendStream<B> {
         Self { stream_id, state: SendStreamState::Idle(stream) }
     }
+
+    /// Settles a finished write: back to `Idle` on success, `Failed` (with
+    /// the error returned now *and* remembered for every later call) on
+    /// failure.
+    fn complete_write(&mut self, stream: qmux::SendStream, result: Result<(), qmux::Error>) -> Result<(), StreamErrorIncoming> {
+        match result {
+            Ok(()) => {
+                self.state = SendStreamState::Idle(stream);
+                Ok(())
+            }
+            Err(e) => {
+                self.state = SendStreamState::Failed(e.to_string());
+                Err(convert_stream_error(e))
+            }
+        }
+    }
+}
+
+/// The error to report for an operation attempted in a state that can't
+/// perform it (`Failed`, or the should-never-be-observed `Invalid`).
+fn failed_error<B: Buf + Send + 'static>(state: &SendStreamState<B>) -> StreamErrorIncoming {
+    let reason = match state {
+        SendStreamState::Failed(reason) => reason.clone(),
+        _ => "send stream is in an invalid state".to_string(),
+    };
+    StreamErrorIncoming::Unknown(Box::new(std::io::Error::other(format!("h3-qmux: {reason}"))))
 }
 
 impl<B> quic::SendStream<B> for SendStream<B>
@@ -548,50 +608,77 @@ where
                 // bytes already queued in `stream`'s internal buffer/task)
                 // the moment this function returns.
                 match fut.poll(cx) {
-                    Poll::Ready((stream, result)) => {
-                        result.map_err(convert_stream_error)?;
-                        self.state = SendStreamState::Idle(stream);
-                        Poll::Ready(Ok(()))
-                    }
+                    Poll::Ready((stream, result)) => Poll::Ready(self.complete_write(stream, result)),
                     Poll::Pending => {
                         self.state = SendStreamState::Writing(fut);
                         Poll::Pending
                     }
                 }
             }
-            other => {
-                self.state = other;
+            SendStreamState::Finishing(stream) => {
+                self.state = SendStreamState::Finishing(stream);
                 Poll::Ready(Ok(()))
+            }
+            other => {
+                let err = failed_error(&other);
+                self.state = other;
+                Poll::Ready(Err(err))
             }
         }
     }
 
+    /// Finishes (FIN) the stream — after completing any write still in
+    /// flight. It used to report `Ok` while a write was pending without ever
+    /// sending FIN, and `Ok` after a failed write.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    fn poll_finish(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+    fn poll_finish(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         match std::mem::replace(&mut self.state, SendStreamState::Invalid) {
             SendStreamState::Idle(mut stream) => {
                 let result = stream.finish().map_err(convert_stream_error);
                 self.state = SendStreamState::Finishing(stream);
                 Poll::Ready(result)
             }
+            SendStreamState::Writing(mut fut) => match fut.poll(cx) {
+                Poll::Ready((stream, result)) => {
+                    if let Err(e) = self.complete_write(stream, result) {
+                        return Poll::Ready(Err(e));
+                    }
+                    self.poll_finish(cx)
+                }
+                Poll::Pending => {
+                    self.state = SendStreamState::Writing(fut);
+                    Poll::Pending
+                }
+            },
             SendStreamState::Finishing(stream) => {
-                self.state = SendStreamState::Idle(stream);
+                self.state = SendStreamState::Finishing(stream);
                 Poll::Ready(Ok(()))
             }
             other => {
+                let err = failed_error(&other);
                 self.state = other;
-                Poll::Ready(Ok(()))
+                Poll::Ready(Err(err))
             }
         }
     }
 
+    /// Resets the stream. With a write in flight, the write future (which
+    /// owns the `qmux::SendStream`) is dropped, which makes qmux reset the
+    /// stream itself — with code `0`, since qmux offers no way to reach a
+    /// stream owned by an in-flight write to pass the requested code. It
+    /// used to do nothing at all in that state.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     fn reset(&mut self, reset_code: u64) {
-        if let SendStreamState::Idle(mut stream) | SendStreamState::Finishing(mut stream) =
-            std::mem::replace(&mut self.state, SendStreamState::Invalid)
-        {
-            stream.reset(reset_code as u32);
-            self.state = SendStreamState::Idle(stream);
+        match std::mem::replace(&mut self.state, SendStreamState::Invalid) {
+            SendStreamState::Idle(mut stream) | SendStreamState::Finishing(mut stream) => {
+                stream.reset(code_to_u32(reset_code));
+                self.state = SendStreamState::Idle(stream);
+            }
+            SendStreamState::Writing(fut) => {
+                drop(fut);
+                self.state = SendStreamState::Failed(format!("stream reset (code {reset_code}) while a write was in flight"));
+            }
+            other => self.state = other,
         }
     }
 
@@ -655,8 +742,7 @@ where
                 // Same Pending-path state-loss hazard as `poll_ready` above.
                 match fut.poll(cx) {
                     Poll::Ready((stream, result)) => {
-                        self.state = SendStreamState::Idle(stream);
-                        result.map_err(convert_stream_error)?;
+                        self.complete_write(stream, result)?;
                         Poll::Ready(Ok(0))
                     }
                     Poll::Pending => {
@@ -666,9 +752,22 @@ where
                 }
             }
             other => {
+                let err = failed_error(&other);
                 self.state = other;
-                panic!("poll_send called while send stream is not ready")
+                Poll::Ready(Err(err))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_that_do_not_fit_in_u32_map_to_internal_error_instead_of_truncating() {
+        assert_eq!(code_to_u32(0x100), 0x100);
+        assert_eq!(code_to_u32(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(code_to_u32(u64::from(u32::MAX) + 0x100), Code::H3_INTERNAL_ERROR.value() as u32);
     }
 }

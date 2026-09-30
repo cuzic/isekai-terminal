@@ -146,6 +146,30 @@ pub async fn open_control_stream(conn: &AnyMuxConnection, proof: &Proof) -> Resu
     .map_err(|_| TransportError::TimedOut { stage: "open_control_stream" })?
 }
 
+/// [`open_control_stream`] plus the check that `CONTROL_ACK` echoed back the
+/// `session_id` this client itself attached (or resumed) as — a server that
+/// answers with a different one is not talking about our session, and
+/// binding APP_ACK bookkeeping (and every later RESUME) to its value would
+/// silently resume the wrong session or none at all.
+async fn open_control_stream_for(
+    conn: &AnyMuxConnection,
+    proof: &Proof,
+    expected: SessionId,
+) -> Result<ControlStream, TransportError> {
+    let control = open_control_stream(conn, proof).await?;
+    check_control_session_id(control.session_id, expected)?;
+    Ok(control)
+}
+
+fn check_control_session_id(echoed: SessionId, expected: SessionId) -> Result<(), TransportError> {
+    if echoed != expected {
+        return Err(TransportError::ControlHandshake(format!(
+            "CONTROL_ACK echoed session_id {echoed}, but this client attached as {expected}"
+        )));
+    }
+    Ok(())
+}
+
 /// The result of establishing a brand-new (non-resumed) relay connection with
 /// resume support wired up: the data stream (HELLO/ACK'd, ready for raw
 /// pass-through), the control stream (`CONTROL_HELLO`/`CONTROL_ACK`'d, ready
@@ -193,11 +217,12 @@ pub async fn connect_via_relay_resumable(
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<ResumableRelaySession, TransportError> {
     let endpoint = factory.create_endpoint(target.bind_spec()).await.map_err(TransportError::Mux)?;
+    let session_id = random_session_id();
     let (conn, data_stream, proof, effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
         target.remote_spec(),
         &target.session_secret,
-        random_session_id(),
+        session_id,
         ConnectionGeneration::INITIAL,
         requested_resume_grace_secs,
         identity,
@@ -210,7 +235,7 @@ pub async fn connect_via_relay_resumable(
     // usable afterward.
     let network_rebinder = endpoint.rebinder();
 
-    let control = open_control_stream(&conn, &proof).await?;
+    let control = open_control_stream_for(&conn, &proof, session_id).await?;
     info!("isekai-transport: control stream established, session_id={}", control.session_id);
 
     Ok(ResumableRelaySession {
@@ -352,7 +377,11 @@ impl std::fmt::Display for SequentialConnectError {
                 )
             }
             Self::GaveUpAfterGenerationRetries { failures, budget } => {
-                write!(f, "gave up after generation retries were exhausted ({budget}); {} pre-attach failure(s) along the way:", failures.len())?;
+                write!(
+                    f,
+                    "gave up after generation retries were exhausted ({budget}); {} failure(s) along the way (the last one exhausted the budget):",
+                    failures.len()
+                )?;
                 for failure in failures {
                     write!(f, " [{}: {}]", failure.candidate_id, failure.failure)?;
                 }
@@ -468,7 +497,10 @@ pub async fn connect_via_relay_resumable_with_fallback(
                 Ok(ok) => ok,
                 Err(attempt_err) => {
                     let failure = crate::attempt::AttemptFailure::from(attempt_err);
-                    match &failure {
+                    // Only the ambiguous/stale arms fall through to here (with
+                    // the exhausted generation budget); every other arm
+                    // continues or returns on its own.
+                    let exhausted = match &failure {
                         crate::attempt::AttemptFailure::RetryablePreAttach { .. } => {
                             failures.push(SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
                             continue;
@@ -489,19 +521,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                     start_index = (idx + 1) % candidates.len();
                                     continue 'rounds;
                                 }
-                                Err(budget) => {
-                                    crate::telemetry::log_rendezvous_outcome(
-                                        None,
-                                        None,
-                                        "abandoned",
-                                        failures.len() as u32,
-                                        attempt_start.elapsed(),
-                                    );
-                                    return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
-                                        failures,
-                                        budget,
-                                    });
-                                }
+                                Err(budget) => budget,
                             }
                         }
                         crate::attempt::AttemptFailure::StaleAttempt { current_generation, .. } => {
@@ -518,19 +538,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                     start_index = (idx + 1) % candidates.len();
                                     continue 'rounds;
                                 }
-                                Err(budget) => {
-                                    crate::telemetry::log_rendezvous_outcome(
-                                        None,
-                                        None,
-                                        "abandoned",
-                                        failures.len() as u32,
-                                        attempt_start.elapsed(),
-                                    );
-                                    return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
-                                        failures,
-                                        budget,
-                                    });
-                                }
+                                Err(budget) => budget,
                             }
                         }
                         crate::attempt::AttemptFailure::MustResume { .. } => {
@@ -559,7 +567,19 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                 failure,
                             });
                         }
-                    }
+                    };
+                    crate::telemetry::log_rendezvous_outcome(
+                        None,
+                        None,
+                        "abandoned",
+                        failures.len() as u32,
+                        attempt_start.elapsed(),
+                    );
+                    // Keep the failure that finally exhausted the budget —
+                    // it used to be dropped, leaving only the (possibly
+                    // empty) pre-attach failures to explain the give-up.
+                    failures.push(SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
+                    return Err(SequentialConnectError::GaveUpAfterGenerationRetries { failures, budget: exhausted });
                 }
             };
 
@@ -568,7 +588,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
             // comment on why that's safe.
             let network_rebinder = endpoint.rebinder();
 
-            let control = match open_control_stream(&conn, &proof).await {
+            let control = match open_control_stream_for(&conn, &proof, round.session_id).await {
                 Ok(control) => control,
                 Err(source) => {
                     return Err(SequentialConnectError::AttachedButControlStreamFailed {
@@ -624,7 +644,7 @@ async fn finish_via_resume(
     let proof = compute_proof(&resumed.connection, &resume_target.session_secret, b"")
         .await
         .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id: candidate_id.clone(), source })?;
-    let control = open_control_stream(&resumed.connection, &proof)
+    let control = open_control_stream_for(&resumed.connection, &proof, session_id)
         .await
         .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id, source })?;
 
@@ -737,7 +757,7 @@ pub async fn reconnect_and_resume(
     client_sent_offset: C2hSentOffset,
     client_delivered_offset: H2cClientDeliveredOffset,
 ) -> Result<ResumeAckOutcome, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await.map_err(TransportError::Mux)?;
     let conn = tokio::time::timeout(
         TRANSPORT_STEP_TIMEOUT,
         endpoint.connect(RemoteSpec {

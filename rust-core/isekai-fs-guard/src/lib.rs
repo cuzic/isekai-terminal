@@ -74,14 +74,49 @@ pub enum FsGuardError {
 /// group is still allowed. Windows: rejects any DACL grant of write-ish
 /// rights to a principal other than the current user (see `windows_acl.rs`,
 /// stricter than the Unix policy by design). A no-op on any other platform.
+///
+/// Unix also requires the (symlink-resolved) path to be owned by the
+/// current user or root: a file/directory owned by another account is
+/// writable by that account whatever its mode bits say (the same rule
+/// `ssh(1)` applies to `~/.ssh` — "Bad owner or permissions"). Symlinks are
+/// followed on purpose (a dotfiles-managed `~/.config` is common); the
+/// checks apply to what they point at.
 #[cfg(unix)]
 pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = fs::metadata(path).map_err(FsGuardError::Stat)?;
     let mode = metadata.permissions().mode();
     if mode & 0o002 != 0 {
         return Err(FsGuardError::WorldWritable { mode: mode & 0o777 });
     }
+    // SAFETY: geteuid never fails and has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let owner = metadata.uid();
+    if owner != euid && owner != 0 {
+        // Reported through the existing variant (a new one would break
+        // downstream exhaustive matches): the "principal" with write access
+        // is the foreign owner.
+        return Err(FsGuardError::InsecureAcl { principal: format!("uid {owner} (owner)"), rights: format!("{:o}", mode & 0o777) });
+    }
+    Ok(())
+}
+
+/// Tightens an existing secret file we own to `0600` if it is readable by
+/// group/others (e.g. copied in by hand, or created before this crate
+/// enforced the mode) — self-healing rather than refusing to read it, which
+/// would break connecting for no gain once the file is fixed anyway.
+#[cfg(unix)]
+fn tighten_secret_file_mode(path: &Path) -> Result<(), FsGuardError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).map_err(FsGuardError::Stat)?;
+    if metadata.is_file() && metadata.permissions().mode() & 0o077 != 0 {
+        set_private_file_permissions(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_secret_file_mode(_path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }
 
@@ -275,6 +310,7 @@ pub fn read_checked(path: &Path) -> Result<Option<String>, FsGuardErrorAt> {
         return Ok(None);
     }
     check_not_world_writable(path).map_err(|e| FsGuardErrorAt::at(path, e))?;
+    tighten_secret_file_mode(path).map_err(|e| FsGuardErrorAt::at(path, e))?;
     let content =
         fs::read_to_string(path).map_err(|source| FsGuardErrorAt::Read { path: path.to_path_buf(), source })?;
     Ok(Some(content))
@@ -295,8 +331,12 @@ pub fn write_private_atomically(path: &Path, contents: &[u8]) -> Result<(), FsGu
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|source| FsGuardErrorAt::Write { path: path.to_path_buf(), source })?;
     set_private_file_permissions(tmp.path()).map_err(|e| FsGuardErrorAt::at(tmp.path(), e))?;
+    // `sync_all` before the rename: otherwise a crash/power loss right after
+    // `persist` can leave the new name pointing at an empty or partially
+    // written file (the rename reaches disk before the data does).
     tmp.write_all(contents)
         .and_then(|_| tmp.flush())
+        .and_then(|_| tmp.as_file().sync_all())
         .map_err(|source| FsGuardErrorAt::Write { path: path.to_path_buf(), source })?;
 
     tmp.persist(path).map_err(|e| FsGuardErrorAt::Write { path: path.to_path_buf(), source: e.error })?;
@@ -473,5 +513,33 @@ mod tests {
         write_private_atomically(&path, b"first").unwrap();
         write_private_atomically(&path, b"second").unwrap();
         assert_eq!(read_checked(&path).unwrap(), Some("second".to_string()));
+    }
+
+    /// A secret file readable by group/others (e.g. copied in by hand) is
+    /// tightened to 0600 on read instead of being left exposed.
+    #[cfg(unix)]
+    #[test]
+    fn read_checked_tightens_a_group_or_world_readable_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("token.json");
+        fs::write(&path, b"secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(read_checked(&path).unwrap(), Some("secret".to_string()));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// Our own files pass the owner check (the foreign-owner branch can't be
+    /// exercised without root, but this pins that the new check doesn't
+    /// reject the normal case).
+    #[cfg(unix)]
+    #[test]
+    fn a_file_owned_by_the_current_user_passes_the_owner_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, b"x").unwrap();
+        check_not_world_writable(&path).unwrap();
     }
 }

@@ -110,6 +110,11 @@ impl PathHealthFsm {
 
         if zero_response {
             self.consecutive_no_response = self.consecutive_no_response.saturating_add(1);
+            // Level-triggered on purpose: the driver re-checks "is any path
+            // still viable?" on every such check (another path may have
+            // degraded meanwhile); the *notification* itself is
+            // de-duplicated by `PathHealthTracker` (sent once per transition
+            // into "no viable path").
             if self.consecutive_no_response >= NO_RESPONSE_CONSECUTIVE_CHECKS {
                 self.degraded = true;
                 actions.push(PathHealthAction::DegradeZeroResponse { consecutive: self.consecutive_no_response });

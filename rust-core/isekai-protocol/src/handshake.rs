@@ -28,7 +28,8 @@ pub const CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST: &str = "direct-by-bootstrap-host";
 pub const CANDIDATE_SERVER_REFLEXIVE: &str = "server-reflexive";
 pub const CANDIDATE_RELAYED: &str = "relayed";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` redacts `session_secret`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeJson {
     pub v: u32,
     pub session_secret: String,
@@ -38,6 +39,19 @@ pub struct HandshakeJson {
     pub services: Vec<HandshakeService>,
     #[serde(default)]
     pub candidates: Vec<HandshakeCandidate>,
+}
+
+impl std::fmt::Debug for HandshakeJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeJson")
+            .field("v", &self.v)
+            .field("session_secret", &"<redacted>")
+            .field("protocol", &self.protocol)
+            .field("peer", &self.peer)
+            .field("services", &self.services)
+            .field("candidates", &self.candidates)
+            .finish()
+    }
 }
 
 /// Logical wire protocol served by this process.

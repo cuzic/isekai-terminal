@@ -17,7 +17,7 @@
 //! straight to `rebind_socket`, matching `quicsock`'s own recommendation).
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use crate::error::TransportError;
 
@@ -46,10 +46,7 @@ pub fn bind_physical_interface(interface: InterfaceIndex, local_addr: SocketAddr
 /// wired interfaces this crate's other dial paths were originally written
 /// against.
 fn unspecified_addr_for(remote: SocketAddr) -> SocketAddr {
-    match remote {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    }
+    quicmux::BindSpec::unspecified_for(remote).local_addr
 }
 
 /// Binds a UDP socket restricted to `interface`, trying each port
