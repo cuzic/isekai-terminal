@@ -93,8 +93,8 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L13a** `noq_backend.rs:32` — `candidate_ports` が start>end で underflow する → 空集合を返す。
 - [x] **TR-L13b** `noq_backend.rs:52-66` — ポート範囲の bind を最大 65536 回同期的に試行する → 試行回数に上限を設ける。
 - [x] **TR-L14** `relay_client.rs:321-325` — RelayUdpSocket を drop しても外側の接続を閉じない → socket の drop を検知して driver タスクを終了させる(H2 と同じコミット)。
-- [~] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
-  見送り(担当境界): `quicmux/src/resume*.rs` は isekai-pipe 担当(fix-isekai-pipe)の領域。
+- [-] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
+  対応不要(本PR外で対応済み): `quicmux/src/resume*.rs` は isekai-pipe 担当。PR #127(PIPE-15)で drain(..k) 化し、回帰テストも追加済み。
 - [x] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
 - [x] **TR-L16b** `h3-qmux/src/lib.rs:253` — peer の close code を捨てている → code を保持する。
 - [x] **TR-L17a** `isekai-auth/src/device_flow.rs:90` — 巨大な expires_in で Instant の加算が panic する → checked_add を使い、上限にクランプする。
