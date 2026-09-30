@@ -188,6 +188,8 @@
   - 要約: composing 中に `insertText` が来ると marked text を確定送信したうえで insertText も送り、二重送信されうる(pinyin 系で要実機確認)。
     `markedTextLog` と `buffer` が際限なく伸びる。
   - 修正方針: 伸長は上限を設けて対処する。二重送信は実機での IME 挙動確認が前提。
-- [ ] **IOS-L5** (Low) `ios/Sources/IsekaiTerminalCore/ProfileDatabase.swift:449-451,467`
+- [x] **IOS-L5** (Low) `ios/Sources/IsekaiTerminalCore/ProfileDatabase.swift:449-451,467`
   - 要約: `jumpKeyEntryId` に FK/ON DELETE SET NULL がなく、鍵を削除すると踏み台プロファイルの参照がぶら下がる。
   - 修正方針: スキーマ変更(migration)ではなく、`deleteKeyEntry` の同一トランザクション内で `jumpKeyEntryId` を NULL に戻す。テストを追加。
+  - 対応: `deleteKeyEntry` の同一トランザクション内で `UPDATE connection_profile SET jumpKeyEntryId = NULL WHERE jumpKeyEntryId = ?` を実行するようにした。migration は不要。
+    テスト `testDeletingKeyEntrySetsProfileJumpKeyEntryIdToNull`(他の鍵を参照するプロファイルに影響しないことも含む)を追加。
