@@ -528,6 +528,47 @@ pub(crate) fn init_logging(plan: &WrapperPlan) -> Result<()> {
 /// to run) for both — a small, deliberate UX improvement riding along with
 /// this dedup, not a functional change (this arm is reached only when the
 /// user has explicitly opted out of auto-bootstrap).
+/// Whether a persisted profile exists for `resolution`'s profile key, as far
+/// as [`build_intent_or_bootstrap`]'s choice of trust-confirmation mode is
+/// concerned (review 2026-09-29, SSH-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileFileState {
+    /// Genuinely never registered (no file at all) — first contact.
+    Missing,
+    /// A file exists — readable or not (corrupt JSON, schema mismatch, an
+    /// I/O error, or readable but unusable). This host was trusted once.
+    Present,
+}
+
+fn profile_file_state(resolution: &WrapperResolution) -> ProfileFileState {
+    let Ok(key) = isekai_trust::normalize_host_port(&resolution.isekai.profile) else {
+        return ProfileFileState::Missing;
+    };
+    let Ok(profiles_dir) = default_profiles_dir() else {
+        return ProfileFileState::Missing;
+    };
+    match load_persistent_profile(&profiles_dir, &key) {
+        Ok(None) => ProfileFileState::Missing,
+        Ok(Some(_)) | Err(_) => ProfileFileState::Present,
+    }
+}
+
+/// A profile that *exists* but can't be turned into a connection intent
+/// (corrupt, schema-mismatched, unreadable, or lacking a usable transport)
+/// belongs to a host the user already trusted once — re-deploying it is the
+/// same silent self-heal `.claude/rules/always-connects.md` requires for any
+/// other stale deployment. It used to fall into the first-contact
+/// `[y/N]` prompt instead (SSH-08), which is both wrong (not a first
+/// contact) and harmful: that prompt reads a line from stdin, so
+/// `cmd | isekai-ssh host ...` had its first line of real data eaten as the
+/// "answer". Only a genuinely missing profile keeps the caller's `tofu`.
+fn tofu_for_unusable_profile(state: ProfileFileState, requested: TofuConfirmation) -> TofuConfirmation {
+    match state {
+        ProfileFileState::Missing => requested,
+        ProfileFileState::Present => TofuConfirmation::Silent,
+    }
+}
+
 pub(crate) async fn build_intent_or_bootstrap(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
@@ -536,6 +577,7 @@ pub(crate) async fn build_intent_or_bootstrap(
     match build_connection_intent(resolution) {
         Ok(intent) => Ok(intent),
         Err(err) if should_bootstrap(plan, resolution) => {
+            let tofu = tofu_for_unusable_profile(profile_file_state(resolution), tofu);
             if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, tofu).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
@@ -3108,6 +3150,74 @@ mod tests {
     fn quote_proxy_command_arg_falls_back_to_shell_quote_when_unsafe() {
         assert_eq!(quote_proxy_command_arg("prod host"), shell_quote("prod host"));
         assert_eq!(quote_proxy_command_arg("safe-host"), "safe-host");
+    }
+
+    /// SSH-08 regression: only a genuinely missing profile may keep the
+    /// first-contact `[y/N]` prompt; a profile file that exists but can't be
+    /// loaded (corrupt JSON here) is a host trusted once and must re-bootstrap
+    /// silently instead of eating a line of piped stdin as the "answer".
+    #[test]
+    fn an_existing_but_corrupt_profile_rebootstraps_silently_not_with_a_first_contact_prompt() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home, _restore) = crate::test_home::with_temp_home();
+
+        let resolution_for = |profile: &str| WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: profile.to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: Vec::new(),
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+                ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                local_bind_port_range: None,
+                tty: None,
+            },
+        };
+
+        let trust = HelperTrust {
+            identity_pubkey: "pk".to_string(),
+            trusted_helper_sha256: "sha".to_string(),
+            trusted_helper_version: "0.1.0".to_string(),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: None,
+            trusted_at: "2026-07-04T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "127.0.0.1:1234".to_string(),
+            cached_cert_sha256: "ab".to_string(),
+            cached_session_secret: "c2VjcmV0".to_string(),
+            cached_stun_observed_addr: None,
+        };
+        let path = write_persistent_profile(
+            &default_profiles_dir().unwrap(),
+            &PersistentProfile::migrate_legacy_helper_trust("corrupt-host:22", &trust),
+        )
+        .unwrap();
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let corrupt = resolution_for("corrupt-host");
+        assert!(build_connection_intent(&corrupt).is_err(), "precondition: the corrupt profile must not load");
+        assert_eq!(profile_file_state(&corrupt), ProfileFileState::Present);
+        assert_eq!(profile_file_state(&resolution_for("never-seen-host")), ProfileFileState::Missing);
+
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Present, TofuConfirmation::AlwaysPrompt), TofuConfirmation::Silent);
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Missing, TofuConfirmation::AlwaysPrompt), TofuConfirmation::AlwaysPrompt);
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Missing, TofuConfirmation::Silent), TofuConfirmation::Silent);
     }
 
     #[test]
