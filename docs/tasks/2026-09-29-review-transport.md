@@ -20,7 +20,7 @@ openssh-config / osc-color(quicsock は vendored)。
     probe は hold stream 上の PING/PONG に変える。旧サーバー(REJECT_UNSUPPORTED)ではそのセッションの standby を無効化し、再 dial しない。
     モックを実サーバー準拠(first-frame deadline あり)に書き直し、実 `isekai-pipe serve` を相手にする e2e(`isekai-pipe/tests/warm_standby_e2e.rs`)を追加する。
     サーバーの bidi 上限は 2→3(hold+resume+control)。
-- [ ] **TR-H2** High `isekai-link-masque/src/relay_client.rs:358-366` — `send_datagram` のエラーは TooLarge を含めて何でも break し、`serve --relay` の送信方向が恒久停止する。
+- [x] **TR-H2** High `isekai-link-masque/src/relay_client.rs:358-366` — `send_datagram` のエラーは TooLarge を含めて何でも break し、`serve --relay` の送信方向が恒久停止する。
   - 方針: TooLarge はそのデータグラムだけ捨てて継続し、NotAvailable/ConnectionError のときだけ終了する。
     内側 endpoint の MTU 上限は不要と判断した。noq の PMTUD(既定で有効、上限 1452)のプローブが捨てられても、プローブ損失として処理されるだけなので正常に動く。
 - [ ] **TR-H3** High `isekai-netmon/src/linux.rs:91-95,143-150` / `windows.rs:81-87` — 無関係な netlink メッセージ(veth・docker・経路変更・RA)でも `InterfaceChange` を送り、再接続を引き起こす。debounce も無い。
@@ -40,9 +40,9 @@ openssh-config / osc-color(quicsock は vendored)。
     src 側(ハンドル保持と `spawn_app_ack_bridge` の終了条件)は fix-rust-core に連絡済み。
 - [ ] **TR-M4** Medium `relay.rs:90-92` / `resume.rs:740` / `stun_p2p.rs:267` / `quicmux/src/qmux_backend.rs:147` — 常に IPv4 で bind するため、IPv6 の宛先に繋がらない。
   - 方針: 宛先のアドレスファミリーに合わせた `BindSpec`(`BindSpec::unspecified_for(dest)`)を quicmux に追加し、全経路で使う。qmux の TCP も同様にする。
-- [ ] **TR-M5** Medium `relay_client.rs:330,343` — relay 受信経路が unbounded チャネルで、公開アドレス宛ての任意の UDP でメモリを枯渇させられる。
+- [x] **TR-M5** Medium `relay_client.rs:330,343` — relay 受信経路が unbounded チャネルで、公開アドレス宛ての任意の UDP でメモリを枯渇させられる。
   - 方針: bounded(1024)にし、`try_send` が Full なら捨てる(UDP と同じ振る舞い)。
-- [ ] **TR-M6** Medium `isekai-link-masque/src/capsule.rs:92-95` / `relay_client.rs:288-291,377-410` — capsule 長を無制限に信頼しており、handshake にタイムアウトが無い。
+- [x] **TR-M6** Medium `isekai-link-masque/src/capsule.rs:92-95` / `relay_client.rs:288-291,377-410` — capsule 長を無制限に信頼しており、handshake にタイムアウトが無い。
   - 方針: payload の上限を 64KiB にし(`CapsuleDecodeError::TooLarge`)、recv_response と COMPRESSION_ACK 待ちを 15 秒で包む。
 - [ ] **TR-M7** Medium `quicmux/src/qmux_backend.rs:254-263,296` — QMux listener が一時的な accept エラー1回で恒久停止する。TLS accept にもタイムアウトが無い。
   - 方針: TCP accept のエラーはバックオフして継続する。TLS と QMux handshake はタスク内でタイムアウト付きにする。
@@ -50,7 +50,7 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: 実 id を qmux から取得できるならそれを使う。できなければ、サーバー用途(peer 起点 stream の accept)を明示的にエラーにする。
 - [ ] **TR-M9** Medium `h3-qmux/src/lib.rs:550-596` — `SendStream` の状態機械が、エラー後や Writing 中の finish/reset で偽の成功を返す。
   - 方針: `Failed(err)` 状態を追加する。Writing 中の finish/reset は、書き込みを完了させてから実行する。
-- [ ] **TR-M10** Medium `relay_client.rs:100-105` — relay 上りの QUIC に keep-alive が無い(noq の既定 idle は 30 秒、keep-alive は off)。
+- [x] **TR-M10** Medium `relay_client.rs:100-105` — relay 上りの QUIC に keep-alive が無い(noq の既定 idle は 30 秒、keep-alive は off)。
   - 方針: `keep_alive_interval(10s)` を設定する。
 - [~] **TR-M11** Medium `isekai-protocol/src/ctl.rs:43,396-402` — ctl の行長上限が、行を読み終えた後にしか効いていない。
   - 見送り(担当境界): 実際の無制限 `read_line` は `isekai-ssh/src/ctl_forward.rs:318-325` と `src/transport/ssh_handler.rs:356-366` にあり、isekai-protocol 側には読み取りコードが無い(I/O-free crate)。fix-isekai-ssh に連絡済み。
@@ -85,10 +85,10 @@ openssh-config / osc-color(quicsock は vendored)。
 - [ ] **TR-L10a** `quicmux/src/qmux_backend.rs:181,308` — MuxClientConfig/MuxServerConfig の idle・keepalive・max_streams を無視している → qmux::Config に反映できるものは反映する。
 - [ ] **TR-L10b** `quicmux/src/noq_backend.rs:400-402` — `NoqListener::bind` が port_range を無視している → `bind_with_port_range` を使う。
 - [ ] **TR-L11** `qmux_backend.rs:248-252` — `close()` の起床通知を取りこぼす → notified を enable してからフラグを確認する。
-- [ ] **TR-L12** `relay_client.rs:270-272,281` — IPv6 SNI や JWT 中の不正なヘッダバイトで expect が panic する → エラーを返す。IPv6 はブラケットで囲む(H2 と同じコミット)。
+- [x] **TR-L12** `relay_client.rs:270-272,281` — IPv6 SNI や JWT 中の不正なヘッダバイトで expect が panic する → エラーを返す。IPv6 はブラケットで囲む(H2 と同じコミット)。
 - [ ] **TR-L13a** `noq_backend.rs:32` — `candidate_ports` が start>end で underflow する → 空集合を返す。
 - [ ] **TR-L13b** `noq_backend.rs:52-66` — ポート範囲の bind を最大 65536 回同期的に試行する → 試行回数に上限を設ける。
-- [ ] **TR-L14** `relay_client.rs:321-325` — RelayUdpSocket を drop しても外側の接続を閉じない → socket の drop を検知して driver タスクを終了させる(H2 と同じコミット)。
+- [x] **TR-L14** `relay_client.rs:321-325` — RelayUdpSocket を drop しても外側の接続を閉じない → socket の drop を検知して driver タスクを終了させる(H2 と同じコミット)。
 - [ ] **TR-L15** `quicmux/src/resume.rs:479-484` — ReplayBuffer の advance_start が1バイトずつ remove している → drain を使う。
   注: 本項目は quicmux/src/resume.rs のため、「quicmux の resume*.rs は isekai-pipe 担当」の境界に該当する。isekai-pipe 側が触らない場合のみ対応する。
 - [ ] **TR-L16a** `h3-qmux/src/lib.rs:247,326,480,593` — エラーコードを `as u32` で切り詰めている → u32 に収まらない値は H3_INTERNAL_ERROR に写像する。
