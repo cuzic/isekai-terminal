@@ -275,7 +275,7 @@ where
         }
         Ok(Some(Ok(Some(Frame::Rejected { reason })))) => return Ok(ClientOutcome::Rejected { reason }),
         Ok(Some(Ok(Some(other)))) => {
-            return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
+            return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {}", other.kind()) })
         }
         // The owner connection dropped *during the handshake* — before any
         // shell session ever existed. Unlike a mid-session drop (below, in
@@ -418,7 +418,7 @@ where
                     }
                     Some(Ok(Some(other))) => {
                         abort_active(&mut active_build).await;
-                        return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}"));
+                        return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {}", other.kind()));
                     }
                     // A clean close without an Exit, any read error (a reset
                     // pipe), or the reader task ending all mean the owner died

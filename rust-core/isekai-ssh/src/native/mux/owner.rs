@@ -341,7 +341,7 @@ where
             }
             (term, cols, rows, want_pty, remote_command, tty_exec)
         }
-        other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
+        other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {}", other.kind())),
     };
     let session_kind = session_kind_for_hello(&term, cols, rows, want_pty, remote_command.as_deref());
 
@@ -639,7 +639,7 @@ where
                     // A truncated or malformed frame is a hard error, surfaced to
                     // `serve_clients` (which logs and contains it per-client).
                     Some(Err(e)) => return Err(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}")),
-                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh mux owner: unexpected frame from client: {other:?}")),
+                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh mux owner: unexpected frame from client: {}", other.kind())),
                 }
             }
             msg = channel.wait() => {
