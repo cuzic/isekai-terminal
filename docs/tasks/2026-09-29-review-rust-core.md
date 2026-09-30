@@ -33,7 +33,7 @@
   - 方針: magic後の最初の行が改行まで揃ってなおパース不能ならVTEへflushする。改行待ちの候補にもサイズ上限を設け、超えたらflush。
 - [ ] **RC-11** Medium — `trzsz.rs:274-277, 496-500, 681-687` — フレーム行長・WaitingKotlin中のバッファ・zlib展開出力に上限なし(zip bomb)。
   - 方針: 行長上限・WaitingKotlin中のバッファ上限・`ZlibDecoder`に`take(limit)`で展開上限を設け、超過時は転送失敗にする。
-- [ ] **RC-12** Medium(sec) — `lib.rs:691-706` — bracketed paste時に本文中の`ESC[201~`を除去せずに括る → 貼り付けでコマンド注入。
+- [x] **RC-12** Medium(sec) — `lib.rs:691-706` — bracketed paste時に本文中の`ESC[201~`を除去せずに括る → 貼り付けでコマンド注入。
   - 方針: bracketed paste時は本文中のESC(0x1B)を除去する(xterm等と同様)。
 - [x] **RC-13** Medium — `orchestrator.rs:913` / `session.rs:1172-1178` — 生きている旧sessionをdisconnectせずに差し替え(旧接続・フォワード残存)、`session_cmd_rx`クローズ後に`select!`がbusy-spin。
   - 方針: `build_and_store_session`で旧sessionを取り出してdisconnectする。`session_cmd_rx`がNoneを返したらそのアームを以後無効化する。
