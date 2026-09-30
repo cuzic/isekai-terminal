@@ -127,12 +127,12 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   分断して化ける。受信ごとに最大200KBの文字列を再構築(O(n))。
   - 方針: ストリーミング`CharsetDecoder`で境界をまたぐマルチバイトを保持し、`StringBuilder`へ
     追記(トリムは閾値超過時のみ)。ログは要求時にスナップショットを返す。
-- [ ] **AND-L9** (Low) `filepreview/ImageViewer.kt:27-29` — サンプリング無しのフル解像度デコードを
+- [x] **AND-L9** (Low) `filepreview/ImageViewer.kt:27-29` — サンプリング無しのフル解像度デコードを
   コンポジション中(メインスレッド)に行う。
   - 方針: bounds→inSampleSizeで縮小し、`produceState`でバックグラウンドデコードする。
-- [ ] **AND-L10** (Low) `session/TerminalSession.kt:212-216` — AIパネルのフォーム送信がPTYへの生書き込みで、
+- [~] **AND-L10** (Low) 見送り(Rust側新API要: 「要求元がまだ待っているか」をRust側で判定するAPIが必要。Kotlin側だけでは要求元プロセスの生存を知り得ない。信頼境界はリモートホスト内に閉じるため影響も限定的) — `session/TerminalSession.kt:212-216` — AIパネルのフォーム送信がPTYへの生書き込みで、
   要求元が終了済みだとシェルにコマンドとして解釈されうる。
   - 方針: 送信前に「要求元がまだ待っているか」をRust側で確認する必要がある。
-- [ ] **AND-L11** (Low) `data/AppDatabase.kt:16-17` — `exportSchema=false`で`MigrationTestHelper`による
+- [~] **AND-L11** (Low) 見送り(設計判断要: `exportSchema=true`にはgradleビルドでのスキーマJSON生成・コミットが必要で、本作業はローカルgradle実行禁止。過去版1〜21のスキーマは再生成できず`MigrationTestHelper`での全チェーン照合もできない。既存の`AppDatabaseMigrationTest`(手書きSQLでの移行検証)とCIの`room-migration`チェックで当面カバー。次にmigrationを追加する作業で`room.schemaLocation`設定とv22以降のJSONコミットを併せて行うのが妥当) — `data/AppDatabase.kt:16-17` — `exportSchema=false`で`MigrationTestHelper`による
   スキーマ照合ができない。
   - 方針: スキーマexportを有効化してCIで検証する。
