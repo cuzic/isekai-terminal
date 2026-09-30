@@ -135,12 +135,16 @@
   - 要約: Controller → orchestrator(強参照)→ callback(Controller)の循環参照により、タブを閉じても deinit されない。
     認証情報・scrollback・NWPathMonitor が生き残る。
   - 修正方針: orchestrator には弱参照プロキシ(`WeakOrchestratorCallback`)を渡す。deinit で `orchestrator.disconnect()` と monitor の cancel を行う。
-- [ ] **IOS-I2** (Medium) `ios/Sources/IsekaiTerminalCoreLogic/SshHostTrustStore.swift:47,61,73`
+- [x] **IOS-I2** (Medium) `ios/Sources/IsekaiTerminalCoreLogic/SshHostTrustStore.swift:47,61,73`
   - 要約: `records` に同期がなく、Rust スレッドと main から同時に読み書きされる。`trust` は save 失敗時にメモリだけ更新されたまま残る。
   - 修正方針: `NSLock` で保護する。save 成功後にだけメモリへ反映する。Linux テストを追加。
-- [ ] **IOS-I3** (Medium) `SshHostTrustStore.swift:104-106`, `AppServices.swift:25-27`
+  - 対応: `records` への全アクセスを `NSLock` で直列化し、`trust`/`revoke` はコピーを保存して成功した場合だけメモリへ反映するようにした。
+    Linux テスト(`concurrentPerform` 200並列の verify/trust、保存失敗時にメモリが変わらないこと)を追加。
+- [x] **IOS-I3** (Medium) `SshHostTrustStore.swift:104-106`, `AppServices.swift:25-27`
   - 要約: JSON 破損や identifier の重複で、起動のたびに fatalError(`uniqueKeysWithValues` の trap)。
   - 修正方針: 重複は後勝ちで読み込む。破損時はファイルを退避して空で開く `openRecoveringCorruption` を追加し、AppServices から使う。
+  - 対応: load を `uniquingKeysWith`(後勝ち)に変更。`openRecoveringCorruption` を追加し(壊れたファイルを `.corrupt-<unix秒>` へ退避して空で開く)、AppServices はこれを使ってログを出すようにした。
+    重複 identifier・破損ファイルの Linux テストを追加。
 - [ ] **IOS-I4** (Medium) `ios/Sources/IsekaiTerminalCore/CredentialVault.swift:80-84`
   - 要約: `rotateKey` が旧 KEK を削除してから store するため、失敗すると秘密鍵を永久に失う。
   - 修正方針: 新 KEK で封緘した blob を一時ファイルへ書く → Keychain を `SecItemUpdate` で差し替える → blob を置き換える、の順にする。
