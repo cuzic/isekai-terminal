@@ -91,9 +91,11 @@
 
 ## Info
 
-- [ ] **CI-INFO1** (Info) `scripts/measure_latency.sh:47,16-18`, `scripts/device_verify.sh:30`
+- [x] **CI-INFO1** (Info) `scripts/measure_latency.sh:47,16-18`, `scripts/device_verify.sh:30`
   - 要約: `StrictHostKeyChecking=no`、個人用 Tailscale IP とユーザー名が既定値としてハードコードされている。
   - 修正方針: `StrictHostKeyChecking=accept-new` に変更。既定値は環境変数で上書きできるようにする。
+  - 対応: `measure_latency.sh` を `StrictHostKeyChecking=accept-new` に変更し、既定ホスト/ユーザーを `ISEKAI_E2E_SSH_HOST`/`ISEKAI_E2E_SSH_USER`(ユーザーの既定は実行ユーザー名)で上書き可能にした。
+    `device_verify.sh` の既定ホスト/ポートも `ISEKAI_E2E_SSH_HOST`/`ISEKAI_E2E_SSH_PORT` で上書き可能にした(個人用 IP の既定値自体は後方互換のため残す)。
 - [x] **CI-INFO2** (Info) `scripts/device_verify.sh:143`
   - 要約: `./gradlew installDebug` をローカルで実行する(ローカルビルド禁止方針と矛盾)。
   - 修正方針: 既定を「インストール済み前提」に切り替え、ローカルビルドは明示的な `--install-local` 指定時だけにする。GHA でのビルドは android-ci-deploy スキルを案内する。
