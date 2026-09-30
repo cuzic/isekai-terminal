@@ -75,9 +75,10 @@
 
 ## Low
 
-- [ ] **CI-L1** (Low) `cargo-mutants-check.yml:174-178`, `noq-738-repro-check.yml:74-76`
+- [x] **CI-L1** (Low) `cargo-mutants-check.yml:174-178`, `noq-738-repro-check.yml:74-76`
   - 要約: workflow_dispatch 入力を `run:` に直接展開している(スクリプトインジェクション)。
   - 修正方針: `env:` 経由で渡す(`extra_args` は配列化して分割)。
+  - 対応: cargo-mutants は3入力を `env:` 経由にし、`extra_args` は `read -r -a` で配列に分割(再評価なし)。noq-738-repro は `env:` 経由にし、16進 SHA(7-40桁)であることを検証してから Cargo.toml に書く。
 - [ ] **CI-L2** (Low) `android-test-check.yml:128-131`, `rust-core-test-check.yml`(muslビルド), `ios-logic-linux-check.yml:72-75,81-84`
   - 要約: zig/Swift tarball のチェックサム未検証。
   - 修正方針: zig 0.16.0 tarball の sha256 を固定して検証する。Swift tarball も sha256 を固定して検証する。
