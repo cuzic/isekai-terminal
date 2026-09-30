@@ -22,7 +22,7 @@
     `lease.keep()`+テーブル外のhandleにpark → 誰も `relay_ended` を呼ばずfencing slotが永久リーク。mainでも有効。
   - 方針: テーブルに載っていない(=resume不能な)セッションは DataStreamDied/Preempted でも `lease.release()` して
     TCPを破棄する。根本の引き金(PIPE-11)も同時に塞ぐ。
-- [ ] **PIPE-03** (High) `engine/mod.rs::relay_buffered`(S→C) / `resume_loop.rs::pump_c2h`(C→S)
+- [x] **PIPE-03** (High) `engine/mod.rs::relay_buffered`(S→C) / `resume_loop.rs::pump_c2h`(C→S)
   - 要約: 「送信→replayバッファへappend」の順で、送信失敗/キャンセル時にバイトがreplayから欠落する。mainでも有効。
   - 方針: 読み取り量は既に `remaining_capacity()` で頭打ちなので、appendを先に行ってから送信する(両側)。
     `quicmux::ReplayBuffer::advance_start` のdocs(send-then-append前提の記述)も更新。
@@ -60,7 +60,7 @@
   - 要約: control streamが確立しないとAPP_ACKが来ず、replay満杯でS→Cが永久停止。docstringも事実と異なる。mainでも有効。
   - 方針: `Session::resume_disabled` フラグを追加。control stream確立失敗/タイムアウトでフラグを立て、replayをクリアし
     tee停止(`output_space_available`で中継ループを起こす)。この状態のセッションはDataStreamDied/Preemptedでもparkせず破棄。
-- [ ] **PIPE-10** (Medium) `resume_loop.rs::resume_with_backoff_until_deadline`
+- [x] **PIPE-10** (Medium) `resume_loop.rs::resume_with_backoff_until_deadline`
   - 要約: `OffsetGone` とreplay範囲外(committed_offsetがローカルreplay範囲外)は決定的・恒久的失敗なのに
     deadline(既定10日)まで再試行し、ConnectOutcomeも書かれない。mainでも有効。
   - 方針: 両者を即give-up(`Err`)にし、既存のgive-up経路(→`write_connect_outcome_for_wrapper`)に渡す。
