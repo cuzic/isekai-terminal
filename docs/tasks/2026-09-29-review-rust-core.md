@@ -82,11 +82,13 @@
   - 方針: take→register→set hooksを1回のロック区間で行う。
 - [~] **RC-32** Low — `tmux_window_claim.rs:16-35` — claimが明示releaseでしか解放されずTTL/owner生存確認がない。
   - 見送り: owner_idはKotlin側が発行する識別子で、Rust側はその生存を知る手段が無い。解決するにはclaimをSessionOrchestrator等のRustオブジェクトの寿命に結び付けるUniFFI APIの再設計(とandroid/ios側の呼び出し変更)が必要で、担当境界(rust-core/src)内だけでは直せない。プロセス再起動では解消する(ファイル冒頭doc参照)。
-- [ ] **RC-33** Low(sec/design) — `transport/ctl_streamlocal.rs:25-35` — `VarScope::Global`のctl変数が異なるリモートホスト間で共有される。
+- [~] **RC-33** Low(sec/design) — `transport/ctl_streamlocal.rs:25-35` — `VarScope::Global`のctl変数が異なるリモートホスト間で共有される。
+  - 見送り: task #16で「Globalはアプリ内の全タブ(ホスト横断)で共有する」と意図的に決めた仕様(ctl_streamlocal.rsのdoc参照)で、ctl-socket forward自体が既定OFFのopt-in。ホスト単位に分けるか否かは仕様判断であり、レビューも「明示的な信頼判断を」との提起に留まるため、この修正では変えない。
 - [x] **RC-34** Low — `tmux_locator.rs:489-494, 549-551` — `TMUX_LOCATOR_REGISTRY`/`pending_ctl_socket_paths`のエントリが削除されない。
   - 方針: orchestrator破棄(Drop)時にそのAppPaneIdのエントリを削除する。
-- [ ] **RC-35** Low — `forward.rs:69, 121, 188` / `ssh_handler.rs:295` / `socks.rs:40-148` — フォワード削除/タブ切断で受理済みrelayタスクが残る。SOCKSネゴシエーションにタイムアウトなし。
+- [x] **RC-35** Low — `forward.rs:69, 121, 188` / `ssh_handler.rs:295` / `socks.rs:40-148` — フォワード削除/タブ切断で受理済みrelayタスクが残る。SOCKSネゴシエーションにタイムアウトなし。
   - 方針: relayタスクをフォワードごとの`JoinSet`/abort tokenで管理し削除時にabort。SOCKSハンドシェイクにタイムアウト。
+  - -L/-Dは中継タスクを待受タスクのJoinSetで所有し、削除・切断時のabortで一緒に止まるようにした。-R(サーバー起点、russh Handlerのコールバックでspawn)の受理済み中継は、どのフォワードに属するかをHandler側で追跡する仕組みが無く、今回は削除時にcancel_tcpip_forwardで新規接続が止まる既存挙動のまま。
 - [ ] **RC-36** Low — `file_preview.rs:127-161` — パス先頭の`-`がオプションとして解釈される。
   - 方針: パス引数の前に`--`を入れる(リモートCLIが`--`に対応しているか確認)か、`-`始まりのパスに`./`を前置する。
 - [ ] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
