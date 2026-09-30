@@ -120,9 +120,10 @@
   - 要約: `./gradlew installDebug` をローカルで実行する(ローカルビルド禁止方針と矛盾)。
   - 修正方針: 既定を「インストール済み前提」に切り替え、ローカルビルドは明示的な `--install-local` 指定時だけにする。GHA でのビルドは android-ci-deploy スキルを案内する。
   - 対応: 既定をインストール済みアプリの使用に変更し、`--apk PATH`(GHA ビルド済み APK を adb install)と `--install-local`(明示時のみ gradle)を追加。`--skip-install` は互換のため受け付ける。
-- [ ] **CI-INFO3** (Info) `.github/workflows/noq-738-repro-check.yml`
+- [~] **CI-INFO3** (Info) `.github/workflows/noq-738-repro-check.yml`
   - 要約: 自称「使い捨て」のワークフローがまだ残っている。
   - 修正方針: noq#738 の再現用として今後も使うかを確認してから削除する。
+  - 見送り: noq#738 の修正は cuzic/noq fork で取り込み済みだが、upstream(n0-computer/noq PR #784)はまだレビュー中で、このワークフローは upstream 側の修正 rev を検証する手段として有用。削除は upstream マージ後の判断としてユーザーに委ねる(入力の注入対策は CI-L1 で実施済み)。
 - [~] **CI-INFO4** (Info) `.claude/hooks/cargo_check_on_edit.py`(M5の付随)
   - 要約: 編集のたびにローカルで `cargo build` を実行し、「ローカルビルド禁止」の HARD RULE と矛盾している。
   - 修正方針: hook の有効/無効は `.claude/settings.json` 側の運用判断。
