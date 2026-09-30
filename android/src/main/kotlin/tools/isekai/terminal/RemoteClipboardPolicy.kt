@@ -1,5 +1,6 @@
 package tools.isekai.terminal
 
+import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.ClipboardPayload
 
 /**
@@ -21,10 +22,32 @@ class RemoteClipboardPolicy(
     private val writeToClipboard: (ClipboardPayload) -> Unit,
     private val readFromClipboard: () -> ClipboardPayload?,
 ) {
+    // AND-L1: どちらもRust側スレッドからUniFFI callback境界越しに呼ばれる。ここで例外
+    // (他アプリのURI権限切れによるSecurityException等)やOOM(巨大画像のデコード)が
+    // 漏れるとcallback境界で「想定外エラー」になるため、捕捉して「何もしない/応答なし」に落とす。
+
     fun onClipboardWriteRequested(payload: ClipboardPayload) {
-        if (isWriteAllowed()) writeToClipboard(payload)
+        try {
+            if (isWriteAllowed()) writeToClipboard(payload)
+        } catch (e: Exception) {
+            RemoteLogger.w(TAG, "clipboard write failed (ignored): ${e.javaClass.simpleName}: ${e.message}")
+        } catch (e: OutOfMemoryError) {
+            RemoteLogger.w(TAG, "clipboard write ran out of memory (ignored)")
+        }
     }
 
     fun onClipboardPullRequested(): ClipboardPayload? =
-        if (isPullAllowed()) readFromClipboard() else null
+        try {
+            if (isPullAllowed()) readFromClipboard() else null
+        } catch (e: Exception) {
+            RemoteLogger.w(TAG, "clipboard pull failed (no reply): ${e.javaClass.simpleName}: ${e.message}")
+            null
+        } catch (e: OutOfMemoryError) {
+            RemoteLogger.w(TAG, "clipboard pull ran out of memory (no reply)")
+            null
+        }
+
+    private companion object {
+        const val TAG = "IsekaiTerminalClipboard"
+    }
 }
