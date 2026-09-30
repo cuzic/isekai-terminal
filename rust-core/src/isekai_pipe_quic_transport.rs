@@ -490,7 +490,9 @@ pub(crate) async fn finish_quic_stream(
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
                     let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                    // APP_ACKタスクはcontrol stream終了で自己終了する(isekai-transport側)ため、
+                    // ハンドルは保持せず明示的に手放す。
+                    let _ = isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
                     spawn_app_ack_bridge(resume_state, counters);
                 }
                 Ok(Err(e)) => {
@@ -629,7 +631,9 @@ pub(crate) fn spawn_control_stream_reestablishment_after_resume(
             Ok(Ok(control)) => {
                 info!("{log_prefix}: control stream re-established after resume, session_id={}", control.session_id);
                 let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
-                isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                // APP_ACKタスクはcontrol stream終了で自己終了する(isekai-transport側)ため、
+                // ハンドルは保持せず明示的に手放す。
+                let _ = isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
                 spawn_app_ack_bridge(resume_state, counters);
             }
             Ok(Err(e)) => {
