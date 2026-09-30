@@ -15,7 +15,7 @@
 - [x] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
   - 要約: relay route の resume window 枯渇、cross-family fallback、panic は `Unreachable` として書かれる。B5 ガード(remote command は再実行しない)が `Unknown` / `MidSessionDisconnect` にしか掛かっていないため、`isekai-ssh host -- ./deploy.sh` がサイレントに再実行される。
   - 方針: fail-safe として、remote command があるときは `StaleTrust`/`Unreachable`/`Unknown` のどれでも**再実行しない**。サイレント再デプロイ(自己修復)だけ行い、「再実行してください」と案内して終了する。こうすれば次回の起動は正常に繋がり、always-connects に沿う。isekai-pipe 担当が `ConnectOutcome.session_established`(serde default)を追加中なので、それがマージされたら「`session_established == false` のときだけ再実行する」ように緩めるフォローアップを行う。
-- [ ] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
+- [x] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
   - 要約: Windows holder は SSH handle がどう死んでも `Ok(0)` を返し、recovery を飛ばす。根本原因の候補は russh keepalive(60s×3)で、これが isekai-pipe の resume window(既定 864000s)より先に SSH 層を殺す。すると resume 可能だったセッションまで切れ、スリープ復帰後に新しいリモートシェルになる。
   - 方針: native 経路の russh keepalive を無効化し、liveness は isekai-pipe の QUIC/resume 層に一任する(`ssh(1)` 既定の `ServerAliveInterval 0` と同等)。holder の serve 終了時には、SSH handle が閉じたかどうかをログに残す。holder 自身が再接続しても channel は復元できないので、`Ok(0)` 終了(クライアントが OwnerLost → 新 holder)は維持し、その理由を doc に明記する。
 - [ ] **SSH-04** High `isekai-bootstrap/src/russh_backend.rs:270,355-356`

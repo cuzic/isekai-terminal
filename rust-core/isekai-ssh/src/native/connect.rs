@@ -879,7 +879,24 @@ async fn run_authenticated_session(
     let ctl_routes_for_holder = resolution.ctl_socket_enabled().then(|| forward_routes.clone());
     if let Some(hook) = owner_hook.take() {
         let serve_handle = hook(handle.clone(), ctl_routes_for_holder);
-        let _ = serve_handle.await;
+        let join = serve_handle.await;
+        // Deliberately still `Ok(0)` even when the shared SSH connection
+        // died (review 2026-09-29, SSH-03): every channel the holder served
+        // lived on that one connection, so no holder-side reconnect could
+        // bring any tab's remote shell back — and a holder has no
+        // foreground session of its own to retry into (`owner_hook` is
+        // already consumed, so a recovery-loop retry would open a *new*
+        // shell inside a detached, console-less process). Each client
+        // observes `OwnerLost` and runs its own reconnect loop
+        // (`mux::run_with_reconnect`). What actually kept the shells alive
+        // across an outage was never this path but not killing the SSH
+        // layer in the first place — see `native_ssh_client_config`'s docs.
+        // Logged so the holder diagnostics log records *why* it ended.
+        let ssh_closed = handle.lock().await.is_closed();
+        log_line!(
+            "isekai-ssh mux holder: serve loop ended (join_ok={}, shared SSH connection closed={ssh_closed})",
+            join.is_ok()
+        );
         return Ok(0);
     }
 
@@ -1076,6 +1093,36 @@ struct InteractivePrompts<'a> {
 /// module in this crate uses. Everything in [`connect_attempt`] above this
 /// call (real subprocess, real trust store, real terminal I/O) is not
 /// unit-tested.
+/// The russh client config for the native path's SSH session, which always
+/// runs over an `isekai-pipe connect` child's stdio — never directly over a
+/// network socket.
+///
+/// **No SSH-level keepalive** (review 2026-09-29, SSH-03). This used to set
+/// `keepalive_interval = 60s`, `keepalive_max = 3` (an `ssh(1)`
+/// `ServerAliveInterval`/`ServerAliveCountMax` equivalent), which let russh
+/// tear the *SSH* session down after roughly 3-4 minutes without a reply. But
+/// the transport underneath is `isekai-pipe`'s resumable QUIC session, whose
+/// whole point is to survive outages far longer than that — Wi-Fi roaming, a
+/// laptop sleeping overnight — within its resume window (`#@isekai
+/// resume-grace`, default `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`, ten
+/// days). While `isekai-pipe connect` was quietly parked/resuming, the
+/// unanswered keepalives killed the SSH layer above it first: every channel
+/// died, the mux holder exited, and every tab reconnected into a *brand new*
+/// remote shell even though the resume itself would have succeeded — the
+/// "after waking from sleep I'm in a different shell" symptom.
+///
+/// Liveness is owned by the layer that can actually recover from an outage:
+/// when `isekai-pipe connect` finally gives up it exits, which closes this
+/// session's stdio (a clean EOF russh notices on its own). Same as
+/// `ssh(1)`'s own default (`ServerAliveInterval 0`) — the Unix `ProxyCommand`
+/// path never had an SSH-level keepalive either.
+fn native_ssh_client_config() -> client::Config {
+    let mut config = client::Config::default();
+    config.keepalive_interval = None;
+    config.inactivity_timeout = None;
+    config
+}
+
 async fn connect_and_authenticate<S, V>(
     stream: S,
     username: &str,
@@ -1095,10 +1142,7 @@ where
     // just to satisfy the signature, even though no caller ever inspected
     // it afterward.
     let rejection = RejectionReason::new();
-    let mut config = client::Config::default();
-    config.keepalive_interval = Some(std::time::Duration::from_secs(60));
-    config.keepalive_max = 3;
-    let config = Arc::new(config);
+    let config = Arc::new(native_ssh_client_config());
     // Install the ctl-socket route table on the handler so server-initiated
     // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
     // delivered in-process. Harmless (and unused) when ctl-socket is off — no
@@ -1513,6 +1557,18 @@ mod tests {
     use russh_stream_session::{verifying_handler, Credential, HostKeyVerifier, VerifyOutcome};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
+
+    /// SSH-03 regression: the native SSH session must not run its own
+    /// keepalive/inactivity timer — `isekai-pipe`'s resumable QUIC session
+    /// underneath owns liveness, and an SSH-level keepalive used to kill the
+    /// whole session (every tab's remote shell) minutes into an outage the
+    /// resume would have survived.
+    #[test]
+    fn native_ssh_client_config_leaves_liveness_to_isekai_pipe() {
+        let config = native_ssh_client_config();
+        assert!(config.keepalive_interval.is_none(), "no SSH-level keepalive may tear the session down during a QUIC resume");
+        assert!(config.inactivity_timeout.is_none(), "no SSH-level inactivity timeout either");
+    }
 
     /// A [`InteractivePrompts`] that never prompts (passphrase: `None`;
     /// keyboard-interactive: no answers) — the right default for every test
