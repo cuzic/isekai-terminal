@@ -9,7 +9,7 @@
 
 ## High
 
-- [ ] **SSH-01** High `isekai-ssh/src/wrapper.rs:1432-1435,1595-1600`
+- [x] **SSH-01** High `isekai-ssh/src/wrapper.rs:1432-1435,1595-1600`
   - 要約: direct-launch route で `HostName` が DNS 名や角括弧なし IPv6 のとき、`helper_addr` に `host:port` をそのまま保存している。消費側は `SocketAddr` パースしかしないため、毎回 `Unreachable` になり、再 bootstrap しても同じ文字列を書き戻して永久に失敗する。
   - 方針: bootstrap 時に host を `SocketAddr` に解決する(IP リテラルはそのまま、名前は `lookup_host` + timeout)。IPv6 は `SocketAddr::to_string()` の角括弧付き形式で保存する。解決に失敗した場合は `JumpHostUnreachable`(再試行可)に分類する。
 - [ ] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
@@ -77,7 +77,7 @@
   - 方針: state ファイルに起動時の sha256 を記録し、reuse は「記録 sha == 期待 sha」を条件にする。
 - [~] **SSH-24** Low-Medium `install_script.rs:436-446`(A12-4)— alive-but-broken な helper を強制再起動する手段(`force_relaunch`)がない。
   - 見送り理由: `BootstrapBackend::install_and_start` の API 拡張(全 backend/テストダブル)に加えて、「いつ force するか」の方針決定(RedeployGate 何回目で、等)が必要な設計判断。SSH-23 で「古いビルドの再利用」ケースは塞がる。
-- [ ] **SSH-25** Low `wrapper.rs:1427-1429`(A13-1)
+- [x] **SSH-25** Low `wrapper.rs:1427-1429`(A13-1)
   - 要約: `max_by_key` は同順位で最後の要素を返すため、first-match-wins 規約と逆になる。
   - 方針: 同順位では先頭を選ぶ。複数 candidate を順に試す fallback は bootstrap 全体の再構成になるため、このタスクには含めない。
 - [ ] **SSH-26** Low `helper_download.rs:256-271` / `wrapper.rs:1498-1520`(A13-2)
