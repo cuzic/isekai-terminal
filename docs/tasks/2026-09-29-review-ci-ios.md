@@ -103,9 +103,11 @@
   - 修正方針: デバイス側シェルへは単一引用符でクォートする共通関数に置き換え、表現不能な入力(改行・`%s`)は明示的にエラーにする。単体テストを追加。
   - 対応: `input_text_shell_arg` に集約した。値全体を単一引用符でクォートし、空白は `%s` に変換する。改行とリテラル `%s` は SystemExit で明示的に拒否する。
     `cmd_type`/`cmd_type_terminal` の両方で使う。`scripts/lib/test_adb_ui.py`(7件、ローカル `sh -c` で往復検証)を追加し、全件成功を確認済み。
-- [ ] **CI-L7** (Low) `rust-core/scripts/android-arm64-clang.sh:4`, `android-arm64-ar.sh:4`, `ndk-common.sh:16`
+- [x] **CI-L7** (Low) `rust-core/scripts/android-arm64-clang.sh:4`, `android-arm64-ar.sh:4`, `ndk-common.sh:16`
   - 要約: linker/ar 実行前に cwd を変更している。`$ANDROID_HOME/ndk` が空だと NDK_ROOT が空文字列になる。
   - 修正方針: `cd` をやめて `source "$(dirname …)/ndk-common.sh"`。空の場合は明示的なエラーにする。
+  - 対応: ラッパー2本から `cd` を外し、`source "$(dirname "${BASH_SOURCE[0]}")/ndk-common.sh"` に変更。`$ANDROID_HOME/ndk` が空のときは明示的なエラーで終了する。
+    偽 NDK で、空ディレクトリのときのエラー(rc=1)と、相対パスで呼んでも呼び出し元の cwd・相対引数のまま exec されることを確認済み。
 
 ## Info
 
