@@ -60,11 +60,11 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   ままのためFGS/常駐通知が残り続ける。
   - 方針: `totalCount<=0`で`stopForeground(STOP_FOREGROUND_REMOVE)`→`stopSelf()`。executor側も
     unbindしてサービスが破棄されうるようにする。
-- [ ] **AND-M3a** (Medium) `session/NetworkPathMonitor.kt:76-83` — PathId単位で状態を持つため、
+- [x] **AND-M3a** (Medium) `session/NetworkPathMonitor.kt:76-83` — PathId単位で状態を持つため、
   Wi-Fiとセルラーが両方いる状態でWi-Fiだけ失うとDIRECTがFAILEDに張り付き、誤った「経路なし」を
   Rustへ送る。
   - 方針: PathIdごとに`Set<Network>`で追跡し、空になった時だけFAILEDにする。
-- [ ] **AND-M3b** (Medium) `session/AndroidAppExecutor.kt:80-91` — 「どちらか一方でも生きていれば
+- [~] **AND-M3b** (Medium) 見送り(Rust側新API要: 生のavailable/lostをtransport種別付きで受けるUniFFIメソッドがRust側に必要。rust-coreは別担当) — `session/AndroidAppExecutor.kt:80-91` — 「どちらか一方でも生きていれば
   onLostを鳴らさない」集約判断がKotlin側にある(rust-ssot)。
   - 方針: 生のavailable/lost(transport種別付き)をRustへ渡す新UniFFI APIを追加し集約はRust側で行う。
 - [ ] **AND-M4** (Medium) `session/PhysicalPathProvider.kt:156-172` — `bindAndDetach`が元の
