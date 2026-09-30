@@ -733,6 +733,21 @@ class TerminalTabsViewModelTest {
             MouseReportingMode.OFF, false, false, false, true, 0uL, 0uL, NotifyKind.INFO, "", "", 0uL, PanelKind.NONE, "", "", emptyList(), CursorShape.BLOCK, true, emptyList(),
             emptyList(), kittyKeyboardFlags, null)
 
+    /** AND-M6: ダウンロード保存の例外(容量不足等)でアプリがクラッシュせず、保留中の
+     *  ダウンロードは消費される(同じファイルの保存を無限に再試行しない)。 */
+    @Test
+    fun downloadSaveFailure_doesNotCrashAndConsumesPendingFile() = runBlocking {
+        executor.saveDownloadError = java.io.IOException("No space left on device")
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+
+        orchestrators[0].simulateDownloadComplete("big.bin", byteArrayOf(1, 2, 3))
+
+        withTimeout(3000) { while (tab(id).primaryPane.session.pendingDownloadFile.value != null) delay(10) }
+        assertEquals(1, executor.saveDownloadCallCount)
+    }
+
     /** AND-H4: 端末の描画フレーム(ScreenUpdate)ごとにFGS通知の集約を再計算・再postしない。 */
     @Test
     fun screenUpdates_doNotRepostSessionsSummaryPerFrame() = runBlocking {
