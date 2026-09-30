@@ -109,9 +109,9 @@ jobs:
 
       - name: Install zig (mlugg/setup-zig)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2 (v2.2.1)
         with:
-          version: latest
+          version: 0.16.0
 
       - name: Cache Gradle and Cargo
         if: inputs.runner_type != 'self-hosted-gcp-spot'
@@ -131,7 +131,7 @@ jobs:
         if: inputs.runner_type != 'self-hosted-gcp-spot'
         run: |
           if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild
+            cargo install cargo-zigbuild --locked --version 0.23.4
           fi
 
       - name: Build musl isekai-pipe (embedded via include_bytes! in isekai-terminal-core)

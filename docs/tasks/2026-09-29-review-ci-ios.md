@@ -23,18 +23,23 @@
 
 ## Medium
 
-- [ ] **CI-M1** (Medium) `release-build.yml:203`(`softprops/action-gh-release@v2`, `contents: write`)、
+- [x] **CI-M1** (Medium) `release-build.yml:203`(`softprops/action-gh-release@v2`, `contents: write`)、
   `mlugg/setup-zig@v2`(多数)、`taiki-e/install-action@nextest`(rust-core-test-check.yml:224)、
   `dtolnay/rust-toolchain@stable`(cargo-mutants-check.yml:104)
   - 要約: サードパーティ action がタグ参照のみ。タグ乗っ取りで `releases/latest`(全ホストの自動 bootstrap 配布元)
     に任意バイナリが載りうる。
   - 修正方針: サードパーティ action をすべて commit SHA 固定にし、元のタグをコメントで残す。
-- [ ] **CI-M2** (Medium) `release-build.yml:107-109`, `android-uniffi-drift-check.yml:103-106`(required),
+  - 対応: `mlugg/setup-zig`(v2.2.1)/`softprops/action-gh-release`(v2)/`taiki-e/install-action`(nextest)/`dtolnay/rust-toolchain`(stable)を
+    2026-09-29 時点のタグが指す commit SHA に固定。`actions/*`(GitHub 公式)はタグ参照のまま。
+- [x] **CI-M2** (Medium) `release-build.yml:107-109`, `android-uniffi-drift-check.yml:103-106`(required),
   `regenerate-uniffi-bindings.yml:45-48`, `ios-*-check.yml`, `build-android.yml`, `cargo-mutants-check.yml`
   - 要約: `mlugg/setup-zig version: latest` と、バージョン未固定の `cargo install cargo-zigbuild`(release-build.yml は `--locked` もない)。
     `rust-toolchain.toml` もない。
   - 修正方針: zig は他ワークフローと同じ 0.16.0 に固定。cargo-zigbuild は `--locked --version 0.23.4` に固定。
     Rust toolchain の固定(`rust-toolchain.toml`)は担当境界外(`rust-core/` 直下)なので別途判断。
+  - 対応: `setup-zig` の `version: latest` を全箇所 0.16.0 に、`cargo install cargo-zigbuild` を全箇所 `--locked --version 0.23.4` に固定。
+  - 見送り(部分): `rust-toolchain.toml` による rustc の固定は `[~]`。rust-core ワークスペース全体(他領域のCI・ローカル・
+    Android の cargo ビルド)の挙動を変え、MSRV の選定も要るため、担当境界(ci-ios)外の設計判断として残す。
 - [ ] **CI-M3** (Medium) `ios-rust-core-check.yml`(「Generate Swift bindings and check for drift」)、`ios-logic-linux-check.yml:94-99`
   - 要約: Swift バインディングの drift-check が `git diff --exit-code` のみで、未追跡の新規生成物・新規 `.sha256` を検知できない。
   - 修正方針: Kotlin 側と同様に `git status --porcelain` でも同じパスを確認する。

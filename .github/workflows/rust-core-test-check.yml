@@ -226,7 +226,7 @@ jobs:
           exit $missing
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@badb8c3638e0b773c6c17a6025c2306a8f1c4303 # nextest
 
       - name: Install openssh-server (opt-in real-sshd E2E tests need /usr/sbin/sshd)
         run: |
@@ -250,7 +250,7 @@ jobs:
           echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
           export PATH="$HOME/zig-toolchain:$PATH"
           if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild --locked
+            cargo install cargo-zigbuild --locked --version 0.23.4
           fi
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh

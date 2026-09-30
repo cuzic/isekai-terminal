@@ -101,7 +101,7 @@ jobs:
 
       - name: Install Rust toolchain (github-hosted only)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       # self-hosted-gcp-spotの永続ディスク(/mnt/cache)にはRust/Android等の
       # 言語ツールチェーンは一切プリインストールされない設計(汎用「素のコンピュート」
@@ -122,9 +122,9 @@ jobs:
 
       - name: Install zig (github-hosted only)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2 (v2.2.1)
         with:
-          version: latest
+          version: 0.16.0
 
       # zigも同様に永続ディスクへ直接展開する(mlugg/setup-zigはランナーの一時領域に
       # 展開するため、instance再作成のたびに再ダウンロードが必要になってしまう)。
@@ -153,7 +153,7 @@ jobs:
       - name: Install cargo-zigbuild (if missing)
         run: |
           if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild
+            cargo install cargo-zigbuild --locked --version 0.23.4
           fi
 
       - name: Install cargo-mutants (if missing)
