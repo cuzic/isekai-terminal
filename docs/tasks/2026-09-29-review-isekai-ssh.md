@@ -125,7 +125,7 @@
 - [x] **SSH-41** Low `install_script.rs:455,219,251,398`, `openssh.rs:118`(D6)
   - 要約: `mv` 前の sha 照合がない、IPv6 アドレスを未クォートで埋め込んでいる、`mktemp -d` 失敗時に `/relay_jwt` へ書く、宛先の前に `--` がない。
   - 方針: それぞれ修正する。
-- [ ] **SSH-42** Low `types.rs`(D7)
+- [x] **SSH-42** Low `types.rs`(D7)
   - 要約: `RelayLaunchSpec.relay_jwt` の Debug が redact されていない。
   - 方針: 手書き Debug で redact する。`TokenSet`/`TokenResponse`/`DeviceAuthorization`(isekai-auth)と `HelperTrust.cached_session_secret`(isekai-trust)は **transport 担当に委譲**。
 - [ ] **SSH-43** Low `log_file.rs:128-135`(D8 の isekai-ssh 部分)
