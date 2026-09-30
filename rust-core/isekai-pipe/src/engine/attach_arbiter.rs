@@ -48,6 +48,14 @@ use isekai_protocol::SessionId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseId(u64);
 
+#[cfg(test)]
+impl LeaseId {
+    /// Lets tests outside this module (e.g. `resume.rs`) name a lease.
+    pub fn for_test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
 /// Opaque handle to the target TCP connection an effect executor already
 /// established for a given lease (assigned by the executor, not this
 /// module — this reducer never creates a real socket).
@@ -252,7 +260,14 @@ impl AttachArbiter {
                     // cancellation already in flight for `old_lease` covers
                     // this too (only one lease is ever being torn down).
                     self.sessions.insert(key.session_id, AttachState::ClosingForSupersede { old_lease, next: key });
-                    vec![]
+                    // The displaced `next` will never be connected now —
+                    // resolve its waiter explicitly, otherwise its
+                    // `AttachRuntime::hello()` caller waits forever
+                    // (review 2026-09-29, PIPE-06).
+                    vec![AttachEffect::SendReject {
+                        key: next,
+                        reason: AttachRejectReason::StaleGeneration { current_generation: key.generation },
+                    }]
                 } else if key.generation < next.generation {
                     vec![AttachEffect::SendReject {
                         key,
@@ -301,7 +316,15 @@ impl AttachArbiter {
         // key.generation > cur.generation: supersede `cur`, but only once
         // its lease has actually finished tearing down.
         self.sessions.insert(key.session_id, AttachState::ClosingForSupersede { old_lease: cur_lease, next: key });
-        vec![AttachEffect::CancelLease { lease: cur_lease }]
+        // `cur` lost to a strictly larger generation: tell its waiter so
+        // (PIPE-06 — previously nothing ever resolved it).
+        vec![
+            AttachEffect::SendReject {
+                key: cur,
+                reason: AttachRejectReason::StaleGeneration { current_generation: key.generation },
+            },
+            AttachEffect::CancelLease { lease: cur_lease },
+        ]
     }
 
     fn on_target_connected(
@@ -345,15 +368,26 @@ impl AttachArbiter {
 
     fn on_cancel_received(&mut self, key: AttachKey) -> Vec<AttachEffect> {
         match self.sessions.get(&key.session_id) {
+            // Both arms also resolve `key`'s own waiter (PIPE-06): the
+            // connection that sent the matching ATTACH_HELLO may still be
+            // blocked in `AttachRuntime::hello()`. `AlreadyAttached` is the
+            // reason the protocol already uses for "a pre-attach fallback
+            // picked another winner", which is what CANCEL signals.
             Some(AttachState::Connecting { key: cur, lease }) if *cur == key => {
                 let lease = *lease;
                 self.sessions.remove(&key.session_id);
-                vec![AttachEffect::CancelLease { lease }]
+                vec![
+                    AttachEffect::SendReject { key, reason: AttachRejectReason::AlreadyAttached },
+                    AttachEffect::CancelLease { lease },
+                ]
             }
             Some(AttachState::PendingActivation { key: cur, lease, .. }) if *cur == key => {
                 let lease = *lease;
                 self.sessions.remove(&key.session_id);
-                vec![AttachEffect::CancelLease { lease }]
+                vec![
+                    AttachEffect::SendReject { key, reason: AttachRejectReason::AlreadyAttached },
+                    AttachEffect::CancelLease { lease },
+                ]
             }
             // Established never yields to CANCEL (module docs); every other
             // state either doesn't match `key` exactly or has nothing live
@@ -528,7 +562,16 @@ mod tests {
 
         let newer = key(1, 6, 1);
         let effects = a.apply(AttachEvent::HelloReceived { key: newer });
-        assert_eq!(effects, vec![AttachEffect::CancelLease { lease: LeaseId(0) }]);
+        assert_eq!(
+            effects,
+            vec![
+                AttachEffect::SendReject {
+                    key: old,
+                    reason: AttachRejectReason::StaleGeneration { current_generation: ConnectionGeneration::new(6) }
+                },
+                AttachEffect::CancelLease { lease: LeaseId(0) }
+            ]
+        );
         assert_eq!(a.state_for(sid(1)), Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer }));
 
         // Stale completion for the old, already-superseded lease must not
@@ -554,7 +597,14 @@ mod tests {
         a.apply(AttachEvent::HelloReceived { key: key(1, 5, 1) });
         a.apply(AttachEvent::HelloReceived { key: key(1, 6, 1) });
         let effects = a.apply(AttachEvent::HelloReceived { key: key(1, 7, 1) });
-        assert_eq!(effects, vec![]);
+        // The displaced `next` (generation 6) must be told it lost (PIPE-06).
+        assert_eq!(
+            effects,
+            vec![AttachEffect::SendReject {
+                key: key(1, 6, 1),
+                reason: AttachRejectReason::StaleGeneration { current_generation: ConnectionGeneration::new(7) }
+            }]
+        );
         assert_eq!(
             a.state_for(sid(1)),
             Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: key(1, 7, 1) })
@@ -635,7 +685,13 @@ mod tests {
         let k = key(1, 0, 1);
         a.apply(AttachEvent::HelloReceived { key: k });
         let effects = a.apply(AttachEvent::CancelReceived { key: k });
-        assert_eq!(effects, vec![AttachEffect::CancelLease { lease: LeaseId(0) }]);
+        assert_eq!(
+            effects,
+            vec![
+                AttachEffect::SendReject { key: k, reason: AttachRejectReason::AlreadyAttached },
+                AttachEffect::CancelLease { lease: LeaseId(0) }
+            ]
+        );
         assert_eq!(a.state_for(sid(1)), None);
     }
 

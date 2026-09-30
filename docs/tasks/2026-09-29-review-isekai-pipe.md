@@ -17,7 +17,7 @@
     (二重管理を構造的に解消)。bootstrap生成と同形のargvを `parse_serve`→`engine::parse_args_from` に通す
     単体テスト、リスト全要素がengineで既知であることのテスト、実バイナリで `--bind-port-range` を渡すe2eを追加。
     install_script.rs(生成側)は触らない。
-- [ ] **PIPE-02** (High) `engine/mod.rs::handle_attach_stream` / `finish_or_park_session`
+- [x] **PIPE-02** (High) `engine/mod.rs::handle_attach_stream` / `finish_or_park_session`
   - 要約: `insert_existing` が `Rejected` のとき `table_guard=None` のまま中継し、DataStreamDied/Preempted で
     `lease.keep()`+テーブル外のhandleにpark → 誰も `relay_ended` を呼ばずfencing slotが永久リーク。mainでも有効。
   - 方針: テーブルに載っていない(=resume不能な)セッションは DataStreamDied/Preempted でも `lease.release()` して
@@ -26,7 +26,7 @@
   - 要約: 「送信→replayバッファへappend」の順で、送信失敗/キャンセル時にバイトがreplayから欠落する。mainでも有効。
   - 方針: 読み取り量は既に `remaining_capacity()` で頭打ちなので、appendを先に行ってから送信する(両側)。
     `quicmux::ReplayBuffer::advance_start` のdocs(send-then-append前提の記述)も更新。
-- [ ] **PIPE-04** (High) `engine/attach_runtime.rs::start_connect` / `activate`
+- [x] **PIPE-04** (High) `engine/attach_runtime.rs::start_connect` / `activate`
   - 要約: spawn後に `Connecting{task}` を登録するため、spawn先が先に `PendingTarget{tcp}` を入れた後に上書きされ得る
     → `activate()` がリソースを見つけられず `EstablishedLease` 未発行のまま slot が `Established` で孤児化。
     失敗パスでは `Connecting` エントリが残る。mainでも有効。
@@ -36,27 +36,27 @@
 
 ## Medium
 
-- [ ] **PIPE-05** (Medium) `engine/mod.rs::relay_buffered` プリエンプション
+- [x] **PIPE-05** (Medium) `engine/mod.rs::relay_buffered` プリエンプション
   - 要約: `preempt.notified()` が select の各周回で作り直されるため、arm内の write で詰まっている間の
     `notify_waiters()` を取りこぼす(ゾンビ接続でこそ効かない)。mainでも有効。
   - 方針: `Notified` をループ外で1つだけ作って pin+enable して保持し、S→C の `send.write_all` と C→S の
     TCP書き込み(cancel-safeな `write` を1回ずつ、進んだ分だけ `helper_committed_offset` を進める)も preempt と select する。
-- [ ] **PIPE-06** (Medium) `engine/attach_runtime.rs::hello` / `attach_arbiter.rs`
+- [x] **PIPE-06** (Medium) `engine/attach_runtime.rs::hello` / `attach_arbiter.rs`
   - 要約: `rx.await` に上限が無く、supersede/next差し替え/CANCELで旧keyのwaiterが解決されずタスク/waiterがリーク
     (`--once`はハング)。同一keyの再送HELLOは前の呼び出し元を `Unsupported` で落とす。mainでも有効。
   - 方針: arbiterが旧keyへ `SendReject(StaleGeneration)` を出す(supersede時・next差し替え時)、CANCEL時も
     該当keyへ `SendReject` を出す。waiterは同一keyで複数保持し全員に配送。`hello()` はタイムアウトで包み、
     タイムアウト時にwaiterを除去。
-- [ ] **PIPE-07** (Medium) `engine/mod.rs::finish_or_park_session`(TcpDied) / `SessionTableEntryGuard::drop`
+- [x] **PIPE-07** (Medium) `engine/mod.rs::finish_or_park_session`(TcpDied) / `SessionTableEntryGuard::drop`
   - 要約: `lease.release()` → `sessions.remove(id)` の順で、解放直後に同session_idで登録された新エントリを消し得る。
     Dropフォールバックもidだけで無条件remove。mainでも有効。
   - 方針: `SessionTable::remove_if_same(id, &handle)`(`Arc::ptr_eq`)を追加し、先にremoveしてからrelease。
     ガードもhandleを保持して `remove_if_same` を使う。
-- [ ] **PIPE-08** (Medium) `engine/mod.rs::handle_resume_stream`(arbiter slot無しでrepark)
+- [x] **PIPE-08** (Medium) `engine/mod.rs::handle_resume_stream`(arbiter slot無しでrepark)
   - 要約: `established_lease_for` が `None` なのに repark してテーブルに残し、以後毎回 UnknownToken、
     sshd接続を最大 `--resume-window` 抱え続ける。mainでも有効。
   - 方針: この分岐では repark せず `remove_if_same` してTCPを破棄する。
-- [ ] **PIPE-09** (Medium) `engine/mod.rs`(control stream無しのS→C 4MiB停止)
+- [x] **PIPE-09** (Medium) `engine/mod.rs`(control stream無しのS→C 4MiB停止)
   - 要約: control streamが確立しないとAPP_ACKが来ず、replay満杯でS→Cが永久停止。docstringも事実と異なる。mainでも有効。
   - 方針: `Session::resume_disabled` フラグを追加。control stream確立失敗/タイムアウトでフラグを立て、replayをクリアし
     tee停止(`output_space_available`で中継ループを起こす)。この状態のセッションはDataStreamDied/Preemptedでもparkせず破棄。
@@ -65,7 +65,7 @@
     deadline(既定10日)まで再試行し、ConnectOutcomeも書かれない。mainでも有効。
   - 方針: 両者を即give-up(`Err`)にし、既存のgive-up経路(→`write_connect_outcome_for_wrapper`)に渡す。
     replay書き込み失敗/タイムアウトは一過性として従来通り再試行。
-- [ ] **PIPE-11** (Medium) `engine/mod.rs::admit_new_session`
+- [x] **PIPE-11** (Medium) `engine/mod.rs::admit_new_session`
   - 要約: 容量判定が check-then-act で非原子的で `--max-sessions` を超過し、PIPE-02の `Rejected` を引き起こす。
     evict対象のslotが既に無い場合も容量が空かないまま admit する。mainでも有効。
   - 方針: `AttachRuntime` にadmission用ロックを置き、「数える→evict→arbiterへHelloReceived適用(slot予約)」を
@@ -73,11 +73,11 @@
 
 ## Low
 
-- [ ] **PIPE-12** (Low) `engine/mod.rs::handle_resume_stream` RESUME_ACK+replay書き込みにタイムアウト無し
+- [x] **PIPE-12** (Low) `engine/mod.rs::handle_resume_stream` RESUME_ACK+replay書き込みにタイムアウト無し
   - 方針: `respond_resume_accepted` をタイムアウトで包み、超過時はreparkして終了。
 - [ ] **PIPE-13** (Low) `quicmux/src/resume.rs::decode_resume_request` 未認証で最大128KiBアロケーション/無期限滞留
   - 方針: token/auth_blob長に上限を設けて早期拒否。呼び出し側(`handle_resume_stream`)でdecodeを `HELLO_TIMEOUT` で包む。
-- [ ] **PIPE-14** (Low) `engine/mod.rs::release_slot_for` が「その時点の」leaseを解放する
+- [x] **PIPE-14** (Low) `engine/mod.rs::release_slot_for` が「その時点の」leaseを解放する
   - 方針: `Session` にlease IDを刻み、evict/sweepはevictしたエントリのlease IDを返す。呼び出し側はそのleaseで
     `relay_ended`(lease一致検査あり)を呼ぶ。
 - [ ] **PIPE-15** (Low) `quicmux/src/resume.rs::ReplayBuffer::advance_start` が1バイトずつpop

@@ -48,18 +48,33 @@ const PENDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// over the network to `target`.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Upper bound on how long [`AttachRuntime::hello`] waits for its
+/// `AttachReadyV2`/reject outcome (review 2026-09-29, PIPE-06). Every
+/// arbiter transition that displaces a waiting key now resolves it
+/// explicitly, so this is only a backstop against a future path that
+/// forgets to: without it such a caller (its connection task, its
+/// `AnyMuxConnection` clone, and its `waiters` entry) leaked forever, and
+/// `serve --once` hung. Longer than `TARGET_CONNECT_TIMEOUT` — the longest
+/// legitimate wait (a slow target connect) — plus margin.
+const HELLO_OUTCOME_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What a `hello()` caller needs in order to build the wire-level
 /// `AttachResponse` — deliberately *not* the full wire type, since
 /// `negotiated_resume_grace_secs` depends on `requested_resume_grace_secs`
 /// (an ATTACH-unrelated policy value the connection task already knows),
 /// which this runtime has no reason to also track.
+#[derive(Clone, Copy)]
 pub enum HelloOutcome {
     Ready { attach_token: AttachToken },
     Reject(AttachRejectReason),
 }
 
 enum LeaseResource {
-    Connecting { task: JoinHandle<()> },
+    /// `task` is `None` between the arbiter emitting `ConnectTarget` (the
+    /// entry is registered right then, inside [`AttachRuntime::apply_event`])
+    /// and `start_connect` actually spawning the connect — so a
+    /// `CancelLease` racing into that gap still finds the lease (PIPE-04).
+    Connecting { task: Option<JoinHandle<()>> },
     PendingTarget { tcp: TcpStream, timer: Option<JoinHandle<()>> },
 }
 
@@ -87,6 +102,12 @@ pub struct EstablishedLease {
 impl EstablishedLease {
     fn new(runtime: Arc<AttachRuntime>, lease: LeaseId) -> Self {
         Self { runtime, lease: Some(lease) }
+    }
+
+    /// The lease this guard protects (`None` only after `release`/`keep`,
+    /// which consume `self`, so always `Some` for a caller holding one).
+    pub fn lease_id(&self) -> Option<LeaseId> {
+        self.lease
     }
 
     /// The target TCP connection died for good — release the slot now.
@@ -135,7 +156,17 @@ impl Drop for EstablishedLease {
 pub struct AttachRuntime {
     arbiter: Mutex<AttachArbiter>,
     leases: Mutex<HashMap<LeaseId, LeaseResource>>,
-    waiters: Mutex<HashMap<AttachKey, oneshot::Sender<HelloOutcome>>>,
+    /// One entry per waiting `hello()` call. A `Vec` rather than a single
+    /// sender: a retransmitted ATTACH_HELLO for the same key (e.g. arriving
+    /// on a fresh QUIC connection) used to *replace* the earlier caller's
+    /// sender, dropping it — that caller then saw a spurious
+    /// `Reject(Unsupported)` (PIPE-06). Every waiter now gets the outcome.
+    waiters: Mutex<HashMap<AttachKey, Vec<oneshot::Sender<HelloOutcome>>>>,
+    /// Serializes `engine/mod.rs`'s `--max-sessions` admission check with the
+    /// arbiter slot reservation it guards (`hello_register`), so concurrent
+    /// brand-new sessions can no longer all pass the same "below the cap"
+    /// check before any of them is counted (PIPE-11).
+    admission: Mutex<()>,
     next_target_id: AtomicU64,
     target: SocketAddr,
 }
@@ -146,6 +177,7 @@ impl AttachRuntime {
             arbiter: Mutex::new(AttachArbiter::new()),
             leases: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
+            admission: Mutex::new(()),
             next_target_id: AtomicU64::new(0),
             target,
         })
@@ -192,12 +224,51 @@ impl AttachRuntime {
     /// `key`, applies the event, executes whatever effects come back
     /// immediately, then waits (possibly across further effects executed by
     /// *other* tasks later) for the eventual `AttachReadyV2`/reject outcome.
+    #[cfg(test)]
     pub async fn hello(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
+        let rx = self.hello_register(key).await;
+        self.hello_wait(key, rx).await
+    }
+
+    /// First half of [`Self::hello`]: registers a waiter for `key` and
+    /// applies `HelloReceived` — after this returns, a brand-new
+    /// `session_id` already occupies an arbiter slot (so it is counted by
+    /// [`Self::session_count`]). Split out so admission control can run
+    /// "count, evict, reserve" under [`Self::admission_guard`] without also
+    /// holding that lock across the (possibly many-second) wait for the
+    /// outcome (PIPE-11).
+    pub async fn hello_register(self: &Arc<Self>, key: AttachKey) -> oneshot::Receiver<HelloOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().await.insert(key, tx);
-        let effects = self.arbiter.lock().await.apply(AttachEvent::HelloReceived { key });
+        self.waiters.lock().await.entry(key).or_default().push(tx);
+        let effects = self.apply_event(AttachEvent::HelloReceived { key }).await;
         self.execute_effects(effects).await;
-        rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
+        rx
+    }
+
+    /// Second half of [`Self::hello`]: waits (bounded by
+    /// `HELLO_OUTCOME_TIMEOUT`) for the outcome `hello_register` subscribed
+    /// to. On timeout the now-dead sender is pruned from `waiters`.
+    pub async fn hello_wait(self: &Arc<Self>, key: AttachKey, rx: oneshot::Receiver<HelloOutcome>) -> HelloOutcome {
+        match tokio::time::timeout(HELLO_OUTCOME_TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => HelloOutcome::Reject(AttachRejectReason::Unsupported),
+            Err(_elapsed) => {
+                log::warn!("attach_runtime: no ATTACH outcome for {key:?} within {HELLO_OUTCOME_TIMEOUT:?}; giving up");
+                let mut waiters = self.waiters.lock().await;
+                if let Some(senders) = waiters.get_mut(&key) {
+                    senders.retain(|tx| !tx.is_closed());
+                    if senders.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+                HelloOutcome::Reject(AttachRejectReason::Target)
+            }
+        }
+    }
+
+    /// See the `admission` field's docs.
+    pub async fn admission_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.admission.lock().await
     }
 
     /// Applies `AttachActivate`; on success (the activation matched the
@@ -208,14 +279,34 @@ impl AttachRuntime {
     /// (the arbiter has just moved this session to `Established`, per
     /// `AttachArbiter::on_activated`).
     pub async fn activate(self: &Arc<Self>, key: AttachKey, attach_token: AttachToken) -> Option<(TcpStream, EstablishedLease)> {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::Activated { key, attach_token });
+        let effects = self.apply_event(AttachEvent::Activated { key, attach_token }).await;
         for effect in effects {
             if let AttachEffect::StartRelay { lease, .. } = effect {
-                if let Some(LeaseResource::PendingTarget { tcp, timer }) = self.leases.lock().await.remove(&lease) {
-                    if let Some(timer) = timer {
-                        timer.abort();
+                let resource = self.leases.lock().await.remove(&lease);
+                match resource {
+                    Some(LeaseResource::PendingTarget { tcp, timer }) => {
+                        if let Some(timer) = timer {
+                            timer.abort();
+                        }
+                        return Some((tcp, EstablishedLease::new(self.clone(), lease)));
                     }
-                    return Some((tcp, EstablishedLease::new(self.clone(), lease)));
+                    other => {
+                        // The arbiter already moved this session to
+                        // `Established`, but there is no target connection to
+                        // hand out (should be unreachable since PIPE-04's
+                        // `start_connect` fix, but defended here regardless):
+                        // no `EstablishedLease` will ever exist for it, so
+                        // nobody would ever call `relay_ended` — give the slot
+                        // back right now instead of orphaning it forever.
+                        log::warn!(
+                            "attach_runtime: StartRelay for lease {lease:?} found no pending target; releasing the slot"
+                        );
+                        if let Some(LeaseResource::Connecting { task: Some(task) }) = other {
+                            task.abort();
+                        }
+                        self.relay_ended(lease).await;
+                        return None;
+                    }
                 }
             }
         }
@@ -237,7 +328,7 @@ impl AttachRuntime {
     }
 
     pub async fn cancel(self: &Arc<Self>, key: AttachKey) {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::CancelReceived { key });
+        let effects = self.apply_event(AttachEvent::CancelReceived { key }).await;
         self.execute_effects(effects).await;
     }
 
@@ -246,7 +337,7 @@ impl AttachRuntime {
     /// parked for a possible resume, which leaves the arbiter `Established`
     /// so a matching `RESUME` can still find its slot).
     pub async fn relay_ended(self: &Arc<Self>, lease: LeaseId) {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::RelayEnded { lease });
+        let effects = self.apply_event(AttachEvent::RelayEnded { lease }).await;
         self.execute_effects(effects).await;
     }
 
@@ -279,18 +370,35 @@ impl AttachRuntime {
     }
 
     async fn resolve_waiter(self: &Arc<Self>, key: AttachKey, outcome: HelloOutcome) {
-        if let Some(tx) = self.waiters.lock().await.remove(&key) {
-            let _ = tx.send(outcome);
+        if let Some(senders) = self.waiters.lock().await.remove(&key) {
+            for tx in senders {
+                let _ = tx.send(outcome);
+            }
         }
     }
 
-    /// Spawns the target `TcpStream::connect`, then — synchronously, before
-    /// this function returns — records `Connecting { task }` in `leases` so
-    /// a `CancelLease` effect processed immediately afterward always finds
-    /// an entry to abort.
+    /// Spawns the target `TcpStream::connect` and records `Connecting { task }`
+    /// in `leases` **while still holding the `leases` lock across the spawn**,
+    /// so a `CancelLease` effect processed immediately afterward always finds
+    /// an entry to abort, and — the actual correctness point (review
+    /// 2026-09-29, PIPE-04) — the spawned task's own `leases` access (its
+    /// `Connecting` → `PendingTarget` transition) is guaranteed to happen
+    /// *after* this registration. The previous shape spawned first and
+    /// inserted `Connecting` afterwards; on the multi-threaded runtime a fast
+    /// loopback connect could insert `PendingTarget { tcp }` first and then
+    /// have it overwritten by the late `Connecting { task }`, so `activate()`
+    /// found no target, never minted an `EstablishedLease`, and the slot sat
+    /// `Established` forever (`.claude/rules/always-connects.md`).
     async fn start_connect(self: &Arc<Self>, lease: LeaseId) {
         let this = self.clone();
         let target_addr = self.target;
+        let mut leases = self.leases.lock().await;
+        // `apply_event` registered `Connecting { task: None }` together with
+        // the `ConnectTarget` effect. If it is gone, a `CancelLease` already
+        // won the race (and reported `LeaseStopped`) — don't connect at all.
+        if !matches!(leases.get(&lease), Some(LeaseResource::Connecting { task: None })) {
+            return;
+        }
         let task = tokio::spawn(async move {
             match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
                 Ok(Ok(tcp)) => {
@@ -298,38 +406,83 @@ impl AttachRuntime {
                     let mut token_bytes = [0u8; ATTACH_TOKEN_LEN];
                     rand::rngs::OsRng.fill_bytes(&mut token_bytes);
                     let attach_token = AttachToken::new(token_bytes);
-                    this.leases.lock().await.insert(lease, LeaseResource::PendingTarget { tcp, timer: None });
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnected {
+                    {
+                        let mut leases = this.leases.lock().await;
+                        // Only a lease still `Connecting` may advance: if the
+                        // entry is gone, `cancel_lease` already took it (and
+                        // is aborting/awaiting this very task), so the fresh
+                        // TCP connection must simply be dropped here.
+                        if !matches!(leases.get(&lease), Some(LeaseResource::Connecting { .. })) {
+                            return;
+                        }
+                        leases.insert(lease, LeaseResource::PendingTarget { tcp, timer: None });
+                    }
+                    let effects = this.apply_event(AttachEvent::TargetConnected {
                         lease,
                         target: target_id,
                         attach_token,
-                    });
+                    })
+                    .await;
                     this.execute_effects(effects).await;
                 }
                 Ok(Err(e)) => {
                     log::info!("attach_runtime: target connect failed for lease {lease:?}: {e}");
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
+                    this.forget_connecting(lease).await;
+                    let effects = this.apply_event(AttachEvent::TargetConnectFailed { lease }).await;
                     this.execute_effects(effects).await;
                 }
                 Err(_elapsed) => {
                     log::info!(
                         "attach_runtime: target connect timed out after {TARGET_CONNECT_TIMEOUT:?} for lease {lease:?}"
                     );
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
+                    this.forget_connecting(lease).await;
+                    let effects = this.apply_event(AttachEvent::TargetConnectFailed { lease }).await;
                     this.execute_effects(effects).await;
                 }
             }
         });
-        self.leases.lock().await.insert(lease, LeaseResource::Connecting { task });
+        leases.insert(lease, LeaseResource::Connecting { task: Some(task) });
+    }
+
+    /// Applies `event` to the arbiter **while holding the `leases` lock**, and
+    /// registers a `Connecting { task: None }` placeholder for every
+    /// `ConnectTarget` effect before either lock is released. Without this,
+    /// between `apply` returning `ConnectTarget` and `start_connect` getting
+    /// to register the lease, a concurrent `CancelLease` (e.g. a superseding
+    /// generation arriving on another connection) found no entry and did
+    /// nothing, leaving `ClosingForSupersede` waiting forever for a
+    /// `LeaseStopped` nobody would send (PIPE-04). Lock order is always
+    /// `leases` → `arbiter`; no code path takes them the other way round.
+    async fn apply_event(self: &Arc<Self>, event: AttachEvent) -> Vec<AttachEffect> {
+        let mut leases = self.leases.lock().await;
+        let effects = self.arbiter.lock().await.apply(event);
+        for effect in &effects {
+            if let AttachEffect::ConnectTarget { lease } = effect {
+                leases.insert(*lease, LeaseResource::Connecting { task: None });
+            }
+        }
+        effects
+    }
+
+    /// Drops `lease`'s `Connecting` bookkeeping once its connect attempt has
+    /// failed for good — without this the entry (and its finished
+    /// `JoinHandle`) stayed in `leases` forever (PIPE-04's side note).
+    async fn forget_connecting(self: &Arc<Self>, lease: LeaseId) {
+        let mut leases = self.leases.lock().await;
+        if matches!(leases.get(&lease), Some(LeaseResource::Connecting { .. })) {
+            leases.remove(&lease);
+        }
     }
 
     async fn cancel_lease(self: &Arc<Self>, lease: LeaseId) {
         let resource = self.leases.lock().await.remove(&lease);
         match resource {
             Some(LeaseResource::Connecting { task }) => {
-                task.abort();
-                let _ = task.await;
-                let effects = self.arbiter.lock().await.apply(AttachEvent::LeaseStopped { lease });
+                if let Some(task) = task {
+                    task.abort();
+                    let _ = task.await;
+                }
+                let effects = self.apply_event(AttachEvent::LeaseStopped { lease }).await;
                 self.execute_effects(effects).await;
             }
             Some(LeaseResource::PendingTarget { tcp, timer }) => {
@@ -337,10 +490,20 @@ impl AttachRuntime {
                     timer.abort();
                 }
                 drop(tcp);
-                let effects = self.arbiter.lock().await.apply(AttachEvent::LeaseStopped { lease });
+                let effects = self.apply_event(AttachEvent::LeaseStopped { lease }).await;
                 self.execute_effects(effects).await;
             }
-            None => {}
+            None => {
+                // Nothing left to tear down: the connect attempt already
+                // finished and dropped its own bookkeeping (`forget_connecting`
+                // after a failed connect). The lease is therefore genuinely
+                // stopped — say so, or a `ClosingForSupersede` waiting on this
+                // lease would never advance to its `next` attempt. Harmless
+                // otherwise: the arbiter ignores `LeaseStopped` for a lease it
+                // isn't superseding.
+                let effects = self.apply_event(AttachEvent::LeaseStopped { lease }).await;
+                self.execute_effects(effects).await;
+            }
         }
     }
 
@@ -353,12 +516,143 @@ impl AttachRuntime {
         let this = self.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(PENDING_ACTIVATION_TIMEOUT).await;
-            let effects = this.arbiter.lock().await.apply(AttachEvent::PendingExpired { lease });
+            let effects = this.apply_event(AttachEvent::PendingExpired { lease }).await;
             this.execute_effects(effects).await;
         });
         match self.leases.lock().await.get_mut(&lease) {
             Some(LeaseResource::PendingTarget { timer: slot, .. }) => *slot = Some(timer),
             _ => timer.abort(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
+    use isekai_protocol::SessionId;
+
+    fn key(session: u8, generation: u64, attempt: u8) -> AttachKey {
+        AttachKey {
+            session_id: SessionId::from_bytes([session; 16]),
+            generation: ConnectionGeneration::new(generation),
+            attempt_id: AttemptId::from_bytes([attempt; 16]),
+        }
+    }
+
+    /// A target that accepts and holds every connection open.
+    async fn listening_target() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    /// A loopback address nothing listens on (bound once, then released).
+    fn closed_target() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr
+    }
+
+    /// PIPE-04 regression: the fast loopback connect used to be able to
+    /// finish (and insert `PendingTarget`) before `start_connect` registered
+    /// `Connecting`, which then overwrote it — `activate()` found nothing and
+    /// the slot was orphaned `Established`. Repeated many times on the
+    /// multi-threaded runtime, where that interleaving was reachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hello_then_activate_always_hands_out_the_target_connection() {
+        let target = listening_target().await;
+        for i in 0..200u32 {
+            let runtime = AttachRuntime::new(target);
+            let k = key((i % 250) as u8, 0, 1);
+            let HelloOutcome::Ready { attach_token } = runtime.hello(k).await else {
+                panic!("iteration {i}: expected Ready");
+            };
+            let activated = runtime.activate(k, attach_token).await;
+            assert!(activated.is_some(), "iteration {i}: activate() lost the target connection");
+            let (_tcp, lease) = activated.unwrap();
+            lease.release().await;
+            assert!(runtime.is_vacant().await, "iteration {i}: slot not released");
+        }
+    }
+
+    /// PIPE-04 side note: a failed connect must not leave its `Connecting`
+    /// bookkeeping behind forever.
+    #[tokio::test]
+    async fn failed_target_connect_rejects_and_leaves_no_lease_bookkeeping() {
+        let runtime = AttachRuntime::new(closed_target());
+        let outcome = runtime.hello(key(1, 0, 1)).await;
+        assert!(matches!(outcome, HelloOutcome::Reject(AttachRejectReason::Target)));
+        assert!(runtime.leases.lock().await.is_empty());
+        assert!(runtime.is_vacant().await);
+    }
+
+    /// PIPE-04: if the arbiter reaches `Established` but no target resource
+    /// exists, `activate()` must give the slot back rather than orphan it.
+    #[tokio::test]
+    async fn activate_without_a_pending_target_releases_the_slot() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let k = key(1, 0, 1);
+        let HelloOutcome::Ready { attach_token } = runtime.hello(k).await else { panic!("expected Ready") };
+        // Simulate the lost resource.
+        runtime.leases.lock().await.clear();
+        assert!(runtime.activate(k, attach_token).await.is_none());
+        assert!(runtime.is_vacant().await, "slot must not stay Established without an EstablishedLease");
+    }
+
+    /// PIPE-06: a waiter superseded by a strictly larger generation while
+    /// still `Connecting` used to wait forever; it must now be told
+    /// `StaleGeneration`. Runs on the (default) current-thread runtime, so
+    /// the first attempt's spawned connect task cannot run before the
+    /// second `hello_register` supersedes it — the old attempt is
+    /// deterministically still `Connecting` at that point.
+    #[tokio::test]
+    async fn superseded_connecting_waiter_is_rejected_instead_of_hanging() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let old = key(1, 5, 1);
+        let rx_old = runtime.hello_register(old).await;
+        let _rx_new = runtime.hello_register(key(1, 6, 1)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx_old)
+            .await
+            .expect("superseded waiter must be resolved promptly")
+            .expect("sender must not just be dropped");
+        assert!(matches!(
+            outcome,
+            HelloOutcome::Reject(AttachRejectReason::StaleGeneration { current_generation }) if current_generation == ConnectionGeneration::new(6)
+        ));
+    }
+
+    /// PIPE-06: a retransmitted HELLO for the same key used to replace (and
+    /// thereby drop) the earlier caller's sender; both must get the outcome.
+    #[tokio::test]
+    async fn retransmitted_hello_for_the_same_key_resolves_every_waiter() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let k = key(1, 0, 1);
+        let rx1 = runtime.hello_register(k).await;
+        let rx2 = runtime.hello_register(k).await;
+        let o1 = tokio::time::timeout(Duration::from_secs(5), rx1).await.unwrap().unwrap();
+        let o2 = tokio::time::timeout(Duration::from_secs(5), rx2).await.unwrap().unwrap();
+        assert!(matches!(o1, HelloOutcome::Ready { .. }));
+        assert!(matches!(o2, HelloOutcome::Ready { .. }));
+    }
+
+    /// PIPE-06: CANCEL for a still-connecting attempt resolves its waiter
+    /// (current-thread runtime: the connect task has not run yet, see above).
+    #[tokio::test]
+    async fn cancel_resolves_the_cancelled_attempts_waiter() {
+        let runtime = AttachRuntime::new(listening_target().await);
+        let k = key(1, 0, 1);
+        let rx = runtime.hello_register(k).await;
+        runtime.cancel(k).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+        assert!(matches!(outcome, HelloOutcome::Reject(AttachRejectReason::AlreadyAttached)));
+        assert!(runtime.is_vacant().await);
     }
 }
