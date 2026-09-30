@@ -24,7 +24,8 @@ use crate::AuthError;
 /// (`device_flow::poll_for_token`) and the refresh-token grant
 /// (`refresh::refresh_access_token`) — both endpoints return exactly this
 /// shape on success.
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` redacts both tokens.
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -35,6 +36,16 @@ pub struct TokenResponse {
     /// `file_provider.rs`, which then never auto-refreshes on this token).
     #[serde(default)]
     pub expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// RFC 6749 §5.2 error response body.
@@ -55,10 +66,18 @@ fn unknown_error() -> String {
 /// into `Err` here, since callers interpret it differently: device-flow
 /// polling treats `authorization_pending`/`slow_down` (both delivered as
 /// HTTP 400 per RFC 8628 §3.5) as "keep waiting", not a fatal error.
+///
+/// Bounded end-to-end by [`HTTP_TIMEOUT`] (ureq 3's own timeouts all default
+/// to "none", so an unresponsive token endpoint used to hang a silent
+/// re-bootstrap forever), and refuses a non-`https` endpoint unless it is a
+/// loopback address (a refresh token sent in clear text would be exposed to
+/// anyone on the path).
 pub(crate) fn post_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String), AuthError> {
+    require_secure_endpoint(url)?;
     let mut response = ureq::post(url)
         .config()
         .http_status_as_error(false)
+        .timeout_global(Some(HTTP_TIMEOUT))
         .build()
         .send_form(form.iter().cloned())
         .map_err(|source| AuthError::HttpRequest { url: url.to_string(), reason: source.to_string() })?;
@@ -69,6 +88,37 @@ pub(crate) fn post_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String
         .read_to_string()
         .map_err(|source| AuthError::HttpRequest { url: url.to_string(), reason: source.to_string() })?;
     Ok((status, body))
+}
+
+/// End-to-end bound (DNS through reading the body) on one token-endpoint
+/// request.
+pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `https://` is always accepted; `http://` only for a loopback host
+/// (`localhost`, `127.0.0.0/8`, `[::1]` — local development/test servers).
+pub(crate) fn require_secure_endpoint(url: &str) -> Result<(), AuthError> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+        let host = if let Some(end) = authority.strip_prefix('[').and_then(|a| a.find(']')) {
+            &authority[1..=end]
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        let loopback = host == "localhost"
+            || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            return Ok(());
+        }
+    }
+    Err(AuthError::HttpRequest {
+        url: url.to_string(),
+        reason: "token endpoint must use https:// (plain http is only allowed for a loopback host)".to_string(),
+    })
 }
 
 /// Parses a successful (2xx) token endpoint response body.
@@ -85,5 +135,32 @@ pub(crate) fn parse_error_body(body: &str) -> (String, Option<String>) {
     match serde_json::from_str::<TokenErrorBody>(body) {
         Ok(err) => (err.error, err.error_description),
         Err(_) => ("unknown_error".to_string(), Some(body.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_is_always_allowed_and_http_only_for_loopback() {
+        for ok in [
+            "https://auth.example.com/token",
+            "HTTPS://auth.example.com/token",
+            "http://127.0.0.1:8080/token",
+            "http://localhost/token",
+            "http://[::1]:9000/token",
+        ] {
+            assert!(require_secure_endpoint(ok).is_ok(), "{ok} should be allowed");
+        }
+        for bad in [
+            "http://auth.example.com/token",
+            "http://127.0.0.1.evil.example/token",
+            "http://user@auth.example.com/token",
+            "ftp://auth.example.com/token",
+            "auth.example.com/token",
+        ] {
+            assert!(require_secure_endpoint(bad).is_err(), "{bad} should be refused");
+        }
     }
 }

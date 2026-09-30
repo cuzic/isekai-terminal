@@ -49,7 +49,10 @@ fn random_attempt_id() -> AttemptId {
 /// `helper_bootstrap::IsekaiPipeHandshake` this crate actually consumes — SSH
 /// bootstrap and handshake-JSON parsing are the caller's responsibility
 /// (`isekai_protocol::handshake`), not this crate's.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts `session_secret` (this type is embedded in several
+/// `Debug`-deriving candidate/race types, any of which may end up in a log).
+#[derive(Clone)]
 pub struct RelayTarget {
     /// The relay-assigned public address of the remote isekai-helper
     /// (`HandshakeJson::relay_public_addr`), *not* the relay server itself —
@@ -74,6 +77,18 @@ pub struct RelayTarget {
     /// (`quicmux::BindSpec::port_range`'s docs). The client-side counterpart
     /// of `isekai-helper --bind-port-range` on the remote side.
     pub local_bind_port_range: Option<(u16, u16)>,
+}
+
+impl std::fmt::Debug for RelayTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayTarget")
+            .field("helper_addr", &self.helper_addr)
+            .field("server_name", &self.server_name)
+            .field("cert_sha256_hex", &self.cert_sha256_hex)
+            .field("session_secret", &"<redacted>")
+            .field("local_bind_port_range", &self.local_bind_port_range)
+            .finish()
+    }
 }
 
 impl RelayTarget {
