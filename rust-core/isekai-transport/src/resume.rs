@@ -737,7 +737,7 @@ pub async fn reconnect_and_resume(
     client_sent_offset: C2hSentOffset,
     client_delivered_offset: H2cClientDeliveredOffset,
 ) -> Result<ResumeAckOutcome, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(target.bind_spec()).await.map_err(TransportError::Mux)?;
     let conn = tokio::time::timeout(
         TRANSPORT_STEP_TIMEOUT,
         endpoint.connect(RemoteSpec {
