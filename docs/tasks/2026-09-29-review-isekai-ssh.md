@@ -128,7 +128,7 @@
 - [x] **SSH-42** Low `types.rs`(D7)
   - 要約: `RelayLaunchSpec.relay_jwt` の Debug が redact されていない。
   - 方針: 手書き Debug で redact する。`TokenSet`/`TokenResponse`/`DeviceAuthorization`(isekai-auth)と `HelperTrust.cached_session_secret`(isekai-trust)は **transport 担当に委譲**。
-- [ ] **SSH-43** Low `log_file.rs:128-135`(D8 の isekai-ssh 部分)
+- [x] **SSH-43** Low `log_file.rs:128-135`(D8 の isekai-ssh 部分)
   - 要約: 既存ログファイルの権限を 0600 に絞り直さない。
   - 方針: open 後に 0600 を再設定する。runtime dir の所有者検証と intent/outcome の掃除は `isekai-pipe-core`(担当外)なので isekai-pipe 担当へ。
 - [ ] **SSH-44** Low `wrapper.rs:2286-2289,2328`(D9-1)
