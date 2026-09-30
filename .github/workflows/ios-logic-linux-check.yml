@@ -41,6 +41,9 @@ permissions:
 
 env:
   SWIFT_VERSION: "6.3.3"
+  # SWIFT_VERSIONのubuntu24.04 tarballのsha256。SWIFT_VERSIONを上げるときは同時に更新する
+  # (`curl -fsSL <tarball URL> | sha256sum`で算出)。
+  SWIFT_SHA256: "da8272a5fddccd65b1529ed0e52e04526e2eadd4237d58d6220efeb973c6cd19"
 
 jobs:
   build-and-test:
@@ -84,6 +87,7 @@ jobs:
           set -euo pipefail
           curl -fL -o /tmp/swift.tar.gz \
             "https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu2404/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu24.04.tar.gz"
+          echo "${SWIFT_SHA256}  /tmp/swift.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/swift-toolchain"
           tar xzf /tmp/swift.tar.gz --strip-components=1 -C "$HOME/swift-toolchain"
           echo "$HOME/swift-toolchain/usr/bin" >> "$GITHUB_PATH"
@@ -98,6 +102,9 @@ jobs:
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
             "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          # ziglang.org/download/index.json 公表の0.16.0 x86_64-linux tarballのsha256
+          # (ダウンロードしたバイト列から再計算して一致を確認済み)。改ざん・破損を検出する。
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz" | sha256sum -c -
           mkdir -p "$HOME/zig-toolchain"
           tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
           echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
