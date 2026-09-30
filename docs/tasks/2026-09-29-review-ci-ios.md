@@ -175,12 +175,17 @@
   - 修正方針: `read(upToCount:)`(throws)に置き換え、エラー時は転送をキャンセルする。
   - 対応: アップロードを `read(upToCount:)` に変更し、`trzszSendChunked` を `readNext: () throws -> Data` + `rethrows` にした。読み出しエラー時は警告ログを出して `trzszCancel()` する。
     テスト `testReadErrorIsPropagatedWithoutSendingALastChunk` を追加。
-- [ ] **IOS-L1** (Low・不確実) `TerminalSessionController.swift:798-821,865-889`
+- [x] **IOS-L1** (Low・不確実) `TerminalSessionController.swift:798-821,865-889`
   - 要約: コールバックごとに別の `Task { @MainActor }` を作っており、状態更新の順序が保証されない。
   - 修正方針: FIFO が保証される `DispatchQueue.main.async` + `MainActor.assumeIsolated` のヘルパーに統一する。
-- [ ] **IOS-L2** (Low) `TerminalSessionController.swift:1012-1033`
+  - 対応: コールバック内の `Task { @MainActor in }` 16箇所を、`onMain { }`(`DispatchQueue.main.async` + `MainActor.assumeIsolated`、FIFO が保証される)に統一した。
+    既存のコールバック系テスト(bell 世代・trzsz・プロンプトジャンプ等)で回帰を確認する。
+- [x] **IOS-L2** (Low) `TerminalSessionController.swift:1012-1033`
   - 要約: agent-sign の保留スロットが1つしかなく、2件目の要求が1件目を上書きする(1件目は30秒ブロックののち拒否)。
   - 修正方針: FIFO キューにし、先頭を表示する。応答・タイムアウトで次の要求を表示する。
+  - 対応: UI の単一スロット(と `TerminalView` の alert 配線)はそのままにし、`agentSignGate`(値1のセマフォ)で要求を1件ずつ提示するようにした。30秒の期限は到着時点から数え、ゲート待ちで期限を過ぎた要求は表示せずに拒否する。
+    キュー化して UI を2件目に即時差し替える方式は、alert の isPresented setter が発火する `respond(false)` が2件目を誤って拒否しうるため採らなかった。
+    テスト `testConcurrentAgentSignRequestsArePresentedOneAtATime` を追加。
 - [x] **IOS-L3** (Low・不確実) `ios/Sources/IsekaiTerminalCore/RemoteClipboardBridge.swift:36-52`
   - 要約: UIPasteboard を Rust スレッドから触っている。
   - 修正方針: write は main へ非同期ディスパッチ、pull は main で同期実行する(呼び出し元が main なら直接実行)。

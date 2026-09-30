@@ -338,6 +338,33 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertFalse(result)
     }
 
+    /// 2026-09-29レビューIOS-L2: 同時に2件の署名要求が来ても、1件目が2件目に上書きされず
+    /// 順に表示され、それぞれの応答が正しい要求に返る。
+    func testConcurrentAgentSignRequestsArePresentedOneAtATime() async throws {
+        let (controller, _) = try makeController()
+
+        let first = Task.detached { controller.onAgentSignRequest(keyFingerprint: "SHA256:first") }
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.pendingAgentSignRequest?.fingerprint == "SHA256:first"
+        }
+        let second = Task.detached { controller.onAgentSignRequest(keyFingerprint: "SHA256:second") }
+
+        // 2件目は1件目の応答前には表示されない(1件目を上書きしない)。
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(controller.uiState.pendingAgentSignRequest?.fingerprint, "SHA256:first")
+
+        controller.respondToAgentSignRequest(approved: true)
+        let firstResult = await first.value
+        XCTAssertTrue(firstResult)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.pendingAgentSignRequest?.fingerprint == "SHA256:second"
+        }
+        controller.respondToAgentSignRequest(approved: false)
+        let secondResult = await second.value
+        XCTAssertFalse(secondResult)
+    }
+
     // MARK: - Phase 1A-9(#30): isekai-helper/QUIC最小縦切り(transportPreference分岐)
     //
     // 実際のネットワーク接続は行わず、Android版`ConnectionProfile.toSshConfig`/

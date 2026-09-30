@@ -196,7 +196,7 @@ let defaultStunServer = "stun.l.google.com:19302"
 /// このクラス自体は`@MainActor`にせず(`onHostKey`/`onAgentSignRequest`が同期的に
 /// Boolを返す必要があり、MainActorへのTask hopでは間に合わないため)、UIへ反映する
 /// `@Published`な状態は別クラス`TerminalUIState`(`@MainActor`)に分離し、
-/// `Task { @MainActor in }`で明示的に受け渡す。
+/// `onMain { }`(FIFOが保証される`DispatchQueue.main`経由)で明示的に受け渡す。
 public final class TerminalSessionController: OrchestratorCallback, @unchecked Sendable {
     public let uiState = TerminalUIState()
     private static let logger = Logger(subsystem: "tools.isekai.terminal", category: "ssh")
@@ -239,6 +239,8 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         /// ためのガード。
         var downloadWriteFailed = false
     }
+    /// agent署名要求を1件ずつ表示するためのゲート(`onAgentSignRequest`参照)。
+    private let agentSignGate = DispatchSemaphore(value: 1)
     private let trzszLock = NSLock()
     private var trzszStateStorage = TrzszTransferState()
 
@@ -873,7 +875,20 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     }
 
     private func fail(message: String) {
-        Task { @MainActor in self.uiState.state = .failed(message: message) }
+        onMain { self.uiState.state = .failed(message: message) }
+    }
+
+    /// Rustのコールバックスレッド等から`uiState`(@MainActor)への反映をmainへ投げる。
+    ///
+    /// 以前はコールバックごとに`Task { @MainActor in }`を作っていたが、別々に生成した
+    /// 非構造化Taskの実行順序は言語仕様上保証されない(例: `.connecting`→`.connected`の
+    /// 順に届いた通知が逆順に反映されうる)。`DispatchQueue.main`はFIFOが保証されるため、
+    /// ここに一本化して「届いた順に反映される」ことを保証する(2026-09-29レビューIOS-L1)。
+    /// ブロックはmain queue上で実行されるので`MainActor.assumeIsolated`で同期的に入る。
+    private func onMain(_ body: @escaping @MainActor () -> Void) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated(body)
+        }
     }
 
     // MARK: - OrchestratorCallback
@@ -884,15 +899,15 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
 
         switch state {
         case .connecting:
-            Task { @MainActor in self.uiState.state = .connecting }
+            onMain { self.uiState.state = .connecting }
         case .connected:
-            Task { @MainActor in self.uiState.state = .connected }
+            onMain { self.uiState.state = .connected }
         case .disconnected(let reason, let issueHint):
-            Task { @MainActor in self.uiState.state = .disconnected(reason: reason, issueHint: issueHint) }
+            onMain { self.uiState.state = .disconnected(reason: reason, issueHint: issueHint) }
         case .error(let message):
             fail(message: message)
         case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
-            Task { @MainActor in
+            onMain {
                 self.uiState.state = .reconnecting(elapsedSecs: elapsedSecs, timeoutSecs: timeoutSecs, reason: reason)
             }
         }
@@ -940,7 +955,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     }
 
     public func onScreenUpdate(update: ScreenUpdate) {
-        Task { @MainActor in
+        onMain {
             self.uiState.latestScreenUpdate = update
             // タスク#26: `bellGeneration`が直近発火済みの値より進んでいれば端末ベルの
             // 触覚フィードバックを1回だけ発火する。`bellGeneration`はTerminalごとに
@@ -968,7 +983,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// タスク#26: BEL(端末ベル)受信時の触覚フィードバック。Android版に対応する
     /// 実装(#25)はまだ無いため、iOS固有の`UIImpactFeedbackGenerator`のみで実装する
     /// (Codexアーキテクチャレビュー指摘の実装例に準拠)。呼び出し元(`onScreenUpdate`)が
-    /// 既に`Task { @MainActor in }`の中から呼ぶため、ここでも`@MainActor`にして
+    /// 既に`onMain { }`(main上)の中から呼ぶため、ここでも`@MainActor`にして
     /// メインスレッドでの発火を保証する。
     @MainActor
     private static func fireBellFeedback() {
@@ -984,7 +999,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// 経由のMITMで攻撃者鍵をそのまま初回登録してしまう実害のあるセキュリティギャップだった
     /// ——Codexアーキテクチャレビューで指摘、旧実装は自動trustしていた)。このcallbackは
     /// Rustスレッドから同期的にBoolを返す必要があるため、確認ダイアログの表示自体は
-    /// `Task { @MainActor in }`経由でuiStateへ反映しつつ、戻り値はここで即座に`false`を返す。
+    /// `onMain { }`経由でuiStateへ反映しつつ、戻り値はここで即座に`false`を返す。
     /// 渡された`host`/`port`をそのまま使う(`profile.host`ではなく)ことで、踏み台経由接続で
     /// ホップ先のホスト鍵が届いた場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
     /// `onHostKey(host, port, fingerprint)`と同じ方針)。
@@ -1005,7 +1020,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
                 try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: fingerprint)
                 return true
             }
-            Task { @MainActor in
+            onMain {
                 self.uiState.newHostKeyPrompt = NewHostKeyPrompt(host: host, port: port, fingerprint: fingerprint)
             }
             return false
@@ -1020,20 +1035,20 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     public func onTrzszStateChanged(state: TrzszPublicState) {
         switch state {
         case .idle:
-            Task { @MainActor in self.uiState.trzszState = nil }
+            onMain { self.uiState.trzszState = nil }
         case .waitingUser(let transferId, let mode, let suggestedName, let expectedSize):
             withTrzszState {
                 $0.transferId = transferId
                 $0.mode = mode
                 $0.fileName = suggestedName
             }
-            Task { @MainActor in
+            onMain {
                 self.uiState.trzszState = .waitingUser(
                     transferId: transferId, mode: mode, suggestedName: suggestedName, expectedSize: expectedSize
                 )
             }
         case .inProgress(let transferId, let mode, let fileName, let transferred, let total):
-            Task { @MainActor in
+            onMain {
                 self.uiState.trzszState = .inProgress(
                     transferId: transferId, mode: mode, fileName: fileName, transferred: transferred, total: total
                 )
@@ -1048,7 +1063,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             let completedURL = withTrzszState { state in
                 (success && state.mode == "download" && !state.downloadWriteFailed) ? state.downloadTempURL : nil
             }
-            Task { @MainActor in
+            onMain {
                 self.uiState.trzszState = .done(transferId: transferId, success: success, message: message)
                 self.uiState.completedDownloadURL = completedURL
             }
@@ -1090,7 +1105,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// ユーザー確認を必須とする。このcallbackはRustスレッドから同期的にBoolを
     /// 返す必要があるため、`DispatchSemaphore`でMainActor側のダイアログ応答を待つ
     /// (30秒でタイムアウトし拒否扱い、Android版のタイムアウトと同じ方針)。
+    ///
+    /// 同時に複数の要求が来た場合は`agentSignGate`で1件ずつ順に表示する(2026-09-29
+    /// レビューIOS-L2)。以前は表示スロットが1つしかなく、2件目が1件目を上書きして
+    /// 1件目はユーザーが応答できないまま30秒ブロックののち拒否されていた。30秒の期限は
+    /// 要求の到着時点から数え、前の要求の応答待ちで期限を過ぎた要求は表示せずに拒否する。
     public func onAgentSignRequest(keyFingerprint: String) -> Bool {
+        let deadline = DispatchTime.now() + 30
+        guard agentSignGate.wait(timeout: deadline) == .success else { return false }
+        defer { agentSignGate.signal() }
+
         let semaphore = DispatchSemaphore(value: 0)
         let resultBox = AgentSignResultBox()
         let request = AgentSignRequest(fingerprint: keyFingerprint) { approved in
@@ -1098,13 +1122,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             semaphore.signal()
         }
 
-        Task { @MainActor in
+        onMain {
             self.uiState.pendingAgentSignRequest = request
         }
 
-        let waitResult = semaphore.wait(timeout: .now() + 30)
+        let waitResult = semaphore.wait(timeout: deadline)
 
-        Task { @MainActor in
+        onMain {
             if self.uiState.pendingAgentSignRequest?.id == request.id {
                 self.uiState.pendingAgentSignRequest = nil
             }
@@ -1154,7 +1178,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// UI側で独自のミラー状態は持たない(Android版`TerminalSession.kt`の
     /// `onRebindStateChanged`と同じ)。
     public func onRebindStateChanged(state: RebindPublicState) {
-        Task { @MainActor in self.uiState.rebindState = state }
+        onMain { self.uiState.rebindState = state }
     }
 
     // Y-P1(#5、旧タスク#13 OSC 133): 「前/次のプロンプトへジャンプ」・「直前コマンドの
@@ -1163,13 +1187,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // 更新はView側(`TerminalView.swift`、`PromptNavigation.scrollTarget`参照)が
     // `promptJumpResult`の変化を見て行う。
     public func onPromptJump(target: PromptJumpTarget?) {
-        Task { @MainActor in
+        onMain {
             self.uiState.promptJumpResult = PromptJumpResult(target: target, seq: self.uiState.promptJumpResult.seq &+ 1)
         }
     }
 
     public func onPromptOutputCopyReady(text: String?) {
-        Task { @MainActor in
+        onMain {
             self.uiState.promptOutputCopyResult = PromptOutputCopyResult(text: text, seq: self.uiState.promptOutputCopyResult.seq &+ 1)
         }
     }
