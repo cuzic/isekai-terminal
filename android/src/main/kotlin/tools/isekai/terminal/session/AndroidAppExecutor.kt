@@ -75,6 +75,10 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
 
     override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         terminalService?.updateSessionsSummary(connectedCount, totalCount)
+        // AND-M2: 最後のタブが閉じられたらbindも解除する。BIND_AUTO_CREATEでbindした
+        // ままだと、サービス側で`stopSelf()`してもbound serviceとして生き残り破棄されない。
+        // 次に[ensureServiceRunning]が呼ばれれば改めてbindし直す。
+        if (totalCount <= 0) release()
     }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
@@ -180,6 +184,9 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
             try { app.unbindService(serviceConnection) } catch (_: Exception) {}
             isServiceBound = false
         }
+        // 自発的なunbindでは`onServiceDisconnected`が呼ばれないため、ここで参照を捨てる
+        // (再bindされるまでの通知更新は無視される)。
+        terminalService = null
     }
 
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {
