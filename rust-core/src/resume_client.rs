@@ -113,6 +113,10 @@ pub(crate) struct ClientResumeState {
     /// control stream 確立時に helper が発行した session_id。
     /// Phase 8-3（reattach ハンドシェイク）で `RESUME` フレームに使う。
     pub(crate) session_id: Option<SessionId>,
+    /// APP_ACK橋渡しタスク(`isekai_pipe_quic_transport::spawn_app_ack_bridge`)の世代。
+    /// 新しいbridgeを立てるたびに進め、古いbridgeは自分の世代と一致しなくなったら
+    /// 終了する(RC-14: 以前はresumeのたびに終了しないbridgeが1本ずつ増えていた)。
+    pub(crate) ack_bridge_generation: u64,
 }
 
 impl ClientResumeState {
@@ -121,6 +125,7 @@ impl ClientResumeState {
             replay_buffer: ReplayBuffer::new(capacity),
             client_delivered_offset: 0,
             session_id: None,
+            ack_bridge_generation: 0,
         }
     }
 }
@@ -652,6 +657,7 @@ mod tests {
             replay_buffer: ReplayBuffer::new(1 << 20),
             client_delivered_offset: 0,
             session_id: Some([7u8; 16]),
+            ack_bridge_generation: 0,
         }))
     }
 
@@ -881,6 +887,7 @@ mod tests {
             replay_buffer: ReplayBuffer::new(4),
             client_delivered_offset: 0,
             session_id: Some([7u8; 16]),
+            ack_bridge_generation: 0,
         }));
         let mut stream = ReattachableStream::new(read1, write1, resume_state, reattach_fn);
         stream.write_all(b"abcdefgh").await.unwrap();

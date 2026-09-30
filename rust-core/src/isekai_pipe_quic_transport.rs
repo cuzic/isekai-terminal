@@ -545,25 +545,56 @@ pub(crate) async fn finish_quic_stream(
 /// 既に使っている`ClientResumeState`ベースのreplay/offset管理と直接には
 /// つながらない — 200ms間隔(APP_ACK自体の送信間隔と同じ)でどちらの方向も
 /// 同期する(isekai-terminal-core/isekai-transport crate共有化 Phase 1c)。
+///
+/// RC-14(2026-09-29 コードレビュー): 以前は終了条件の無い`loop`で、セッション終了後も
+/// `ClientResumeState`(最大4MiBのreplay buffer)を握り続け、resumeのたびに新しい
+/// bridgeが1本ずつ増えていた。現在は(1)`ClientResumeState`を`Weak`で持ち、
+/// `ReattachableStream`(pumpタスクとreattach_fn)が破棄されたら終了し、
+/// (2)`ack_bridge_generation`で世代を持ち、resume後に新しいbridgeが立ったら
+/// 古いbridgeは終了する。
 pub(crate) fn spawn_app_ack_bridge(
     resume_state: Arc<std::sync::Mutex<ClientResumeState>>,
     counters: Arc<isekai_transport::resume::AppAckCounters>,
 ) {
+    let my_generation = {
+        let mut st = resume_state.lock().unwrap();
+        st.ack_bridge_generation = st.ack_bridge_generation.wrapping_add(1);
+        st.ack_bridge_generation
+    };
+    let resume_state = Arc::downgrade(&resume_state);
     RUNTIME.spawn(async move {
         let mut last_delivered_synced = 0u64;
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let current_delivered = {
-                let mut st = resume_state.lock().unwrap();
-                st.replay_buffer.advance_start(counters.c2h_helper_committed_offset());
-                st.client_delivered_offset
-            };
-            if current_delivered > last_delivered_synced {
-                counters.advance_h2c_client_delivered_offset(current_delivered - last_delivered_synced);
-                last_delivered_synced = current_delivered;
+            if !sync_app_ack_once(&resume_state, &counters, my_generation, &mut last_delivered_synced) {
+                return;
             }
         }
     });
+}
+
+/// [spawn_app_ack_bridge]の1周期分。bridgeを続けるべきなら`true`、終了すべき
+/// (`ClientResumeState`が既に破棄された・新しいbridgeに置き換わった)なら`false`。
+fn sync_app_ack_once(
+    resume_state: &std::sync::Weak<std::sync::Mutex<ClientResumeState>>,
+    counters: &isekai_transport::resume::AppAckCounters,
+    my_generation: u64,
+    last_delivered_synced: &mut u64,
+) -> bool {
+    let Some(resume_state) = resume_state.upgrade() else { return false };
+    let current_delivered = {
+        let mut st = resume_state.lock().unwrap();
+        if st.ack_bridge_generation != my_generation {
+            return false;
+        }
+        st.replay_buffer.advance_start(counters.c2h_helper_committed_offset());
+        st.client_delivered_offset
+    };
+    if current_delivered > *last_delivered_synced {
+        counters.advance_h2c_client_delivered_offset(current_delivered - *last_delivered_synced);
+        *last_delivered_synced = current_delivered;
+    }
+    true
 }
 
 /// RESUME成功後に`conn`(reconnect_and_resumeが返した新しいconnection)上で
@@ -804,6 +835,31 @@ mod tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
         fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    /// RC-14: APP_ACK bridgeは`ClientResumeState`が破棄されたら、また新しいbridgeに
+    /// 置き換えられたら終了すること(以前は終了条件が無くリークしていた)。
+    #[test]
+    fn app_ack_bridge_stops_when_state_dropped_or_superseded() {
+        let state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(1024)));
+        state.lock().unwrap().replay_buffer.append(b"0123456789");
+        let counters = isekai_transport::resume::AppAckCounters::new();
+        counters.set_c2h_helper_committed_offset(4);
+        let weak = Arc::downgrade(&state);
+        let mut last = 0u64;
+
+        state.lock().unwrap().ack_bridge_generation = 1;
+        assert!(sync_app_ack_once(&weak, &counters, 1, &mut last), "current bridge keeps running");
+        assert_eq!(state.lock().unwrap().replay_buffer.replay_from(4).unwrap(), b"456789");
+
+        // resume後に新しいbridgeが立った → 古い世代は終了する。
+        state.lock().unwrap().ack_bridge_generation = 2;
+        assert!(!sync_app_ack_once(&weak, &counters, 1, &mut last), "superseded bridge must stop");
+        assert!(sync_app_ack_once(&weak, &counters, 2, &mut last));
+
+        // セッション(ReattachableStream)が破棄された → 終了する。
+        drop(state);
+        assert!(!sync_app_ack_once(&weak, &counters, 2, &mut last), "bridge must stop once the state is dropped");
     }
 
     /// 既知ホストと異なる鍵(ホスト鍵変更/MITMシナリオ)を返した場合、ブートストラップ

@@ -36,7 +36,7 @@
   - 方針: bracketed paste時は本文中のESC(0x1B)を除去する(xterm等と同様)。
 - [ ] **RC-13** Medium — `orchestrator.rs:913` / `session.rs:1172-1178` — 生きている旧sessionをdisconnectせずに差し替え(旧接続・フォワード残存)、`session_cmd_rx`クローズ後に`select!`がbusy-spin。
   - 方針: `build_and_store_session`で旧sessionを取り出してdisconnectする。`session_cmd_rx`がNoneを返したらそのアームを以後無効化する。
-- [ ] **RC-14** Medium — `isekai_pipe_quic_transport.rs:548-567` — `spawn_app_ack_bridge`が無限ループ(resumeごとに追加、4MiB replay bufferを保持し続ける)。
+- [x] **RC-14** Medium — `isekai_pipe_quic_transport.rs:548-567` — `spawn_app_ack_bridge`が無限ループ(resumeごとに追加、4MiB replay bufferを保持し続ける)。
   - 方針: `Weak`で`ClientResumeState`を持ち、strong参照が消えたら終了。さらにbridge世代番号を持たせ、resume後に新しいbridgeが立ったら古いbridgeは終了する。
 - [ ] **RC-15** Medium — `rebind_driver.rs:101-111` — ループタスクが自身の`input_tx`クローンを保持しており`input_rx.recv()`がNoneにならず終了しない → Endpoint/UDP fdリーク。
   - 方針: ループへ渡す送信端を`WeakSender`にする(必要時のみupgrade)。
