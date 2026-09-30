@@ -67,7 +67,7 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-M17** Medium `local-ipc-mux/src/windows_named_pipe.rs:218-241`(+ `isekai-ssh/src/native/mux/naming.rs`) — 接続先 named pipe サーバーの所有者を検証しないため、別ユーザーに成りすまされる(isekai-ssh レビューの C4 と重複)。
   - 方針: `connect()` で `GetNamedPipeServerProcessId`→`OpenProcessToken`→`TokenUser` の SID が自プロセスの SID と一致することを検証し、不一致なら拒否する。
     名前への SID 付与(naming.rs)は fix-isekai-ssh の担当(連絡済み)。
-- [ ] **TR-M18** Medium `openssh-config/src/lib.rs:428-437` — `Match host` を元の destination で判定している(OpenSSH はそれまでに設定された HostName で判定する)。`Match user` は User 未設定時に false になる(OpenSSH はローカルユーザー名で判定する)。
+- [x] **TR-M18** Medium `openssh-config/src/lib.rs:428-437` — `Match host` を元の destination で判定している(OpenSSH はそれまでに設定された HostName で判定する)。`Match user` は User 未設定時に false になる(OpenSSH はローカルユーザー名で判定する)。
   - 方針: 評価時点の HostName(未設定なら destination)で判定する。`originalhost` を追加する。User 未設定時はローカルユーザー名を使う。
 
 ## Low
@@ -113,8 +113,8 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L26b** `isekai-netmon/src/linux.rs:186-192` — Drop で同期 join する(最大 250ms) → 維持するか、detach にするかを検討する。
 - [x] **TR-L26c** `isekai-netmon/src/linux.rs:86` — socket に CLOEXEC が無い → SOCK_CLOEXEC を付ける。
 - [x] **TR-L26d** `isekai-netmon/src/linux.rs:141-154` — EAGAIN 以外のエラーでも即座にリトライし、busy loop になる → バックオフする。致命的なエラーでは終了する。
-- [ ] **TR-L27a** `openssh-config/src/lib.rs:190-241` — `%` トークンを展開しない → HostName 等の基本トークン(%h %p %r %u %n %%)を展開する。
-- [ ] **TR-L27b** `openssh-config/src/lib.rs:492-548` — Host 照合が大文字小文字を区別する → 区別しないようにする。
+- [x] **TR-L27a** `openssh-config/src/lib.rs:190-241` — `%` トークンを展開しない → HostName 等の基本トークン(%h %p %r %u %n %%)を展開する。
+- [x] **TR-L27b** `openssh-config/src/lib.rs:492-548` — Host 照合が大文字小文字を区別する → 区別しないようにする。
 - [x] **TR-L28** `local-ipc-mux/src/framing.rs:35-58` — read_frame がキャンセル非安全であることが doc に無い → 追記する。
 - [ ] **TR-L29a** `russh-stream-session/src/lib.rs:386,393,402-410` — connect/handshake にタイムアウトが無い → タイムアウトを付ける。
 - [ ] **TR-L29b** `russh-stream-session/src/lib.rs:572-576` — keyboard-interactive の回答をゼロ化しない → zeroize する。
