@@ -58,7 +58,7 @@ openssh-config / osc-color(quicsock は vendored)。
   - 方針: `isekai_fs_guard::with_exclusive_lock` で load→refresh→save を囲み、ロック取得後に再読込する。
 - [ ] **TR-M13** Medium `isekai-auth/src/oauth.rs:57-64` — ureq 3 の既定タイムアウトはすべて None。
   - 方針: `timeout_global`(30 秒)を設定する。`isekai-ssh/src/wrapper.rs:1527` の `spawn_blocking` 化は fix-isekai-ssh の担当(連絡済み)。
-- [ ] **TR-M14** Medium `isekai-trust/src/host_key_verifier.rs:145-150,176-181` / `store.rs:133-135` — 既知ホストが一致しても毎回書き込み、`last_seen_at` の保存に失敗すると Rejected になる。
+- [x] **TR-M14** Medium `isekai-trust/src/host_key_verifier.rs:145-150,176-181` / `store.rs:133-135` — 既知ホストが一致しても毎回書き込み、`last_seen_at` の保存に失敗すると Rejected になる。
   - 方針: 既知一致時の更新は best-effort にし、失敗しても Accepted を返して警告ログのみ出す(always-connects.md)。
 - [ ] **TR-M15** Medium `isekai-protocol/src/bootstrap.rs:178-185` — helper アップロードの一時ファイル名が固定(`isekai-pipe.tmp`)で、並行 bootstrap で壊れたバイナリが mv されうる。
   - 方針: 一時ファイル名を `.tmp.$$` で一意にし、失敗時は削除する。
