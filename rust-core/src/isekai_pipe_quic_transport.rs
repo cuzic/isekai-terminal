@@ -241,19 +241,26 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 ) {
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(fp, reply) = ev {
-                let accepted = match &callback {
-                    Some(cb) => {
-                        let cb = Arc::clone(cb);
-                        tokio::task::spawn_blocking(move || cb.on_host_key(fp)).await.unwrap_or(false)
-                    }
-                    None => {
-                        warn!("bootstrap host key check: no session callback available, rejecting for safety");
-                        false
-                    }
-                };
-                let _ = reply.send(accepted);
-            }
+            // RC-07: 踏み台経由のbootstrapでは踏み台自身の鍵(`JumpHostKey`)も届く。
+            // 踏み台の`host:port`で検証させる(targetの識別子で検証・pinしない)。
+            let (check, reply): (Box<dyn FnOnce(&dyn SessionCallback) -> bool + Send>, _) = match ev {
+                TransportEvent::HostKey(fp, reply) => (Box::new(move |cb: &dyn SessionCallback| cb.on_host_key(fp)), reply),
+                TransportEvent::JumpHostKey { host, port, fingerprint, reply } => {
+                    (Box::new(move |cb: &dyn SessionCallback| cb.on_jump_host_key(host, port, fingerprint)), reply)
+                }
+                _ => continue,
+            };
+            let accepted = match &callback {
+                Some(cb) => {
+                    let cb = Arc::clone(cb);
+                    tokio::task::spawn_blocking(move || check(cb.as_ref())).await.unwrap_or(false)
+                }
+                None => {
+                    warn!("bootstrap host key check: no session callback available, rejecting for safety");
+                    false
+                }
+            };
+            let _ = reply.send(accepted);
         }
     });
 }
