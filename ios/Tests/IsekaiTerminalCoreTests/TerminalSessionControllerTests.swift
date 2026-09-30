@@ -21,6 +21,19 @@ final class TerminalSessionControllerTests: XCTestCase {
         return (controller, trustStore)
     }
 
+    /// 2026-09-29レビューIOS-I1: Rust側`SessionOrchestrator`がcallbackを強参照で保持しても、
+    /// 弱参照プロキシ経由なので、controllerへの参照が無くなれば解放される
+    /// (以前は循環参照でタブを閉じても認証情報ごと生き残っていた)。
+    func testControllerIsReleasedWhenNoLongerReferenced() throws {
+        weak var weakController: TerminalSessionController?
+        do {
+            let (controller, _) = try makeController()
+            weakController = controller
+            XCTAssertNotNil(weakController)
+        }
+        XCTAssertNil(weakController)
+    }
+
     func testFirstConnectionShowsPromptAndRejectsUntilTrusted() async throws {
         let (controller, trustStore) = try makeController()
 

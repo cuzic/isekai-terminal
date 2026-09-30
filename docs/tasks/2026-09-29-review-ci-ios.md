@@ -131,10 +131,14 @@
 
 ## iOS(Swift)
 
-- [ ] **IOS-I1** (Medium) `ios/Sources/IsekaiTerminalCore/TerminalSessionController.swift:174,233,237`
+- [x] **IOS-I1** (Medium) `ios/Sources/IsekaiTerminalCore/TerminalSessionController.swift:174,233,237`
   - 要約: Controller → orchestrator(強参照)→ callback(Controller)の循環参照により、タブを閉じても deinit されない。
     認証情報・scrollback・NWPathMonitor が生き残る。
   - 修正方針: orchestrator には弱参照プロキシ(`WeakOrchestratorCallback`)を渡す。deinit で `orchestrator.disconnect()` と monitor の cancel を行う。
+  - 対応: `WeakOrchestratorCallback`(全19コールバックを weak target へ転送し、target が無ければ false/nil を返す)を `createSessionOrchestrator` に渡すようにした。
+    deinit で monitor を cancel し、`orchestrator.disconnect()` は Rust のロックと競合しないよう別スレッドで呼ぶ(closeTab を経由しない解放でも Rust 側のセッションを残さない)。
+    テスト `testControllerIsReleasedWhenNoLongerReferenced` を追加。
+    注意: `OrchestratorCallback` にメソッドが増えた場合は、プロキシにも転送メソッドを足す必要がある(足さないとコンパイルエラーになるので気付ける)。
 - [x] **IOS-I2** (Medium) `ios/Sources/IsekaiTerminalCoreLogic/SshHostTrustStore.swift:47,61,73`
   - 要約: `records` に同期がなく、Rust スレッドと main から同時に読み書きされる。`trust` は save 失敗時にメモリだけ更新されたまま残る。
   - 修正方針: `NSLock` で保護する。save 成功後にだけメモリへ反映する。Linux テストを追加。
