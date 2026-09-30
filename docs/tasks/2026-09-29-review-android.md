@@ -97,7 +97,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 
 ## Low
 
-- [ ] **AND-L1** (Low) `TerminalTabsViewModel.kt:233-247` / `RemoteClipboardPolicy.kt:28-29` /
+- [x] **AND-L1** (Low) `TerminalTabsViewModel.kt:233-247` / `RemoteClipboardPolicy.kt:28-29` /
   `RemoteClipboardImagePolicy.kt` — クリップボードpull/write callbackの例外・OOMがUniFFI callback
   境界へ漏れる。4000万画素までフルデコードを許す。
   - 方針: `RemoteClipboardPolicy`で例外/OOMを捕捉してnull/no-opに落とす。画像はinSampleSizeで
