@@ -30,7 +30,7 @@
 - [-] **SSH-06** Medium `isekai-trust/src/host_key_verifier.rs:145-149` — `last_seen_at` の保存失敗で Rejected になる。**transport 担当に委譲**(isekai-trust は担当外)。
 - [~] **SSH-07** Medium `wrapper.rs:1525-1556` / `init.rs:54-67` — `init` で作った profile(relay/--via/STUN)をサイレント復旧で再現できない。
   - 見送り理由: 修正には launch topology(relay addr/SNI/transport/via)を `PersistentProfile`(`isekai-pipe-core/src/profile.rs`、担当外)へ永続化する schema 変更が必要。`cached_relay_addr` は direct/relay 共用のフィールドで、今の schema では route 種別を区別できない。isekai-pipe 担当/設計判断に回す。
-- [ ] **SSH-08** Medium `wrapper.rs:537-544`
+- [x] **SSH-08** Medium `wrapper.rs:537-544`
   - 要約: 破損/読めない profile が first-contact の `[y/N]` プロンプトに落ち、パイプ入力を食う。
   - 方針: profile ファイルが存在する(読めない/壊れている/transport がない)場合は `TofuConfirmation::Silent` で再 bootstrap する。`Ok(None)`(本当に未登録)のときだけ呼び出し元の tofu を使う。
 - [~] **SSH-09** Medium `native/console_stdin.rs:139-154,404-439` — Windows の常駐 stdin リーダーがパスフレーズ/TOFU 入力を横取りしうる。
