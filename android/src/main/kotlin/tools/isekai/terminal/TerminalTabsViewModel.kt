@@ -39,6 +39,7 @@ import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.RebindFdSource
 import tools.isekai.terminal.session.TerminalSession
+import tools.isekai.terminal.session.TrzszUploadPump
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
@@ -1147,18 +1148,18 @@ class TerminalTabsViewModel(
             try {
                 val file = executor.openUploadFile(uri) ?: return@launch
                 pane.session.trzszAcceptUpload(file.name, file.size.toULong(), 0u)
-                file.stream.use { inp ->
-                    val buf = ByteArray(64 * 1024)
-                    var pending: ByteArray? = null
-                    while (true) {
-                        val n = inp.read(buf)
-                        if (n == -1) {
-                            pane.session.trzszSendChunk(pending ?: ByteArray(0), true)
-                            break
-                        }
-                        pending?.let { pane.session.trzszSendChunk(it, false) }
-                        pending = buf.copyOf(n)
-                    }
+                // AND-M1a: ack済みバイト数(Rust報告)に対する先行送信量を制限し、転送が
+                // 終了/キャンセルされたら読み出しを止める([TrzszUploadPump]参照)。
+                val result = file.stream.use { inp ->
+                    TrzszUploadPump.pump(
+                        input = inp,
+                        trzszState = pane.session.state.map { it.trzszState },
+                        sendChunk = { data, isLast -> pane.session.trzszSendChunk(data, isLast) },
+                    )
+                }
+                if (result == TrzszUploadPump.Result.TIMED_OUT) {
+                    RemoteLogger.w("TrzszUpload", "no ack progress, cancelling upload")
+                    pane.session.trzszCancel()
                 }
             } catch (e: Exception) {
                 RemoteLogger.e("TrzszUpload", "exception: $e")
