@@ -185,21 +185,15 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                     return Err(ExitCode::from(EX_USAGE));
                 }
             }
-            "--once" => helper_args.push(arg),
-            "--bind"
-            | "--idle-timeout"
-            | "--resume-window"
-            | "--resume-buffer-size"
-            | "--max-idle-lifetime"
-            | "--max-sessions"
-            | "--stun-server"
-            | "--punch-peer"
-            | "--relay"
-            | "--relay-sni"
-            | "--relay-jwt"
-            | "--relay-jwt-file"
-            | "--bootstrap-request-file"
-            | "--log-level" => {
+            // The forwarded-option lists live in the engine itself (the one
+            // place that actually parses them) — this used to be a separate,
+            // hand-maintained allow-list here that silently fell behind the
+            // engine (`--bind-port-range`/`--relay-transport` were rejected
+            // as "unsupported option" although the engine implemented both
+            // and `isekai-bootstrap` generates them), making every bootstrap
+            // that used either flag fail permanently.
+            flag if engine::SERVE_FORWARDED_FLAG_OPTIONS.contains(&flag) => helper_args.push(arg),
+            opt if engine::SERVE_FORWARDED_VALUE_OPTIONS.contains(&opt) => {
                 let value = connect::next_arg("serve", &mut iter, &arg).map_err(connect::usage_err)?;
                 helper_args.push(arg);
                 helper_args.push(value);
@@ -285,6 +279,54 @@ mod tests {
             ServiceSpec::ssh_target("127.0.0.1:2222").unwrap()
         );
         assert!(launch.helper_args.is_empty());
+    }
+
+    /// Runs `argv` through the exact two stages the real `serve` subcommand
+    /// does (`parse_serve`, then the engine's own parser on the forwarded
+    /// args + the `--service-name`/`--target` `serve_command` appends) —
+    /// i.e. "would a real `isekai-pipe serve` accept this command line".
+    fn serve_and_engine_accept(argv: &str) {
+        let launch = parse_serve(argv.split_whitespace().map(str::to_string))
+            .unwrap_or_else(|_| panic!("parse_serve rejected {argv:?}"))
+            .expect("not a --help invocation");
+        let mut helper_args = launch.helper_args;
+        helper_args.push("--service-name".to_string());
+        helper_args.push(launch.service.name().as_str().to_string());
+        helper_args.push("--target".to_string());
+        helper_args.push(launch.service.target().to_string());
+        if let Err(e) = engine::parse_args_from(helper_args) {
+            panic!("engine rejected the args parse_serve forwarded for {argv:?}: {e:#}");
+        }
+    }
+
+    /// Regression (review 2026-09-29, PIPE-01): same shape as
+    /// `isekai-bootstrap::install_script`'s `LaunchSpec::Direct` launch args
+    /// with both `#@isekai stun` and `#@isekai remote-bind-port-range` set.
+    /// `parse_serve` used to reject `--bind-port-range` outright, so every
+    /// such bootstrap (and every silent re-deploy after it) failed.
+    #[test]
+    fn serve_accepts_bootstrap_direct_launch_args_with_port_range_and_stun() {
+        serve_and_engine_accept(
+            "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file /tmp/x/bootstrap-request.json \
+             --stun-server 198.51.100.1:3478 --bind-port-range 40000-40100 --max-idle-lifetime 600 \
+             --resume-window 864000 --log-level info",
+        );
+    }
+
+    /// Regression (PIPE-01): `LaunchSpec::Relay` with `relay_transport =
+    /// Qmux` — `parse_serve` used to reject `--relay-transport`.
+    #[test]
+    fn serve_accepts_bootstrap_relay_launch_args_with_qmux_transport() {
+        serve_and_engine_accept(
+            "--target 127.0.0.1:22 --relay 203.0.113.1:4433 --relay-sni relay.test \
+             --relay-jwt-file /tmp/x/relay_jwt --bootstrap-request-file /tmp/x/bootstrap-request.json \
+             --relay-transport qmux --max-idle-lifetime 600 --resume-window 864000 --log-level info",
+        );
+    }
+
+    #[test]
+    fn serve_still_rejects_genuinely_unknown_options() {
+        assert!(parse_serve(["--target", "127.0.0.1:22", "--no-such-flag"].into_iter().map(str::to_string)).is_err());
     }
 
     #[test]
