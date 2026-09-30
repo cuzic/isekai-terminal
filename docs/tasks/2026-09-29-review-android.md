@@ -102,9 +102,10 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   境界へ漏れる。4000万画素までフルデコードを許す。
   - 方針: `RemoteClipboardPolicy`で例外/OOMを捕捉してnull/no-opに落とす。画像はinSampleSizeで
     縮小デコードする。
-- [ ] **AND-L2** (Low) `session/TerminalSession.kt:363-381` — agent署名要求の同時到着で、1件目の
+- [x] **AND-L2** (Low) `session/TerminalSession.kt:363-381` — agent署名要求の同時到着で、1件目の
   `finally { set(null) }`が2件目のdeferredを消す。
   - 方針: `compareAndSet(deferred, null)`にし、表示中fingerprintも自分の分だけ消す。
+    加えて、UIは1件しか出せず応答不能になった先行分は即座に拒否で返す(従来も25秒後にサイレント拒否だった)。
 - [ ] **AND-L3** (Low) `KeyManager.kt:13` / `KeystoreKek.kt:74` — `KeyEntry.kekAlias`に実際とは違う
   エイリアス(`tssh_kek_v2`)が記録される。エントリ欠落時に意味の薄いTypeCastException。
   - 方針: `KeyManager.KEK_ALIAS`を`KeystoreKek`の実エイリアスに揃え、`loadKey`は欠落時に
@@ -116,13 +117,13 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
 - [ ] **AND-L5** (Low) `AndroidManifest.xml` — `dataExtractionRules`が無くAndroid 12+のD2D転送が
   止まらない(Keystoreは移らないので暗号化鍵ファイルが復号不能なゴミになる)。
   - 方針: 全ドメインを除外する`data_extraction_rules.xml`を追加。
-- [ ] **AND-L6** (Low) `session/TerminalSession.kt:584-606` — host key信頼の書き込みが非同期で、
+- [x] **AND-L6** (Low) `session/TerminalSession.kt:584-606` — host key信頼の書き込みが非同期で、
   直後の再接続がDB反映前にcheckして再プロンプトになりうる。
   - 方針: 書き込みJobを保持し、`onHostKey`(Rustのblockingスレッド)で完了を待ってからcheckする。
 - [ ] **AND-L7** (Low) `TerminalSessionService.kt:78-80,102-106` / `session/AndroidAppExecutor.kt` —
   FGS起動(`startService`/`startForeground`)の例外未捕捉。
   - 方針: 両方をtry/catchしてログに落とす(`startForeground`失敗時は`stopSelf`)。
-- [ ] **AND-L8** (Low) `session/TerminalSession.kt:680-686` — `appendLog`がチャンク境界でUTF-8を
+- [x] **AND-L8** (Low) `session/TerminalSession.kt:680-686` — `appendLog`がチャンク境界でUTF-8を
   分断して化ける。受信ごとに最大200KBの文字列を再構築(O(n))。
   - 方針: ストリーミング`CharsetDecoder`で境界をまたぐマルチバイトを保持し、`StringBuilder`へ
     追記(トリムは閾値超過時のみ)。ログは要求時にスナップショットを返す。
