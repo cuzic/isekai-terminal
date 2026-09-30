@@ -145,13 +145,17 @@
   - 修正方針: 重複は後勝ちで読み込む。破損時はファイルを退避して空で開く `openRecoveringCorruption` を追加し、AppServices から使う。
   - 対応: load を `uniquingKeysWith`(後勝ち)に変更。`openRecoveringCorruption` を追加し(壊れたファイルを `.corrupt-<unix秒>` へ退避して空で開く)、AppServices はこれを使ってログを出すようにした。
     重複 identifier・破損ファイルの Linux テストを追加。
-- [ ] **IOS-I4** (Medium) `ios/Sources/IsekaiTerminalCore/CredentialVault.swift:80-84`
+- [x] **IOS-I4** (Medium) `ios/Sources/IsekaiTerminalCore/CredentialVault.swift:80-84`
   - 要約: `rotateKey` が旧 KEK を削除してから store するため、失敗すると秘密鍵を永久に失う。
   - 修正方針: 新 KEK で封緘した blob を一時ファイルへ書く → Keychain を `SecItemUpdate` で差し替える → blob を置き換える、の順にする。
     失敗時は旧 KEK/旧 blob を残し、途中で失敗した場合は Keychain を旧 KEK に戻す。
-- [ ] **IOS-I5** (Low-Medium) `CredentialVault.swift:49,158`, `RelayCredentialVault.swift:20,27`
+  - 対応: 手順を「新 KEK で封緘した blob をステージングファイルへ書く → `SecItemUpdate`(新設の `KeychainKEKStore.replaceKey`)で KEK を差し替える → `replaceItemAt` で blob を置き換え、失敗したら KEK を旧値に戻す」に変更した。
+    App テスト `testRotateKeyFailureKeepsSecretRetrievable`(ディレクトリを読み取り専用にしてローテーションを失敗させても復号できること)を追加。
+- [x] **IOS-I5** (Low-Medium) `CredentialVault.swift:49,158`, `RelayCredentialVault.swift:20,27`
   - 要約: Keychain の読み出しエラー(端末ロック中など)を「鍵なし」とみなして KEK を作り直す。
   - 修正方針: `getOrCreateKey` で新規作成するのは `errSecItemNotFound` のときだけにし、それ以外のエラーは伝播する。
+  - 対応: `getOrCreateKey` が新規作成するのは `keychainError(errSecItemNotFound)` のときだけにし、`deviceLocked` などのエラーはそのまま伝播するようにした(`CredentialVault.store` と `RelayCredentialVault.encrypt` の両方に効く)。
+    Keychain の一時エラーはシミュレータで再現できないため、自動テストはない。
 - [ ] **IOS-I6** (Medium) `ios/Sources/IsekaiTerminalCore/TerminalTabsHostView.swift:83-85`
   - 要約: `beginBackgroundTask` の expirationHandler が非同期に `endBackgroundTask` している。
   - 修正方針: handler(main thread で呼ばれる)内で `MainActor.assumeIsolated` を使い、同期的に終了処理を行う。
