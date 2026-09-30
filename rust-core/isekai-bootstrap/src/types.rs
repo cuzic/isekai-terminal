@@ -223,3 +223,25 @@ pub enum LaunchSpec {
         resume_window_secs: u64,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SSH-42 regression: the relay bearer token never appears in `{:?}`.
+    #[test]
+    fn relay_launch_spec_debug_redacts_the_jwt() {
+        let spec = RelayLaunchSpec {
+            relay_addr: "203.0.113.10:443".parse().unwrap(),
+            relay_sni: "relay.example.com".to_string(),
+            relay_jwt: "eyJ-super-secret-token".to_string(),
+            relay_transport: RelayTransportKind::Udp,
+            idle_lifetime_secs: 60,
+            remote_log_level: "info".to_string(),
+            resume_window_secs: 180,
+        };
+        let rendered = format!("{spec:?} {:?}", LaunchSpec::Relay(spec.clone()));
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("relay.example.com") && rendered.contains("<redacted>"), "{rendered}");
+    }
+}
