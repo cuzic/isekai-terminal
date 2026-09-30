@@ -1276,12 +1276,58 @@ async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
     resolved
 }
 
+/// Resolves the direct-launch helper address (`direct-by-bootstrap-host`) to
+/// a concrete [`SocketAddr`] at bootstrap time, so what gets cached as
+/// `helper_addr` is always something `isekai-pipe connect` can parse.
+///
+/// Every consumer of the cached address (`isekai-transport`'s candidate
+/// parsing, `isekai-pipe connect`) only ever does `str::parse::<SocketAddr>()`
+/// — no DNS resolution. Caching the raw `ssh -G` `HostName` verbatim
+/// (`format!("{host}:{port}")`) therefore made a DNS-named host (or an
+/// unbracketed IPv6 literal, `2001:db8::1:4433`) fail to parse on *every*
+/// connect: always `Unreachable`, and the silent re-bootstrap wrote the same
+/// unparseable string straight back — a permanent failure loop, exactly
+/// what `.claude/rules/always-connects.md` forbids (review 2026-09-29,
+/// SSH-01). Re-resolving on every re-bootstrap also means a host whose
+/// address later changes (DHCP, a moved VM) heals itself the next time the
+/// stale cached address fails.
+///
+/// A DNS failure is classified [`BootstrapFailure::JumpHostUnreachable`]
+/// (retryable): it is a transient-connectivity-shaped failure, not a
+/// trust/config one.
+async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    // A `bootstrap-candidate target=[v6]:22` directive keeps its brackets
+    // through `rsplit_once(':')`; `ssh -G`'s own `hostname` never has them.
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    match tokio::time::timeout(STUN_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
+        Ok(Ok(mut addrs)) => addrs.next().ok_or_else(|| {
+            anyhow!("isekai-ssh: DNS lookup for the bootstrap host {bare:?} returned no addresses")
+                .context(BootstrapFailure::JumpHostUnreachable)
+        }),
+        Ok(Err(e)) => Err(anyhow::Error::new(e)
+            .context(format!("isekai-ssh: could not resolve the bootstrap host {bare:?} for the direct helper address"))
+            .context(BootstrapFailure::JumpHostUnreachable)),
+        Err(_) => Err(anyhow!(
+            "isekai-ssh: DNS lookup for the bootstrap host {bare:?} timed out after {STUN_DNS_LOOKUP_TIMEOUT:?}"
+        )
+        .context(BootstrapFailure::JumpHostUnreachable)),
+    }
+}
+
+/// Picks the bootstrap candidate to deploy through: highest `priority`, and
+/// — among equal priorities — the **first** one listed (first-match-wins,
+/// the same convention `ssh_config(5)` itself uses). `Iterator::max_by_key`
+/// alone returns the *last* of several equal maxima, the opposite of that
+/// convention (review 2026-09-29, SSH-25), hence the `rev()`.
+fn select_bootstrap_candidate(candidates: &[BootstrapCandidate]) -> Option<&BootstrapCandidate> {
+    candidates.iter().rev().max_by_key(|candidate| candidate.priority)
+}
+
 pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
-    let candidate = resolution
-        .isekai
-        .bootstrap_candidates
-        .iter()
-        .max_by_key(|candidate| candidate.priority)
+    let candidate = select_bootstrap_candidate(&resolution.isekai.bootstrap_candidates)
         .ok_or_else(|| anyhow!("no bootstrap candidates were resolved"))?;
 
     let (host, port) = candidate
@@ -1451,7 +1497,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             let direct_port = handshake
                 .direct_by_bootstrap_host_port()
                 .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
-            format!("{host}:{direct_port}")
+            resolve_direct_helper_addr(host, direct_port).await?.to_string()
         }
     };
 
@@ -2439,6 +2485,51 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// SSH-01 regression: the cached direct helper address must always be
+    /// something `str::parse::<SocketAddr>()` accepts — an unbracketed IPv6
+    /// `HostName` used to be cached as `2001:db8::1:4433` (unparseable).
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_brackets_ipv6_and_keeps_ipv4_literals() {
+        let v6 = resolve_direct_helper_addr("2001:db8::1", 4433).await.unwrap().to_string();
+        assert_eq!(v6, "[2001:db8::1]:4433");
+        assert!(v6.parse::<SocketAddr>().is_ok());
+        let bracketed = resolve_direct_helper_addr("[2001:db8::2]", 4433).await.unwrap().to_string();
+        assert_eq!(bracketed, "[2001:db8::2]:4433");
+        assert_eq!(resolve_direct_helper_addr("192.0.2.7", 4433).await.unwrap().to_string(), "192.0.2.7:4433");
+    }
+
+    /// SSH-01 regression: a DNS-named `HostName` is resolved at bootstrap
+    /// time rather than cached verbatim (which `isekai-pipe connect` could
+    /// never parse, failing every single connect forever).
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_resolves_a_dns_name_to_a_socket_addr() {
+        let addr = resolve_direct_helper_addr("localhost", 4433).await.unwrap();
+        assert!(addr.ip().is_loopback(), "localhost should resolve to a loopback address, got {addr}");
+        assert_eq!(addr.port(), 4433);
+        assert!(addr.to_string().parse::<SocketAddr>().is_ok());
+    }
+
+    /// SSH-01: an unresolvable name is a retryable connectivity failure, not
+    /// a permanent one — the next silent re-bootstrap tries resolving again.
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_classifies_a_dns_failure_as_retryable() {
+        let err = resolve_direct_helper_addr("isekai-ssh-test-host.invalid", 4433).await.unwrap_err();
+        let failure = err.downcast_ref::<BootstrapFailure>().expect("DNS failure must carry a BootstrapFailure classification");
+        assert!(failure.may_retry(), "a DNS failure must be retryable, got {failure:?}");
+    }
+
+    /// SSH-25 regression: among equal priorities the *first* listed
+    /// candidate wins (`max_by_key` alone returns the last).
+    #[test]
+    fn select_bootstrap_candidate_prefers_the_first_of_equal_priorities() {
+        let candidate = |target: &str, priority: u32| BootstrapCandidate { target: target.to_string(), via: Vec::new(), priority, alias: None };
+        let candidates = vec![candidate("a:22", 100), candidate("b:22", 100), candidate("c:22", 50)];
+        assert_eq!(select_bootstrap_candidate(&candidates).unwrap().target, "a:22");
+        let candidates = vec![candidate("a:22", 10), candidate("b:22", 100), candidate("c:22", 100)];
+        assert_eq!(select_bootstrap_candidate(&candidates).unwrap().target, "b:22");
+        assert!(select_bootstrap_candidate(&[]).is_none());
     }
 
     #[test]
