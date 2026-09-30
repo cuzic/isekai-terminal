@@ -417,7 +417,11 @@ sha256_of() {{
     echo "isekai-pipe bootstrap: no sha256sum/shasum on remote, binary reuse detection permanently disabled (always re-uploading+relaunching)" >&2
   fi
 }}
-tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT
+sha_matches_or_unknown() {{
+  got_sha=$(sha256_of "$1")
+  [ -z "$got_sha" ] || [ "$got_sha" = "{expected_sha256}" ]
+}}
+tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT || exit 1
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
@@ -475,7 +479,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
-      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
+      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && sha_matches_or_unknown {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
     else
       head -c {encoded_len} > /dev/null
     fi
