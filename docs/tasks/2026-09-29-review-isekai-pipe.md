@@ -75,12 +75,12 @@
 
 - [x] **PIPE-12** (Low) `engine/mod.rs::handle_resume_stream` RESUME_ACK+replay書き込みにタイムアウト無し
   - 方針: `respond_resume_accepted` をタイムアウトで包み、超過時はreparkして終了。
-- [ ] **PIPE-13** (Low) `quicmux/src/resume.rs::decode_resume_request` 未認証で最大128KiBアロケーション/無期限滞留
+- [x] **PIPE-13** (Low) `quicmux/src/resume.rs::decode_resume_request` 未認証で最大128KiBアロケーション/無期限滞留
   - 方針: token/auth_blob長に上限を設けて早期拒否。呼び出し側(`handle_resume_stream`)でdecodeを `HELLO_TIMEOUT` で包む。
 - [x] **PIPE-14** (Low) `engine/mod.rs::release_slot_for` が「その時点の」leaseを解放する
   - 方針: `Session` にlease IDを刻み、evict/sweepはevictしたエントリのlease IDを返す。呼び出し側はそのleaseで
     `relay_ended`(lease一致検査あり)を呼ぶ。
-- [ ] **PIPE-15** (Low) `quicmux/src/resume.rs::ReplayBuffer::advance_start` が1バイトずつpop
+- [x] **PIPE-15** (Low) `quicmux/src/resume.rs::ReplayBuffer::advance_start` が1バイトずつpop
   - 方針: `drain(..k)` に置き換える。
 - [ ] **PIPE-16** (Low) `engine/mod.rs::resolve_relay_jwt` のゼロクリア不完全 / `--relay-jwt` 継続受理
   - 方針: `trimmed` の別Stringを作らず in-place で truncate して返す。`--relay-jwt`(argv露出)は後方互換のため
