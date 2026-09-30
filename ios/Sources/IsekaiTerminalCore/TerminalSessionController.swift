@@ -217,24 +217,36 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// Phase 1C(#14): `reconnect()`が最後に使ったcols/rowsで再接続できるように保持する。
     private var lastCols: UInt32 = 80
     private var lastRows: UInt32 = 24
-    /// Phase 1C(#25): 進行中のtrzsz転送のID/mode/表示名。`onTrzszRequest`で設定し、
-    /// `trzszDismiss()`でクリアする。Rustスレッド(callback)とUI操作スレッドの両方から
-    /// 触るため、単純な代入のみで完結する範囲でしか使わない(複雑な排他制御はしない)。
-    private var activeTrzszTransferId: String?
-    private var activeTrzszMode: String?
-    private var activeTrzszFileName: String?
-    /// Phase 1C(#25): ダウンロード完了時に一括で書き込む一時ファイル。`trzszStartDownload()`
-    /// で確保し、`onDownloadComplete`が到着したらそこへ書き込む(Rust側が全量を
-    /// バッファしてから`onDownloadComplete(fileName:data:)`で一括で渡す設計のため、
-    /// 以前のような逐次チャンク書き込みは不要になった)。`trzszStartDownload()`が空の
-    /// ファイルを既に作成しているため、0バイトの正常終了(Rust側`orchestrator.rs`の
-    /// `on_trzsz_finished`は`data.is_empty()`の場合`onDownloadComplete`自体を呼ばない)
-    /// でも有効なファイルとして扱える。
-    private var downloadTempURL: URL?
-    /// `onDownloadComplete`での書き込みが失敗した場合に`true`。転送完了時、成功扱いでも
-    /// `completedDownloadURL`を公開しない(存在しない/不完全なファイルをUIへ渡さない)
-    /// ためのガード。
-    private var downloadWriteFailed = false
+    /// Phase 1C(#25): 進行中のtrzsz転送の状態。Rustスレッド(callback)・アップロード用の
+    /// バックグラウンドキュー・main(UI操作)の3方向から触るため、`trzszLock`で保護した
+    /// 1つのstructにまとめ、`withTrzszState`経由でのみ読み書きする(2026-09-29レビュー
+    /// IOS-I7。以前はロック無しの個別プロパティで、データ競合があった)。
+    private struct TrzszTransferState {
+        /// 進行中のtrzsz転送のID/mode/表示名。`onTrzszStateChanged(.waitingUser)`で設定し、
+        /// `trzszDismiss()`でクリアする。
+        var transferId: String?
+        var mode: String?
+        var fileName: String?
+        /// ダウンロード完了時に一括で書き込む一時ファイル。`trzszStartDownload()`
+        /// で確保し、`onDownloadComplete`が到着したらそこへ書き込む(Rust側が全量を
+        /// バッファしてから`onDownloadComplete(fileName:data:)`で一括で渡す設計)。
+        /// `trzszStartDownload()`が空のファイルを既に作成しているため、0バイトの正常終了
+        /// (Rust側`orchestrator.rs`の`on_trzsz_finished`は`data.is_empty()`の場合
+        /// `onDownloadComplete`自体を呼ばない)でも有効なファイルとして扱える。
+        var downloadTempURL: URL?
+        /// `onDownloadComplete`での書き込みが失敗した場合に`true`。転送完了時、成功扱いでも
+        /// `completedDownloadURL`を公開しない(存在しない/不完全なファイルをUIへ渡さない)
+        /// ためのガード。
+        var downloadWriteFailed = false
+    }
+    private let trzszLock = NSLock()
+    private var trzszStateStorage = TrzszTransferState()
+
+    private func withTrzszState<T>(_ body: (inout TrzszTransferState) throws -> T) rethrows -> T {
+        trzszLock.lock()
+        defer { trzszLock.unlock() }
+        return try body(&trzszStateStorage)
+    }
     /// Phase 1C(#26): OSの経路変化を検知するためのmonitor。生イベントをそのまま
     /// `orchestrator.notifyNetworkPathChanged(isSatisfied:)`へ転送するだけで、
     /// debounce/coalesceの判断自体はRust側([`crate::net_health_policy`])に集約されている
@@ -767,7 +779,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// バックグラウンドキューで行う。Android版`TerminalTabsViewModel.trzszStartUpload`
     /// と同じ「1チャンク先読みしてisLastを判定」方式(`Self.trzszSendChunked`)を使う。
     public func trzszStartUpload(url: URL) {
-        guard let transferId = activeTrzszTransferId else { return }
+        guard withTrzszState({ $0.transferId }) != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let didAccess = url.startAccessingSecurityScopedResource()
@@ -782,14 +794,21 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             }
             defer { try? fileHandle.close() }
 
-            self.activeTrzszFileName = url.lastPathComponent
+            self.withTrzszState { $0.fileName = url.lastPathComponent }
             self.orchestrator.trzszAcceptUpload(fileName: url.lastPathComponent, fileSize: fileSize, mode: 0)
-            Self.trzszSendChunked(
-                readNext: { fileHandle.readData(ofLength: Self.trzszChunkSize) },
-                send: { chunk, isLast in
-                    self.orchestrator.trzszSendChunk(data: chunk, isLast: isLast)
-                }
-            )
+            do {
+                // `readData(ofLength:)`はI/Oエラー時にSwiftで捕捉できないObjective-C例外を
+                // 投げてクラッシュするため、throwsな`read(upToCount:)`を使う(IOS-I8)。
+                try Self.trzszSendChunked(
+                    readNext: { try fileHandle.read(upToCount: Self.trzszChunkSize) ?? Data() },
+                    send: { chunk, isLast in
+                        self.orchestrator.trzszSendChunk(data: chunk, isLast: isLast)
+                    }
+                )
+            } catch {
+                Self.logger.warning("trzsz upload read failed, cancelling: \(String(describing: error), privacy: .public)")
+                self.orchestrator.trzszCancel()
+            }
         }
     }
 
@@ -797,7 +816,8 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// `trzszAcceptDownload`を呼ぶ(実際の書き込みは、Rust側が全量を貯めてから
     /// 一括で渡してくる`onDownloadComplete`で行う)。
     public func trzszStartDownload() {
-        guard let transferId = activeTrzszTransferId else { return }
+        let (activeTransferId, activeFileName) = withTrzszState { ($0.transferId, $0.fileName) }
+        guard let transferId = activeTransferId else { return }
         // transferIdでnamespaceしたディレクトリに置く(同じ`suggestedName`の別転送/別タブが
         // 同じ一時パスへ書き込んで衝突するのを避けつつ、`.fileMover`に見せるファイル名は
         // 人間可読なままにする)。
@@ -805,14 +825,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             "trzsz-\(transferId)", isDirectory: true
         )
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        let tempURL = tempDir.appendingPathComponent(activeTrzszFileName ?? UUID().uuidString)
+        let tempURL = tempDir.appendingPathComponent(activeFileName ?? UUID().uuidString)
         // 空で作っておく: 0バイトの正常終了はRust側が`onDownloadComplete`自体を呼ばない
         // ため、これが無いと`completedDownloadURL`が存在しないファイルを指してしまう。
         // データが実際に届けば`onDownloadComplete`が上書きする。作成自体に失敗した場合
         // (ディレクトリ作成失敗を含む)は、成功扱いでも公開しないようフラグを立てる。
         let created = FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-        downloadTempURL = tempURL
-        downloadWriteFailed = !created
+        withTrzszState {
+            $0.downloadTempURL = tempURL
+            $0.downloadWriteFailed = !created
+        }
         orchestrator.trzszAcceptDownload()
     }
 
@@ -831,18 +853,19 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     @MainActor
     public func trzszDismiss() {
         orchestrator.trzszDismiss()
-        if let url = downloadTempURL {
+        // 状態のクリアと一時ファイルURLの取り出しを1回のロック内で行う。
+        let previous = withTrzszState { state -> TrzszTransferState in
+            let previous = state
+            state = TrzszTransferState()
+            return previous
+        }
+        if let url = previous.downloadTempURL {
             // 個々のファイルだけでなく、`trzszStartDownload()`が作った
             // transferId単位の一時ディレクトリごと削除する。
             try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
         }
         uiState.trzszState = nil
         uiState.completedDownloadURL = nil
-        activeTrzszTransferId = nil
-        activeTrzszMode = nil
-        activeTrzszFileName = nil
-        downloadTempURL = nil
-        downloadWriteFailed = false
     }
 
     private func fail(message: String) {
@@ -1005,9 +1028,11 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         case .idle:
             Task { @MainActor in self.uiState.trzszState = nil }
         case .waitingUser(let transferId, let mode, let suggestedName, let expectedSize):
-            activeTrzszTransferId = transferId
-            activeTrzszMode = mode
-            activeTrzszFileName = suggestedName
+            withTrzszState {
+                $0.transferId = transferId
+                $0.mode = mode
+                $0.fileName = suggestedName
+            }
             Task { @MainActor in
                 self.uiState.trzszState = .waitingUser(
                     transferId: transferId, mode: mode, suggestedName: suggestedName, expectedSize: expectedSize
@@ -1026,7 +1051,9 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             // 呼ばれない — `trzszStartDownload()`が空ファイルを事前に作っているため
             // それでも有効)で既に書き終わっている。実際の書き込みが失敗していた場合は
             // `downloadWriteFailed`により公開しない。
-            let completedURL = (success && activeTrzszMode == "download" && !downloadWriteFailed) ? downloadTempURL : nil
+            let completedURL = withTrzszState { state in
+                (success && state.mode == "download" && !state.downloadWriteFailed) ? state.downloadTempURL : nil
+            }
             Task { @MainActor in
                 self.uiState.trzszState = .done(transferId: transferId, success: success, message: message)
                 self.uiState.completedDownloadURL = completedURL
@@ -1036,14 +1063,14 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
 
     /// ダウンロード完了。Rust側が全量を貯めてから一括で渡してくる(逐次チャンク書き込み
     /// ではない)。`trzszStartDownload()`が確保した`downloadTempURL`へ書き込む
-    /// (`fileName`は常にnilで届くため使わない、`activeTrzszFileName`は既に
+    /// (`fileName`は常にnilで届くため使わない、表示名は既に
     /// `onTrzszStateChanged(.waitingUser)`で捕捉済み)。
     public func onDownloadComplete(fileName: String?, data: Data) {
-        guard let url = downloadTempURL else { return }
+        guard let url = withTrzszState({ $0.downloadTempURL }) else { return }
         do {
             try data.write(to: url)
         } catch {
-            downloadWriteFailed = true
+            withTrzszState { $0.downloadWriteFailed = true }
         }
     }
 
