@@ -113,6 +113,13 @@ impl AppAckCounters {
 /// stream they were reading/writing from is about to become invalid anyway
 /// (mirrors `resume_client.rs`'s reattach path implicitly doing the same by
 /// simply not reusing the old control stream's tasks).
+///
+/// Dropping this does **not** abort the tasks (some callers deliberately
+/// discard it), but the tasks no longer outlive their control stream either:
+/// once the receive loop ends (EOF/error — the stream or its connection is
+/// gone), the send loop stops too, instead of waking every
+/// `APP_ACK_INTERVAL` forever while its counter never advances again.
+#[must_use = "keep the handle to abort() the APP_ACK tasks on reconnect; they also end on their own once the control stream dies"]
 pub struct AppAckTasks {
     send: tokio::task::JoinHandle<()>,
     recv: tokio::task::JoinHandle<()>,
@@ -157,7 +164,12 @@ fn spawn_app_ack_tasks_over(
     counters: Arc<AppAckCounters>,
 ) -> AppAckTasks {
     let recv_counters = counters.clone();
+    // Signalled (by dropping the sender) when the receive loop ends, so the
+    // send loop — which otherwise only touches the stream when its counter
+    // moves — ends with it rather than leaking.
+    let (recv_done_tx, mut recv_done_rx) = tokio::sync::oneshot::channel::<()>();
     let recv = tokio::spawn(async move {
+        let _recv_done = recv_done_tx;
         loop {
             let mut frame = [0u8; APP_ACK_FRAME_LEN];
             if read_exact_half(&mut read_half, &mut frame).await.is_err() {
@@ -167,7 +179,15 @@ fn spawn_app_ack_tasks_over(
                 break;
             }
             let offset = u64::from_be_bytes(frame[1..APP_ACK_FRAME_LEN].try_into().unwrap());
-            recv_counters.set_c2h_helper_committed_offset(offset);
+            // The helper's committed offset only ever grows; a smaller value
+            // (reordered/garbage frame) must not move the counter backwards
+            // and make the caller think it may not discard bytes it already
+            // could.
+            if offset >= recv_counters.c2h_helper_committed_offset() {
+                recv_counters.set_c2h_helper_committed_offset(offset);
+            } else {
+                log::debug!("isekai-transport: ignoring non-monotonic APP_ACK offset {offset}");
+            }
         }
     });
 
@@ -175,7 +195,10 @@ fn spawn_app_ack_tasks_over(
     let send = tokio::spawn(async move {
         let mut last_sent = 0u64;
         loop {
-            tokio::time::sleep(APP_ACK_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(APP_ACK_INTERVAL) => {}
+                _ = &mut recv_done_rx => break,
+            }
             let current = send_counters.h2c_client_delivered_offset();
             if current == last_sent {
                 continue;
@@ -295,5 +318,61 @@ mod tests {
 
         client_tasks.abort();
         helper_tasks.abort();
+    }
+
+    /// A handle that was simply dropped must not leak its tasks once the
+    /// control stream is gone: the send loop ends together with the receive
+    /// loop.
+    #[tokio::test]
+    async fn both_tasks_end_on_their_own_once_the_control_stream_dies() {
+        let (client_half, helper_half) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_half);
+        let tasks = spawn_app_ack_tasks_over(DuplexReadHalf(client_read), DuplexWriteHalf(client_write), Arc::new(AppAckCounters::new()));
+        drop(helper_half);
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.recv).await.expect("recv loop must end on EOF").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.send)
+            .await
+            .expect("send loop must end once the recv loop has")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_smaller_app_ack_offset_does_not_move_the_counter_backwards() {
+        let (client_half, mut helper_half) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_half);
+        let counters = Arc::new(AppAckCounters::new());
+        let tasks = spawn_app_ack_tasks_over(DuplexReadHalf(client_read), DuplexWriteHalf(client_write), counters.clone());
+        let frame = |offset: u64| {
+            let mut f = vec![APP_ACK];
+            f.extend_from_slice(&offset.to_be_bytes());
+            f
+        };
+        helper_half.write_all(&frame(100)).await.unwrap();
+        // A later, smaller frame followed by a larger one: once the larger
+        // one has landed, the smaller one has certainly been processed too
+        // (frames are handled in order), and must not have won.
+        helper_half.write_all(&frame(40)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let seen = counters.c2h_helper_committed_offset();
+                assert_ne!(seen, 40, "a smaller APP_ACK offset must be ignored");
+                if seen == 100 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first offset must land");
+        helper_half.write_all(&frame(150)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while counters.c2h_helper_committed_offset() != 150 {
+                assert_ne!(counters.c2h_helper_committed_offset(), 40, "a smaller APP_ACK offset must be ignored");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a larger offset must still land");
+        tasks.abort();
     }
 }
