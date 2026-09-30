@@ -42,6 +42,12 @@ class TerminalSessionService : Service() {
      */
     fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         if (totalCount <= 0) {
+            // AND-M2: `stopSelf()`だけでは、Activity/ViewModel側がbind(BIND_AUTO_CREATE)
+            // している間サービスは破棄されず、フォアグラウンド状態と最後のラベルの常駐通知が
+            // プロセス終了まで残り続けていた。先にフォアグラウンドを解除して通知を消す
+            // (bind解除は[tools.isekai.terminal.session.AndroidAppExecutor]側が行う)。
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isNotificationPosted = false
             stopSelf()
             return
         }

@@ -55,7 +55,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
     Done/消滅したら読み出しを止める。
 - [~] **AND-M1b** (Medium) 同上のRust側 — 見送り(Rust側新API要: rust-coreは別担当。Kotlin側はAND-M1aのack駆動ウィンドウで取りこぼしを実質防止済み) — `session.rs`の`try_send`失敗黙殺、bounded+awaitのAPIや
   「次チャンク要求」コールバックによるRust主導のフロー制御。
-- [ ] **AND-M2** (Medium) `TerminalSessionService.kt:41-45` / `session/AndroidAppExecutor.kt:57-66` —
+- [x] **AND-M2** (Medium) `TerminalSessionService.kt:41-45` / `session/AndroidAppExecutor.kt:57-66` —
   最後のタブを閉じても`stopSelf()`だけで`stopForeground`されず、`BIND_AUTO_CREATE`でbindされた
   ままのためFGS/常駐通知が残り続ける。
   - 方針: `totalCount<=0`で`stopForeground(STOP_FOREGROUND_REMOVE)`→`stopSelf()`。executor側も
