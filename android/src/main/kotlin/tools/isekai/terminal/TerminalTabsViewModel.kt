@@ -824,11 +824,23 @@ class TerminalTabsViewModel(
 
     private suspend fun observeConnectionTransitions(tab: TabState, pane: PaneState) {
         var prevConnected = false
+        var prevAlive = false
         pane.uiState.collect { state ->
             val connected = state.connected
+            // AND-H2a: Rustの`Reconnecting`は`connected=false`に畳み込まれる
+            // ([tools.isekai.terminal.session.ConnectionStateMapper])。Rustが自動再接続
+            // ループを回している間にKotlinが「切断された」と判断して物理マルチパスの
+            // NetworkRequest・upstream監視を畳むと、Reconnecting→Connected(Rust自動再接続)の
+            // 後にそれらが二度と復活しなかった。リソースの解放は「論理セッションが終わった」
+            // (=接続済みでも再接続中でもない)立ち下がりに限定する。
+            // 本来はRust側から「論理セッション終了」「transport再確立」を区別したイベントを
+            // 受けて判断すべき(AND-H2b、Rust側新API要)。
+            val alive = connected || state.isReconnecting
             if (connected && !prevConnected) {
                 executor.notifyConnected(state.currentHost ?: "")
-                if (pane.upstreamFailoverEnabledForCurrentSession) {
+                // 接続試行ごとにprofileから導出済みのフラグ([ConnectionCoordinator.connectPane])を
+                // 見て、まだ監視が無い場合だけ登録する(Rust自動再接続後の再Connectedでも復活する)。
+                if (pane.upstreamFailoverEnabledForCurrentSession && pane.upstreamFailoverMonitorHandle == null) {
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
@@ -852,19 +864,21 @@ class TerminalTabsViewModel(
                 tab.profile?.let { persistReattachRecord(tab.tabId, it) }
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
-                pane.physicalMultipathHandle?.close()
-                pane.physicalMultipathHandle = null
-                pane.upstreamFailoverMonitorHandle?.close()
-                pane.upstreamFailoverMonitorHandle = null
-                pane.upstreamFailoverEnabledForCurrentSession = false
-                // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
+                // タスク#60: 切断中/再接続中は古い`tmux:N`ラベルを表示し続けない(再接続後の
                 // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
-                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
+                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。UI表示のみ。
                 if (pane.paneId == tab.primaryPane.paneId) {
                     tab.tmuxWindowLabel.value = null
                 }
             }
+            if (!alive && prevAlive) {
+                pane.physicalMultipathHandle?.close()
+                pane.physicalMultipathHandle = null
+                pane.upstreamFailoverMonitorHandle?.close()
+                pane.upstreamFailoverMonitorHandle = null
+            }
             prevConnected = connected
+            prevAlive = alive
         }
     }
 

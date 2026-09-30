@@ -507,6 +507,49 @@ class TerminalTabsViewModelTest {
         assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
     }
 
+    /** AND-H2a: Rustの自動再接続(Reconnecting→Connected)中はupstream監視・物理マルチパスの
+     *  handleを畳まず、再Connected後もupstream監視が生きている。論理セッションが終わった
+     *  (Disconnected)時点で初めて解放する。 */
+    @Test
+    fun rustAutoReconnect_keepsUpstreamMonitorAndPhysicalMultipathUntilSessionEnds() = runBlocking {
+        val id = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+        assertFalse("再接続中はupstream監視を畳まない", executor.upstreamFailoverHandles[0].closed)
+        assertFalse("再接続中は物理マルチパスのNetworkRequestを畳まない", executor.physicalMultipathHandles[0].closed)
+
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.connected) delay(10) }
+        assertEquals("再Connectedで監視を二重登録しない", 1, executor.upstreamFailoverHandles.size)
+        assertFalse(executor.upstreamFailoverHandles[0].closed)
+
+        orchestrators[0].simulateDisconnected("bye")
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.connected) delay(10) }
+        assertTrue(executor.upstreamFailoverHandles[0].closed)
+        assertTrue(executor.physicalMultipathHandles[0].closed)
+    }
+
+    /** AND-H2a: 再接続ループが最終的に諦めた(Reconnecting→Disconnected)場合も解放する。 */
+    @Test
+    fun rustAutoReconnect_givingUp_releasesHandles() = runBlocking {
+        val id = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+        orchestrators[0].simulateReconnecting()
+        withTimeout(3000) { while (!tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+
+        orchestrators[0].simulateDisconnected("gave up")
+        withTimeout(3000) { while (tab(id).primaryPane.session.state.value.isReconnecting) delay(10) }
+
+        assertTrue(executor.upstreamFailoverHandles[0].closed)
+        assertTrue(executor.physicalMultipathHandles[0].closed)
+    }
+
     /** クラッシュ観点レビュー(2026-07-31): `ConnectivityManager`コールバックスレッドから
      *  同期的に呼ばれる`notifyUpstreamHealthDegraded`が(本番の生成バインディングが実際
      *  投げ得る)`InternalException`を投げても、`TerminalTabsViewModel.forwardToRust`が

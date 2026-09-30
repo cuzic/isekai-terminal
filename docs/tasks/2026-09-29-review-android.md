@@ -20,14 +20,15 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   - 方針: `close()`で`(orchestrator as? AutoCloseable)?.close()`を呼ぶ。`pendingAgentSignRequest`を
     `complete(false)`する。close後の呼び出しは生成バインディングが`IllegalStateException`
     ("already destroyed")を投げるため、公開メソッドをclose済みガードで包む。
-- [ ] **AND-H2a** (High) `TerminalTabsViewModel.kt:825-869` — `connected`の立ち下がり(=Rustの
+- [x] **AND-H2a** (High) `TerminalTabsViewModel.kt:825-869` — `connected`の立ち下がり(=Rustの
   `Reconnecting`も含む)で物理マルチパスのNetworkRequest・upstream監視を畳み、
   `upstreamFailoverEnabledForCurrentSession=false`にするため、Rust自動再接続後にupstream
   フェイルオーバー監視/物理マルチパスが二度と復活しない。
   - 方針(Kotlin側でできる範囲): リソース解放は「セッションが生きている(`connected || isReconnecting`)」
     の立ち下がりに限定し、Reconnecting中は保持する。フェイルオーバー可否フラグは接続試行のたびに
     profileから導出し、切断で落とさない。監視は未登録時のみ登録。
-- [ ] **AND-H2b** (High) 同上のrust-ssot逸脱の根本対応 — リソース保持/解放のタイミングをKotlinが
+- [~] **AND-H2b** (High) 同上のrust-ssot逸脱の根本対応 — 見送り(Rust側新API要: rust-coreは別担当。
+  Kotlin側はAND-H2aで実害だけ止め、判断箇所に「Rust側イベント待ち」のコメントを残した) — リソース保持/解放のタイミングをKotlinが
   Rust状態ミラーのエッジから推論している。
   - 方針: Rust側から「論理セッション終了」「transport再確立」を区別したイベント
     (例: `onSessionEnded`/`onTransportReestablished`)を出す必要がある。

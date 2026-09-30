@@ -57,6 +57,11 @@ internal class ConnectionCoordinator(
         // 古いhandleを閉じてから次の接続試行に入る(閉じ忘れによるリーク防止)。
         pane.physicalMultipathHandle?.close()
         pane.physicalMultipathHandle = null
+        // AND-H2a: upstream監視の要否は接続試行のたびにprofileから導出する(以前は切断の
+        // 立ち下がりでfalseに落とし、手動connectPaneの MULTIPATH 分岐でしかtrueに戻らなかった
+        // ため、Rust自動再接続後に監視が二度と登録されなかった)。
+        pane.upstreamFailoverEnabledForCurrentSession =
+            profile.transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH && profile.enableUpstreamFailover
         pane.preConnectError.value = null
         armPostConnectCommands(pane, profile)
         loadPaneContent(pane, profile.id)
@@ -98,7 +103,6 @@ internal class ConnectionCoordinator(
                     } else {
                         PhysicalMultipathFds()
                     }
-                    pane.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
                     pane.session.connectMultipathIsekaiPipeQuic(
                         profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth),
                     )
