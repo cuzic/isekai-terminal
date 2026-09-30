@@ -955,6 +955,25 @@ pub(crate) fn resolve_claimed_outcome(
 /// task `spawn_ctl_listener` started (see `CtlForward::listener_task`'s
 /// docs for why that matters now that `run_ssh_once` can run many times per
 /// invocation).
+/// Whether `apply_ctl_socket_forward` must add `-t` itself. Only ever under
+/// `RequestTty::Auto` (an explicit `-t`/`-tt`/`-T` is the caller's call):
+///
+/// - `--isekai-tty`: always — `isekai-pipe tty attach` needs a PTY.
+/// - ctl-socket (review 2026-09-29, SSH-20): it turns what the user typed
+///   as a plain interactive `isekai-ssh host` into `ssh host '<login shell
+///   command>'`, and `ssh(1)` never allocates a PTY for a remote command
+///   without `-t` — so enabling ctl-socket silently gave the user a
+///   PTY-less shell (no prompt, no line editing, no job control). Added only
+///   when local stdin is a terminal, which is exactly when `ssh(1)` itself
+///   would have allocated one for the command-less session the user
+///   actually asked for (this is `ssh(1)`-parity, not the
+///   `TofuConfirmation`-style "may we prompt" decision
+///   `.claude/rules/always-connects.md` forbids inferring from a tty).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn needs_forced_tty(tty_exec: bool, ctl_forward: bool, request_tty: RequestTty, stdin_is_terminal: bool) -> bool {
+    request_tty == RequestTty::Auto && (tty_exec || (ctl_forward && stdin_is_terminal))
+}
+
 #[cfg(unix)]
 async fn apply_ctl_socket_forward(
     command: &mut Command,
@@ -997,7 +1016,7 @@ async fn apply_ctl_socket_forward(
         // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`).
         command.args(crate::ctl_forward::forward_option_args(forward));
     }
-    if tty_exec.is_some() && plan.request_tty == RequestTty::Auto {
+    if needs_forced_tty(tty_exec.is_some(), ctl_forward.is_some(), plan.request_tty, std::io::stdin().is_terminal()) {
         // Real `ssh(1)` only allocates a PTY for a remote command when `-t`
         // is given — `isekai-pipe tty attach` needs one to relay through
         // (`login_tty` on the daemon side). An explicit `-t`/`-tt`/`-T` the
@@ -2560,6 +2579,19 @@ mod tests {
         let err = resolve_direct_helper_addr("isekai-ssh-test-host.invalid", 4433).await.unwrap_err();
         let failure = err.downcast_ref::<BootstrapFailure>().expect("DNS failure must carry a BootstrapFailure classification");
         assert!(failure.may_retry(), "a DNS failure must be retryable, got {failure:?}");
+    }
+
+    /// SSH-20 regression: ctl-socket's login-shell command must still get a
+    /// PTY for an interactive terminal session (it used to silently yield a
+    /// PTY-less shell), while explicit `-t`/`-T` stay the caller's choice.
+    #[test]
+    fn needs_forced_tty_covers_ctl_socket_sessions_on_a_terminal() {
+        assert!(needs_forced_tty(false, true, RequestTty::Auto, true), "ctl-socket on a terminal needs -t");
+        assert!(!needs_forced_tty(false, true, RequestTty::Auto, false), "piped stdin: ssh(1) would not allocate one either");
+        assert!(needs_forced_tty(true, false, RequestTty::Auto, false), "--isekai-tty always needs a PTY");
+        assert!(!needs_forced_tty(true, true, RequestTty::No, true), "an explicit -T is respected");
+        assert!(!needs_forced_tty(false, true, RequestTty::Yes, true), "an explicit -t is already there");
+        assert!(!needs_forced_tty(false, false, RequestTty::Auto, true));
     }
 
     /// SSH-25 regression: among equal priorities the *first* listed
