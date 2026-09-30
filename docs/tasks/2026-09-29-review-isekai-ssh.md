@@ -60,7 +60,7 @@
   - 要約: helper ダウンロードの HTTP に timeout がない。
   - 方針: ureq Agent に global/connect timeout を設定する。`isekai-auth/src/oauth.rs` 側は **transport 担当に委譲**。
 - [-] **SSH-19** Medium `isekai-auth/src/file_provider.rs:370-402`(D2)— token refresh にプロセス間 lock がない。**transport 担当に委譲**。
-- [ ] **SSH-20** Medium `wrapper.rs:1103-1119`(D9 の一部)
+- [x] **SSH-20** Medium `wrapper.rs:1103-1119`(D9 の一部)
   - 要約: ctl-socket 有効かつ `--isekai-tty` なしだと `-t` が付かず、PTY なしシェルになる。
   - 方針: ctl-socket の login shell command を付ける場合も、`RequestTty::Auto` なら `-t` を付ける。
 
