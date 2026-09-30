@@ -114,7 +114,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   PEM妥当性・パスフレーズ付き鍵の検証が無く、平文PEMのゼロ化も無い。
   - 方針: 上限付き読み出し、PEM/OpenSSH形式の検証とパスフレーズ付き鍵(未対応)の拒否、
     保存後の`fill(0)`。
-- [ ] **AND-L5** (Low) `AndroidManifest.xml` — `dataExtractionRules`が無くAndroid 12+のD2D転送が
+- [x] **AND-L5** (Low) `AndroidManifest.xml` — `dataExtractionRules`が無くAndroid 12+のD2D転送が
   止まらない(Keystoreは移らないので暗号化鍵ファイルが復号不能なゴミになる)。
   - 方針: 全ドメインを除外する`data_extraction_rules.xml`を追加。
 - [x] **AND-L6** (Low) `session/TerminalSession.kt:584-606` — host key信頼の書き込みが非同期で、
