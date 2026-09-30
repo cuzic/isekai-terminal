@@ -99,10 +99,10 @@ openssh-config / osc-color(quicsock は vendored)。
 - [x] **TR-L19** `isekai-protocol/src/ctl_vars.rs:49-52` — CtlVarStore のキー数に上限が無い → 上限を設ける(超過時は set を拒否する)。
 - [~] **TR-L20a** ctl preamble の比較が非定数時間(`isekai-ssh/src/ctl_forward.rs:319`, `src/transport/ssh_handler.rs:360`) — 担当境界外。fix-isekai-ssh / fix-rust-core の担当。
 - [x] **TR-L20b** `isekai-protocol` の自前 ct_eq(hello.rs:49, attach.rs:185,221) → `subtle` に統一する。
-- [ ] **TR-L21a** `isekai-stun/src/lib.rs:103-105` — XOR-MAPPED のデコード失敗時に MAPPED-ADDRESS へフォールバックしない → フォールバックする。
-- [ ] **TR-L21b** `isekai-stun/src/lib.rs:211` — 無関係なデータグラムで試行回数を消費する → transaction id が一致しない応答は読み捨て、同じ試行内で待ち続ける。
-- [ ] **TR-L21c** `isekai-stun/src/lib.rs:205` — 送信元の比較が v4-mapped v6 を考慮していない → to_canonical で比較する。
-- [ ] **TR-L22** `isekai-trust/src/normalize.rs:48` — 裸の IPv6 を誤って分割する。大文字小文字も正規化していない → 修正する。
+- [x] **TR-L21a** `isekai-stun/src/lib.rs:103-105` — XOR-MAPPED のデコード失敗時に MAPPED-ADDRESS へフォールバックしない → フォールバックする。
+- [x] **TR-L21b** `isekai-stun/src/lib.rs:211` — 無関係なデータグラムで試行回数を消費する → transaction id が一致しない応答は読み捨て、同じ試行内で待ち続ける。
+- [x] **TR-L21c** `isekai-stun/src/lib.rs:205` — 送信元の比較が v4-mapped v6 を考慮していない → to_canonical で比較する。
+- [x] **TR-L22** `isekai-trust/src/normalize.rs:48` — 裸の IPv6 を誤って分割する。大文字小文字も正規化していない → 修正する。
 - [x] **TR-L23** `isekai-protocol/src/bootstrap.rs:113` — validate_remote_path が先頭 `-` を許している(オプション注入) → 拒否する。
 - [~] **TR-L24** `isekai-trust/src/host_key_verifier.rs:97` — TOFU プロンプトの spawn_blocking がキャンセル後も残る。
   見送り: std の stdin 読み取りはキャンセルできない。現状キャンセルする呼び出し元も無い(latent)。回避には stdin 読み取りスレッドの共有化が必要で、isekai-ssh 側の設計変更になる。
