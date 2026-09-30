@@ -22,9 +22,9 @@
 - [x] **RC-07** High(sec) — `transport/ssh_handler.rs:517, 249-257` / `orchestrator.rs:512-520` — ProxyJump時、jump hostのホスト鍵イベントがtargetの`host:port`で検証/pinされる。
   - 方針: `TransportEvent::HostKey`に検証対象の`(host, port)`を持たせ、`RusshEventHandler`をjump/targetそれぞれの識別子付きで構築する。
   - Kotlin側は既存のOrchestratorCallback::on_host_key(host, port, fp)が踏み台の識別子で呼ばれるだけなので変更不要(UniFFI公開シグネチャ変更なし)。
-- [ ] **RC-08** High — `terminal.rs:2728-2730, 2747-2749` — OSC 133;C〜;D間の出力キャプチャに上限なし。
+- [x] **RC-08** High — `terminal.rs:2728-2730, 2747-2749` — OSC 133;C〜;D間の出力キャプチャに上限なし。
   - 方針: 行数・バイト数の上限を設け、超えたら古い行から捨てる(リングバッファ的に直近N行を保持)。
-- [ ] **RC-09** High→Medium — `terminal.rs:2284-2292` — OSC 8リンクテーブルは件数上限のみでURL長無制限(最大~700MB級)、毎画面更新でKotlinへ全コピー。
+- [x] **RC-09** High→Medium — `terminal.rs:2284-2292` — OSC 8リンクテーブルは件数上限のみでURL長無制限(最大~700MB級)、毎画面更新でKotlinへ全コピー。
   - 方針: URI長上限(2 KiB、他端末と同程度)を設け、超えるURIはリンクとして登録しない。
 
 ## Medium
@@ -62,9 +62,9 @@
   - 方針: FFI境界を越えた直後に`OwnedFd`でラップし、どの経路でもdropでcloseされるようにする。
 - [ ] **RC-25** Medium — `trzsz.rs:428-436, 381, 371` — ダウンロードのMD5を検証せず成功扱い。SIZE/NUMのパース失敗を0/1へ黙って変換。
   - 方針: 受信データのMD5を計算して照合し、不一致なら失敗。SIZE/NUMのパース失敗は転送失敗にする。
-- [ ] **RC-26** Medium — `sixel.rs:229-231` — Sixel色指定パラメータVecが無制限に伸びる。
+- [x] **RC-26** Medium — `sixel.rs:229-231` — Sixel色指定パラメータVecが無制限に伸びる。
   - 方針: `params.len() >= 5`以降はpushしない(使うのは先頭4〜5個のみ)。
-- [ ] **RC-27** Medium — `terminal.rs:3352-3357` — 中間バイト付きDCS(`$q`DECRQSS / `+q`XTGETTCAP)もSixelとしてデコードし画面破損。
+- [x] **RC-27** Medium — `terminal.rs:3352-3357` — 中間バイト付きDCS(`$q`DECRQSS / `+q`XTGETTCAP)もSixelとしてデコードし画面破損。
   - 方針: `c == 'q' && ints.is_empty()`のときだけSixelとして扱う。
 
 ## Low
@@ -89,15 +89,15 @@
 - [ ] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
 - [ ] **RC-39** Low — `isekai_stun_p2p_transport.rs:270-279` — STUN P2Pのreattachが穴あけ無しの新ソケットからdialする。
 - [ ] **RC-40** Low — `quic_transport.rs:135-146, 210` — 旧tsshd QUIC transportは証明書検証有効時に空RootCertStoreで必ず失敗。handshake JSONを`format!`で組み立て`ssh_host`を未エスケープ。
-- [ ] **RC-41** Low-Medium — `terminal.rs:3144` — REPのclampが`cols*rows`で大きなCPU増幅が残る。
+- [x] **RC-41** Low-Medium — `terminal.rs:3144` — REPのclampが`cols*rows`で大きなCPU増幅が残る。
   - 方針: `cols`へclampする。
-- [ ] **RC-42** Low — `terminal.rs:2769` — SGRのコロン区切りサブパラメータを捨てて誤適用(`4:0`→下線ON、`38:2::R:G:B`の色消失)。
+- [x] **RC-42** Low — `terminal.rs:2769` — SGRのコロン区切りサブパラメータを捨てて誤適用(`4:0`→下線ON、`38:2::R:G:B`の色消失)。
   - 方針: サブパラメータ付きの`4`/`38`/`48`/`58`を正しく解釈する。
-- [ ] **RC-43** Low — `terminal.rs:2574-2583` — 拡張色成分の範囲チェックなし(`300`が隣チャネルへ溢れる、`38;5;256`が0へwrap、短すぎる`38;2;1`が後続を誤解釈)。
+- [x] **RC-43** Low — `terminal.rs:2574-2583` — 拡張色成分の範囲チェックなし(`300`が隣チャネルへ溢れる、`38;5;256`が0へwrap、短すぎる`38;2;1`が後続を誤解釈)。
   - 方針: 0..=255外の成分は無効として色を適用せず、パラメータは消費する。
-- [ ] **RC-44** Low — `terminal.rs:3218-3220` — OSC 0/2タイトルが最初の`;`で切れる。制御文字/bidiフィルタなし。
+- [x] **RC-44** Low — `terminal.rs:3218-3220` — OSC 0/2タイトルが最初の`;`で切れる。制御文字/bidiフィルタなし。
   - 方針: `params[1..]`を`;`で再結合し、制御文字・bidi制御文字を除去する。
-- [ ] **RC-45** Low — `terminal.rs:829-834` — urxvt(1015)マウスエンコーディングがurxvt仕様と異なる(+32オフセット無し、release時`m`)。
+- [x] **RC-45** Low — `terminal.rs:829-834` — urxvt(1015)マウスエンコーディングがurxvt仕様と異なる(+32オフセット無し、release時`m`)。
   - 方針: Cbに+32、releaseはボタン3・終端常に`M`。
-- [ ] **RC-46** Low — `terminal.rs` 各所 — `pending_terminal_responses`が1バッチ内で無制限。
+- [x] **RC-46** Low — `terminal.rs` 各所 — `pending_terminal_responses`が1バッチ内で無制限。
   - 方針: 1バッチあたりの件数上限を設ける。
