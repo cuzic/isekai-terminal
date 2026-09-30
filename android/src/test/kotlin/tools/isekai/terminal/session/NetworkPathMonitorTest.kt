@@ -12,6 +12,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
+import org.robolectric.shadows.ShadowNetwork
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -57,6 +58,32 @@ class NetworkPathMonitorTest {
 
         assertEquals(PathState.FAILED, monitor.currentState(PathId.DIRECT))
         assertEquals(PathState.FAILED, monitor.currentState(PathId.TAILSCALE))
+    }
+
+    /** AND-M3a: 同じPathId(DIRECT)に複数ネットワーク(Wi-Fi+セルラー)がいる状態で片方だけ
+     *  失っても、残りがある限りFAILEDにせず、誤った「経路なし」を通知しない。 */
+    @Test
+    fun losingOneOfTwoNetworksOnSamePath_keepsPathValidated() {
+        val seen = mutableListOf<Boolean>()
+        monitor.start { seen.add(it) }
+        val wifi = ShadowNetwork.newInstance(100)
+        val cellular = ShadowNetwork.newInstance(101)
+        // networkCallbacksの順序は保証されないため、どちらのPathIdのコールバックかは
+        // 最初のonAvailable後に状態から特定する(検証内容はPathIdに依らない)。
+        val cb = shadowOf(connectivityManager).networkCallbacks.toList()[0]
+
+        cb.onAvailable(wifi)
+        val path = PathId.values().single { monitor.currentState(it) == PathState.VALIDATED }
+        cb.onAvailable(cellular)
+        cb.onLost(wifi)
+
+        assertEquals(PathState.VALIDATED, monitor.currentState(path))
+        assertEquals(listOf(true, true, true), seen)
+
+        cb.onLost(cellular)
+
+        assertEquals(PathState.FAILED, monitor.currentState(path))
+        assertEquals(false, seen.last())
     }
 
     @Test
