@@ -89,7 +89,7 @@
 - [x] **RC-35** Low — `forward.rs:69, 121, 188` / `ssh_handler.rs:295` / `socks.rs:40-148` — フォワード削除/タブ切断で受理済みrelayタスクが残る。SOCKSネゴシエーションにタイムアウトなし。
   - 方針: relayタスクをフォワードごとの`JoinSet`/abort tokenで管理し削除時にabort。SOCKSハンドシェイクにタイムアウト。
   - -L/-Dは中継タスクを待受タスクのJoinSetで所有し、削除・切断時のabortで一緒に止まるようにした。-R(サーバー起点、russh Handlerのコールバックでspawn)の受理済み中継は、どのフォワードに属するかをHandler側で追跡する仕組みが無く、今回は削除時にcancel_tcpip_forwardで新規接続が止まる既存挙動のまま。
-- [ ] **RC-36** Low — `file_preview.rs:127-161` — パス先頭の`-`がオプションとして解釈される。
+- [x] **RC-36** Low — `file_preview.rs:127-161` — パス先頭の`-`がオプションとして解釈される。
   - 方針: パス引数の前に`--`を入れる(リモートCLIが`--`に対応しているか確認)か、`-`始まりのパスに`./`を前置する。
 - [ ] **RC-37** Low — `isekai-protocol/src/bootstrap.rs:178-184` / `helper_bootstrap.rs:159-204, 469-476` — 固定`.tmp`アップロードパス・アップロード後のsha256未検証・`run_exec`にタイムアウト/出力上限なし。
 - [ ] **RC-38** Low — `debug_fault.rs:23-53` / `lib.rs:43` — デバッグ用フォルト注入exportがreleaseビルドにも含まれる。
