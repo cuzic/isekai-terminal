@@ -191,10 +191,13 @@
   - 修正方針: write は main へ非同期ディスパッチ、pull は main で同期実行する(呼び出し元が main なら直接実行)。
   - 対応: write は `performOnMain`(main 以外からは main へ非同期に投げる)で行う。pull は `readOnMain`(main で読み、最大5秒セマフォで待つ。超過したら nil = 取得不可)で行い、main が塞がっていても Rust 側をデッドロックさせない。
     `RemoteClipboardBridgeTests`(3件、実際の UIPasteboard には触れない)を追加。
-- [ ] **IOS-L4** (Low) `ios/Sources/IsekaiTerminalCore/TerminalIMEInputView.swift:84,207-211`
+- [x] **IOS-L4** (Low) `ios/Sources/IsekaiTerminalCore/TerminalIMEInputView.swift:84,207-211`
   - 要約: composing 中に `insertText` が来ると marked text を確定送信したうえで insertText も送り、二重送信されうる(pinyin 系で要実機確認)。
     `markedTextLog` と `buffer` が際限なく伸びる。
   - 修正方針: 伸長は上限を設けて対処する。二重送信は実機での IME 挙動確認が前提。
+  - 対応: 伸長: `markedTextLog` は直近64件だけを保持し、`buffer` は `insertText` 時に4096文字を超えたら末尾1024文字に切り詰める(変換中は触らない)。テスト2件を追加。
+    見送り(部分): composing 中の `insertText` による二重送信は `[~]`。現在の「marked を確定してから insertText を追加する」挙動はコメントで実 IME/UIKit の挙動に合わせたと明記されていて、既存テストもそれを前提にしている。
+    pinyin 系キーボードで実際に二重送信になるかは実機確認が前提なので、確認なしに挙動を変えない。
 - [x] **IOS-L5** (Low) `ios/Sources/IsekaiTerminalCore/ProfileDatabase.swift:449-451,467`
   - 要約: `jumpKeyEntryId` に FK/ON DELETE SET NULL がなく、鍵を削除すると踏み台プロファイルの参照がぶら下がる。
   - 修正方針: スキーマ変更(migration)ではなく、`deleteKeyEntry` の同一トランザクション内で `jumpKeyEntryId` を NULL に戻す。テストを追加。
