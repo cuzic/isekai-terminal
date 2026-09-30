@@ -725,6 +725,26 @@ async fn establish_fresh(
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
 ) -> Result<PooledSshHandle, AcquireError> {
+    // RC-16: bootstrap(SSH)+QUICハンドシェイク+ネスト認証の全体に上限を設ける。
+    // 止まったままだとプールエントリが`Connecting`のまま残り、後続タブ・再接続が
+    // 永久に待つ。打ち切りは(Autoなら通常SSHへフォールバックできるよう)ダイヤル失敗扱い。
+    match tokio::time::timeout(crate::pool::ESTABLISH_TIMEOUT, establish_fresh_inner(config, host_key_callback, event_tx)).await {
+        Ok(r) => r,
+        Err(_) => {
+            zeroize_ssh_auth(&mut config.auth);
+            Err(AcquireError::DialFailed(format!(
+                "isekai-pipe QUIC connection establishment timed out after {}s",
+                crate::pool::ESTABLISH_TIMEOUT.as_secs()
+            )))
+        }
+    }
+}
+
+async fn establish_fresh_inner(
+    config: &mut IsekaiPipeQuicConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<PooledSshHandle, AcquireError> {
     let stream = try_connect_isekai_pipe_quic(config, host_key_callback)
         .await
         .map_err(AcquireError::DialFailed)?;
