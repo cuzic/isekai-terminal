@@ -165,12 +165,16 @@
   - 修正方針: handler(main thread で呼ばれる)内で `MainActor.assumeIsolated` を使い、同期的に終了処理を行う。
   - 対応: handler 内で `MainActor.assumeIsolated` を使い、`handleBackgroundBudgetExpired()`(各タブへの通知と `endBackgroundTask`)を同期実行するようにした。
     システムの期限切れはシミュレータのテストから起こせないため、確認は ios-app-build(コンパイル)による。
-- [ ] **IOS-I7** (Low-Medium) `TerminalSessionController.swift:181-195,735,948-950,969,982-986,791-795`
+- [x] **IOS-I7** (Low-Medium) `TerminalSessionController.swift:181-195,735,948-950,969,982-986,791-795`
   - 要約: 転送状態(`downloadTempURL` 等)がロックなしで複数スレッドから触られる。
   - 修正方針: 転送状態を1つの struct にまとめ、`NSLock` で保護する。
-- [ ] **IOS-I8** (Low-Medium) `TerminalSessionController.swift:738`
+  - 対応: 転送状態5フィールドを `TrzszTransferState` 構造体にまとめて `NSLock` で保護し、すべての読み書きを `withTrzszState` 経由にした。
+    完了 URL の判定(mode/失敗フラグ/URL の3値)と dismiss 時のクリアは1回のロック内で行う。既存の trzsz テスト群で挙動の回帰を確認する。
+- [x] **IOS-I8** (Low-Medium) `TerminalSessionController.swift:738`
   - 要約: `FileHandle.readData(ofLength:)` は I/O エラーで ObjC 例外を投げ、Swift では捕捉できない。
   - 修正方針: `read(upToCount:)`(throws)に置き換え、エラー時は転送をキャンセルする。
+  - 対応: アップロードを `read(upToCount:)` に変更し、`trzszSendChunked` を `readNext: () throws -> Data` + `rethrows` にした。読み出しエラー時は警告ログを出して `trzszCancel()` する。
+    テスト `testReadErrorIsPropagatedWithoutSendingALastChunk` を追加。
 - [ ] **IOS-L1** (Low・不確実) `TerminalSessionController.swift:798-821,865-889`
   - 要約: コールバックごとに別の `Task { @MainActor }` を作っており、状態更新の順序が保証されない。
   - 修正方針: FIFO が保証される `DispatchQueue.main.async` + `MainActor.assumeIsolated` のヘルパーに統一する。

@@ -70,4 +70,26 @@ final class TrzszSendChunkedTests: XCTestCase {
         XCTAssertEqual(sent[0].0, exactChunk)
         XCTAssertTrue(sent[0].1)
     }
+
+    /// 2026-09-29レビューIOS-I8: 読み出しエラーはthrowで呼び出し元へ返り、
+    /// 途中までのデータをisLast=trueとして送ってしまわない。
+    func testReadErrorIsPropagatedWithoutSendingALastChunk() {
+        struct ReadFailure: Error {}
+        var sent: [(Data, Bool)] = []
+        var calls = 0
+        let readNext: () throws -> Data = {
+            calls += 1
+            if calls <= 2 { return Data(repeating: UInt8(calls), count: 4) }
+            throw ReadFailure()
+        }
+
+        XCTAssertThrowsError(try TerminalSessionController.trzszSendChunked(readNext: readNext, send: { chunk, isLast in
+            sent.append((chunk, isLast))
+        })) { error in
+            XCTAssertTrue(error is ReadFailure)
+        }
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertFalse(sent[0].1)
+    }
 }
