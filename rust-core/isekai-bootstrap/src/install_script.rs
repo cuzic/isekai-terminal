@@ -240,8 +240,7 @@ pub(crate) async fn build_install_script(
             let remote_log_level = validate_log_level(&relay.remote_log_level)
                 .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
 
-            // Quoted for the same IPv6-glob reason as `stun_server_arg`.
-            let relay_addr = shell_single_quote(&relay.relay_addr.to_string());
+            let relay_addr = relay.relay_addr;
             let quoted_sni = shell_single_quote(&relay.relay_sni);
             let idle_lifetime_secs = relay.idle_lifetime_secs;
             let resume_window_secs = relay.resume_window_secs;
