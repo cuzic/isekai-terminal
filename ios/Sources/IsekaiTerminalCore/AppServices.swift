@@ -1,4 +1,5 @@
 import Foundation
+import os
 import IsekaiTerminalCoreLogic
 
 /// Phase 1D: アプリ全体で共有するローカルDB/Vaultのシングルトン置き場。
@@ -6,6 +7,7 @@ import IsekaiTerminalCoreLogic
 /// テストからは触れず、実アプリ(`IsekaiTerminalApp`)からのみ使う想定。
 public final class AppServices {
     public static let shared = AppServices()
+    private static let logger = Logger(subsystem: "tools.isekai.terminal", category: "app-services")
 
     public let db: ProfileDatabase
     public let vault: CredentialVault
@@ -21,7 +23,18 @@ public final class AppServices {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
             db = try ProfileDatabase(path: support.appendingPathComponent("isekai_terminal.sqlite").path)
             vault = try CredentialVault(blobDirectory: support.appendingPathComponent("credential_vault", isDirectory: true))
-            trustStore = try SshHostTrustStore(storeURL: support.appendingPathComponent("ssh_host_trust.json"))
+            // 信頼ストアのJSONが壊れていても起動不能にしない(壊れたファイルは退避して
+            // 空で開く、`SshHostTrustStore.openRecoveringCorruption`参照)。以前は
+            // ここがthrowしてfatalErrorになり、再インストール以外に復旧手段が無かった。
+            let opened = SshHostTrustStore.openRecoveringCorruption(
+                storeURL: support.appendingPathComponent("ssh_host_trust.json")
+            )
+            trustStore = opened.store
+            if let recovered = opened.recovered {
+                Self.logger.error(
+                    "ssh_host_trust.json was unreadable and has been reset (quarantined to \(recovered.quarantinedURL?.path ?? "<not moved>", privacy: .public)): \(String(describing: recovered.error), privacy: .public)"
+                )
+            }
         } catch {
             fatalError("AppServices initialization failed: \(error)")
         }
