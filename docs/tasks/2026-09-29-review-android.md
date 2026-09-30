@@ -75,7 +75,7 @@ Rust側に新しいUniFFI APIが必要な部分は `[~]` として「Rust側新A
   Setのため、同一タブの(手動/Rust自動)再接続でensure/フック再インストールがスキップされる。
   - 方針: 予約を「profileId→所有tabId」のマップにし、所有タブ自身の再接続は通す。所有タブを
     閉じたら解放する。
-- [ ] **AND-M6** (Medium) `TerminalTabsViewModel.kt:817-823` / `session/AndroidAppExecutor.kt:185-209` —
+- [x] **AND-M6** (Medium) `TerminalTabsViewModel.kt:817-823` / `session/AndroidAppExecutor.kt:185-209` —
   ダウンロード保存の例外が未捕捉でプロセスが落ち、`IS_PENDING=1`の行がMediaStoreに残る。
   - 方針: collect側でtry/catchしてログに落とし、executor側は失敗時に挿入した行を`delete`する。
 - [ ] **AND-M7** (Medium) `input/TerminalInputConnection.kt` / `input/TerminalInputView.kt:97-100` —

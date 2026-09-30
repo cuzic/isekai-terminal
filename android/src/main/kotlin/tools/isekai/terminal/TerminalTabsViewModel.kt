@@ -824,7 +824,15 @@ class TerminalTabsViewModel(
     private suspend fun observeDownloads(pane: PaneState) {
         pane.session.pendingDownloadFile.collect { pending ->
             pending ?: return@collect
-            executor.saveDownloadFile(pending.first, pending.second)
+            // AND-M6: 保存失敗(容量不足等のIOException、MediaStoreのSecurityException等)は
+            // viewModelScope上で未捕捉だとプロセスごと落ちるため、ログに落として続行する。
+            try {
+                executor.saveDownloadFile(pending.first, pending.second)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                RemoteLogger.e("IsekaiTerminalDownload", "failed to save download '${pending.first}': ${e.message}", e)
+            }
             pane.session.consumeDownloadFile()
         }
     }

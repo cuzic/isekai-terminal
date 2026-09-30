@@ -69,7 +69,13 @@ class DumbAppExecutor : AppExecutor {
     }
     override suspend fun openUploadFile(uri: Uri): UploadFile =
         UploadFile(uri.lastPathSegment ?: "fake", 0L, ByteArrayInputStream(ByteArray(0)))
-    override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}
+    /** AND-M6: 保存失敗(IOException等)を注入する。 */
+    var saveDownloadError: Throwable? = null
+    var saveDownloadCallCount = 0
+    override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {
+        saveDownloadCallCount++
+        saveDownloadError?.let { throw it }
+    }
     override fun release() { released = true }
 
     /** [AppExecutor]が返すhandle/sourceのclose記録用フェイク。テストから`.closed`を検証する。 */
