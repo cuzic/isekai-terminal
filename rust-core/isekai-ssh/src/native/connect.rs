@@ -1090,7 +1090,8 @@ async fn try_encrypted_identity<H: client::Handler>(
     prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
 ) -> Result<bool> {
     for attempt in 1..=3 {
-        let Some(passphrase) = prompt_passphrase(path, attempt) else {
+        // Wiped when this attempt's scope ends (review 2026-09-29, SSH-32).
+        let Some(passphrase) = prompt_passphrase(path, attempt).map(zeroize::Zeroizing::new) else {
             return Ok(false);
         };
         let result = match certificate_pem {

@@ -535,8 +535,10 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     // after), or (the common case: no encrypted identity in play) left
     // stdin null, which reads as EOF immediately too — `handoff::decode`
     // treats an empty read as an empty (no-op) set either way.
-    let mut handoff_bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut handoff_bytes)
+    // `Zeroizing`: this is decrypted private-key material (review
+    // 2026-09-29, SSH-32) — wiped when this buffer is dropped.
+    let mut handoff_bytes = zeroize::Zeroizing::new(Vec::new());
+    tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut *handoff_bytes)
         .await
         .context("isekai-ssh mux holder: failed to read the passphrase hand-off from stdin")?;
     let handoff = handoff::decode(&handoff_bytes).unwrap_or_else(|e| {
