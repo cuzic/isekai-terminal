@@ -106,7 +106,7 @@
 - [ ] **SSH-34** Low `mux/mod.rs:537 vs 604`(C5-7)
   - 要約: holder ログを claim 前に開いている。`rotating_log.rs` の rotate 失敗無視は isekai-pipe-core(担当外)。
   - 方針: 実装時に確認する。
-- [ ] **SSH-35** Low-Medium `native/connect.rs:1377`(C5-8)
+- [x] **SSH-35** Low-Medium `native/connect.rs:1377`(C5-8)
   - 要約: `-T`(PTY なし)でも `~.` エスケープを処理するため、パイプ入力のバイナリが壊れる。
   - 方針: `ssh(1)` と同じく、PTY を要求しない場合はエスケープ処理を無効にする。
 - [x] **SSH-36** Low `escape.rs:40-43,61-69`(C5-9)

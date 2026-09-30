@@ -1003,7 +1003,13 @@ async fn run_authenticated_session(
     }
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;
-    let exit_code = run_shell_io_loop(&mut channel).await?;
+    // `ssh(1)` only interprets `~` escapes when a PTY was requested
+    // (`EscapeChar` is effectively `none` for `-T`/an `Exec` channel) — with
+    // no PTY the stdin bytes are data (a piped file, `tar` output, ...), and
+    // rewriting any `\n~.` / `\n~~` inside it corrupted binary transfers
+    // (review 2026-09-29, SSH-35).
+    let escapes_enabled = wants_pty(plan.remote_command(), plan.request_tty);
+    let exit_code = run_shell_io_loop(&mut channel, escapes_enabled).await?;
 
     // Best-effort teardown of this tab's forward before the handle is dropped.
     if let Some(path) = &ctl_remote_path {
@@ -1396,9 +1402,9 @@ enum BreakReason {
 /// Delegates to [`run_shell_io_loop_inner`] (which the tests drive against
 /// in-memory buffers) with the real local `stdin`/`stdout`/`stderr`; driving
 /// a real terminal stdin/stdout pair isn't practical in a unit test.
-async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<u8> {
+async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>, escapes_enabled: bool) -> Result<u8> {
     let resize_rx = console::spawn_resize_watcher();
-    run_shell_io_loop_inner(channel, console_stdin::ConsoleStdin::open(), tokio::io::stdout(), tokio::io::stderr(), resize_rx).await
+    run_shell_io_loop_inner(channel, console_stdin::ConsoleStdin::open(), tokio::io::stdout(), tokio::io::stderr(), resize_rx, escapes_enabled).await
 }
 
 /// The body of [`run_shell_io_loop`] with the three local streams plus an
@@ -1419,6 +1425,7 @@ async fn run_shell_io_loop_inner<I, O, E>(
     mut stdout: O,
     mut stderr: E,
     mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+    escapes_enabled: bool,
 ) -> Result<u8>
 where
     I: tokio::io::AsyncRead + Unpin,
@@ -1455,7 +1462,11 @@ where
                         let _ = channel.eof().await;
                     }
                     Ok(n) => {
-                        let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
+                        let (to_send, action) = if escapes_enabled {
+                            process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape)
+                        } else {
+                            (buf[..n].to_vec(), EscapeAction::None)
+                        };
                         if !to_send.is_empty() {
                             if channel.data(&to_send[..]).await.is_err() {
                                 // Local stdin just produced real bytes, so
@@ -2162,7 +2173,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_shell_io_loop(&mut channel).await;
+        let result = run_shell_io_loop(&mut channel, true).await;
         assert!(result.is_err(), "an abnormal disconnect must propagate as Err, not a successful-looking exit code");
     }
 
@@ -2190,7 +2201,7 @@ mod tests {
             .await
             .unwrap();
 
-        let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
+        let exit_code = run_shell_io_loop(&mut channel, true).await.unwrap();
         assert_eq!(exit_code, 255, "an ExitSignal must be reported as 255, matching ssh(1)'s own convention, and as Ok (not Err)");
     }
 
@@ -2228,7 +2239,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
+        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None, true).await.unwrap();
         assert_eq!(exit_code, 42, "an exit-status arriving after CHANNEL_EOF must still be honored, not reported as 255");
     }
 
@@ -2243,7 +2254,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
+        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None, true).await.unwrap();
         assert_eq!(stdout, b"hello-stdout", "remote stdout (Data) must land on local stdout");
         assert_eq!(stderr, b"hello-stderr", "remote stderr (ExtendedData) must land on local stderr, not stdout");
     }
