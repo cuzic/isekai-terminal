@@ -49,7 +49,7 @@
 - [x] **SSH-14** Medium/Low `native/connect.rs:806-813`
   - 要約: silent 時の keyboard-interactive がエラーにせず空回答を送り、PAM の faillock を積む。
   - 方針: silent 時は keyboard-interactive 認証自体を試みない。
-- [ ] **SSH-15** Medium `native/mux/owner.rs:603-623,773-782`
+- [x] **SSH-15** Medium `native/mux/owner.rs:603-623,773-782`
   - 要約: タブを閉じてもリモートシェルが残る(`Channel` に Drop 実装がない)。
   - 方針: `relay_loop` のすべての終了経路で `channel.close()` を送る(RemoteExitReported 以外)。誤ったコメントも修正する。
 - [ ] **SSH-16** Medium `native/mux/client.rs:324`, `owner.rs:620`
