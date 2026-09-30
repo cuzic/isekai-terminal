@@ -7,9 +7,9 @@
 
 ## High
 
-- [ ] **RC-01** High — `resume_client.rs:49-55, 305-316` — ReplayBufferが容量超過で未ACKバイトをevictし、reattach時に`replay_from`が`None`でも成功扱い → C→Sバイトが黙って欠落しSSHストリーム破損。
+- [x] **RC-01** High — `resume_client.rs:49-55, 305-316` — ReplayBufferが容量超過で未ACKバイトをevictし、reattach時に`replay_from`が`None`でも成功扱い → C→Sバイトが黙って欠落しSSHストリーム破損。
   - 方針: `helper_committed_offset`が`[start_offset, end_offset]`外なら回復不能エラーとしてreattachを即失敗させる(リトライ予算を消費しない)。
-- [ ] **RC-02** High — `resume_client.rs:349-362` — `write_all`部分成功→失敗時、chunkがreplay未登録のまま新接続へ全量再送され、helperがcommit済みの先頭部分が重複。
+- [x] **RC-02** High — `resume_client.rs:349-362` — `write_all`部分成功→失敗時、chunkがreplay未登録のまま新接続へ全量再送され、helperがcommit済みの先頭部分が重複。
   - 方針: chunkを書き込み**前に**replay_bufferへ積み、reattach時の再送は`helper_committed_offset`からの差分のみにする。
 - [ ] **RC-03** High — `orchestrator.rs` `disconnect()` — `reconnect_epoch`を進めず、再接続ループ中のタブclose/切断でもループが最大60s継続し、成功すると閉じたタブへConnectedを通知する。
   - 方針: `disconnect()`で`reconnect_epoch`を進めループ系フラグをクリア、ループ中なら進行中attemptの世代も無効化し`Disconnected`をRust側から通知(Kotlinに`cancelReconnect`併用を要求しない)。
