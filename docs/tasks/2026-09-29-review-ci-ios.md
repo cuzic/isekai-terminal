@@ -98,9 +98,11 @@
   - 要約: NDK バージョンの参照元 `fdroid/tools.isekai.terminal.yml` が pr-path-gate のパターンにない。
   - 修正方針: `^fdroid/` を patterns と push.paths に追加。
   - 対応: `^fdroid/` を pr-path-gate の patterns に、`fdroid/**` を push.paths に追加。
-- [ ] **CI-L6** (Low) `scripts/lib/adb_ui.py:193-196,220-224`
+- [x] **CI-L6** (Low) `scripts/lib/adb_ui.py:193-196,220-224`
   - 要約: `input text` のエスケープが不完全(`*?~#!{[`、改行、`%`)。
   - 修正方針: デバイス側シェルへは単一引用符でクォートする共通関数に置き換え、表現不能な入力(改行・`%s`)は明示的にエラーにする。単体テストを追加。
+  - 対応: `input_text_shell_arg` に集約した。値全体を単一引用符でクォートし、空白は `%s` に変換する。改行とリテラル `%s` は SystemExit で明示的に拒否する。
+    `cmd_type`/`cmd_type_terminal` の両方で使う。`scripts/lib/test_adb_ui.py`(7件、ローカル `sh -c` で往復検証)を追加し、全件成功を確認済み。
 - [ ] **CI-L7** (Low) `rust-core/scripts/android-arm64-clang.sh:4`, `android-arm64-ar.sh:4`, `ndk-common.sh:16`
   - 要約: linker/ar 実行前に cwd を変更している。`$ANDROID_HOME/ndk` が空だと NDK_ROOT が空文字列になる。
   - 修正方針: `cd` をやめて `source "$(dirname …)/ndk-common.sh"`。空の場合は明示的なエラーにする。
