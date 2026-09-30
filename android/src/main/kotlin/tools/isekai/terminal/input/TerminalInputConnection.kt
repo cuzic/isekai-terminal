@@ -9,6 +9,11 @@ class TerminalInputConnection(
     private val view: TerminalInputView,
 ) : BaseInputConnection(view, true) {
 
+    private companion object {
+        /** [deleteSurroundingText]で1回に送るDELの上限(AND-M7(c))。 */
+        const val MAX_DELETE_BEFORE = 256
+    }
+
     override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
         val str = text?.toString() ?: return true
         if (view.ctrlArmed) {
@@ -21,6 +26,11 @@ class TerminalInputConnection(
             if (ctrlBytes != null) {
                 view.onComposingText?.invoke("")
                 view.onSendBytes?.invoke(ctrlBytes)
+                // AND-M7(b): `super.commitText`を呼ばない経路でも、IMEがcomposing中に
+                // commitしてきた場合のcomposing spanをEditableに残さない(残すと以後
+                // `composingText()`が非空を返し続けてショートカットが無効化され、次の
+                // `finishComposingText`で古い文字が再送されうる)。
+                resetEditable()
                 return true
             }
             // 変換不可（日本語確定等）: 通常のコミット処理にフォールスルーする
@@ -32,7 +42,10 @@ class TerminalInputConnection(
                 RemoteLogger.i("IsekaiTerminalIME", "paste $codePoints codepoints → bracketed paste")
             view.onSendBytes?.invoke(TerminalKeyEncoder.commitTextBytes(str, view.bracketedPasteMode))
         }
-        return super.commitText(text, newCursorPosition)
+        val result = super.commitText(text, newCursorPosition)
+        // AND-M7(a): 送信済みテキストを内部Editableに溜め続けない。
+        resetEditable()
+        return result
     }
 
     override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
@@ -49,7 +62,22 @@ class TerminalInputConnection(
             RemoteLogger.d("IsekaiTerminalIME", "composing finish: '${pending.take(20)}' (${pending.length} chars) → sent")
             view.onSendBytes?.invoke(pending.toByteArray(Charsets.UTF_8))
         }
-        return super.finishComposingText()
+        val result = super.finishComposingText()
+        // AND-M7(a): 送信済みテキストを内部Editableに溜め続けない。
+        resetEditable()
+        return result
+    }
+
+    /**
+     * AND-M7: `BaseInputConnection(fullEditor=true)`の内部Editableは、送信済みテキストを
+     * クリアしない限り無限に肥大する(長時間セッションでメモリが増え続け、IMEによっては
+     * `getExtractedText`/カーソル同期も重くなる)。端末は送信済みテキストを保持する必要が
+     * 無いため、コミット/確定のたびにcomposing spanごと空に戻す。
+     */
+    private fun resetEditable() {
+        val editable = getEditable() ?: return
+        BaseInputConnection.removeComposingSpans(editable)
+        editable.clear()
     }
 
     override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
@@ -59,11 +87,29 @@ class TerminalInputConnection(
             setComposingText(newText, 1)
             return true
         }
-        repeat(beforeLength) { view.onSendBytes?.invoke(byteArrayOf(0x7F)) }
+        // AND-M7(c): IME側の異常に大きな値でDELを大量送信しない。
+        repeat(beforeLength.coerceIn(0, MAX_DELETE_BEFORE)) { view.onSendBytes?.invoke(byteArrayOf(0x7F)) }
         return true
     }
 
+    /**
+     * IMEから届いたキーイベント。端末として処理できなかったもの(Shift単押し等)だけを
+     * `super.sendKeyEvent`(=Viewへの再注入)へ回す。
+     */
     override fun sendKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && handleKeyDown(event)) return true
+        return super.sendKeyEvent(event)
+    }
+
+    /**
+     * ACTION_DOWNのキーを端末入力として処理し、処理した場合true。
+     *
+     * AND-M7(d): [TerminalInputView.onKeyDown](物理キーボード経由)からは[sendKeyEvent]ではなく
+     * こちらを直接呼ぶ。以前はonKeyDownが[sendKeyEvent]を呼び、未処理キーが
+     * `super.sendKeyEvent`→`ViewRootImpl.dispatchKeyFromIme`で同じViewへ再注入され、
+     * 再び`onKeyDown`→[sendKeyEvent]…と再注入ループになりうる構造だった。
+     */
+    fun handleKeyDown(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             // IME 変換中（日本語 henkan 中など、確定前の composing テキストが残っている間）は
             // 以下の物理ショートカット判定（アプリレベルショートカット・Ctrl/Alt 明示送出）を
@@ -149,7 +195,7 @@ class TerminalInputConnection(
                 return true
             }
         }
-        return super.sendKeyEvent(event)
+        return false
     }
 
     /**
