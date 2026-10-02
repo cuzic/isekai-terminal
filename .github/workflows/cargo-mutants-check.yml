@@ -98,10 +98,18 @@ jobs:
           restore-keys: |
             cargo-mutants-${{ runner.os }}-
 
-      - name: Install cargo-zigbuild and cargo-mutants
+      - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,cargo-mutants
+          tool: cargo-zigbuild
+
+      # cargo-mutantsの事前ビルド済みgnuバイナリはglibc 2.39を要求し、self-hosted VM
+      # (Debian 12、glibc 2.36)では動かない。ソースからインストールする(32コアで約26秒)。
+      - name: Install cargo-mutants (if missing)
+        run: |
+          if ! command -v cargo-mutants >/dev/null; then
+            cargo install cargo-mutants --locked
+          fi
 
       - name: Build musl isekai-pipe (embedded via include_bytes! in isekai-terminal-core)
         working-directory: rust-core
