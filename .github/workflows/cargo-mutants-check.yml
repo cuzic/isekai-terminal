@@ -9,9 +9,9 @@ name: cargo-mutants sweep (on-demand)
 #   - self-hosted-gcp-spot(既定): cargo-ci-gcp-spot-instanceスキル(~/.claude/skills/
 #     cargo-ci-gcp-spot-instance)で用意したGCP Spot VMをephemeral self-hosted runner
 #     として登録して使う(事前にrunner登録が必要、詳細はそのスキルのSKILL.md参照)。
-#     ツールチェーン・cargo依存・musl埋め込みバイナリが永続ディスクに常駐しているため、
-#     依存インストールが丸ごと不要になり、GitHub-hostedのjob時間制限を気にせず
-#     全ミュータント走査のような重いジョブを回せる。
+#     VMは毎回新規作成(永続ディスク・キャッシュ無し)なのでツールチェーンは毎回導入する
+#     が、GitHub-hostedのjob時間制限を気にせず全ミュータント走査のような重いジョブを
+#     回せる。
 #   - github-hosted: GitHub-hosted ubuntu-latest。依存インストールを毎回行うため
 #     大きなcrate/broadなfilterでは非現実的だが、狭いfilter(1関数程度)での
 #     動作確認には使える。
@@ -61,53 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── self-hosted-gcp-spot専用: VMは使うたびに新規作成され永続ディスクを持たない
-      #    (2026-10、PD課金対策)。/mnt/cache配下のツールチェーン(rustup/cargo-home/
-      #    zig)はGitHubのactions/cacheで保存・復元する(self-hosted runnerでも動く)。
-      #    rust-core/targetは10GB上限に収まらない恐れがあるため対象外(毎回ビルド)。
-      - name: Cache toolchains (self-hosted only)
-        if: inputs.runner_type == 'self-hosted-gcp-spot'
-        uses: actions/cache@v4
-        with:
-          path: |
-            /mnt/cache/cargo-home-isekai-terminal
-            /mnt/cache/rustup-home-isekai-terminal
-            /mnt/cache/zig
-          key: cargo-mutants-selfhosted-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            cargo-mutants-selfhosted-
-
-      # ── self-hosted-gcp-spot専用: 永続ディスク側のキャッシュ済み環境を指す
-      #    環境変数を$GITHUB_ENVへ書く(/etc/environmentのソースだけでは子プロセスに
-      #    exportされない不具合を過去に踏んでいるため、cargo-ci-gcp-spot-instance
-      #    スキル参照。GitHub Actions自体が保証する$GITHUB_ENV/$GITHUB_PATHの
-      #    伝播機構を使い同じ地雷を避ける)。複数リポジトリがこのVMを使い回すため
-      #    リポジトリ名をサブパスに含める(同スキルの「複数プロジェクトでの共有」節参照)。
-      - name: Point at /mnt/cache toolchain dirs (self-hosted only)
-        if: inputs.runner_type == 'self-hosted-gcp-spot'
-        run: |
-          echo "CARGO_HOME=/mnt/cache/cargo-home-isekai-terminal" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=/mnt/cache/rustup-home-isekai-terminal" >> "$GITHUB_ENV"
-          echo "/mnt/cache/cargo-home-isekai-terminal/bin" >> "$GITHUB_PATH"
-          echo "/mnt/cache/zig" >> "$GITHUB_PATH"
-
-      # rust-core/targetはinclude_bytes!がCARGO_MANIFEST_DIRからの相対パスを
-      # ハードコードしているため、CARGO_TARGET_DIRでは永続化できない
-      # (cargo-ci-gcp-spot-instanceスキル参照)。actions/checkoutで作られる
-      # 毎回新しいワークスペースの中で、都度シンボリックリンクを張り直す。
-      - name: Symlink rust-core/target to persistent cache (self-hosted only)
-        if: inputs.runner_type == 'self-hosted-gcp-spot'
-        run: |
-          mkdir -p /mnt/cache/target-isekai-terminal-gha-runner
-          rm -rf rust-core/target
-          ln -sfn /mnt/cache/target-isekai-terminal-gha-runner rust-core/target
-
-      # 新しいcargo-ci-gcp-spot-instanceスキルの「素のコンピュート」設計上、
-      # 言語ごとのビルド依存(build-essential等)はworkflow側の責務(startup script
-      # のコメント参照)。cargo-zigbuild等のRustクレートはbuild.rsでネイティブ
-      # `cc`を要求するため、無いと`linker "cc" not found`で失敗する
-      # (2026-07-24に実際に踏んだ)。ciuserにはNOPASSWD sudoが与えられている。
-      - name: Install build-essential (self-hosted only, idempotent)
+      # self-hosted-gcp-spotのVMは使うたびに新規作成され、永続ディスクもキャッシュも
+      # 持たない(2026-10、PD課金対策。cargo-ci-gcp-spot-instanceスキル参照)。
+      # github-hostedと同じ手順でツールチェーンを毎回導入する(Rust/zig/cargo-*は
+      # 合計1〜2分程度で、キャッシュの有無による差は実測で約1分だった)。
+      # 唯一の差分は、素のDebianにはcc(cargo-zigbuild等のbuild.rsが要求)が無い点。
+      # ciuserにはNOPASSWD sudoが与えられている。
+      - name: Install build-essential (self-hosted only)
         if: inputs.runner_type == 'self-hosted-gcp-spot'
         run: |
           if ! command -v cc >/dev/null; then
@@ -115,44 +75,16 @@ jobs:
             sudo apt-get install -y -qq build-essential
           fi
 
-      - name: Install Rust toolchain (github-hosted only)
-        if: inputs.runner_type != 'self-hosted-gcp-spot'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      # self-hosted-gcp-spotの永続ディスク(/mnt/cache)にはRust/Android等の
-      # 言語ツールチェーンは一切プリインストールされない設計(汎用「素のコンピュート」
-      # というcargo-ci-gcp-spot-instanceスキルの方針、SKILL.md参照)。dtolnay/
-      # rust-toolchainはCARGO_HOME/RUSTUP_HOMEをrustupの既定パスに戻してしまうため
-      # 使わず、rustup公式スクリプトを直接、永続ディスク上のCARGO_HOME/RUSTUP_HOMEへ
-      # 手動インストールする(既に入っていれば`command -v`でスキップし高速化する)。
-      - name: Install Rust toolchain (self-hosted only, idempotent on persistent disk)
-        if: inputs.runner_type == 'self-hosted-gcp-spot'
-        run: |
-          if ! command -v cargo >/dev/null; then
-            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --default-toolchain stable --no-modify-path
-          fi
 
       - name: Add musl targets
         run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-      - name: Install zig (github-hosted only)
-        if: inputs.runner_type != 'self-hosted-gcp-spot'
+      - name: Install zig
         uses: mlugg/setup-zig@v2
         with:
           version: latest
-
-      # zigも同様に永続ディスクへ直接展開する(mlugg/setup-zigはランナーの一時領域に
-      # 展開するため、instance再作成のたびに再ダウンロードが必要になってしまう)。
-      - name: Install zig (self-hosted only, idempotent on persistent disk)
-        if: inputs.runner_type == 'self-hosted-gcp-spot'
-        run: |
-          if ! command -v zig >/dev/null; then
-            ZIG_VERSION=0.13.0
-            curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
-              | tar -xJ -C /mnt/cache
-            mv "/mnt/cache/zig-linux-x86_64-${ZIG_VERSION}" /mnt/cache/zig
-          fi
 
       - name: Cache Cargo (github-hosted only)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
@@ -166,17 +98,10 @@ jobs:
           restore-keys: |
             cargo-mutants-${{ runner.os }}-
 
-      - name: Install cargo-zigbuild (if missing)
-        run: |
-          if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild
-          fi
-
-      - name: Install cargo-mutants (if missing)
-        run: |
-          if ! command -v cargo-mutants >/dev/null; then
-            cargo install cargo-mutants --locked
-          fi
+      - name: Install cargo-zigbuild and cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,cargo-mutants
 
       - name: Build musl isekai-pipe (embedded via include_bytes! in isekai-terminal-core)
         working-directory: rust-core
