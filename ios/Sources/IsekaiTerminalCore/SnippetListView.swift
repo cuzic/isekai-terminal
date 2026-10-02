@@ -34,7 +34,7 @@ public struct SnippetListView: View {
     private let onEditSnippet: (Snippet) -> Void
     /// Y-P1(#8): テンプレートを選ぶと、そのラベル/コマンドを引き継いだ未保存の
     /// `Snippet`(`id == nil`)を編集画面へ渡す(Android版`onAddFromTemplate`と対称、
-    /// `ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+    /// `docs/adr/0001-ios-parity-implementation.md` §3.3)。
     private let onAddFromTemplate: (SnippetTemplate) -> Void
     @State private var showTemplatePicker = false
 
@@ -126,7 +126,7 @@ private struct SnippetRow: View {
 }
 
 /// Y-P1(#8): テンプレート選択シート。Android版`SnippetListScreen.kt`の
-/// `showTemplatePicker`ダイアログと対称(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+/// `showTemplatePicker`ダイアログと対称(`docs/adr/0001-ios-parity-implementation.md` §3.3)。
 private struct SnippetTemplatePickerView: View {
     let onPick: (SnippetTemplate) -> Void
     @Environment(\.dismiss) private var dismiss

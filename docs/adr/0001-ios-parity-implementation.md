@@ -15,7 +15,7 @@
 
 ## 0. 改訂履歴
 
-### Round 3（2026-08-21）— `ADR_REVIEW_ROUND2.md` への対応（最終）
+### Round 3（2026-08-21）— `docs/adr/reviews/0001-ios-parity-implementation-review-round2.md` への対応（最終）
 
 round-2 レビューは **blocking ゼロ・B1〜B4 すべて resolved** と判定し、
 S2 の反論も「アーキテクト側が正しい、こちらの事実誤認だった」と明示的に撤回された。
@@ -36,9 +36,9 @@ minor 3件・Q9〜Q11 への回答を反映して収束させたのが本改訂�
 | Q9（Android の claim を Rust へ寄せない）を**トリガー付き follow-up** として記録、Q10（Y-R では Android は no-op + log のまま）、Q1・Q2 は現状維持で確定 | Q9/Q10/Q1/Q2 |
 | リスク表に NP1〜NP4 由来の4件を追加 | round-2 §8 |
 
-### Round 2（2026-08-21）— `ADR_REVIEW_ROUND1.md` への対応
+### Round 2（2026-08-21）— `docs/adr/reviews/0001-ios-parity-implementation-review-round1.md` への対応
 
-レビュアーによる敵対的レビュー（`ADR_REVIEW_ROUND1.md`、blocking 4件・significant 10件・
+レビュアーによる敵対的レビュー（`docs/adr/reviews/0001-ios-parity-implementation-review-round1.md`、blocking 4件・significant 10件・
 minor 3件・premortem 5シナリオ）を受けての全面改訂。**round-1 の最大の誤りは、
 「Rust側の public API 追加は1つも必要ない」という headline conclusion が
 自分の設計自身によって破られていたこと**（B3）である。round-2 ではこれを撤回し、
@@ -1306,7 +1306,7 @@ D-6 に全文を記載した。要点の再掲:
 ## 7. 参照
 
 - `IOS_PARITY_GAP.md`（本ADRの入力となった gap 分析）
-- `ADR_REVIEW_ROUND1.md` / `ADR_REVIEW_ROUND2.md`（敵対的レビュー2ラウンド。
+- `docs/adr/reviews/0001-ios-parity-implementation-review-round1.md` / `docs/adr/reviews/0001-ios-parity-implementation-review-round2.md`（敵対的レビュー2ラウンド。
   round-2 は blocking ゼロで収束と判定し、N1〜N4 の反映をもって完了とした）
 - `PLAN.md` 「Phase Y: iOS対応」節（**Phase 1C #24 の `session_supervisor.rs` 記述は
   既に古い**、§1.3 参照）

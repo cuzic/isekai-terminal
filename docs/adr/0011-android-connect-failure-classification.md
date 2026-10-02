@@ -1,13 +1,13 @@
 # ADR: 接続失敗の分類に基づく体系的リトライ(「常に接続できる」原則の核をAndroidへ移植)
 
-- **Status**: Draft(2026-09-16起草。Windows `isekai-ssh` との接続安定化
+- **Status**: Proposed(2026-09-16起草。Windows `isekai-ssh` との接続安定化
   ギャップ分析セッションから派生。実装着手前にレビュー要——本ADRは
   `opus-adversarial-consult`の対象には含めていない(ユーザー指定))
 - **対象**(見込み、要精査): `rust-core/src/orchestrator.rs`
   (`spawn_reconnect_loop`・`connect_via`)、`rust-core/src/helper_bootstrap.rs`、
   各Transport(`isekai_pipe_quic_transport.rs`・`multipath_transport.rs`・
   `isekai_stun_p2p_transport.rs`)のエラー型
-- **入力**: `ADR_ANDROID_RECONNECT_TIMEOUT.md`と同一のセッション。
+- **入力**: `docs/adr/0013-android-reconnect-timeout.md`と同一のセッション。
   `ISEKAI_PIPE_DESIGN.md` Epic N-2(「常に接続できる」原則への拡張)を
   直接の参照元とする
 - **拘束される既存ルール**: `.claude/rules/rust-ssot.md`、
@@ -53,7 +53,7 @@ Windows(isekai-ssh)はEpic N-2で「単純なQUIC idle timeoutを含む
    状態に起因する失敗(サーバーを再起動しない限りクライアント側の
    再試行では原理的に回復不可能、`always-connects.md`が明記する
    ケース)を、Androidは他の失敗と区別せず同じ手順で
-   `ADR_ANDROID_RECONNECT_TIMEOUT.md`のtimeout(現状60秒)まで
+   `docs/adr/0013-android-reconnect-timeout.md`のtimeout(現状60秒)まで
    単純リトライし続ける。
 3. **本質的に自動化してはいけないケースとの未区別(要確認)**: 新規ホストの
    TOFU確認・ホスト鍵mismatch相当の失敗をAndroid側がどう扱っているかは
@@ -92,8 +92,8 @@ Windows(isekai-ssh)はEpic N-2で「単純なQUIC idle timeoutを含む
 - **最優先**: Android側で「証明書pin不一致・ホスト鍵mismatch」相当の
   失敗は現状どう扱われているか(既存実装の再確認が必要。無ければ
   「別途対処が必要なバグ」に格上げ)。
-- `ADR_ANDROID_RECONNECT_TIMEOUT.md`(timeout設計)・
-  `ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`(reattach予算)との実装順序
+- `docs/adr/0013-android-reconnect-timeout.md`(timeout設計)・
+  `docs/adr/0012-android-midsession-resume-budget.md`(reattach予算)との実装順序
   ——本ADRの分類を先に入れておくと、他2件の「自動化してよい失敗だけを
   長時間リトライする」設計がしやすくなる可能性が高い。
 

@@ -134,7 +134,7 @@ struct HolderLogEntry {
 /// holder mid-`rename` during its own `RotatingLogFile` rotation racing this
 /// scan) must not hide every *other* log this call could otherwise report —
 /// so a failure at any per-entry step is skipped rather than propagated
-/// (ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md §C5). `read_dir` itself failing
+/// (docs/adr/0009-isekai-ssh-exit-diagnostics.md §C5). `read_dir` itself failing
 /// (the directory disappearing between the `exists()` check and here) is the
 /// one case still surfaced to the caller, since there is nothing left to
 /// list at all.
@@ -217,7 +217,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     // repair path below) must keep working even in the degraded environment
     // (`%LOCALAPPDATA%`/`$HOME` unset) `default_log_file()` itself can fail
     // to resolve in -- the same fail-open policy `log_file.rs` applies to
-    // every write it makes (ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md §C3).
+    // every write it makes (docs/adr/0009-isekai-ssh-exit-diagnostics.md §C3).
     if let Ok(default_log) = default_log_file() {
         print_log_locations(&default_log);
     }

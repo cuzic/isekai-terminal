@@ -1,7 +1,7 @@
 # 実機スパイク検証計画: Android接続安定化(ローミング/長時間バックグラウンド耐性)
 
-- **Status**: Draft(2026-09-16起草。`ADR_ANDROID_RECONNECT_TIMEOUT.md`・
-  `ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`のopus-adversarial-consult
+- **Status**: Draft(2026-09-16起草。`docs/adr/0013-android-reconnect-timeout.md`・
+  `docs/adr/0012-android-midsession-resume-budget.md`のopus-adversarial-consult
   round 1レビューで、机上の議論だけでは決められない前提(Doze下での
   ConnectivityManagerコールバック配送・WakeLockの実効性・FGSの実機生存期間等)が
   複数見つかったことを受け、**これ以上の設計判断は実機データを取ってから行う**
@@ -103,7 +103,7 @@ opt-inではなくデフォルト経路に格上げし、可能な限りセッ�
 
 ### 案A〜Eとは独立に必要な前提修正(opus-adversarial-consult round 2で判明)
 
-`ADR_ANDROID_RECONNECT_TIMEOUT.md`/`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`の
+`docs/adr/0013-android-reconnect-timeout.md`/`docs/adr/0012-android-midsession-resume-budget.md`の
 round 2レビューで、**案A〜Eのどれを選んでも共通して必要になる、実機データを
 待たずに設計として決めておくべき修正**が3つ見つかっている。スパイクの
 結果解釈にも影響するため、対象コードを触る前提として明記する:
@@ -224,7 +224,7 @@ round 2レビューで、**案A〜Eのどれを選んでも共通して必要に
 着弾回数」の比率と、着弾までの遅延分布。比率がほぼ100%かつ遅延が数秒〜
 十数秒以内なら案Aの前提は成立。取りこぼしが見られる、または遅延が数分に
 及ぶ場合は、案Aを単独では採用できず、案B/Cとの併用または案Dへ倒す根拠になる。
-**なお、`ADR_ANDROID_RECONNECT_TIMEOUT.md`§3.1.1が指摘する「起床の取りこぼし」
+**なお、`docs/adr/0013-android-reconnect-timeout.md`§3.1.1が指摘する「起床の取りこぼし」
 対策(pending_wake等)を先に実装してからこのスパイクを行うこと**——対策無しで
 計測すると、コールバック自体は届いていてもin-flight中のpermit破棄で
 再接続が起きず、「コールバックが届いていない」と誤診断するおそれがある。
@@ -252,7 +252,7 @@ debug APK、`pending_wake`実装済み)**: 案Aの前提は**成立**。
   「数秒〜十数秒以内」を大幅に下回る。
 - 副産物: 起床自体は3回とも成功したものの、起床直後の再接続試行はいずれも
   即座に`reason=Channel send error`で失敗した——これは
-  `ADR_ANDROID_POOL_STALE_HANDLE.md`(issue #120)で報告済みのSSHプール
+  `docs/adr/0016-android-pool-stale-handle.md`(issue #120)で報告済みのSSHプール
   stale handle再利用バグが同一試行内で再現したもの(90秒のidle graceが
   経過する前だったため)。**案Aの「起床」自体は完全に機能しているが、
   起床後に実際に再接続が成功するには別途この pool バグの修正が必要**

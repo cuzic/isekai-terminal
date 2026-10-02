@@ -95,7 +95,7 @@ const CONTROL_ACK_FRAME_LEN: usize = 1 + SESSION_ID_LEN;
 /// `pub` (not `pub(crate)`) so `isekai-pipe`'s own per-attempt cost budgets
 /// (`resume_loop.rs`'s `CROSS_FAMILY_MIN_PROBE_BUDGET`) can derive from this
 /// value directly instead of hand-mirroring it in a comment across crates
-/// (`/code-review` finding on `ADR_STUN_REESTABLISH_CONTINUITY.md`'s
+/// (`/code-review` finding on `docs/adr/0006-stun-reestablish-continuity.md`'s
 /// implementation — the very mismatch that caused opus review round 5's
 /// finding on that ADR).
 pub const TRANSPORT_STEP_TIMEOUT: Duration = Duration::from_secs(15);

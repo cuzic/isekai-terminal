@@ -1,6 +1,6 @@
 # ADR: STUN P2Pに、relayへの自動フォールバックをopt-in変種として追加する(Android)
 
-- **Status**: Draft(2026-09-16起草。Windows `isekai-ssh` との接続安定化
+- **Status**: Proposed(2026-09-16起草。Windows `isekai-ssh` との接続安定化
   ギャップ分析セッションから派生。実装着手前にレビュー要——本ADRは
   `opus-adversarial-consult`の対象には含めていない(ユーザー指定)が、
   §3の「既存のセキュリティ判断と矛盾しないか」は着手前に必ず再確認すること)
@@ -10,7 +10,7 @@
   `android/src/main/kotlin/tools/isekai/terminal/data/ConnectionProfile.kt`・
   `ProfileEditScreen.kt`。**前提として`rust-core/src/isekai_link_relay_transport.rs`
   (MASQUE relay)の実装完了が必要**(§3参照)
-- **入力**: `ADR_ANDROID_RECONNECT_TIMEOUT.md`と同一のセッション
+- **入力**: `docs/adr/0013-android-reconnect-timeout.md`と同一のセッション
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`。
   PLAN.md Phase 10「STUN/Relayのフォールバックなし設計」の既存判断
   (下記§1.1)

@@ -112,7 +112,7 @@ pub(crate) fn spawn_isekai_pipe_connect(
 }
 
 /// Priority order for the `isekai-pipe connect` child's `ISEKAI_PIPE_LOG_FILE`
-/// target (`ADR_ISEKAI_SSH_OBSERVABILITY.md` §3.1): (1) `--isekai-log-file`
+/// target (`docs/adr/0008-isekai-ssh-observability.md` §3.1): (1) `--isekai-log-file`
 /// explicit override, if given; (2) the holder-specific rotating log
 /// ([`crate::native::mux::naming::pipe_holder_log_file`]), if `is_holder` (the caller passes
 /// `native::mux::holder::is_holder_reexec()` — kept as a plain `bool`
@@ -245,7 +245,7 @@ mod tests {
     /// `ISEKAI_PIPE_LOG_FILE` are set and inherited by the child (verified
     /// via the child's own env-var preamble — the exact bug an earlier
     /// Codex review caught for the first two, and the exact bug
-    /// `ADR_ISEKAI_SSH_OBSERVABILITY.md` §1.3 found for the third: without
+    /// `docs/adr/0008-isekai-ssh-observability.md` §1.3 found for the third: without
     /// it, `isekai-pipe connect`'s diagnostic logging vanishes into the
     /// holder's null stderr), and bytes round-trip through `ChildStdio`
     /// afterward.

@@ -1,6 +1,6 @@
 # ADR: pool.rs修正(issue #120/PR #119)実装後にコードレビューで見つかった残存ギャップ
 
-- **Status**: Draft(2026-09-17起草、rev4。`ADR_ANDROID_POOL_STALE_HANDLE.md`
+- **Status**: Proposed(2026-09-17起草、rev4。`docs/adr/0016-android-pool-stale-handle.md`
   (rev4、収束済み)の実装(PR #119、コミット4793ebcd・c4eb37ac)がmainへ
   マージ前の`/code-review`で発見された指摘のうち、同ADRの設計範囲に
   直接関わる2件を切り出して検討する。opus-adversarial-consult round 1で
@@ -23,7 +23,7 @@
   (`pooled.handle`のMutexをawait中握り続ける全箇所)、
   `rust-core/src/pool.rs`(`mark_dead_if_same`、変更しないことを確認)
 - **入力**: PR #119の`/code-review`(2026-09-17実施、8観点並列+4バッチ検証、
-  10件中2件が本ADRの対象)。`ADR_ANDROID_POOL_STALE_HANDLE.md`(収束済み、
+  10件中2件が本ADRの対象)。`docs/adr/0016-android-pool-stale-handle.md`(収束済み、
   §2.4「削除タイマーが値に関わらず成熟しないライブロック」・§3.2「限界」・
   §3.4項目2)。opus-adversarial-consult round 1
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-followup-gaps.md`)・
@@ -37,7 +37,7 @@
 
 ## 1. 背景
 
-`ADR_ANDROID_POOL_STALE_HANDLE.md`(以下「元ADR」)は、SSH接続プールが
+`docs/adr/0016-android-pool-stale-handle.md`(以下「元ADR」)は、SSH接続プールが
 死んだハンドルを再利用し続けるバグ(issue #120)を、(a)`try_attach`への
 生存確認+tombstone-in-place(I1〜I4)、(b)`run_ssh_channel_loop`の
 最初の`channel_open_session()`だけを`RUN_EXEC_TIMEOUT`でタイムアウトさせ

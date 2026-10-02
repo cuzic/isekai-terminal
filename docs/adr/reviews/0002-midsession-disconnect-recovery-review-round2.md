@@ -1,4 +1,4 @@
-# Review Round 2: `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（opus-critic-a、単独）
+# Review Round 2: `docs/adr/0002-midsession-disconnect-recovery.md`（opus-critic-a、単独）
 
 opus-critic-bはround 1 draftで収束（「収束、blocking/significantなし」）。
 opus-critic-aは同じround 1 draftに新規blocking 2件・significant 5件を

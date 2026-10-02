@@ -1,12 +1,12 @@
 # ADR: 完全切断時の自動再接続タイムアウトを見直す(Android)
 
-- **Status**: Draft(2026-09-16起草。round 1レビューで§1の現状認識(フォア
+- **Status**: Proposed(2026-09-16起草。round 1レビューで§1の現状認識(フォア
   グラウンド復帰による自動復旧が実際には機能していない)を訂正し、B案を
   「締切を外す」から「起床源をnetwork callback主導に切り替える」へ書き直した。
   round 2レビューで、B案が「起床の取りこぼしを致命化させる」欠落(§3.1)・
   「認証失敗を無限にリトライする」欠落(§3.2、新規タスク追加)・
   iOSとの矛盾(§3.4)を指摘され修正。ユーザー判断により、これ以上の設計判断は
-  `ANDROID_RECONNECT_SPIKE_PLAN.md`の実機スパイク結果を得てから行う——
+  `docs/spikes/android-reconnect-stability.md`の実機スパイク結果を得てから行う——
   本ADRは現時点でのDraftとして凍結し、スパイク結果を受けて改訂する)
 - **対象**(見込み、要精査): `rust-core/src/orchestrator.rs`(`ReconnectPolicy`・
   `spawn_reconnect_loop`・`BackgroundState`)。`ConnectionPublicState::Reconnecting`の
@@ -87,13 +87,13 @@ OSからメモリ逼迫を告げられた場合のみ**であり、本節の本�
 120秒→10日へ引き上げ、`wrapper.rs`の`RECONNECT_BUDGET`(24時間)という
 予算軸を持つ。Android側はこの教訓が反映されないまま60秒だけが残っている。
 
-### 1.4 マルチパス経路には本ADRの層以外に砦が無い(`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`との関係)
+### 1.4 マルチパス経路には本ADRの層以外に砦が無い(`docs/adr/0012-android-midsession-resume-budget.md`との関係)
 
-`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`(round 1レビューで判明)の通り、
+`docs/adr/0012-android-midsession-resume-budget.md`(round 1レビューで判明)の通り、
 `multipath_transport.rs`にはmid-sessionのreattach層が存在しない。
 `RebindManager`のWi-Fi⇔セルラーフェイルオーバーが失敗した場合、即座に
 本ADRが扱う60秒ループへ処理が移る。実機で最も頻繁に踏まれるのはこの経路と
-見られ、**本ADRは`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`より優先度が高く、
+見られ、**本ADRは`docs/adr/0012-android-midsession-resume-budget.md`より優先度が高く、
 単独で先行して出荷できる。**
 
 ### 1.5 Foreground Serviceとの関係
@@ -179,11 +179,11 @@ Rust側の`ReconnectPolicy.timeout`という**別の**時間ベースの締切�
 - パス変化時にin-flightの試行をabortする(現状`connect_via`にキャンセル
   機構は無いので新設が必要)。
 
-### 3.2 orchestrator層の失敗分類(round 2レビューで新規追加——`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`タスク1と同型)
+### 3.2 orchestrator層の失敗分類(round 2レビューで新規追加——`docs/adr/0012-android-midsession-resume-budget.md`タスク1と同型)
 
 **B案(§3.1)は「無期限リトライ」または「大幅に長いリトライ」を導入するが、
 現状のorchestratorは失敗理由を一切見ずに同じ手順を繰り返す。これは
-`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`が対象にしていたreattach層と
+`docs/adr/0012-android-midsession-resume-budget.md`が対象にしていたreattach層と
 同型の欠落だが、締切を外す(=長時間化させる)のはこちらの方であり、
 危険度はこちらの方が大きい。**
 
@@ -210,12 +210,12 @@ Rust側の`ReconnectPolicy.timeout`という**別の**時間ベースの締切�
 
 **タスク**: 恒久的失敗(認証失敗・ホスト鍵不一致等)と判定できるものは
 即座に諦めて`Disconnected`を出す分類を`orchestrator.rs`に追加する。
-`ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`§3.1と完全に同型の作業であり、
+`docs/adr/0012-android-midsession-resume-budget.md`§3.1と完全に同型の作業であり、
 2本のADRで同じ設計判断を共有できる。
 
 **round 3レビューで発見された2つの追加要件(必須)**:
 
-1. **単発判定ではなくガードを課すこと**: `ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`
+1. **単発判定ではなくガードを課すこと**: `docs/adr/0012-android-midsession-resume-budget.md`
    §3.1は「1回の確定的に見えるシグナルは消滅の証拠にならない」という
    Epic N-3の教訓から、`UNKNOWN_SESSION_CONFIRM_THRESHOLD`(N回連続)+
    `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`(最小経過時間)の2つ組を必須にしている。
@@ -318,7 +318,7 @@ recompositionが走り、`forEachPane`でタブ/ペインごとに独立した�
 通知間隔をリトライ間隔に合わせて伸ばす)。判断材料は既に`OrchestratorState::
 app_foreground`(`orchestrator.rs:379`)にある。
 
-**出荷ゲート(round 2レビューで追加)**: `ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`と
+**出荷ゲート(round 2レビューで追加)**: `docs/adr/0012-android-midsession-resume-budget.md`と
 同様、再接続中の状態(無期限リトライ中であること・キャンセル導線)がUIに
 正しく表現されるようになるまで、締切の延長・無期限化のいずれも出荷しない。
 
@@ -360,7 +360,7 @@ acceptable use casesにSSHクライアントは該当せず、誤用はアプリ
 しており、Doze検証中にadbを意図的に切る手順を挟む場合はその間を
 取りこぼす、の2点。指標2・3は、Doze/長時間計測中はローカルへ永続化
 (既存のSharedPreferencesかファイル)してから後で吸い上げる形にする。
-詳細と具体的な計測手順は`ANDROID_RECONNECT_SPIKE_PLAN.md`参照(Doze強制
+詳細と具体的な計測手順は`docs/spikes/android-reconnect-stability.md`参照(Doze強制
 遷移には`adb shell dumpsys battery unplug`が前提条件として必須——
 充電中はDozeに入らないため、これが無いと指標2・3が全て空振りする)。
 
@@ -399,7 +399,7 @@ FGSごとプロセスが死んだ場合に効く3層目が既に存在する**: 
   共有であり、変更すれば両方に波及するため)。§3.4のsentinel案(型を
   変えない)を採用できれば、この非目標との緊張自体が解消される。
 - `resume_client.rs`側のmid-session reattach予算は
-  `ADR_ANDROID_MIDSESSION_RESUME_BUDGET.md`で扱う別レイヤの問題。
+  `docs/adr/0012-android-midsession-resume-budget.md`で扱う別レイヤの問題。
 
 ## 5. Open Questions
 

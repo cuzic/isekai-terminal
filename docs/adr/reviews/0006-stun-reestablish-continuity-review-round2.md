@@ -1,9 +1,9 @@
-# ADR_STUN_REESTABLISH_CONTINUITY.md 批判的レビュー（round 2）
+# docs/adr/0006-stun-reestablish-continuity.md 批判的レビュー（round 2）
 
-- **対象**: `/home/cuzic/isekai-terminal/ADR_STUN_REESTABLISH_CONTINUITY.md`（Status: Draft rev2）
+- **対象**: `docs/adr/0006-stun-reestablish-continuity.md`（Status: Draft rev2）
   および `/home/cuzic/isekai-terminal/ADR_INPUT_RESUME_SYMMETRY.md`（§3 論点1/3/4/5 更新分）
 - **レビュー日**: 2026-09-13
-- **前回**: `/home/cuzic/isekai-terminal/ADR_STUN_REESTABLISH_CONTINUITY_REVIEW.md`（round 1）
+- **前回**: `docs/adr/reviews/0006-stun-reestablish-continuity-review-round1.md`（round 1）
 - **レビュー種別**: 実装着手前の設計方針レビュー（読み取り・分析のみ。コードは一切変更していない）
 
 ---
@@ -26,7 +26,7 @@
   - [R2-C4. §3.2 タスク4（preempt ping-pong ラッチ）は駆動主体が1つしかないため前提が成立していない可能性](#r2-c4)
   - [R2-C5. §6 の成功基準は分母・目標値・読み出し手段が未定義で、このままでは測れない](#r2-c5)
 - [D. NICE-TO-HAVE: 軽微な不整合・体裁](#section-d)
-- [E. `ADR_INPUT_RESUME_SYMMETRY.md` 側の確認結果](#section-e)
+- [E. `docs/adr/0005-input-resume-symmetry.md` 側の確認結果](#section-e)
 - [F. 結論と、Approved までに必要な差分](#section-f)
 
 ---
@@ -76,7 +76,7 @@
 
 ### R2-B1. §3.2 タスク2（bail-out の「置き換え」）は §4.1 が禁じている破壊を再導入する
 
-**該当**: `ADR_STUN_REESTABLISH_CONTINUITY.md` §3.2 タスク2（135-136行目）
+**該当**: `docs/adr/0006-stun-reestablish-continuity.md` §3.2 タスク2（135-136行目）
 
 > 2. `isekai-pipe/src/connect.rs:835-843`の`MidSessionDisconnectSignal`
 >    bail-outを、上記1のresume-preserving fallback呼び出しに置き換える。
@@ -196,7 +196,7 @@ slot 不一致）を同じ `quicmux::ResumeRejectReason::UnknownToken` に潰し
    「Windows/native のみ」と書くと、Unix が対象外だと読まれてしまう。
 
 2. **`native/` は Windows 専用のモジュールであり、しかも Windows の既定経路ですらない。**
-   `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.4 が明記している通り、経路は3つある:
+   `docs/adr/0002-midsession-disconnect-recovery.md` §2.4 が明記している通り、経路は3つある:
    - **Unix**: `wrapper.rs::run_ssh_with_connect_failure_recovery`（`ssh(1)` を spawn）
    - **Windows 単一プロセス fallback**: `native/connect.rs` の対応関数
    - **Windows mux 経路（既定）**: 新ループを持たず既存 `native::mux::run_with_reconnect` を使う
@@ -559,7 +559,7 @@ ping-pong が起きるには**独立した2つの再接続駆動主体**が必�
 
 **修正案**: タスク4 を「ラッチを持つこと」という断定から、
 **「2駆動主体が実在するかをまず確認し、実在する場合のみラッチを入れる」**に
-格下げする。これは `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.2.2 の S1 対応
+格下げする。これは `docs/adr/0002-midsession-disconnect-recovery.md` §2.2.2 の S1 対応
 （孫プロセス孤児化、「実装時にまず実測してから機構の要否を決める」）と同じ進め方であり、
 このリポジトリに前例がある。存在しない競合のためにラッチという状態を1つ増やすのは、
 `rust-ssot.md` が戒めている「判断のためのミラー状態を増やす」方向でもある。
@@ -613,13 +613,13 @@ ping-pong が起きるには**独立した2つの再接続駆動主体**が必�
   2つ問題がある。(1) `"abandoned"` は §1.1 でわざわざ「接続失敗を意味し、連続性喪失では
   ない」と訂正した語であり、ここで新しい意味に再利用すると round 1 で起きた誤解が
   そのまま再発する（→ R2-B5 の新 class 名を使うこと）。(2) 参照先の `（§7）` は
-  `ADR_INPUT_RESUME_SYMMETRY.md` との関係を述べる節であり、再評価の話は書かれていない。
+  `docs/adr/0005-input-resume-symmetry.md` との関係を述べる節であり、再評価の話は書かれていない。
   `§9`（次のステップ）を指すべき、あるいは §9 に「§4.2 の再評価トリガ」を追記する。
 
 - **R2-D2. ヘッダの「対象」に入力キューが混ざっている**（8-9行目）
   > `resume_loop.rs`（give-up境界の直前処理・**入力キューの置き場所**）
 
-  入力キューの実装は `ADR_INPUT_RESUME_SYMMETRY.md` の担当であり、本 ADR は
+  入力キューの実装は `docs/adr/0005-input-resume-symmetry.md` の担当であり、本 ADR は
   「置き場所を決める」だけ（§7.1）。本 ADR の「対象（変更するファイル）」に含めると
   所有権が曖昧になる。「§7.1 で置き場所を決めるが、実装は別 ADR」と明記するか、
   対象から外すこと。
@@ -643,7 +643,7 @@ ping-pong が起きるには**独立した2つの再接続駆動主体**が必�
 
 <a id="section-e"></a>
 
-## E. `ADR_INPUT_RESUME_SYMMETRY.md` 側の確認結果
+## E. `docs/adr/0005-input-resume-symmetry.md` 側の確認結果
 
 **結論: §7.1/§7.2 の内容が正しく、かつ矛盾なく反映されている。** 具体的には:
 
@@ -677,7 +677,7 @@ ping-pong が起きるには**独立した2つの再接続駆動主体**が必�
 
    §3 の論点1・4 は本 ADR の round 1 レビューを経て**既に結論が出ている**。
    「設計相談は未実施」は現状と食い違う。「論点1・4 は
-   `ADR_STUN_REESTABLISH_CONTINUITY.md` round 1 レビュー経由で決着済み、
+   `docs/adr/0006-stun-reestablish-continuity.md` round 1 レビュー経由で決着済み、
    論点2・3 は同 ADR §3 の確定待ち」と書き分けること。
 
 ---
@@ -731,15 +731,15 @@ ping-pong が起きるには**独立した2つの再接続駆動主体**が必�
    §3.3 に明記し、計装で**失敗理由を「セッション消滅」と「relay 到達不能」に
    分けて記録する**ことをタスク3 の要件に加える。
 10. **R2-C4**: タスク4（preempt ラッチ）を「まず 2駆動主体が実在するか確認する」へ格下げ
-    （`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.2.2 S1 と同じ進め方）。
+    （`docs/adr/0002-midsession-disconnect-recovery.md` §2.2.2 S1 と同じ進め方）。
     サーバー側 preempt 待ちがレイテンシに乗る点だけはタスクとして残す。
 11. **R2-C5**: §6 の成功基準に分母（give-up 境界到達回数）・目標値・読み出し手段を書く。
 
-### 付随（`ADR_INPUT_RESUME_SYMMETRY.md` 側）
+### 付随（`docs/adr/0005-input-resume-symmetry.md` 側）
 
 12. ヘッダの「対象」を `isekai-pipe/src/resume_loop.rs` 中心へ更新（現状、本文の結論で
     否定された `isekai-transport`/`isekai-ssh/src/session.rs` が残っている）。
-13. Status 行を「論点1・4 は決着済み、論点2・3 は `ADR_STUN_REESTABLISH_CONTINUITY.md`
+13. Status 行を「論点1・4 は決着済み、論点2・3 は `docs/adr/0006-stun-reestablish-continuity.md`
     §3 の確定待ち」に書き分ける。
 
 ### round 3 の要否
@@ -788,6 +788,6 @@ round 3 では R2-B1/B6 の書き直し結果と、R2-C1 の判断（切替ト�
   `to_legacy_relay_transport` 168-177
 - `rust-core/isekai-ssh/src/main.rs`
   — `mod wrapper;`（`#[cfg]` ゲートされていない）25行目付近
-- `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
+- `docs/adr/0002-midsession-disconnect-recovery.md`
   — §2.4（Unix / Windows 単一プロセス fallback / Windows mux 既定 の3経路）、
   §2.2.2 S1（「実測してから機構の要否を決める」の前例）

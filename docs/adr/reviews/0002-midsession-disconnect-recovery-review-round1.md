@@ -1,4 +1,4 @@
-# Review Round 1: `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（opus 2体、独立並行レビュー）
+# Review Round 1: `docs/adr/0002-midsession-disconnect-recovery.md`（opus 2体、独立並行レビュー）
 
 opus-critic-a・opus-critic-bの2エージェントに、ADR draft(round 0)を独立に
 （互いの指摘を見せずに）実コード裏取り込みでレビューさせた。両者が

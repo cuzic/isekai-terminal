@@ -1,4 +1,4 @@
-# Review Round 2: `ADR_PARAM_COHESION_REFACTOR.md`(opus 2体、独立並行レビュー)
+# Review Round 2: `docs/adr/0003-param-cohesion-refactor.md`(opus 2体、独立並行レビュー)
 
 round 1の指摘を反映したADR改訂版を、opus-critic-a・opus-critic-bへ再度独立に
 (互いの指摘を見せずに)再確認させた。**両者とも「設計面には異論なし」**——

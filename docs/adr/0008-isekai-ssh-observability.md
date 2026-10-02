@@ -1,6 +1,6 @@
 # ADR: isekai-ssh(Windows)の接続ライフサイクル可観測性
 
-- **Status**: **Approved**(2026-09-11〜12起草・同日Approved。
+- **Status**: **Accepted**(2026-09-11〜12起草・同日Accepted。
   opus-adversarial-consult 4ラウンドで収束。Round 1: 当初案の中核前提
   (「Windowsネイティブ経路は`init_verbose`を一度も呼ばない」)がそもそも
   誤りだったと判明し、真因(§1.3、`isekai-pipe connect`子プロセスへの
@@ -24,7 +24,7 @@
 - **拘束される既存ルール**: `.claude/rules/rust-ssot.md`、
   `.claude/rules/always-connects.md`(本ADRが直接支える)、
   `.claude/rules/prefer-gh-actions-over-local-cargo.md`、
-  `ADR_STUN_REESTABLISH_CONTINUITY.md`(未実装のDraft。本ADRはこのADRの
+  `docs/adr/0006-stun-reestablish-continuity.md`(未実装のDraft。本ADRはこのADRの
   §3「現状、真の再ランデブーのケースは検知すらされていないのか」という
   未決の論点に直接答える前提作業)
 
@@ -97,7 +97,7 @@ holder配下だけ別ファイルへ分ける設計にする(§3.2)。ローミ�
 生き続けるのは実際にはholder配下の`isekai-pipe connect`であり、今回の
 インシデントで欲しかった情報はまさにここにあった。
 
-### 1.4 `ADR_STUN_REESTABLISH_CONTINUITY.md`との関係、および計装先の訂正
+### 1.4 `docs/adr/0006-stun-reestablish-continuity.md`との関係、および計装先の訂正
 
 同ADR(2026-09-07起票、未実装のDraft)は、クライアント・サーバー双方の
 実効アドレスが同時に変わる「真の再ランデブー」で、resume連続性
@@ -138,10 +138,10 @@ out of scope、signalingチャネルが無い」と明言しており、新旧
   規約で機能しており、置き換える理由が無い。`ADR_CONNECTION_
   OBSERVABILITY.md`(Android向け)のtracing化はそちらのADRのスコープに
   留め、混同しない。
-- `ADR_STUN_REESTABLISH_CONTINUITY.md`が扱う「連続性そのものを保てないか」
+- `docs/adr/0006-stun-reestablish-continuity.md`が扱う「連続性そのものを保てないか」
   という設計課題の解決。本ADRはあくまで**観測**であり、その判断材料を
   提供する前段。
-- `ADR_INPUT_RESUME_SYMMETRY.md`/`ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`
+- `docs/adr/0005-input-resume-symmetry.md`/`docs/adr/0004-isekai-ssh-local-scrollback.md`
   (同じ2026-09-07セッション由来の別ADR、いずれも未実装)への波及。
 - Prometheus等の集計metricsパイプライン(単一ユーザー・単一デバイスの
   個人用途)。
@@ -203,7 +203,7 @@ holderのログ先を分ける理由の1つ。
   無限成長の懸念自体が無い。
 - **holder配下の子だけ、別の(ローテーション対応の)ログパスへ向ける。**
   `isekai-pipe/Cargo.toml`のログ系依存は`log`+`env_logger`の2つのみで
-  `tracing`系は無く、`ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`のユーザー
+  `tracing`系は無く、`docs/adr/0004-isekai-ssh-local-scrollback.md`のユーザー
   決定事項(「isekai-pipeは薄くありたい」)は明確に依存追加を避ける
   方向を示している。`tracing-appender`は`tracing-subscriber`を
   芋づる式に引き込むため(「単なるWrite実装として使う」つもりでも
@@ -257,10 +257,10 @@ pub fn log_rendezvous_outcome(
    分けてもよいが、本ADRでは「接続できなかった」という粒度で1つに
    まとめる。
 3. (bare redialの既存経路があれば同様に1行追加、無ければ本ADRの
-   スコープでは追わない——`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
+   スコープでは追わない——`docs/adr/0002-midsession-disconnect-recovery.md`
    Task 3.4で「一度だけログ」が既に実装済みとされている経路)。
 
-これにより`ADR_STUN_REESTABLISH_CONTINUITY.md` §3の未決論点
+これにより`docs/adr/0006-stun-reestablish-continuity.md` §3の未決論点
 (「真の再ランデブーは検知されているか」)に直接答えられるようになる。
 
 ### 3.4 相関ID

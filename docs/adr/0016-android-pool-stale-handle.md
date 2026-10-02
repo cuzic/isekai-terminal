@@ -1,6 +1,6 @@
 # ADR: SSH接続プール(`pool.rs`)のstale handle再利用により`TransportPreference::Auto`の自動再接続が構造的に失敗する
 
-- **Status**: Draft(2026-09-16起草、2026-09-17 rev4。issue #120として先行報告済み、
+- **Status**: Proposed(2026-09-16起草、2026-09-17 rev4。issue #120として先行報告済み、
   実機Spike 5の副産物として発見。opus-adversarial-consult round 1で根本原因の因果関係
   そのものが誤っていたことが判明し、rev2で全面的に書き直した——rev1は「90秒の猶予 >
   60秒の再接続タイムアウト」という枠組みだったが、実際は`try_attach`が毎回
@@ -22,7 +22,7 @@
   (プレーンSSHプールの本番`release`呼び出し箇所)
 - **入力**: [issue #120](https://github.com/cuzic/isekai-terminal/issues/120)
   (実機Sony XQ-DQ44、`feat/android-reconnect-spike-infra`のdebug APKでの
-  100%決定的な再現ログを含む)。`ANDROID_RECONNECT_SPIKE_PLAN.md`スパイク5の
+  100%決定的な再現ログを含む)。`docs/spikes/android-reconnect-stability.md`スパイク5の
   実施結果として発見。rev2はopus-adversarial-consult round 1
   (`/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/scratchpad/opus-review-pool-stale-handle.md`)
   の指摘を反映、rev3はround 2

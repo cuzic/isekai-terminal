@@ -42,7 +42,7 @@ final class SnippetEditModelTests: XCTestCase {
 
     /// Y-P1(#8): テンプレートから追加(`IsekaiTerminalApp.swift`の`onAddFromTemplate`は
     /// `id == nil`の下書き`Snippet`を渡す)しても、通常の新規スニペットと同じ経路で
-    /// 永続化されること(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+    /// 永続化されること(`docs/adr/0001-ios-parity-implementation.md` §3.3)。
     func testSaveFromTemplateDraftInsertsNewSnippetLikeAnyOther() throws {
         let db = try ProfileDatabase.inMemory()
         let template = SnippetTemplates.tmuxSessionPicker

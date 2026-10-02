@@ -4,7 +4,7 @@ import Foundation
 /// `TerminalView`が持つ`scrollOffset`/`showingScrollback`(UI表示だけに閉じた状態、
 /// `.claude/rules/rust-ssot.md`の例外)へどう反映すべきかを決める純関数。
 /// Android版`TerminalScreen.kt`の`LaunchedEffect(uiState.promptJumpResult.seq)`内の
-/// 分岐(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.1)をLogic層(Linux CIで検証可能)へ
+/// 分岐(`docs/adr/0001-ios-parity-implementation.md` §3.1)をLogic層(Linux CIで検証可能)へ
 /// 抽出したもの。`PromptJumpTarget.isLive`が「`scrollOffset == 0`はライブ画面表示」
 /// という規約と「scrollback最新行(row=0)表示」を明示的に区別する(タスク#79と同じ理由)。
 public enum PromptNavigation {

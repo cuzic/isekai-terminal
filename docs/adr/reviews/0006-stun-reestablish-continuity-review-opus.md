@@ -1,7 +1,7 @@
 # Opus review: cross-family resume-preserving fallback 実装レビュー
 
 対象: `feat/stun-reestablish-continuity`(`origin/main..HEAD` の4コミット)
-基準: `ADR_STUN_REESTABLISH_CONTINUITY.md` rev4 §3.2 タスク1〜9、§3.3、§4
+基準: `docs/adr/0006-stun-reestablish-continuity.md` rev4 §3.2 タスク1〜9、§3.3、§4
 性質: 読み取り専用レビュー(ファイルは一切編集していない)。行番号はこの worktree の
 HEAD 時点のもの。
 
@@ -870,7 +870,7 @@ streak がリセットされ続ける」という元々の狭いケースのみ�
 
 ## 最終判定
 
-ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 のタスク1〜9は、すべて意図通りに
+docs/adr/0006-stun-reestablish-continuity.md §3.2 のタスク1〜9は、すべて意図通りに
 実装されていることを確認した。round 1 の critical 1件・major 2件・minor 9件、
 round 2 の major 1件・minor 3件について、対応されたものは正しく対応され、
 据え置かれたものはいずれも実害が計測品質か稀な経路に限られる。
@@ -1353,7 +1353,7 @@ fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
     remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
 }
 
-/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// The failure-count switch trigger (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 1's second disjunct), made deadline-aware.
 ///
 /// The count alone silently *never fires* whenever the episode's deadline is

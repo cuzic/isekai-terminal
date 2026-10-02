@@ -50,7 +50,7 @@ public struct ProfileListView: View {
 
     /// Y-P0(a): 従来ここに直接`@AppStorage`でインラインされていた4つのオプトイン設定
     /// (画面の保護/リモートクリップボード書込・送信許可/tmux迂回control-plane)は
-    /// `SettingsView.swift`へ抽出した(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(a))。
+    /// `SettingsView.swift`へ抽出した(`docs/adr/0001-ios-parity-implementation.md` §3.11(a))。
     @State private var showSettings = false
 
     // `model`にデフォルト値を持たせると、そのデフォルト式`ProfileListModel()`は

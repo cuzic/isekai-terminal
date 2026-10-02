@@ -590,7 +590,7 @@ impl PooledSshHandle {
         with_shared_handle_timeout(&self.handle, timeout, f).await
     }
 
-    /// `try_attach_with`の生存確認述語として渡す(`ADR_ANDROID_POOL_STALE_HANDLE.md`
+    /// `try_attach_with`の生存確認述語として渡す(`docs/adr/0016-android-pool-stale-handle.md`
     /// §3.2)。`handle`フィールドをprivateにしたことで、この定義を経由せずに
     /// 生存確認ロジックを複製することはコンパイルエラーになる(code-reviewで
     /// 発見した「同一クロージャが4箇所に複製されていた」問題の再発防止)。
@@ -1969,7 +1969,7 @@ mod pooling_e2e_tests {
     /// `FaultyStream::cut()`(EOF/`ConnectionReset`=TCP RST相当)した場合のみを見る。
     /// `is_alive`の`try_lock`失敗→「生存」扱い(`unwrap_or(true)`)の分岐と、UDPのサイレント
     /// 遮断(`debugCutUdpFault`相当)で`is_closed()`が立つまでの時間は未検証
-    /// (`ADR_CONNECTION_RESILIENCE_SIMULATION.md` L0-2/L0-3)。
+    /// (`docs/adr/0018-connection-resilience-simulation.md` L0-2/L0-3)。
     /// graceには本番の`SSH_POOL`と同じ`PLAIN_SSH_IDLE_GRACE`(30秒。QUICプールは90秒)を
     /// 使う。この間に死んだ値が生き残っていることがバグの本質だったため、短いgraceだと
     /// 削除タイマーがバグを覆い隠してしまう。
@@ -2066,7 +2066,7 @@ mod pooling_e2e_tests {
 
     /// UDPサイレント遮断(`debugCutUdpFault`相当: 送ったふりをして破棄、EOFもエラーも出ない)
     /// でも、本番のrussh設定(keepalive 60秒×3)で**いずれ**基盤接続が死亡判定され、プールが
-    /// 死んだHandleを再利用しないことを検証する(`ADR_CONNECTION_RESILIENCE_SIMULATION.md`
+    /// 死んだHandleを再利用しないことを検証する(`docs/adr/0018-connection-resilience-simulation.md`
     /// L0-2 / Q8)。`dead_pooled_handle_is_not_reused_after_underlying_connection_loss`
     /// (EOF/RST版)と対になる。
     ///
