@@ -140,7 +140,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Android実機スパイク用の再接続計測ログ(`ANDROID_RECONNECT_SPIKE_PLAN.md`)を
+     * Android実機スパイク用の再接続計測ログ(`docs/spikes/android-reconnect-stability.md`)を
      * debugビルドでのみ有効化する。`Application.onCreate()`はRobolectric JVMテストでも
      * 必ず生成されるため、そこでuniffi経由のnative呼び出しをするとテストが壊れる
      * ([restorePersistedTerminalTheme]と同じ理由でMainActivity側に置いている)。

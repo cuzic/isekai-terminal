@@ -1508,7 +1508,7 @@ pub trait OrchestratorCallback: Send + Sync {
     /// 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
     /// (`orchestrator.rs::notify_will_enter_foreground`から発火)。
     /// `did_reconnect`は「再接続を開始した」であって「成功した」ではない
-    /// (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+    /// (round-3 N2b、`docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照。再接続は
     /// `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
     /// 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
     /// 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し

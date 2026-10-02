@@ -1,10 +1,10 @@
-# ADR_STUN_REESTABLISH_CONTINUITY.md 批判的レビュー（round 3）
+# docs/adr/0006-stun-reestablish-continuity.md 批判的レビュー（round 3）
 
-- **対象**: `/home/cuzic/isekai-terminal/ADR_STUN_REESTABLISH_CONTINUITY.md`（Status: Draft rev3）
+- **対象**: `docs/adr/0006-stun-reestablish-continuity.md`（Status: Draft rev3）
   および `/home/cuzic/isekai-terminal/ADR_INPUT_RESUME_SYMMETRY.md`（ヘッダ更新分）
 - **レビュー日**: 2026-09-13
-- **前回**: `ADR_STUN_REESTABLISH_CONTINUITY_REVIEW.md`（round 1）、
-  `ADR_STUN_REESTABLISH_CONTINUITY_REVIEW_ROUND2.md`（round 2）
+- **前回**: `docs/adr/reviews/0006-stun-reestablish-continuity-review-round1.md`（round 1）、
+  `docs/adr/reviews/0006-stun-reestablish-continuity-review-round2.md`（round 2）
 - **レビュー種別**: 実装着手前の設計方針レビュー（読み取り・分析のみ。コードは一切変更していない）
 
 ---
@@ -25,7 +25,7 @@
   - [R3-C4. §6 の 80% は、§3.3 の未検証仮定と同じ観測期間で評価すると誤読を招く](#r3-c4)
   - [R3-C5. §4.2 のケースが `always-connects.md` 違反にならないことの確認が抜けている](#r3-c5)
 - [D. NICE-TO-HAVE](#section-d)
-- [E. `ADR_INPUT_RESUME_SYMMETRY.md` ヘッダ更新の確認](#section-e)
+- [E. `docs/adr/0005-input-resume-symmetry.md` ヘッダ更新の確認](#section-e)
 - [F. 結論 — Approved までに必要な差分と round 4 の要否](#section-f)
 
 ---
@@ -64,17 +64,17 @@ rev3 で技術的に正しい状態になっている。
 |---|---|---|
 | **R2-B1** bail-out は残す | §3.2 タスク3（175-184行）、§3.1（132-142行） | **反映済み**。禁止形（「置き換えたり削除したりしてはいけない」）まで入っており、実装者が誤る余地は大きく減った。§3.1 の一文のみ精度不足 → R3-C1 |
 | **R2-B2** `BUSY_OTHER_SESSION` は RESUME に存在しない | §3.2 タスク6 の括弧書き（223-227行）、旧§8 第1項は削除 | **反映済み**。`map_reject_reason`（`resume.rs:693-699`）の引用も正確。3値のみという記述も正しい |
-| **R2-B3** プラットフォーム範囲 | §5（334-374行）、§4.1（303-308行） | **反映済み**。3経路の列挙が `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.4 と一致。「方針として除外したのではなく構造上到達しない」という言い回しも入った。§4.1 の経路名も一般化済み |
+| **R2-B3** プラットフォーム範囲 | §5（334-374行）、§4.1（303-308行） | **反映済み**。3経路の列挙が `docs/adr/0002-midsession-disconnect-recovery.md` §2.4 と一致。「方針として除外したのではなく構造上到達しない」という言い回しも入った。§4.1 の経路名も一般化済み |
 | **R2-B4** `max_resume_window` を `None` へ | §3.2 タスク7（228-248行） | **反映済み**。`notify_on_give_up` 連動（`resume_loop.rs:1087`）まで含めて「パラメータ束の切替」としてまとめられている。実装形だけ1段ずれ → R3-C2 |
 | **R2-B5** `log_rendezvous_outcome` 再利用 | §3.2 タスク5（196-217行）、§4.2（328-330行） | **反映済み**。新 class 値2つ、失敗理由の2分類、`telemetry.rs:200-228` の doc 更新まで入った。`"abandoned"` の再利用も `"continuity-lost"` へ修正済み |
 | **R2-B6** 有界リトライ | §3.2 タスク4（185-195行）、タスク1（146-158行、「1回試みる」撤回） | **反映済み**。ただし新しい不発経路が発生 → R3-B1 |
 | **R2-C1** 前倒し切替 | §3.2 タスク1（146-158行） | **反映済み**。「120秒待ってから1回をデフォルト実装にしない」がタスク要件として明記された。条件の成立性に問題 → R3-B3、R3-B4 |
 | **R2-C2** 配線 | §3.2 タスク2（159-174行） | **反映済み**。検証の実行場所・`local_bind_port_range`・`None` ケースの3点すべて記載。深さが1段ずれ → R3-C2 |
 | **R2-C3** `cached_relay_addr` 到達可能性の仮定 | §3.3（278-291行）、§3.2 タスク5（208-213行） | **反映済み**。Tailscale/LAN の具体例も、失敗理由の2分類要件も、`relay_endpoints` 等への将来の移行も入った |
-| **R2-C4** preempt ラッチを実測へ格下げ | §3.2 タスク8（249-260行） | **反映済み**。`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.2.2 S1 の前例参照も入った。サーバー側 preempt 待ちのレイテンシも残っている。**ただし別の理由で「一方向の切替」が必要** → R3-B2 |
+| **R2-C4** preempt ラッチを実測へ格下げ | §3.2 タスク8（249-260行） | **反映済み**。`docs/adr/0002-midsession-disconnect-recovery.md` §2.2.2 S1 の前例参照も入った。サーバー側 preempt 待ちのレイテンシも残っている。**ただし別の理由で「一方向の切替」が必要** → R3-B2 |
 | **R2-C5** 成功基準 | §6（376-392行） | **反映済み**。分母・目標値（暫定80%、再較正前提）・読み出し手段（手動検分、集計基盤は作らない）の3点すべて記載。評価タイミングのみ懸念 → R3-C4 |
 | **R2-D1** `"abandoned"` 再利用と `（§7）` 誤参照 | §4.2（328-330行） | **反映済み**。`"continuity-lost"` へ、参照も `（§9）` へ修正済み |
-| **R2-D2** ヘッダに入力キューが混在 | ヘッダ（14-16行） | **反映済み**。「置き場所は本ADR§7.1で決定するが、実装自体は`ADR_INPUT_RESUME_SYMMETRY.md`の担当（本ADRの変更範囲には含めない）」と明記 |
+| **R2-D2** ヘッダに入力キューが混在 | ヘッダ（14-16行） | **反映済み**。「置き場所は本ADR§7.1で決定するが、実装自体は`docs/adr/0005-input-resume-symmetry.md`の担当（本ADRの変更範囲には含めない）」と明記 |
 | **R2-D3** 毎回新 ephemeral socket から dial | §3.1 末尾（116-121行） | **反映済み**。`resume.rs:733` の引用も正確 |
 | **R2-D4** §4.1 の経路名一般化 | §4.1（303-308行） | **反映済み** |
 | **入力ADR ①** ヘッダの対象更新 | 入力ADR 7-11行 | **反映済み**。`isekai-pipe/src/resume_loop.rs` 中心へ。当初案を採用しなかった理由（Android 経路との無用な共有回避）まで書かれている |
@@ -536,7 +536,7 @@ lightweight retry は**再デプロイをしない**ので、§4.2 のケース
 
 <a id="section-e"></a>
 
-## E. `ADR_INPUT_RESUME_SYMMETRY.md` ヘッダ更新の確認
+## E. `docs/adr/0005-input-resume-symmetry.md` ヘッダ更新の確認
 
 round 2 で指摘した2点とも**正しく反映されている**。
 

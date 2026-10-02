@@ -1,8 +1,8 @@
-# ADR_IOS_PARITY_IMPLEMENTATION.md — Round-2 Review
+# docs/adr/0001-ios-parity-implementation.md — Round-2 Review
 
 - **Reviewer**: reviewer agent (Opus), 2026-08-21
-- **Target**: round-2 revision of `/home/cuzic/isekai-terminal/ADR_IOS_PARITY_IMPLEMENTATION.md`
-- **Previous round**: `ADR_REVIEW_ROUND1.md` (4 blocking / 10 significant / 3 minor / 5 premortem)
+- **Target**: round-2 revision of `docs/adr/0001-ios-parity-implementation.md`
+- **Previous round**: `docs/adr/reviews/0001-ios-parity-implementation-review-round1.md` (4 blocking / 10 significant / 3 minor / 5 premortem)
 - **Scope**: verification of the 4 blocking fixes, adjudication of the architect's one pushback,
   spot-check of newly added designs, answers to Q9–Q11, fresh premortem.
 

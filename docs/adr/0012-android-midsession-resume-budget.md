@@ -1,10 +1,10 @@
 # ADR: mid-session reattach(resume)の予算と失敗理由の区別をisekai-pipe相当に近づける(Android)
 
-- **Status**: Draft(2026-09-16起草。round 1レビューで§1の予算値・対象トランスポート
+- **Status**: Proposed(2026-09-16起草。round 1レビューで§1の予算値・対象トランスポート
   範囲・参照識別子の事実誤認を修正、優先順位を入れ替えた。round 2レビューで
   round 1の数値自体が再訂正され(§1.1)、新規タスク(§3.2早期打ち切り)・
   出荷ゲート(§3.4)・既存テストへの影響(§8)を追加。ユーザー判断により、
-  これ以上の設計判断は`ANDROID_RECONNECT_SPIKE_PLAN.md`の実機スパイク結果を
+  これ以上の設計判断は`docs/spikes/android-reconnect-stability.md`の実機スパイク結果を
   得てから行う——本ADRは現時点でのDraftとして凍結し、スパイク結果を受けて改訂する)
 - **対象**(見込み、要精査): `rust-core/src/resume_client.rs`
   (`ReattachableStream`・`attempt_reattach`・`ReattachFn`・`REATTACH_MAX_RETRIES`・
@@ -12,7 +12,7 @@
   ——`isekai_pipe_quic_transport.rs`・`isekai_stun_p2p_transport.rs`・
   `isekai_link_relay_transport.rs`(§1.2参照。当初案にあった`multipath_transport.rs`は
   reattach層を持たないため対象外)
-- **入力**: `ADR_ANDROID_RECONNECT_TIMEOUT.md`と同一のセッション。round 1レビュー
+- **入力**: `docs/adr/0013-android-reconnect-timeout.md`と同一のセッション。round 1レビュー
   (`.../scratchpad/opus-review-android-reconnect-round1.md`)・round 2レビュー
   (`.../scratchpad/opus-review-android-reconnect-round2.md`、両方とも
   `/tmp/claude-1001/-home-cuzic-isekai-terminal/2285f8d6-e7bb-4a20-83c5-de317b68d9c7/`配下)
@@ -75,8 +75,8 @@ resume/reattach層は無い」。`multipath_transport.rs:1062-1063`にも
 つまり**ユーザーがWi-Fi⇔セルラーのローミング耐性のために選ぶ、まさに今回の
 相談の動機である`multipath_transport`経路には、mid-sessionのreattachが
 最初から存在しない**。`RebindManager`のフェイルオーバーが失敗した場合、
-即座に`ADR_ANDROID_RECONNECT_TIMEOUT.md`が扱うorchestratorの60秒ループへ
-移行する(本ADRの層は関与しない)。この事実は`ADR_ANDROID_RECONNECT_TIMEOUT.md`
+即座に`docs/adr/0013-android-reconnect-timeout.md`が扱うorchestratorの60秒ループへ
+移行する(本ADRの層は関与しない)。この事実は`docs/adr/0013-android-reconnect-timeout.md`
 の優先度がADR2より高いことの根拠になる(同ADR参照)。
 
 ### 1.3 Windows(isekai-pipe)との対比、および対比が成立しない構造的理由
@@ -204,7 +204,7 @@ deadline+バックオフ上限8〜10秒クランプにすると、圏外から�
   STUN版のようなNATマッピング喪失制約は無い」と対比的に明記している通り)。
   したがって本タスクの早期打ち切りは、STUN P2P経路では「確実に失敗する
   試行を早く回すだけ」になり、真の解決(再STUN・再punch)には
-  `ADR_ANDROID_STUN_REESTABLISH_CONTINUITY.md`が扱う別課題が必要。
+  `docs/adr/0015-android-stun-reestablish-continuity.md`が扱う別課題が必要。
   本タスクではSTUN P2P向けの特別分岐は入れず、この既知の制約を残したまま
   出荷する(コードを複雑化させてまで対処する優先度ではないと判断)。
 
@@ -213,7 +213,7 @@ deadline+バックオフ上限8〜10秒クランプにすると、圏外から�
 **§1.1の通り、予算延長の第一根拠(「最短15秒」)は撤回された。本タスクは
 実測結果が出るまで着手を保留する。** 保留理由: reattach層の実効予算が
 15〜90秒のどこに(あるいは§1.1の分析通り上端の90秒付近に)実際に張り付くかは
-実機ログでしか確定できない。**`ANDROID_RECONNECT_SPIKE_PLAN.md`スパイク5
+実機ログでしか確定できない。**`docs/spikes/android-reconnect-stability.md`スパイク5
 (ADR1・ADR2共通)は既にこれを対象に含めている**
 (`resume_client.rs`の`attempt_reattach`/`reconnect_and_resume`の実際の
 in-flight時間を計測対象に含む、round 3レビューで指示形から参照形に修正)——
@@ -239,7 +239,7 @@ configで揃って`keepalive_interval: Some(Duration::from_secs(60))`,
 タスク2の早期打ち切りにより、確定的消滅・network復帰のいずれの場合も
 120秒を待たずにorchestratorへ制御が渡る。
 
-### 3.4 タスク4: `ADR_ANDROID_RECONNECT_TIMEOUT.md`との役割分担・UI可視化
+### 3.4 タスク4: `docs/adr/0013-android-reconnect-timeout.md`との役割分担・UI可視化
 
 **「二重の安全網」として両者を独立に長くする案は採らない**(round 1レビューで
 筋が悪いと指摘): reattachを延ばすほど、確実に成功しうる新規接続の開始
@@ -254,8 +254,8 @@ configで揃って`keepalive_interval: Some(Duration::from_secs(60))`,
 t=0〜最大90秒(タスク2適用後は最大120秒)は「接続済み」表示のまま端末が
 固まって見えるだけで、`Reconnecting`通知は一切出ない。「予算が足し算される」
 のではなく「前半は無表示、後半だけ表示」という非対称な体験になっている。
-**担当は`ADR_CONNECTION_OBSERVABILITY.md`ではなく本ADRが持つ(round 3レビューで
-確定)**: `ADR_CONNECTION_OBSERVABILITY.md`は`tracing`による**事後診断のための
+**担当は`docs/adr/0007-connection-observability.md`ではなく本ADRが持つ(round 3レビューで
+確定)**: `docs/adr/0007-connection-observability.md`は`tracing`による**事後診断のための
 計装**(Phase 1を`rust-core/src`に限定、`attempt_reattach`等をログ対象として
 列挙)が目的であり、生成するのはログであって**ライブなUI状態ではない**。
 「reattach中であることをユーザーに見せる」仕事はどちらのADRにも
@@ -264,7 +264,7 @@ orchestratorが新しい`ConnectionPublicState`値(または既存`Reconnecting`
 転用)でreattach中を通知し、Kotlin/Swift側のUIがそれを表示する形にする。
 
 **出荷ゲート(round 2レビューで格上げ、round 3レビューで引受先を具体化)**:
-`ADR_CONNECTION_OBSERVABILITY.md`の完了ではなく、**上記のライブUI状態
+`docs/adr/0007-connection-observability.md`の完了ではなく、**上記のライブUI状態
 (reattach中を表す`ConnectionPublicState`とその表示)が実装されるまで**、
 タスク3(予算延長)は出荷しない。observability ADR側の計装完了だけでは
 このゲートは満たされない——それは事後ログであってユーザーに見える状態
@@ -325,7 +325,7 @@ orchestratorが新しい`ConnectionPublicState`値(または既存`Reconnecting`
   (単純なenum2値か、`ResumeRejectReason`をそのまま伝播させるか)。
 - `session_id`未確立の窓(§5)を、control stream確立待ちの猶予として
   明示的に予算に含めるかどうか。
-- タスク4のUI可視化を本ADRと`ADR_CONNECTION_OBSERVABILITY.md`のどちらが
+- タスク4のUI可視化を本ADRと`docs/adr/0007-connection-observability.md`のどちらが
   実装するか。
 
 ## 8. 参照実装

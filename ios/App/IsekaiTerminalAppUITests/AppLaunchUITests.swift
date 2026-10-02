@@ -242,7 +242,7 @@ final class AppLaunchUITests: XCTestCase {
     /// ON/OFFを切り替えられることを確認する(`ScreenProtectionOverlay`/
     /// `RemoteClipboardBridge`/`CtlSocketForwardSettings`が読む`@AppStorage`との配線確認)。
     /// Y-P0(a)でメニュー直下のトグルから独立した設定画面へ移設された
-    /// (`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(a))。
+    /// (`docs/adr/0001-ios-parity-implementation.md` §3.11(a))。
     func testOptInSettingsMenuItemsToggleBetweenOnAndOff() throws {
         let app = XCUIApplication()
         app.launch()

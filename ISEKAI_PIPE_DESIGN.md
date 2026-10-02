@@ -1928,7 +1928,7 @@ v1では既存の3配信方式(`IsekaiPipeCtl`/`TmuxSession`/`DirectTty`)をそ�
 (`ssh(1)` ProxyCommand経由)・Windows(`russh`ネイティブ経由)の両方で
 同じ症状が再現していた——根本原因は両OSが共通して起動する単一の中継
 プロセス`isekai-pipe connect`にあった。詳細な設計判断・レビュー経緯は
-`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`(§1が根本原因分析、§2が3PR分の
+`docs/adr/0002-midsession-disconnect-recovery.md`(§1が根本原因分析、§2が3PR分の
 設計、§0改訂履歴がround 1〜5+フォローアップの敵対的レビュー記録)を参照。
 
 PR1(#108)・PR2(#109)・PR3の3段階で実装した:
@@ -1992,7 +1992,7 @@ EOF-latch(`pump_c2h`が既にEOFに達した後の`Remote`失敗も同じ経路�
 他のどの分類より先にチェックしてoutcomeファイル自体を書かないようにした
 ——relay経路で`Unreachable`→`RebootstrapAndRetry`(非冪等リモート
 コマンド再実行防止のB5ガード無し)に化ける経路を根本から断つ。詳細な
-経緯・却下した代替案の理由は`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
+経緯・却下した代替案の理由は`docs/adr/0002-midsession-disconnect-recovery.md`
 Round 6〜7、`parent_watchdog.rs`自身のモジュールdoc参照。
 
 ### Epic S: cross-family resume-preserving fallback(STUN P2P→relay) — 完了(2026-09-13)
@@ -2004,7 +2004,7 @@ Round 6〜7、`parent_watchdog.rs`自身のモジュールdoc参照。
 (120秒)を待ってから`ssh(1)`ごと殺しフルSTUN再確立(新セッション、scrollback
 連続性喪失)へ落ちるのが唯一の復旧経路だった——サーバー自身のアドレスは変わって
 いないため、実はrelay経路は生きているにもかかわらず。詳細な設計判断・
-opus-adversarial-consult 3ラウンドのレビュー経緯は`ADR_STUN_REESTABLISH_CONTINUITY.md`
+opus-adversarial-consult 3ラウンドのレビュー経緯は`docs/adr/0006-stun-reestablish-continuity.md`
 参照。
 
 **実装した内容**(同ADR§3.2タスク1〜9):

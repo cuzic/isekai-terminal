@@ -1,7 +1,7 @@
 import XCTest
 @testable import IsekaiTerminalCoreLogic
 
-/// Y-P1(#8): `SnippetTemplates.all`の妥当性検証(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+/// Y-P1(#8): `SnippetTemplates.all`の妥当性検証(`docs/adr/0001-ios-parity-implementation.md` §3.3)。
 final class SnippetTemplatesTests: XCTestCase {
     func testAllTemplatesAreNonEmpty() {
         XCTAssertFalse(SnippetTemplates.all.isEmpty)

@@ -1,7 +1,7 @@
 //! Detects that this process's local peer — normally `ssh(1)`'s
 //! `ProxyCommand`, which owns the other end of our stdin/stdout — is gone,
 //! even when nothing is currently being read or written. Task 2.9 / issue
-//! #111 (`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Round 6/7): `ssh(1)` does
+//! #111 (`docs/adr/0002-midsession-disconnect-recovery.md` Round 6/7): `ssh(1)` does
 //! not reliably reap this process when it is killed externally
 //! (`SIGTERM`/`SIGKILL` — confirmed by direct experiment, 2026-09-02), so
 //! without an active signal, an orphaned `isekai-pipe connect` can spend up

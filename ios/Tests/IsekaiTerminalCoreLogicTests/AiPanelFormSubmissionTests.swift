@@ -1,7 +1,7 @@
 import XCTest
 @testable import IsekaiTerminalCoreLogic
 
-/// Y-P1(#2): `AiPanelFormSubmission.bytes`の検証(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.2)。
+/// Y-P1(#2): `AiPanelFormSubmission.bytes`の検証(`docs/adr/0001-ios-parity-implementation.md` §3.2)。
 final class AiPanelFormSubmissionTests: XCTestCase {
     private func string(_ data: Data) -> String {
         String(data: data, encoding: .utf8)!

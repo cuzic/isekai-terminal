@@ -200,7 +200,7 @@ pub fn log_must_resume_convergence(session_id: SessionId, resume_candidate_id: &
 /// Logged for rendezvous and resume-continuity outcomes produced by
 /// `resume::connect_via_relay_resumable_with_fallback` and by
 /// `isekai-pipe`'s cross-family STUN-to-relay switch in `resume_loop.rs`
-/// (`ADR_STUN_REESTABLISH_CONTINUITY.md` §3.2). The relay fallback round
+/// (`docs/adr/0006-stun-reestablish-continuity.md` §3.2). The relay fallback round
 /// runner records a brand new session minted at the start of a round
 /// (`class = "fresh-rendezvous"`, `new_session_id = Some(..)`) or a round
 /// that gives up before completing an attach (`class = "abandoned"`,

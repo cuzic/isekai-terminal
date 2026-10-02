@@ -12,7 +12,7 @@
 //!
 //! Deliberately hand-rolled instead of pulling in `tracing-appender`: this
 //! crate (and `isekai-pipe`, `isekai-ssh`) intentionally stays thin
-//! (`ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`'s "isekai-pipe should stay thin"
+//! (`docs/adr/0004-isekai-ssh-local-scrollback.md`'s "isekai-pipe should stay thin"
 //! decision) and `tracing-appender` would drag in the whole
 //! `tracing-subscriber` dependency graph just to be used as a `Write` impl.
 //!

@@ -1,7 +1,7 @@
-# ADR_IOS_PARITY_IMPLEMENTATION.md — Round-1 Adversarial Review / Premortem
+# docs/adr/0001-ios-parity-implementation.md — Round-1 Adversarial Review / Premortem
 
 - **Reviewer**: reviewer agent (Opus), 2026-08-21
-- **Target**: `/home/cuzic/isekai-terminal/ADR_IOS_PARITY_IMPLEMENTATION.md`（round-1 draft）
+- **Target**: `docs/adr/0001-ios-parity-implementation.md`（round-1 draft）
 - **Grounding**: `IOS_PARITY_GAP.md`, the ADR, `CLAUDE.md`, `.claude/rules/{rust-ssot,uniffi-binding-regeneration,always-connects,parallel-worktree-agent-operations,main-branch-protection}.md`,
   `PLAN.md` §Phase Y（1780行〜、特に Phase 1C #24 の 2796-2868行）, and direct verification against the source tree.
 

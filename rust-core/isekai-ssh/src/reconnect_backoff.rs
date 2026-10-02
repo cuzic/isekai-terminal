@@ -100,7 +100,7 @@ pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(200)
 /// closed, `RebootstrapAndRetry` falls through to a plain lightweight
 /// reconnect with the existing intent instead — most reconnects after a
 /// real, transient network blip need nothing more than that, matching both
-/// `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`'s own observation ("re-deploying
+/// `docs/adr/0002-midsession-disconnect-recovery.md`'s own observation ("re-deploying
 /// the helper is often unnecessary — the server-side helper is usually
 /// still alive") and tssh/tsshd's actual design (confirmed by reading
 /// `tssh/udp.go` and `tsshd/server.go`: `tsshd` stays resident across

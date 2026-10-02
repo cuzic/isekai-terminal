@@ -441,7 +441,7 @@ give-up境界）を正しい理由で採用する」が正解だった、とい�
 opus-critic-bはround 2で収束（「収束、blocking/significantなし」）。
 opus-critic-aは同じround 2 draftにsignificant 1件・minor 3件を発見
 （blockingなし。詳細:
-[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND2.md`]の末尾に
+[`docs/adr/reviews/0002-midsession-disconnect-recovery-review-round2.md`]の末尾に
 round 3分も追記）。
 
 | 変更 | 由来 |
@@ -455,7 +455,7 @@ round 3分も追記）。
 
 opus-critic-a・opus-critic-bの2エージェントに、互いの指摘を見せずに
 round 0 draftを実コード裏取り込みでレビューさせた（詳細:
-[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND1.md`]）。**両者が独立に
+[`docs/adr/reviews/0002-midsession-disconnect-recovery-review-round1.md`]）。**両者が独立に
 同じblocking項目に収束した**ことに加え、opus-critic-bへの追加深掘り依頼で
 Windows mux機構の重大な発見（owner側がtransport死を`Frame::Exit(255)`に
 「洗浄」しており、既存の`native::mux::run_with_reconnect`が判定材料の
@@ -1613,7 +1613,7 @@ connect`）がQUICの`max_idle_timeout`で先に死んで`ssh(1)`にEOFを
 
 round 1〜2のレビューで、round 0の6項目・round 1で新規発見された
 指摘の大半は解決済み（詳細:
-[`ADR_MIDSESSION_DISCONNECT_RECOVERY_REVIEW_ROUND1.md`]、および
+[`docs/adr/reviews/0002-midsession-disconnect-recovery-review-round1.md`]、および
 本ドキュメント各所に反映済み）。round 1で残っていたOpen Question 2
 （Windows mux修正の判定方法）はround 2でopus-critic-a自身の具体案
 （`exit_code: Option<u8>`を判別子に使う、§2.2.1）を採用して解決した。

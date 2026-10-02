@@ -1,10 +1,10 @@
-# ADR_STUN_REESTABLISH_CONTINUITY.md 批判的レビュー（round 1）
+# docs/adr/0006-stun-reestablish-continuity.md 批判的レビュー（round 1）
 
-- **対象**: `ADR_STUN_REESTABLISH_CONTINUITY.md`（Status: Draft、2026-09-07起草）
+- **対象**: `docs/adr/0006-stun-reestablish-continuity.md`（Status: Draft、2026-09-07起草）
 - **レビュー日**: 2026-09-13
 - **レビュー種別**: 実装着手前の設計方針レビュー（読み取り・分析のみ。コードは一切変更していない）
-- **関連**: `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（前提ADR、Epic R）、
-  `ADR_INPUT_RESUME_SYMMETRY.md`（スコープ重複の相手）、
+- **関連**: `docs/adr/0002-midsession-disconnect-recovery.md`（前提ADR、Epic R）、
+  `docs/adr/0005-input-resume-symmetry.md`（スコープ重複の相手）、
   `.claude/rules/always-connects.md`、`PLAN.md:982`
 
 ---
@@ -15,7 +15,7 @@
 - [P0-2. 方向3は「難しい」のではなく、現状の isekai-ssh アーキテクチャでは実装不可能](#p0-2)
 - [P0-3. 方向2と方向3は統合できる。しかも今すぐ安く実装できる（最重要）](#p0-3)
 - [P1-4. Android は別アーキテクチャ。ADR の対象範囲行（5-6行目）が不正確](#p1-4)
-- [P1-5. `ADR_INPUT_RESUME_SYMMETRY.md` とのスコープ重複を「実装時に整理」で先送りするのは不可](#p1-5)
+- [P1-5. `docs/adr/0005-input-resume-symmetry.md` とのスコープ重複を「実装時に整理」で先送りするのは不可](#p1-5)
 - [P2-6. セキュリティ: なりすまし・リプレイ懸念はほぼ杞憂だが、実在する項目が2つある](#p2-6)
 - [P2-7. ADR 本文の体裁・欠落](#p2-7)
 - [P2-8. その他の見落としているエッジケース](#p2-8)
@@ -220,7 +220,7 @@ ADR が方向2（発生頻度を下げる）で狙っていた効果は、確立
 **`isekai-pipe` は `isekai-bootstrap`/russh に依存していない**
 （`rust-core/isekai-pipe/Cargo.toml` と `rust-core/isekai-ssh/Cargo.toml` の依存リストを比較すれば明らか
  — `isekai-bootstrap`・`russh`・`russh-keys` を持つのは後者のみ）。
-依存を足すことは `ADR_INPUT_RESUME_SYMMETRY.md:36-37` が記録している
+依存を足すことは `docs/adr/0005-input-resume-symmetry.md:36-37` が記録している
 「isekai-pipe は薄いトランスポート中継のままにしたい（ユーザー判断）」に真正面から反する。
 
 **これが「両者同時変化はスコープ外」の本当の理由**であり、
@@ -274,9 +274,9 @@ ADR は対象を `rust-core/isekai-transport`（`stun_p2p` モジュール）と
 
 <a id="p1-5"></a>
 
-## P1-5. `ADR_INPUT_RESUME_SYMMETRY.md` とのスコープ重複を「実装時に整理」で先送りするのは不可
+## P1-5. `docs/adr/0005-input-resume-symmetry.md` とのスコープ重複を「実装時に整理」で先送りするのは不可
 
-ADR 本文 64-66行目は「`ADR_INPUT_RESUME_SYMMETRY.md`（C→S入力のresume対称化）は、本ADRの
+ADR 本文 64-66行目は「`docs/adr/0005-input-resume-symmetry.md`（C→S入力のresume対称化）は、本ADRの
 対象ケースでは新セッション扱いになるため保証範囲外になる。両ADRのスコープの重なりを
 実装時に整理する必要がある」で止めている。
 
@@ -304,7 +304,7 @@ P0-3 を採用すると、入力キューの flush 境界が
    RESUME_ACK の `helper_committed_offset` を見て未ACKバイトを再送する既存処理の**直後**に、
    「そもそもオフラインで送信すらしていない新規入力」を継ぐ。
 
-これは同時に `ADR_INPUT_RESUME_SYMMETRY.md` §3 の未決論点2つへの直接の回答になっている:
+これは同時に `docs/adr/0005-input-resume-symmetry.md` §3 の未決論点2つへの直接の回答になっている:
 
 - **同§3 論点1（キューの置き場所: isekai-ssh 側 session 層か isekai-transport か）**
   → **どちらでもなく `isekai-pipe` の `resume_loop.rs`**。理由: resume の offsets 管理
@@ -319,7 +319,7 @@ P0-3 を採用すると、入力キューの flush 境界が
 
 ### 依存2（安全要件）— 決定順序が逆だとやり直しになる
 
-`ADR_INPUT_RESUME_SYMMETRY.md` §3 論点3 は「切断中に打った内容（危険なコマンド含む）が、
+`docs/adr/0005-input-resume-symmetry.md` §3 論点3 は「切断中に打った内容（危険なコマンド含む）が、
 長時間後の再接続時に無警告で実行される事故をどう防ぐか」を挙げている。
 
 P0-3 が入ると、**サイレントに再接続が成功する窓が 120秒（`STUN_RESUME_GIVE_UP_WINDOW`、
@@ -455,7 +455,7 @@ ADR draft が触れていないが、実装前に決めておくべきもの。
    セッション途中で変わりうるようになる。doctor / ステータス表示が
    「確立時の経路」を静的に見せているなら、実態とずれる。要確認。
 
-6. **`ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md` との関係（未読だが同時に draft 中）**
+6. **`docs/adr/0004-isekai-ssh-local-scrollback.md` との関係（未読だが同時に draft 中）**
    本ADRの主題は「スクロールバックの連続性」であり、ローカルスクロールバックADRが
    クライアント側で画面履歴を保持するなら、**方向3の価値そのものが目減りする**
    （サーバー側バッファを引き継げなくても、ローカルに履歴があれば体験上の損失が小さい）。
@@ -515,7 +515,7 @@ doc コメント `wrapper.rs:628-633`）を書いて畳む。
 再評価の際は P1-4（Android なら成立しうるが serve 側の再punch制御が要る）と、
 `isekai-pipe` への `isekai-bootstrap` 依存追加の是非が論点になる。
 
-### 5. `ADR_INPUT_RESUME_SYMMETRY.md` は P0-3 の決定後に着手する
+### 5. `docs/adr/0005-input-resume-symmetry.md` は P0-3 の決定後に着手する
 
 P1-5 の依存2（サイレント再接続窓が 120秒→10日に伸びることで、危険コマンド遅延実行の
 リスク予算が変わる）があるため。

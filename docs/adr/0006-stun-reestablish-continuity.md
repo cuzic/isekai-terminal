@@ -1,9 +1,9 @@
 # ADR: STUN P2Pの真の再ランデブー時にもresume連続性を保てないか
 
-- **Status**: **Approved（rev4、2026-09-13）**。2026-09-13に
-  `opus-adversarial-consult`round 1（`ADR_STUN_REESTABLISH_CONTINUITY_REVIEW.md`）・
-  round 2（`ADR_STUN_REESTABLISH_CONTINUITY_REVIEW_ROUND2.md`）・
-  round 3（`ADR_STUN_REESTABLISH_CONTINUITY_REVIEW_ROUND3.md`）の3ラウンドの
+- **Status**: **Accepted（rev4、2026-09-13）**。2026-09-13に
+  `opus-adversarial-consult`round 1（`docs/adr/reviews/0006-stun-reestablish-continuity-review-round1.md`）・
+  round 2（`docs/adr/reviews/0006-stun-reestablish-continuity-review-round2.md`）・
+  round 3（`docs/adr/reviews/0006-stun-reestablish-continuity-review-round3.md`）の3ラウンドの
   批判的レビューを経て全面改訂し、round 3のMUST-FIX 4件・SHOULD-FIX 5件を
   rev4に反映した上で同レビュアーによる最終照合を受け「Approvedで確定してよい」
   との結論を得た。**残る未確認事項はR3-C5（§4.2が`always-connects.md`に
@@ -15,24 +15,24 @@
   切替）。**`rust-core/isekai-pipe/src/engine/`（サーバー側）は変更不要**——
   サーバーは既に`SessionId`のみをキーに任意アドレスからのRESUMEを受理する設計
   になっている（`engine/mod.rs:962`）。**入力キューの置き場所は本ADR§7.1で
-  決定するが、実装自体は`ADR_INPUT_RESUME_SYMMETRY.md`の担当**（本ADRの
+  決定するが、実装自体は`docs/adr/0005-input-resume-symmetry.md`の担当**（本ADRの
   変更範囲には含めない）。**Android（`rust-core/src/isekai_*_transport.rs`、
   `isekai-pipe connect`プロセスを起動しない経路）は構造上到達しないため対象外**
   ——§5参照。
 - **入力**: ユーザーとの「mosh的な、切断中の入力バッファリング/画面操作継続」
-  検討セッション（2026-09-07）。`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`
+  検討セッション（2026-09-07）。`docs/adr/0002-midsession-disconnect-recovery.md`
   （Epic R、2026-09-02完了）で明示的にスコープ外とされた残課題の掘り下げ
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`、
-  `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（本ADRの前提となる既存設計。特に
+  `docs/adr/0002-midsession-disconnect-recovery.md`（本ADRの前提となる既存設計。特に
   §2.4の経路分岐、§2.2.2 S1の「実測してから機構の要否を決める」前例）、
-  `ADR_INPUT_RESUME_SYMMETRY.md:36-37`「isekai-pipeは薄いトランスポート
+  `docs/adr/0005-input-resume-symmetry.md:36-37`「isekai-pipeは薄いトランスポート
   中継のままにしたい」
 
 ---
 
 ## 1. 背景
 
-`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（Epic R、PR1〜3）により、
+`docs/adr/0002-midsession-disconnect-recovery.md`（Epic R、PR1〜3）により、
 確立後のネットワーク切断からの自動復旧が実装済み:
 
 - **relay経路**: 完全バイトレベルresume（`OutputBuffer`ベース、既定
@@ -46,7 +46,7 @@
 
 明示的にスコープ外とされているのは、**クライアント・サーバー双方の
 アドレスが同時に変わる、対称NAT越しの真の再ランデブーが必要な
-ケース**（`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.3.6、
+ケース**（`docs/adr/0002-midsession-disconnect-recovery.md` §2.3.6、
 1431〜1439行）。この場合フルSTUN再確立が走り、**新セッション扱いと
 なりresume連続性（scrollback/未確認バイトの継続）が失われる**
 （同ADR §4.2、1539〜1543行）。
@@ -332,7 +332,7 @@ RESUMEする場合）に限られる。**`connect.rs:835-843`のガードの地�
    （resumeループに入った時点でクライアント側の旧STUN接続は既に
    死んでいる）。**ラッチを先んじて実装せず、まず実測して2駆動主体が
    実在するかを確認してから機構の要否を決める**
-   （`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.2.2 S1と同じ進め方）。
+   （`docs/adr/0002-midsession-disconnect-recovery.md` §2.2.2 S1と同じ進め方）。
    ただし**サーバー側のpreempt待ちタイムアウト**
    （`engine/mod.rs:72`）はcross-family resumeのレイテンシに直接乗る
    ため、タスク1のトリガー/タイムアウト設計ではこれを見込むこと。
@@ -400,7 +400,7 @@ in-processの再bootstrapシグナリングが要るが、**`isekai-pipe`は
 `isekai-bootstrap`/russh に依存していない**
 （`rust-core/isekai-pipe/Cargo.toml`と`rust-core/isekai-ssh/Cargo.toml`
 の依存リストを比較すると、`isekai-bootstrap`・`russh`・`russh-keys`を
-持つのは後者のみ）。この依存を足すことは`ADR_INPUT_RESUME_SYMMETRY.md:36-37`
+持つのは後者のみ）。この依存を足すことは`docs/adr/0005-input-resume-symmetry.md:36-37`
 が記録している「isekai-pipeは薄いトランスポート中継のままにしたい
 （ユーザー判断）」に真正面から反する。**これが「両者同時変化は
 スコープ外」の本当の理由**であり、§3.2タスク5の計装で
@@ -429,7 +429,7 @@ lightweight retryは再デプロイをしないため、本ケース（キャッ
 本ADRの変更対象（`connect.rs`/`resume_loop.rs`）は`isekai-pipe connect`
 というバイナリ・コードパスであり、これは**Unix・Windowsいずれの
 プラットフォームでも同じ**——経路は3つある
-（`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §2.4）:
+（`docs/adr/0002-midsession-disconnect-recovery.md` §2.4）:
 
 - **Unix**: `wrapper.rs::run_ssh_with_connect_failure_recovery`が
   `ssh(1)`をspawnし、`isekai-pipe connect`をProxyCommandとして起動
@@ -490,7 +490,7 @@ Androidで同種の改善をするなら、serve側の再punch制御コマンド
   §3.2タスク9で触れた`isekai-ssh doctor`への件数表示は、将来の
   簡易集計手段の候補として検討する。
 
-## 7. `ADR_INPUT_RESUME_SYMMETRY.md`との関係
+## 7. `docs/adr/0005-input-resume-symmetry.md`との関係
 
 両ADRのスコープ重複は「実装時に整理する」では不十分——衝突点は
 **入力キューのキー設計そのもの**であり、今決めないと手戻りになる
@@ -523,14 +523,14 @@ cross-family切替が起きる環境でしかテストで検出できない。
    既存の`ReplayBuffer`/`ClientResumeState`とはレイヤーが自然に
    分かれる）。
 
-これは`ADR_INPUT_RESUME_SYMMETRY.md`§3の論点1（キューの置き場所）と
+これは`docs/adr/0005-input-resume-symmetry.md`§3の論点1（キューの置き場所）と
 論点4（既存ReplayBufferとの役割分離）への直接の回答でもある
 （**この2論点は本レビューを経て決着済み**——同ADR側にも同じ結論を
 反映済み）。
 
 ### 7.2 安全要件への影響（決定順序が逆だとやり直しになる）
 
-`ADR_INPUT_RESUME_SYMMETRY.md`§3論点3（切断中に打った危険なコマンドが
+`docs/adr/0005-input-resume-symmetry.md`§3論点3（切断中に打った危険なコマンドが
 無警告で実行される事故の防止）は、本ADRの§3導入によって前提が変わる:
 **サイレントに再接続が成功する窓が、STUNの120秒
 （`STUN_RESUME_GIVE_UP_WINDOW`）からrelayのresume grace（既定10日）へ
@@ -538,7 +538,7 @@ cross-family切替が起きる環境でしかテストで検出できない。
 変える。「スコープが重なる」ではなく**「片方の決定が他方の安全要件の
 前提を変える」**が正確な関係。
 
-**順序: 本ADR§3を先に決めてから、`ADR_INPUT_RESUME_SYMMETRY.md`の
+**順序: 本ADR§3を先に決めてから、`docs/adr/0005-input-resume-symmetry.md`の
 上限サイズ・TTL・可視化ポリシーを決める**（逆順だと決め直しになる。
 同ADRの論点2・3はこの決定待ちのため未決のまま）。
 
@@ -552,7 +552,7 @@ cross-family切替が起きる環境でしかテストで検出できない。
   同じ秘密がより長寿命のセッションを守ることになる——個人relayの
   脅威モデルでは問題にならない前提だが、意識的な選択として記録して
   おく。
-- `ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`（同時にdraft中）との価値の
+- `docs/adr/0004-isekai-ssh-local-scrollback.md`（同時にdraft中）との価値の
   相互依存: ローカルスクロールバックがクライアント側で画面履歴を
   持つなら、本ADRが救えないケース（§4.2）の体験上の損失はその分
   小さくなる。3つのdraft ADR（本ADR・入力対称化・ローカル

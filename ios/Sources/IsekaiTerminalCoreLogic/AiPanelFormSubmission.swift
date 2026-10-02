@@ -3,7 +3,7 @@ import Foundation
 /// Y-P1(#2): `presentForm`パネルの送信バイト列(1行JSON + 改行)を、フォーム入力値から
 /// 組み立てる純関数。`AI_INTEGRATION_DESIGN.md` §6.2の方針通り、Rust側へ返す専用チャネルは
 /// 持たずPTYへの通常のstdin文字列書き込みで返す(Android版`TerminalSession.submitAiPanelForm`
-/// と対称、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.2)。
+/// と対称、`docs/adr/0001-ios-parity-implementation.md` §3.2)。
 ///
 /// **信頼境界**: 送信内容はあくまで表示専用パネルへのユーザー入力であり、
 /// Rust/Swiftどちらの側でも実行・評価はしない。

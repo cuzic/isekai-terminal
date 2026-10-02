@@ -531,7 +531,7 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     // over this holder sink, so installing it anyway would only create a
     // permanently-empty `-ssh.log` companion file and log a "writing holder
     // diagnostics to <path>" line that is not actually where anything ends
-    // up (`ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md` §C4).
+    // up (`docs/adr/0009-isekai-ssh-exit-diagnostics.md` §C4).
     if !crate::log_file::is_enabled() {
         if let Some(channel_name) = &early_channel_name {
             match naming::ssh_holder_log_file(channel_name).and_then(|path| crate::log_file::init_holder_log(&path).map(|()| path)) {

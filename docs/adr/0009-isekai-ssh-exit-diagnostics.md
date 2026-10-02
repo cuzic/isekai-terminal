@@ -1,6 +1,6 @@
 # ADR: isekai-ssh(Windows native)の異常終了理由が診断ログに一切残らない
 
-- **Status**: **Approved**(2026-09-12起草・同日Approved。
+- **Status**: **Accepted**(2026-09-12起草・同日Accepted。
   opus-adversarial-consult 3ラウンドで収束。Round 1で
   §1.3の因果関係の主張の一部[「VERBOSEへの書き手はパニックフックだけ」]が
   誤りと判明し、より正確な診断[「holderでは`log_line!`が`NUL`へ消える」]
@@ -32,7 +32,7 @@
   `opus-adversarial-consult`(Round 1、general-purpose/opus)による
   独立検証
 - **拘束される既存ルール**: `.claude/rules/always-connects.md`(本ADRが
-  補強する対象)、`ADR_ISEKAI_SSH_OBSERVABILITY.md`(Approved・実装済み
+  補強する対象)、`docs/adr/0008-isekai-ssh-observability.md`(Approved・実装済み
   [PR #116]。前例として「Windowsネイティブ経路はinit_verboseを呼ばない」
   という誤診断がRound 1レビューで訂正された経緯があり、本ADRも同じ
   誤りを一度犯した[後述§1.3]ことを踏まえる)、`ADR_ISEKAI_SSH_LOCAL_
@@ -44,7 +44,7 @@
 
 ### 1.1 経緯
 
-`ADR_MIDSESSION_DISCONNECT_RECOVERY.md`(Epic R)・PR #115(2026-09-07)により
+`docs/adr/0002-midsession-disconnect-recovery.md`(Epic R)・PR #115(2026-09-07)により
 「再デプロイ後の再接続を1回きりで諦めてプロセスが終了する」という
 常時接続原則違反は修正済みで、ユーザーは実際に最新ビルド
 (`isekai-ssh 0.1.0 (a266f1f387ae)`、バイナリの`LastWriteTime`は
@@ -72,7 +72,7 @@
 
 ### 1.3 コード調査で判明した根本原因(Round 1レビューで訂正済み)
 
-(`ADR_ISEKAI_SSH_OBSERVABILITY.md`のRound 1レビューが一度「Windows
+(`docs/adr/0008-isekai-ssh-observability.md`のRound 1レビューが一度「Windows
 ネイティブ経路は`init_verbose`を呼んでいない」という誤診断をした前例が
 あり、当初の本ADRも形を変えて同じ轍を踏んだ。以下は`opus-adversarial-
 consult`による独立検証を経て訂正済みの内容。)
@@ -313,7 +313,7 @@ holderの`log_line!`フォールバック先をこの系統に向ければ、§3
   (`child_stdio.rs`)ため、client+holder+孫が無制限成長する単一
   ファイルへ集約されてしまう。いずれも不採用。
 
-### 3.6 `ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`との重複整理(決定事項)
+### 3.6 `docs/adr/0004-isekai-ssh-local-scrollback.md`との重複整理(決定事項)
 
 衝突点は1つ: 同ADR論点3の選択肢「ローカルファイルへ継続的にログ出力
 する」が素直に実装されると、リモート端末出力(scrollback)が「clipwire
@@ -331,7 +331,7 @@ holderの`log_line!`フォールバック先をこの系統に向ければ、§3
   (`mux/mod.rs:349`)を跨いで出入りする。**scrollbackもholderに
   置かないと切断を跨いで保持できない**——これは本ADR自身が診断ログに
   ついて到達した結論(§3.4、holder側で解決する)と同一の構造。
-  `ADR_ISEKAI_SSH_LOCAL_SCROLLBACK.md`論点1(「Windows Terminal自身の
+  `docs/adr/0004-isekai-ssh-local-scrollback.md`論点1(「Windows Terminal自身の
   scrollbackで足りるのでは」)への部分的な答えにもなる:
   PR #115が「Windows Terminalクラッシュ風終了」と呼んだ現象そのものが、
   タブ(=Windows Terminal自身のscrollback)ごと消える異常終了であり、

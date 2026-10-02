@@ -1,6 +1,6 @@
 # ADR: 接続耐性を実機なしで検証する方法
 
-- **Status**: Draft rev4(2026-09-21)。rev3までは「仮想時間 + in-memory UDPのシミュレーション基盤(L1)」を
+- **Status**: Proposed rev4(2026-09-21)。rev3までは「仮想時間 + in-memory UDPのシミュレーション基盤(L1)」を
   中心に据えていたが、調査の結果、**費用対効果の高い順に L0(安い不変条件テスト)→ L2(夜間netns)を先に
   やり、L1は保留**する構成へ組み替えた。経緯は§8。
 - **対象**: `rust-core/src/{pool,orchestrator,resume_client,isekai_pipe_quic_transport,android_quic_endpoint,faulty_stream,faulty_udp_socket}.rs`、

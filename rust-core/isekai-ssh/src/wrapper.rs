@@ -1018,7 +1018,7 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe
 /// are inherited (interactive TTY passthrough) — `.status()` (not
 /// `.output()`) only waits on the direct child (`ssh(1)` itself), *not* the
 /// whole process tree: confirmed 2026-09-02 by direct experiment (Task 2.9 /
-/// issue #111, `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Round 6) that when
+/// issue #111, `docs/adr/0002-midsession-disconnect-recovery.md` Round 6) that when
 /// `ssh(1)` is killed by an external signal (`SIGTERM`/`SIGKILL`, as opposed
 /// to exiting on its own, e.g. via `ConnectTimeout`) it does **not** reap its
 /// `ProxyCommand` grandchild — the grandchild is simply reparented to init

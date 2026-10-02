@@ -21,7 +21,7 @@
     (`drawRow`/`redrawDirtyRows`)
   - `rust-core/isekai-pipe/src/resume_loop.rs`(`resume_with_backoff_until_deadline`)
 - **入力**: 本セッションでの「引数過多/feature envy」監査(2回、根本原因分析込み)、
-  および本ADRのround 1敵対的レビュー(`ADR_PARAM_COHESION_REFACTOR_REVIEW_ROUND1.md`、
+  および本ADRのround 1敵対的レビュー(`docs/adr/reviews/0003-param-cohesion-refactor-review-round1.md`、
   opus-critic-a・opus-critic-bへの独立並行依頼)。
 - **拘束される既存ルール**: `CLAUDE.md`(`isekai-ssh`/`isekai-terminal-core`は
   「独立したcrate群」と明記。round 1レビューで、この独立性は**相互依存の禁止**
@@ -52,7 +52,7 @@
 ### Round 1(2026-09-05)— opus-critic-a・opus-critic-bへの独立並行レビュー
 
 round 0 draftを両エージェントへ独立に(互いの指摘を見せずに)実コード裏取り込みで
-レビューさせた。詳細は`ADR_PARAM_COHESION_REFACTOR_REVIEW_ROUND1.md`。要点:
+レビューさせた。詳細は`docs/adr/reviews/0003-param-cohesion-refactor-review-round1.md`。要点:
 
 | 変更 | 由来 |
 |---|---|
@@ -68,7 +68,7 @@ round 0 draftを両エージェントへ独立に(互いの指摘を見せずに
 ### Round 2(2026-09-05)— round 1改訂版の再確認、両者とも未収束と判定
 
 round 1の修正を反映したADRを同じ2エージェントへ再送し、独立に再確認させた。
-詳細は`ADR_PARAM_COHESION_REFACTOR_REVIEW_ROUND2.md`。両者とも「設計面には
+詳細は`docs/adr/reviews/0003-param-cohesion-refactor-review-round2.md`。両者とも「設計面には
 異論なし(round 1のBLOCKING/SIGNIFICANTは全て意図通り解消)」としつつ、
 round 1の修正自体が新たに導入した誤りを独立に2件ずつ発見した:
 
@@ -214,7 +214,7 @@ secretを保持しており、専用structに絞ることでsecretの伝播範�
 **当初案(`isekai-protocol`への`HelperLaunchOptions`新設)は撤回。**
 round 1レビューで、この2型は「意図せず重複した概念」ではなく「異なる抽象度で
 意図的に別々に設計された型」であり、統合するとargvレンダラの非対称
-(`ADR_PARAM_COHESION_REFACTOR_REVIEW_ROUND1.md`のB2-B6/B-2〜B-7参照)により
+(`docs/adr/reviews/0003-param-cohesion-refactor-review-round1.md`のB2-B6/B-2〜B-7参照)により
 `always-connects.md`が最優先とする接続経路の挙動を壊すリスクがあることが
 判明したため。
 
@@ -247,7 +247,7 @@ round 1レビューで、この2型は「意図せず重複した概念」では
 STUNは既に`Direct`+`stun_servers`として正規化済み(`isekai-bootstrap/src/
 backend.rs:47`の`BootstrapBackend::install_and_start(..., stun_servers: &[SocketAddr])`、
 `install_script.rs:218-221`)であり、`Stun`バリアントを足すと表現方法が2通りに
-なる(`ADR_PARAM_COHESION_REFACTOR_REVIEW_ROUND1.md`のB4/B-4参照)。
+なる(`docs/adr/reviews/0003-param-cohesion-refactor-review-round1.md`のB4/B-4参照)。
 
 このためPR2(旧: §2.3独立PR)は消滅し、このdocコメント追記はPR1に含める。
 

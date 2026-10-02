@@ -3,7 +3,7 @@
 - **レビュー対象**: `git log main..feat/yr-orchestrator-foreground-resume-tmux-claim`
   （`bc2181ab` Rust / `d54224e9` UniFFI regen / `8e2b4b2a` Swift+Kotlin 適合）。
   worktree `/home/cuzic/isekai-terminal/.claude/worktrees/yr-orchestrator-callback` で実読。
-- **照合先**: `ADR_IOS_PARITY_IMPLEMENTATION.md`（Accepted, round-3）D-6 / §3.9.3c の N2a–N2c /
+- **照合先**: `docs/adr/0001-ios-parity-implementation.md`（Accepted, round-3）D-6 / §3.9.3c の N2a–N2c /
   §3.10.2-② の N3-i〜iv / §3.10.4、`TASKS_IOS_ADR_YR.md` A-1〜A-6・B-1〜B-5・C・D・E、
   `TASKS_IOS_ADR_YR_REVIEW.md`（B1/B2）、`.claude/rules/uniffi-binding-regeneration.md`、
   `.claude/rules/main-branch-protection.md`。

@@ -1,7 +1,7 @@
 import XCTest
 @testable import IsekaiTerminalCoreLogic
 
-/// Y-P1(#5): `PromptNavigation`の検証(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.1)。
+/// Y-P1(#5): `PromptNavigation`の検証(`docs/adr/0001-ios-parity-implementation.md` §3.1)。
 final class PromptNavigationTests: XCTestCase {
     func testScrollTargetForNilReturnsNil() {
         XCTAssertNil(PromptNavigation.scrollTarget(for: nil))

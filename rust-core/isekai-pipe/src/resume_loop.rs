@@ -91,7 +91,7 @@ const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 /// the deadline stops being enough for even one cross-family probe,
 /// independent of this attempt count — see that function's own docs.
 ///
-/// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// Deliberately no preempt/ping-pong latch here (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
 /// single sequential loop with no second concurrent reconnect driver, so
 /// there's nothing to latch against yet; build one only if real-world
@@ -106,7 +106,7 @@ const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 ///
 /// This is deliberately **not** the same as the relay-grace-based deadline
 /// (`None`/multi-day) that `run_resume_loop` installs for later episodes
-/// once the switch has actually succeeded once (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// once the switch has actually succeeded once (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 7's "成功した後" wording, and its own separate task 4 bullet
 /// requiring a *bounded* first attempt) — the two are easy to conflate
 /// because both are implemented as `ResumeDeadlinePolicy::max_resume_window`
@@ -252,7 +252,7 @@ impl std::error::Error for MidSessionDisconnectSignal {}
 /// (`anyhow!("network change detected, reconnecting")`) with the same
 /// typed-marker + `downcast_ref` pattern already used by
 /// `MidSessionDisconnectSignal`/`StaleTrustSignal`, so callers can check for
-/// it without string-matching (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 2:
+/// it without string-matching (docs/adr/0006-stun-reestablish-continuity.md §3.2 task 2:
 /// this is what lets the cross-family switch trigger react to "this episode
 /// started from a network change" without inventing a second channel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,7 +949,7 @@ async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
 }
 
 /// Which branch [`wait_backoff_or_network_change`] returned through — lets
-/// callers (the cross-family switch trigger, ADR_STUN_REESTABLISH_CONTINUITY.md
+/// callers (the cross-family switch trigger, docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 1/2) react to "this wait ended because of a fresh network
 /// change" without string-matching a log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1229,7 +1229,7 @@ struct ResumeDeadlinePolicy {
     max_resume_window: Option<Duration>,
 }
 
-/// Records `"continuity-lost"` (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)
+/// Records `"continuity-lost"` (docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5)
 /// the moment [`resume_with_backoff_until_deadline`] gives up while on the
 /// cross-family relay target — whether that's *this* call's own bounded
 /// probe (`switched_this_call.is_some()`) or a later episode that already
@@ -1269,7 +1269,7 @@ fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
     remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
 }
 
-/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// The failure-count switch trigger (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 1's second disjunct), made deadline-aware.
 ///
 /// The count alone can silently *never* fire whenever the episode's
@@ -1536,7 +1536,7 @@ async fn resume_with_backoff_until_deadline(
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
                 if switched_this_call.is_some() {
-                    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: only
+                    // docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5: only
                     // logged the one time the switch actually happens in
                     // this call — deliberately *not* gated on
                     // `already_cross_family` too, since that would repeat
@@ -1743,7 +1743,7 @@ pub(crate) async fn run_resume_loop(
     // no-op in that case, matching this codebase's "opportunistic,
     // default-off" convention for experimental features.
     //
-    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 7's last bullet asks this
+    // docs/adr/0006-stun-reestablish-continuity.md §3.2 task 7's last bullet asks this
     // to be an explicit decision rather than left implicit: this function
     // (and `experimental_network_rebind` above) are received once, as plain
     // arguments, and are *not* re-derived after a cross-family switch. This
