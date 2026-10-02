@@ -61,13 +61,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── self-hosted-gcp-spot専用: VMは使うたびに新規作成され永続ディスクを持たない
+      #    (2026-10、PD課金対策)。/mnt/cache配下のツールチェーン(rustup/cargo-home/
+      #    zig)はGitHubのactions/cacheで保存・復元する(self-hosted runnerでも動く)。
+      #    rust-core/targetは10GB上限に収まらない恐れがあるため対象外(毎回ビルド)。
+      - name: Cache toolchains (self-hosted only)
+        if: inputs.runner_type == 'self-hosted-gcp-spot'
+        uses: actions/cache@v4
+        with:
+          path: |
+            /mnt/cache/cargo-home-isekai-terminal
+            /mnt/cache/rustup-home-isekai-terminal
+            /mnt/cache/zig
+          key: cargo-mutants-selfhosted-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            cargo-mutants-selfhosted-
+
       # ── self-hosted-gcp-spot専用: 永続ディスク側のキャッシュ済み環境を指す
       #    環境変数を$GITHUB_ENVへ書く(/etc/environmentのソースだけでは子プロセスに
       #    exportされない不具合を過去に踏んでいるため、cargo-ci-gcp-spot-instance
       #    スキル参照。GitHub Actions自体が保証する$GITHUB_ENV/$GITHUB_PATHの
       #    伝播機構を使い同じ地雷を避ける)。複数リポジトリがこのVMを使い回すため
       #    リポジトリ名をサブパスに含める(同スキルの「複数プロジェクトでの共有」節参照)。
-      - name: Point at persistent-disk toolchain caches (self-hosted only)
+      - name: Point at /mnt/cache toolchain dirs (self-hosted only)
         if: inputs.runner_type == 'self-hosted-gcp-spot'
         run: |
           echo "CARGO_HOME=/mnt/cache/cargo-home-isekai-terminal" >> "$GITHUB_ENV"
