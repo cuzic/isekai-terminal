@@ -1037,7 +1037,7 @@ mod tests {
                                 GiveUpReason::SessionGone => {
                                     // (G1) UnknownSessionのgive-upは「今回もUnknownSession」「閾値回連続」
                                     //      「切断から下限時間経過」の3つがすべて揃ったときだけ。
-                                    prop_assert!(unknown_failure_now);
+                                    prop_assert!(unknown_failure_now, "invariant violated at line 1040");
                                     prop_assert!(model.unknown_streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD, "gave up at streak {}", model.unknown_streak);
                                     prop_assert!(elapsed >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR, "gave up only {elapsed:?} after disconnect");
                                 }
@@ -1045,7 +1045,7 @@ mod tests {
                                     // (G2) 期限のgive-upは now >= disconnected_at + resume_window のときだけ
                                     //      (時刻が逆行しても誤発火しない)。
                                     prop_assert_eq!(elapsed, resume_window + exceeded_by);
-                                    prop_assert!(Millis(now) >= millis_after(model.disconnected_at.unwrap(), resume_window));
+                                    prop_assert!(Millis(now) >= millis_after(model.disconnected_at.unwrap(), resume_window), "invariant violated at line 1048");
                                 }
                             }
                             prop_assert_eq!(p.phase, Phase::GaveUp);
@@ -1054,28 +1054,28 @@ mod tests {
                             let ep = p.episode().expect("Backoff outside an episode");
                             // (B1) backoffは期限を越えない、かつ期限到達後にはbackoffしない(=諦める)。
                             prop_assert!(Millis(now) < ep.deadline, "backed off at/after the deadline instead of giving up");
-                            prop_assert!(after <= ep.deadline.saturating_sub(Millis(now)));
-                            prop_assert!(after <= RESUME_BACKOFF.max);
-                            prop_assert!(ep.resume_window <= grant);
+                            prop_assert!(after <= ep.deadline.saturating_sub(Millis(now)), "invariant violated at line 1057");
+                            prop_assert!(after <= RESUME_BACKOFF.max, "invariant violated at line 1058");
+                            prop_assert!(ep.resume_window <= grant, "invariant violated at line 1059");
                             prop_assert_eq!(ep.deadline, millis_after(ep.disconnected_at, ep.resume_window));
                         }
                         ResumeCmd::SwitchedToCrossFamily { trigger } => {
                             // (W) switchは cross-familyがあり、未switchで、元の経路へ1回以上失敗し、
                             //     切り替え時点でprobeが1回入る残り期限があるときだけ、episodeに1回。
-                            prop_assert!(cfg.has_cross_family_target && !model.ever_switched);
-                            prop_assert!(model.stun_failures >= 1);
+                            prop_assert!(cfg.has_cross_family_target && !model.ever_switched, "invariant violated at line 1065");
+                            prop_assert!(model.stun_failures >= 1, "invariant violated at line 1066");
                             let ep0 = ep_before.expect("switch outside an episode");
-                            prop_assert!(cross_family_probe_fits(ep0.deadline.saturating_sub(Millis(now))));
+                            prop_assert!(cross_family_probe_fits(ep0.deadline.saturating_sub(Millis(now))), "invariant violated at line 1068");
                             if trigger == SwitchTrigger::FailuresOrDeadline {
-                                prop_assert!(should_switch_to_cross_family(model.stun_failures, ep0.switch_attempts_before_cross_family, ep0.deadline.saturating_sub(Millis(now))));
+                                prop_assert!(should_switch_to_cross_family(model.stun_failures, ep0.switch_attempts_before_cross_family, ep0.deadline.saturating_sub(Millis(now))), "invariant violated at line 1070");
                             }
                             model.switched = true;
                             model.ever_switched = true;
                         }
                         ResumeCmd::ShowReconnecting { elapsed: shown, resume_window } => {
                             // (N) 再接続表示は切断から15秒の猶予を過ぎてから。
-                            prop_assert!(shown >= RECONNECT_NOTIFY_GRACE);
-                            prop_assert!(resume_window <= grant);
+                            prop_assert!(shown >= RECONNECT_NOTIFY_GRACE, "invariant violated at line 1077");
+                            prop_assert!(resume_window <= grant, "invariant violated at line 1078");
                         }
                         ResumeCmd::Resumed { announce, cross_family_switched, .. } => {
                             prop_assert_eq!(announce, elapsed >= RECONNECT_NOTIFY_GRACE);
@@ -1083,7 +1083,7 @@ mod tests {
                             prop_assert_eq!(p.phase, Phase::Connected);
                         }
                         ResumeCmd::Dial { path, .. } => {
-                            prop_assert!(path != DialPath::CrossFamily || model.ever_switched);
+                            prop_assert!(path != DialPath::CrossFamily || model.ever_switched, "invariant violated at line 1086");
                         }
                         ResumeCmd::ReportAttemptFailure { .. } => {}
                     }
@@ -1095,7 +1095,7 @@ mod tests {
                 }
                 // (C) 接続済みへ戻るのは`Resumed`を返したときだけ(03224b11)。
                 if before.phase != Phase::Connected && p.phase == Phase::Connected {
-                    prop_assert!(cmds.iter().any(|c| matches!(c, ResumeCmd::Resumed { .. })));
+                    prop_assert!(cmds.iter().any(|c| matches!(c, ResumeCmd::Resumed { .. })), "invariant violated at line 1098");
                 }
                 if gave_up {
                     model.disconnected_at = None;
@@ -1119,12 +1119,12 @@ mod tests {
                 now = now.saturating_add_signed(delta);
                 match r.on_failure(Millis(now), busy, seed) {
                     BusyRetryDecision::GiveUp => {
-                        prop_assert!(!busy || now >= deadline);
+                        prop_assert!(!busy || now >= deadline, "invariant violated at line 1122");
                     }
                     BusyRetryDecision::RetryAfter { after, .. } => {
-                        prop_assert!(busy && now < deadline);
-                        prop_assert!(Duration::from_millis(now) + after <= Duration::from_millis(deadline));
-                        prop_assert!(after <= RESUME_BACKOFF.max);
+                        prop_assert!(busy && now < deadline, "invariant violated at line 1125");
+                        prop_assert!(Duration::from_millis(now) + after <= Duration::from_millis(deadline), "invariant violated at line 1126");
+                        prop_assert!(after <= RESUME_BACKOFF.max, "invariant violated at line 1127");
                     }
                 }
             }
