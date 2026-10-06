@@ -8,6 +8,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.runBlocking
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -25,13 +26,26 @@ import tools.isekai.terminal.data.SnippetTemplate
 class SnippetListScreenTest {
     @get:Rule val composeTestRule = createComposeRule()
 
+    private lateinit var vmOwner: PreloadedViewModelStoreOwner
+    private var insertedCount = 0
+
     @Before fun clearDb() {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
         Repositories.init(ctx)
         runBlocking { Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) } }
+        vmOwner = PreloadedViewModelStoreOwner(ctx)
+        insertedCount = 0
     }
 
-    private fun insertSnippet(snippet: Snippet) = runBlocking { Repositories.snippets.save(snippet) }
+    @After fun clearViewModels() { vmOwner.clear() }
+
+    private fun insertSnippet(snippet: Snippet) {
+        runBlocking { Repositories.snippets.save(snippet) }
+        insertedCount++
+    }
+
+    /** 画面が使う[SnippetListViewModel]。[setScreen]で生成され、DB読み込み完了済み。 */
+    private lateinit var vm: SnippetListViewModel
 
     private fun setScreen(
         onAddSnippet: () -> Unit = {},
@@ -39,13 +53,22 @@ class SnippetListScreenTest {
         onEditSnippet: (Snippet) -> Unit = {},
         onBack: () -> Unit = {},
     ) {
+        // SnippetListViewModelはinit{}でDispatchers.IO上に一覧読み込みを投げるが、これは
+        // Composeのアイドリング判定の対象外なので、setContent→waitForIdleだけでは一覧が
+        // まだ描画されていないことがあった(CI 2026-10-06: deleteConfirmation_dismiss_keepsSnippet
+        // が「削除」ノード未検出でflaky)。画面合成前にViewModelを生成し、挿入済みの件数が
+        // StateFlowへ反映されるまで待ってから合成する(PreloadedViewModelStoreOwner参照)。
+        vm = vmOwner.preload<SnippetListViewModel>()
+        vmOwner.awaitState(vm.snippets) { it.size == insertedCount }
         composeTestRule.setContent {
-            SnippetListScreen(
-                onAddSnippet = onAddSnippet,
-                onAddFromTemplate = onAddFromTemplate,
-                onEditSnippet = onEditSnippet,
-                onBack = onBack,
-            )
+            vmOwner.Provide {
+                SnippetListScreen(
+                    onAddSnippet = onAddSnippet,
+                    onAddFromTemplate = onAddFromTemplate,
+                    onEditSnippet = onEditSnippet,
+                    onBack = onBack,
+                )
+            }
         }
         composeTestRule.waitForIdle()
     }
@@ -130,9 +153,13 @@ class SnippetListScreenTest {
         composeTestRule.waitForIdle()
         composeTestRule.onAllNodesWithText("削除").assertCountEquals(2)
         composeTestRule.onAllNodesWithText("削除")[1].performClick()
+        // confirmDeleteはDispatchers.IO上で削除→再読み込みする(Composeのアイドリング判定の
+        // 対象外)。再読み込みで一覧が空になる=deleteItem完了後、をStateFlowで待ってから検証する。
+        vmOwner.awaitState(vm.snippets) { it.isEmpty() }
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("削除確認").assertDoesNotExist()
+        composeTestRule.onNodeWithText("list files").assertDoesNotExist()
         runBlocking { assertTrue(Repositories.snippets.getAll().isEmpty()) }
     }
 
