@@ -757,7 +757,7 @@ mod tests {
                             }
                             DiscardCause::Unresumable => {
                                 prop_assert!(before_index[&did].unresumable);
-                                prop_assert!(matches!(event, ServeEvent::Parked { .. }));
+                                prop_assert!(matches!(event, ServeEvent::Parked { .. }), "Unresumable discard from non-Parked event");
                             }
                             DiscardCause::TcpDied | DiscardCause::GuardDropped => {}
                         }
@@ -829,7 +829,7 @@ mod tests {
                     | ServeEvent::PendingExpired { .. } => {
                         // indexを変えない(Established以外にしか作用しない)。
                         prop_assert_eq!(&before.1, &after.1);
-                        prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })));
+                        prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })), "ATTACH event produced a Discard");
                     }
                     ServeEvent::Activated { .. }
                     | ServeEvent::Sweep { .. }
