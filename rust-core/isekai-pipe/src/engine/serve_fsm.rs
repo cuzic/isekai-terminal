@@ -895,8 +895,12 @@ mod tests {
                                 // I-h: 非単調nowでも、park後の経過が締切未満なら出さない。
                                 let since = since.unwrap_or(Millis(0));
                                 let deadline = effective_deadline(&before_index[&did], max_parked);
-                                prop_assert!(now.0 >= since.0, "expired with time going backwards");
-                                prop_assert!(Duration::from_millis(now.0 - since.0) >= deadline);
+                                // 経過は§2.2どおり`saturating_sub`で測る(時刻逆行=経過0)。締切0(grace 0 や
+                                // max_parked 0)なら経過0でも期限切れなので、`now >= since`そのものは要求しない
+                                // (Step 2bのproptestが`grace: Some(0)`+時刻逆行で見つけた、検査側の過剰な要求)。
+                                let elapsed = now.saturating_sub(since);
+                                prop_assert!(elapsed >= deadline, "expired before its deadline (elapsed {:?} < {:?})", elapsed, deadline);
+                                prop_assert!(deadline.is_zero() || now.0 >= since.0, "expired with time going backwards");
                             }
                             if cause == DiscardCause::Evicted {
                                 // 決定論的タイブレーク: (parked_since, id)最小のparkedを選ぶ。
