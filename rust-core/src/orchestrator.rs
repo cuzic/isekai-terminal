@@ -3069,6 +3069,52 @@ mod tests {
         );
     }
 
+    /// eecba351 / ADR §6 Step 3a(rev6)のshell配線テスト: 試行中(`retry_attempt_in_flight`)に
+    /// 届いたネットワーク復帰wakeは`pending_wake`として保持され、その試行の結果(現行世代の
+    /// `on_disconnected`)を観測した直後に、tick cadence(ここでは60秒)を待たず次の試行になる。
+    /// reducer側の不変条件(`reconnect_fsm::tests::wake_during_in_flight_attempt_is_never_lost`)を、
+    /// 実際のループ・`Notify`・アダプタ経由で確かめる。
+    #[tokio::test(start_paused = true)]
+    async fn wake_during_in_flight_attempt_is_retried_right_after_the_attempt_result() {
+        let policy = ReconnectPolicy {
+            tick: Duration::from_millis(10),
+            retry_interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+        };
+        let (orch, _cb, attempt_count) =
+            orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        assert!(orch.shared.state.lock().reconnect.reconnect_loop_active);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // 1回目のwake: 試行中でないので即座に試行する(フェイクは結果を報告しないので試行中のまま残る)。
+        orch.notify_network_path_changed(true);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(orch.shared.state.lock().reconnect.retry_attempt_in_flight);
+
+        // 2回目のwake: 試行中なので重ねて試行せず、pending_wakeとして保持する。
+        orch.notify_network_path_changed(true);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "試行中に新しい試行を重ねてはいけない"
+        );
+        assert!(orch.shared.state.lock().reconnect.pending_wake, "wakeは捨てずに保持されるはず");
+
+        // 試行の結果(この試行が作った現行世代のセッションの切断)が届くと、保持していた
+        // wakeでループが起こされ、retry_interval(60秒)を待たずに次の試行になる。
+        let attempt_adapter = OrchestratorAdapter::new(orch.shared.clone());
+        attempt_adapter.on_disconnected(Some("retry attempt failed".to_string()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 2,
+            "保持していたwakeが試行結果の直後に再試行へ繋がるはず"
+        );
+        assert!(!orch.shared.state.lock().reconnect.pending_wake);
+    }
+
     #[test]
     fn network_path_restored_while_idle_does_nothing_if_no_reconnect_loop_is_active() {
         let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
