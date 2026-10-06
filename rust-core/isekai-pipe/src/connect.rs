@@ -531,6 +531,26 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     }
 }
 
+/// Pure classification of a `run_connect` error into the
+/// `ConnectOutcomeClass` the wrapper sees (`None` = deliberately record
+/// nothing, only for `ParentGoneSignal`). Total: anything without a marker is
+/// `Unreachable`. Extracted from `write_connect_outcome_for_wrapper` (behavior
+/// preserving) so the always-connects exhaustiveness table can test it.
+fn classify_connect_error(err: &anyhow::Error) -> Option<isekai_pipe_core::ConnectOutcomeClass> {
+    if err.downcast_ref::<crate::resume_loop::ParentGoneSignal>().is_some() {
+        return None;
+    }
+    Some(if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
+        isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+    } else if err.downcast_ref::<crate::resume_loop::MidSessionDisconnectSignal>().is_some() {
+        // Epic R PR2, Task 2.5: a bare downcast finds this even through the
+        // outer `.context(..)` wrap each `run_connect` call site adds.
+        isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect
+    } else {
+        isekai_pipe_core::ConnectOutcomeClass::Unreachable
+    })
+}
+
 /// Writes a `ConnectOutcome` side-channel file for `isekai-ssh`'s wrapper to
 /// notice after `ssh` exits (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — for
 /// *every* `run_connect` failure, not just ones that look like stale trust
@@ -562,25 +582,12 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
 /// real cause is "the `ssh(1)` session this ran under is already gone",
 /// where no re-deploy or retry is a meaningful response anyway.
 fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
-    if err.downcast_ref::<crate::resume_loop::ParentGoneSignal>().is_some() {
-        return;
-    }
+    let Some(class) = classify_connect_error(err) else { return };
     let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") else { return };
     let intent_id = intent_id.to_string_lossy().into_owned();
     let Ok(runtime_dir) = default_runtime_dir() else {
         log::warn!("isekai-pipe connect: could not determine runtime dir to record a connect outcome");
         return;
-    };
-    let class = if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
-        isekai_pipe_core::ConnectOutcomeClass::StaleTrust
-    } else if err.downcast_ref::<crate::resume_loop::MidSessionDisconnectSignal>().is_some() {
-        // Epic R PR2, Task 2.5: a bare downcast finds this even through the
-        // outer `.context("isekai-pipe connect: ... failed")` wrap each
-        // `run_connect` call site adds — `anyhow::Error::downcast_ref`
-        // already walks the `ContextError` chain itself.
-        isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect
-    } else {
-        isekai_pipe_core::ConnectOutcomeClass::Unreachable
     };
     let outcome = isekai_pipe_core::ConnectOutcome {
         schema_version: isekai_pipe_core::CONNECT_OUTCOME_SCHEMA_VERSION,
@@ -1149,6 +1156,72 @@ pub(crate) fn decode_secret(b64: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Step 12 (always-connects exhaustiveness): every `run_connect` `Err`
+    /// shape maps to a `ConnectOutcomeClass`, except `ParentGoneSignal`
+    /// (deliberately unrecorded). If you add a new marker type or an early
+    /// return in `classify_connect_error`, add a row here.
+    #[test]
+    fn classify_connect_error_table_covers_every_marker_at_every_context_depth() {
+        use isekai_pipe_core::ConnectOutcomeClass as C;
+        fn wrap(mut e: anyhow::Error, depth: usize) -> anyhow::Error {
+            for i in 0..depth {
+                e = e.context(format!("isekai-pipe connect: layer {i} failed"));
+            }
+            e
+        }
+        type Mk = fn() -> anyhow::Error;
+        let rows: Vec<(&str, Mk, Option<C>)> = vec![
+            ("stale-trust marker", || anyhow::Error::new(isekai_transport::StaleTrustSignal), Some(C::StaleTrust)),
+            (
+                "mid-session marker",
+                || anyhow::Error::new(crate::resume_loop::MidSessionDisconnectSignal),
+                Some(C::MidSessionDisconnect),
+            ),
+            ("parent-gone marker", || anyhow::Error::new(crate::resume_loop::ParentGoneSignal), None),
+            ("unmarked error", || anyhow::anyhow!("plain failure"), Some(C::Unreachable)),
+            ("panic guard message", || anyhow::anyhow!("isekai-pipe connect: run_connect panicked"), Some(C::Unreachable)),
+            (
+                "stale-trust + mid-session (stale-trust wins)",
+                || anyhow::Error::new(crate::resume_loop::MidSessionDisconnectSignal).context(isekai_transport::StaleTrustSignal),
+                Some(C::StaleTrust),
+            ),
+            (
+                "parent-gone + mid-session (parent-gone wins)",
+                || anyhow::Error::new(crate::resume_loop::MidSessionDisconnectSignal).context(crate::resume_loop::ParentGoneSignal),
+                None,
+            ),
+            (
+                "parent-gone + stale-trust (parent-gone wins)",
+                || anyhow::Error::new(isekai_transport::StaleTrustSignal).context(crate::resume_loop::ParentGoneSignal),
+                None,
+            ),
+        ];
+        for (name, mk, expected) in rows {
+            for depth in 0..=2 {
+                let got = classify_connect_error(&wrap(mk(), depth));
+                assert_eq!(got, expected, "row `{name}` at context depth {depth}");
+            }
+        }
+    }
+
+    /// Step 12 (limitation guard): `run_connect` must have exactly one call
+    /// site (`connect_command`), whose `Err` flows into
+    /// `write_connect_outcome_for_wrapper`. A second caller could bypass that
+    /// recording point and silently break always-connects.
+    #[test]
+    fn run_connect_has_a_single_call_site() {
+        let src = include_str!("connect.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module marker")];
+        let calls = prod.matches("run_connect(").count();
+        // 1 definition + 1 call (+ doc/comment mentions are written without the paren-call form
+        // `run_connect(` only where they are real code or the `run_connect(launch)` call).
+        let code_calls = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains("run_connect("))
+            .count();
+        assert_eq!(code_calls, 2, "expected 1 definition + 1 call site of run_connect, found {code_calls} code lines (raw {calls})");
+    }
     use super::*;
     use isekai_pipe_core::ServerIdentity;
 
