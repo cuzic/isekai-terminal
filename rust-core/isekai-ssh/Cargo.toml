@@ -21,6 +21,7 @@ isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-bootstrap-plan = { path = "../isekai-bootstrap-plan" }
 isekai-auth = { path = "../isekai-auth" }
 isekai-pipe-core = { path = "../isekai-pipe-core" }
+isekai-transport = { path = "../isekai-transport" }
 isekai-protocol = { path = "../isekai-protocol" }
 russh-stream-session = { path = "../russh-stream-session" }
 openssh-config = { path = "../openssh-config" }

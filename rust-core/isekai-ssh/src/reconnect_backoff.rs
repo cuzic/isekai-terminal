@@ -24,17 +24,13 @@ pub(crate) const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Same exponential-backoff-with-jitter shape as
 /// `native::mux::mod::ReconnectBackoff` and
-/// `isekai-pipe::resume_loop::RESUME_BACKOFF` — jitter specifically to
-/// avoid every open tab's reconnect loop retrying (and re-dialing) on the
-/// exact same schedule after a shared event like a sleep/resume or roaming
-/// network change.
-pub(crate) struct ReconnectBackoff {
-    pub(crate) initial: Duration,
-    pub(crate) max: Duration,
-    /// Fraction in `0.0..=1.0` of random jitter applied on top of the
-    /// exponential delay. `0.0` disables jitter entirely.
-    pub(crate) jitter: f64,
-}
+/// `isekai-pipe::resume_loop::RESUME_BACKOFF` — all three are now the one
+/// `isekai_transport::backoff::BackoffPolicy` (ADR_FUNCTIONAL_CORE_EFFECTS.md
+/// Step 6); jitter specifically avoids every open tab's reconnect loop
+/// retrying (and re-dialing) on the exact same schedule after a shared event
+/// like a sleep/resume or roaming network change. Draw it with the pure
+/// `next_delay(attempt, seed)`.
+pub(crate) use isekai_transport::backoff::BackoffPolicy as ReconnectBackoff;
 
 pub(crate) const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.25 };
 
@@ -146,7 +142,7 @@ impl RedeployGate {
     }
 
     pub(crate) fn record_attempt(&mut self) {
-        self.next_due_at = Some(tokio::time::Instant::now() + REDEPLOY_BACKOFF.delay_for_attempt(self.attempt));
+        self.next_due_at = Some(tokio::time::Instant::now() + REDEPLOY_BACKOFF.next_delay(self.attempt, rand::random()));
         self.attempt += 1;
     }
 
@@ -180,28 +176,6 @@ impl RedeployGate {
     }
 }
 
-impl ReconnectBackoff {
-    fn base_delay(&self, attempt: u32) -> Duration {
-        let shift = attempt.min(32);
-        let multiplier: u64 = 1u64 << shift;
-        let initial_millis = u64::try_from(self.initial.as_millis()).unwrap_or(u64::MAX);
-        let max_millis = u64::try_from(self.max.as_millis()).unwrap_or(u64::MAX);
-        Duration::from_millis(initial_millis.saturating_mul(multiplier).min(max_millis))
-    }
-
-    pub(crate) fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        use rand::Rng as _;
-        let base = self.base_delay(attempt);
-        if self.jitter <= 0.0 {
-            return base;
-        }
-        let jitter = self.jitter.min(1.0);
-        let factor = 1.0 + rand::thread_rng().gen_range(-jitter..=jitter);
-        let jittered_secs = (base.as_secs_f64() * factor).max(0.0);
-        Duration::from_secs_f64(jittered_secs).min(self.max)
-    }
-}
-
 pub(crate) enum ReconnectDecision {
     Retry,
     GiveUp,
@@ -221,7 +195,7 @@ pub(crate) async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: 
     if lost_at.elapsed() >= RECONNECT_BUDGET {
         return ReconnectDecision::GiveUp;
     }
-    let delay = RECONNECT_BACKOFF.delay_for_attempt(*attempt);
+    let delay = RECONNECT_BACKOFF.next_delay(*attempt, rand::random());
     *attempt += 1;
     tokio::time::sleep(delay).await;
     ReconnectDecision::Retry
@@ -260,9 +234,9 @@ mod tests {
     #[test]
     fn delay_for_attempt_grows_but_is_capped_at_max() {
         let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(1), jitter: 0.0 };
-        assert_eq!(backoff.delay_for_attempt(0), Duration::from_millis(100));
-        assert_eq!(backoff.delay_for_attempt(1), Duration::from_millis(200));
-        assert_eq!(backoff.delay_for_attempt(10), Duration::from_secs(1), "must be capped at max, not keep doubling forever");
+        assert_eq!(backoff.next_delay(0, 0), Duration::from_millis(100));
+        assert_eq!(backoff.next_delay(1, 0), Duration::from_millis(200));
+        assert_eq!(backoff.next_delay(10, 0), Duration::from_secs(1), "must be capped at max, not keep doubling forever");
     }
 
     #[tokio::test]
@@ -311,7 +285,7 @@ mod tests {
             assert!(gate.due(), "the very first redeploy for a storm must not be delayed");
         }
 
-        // `REDEPLOY_BACKOFF.delay_for_attempt(0)` draws from `[45s, 75s]`
+        // `REDEPLOY_BACKOFF.next_delay(0, seed)` draws from `[45s, 75s]`
         // (60s base, ±25% jitter). Bracketing the assertions outside that
         // whole range — instead of exactly at the 60s mean, which
         // `record_attempt`'s fresh jitter draw made a ~50%-flaky boundary
