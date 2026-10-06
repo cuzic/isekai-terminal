@@ -95,8 +95,12 @@ jobs:
           java-version: "17"
           cache: gradle
 
+      # 保存はmainへのpush時のみ(ジョブ末尾の`Save cargo cache`参照)。PR上で保存した
+      # キャッシュは`refs/pull/N/merge`スコープで他のPRから読めず、リポジトリ上限10GBを
+      # 食い潰してmainのキャッシュをLRUで追い出していた(rust-core-test-check.yml参照)。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -137,6 +141,16 @@ jobs:
 
       - name: ./gradlew :android:testDebugUnitTest
         run: ./gradlew :android:testDebugUnitTest --stacktrace
+
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload test reports on failure
         if: failure()
