@@ -93,31 +93,34 @@ import uniffi.isekai_terminal_core.*
  * ペイン単位の操作を1つにまとめて渡す)が個々の操作の配線を気にせず済むようにするための束。
  *
  * すべての操作は最終的に [tools.isekai.terminal.session.TerminalSession] への薄い委譲。
+ *
+ * 関数型プロパティには既定値を持たせない(既定のno-opに吸われて渡し忘れがコンパイルを通る
+ * 配線漏れを防ぐ、`ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g)。`WiringLintTest`が再発を検査する)。
  */
 data class TerminalScreenActions(
     val onConnect: () -> Unit,
     val onDisconnect: () -> Unit,
     /** 自動再接続ループ(isReconnecting中)を中止する。 */
-    val onCancelReconnect: () -> Unit = {},
+    val onCancelReconnect: () -> Unit,
     val onBack: () -> Unit,
     val onSend: (ByteArray) -> Unit,
     val onResize: (UInt, UInt) -> Unit,
     val onScrollbackCells: (Int, Int) -> List<CellData>?,
     /** タスク#66: スクロールバック検索。マッチ計算は一切Kotlin側で行わず、Rust側
      *  `SessionCore::search_scrollback`(#37)の結果をそのまま返すだけ(rust-ssot)。 */
-    val onSearchScrollback: (String, Boolean) -> List<ScrollbackSearchMatch> = { _, _ -> emptyList() },
+    val onSearchScrollback: (String, Boolean) -> List<ScrollbackSearchMatch>,
     /** タスク#13(OSC 133): 「前/次のプロンプトへジャンプ」。既存のスクロールバック検索
      *  ([onSearchScrollback])とは独立した機能。引数は現在の(scrollOffset, showingScrollback)。
      *  結果は[TerminalUiState.promptJumpResult]で非同期に届く。 */
-    val onJumpToPreviousPrompt: (Int, Boolean) -> Unit = { _, _ -> },
-    val onJumpToNextPrompt: (Int, Boolean) -> Unit = { _, _ -> },
+    val onJumpToPreviousPrompt: (Int, Boolean) -> Unit,
+    val onJumpToNextPrompt: (Int, Boolean) -> Unit,
     /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
      *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
      *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
-    val onClickToPromptCursor: (Int, Int) -> Unit = { _, _ -> },
+    val onClickToPromptCursor: (Int, Int) -> Unit,
     /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
      *  [TerminalUiState.promptOutputCopyResult]で非同期に届く。 */
-    val onCopyLastCommandOutput: () -> Unit = {},
+    val onCopyLastCommandOutput: () -> Unit,
     val onTrustUpdatedHostKey: () -> Unit,
     val onDismissHostKeyWarning: () -> Unit,
     val onTrustNewHostKey: () -> Unit,
@@ -128,30 +131,29 @@ data class TerminalScreenActions(
     val onTrzszDismiss: () -> Unit,
     val onGetSessionLog: () -> String,
     val onSendSnippet: (Snippet) -> Unit,
-    val onSendKeySequence: (List<KeyStep>) -> Unit = {},
+    val onSendKeySequence: (List<KeyStep>) -> Unit,
     val onRespondAgentSignRequest: (Boolean) -> Unit,
     /** 画面分割(split pane)でこのペインがタップされた時に呼ぶ。フォーカスをこのペインへ
      *  切り替える(タブ横断の`TerminalTabsViewModel.setFocusedPane`への委譲)。分割していない
-     *  単一ペインの場合は no-op のままでよい。 */
-    val onRequestFocus: () -> Unit = {},
-    val onNextTab: () -> Unit = {},
-    val onPreviousTab: () -> Unit = {},
+     *  単一ペインで呼ばれても実害は無い。 */
+    val onRequestFocus: () -> Unit,
+    val onNextTab: () -> Unit,
+    val onPreviousTab: () -> Unit,
     /** #14: 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでもRust側で無視される。 */
-    val onForceReturnToWifi: () -> Unit = {},
+    val onForceReturnToWifi: () -> Unit,
     /** #60: このペインの実効フォーカス状態(`isActive && hasFocus`)が変化するたびに
      *  そのまま呼ばれる。フォーカスレポーティング(`CSI ?1004`)が有効かどうかの判断は
      *  Rust側が持つため、ここでは生の値を渡すだけでよい。 */
-    val onFocusChanged: (Boolean) -> Unit = {},
+    val onFocusChanged: (Boolean) -> Unit,
     /** タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモートで
      *  1回実行して結果を待つ。`TerminalSession.filePreviewRequest`への薄い委譲
      *  (パース/デコードは全てRust側で完結しており、ここは中継するだけ)。 */
-    val onFilePreviewRequest: suspend (FilePreviewRequestKind) -> FilePreviewOutcome =
-        { FilePreviewOutcome.Error("not connected") },
+    val onFilePreviewRequest: suspend (FilePreviewRequestKind) -> FilePreviewOutcome,
     /** `AI_INTEGRATION_DESIGN.md` §6.2: `presentForm`パネルの送信(フィールドid→値)。
      *  `TerminalSession.submitAiPanelForm`への薄い委譲。 */
-    val onSubmitAiPanelForm: (Map<String, String>) -> Unit = {},
+    val onSubmitAiPanelForm: (Map<String, String>) -> Unit,
     /** 同、パネルを閉じる(送信せずキャンセル、またはpresentDocumentを閉じる)。 */
-    val onDismissAiPanel: () -> Unit = {},
+    val onDismissAiPanel: () -> Unit,
 )
 
 /**

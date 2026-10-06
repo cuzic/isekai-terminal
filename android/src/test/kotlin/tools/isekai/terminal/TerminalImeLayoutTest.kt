@@ -91,25 +91,7 @@ class TerminalImeLayoutTest {
         emptyList(), 0u, null,
     )
 
-    private fun noopActions(onResize: (UInt, UInt) -> Unit) = TerminalScreenActions(
-        onConnect = {},
-        onDisconnect = {},
-        onBack = {},
-        onSend = {},
-        onResize = onResize,
-        onScrollbackCells = { _, _ -> null },
-        onTrustUpdatedHostKey = {},
-        onDismissHostKeyWarning = {},
-        onTrustNewHostKey = {},
-        onDismissNewHostKeyPrompt = {},
-        onTrzszStartUpload = {},
-        onTrzszStartDownload = {},
-        onTrzszCancel = {},
-        onTrzszDismiss = {},
-        onGetSessionLog = { "" },
-        onSendSnippet = {},
-        onRespondAgentSignRequest = {},
-    )
+    private fun noopActions(onResize: (UInt, UInt) -> Unit) = noopTerminalScreenActions(onResize = onResize)
 
     /** [heightState]/[imeState]を外側から操作できる形で[TerminalScreenBody]をマウントする。 */
     private fun setImeAwareScreen(

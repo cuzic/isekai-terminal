@@ -46,7 +46,7 @@ class NetworkPathMonitor(private val connectivityManager: ConnectivityManager) {
      * (e.g. [AndroidAppExecutor]'s network-lost notification) don't need to track individual
      * paths themselves.
      */
-    fun start(onAggregateChanged: (anyPathAvailable: Boolean) -> Unit = {}) {
+    fun start(onAggregateChanged: (anyPathAvailable: Boolean) -> Unit) {
         this.onAggregateChanged = onAggregateChanged
         register(
             PathId.DIRECT,

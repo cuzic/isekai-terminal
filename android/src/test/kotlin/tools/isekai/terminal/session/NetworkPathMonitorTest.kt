@@ -30,14 +30,14 @@ class NetworkPathMonitorTest {
 
     @Test
     fun bothPathsStartUnknown() {
-        monitor.start()
+        monitor.start {}
         assertEquals(PathState.UNKNOWN, monitor.currentState(PathId.DIRECT))
         assertEquals(PathState.UNKNOWN, monitor.currentState(PathId.TAILSCALE))
     }
 
     @Test
     fun pathsBecomeValidatedWhenTheirNetworkBecomesAvailable() {
-        monitor.start()
+        monitor.start {}
         val network = Shadow.newInstanceOf(Network::class.java)
 
         shadowOf(connectivityManager).networkCallbacks.forEach { it.onAvailable(network) }
@@ -48,7 +48,7 @@ class NetworkPathMonitorTest {
 
     @Test
     fun pathsBecomeFailedWhenTheirNetworkIsLost() {
-        monitor.start()
+        monitor.start {}
         val network = Shadow.newInstanceOf(Network::class.java)
         val callbacks = shadowOf(connectivityManager).networkCallbacks
         callbacks.forEach { it.onAvailable(network) }
@@ -61,7 +61,7 @@ class NetworkPathMonitorTest {
 
     @Test
     fun stopUnregistersAllCallbacks() {
-        monitor.start()
+        monitor.start {}
         assertEquals(2, shadowOf(connectivityManager).networkCallbacks.size)
 
         monitor.stop()
