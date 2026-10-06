@@ -330,6 +330,8 @@ impl ReconnectState {
             // #19: 一度もConnectedに至らず切断された(=接続試行そのものの失敗)場合
             // だけLocal Network Privacyヒントの対象にする。Connected後の正常終了/
             // ユーザー切断ではヒントを付けても意味がない。
+            // NOTE: `targets_local_network: bool`で足りるのは`ConnectionIssueHint`が現状1 variant
+            // だけだから。variantが増えたら、shellの事前計算をヒントの種類ごとの入力に広げること。
             let issue_hint = (!was_connected && targets_local_network)
                 .then_some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied);
             // #20: 自動ループが始まらない切断は、バックグラウンド遷移の追跡対象外に戻す

@@ -735,6 +735,9 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         (effects, resolved_attempt)
     };
     // 旧`Action::Suppress`/`Action::StartLoop`(=Disconnectedを公開しない分岐)のときだけ記録する。
+    // NOTE: この`matches!`と`resolve_start_loop_attempt`の`matches!`は登録interpreter
+    // (`execute_reconnect_effects`)の外で、ログ判定とin-lock解決のためにEffectを覗くだけで、
+    // 消費(捨てる)はしない。Effectの解釈はすべてinterpreterの明示armで行う(ADR §3-8)。
     let retry_log = !effects.iter().any(|e| matches!(e, ReconnectEffect::PublishDisconnected { .. }));
     if retry_log {
         crate::debug_reconnect::record(format!(
@@ -815,13 +818,17 @@ fn execute_reconnect_effects(
                 } else {
                     // `set_last_connect_attempt`の不変条件が破れない限り到達しない。到達した
                     // 場合もループフラグを立てたまま放置せず(always-connects.md)、ループ無しの
-                    // 切断として扱う。
+                    // 切断として扱う。状態は`ReconnectState::apply`の「直前の接続設定が無い」分岐
+                    // (`last_attempt == None`)と同じ形に揃える: ループ非動作・`background_state`は
+                    // Foreground(`pending_wake`はその遷移で既に下りている)。
+                    // NOTE: reducer外からの直接書き込み(Step 3aで未移行の他の書き手と同じ扱い)。
                     debug_assert!(false, "StartReconnectLoop: AttemptRef {attempt:?} could not be resolved");
                     log::error!("orchestrator: reconnect attempt {attempt:?} could not be resolved; not starting the loop");
                     {
                         let mut s = shared.state.lock();
                         if s.reconnect.reconnect_epoch == epoch {
                             s.reconnect.reconnect_loop_active = false;
+                            s.reconnect.background_state = BackgroundState::Foreground;
                         }
                     }
                     shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
@@ -1097,6 +1104,9 @@ fn spawn_reconnect_loop(
             }
 
             if elapsed >= policy.timeout {
+                // NOTE: ギブアップはtick会計の結果なのでStep 3aでは未移行(3b/3cの再評価対象)。
+                // 現状どおり`reconnect_epoch`を進めない: 既に送出済みの試行の遅延結果(同epochの
+                // `AttemptFailedSync`等)はこのepochのまま届きうる。挙動は変えていない。
                 let mut s = shared.state.lock();
                 if s.reconnect.reconnect_epoch == epoch {
                     s.reconnect.reconnect_loop_active = false;
@@ -3077,9 +3087,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wake_during_in_flight_attempt_is_retried_right_after_the_attempt_result() {
         let policy = ReconnectPolicy {
-            tick: Duration::from_millis(10),
+            // tickを5秒にして、テスト内の30msの待機中には通常のtickが一度も来ないようにする。
+            // こうすると最後の再試行は`WakeReconnectLoop`(試行結果の直後のwake通知)でしか起き得ず、
+            // そのarmがno-opなら次のtick(5秒後)まで試行は1回のままでこのテストは失敗する
+            // (tick=10msだと次のtickが`pending_wake`を拾ってしまい、wake通知の有無を区別できない)。
+            tick: Duration::from_secs(5),
             retry_interval: Duration::from_secs(60),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(120),
         };
         let (orch, _cb, attempt_count) =
             orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
