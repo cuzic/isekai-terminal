@@ -30,6 +30,12 @@ package = "isekai-terminal-core"
 file = "src/trzsz.rs"
 module = "trzsz"
 
+# Step 4: pool.rsのrefcount/アイドル削除タイマー判断(token付きArmIdleTimer/IdleExpired)。
+[[module]]
+package = "isekai-terminal-core"
+file = "src/pool_idle_fsm.rs"
+module = "pool_idle_fsm"
+
 [[module]]
 package = "isekai-terminal-core"
 file = "src/net_health_policy.rs"
@@ -129,3 +135,14 @@ effect = "ServeEffect"
 file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
 effect = "ReconnectEffect"
+
+# Step 4: pool.rsのアイドルタイマーinterpreter(ロック内: Remove実行 / ロック外: ArmIdleTimerのspawn)。
+[[interpreter]]
+file = "src/pool.rs"
+fn = "apply_idle_in_lock"
+effect = "IdleEffect"
+
+[[interpreter]]
+file = "src/pool.rs"
+fn = "run_pool_effects"
+effect = "PoolEffect"

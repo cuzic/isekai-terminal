@@ -11,6 +11,8 @@ pub(crate) mod ai_panel;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
+// Step 4(ADR_FUNCTIONAL_CORE_EFFECTS.md): pool.rsのrefcount/アイドルタイマー判断の純粋reducer。
+pub(crate) mod pool_idle_fsm;
 pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
