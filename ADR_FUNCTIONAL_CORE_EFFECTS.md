@@ -2,6 +2,8 @@
 
 - **Status**: **Approved(2026-10-06、ユーザーApprove済み)**。rev4。Approve時のユーザー決定: D1=Step 2bの後で2cを実施、
   D3=純粋性検査ジョブのみrequired check化(mutants週次ジョブは非required)。それ以外の未解決事項は§10の既定案に従う。
+  **rev5(2026-10-06、amendment)**: ユーザー承認済みの追加Step 7a・9・10・11・12・13をロードマップに追加(§0 rev5)。
+  rev4までの決定は一切変更していない。
   (以下は承認前のレビュー経過)敵対的レビューは4ラウンドで収束済み。
   round 1〜4の敵対的レビュー(`scratchpad/opus-review-fcis-adr-round{1,2,3,4}.md`、Opus)の全指摘と、
   それを受けたユーザー決定を反映。round 4の判定は「converged」(残りは軽微6件で、rev4に取り込み済み)。
@@ -14,6 +16,9 @@
   - Android: `TerminalTabsViewModel.kt`、`session/{TerminalSession,ConnectionStateMapper}.kt`
   - CI: `.github/workflows/{rust-core-test-check,cargo-mutants-check,regenerate-lockfile,regenerate-uniffi-bindings}.yml`、
     `rust-core/.config/nextest.toml`、新設`rust-core/clippy.toml`・`rust-core/pure_modules.toml`
+  - rev5追加分: `isekai-pipe/src/connect.rs`(Step 12)、`isekai-pipe-core/src/outcome.rs`(Step 12、読むだけ)、
+    Kotlin/Swiftのテスト(`android/src/test/`、`ios/Tests/IsekaiTerminalCoreLogicTests/`、Step 13)、
+    `.github/workflows/ios-logic-linux-check.yml`(Step 13のマージ条件)
 - **ユーザーの目的**: FCIS・algebraic effects風(Effect enumをshellが解釈)・ASGI風のプロトコル境界・
   Elm architecture・Redux(単一State/Event/純粋reduce)の考え方をisekai-terminal(Android+rust-core)と
   isekai-ssh/isekai-pipeに持ち込み、**CIで決定論的に検証できる範囲を広げる**。
@@ -28,6 +33,24 @@
 ---
 
 ## 0. 改訂履歴
+
+### rev5(2026-10-06)— Approve後のamendment: 追加Step 7a・9・10・11・12・13
+
+ユーザーが承認した追加Stepを、既存の決定(rev1〜rev4、D1・D3を含む)を変えずにロードマップへ組み込んだ。
+rev5で「確認済み」と書いたコード事実はmain `b413c2ac`で読んだもの(rev4までの`beb74a03`との間にこれらのファイルへの
+変更は無い)。
+
+| 追加 | 内容 | 依存 |
+|---|---|---|
+| **Step 7a**(lint) | Effect interpreter関数に`#[deny(clippy::wildcard_enum_match_arm)]`を付け、Effect enumは`match`の明示armでのみ消費する。Effect追加時に全interpreterでの対応がコンパイル時に強制される。`AttachRuntime::activate`(`attach_runtime.rs:210-222`)が`if let AttachEffect::StartRelay`で他のEffectを黙って捨てている箇所(確認済み)が、2aで`Activated`が`Discard{Evicted}`も返すようになると実害になる | Step 0の後 |
+| **Step 9**(調査) | 不具合履歴に基づくStep順序の再ランク付け。別エージェントが`scratchpad/defect-history-rank.md`を作成中で、**本ADRはその結果を先取りしない**。結果はStep順序見直しの入力であり、順序の変更はユーザーが決めるADR amendmentとして行う | なし(いつでも) |
+| **Step 10**(shell競合の検証層) | 実shell(`start_paused`)と純粋集約モデルに同じ操作列を流す差分テスト(PR #124の`pool.rs`方式)と、`AttachArbiter`+`SessionIndex`集約の有界網羅探索の評価(手書き探索器/stateright/loom)。loomはtokio非同期mutexとparking_lotの使用から集約には適用困難と評価 | Step 2aの後 |
+| **Step 11**(Effect/callback列の不変条件検査) | e2e/orchestratorテストで記録したEffect・callback列に不変条件(例: `Established(g)`の後に`Lost(g)`が正確に1回)を課す。秘密を載せない(§3-3)。Q12(実機記録+replay)とは別物で、Q12の既定案「実施しない」は変えない | Step 3a・8a′の後 |
+| **Step 12**(always-connects網羅性) | `isekai-pipe`の`run_connect`の全`Err`経路→`ConnectOutcomeClass`の分類と、`decide_connect_failure_recovery`の全クラス×入力の網羅表テスト | 独立 |
+| **Step 13**(Android/iOS callback契約golden) | Rust(8a′の`on_connection_edge`等)から生成したgolden callback列をKotlin JVMテストとSwiftテストでreplayする。`ios-*`はrequiredでないため、該当PRでは`ios-logic-linux-check`の緑をマージ条件にする | Step 8a′の後 |
+
+§6の順序行・固定依存・並行可の記述、§7(CI)、§10(新規の未解決事項Q15〜Q18・D5)を更新した。
+§3に規則8(interpreterのEffect消費)を追加した(Step 7aの規則化。既存規則1〜7は不変)。
 
 ### rev4(2026-10-06)— round 4レビュー(収束判定)の軽微指摘の取り込み
 
@@ -366,6 +389,10 @@ Event列をCIのreplayテストにする構想は残すが、**§3の秘密情�
    §4.1の不変条件proptestを更新する。
 6. reducerの型を`#[uniffi::export]`しない。UniFFIへ出すのは公開状態と生イベントの入口だけ。
 7. 新しいreducerには最低1本のproptest(任意Event列→不変条件)を同じPRで付ける。
+8. (rev5、Step 7a)**Effectを解釈する関数(interpreter)はEffect enumを`match`の明示armでのみ消費する。**
+   `_`/束縛ワイルドカードarm・`if let`・`let .. else`・`matches!`でEffectを選り分けて残りを捨てない。
+   新しいinterpreterは`pure_modules.toml`の`[[interpreter]]`に登録し、関数に
+   `#[deny(clippy::wildcard_enum_match_arm)]`を付ける(Step 7a)。
 
 ---
 
@@ -463,13 +490,24 @@ reducer化した再接続系FSMには有界到達性のプロパティを課す:
 
 ## 6. 移行ロードマップ
 
-順序: **0 → 1 → 1.5 → 2a → 2b(→ 2c) → 2.5 → 3a → 4 → 6 → 8a′ → 8b**。
+順序: **0 → 7a → 1 → 1.5 → 2a → 10 → 2b(→ 2c) → 2.5 → 3a → 4 → 6 → 8a′ → 11 → 13 → 8b**(rev5で7a・10・11・13を挿入)。
+Step 12は独立(どこに入れてもよい)。Step 9はコード変更を伴わない調査で、結果が出た時点でこの順序行自体の
+見直し材料になる(見直しはユーザーが決めるADR amendment)。
 3b/3c/5/7は**証拠を見て再評価**(§6末尾)。
+rev5の固定依存: **0 → 7a**(7aはStep 0のclippyジョブ・`pure_modules.toml`・allowlistスクリプトに乗る)、
+**2a → 10**(10の差分テストと網羅探索の対象は2aの`ServeAggregate`)、**3a → 11**・**8a′ → 11**(11が検査するEffect/
+callback列は3aの`ReconnectEffect`と8a′の`on_connection_edge`)、**8a′ → 13**(goldenの中身が8a′のcallback)。
+推奨順序(固定依存ではない): 7aは2aより前(2aで`activate`が`Discard`も受け取るようになる前にlintを効かせる)、
+10は2bより前(2b/2cの挙動変更に対する安全網になる)、11 → 13(13のgolden生成は11の記録器を再利用する)、
+13 → 8b(13のKotlin replayテストが8bの`_state.update`書き換えの安全網になる。13はテストファイルだけを足し
+`TerminalSession.kt`本体を変えないので、8a′ → 8bのファイル衝突規則には当たらない)。
 固定の依存関係(round 2 m-R2-7): **2.5 → 4**(どちらも`pool::release`のシグネチャ/spawn箇所`pool.rs:175-196`を
 変えるので、逆順や並行は確実に衝突する)、**3a → 8a′**(8a′は3aが作る`reconnect_fsm.rs`にedge状態を足す)。
 **8a′ → 8b**(どちらも`android/.../session/TerminalSession.kt`を変える。8a′は新callbackの実装者として、
 8bは`_state.update`22箇所の書き換えとして。round 3 m-R3-5)。
 並行してよいのは、Step 0の後のStep 6だけ(他のStepと触るファイルが重ならない)。
+rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs`・`isekai-ssh/src/native/connect.rs`のみ。
+Step 6の`reconnect_backoff.rs`/`native/mux/mod.rs`とも重ならない)とStep 9(調査のみ)も、いつでも並行してよい。
 各Stepはそれぞれ独立PR、コミットは細かく分ける。
 
 ### Step 0: 純粋性検査の導入(本番コード変更は最小)
@@ -503,6 +541,47 @@ reducer化した再接続系FSMには有界到達性のプロパティを課す:
     `tokio::`/`spawn`/`Notify`は、clippyはコメントを見ないので問題にならない。
 - **得られるCI検証**: 既存純粋モジュールが直接・推移的に時計/I/O/ロックへ依存し始める退行の検知。
 - **リスク/ロールバック**: 誤検知時は登録解除のみ。clippyジョブはrequired化しない。
+
+### Step 7a(rev5新規): Effect interpreterの網羅性lint
+
+§6末尾の再評価対象「Step 7」(isekai-ssh回復ループの共通化)とは無関係。番号は「Step 0の検査基盤に乗る小さなlint」
+であることを示すために付けた。
+
+- **問題(確認済み)**: Effectを解釈する側が`match`以外でEffectを選り分けると、reducerが新しいEffectを返し始めたときに
+  黙って捨てられる。実例: `AttachRuntime::activate`(`isekai-pipe/src/engine/attach_runtime.rs:210-222`)は
+  `apply(AttachEvent::Activated{..})`の戻り値を`for effect in effects { if let AttachEffect::StartRelay { lease, .. } = effect { .. } }`
+  で走査し、`StartRelay`以外のvariantは無視する。現状の`on_activated`(`attach_arbiter.rs:330-344`)は`StartRelay`しか
+  返さないので無害だが、**Step 2aで`Activated`は「満杯なら最古parkedを`Discard{Evicted}`」も返す**(Step 2a)。
+  この`if let`のままだとそのDiscard(in-lock effect)は解釈されず、立ち退きが起きない。
+  一方`execute_effects`(`attach_runtime.rs:253-275`)は6 variantすべてを明示armで`match`しており(`StartRelay`は
+  到達しない前提の`log::warn!` arm)、これが目標の形。
+- **決定**:
+  - interpreter関数(Effect列を受け取って実行する関数)に`#[deny(clippy::wildcard_enum_match_arm)]`を**関数単位で**付ける。
+    モジュール単位にしないのは、同じ`attach_runtime.rs`にEffect以外の正当なワイルドカード`match`があるため
+    (`:185-187`の`state_for`、`:359-361`の`leases`、確認済み)。`wildcard_enum_match_arm`はclippyのrestriction群のlint [EXT]
+    で`clippy::all`に含まれないが、ソース内の`deny`はStep 0のジョブの`-A clippy::all`より優先されるので(§2.3)、
+    同じジョブで検査される。
+  - lintが捕まえない形(`if let`/`let .. else`/`matches!`/入れ子パターン内の`_`。どこまで捕まるかは [EXT] で
+    Step 7aのPRで確認)は、Step 0のallowlistスクリプトを拡張して捕まえる: `pure_modules.toml`に
+    `[[interpreter]] file = .., fn = .., effect = "AttachEffect"`を登録し、スクリプトはその関数本体で
+    `if let <effect>::`・`let <effect>::`・`matches!(.., <effect>::`を拒否する(§2.3と同じ簡易字句解析なので、
+    既知の死角をスクリプト冒頭に追記する)。
+  - 初期登録: `AttachRuntime::execute_effects`、`AttachRuntime::activate`(本PRで`if let`を全variantの明示`match`に
+    書き換える。`StartRelay`以外のarmは`execute_effects`の`StartRelay` armと同じく`log::warn!`のみ=現状到達しないので
+    **挙動保存**)。以後、2aの`ServeAggregate` interpreter、3aの`ReconnectEffect` interpreter(`handle_unexpected_disconnect`の
+    実行部)、4の`pool` interpreter、将来の再接続ループinterpreterは、それぞれのStepのPRで登録する(§3-8)。
+  - Effect enumに`#[non_exhaustive]`は付けない(同一crate内では効かず、付けても網羅性検査は強まらない [EXT])。
+  - Step 12の`decide_connect_failure_recovery`のように「Effectではないが網羅性が不変条件を担うenum」の`match`にも
+    同じ属性を付けてよい(Step 12で判断)。
+- **得られるCI検証**: Effect variantを追加したPRは、登録済みの全interpreterで明示armを書かない限りclippyジョブが落ちる。
+  「reducerは正しいEffectを返したが、shellが黙って捨てた」という、reducerのproptest(§3-7)では原理的に見えない
+  種類の退行がコンパイル時に止まる。
+- **リスク**: 低。本番コードの変更は`activate`の書き換えだけで、到達しないarmの追加のみ。lint・スクリプトの誤検知は
+  関数単位の属性/登録の解除で戻せる。
+- **前提**: Step 0(clippy純粋性ジョブ・`pure_modules.toml`・allowlistスクリプト)がmainにあること。D3により
+  純粋性検査ジョブがrequired化された後は、7aの検査もそのrequired check内で走る(ジョブを分けないので
+  `main-branch-protection.md`のcontext追加作業は発生しない)。
+- **ロールバック**: 属性と`[[interpreter]]`登録の削除、スクリプト拡張部分のrevert。`activate`の書き換えは挙動保存なので残してよい。
 
 ### Step 1: `AttachArbiter`のproptest不変条件(テストのみ)
 
@@ -834,6 +913,195 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 - **得られるCI検証**: `android-unit-test`(required)内でRobolectric無しの高速テスト。
 - **リスク**: 低。
 
+### Step 9(rev5新規): 不具合履歴によるStep順序の再ランク付け(調査のみ)
+
+- **内容**: 過去の不具合履歴(コミット・issue・PR・`PLAN.md`等の記録)を、本ADRの各Stepが「防げた/検出できた」かで
+  分類し、Stepの期待効果を実績ベースで並べ直す材料を作る。コード変更もPRも伴わない調査。
+- **成果物**: 別エージェントが`scratchpad/defect-history-rank.md`を作成中(rev5執筆時点で未完了)。**本ADRはその結果を
+  先取りして書かない。**
+- **位置付け**: 結果は§6の順序行・D2(3b/3c/5/7の再評価)の**入力**にすぎない。順序を変える場合は、ユーザーが決めた上で
+  本ADRのamendment(rev6以降)として記録する。報告が順序変更を勧めても、amendmentが入るまでは§6の順序行が有効。
+  scratchpadはリポジトリ外なので、amendmentで採用した根拠は要約してADR本文に書き写す(参照だけで済ませない)。
+- **得られるCI検証**: なし(調査)。
+- **リスク**: なし。履歴の分類は事後判断なので「このStepがあれば防げた」は推測を含む。報告側で確認済み/推測を区別することを
+  amendment時の採用条件にする。
+- **前提**: なし(いつでも並行可)。
+- **ロールバック**: 不要(成果物はADRの外)。
+
+### Step 10(rev5新規): shell競合の検証層(差分テスト+有界網羅探索の評価)
+
+**位置付け**: Step 2aの集約proptest(I-a〜I-j)は「reducerが正しい」ことを示すが、「shell(`AttachRuntime`+`engine/mod.rs`の
+ファサード)がreducerと同じことをしている」ことと、「reducerが表す単一集約の状態空間を**網羅的に**見た」ことは示さない
+(proptestはランダム探索)。Step 10はこの2つの隙間を埋める。どちらも**テストのみ**で本番の挙動は変えない。
+
+**10-1 差分テスト(採用、2aの後)**
+- 手本はPR #124の`pool.rs`モデルベーステスト(`src/pool.rs:613`の`mod model_based`、`:832-838`の
+  `pool_matches_reference_model_under_random_operations`、確認済み): 任意の操作列を実装と参照モデルの両方に流し、
+  各操作の後で観測値を突き合わせる。
+- Step 10では「実装」=実shell、「参照モデル」=純粋な`ServeAggregate`(2a)。操作の語彙は
+  `Hello`/`Activate`/データストリーム切断によるpark/`Resume`/`Cancel`/時間経過(`tokio::time::advance`)+sweep/target TCP切断。
+  実shellは`#[tokio::test(start_paused = true)]`相当の仮想時刻で、targetはStep 1.5と同じローカル`TcpListener`。
+- 観測値の射影: `AttachRuntime::established_lease_for(id)`の有無とlease、indexでのparked/active/unresumable、
+  RESUMEの結果種別(`ResumeGranted`/`RequestPreempt`/`UnknownToken`)。モデル側は同じ射影を`ServeAggregate`から計算する。
+- proptest+非同期: `proptest!`の各ケース内で`tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true)`
+  のランタイムを作って`block_on`する形を想定(マクロの組み合わせ方は [EXT]、PRで確認)。
+- **限界(明記)**: 操作は**逐次**に流すので、await点での非同期タスクのインターリーブは探索しない。差分テストが捕まえるのは
+  「shellがEventを渡し忘れる/Effectを取り違える/in-lock effectを別臨界区間で実行する」等の**翻訳誤り**。
+  2a以前のTOCTOU(sweep×RESUME)のようなインターリーブ由来の競合は、2aの設計(単一ロック・単一apply)で
+  構造的に除いた上でStep 1.5の特性テスト(反転後)が見る。
+
+**10-2 集約の有界網羅探索(評価、採否はQ15)**
+- 対象: 2aの`ServeAggregate`(`AttachArbiter`+`SessionIndex`)。純粋なので、小さい有界な宇宙(例: session_id 2個、
+  クライアント2本、`now`は数点の離散値、Event列長≤N)で到達可能状態を**全列挙**し、各状態でI-a〜I-jを検査できる。
+- 候補と評価:
+  - **手書きの有界BFS(既定案)**: `#[cfg(test)]`内に、Event語彙を列挙して`apply`を適用し、訪問済み集合で重複を
+    除くだけの探索器を書く(依存追加なし、`Cargo.lock`不変)。必要な前提: 状態を重複判定できること。
+    `AttachArbiter`は現在`#[derive(Debug, Default)]`のみで`Clone`/`Eq`/`Hash`を持たず、内部が`HashMap<SessionId, AttachState>`
+    (`attach_arbiter.rs:154-158`、確認済み)なので、`Clone`の導出と、`BTreeMap`へ射影した正規形(またはテスト用の
+    fingerprint関数)が要る。`SessionIndex`は2aで`BTreeMap`なのでそのまま使える。
+  - **stateright [EXT]**: 状態機械/actorモデルの有界モデル検査crate。BFS/DFS・`always`/`eventually`性質・反例経路の
+    出力を持つ。`ServeAggregate`を`Model`として包めば上と同じことができ、eventually性質(§4.2の有界到達性)も書ける。
+    コスト: dev-dependencyの追加で`Cargo.lock`が変わる(§7の最小lockfile手順、`lockfile-drift`required)、推移依存の
+    規模は未確認 [EXT]、状態型に`Clone + Hash + Eq`が要る点は手書きと同じ。**§8「新しいFSM/effectフレームワーク
+    crateの導入」はしないとの関係**: staterightはテスト専用dev-dependencyで本番コードの形を規定しないので、
+    §8が禁じた「フレームワーク」には当たらないと解釈する。ただしこの解釈もQ15でユーザーが確認する。
+    既定案は「まず手書きBFS、反例経路の可読性やeventually性質が要るとわかったらstateright」。
+  - **loom [EXT](この集約には適用しない、と評価)**: loomは`std::sync`/atomic/スレッドを`loom::sync`等に差し替えた
+    コード(`#[cfg(loom)]`のshim)を、メモリモデルを含めて全インターリーブで実行する道具。適用できない理由:
+    1. 2a後の`ServeAggregate`自体は純粋でロックを持たない。並行性はshell側にしか無い。
+    2. そのshellの集約ロックは`tokio::sync::Mutex`(`attach_runtime.rs:28,136`、確認済み)で、並行性の単位は
+       スレッドではなく**asyncタスクのawait点**。loomはtokioランタイム/非同期mutexをモデル化しない(tokioは内部で
+       loomを使うが、下流crate向けのloom対応ビルドは提供していない、という理解 [EXT])。
+    3. `parking_lot`はloom非対応なので、`parking_lot::Mutex`を使う箇所は`cfg(loom)`で`loom::sync::Mutex`へ差し替える
+       自前shimが要る(`try_lock`等のAPI差の吸収を含む [EXT])。
+    loomが意味を持ちうるのは、同期ロック+スレッドで組まれた小さな部品だけ。候補は`pool.rs`(`parking_lot::Mutex`、
+    `src/pool.rs:20,46`、確認済み)の`try_lock`失敗→false-alive(§9の既存記述)だが、`release`が`RUNTIME.spawn`の
+    タイマーを含むので、Step 4でタイマーをEffect化した後の純粋部分にしか当てられない。採否はQ16(既定: 導入しない)。
+- **得られるCI検証**: 10-1でshellの翻訳誤りを任意操作列で検出。10-2(採用時)で有界宇宙内の全到達状態について
+  I-a〜I-jを証明(ランダム探索では漏れうる深い組み合わせを含む)。
+- **リスク**: 10-1は低(テストのみ、ただし実ソケットを使うので実行時間はStep 1.5並み。nextestの`retries`対象には入れない、§7)。
+  10-2は状態爆発: 宇宙のサイズはCI時間(目安: 数十秒以内)に収まる範囲に固定し、PRで実測値を書く。
+- **前提**: Step 2a(`ServeAggregate`とファサード)。10-1はStep 1.5の`AttachRuntime`込みテスト基盤を再利用する。
+- **ロールバック**: テストのrevertのみ。stateright採用時はdev-dependencyの削除と`Cargo.lock`の再生成(§7)。
+
+### Step 11(rev5新規): Effect/callback列の不変条件検査(テストのみ)
+
+- **問題**: Step 8a′の「shell側の検証」は退出経路ごとに1本ずつの専用テスト(a)〜(f)で、それ以外の既存orchestratorテスト・
+  e2eテストは、途中で出たcallback列が不変条件を満たしているかを見ていない。reducerのproptest(8a′)は「reducerが正しい」
+  ことしか示さないので、shellの経路漏れは専用テストが無いシナリオでは見えない。
+- **決定**: テスト用の記録器が受け取ったEffect/callbackを、**テスト内メモリ上の列**として持ち、テスト終了時に純粋な
+  検査関数`check_trace(&[TraceEvent]) -> Result<(), TraceViolation>`(`#[cfg(test)]`の共有モジュール)を通す。
+  - 記録点: `orchestrator.rs`テスト内の`RecordingCallback`(`:1952`、確認済み)、`rust-core/src/test_callbacks.rs`の
+    `ForwardingOrchestratorCallback`、2a後の`isekai-pipe` engineテスト(interpreterへのテスト用フック)。
+  - 記録器の`Drop`で検査する場合は、テスト自体のpanic中に二重panicしないよう`std::thread::panicking()`なら検査を省く。
+  - 既存のorchestratorテストすべてが自動的に不変条件の検査にもなる(個々のテストのassertは変えない)。
+- **不変条件の初期セット**:
+  - T1(8a′): 各`g`について`Established(g)`は高々1回。テストが切断で終わるなら、`Established(g)`ごとに`Lost(g)`が正確に1回。
+  - T2: `Lost(g)`は、先行する`Established(g)`がある場合にだけ出る。
+  - T3(2a後のengine): 同じ`(id, lease)`の`Discard`は高々1回(interpreterの冪等性に頼らずreducerが1回しか出さないこと)、
+    `StartRelay`は同一leaseに高々1回(Step 1の不変条件のshell側の確認)。
+  - **順序についての注意(推測、8a′の実装で確定)**: §2.4-4により、別スレッドから出るcallbackの順序は保証しない。
+    `Established(g)`(`on_connected`の呼び出し元)と`Lost(g)`(別スレッドの切断経路)は、それぞれロック解放後に公開
+    されるので、callback到着順が`Lost(g)`→`Established(g)`に逆転しうる。そこでT1は**世代ごとの回数**として検査し、
+    順序は同じ呼び出し箇所から出る組(§2.4-4、例: `Connected`公開→`Established`)に限って検査する。順序の逆転を
+    テストで観測した場合は、それを§2.4-4の「逆転が実害として観測された」証拠として扱い、連番publisherのStepを
+    別途提案する(本Stepでは導入しない)。
+- **秘密情報(§3-3)**: `TraceEvent`はvariant名・世代/lease・公開状態のタグだけを持ち、`SshConfig`/`SshAuth`/
+  `LastConnectAttempt`を参照しない。`Established{host}`のhost文字列も記録しない(検査に不要)。
+- **Q12との違い**: Q12(§2.6)は「実機で記録したEvent列をCIでreplayする」構想で、既定案は「実施しない」のまま
+  変えない。Step 11は本番コードに記録機構を入れず、ファイルにも書き出さず、テストが自分で起こしたEffect/callbackを
+  その場で検査するだけ。
+- **得られるCI検証**: 既存シナリオテストすべてで、8a′のエッジ契約とengineのEffect契約が自動検査される。
+  専用テストを書いていない経路のshell漏れを拾える。
+- **リスク**: 低。既存テストが新たに赤くなった場合、それは既存の契約違反の発見なので、検査を緩めずに原因を調べる
+  (ただし上記の順序注意に該当するものは回数検査へ落とす)。
+- **前提**: Step 3a(`ReconnectEffect`)と8a′(`on_connection_edge`)。T3は2aの後で足す。Step 2.5で
+  orchestratorテストが`start_paused`化済みであること。
+- **ロールバック**: 検査呼び出しの削除のみ。
+
+### Step 12(rev5新規): always-connectsの網羅性テスト(`run_connect`の`Err` → `ConnectOutcomeClass` → 回復動作)
+
+- **現状(確認済み)**:
+  - `isekai-pipe connect`の失敗記録は`write_connect_outcome_for_wrapper`(`isekai-pipe/src/connect.rs:564`。
+    `always-connects.md`は`main.rs`と書いているが、実体は`connect.rs`)。`run_connect`(`connect.rs:681`)の`Err`は呼び出し元が
+    無条件に記録し(`:528`)、panicはDropガードが`"run_connect panicked"`として記録する(`:440-450`)。
+  - 分類は同関数内のインライン`if/else`(`:574-584`): `isekai_transport::StaleTrustSignal`(`isekai-transport/src/error.rs:108`)→
+    `StaleTrust`、`resume_loop::MidSessionDisconnectSignal`(`resume_loop.rs:237`)→`MidSessionDisconnect`、それ以外→
+    `Unreachable`。`resume_loop::ParentGoneSignal`(`resume_loop.rs:301`)は**意図的に何も書かない**(`:565-567`、親の`ssh(1)`が
+    既に居ないので回復しても意味が無い)。`ISEKAI_INTENT_ID`が無い・runtime dirが取れない場合も書かない(`:568-573`。
+    wrapperは`ISEKAI_INTENT_ID`を必ず設定して起動する、`isekai-ssh/src/wrapper.rs:1135`・`native/child_stdio.rs:74`)。
+  - `ConnectOutcomeClass`は`StaleTrust`/`Unreachable`/`MidSessionDisconnect`/`Unknown`(`isekai-pipe-core/src/outcome.rs:65-114`)。
+  - 読み手の判断は`decide_connect_failure_recovery`(`isekai-ssh/src/wrapper.rs:1007-1013`)で、`MidSessionDisconnect`以外を
+    `Some(_)`のワイルドカードで扱う。Unix経路(`wrapper.rs:707-782`付近)とWindows native経路
+    (`native/connect.rs:436`)が同じ関数を呼ぶ。加えて「`Unknown`かつremote commandあり」なら自動再試行しないガードが
+    2箇所に重複している(`wrapper.rs:727`、`native/connect.rs:454`)。
+- **決定(テスト中心、本番の変更は挙動保存の抽出だけ)**:
+  1. `isekai-pipe`: 分類部分を純粋関数`classify_connect_error(&anyhow::Error) -> Option<ConnectOutcomeClass>`
+     (`None`は`ParentGoneSignal`のときだけ)に抽出し、`write_connect_outcome_for_wrapper`はそれを呼ぶだけにする。
+     **表テスト**: 各marker型 × `.context()`の包み深さ(0/1/2) × 組み合わせ(例: ParentGoneと他markerの同居は
+     ParentGone優先=現状の判定順)と、markerを持たない任意のエラー→`Unreachable`、panicガードのメッセージ→`Unreachable`。
+     else分岐が`Unreachable`なので分類関数は構造的に全域だが、表テストは**新しいmarkerや早期returnを足したときに
+     表の更新を強制する**ためのもの。
+  2. `isekai-ssh`: `decide_connect_failure_recovery`の`Some(_)`をvariantごとの明示armに書き換える(現在の結果と同じ値を返す、
+     挙動保存)。Step 7aの後なら`#[deny(clippy::wildcard_enum_match_arm)]`を付ける。`Unknown`+remote commandのガード条件は
+     純粋な述語関数に抽出して2箇所から呼ぶ(ループ本体2つの共通化は再評価Step 7の範囲で、ここでは行わない)。
+  3. **網羅表テスト**: 全`ConnectOutcomeClass`(テスト内の`all_classes()`はvariantごとの明示`match`で作り、variant追加で
+     コンパイルが落ちるようにする)× `should_bootstrap` × remote commandの有無 → 期待する`ConnectFailureRecoveryAction`。
+     この表の上で`always-connects.md`の性質を明示的にassertする: 「記録されたどのクラスについても、`should_bootstrap = true`
+     かつ非冪等ガードに当たらない限り、結果は`RebootstrapAndRetry`か`RetryConnectLightweight`であり、
+     `NoRecoverableSignal`にはならない」。例外は表の行として列挙し、理由を書く: `ParentGoneSignal`(記録なし→
+     `NoRecoverableSignal`)、`should_bootstrap = false`(ユーザーの明示的なopt-out→`AutoBootstrapDisabled`)、
+     `Unknown`+remote command(非冪等コマンドの再実行防止)。
+  4. `outcome_summary`(`wrapper.rs:870-882`)は既に全variantを明示`match`している(確認済み)ので変更しない。
+- **`ConnectOutcomeClass`の分類そのものは変えない**(§4.2)。新しいクラスや判定の変更は本Stepの範囲外。
+- **得られるCI検証**: `always-connects.md`の「`run_connect`が失敗する限り回復シグナルが書かれ、wrapperがそれを自動回復に
+  つなげる」が表として固定される。新しい`ConnectOutcomeClass`を足したPRは、`decide_connect_failure_recovery`の明示armと
+  網羅表の行を書かないとコンパイル/テストが落ちる(`always-connects.md`が今は文章で求めている`outcome_summary`への追記と
+  同じ強制が、回復判断側にも効く)。
+- **限界**: 「`run_connect`の**全**`Err`経路が呼び出し元の記録点を通る」こと自体は、呼び出し構造(`:528`と`:440-450`)に
+  依存しており表テストでは証明しない。`run_connect`の呼び出し箇所が増えた場合に気づけるよう、呼び出し箇所が1つで
+  あることを確認する仕組み(テスト or Step 0のスクリプト)を入れるかはPRで決める(推測: スクリプトの方が安い)。
+- **リスク**: 低。抽出と明示armへの書き換えは挙動保存で、既存の`decide_connect_failure_recovery_*`テスト
+  (`wrapper.rs:2614-2672`)がそのまま回帰検査になる。
+- **前提**: なし(独立)。7aの後なら7aのlint属性も付ける。
+- **ロールバック**: PRごとrevert。
+
+### Step 13(rev5新規): Android/iOSのcallback契約golden
+
+- **問題**: Step 8a′で`OrchestratorCallback`に`on_connection_edge`を足すと、Kotlin(`TerminalSession.kt`)とSwift
+  (`CallbackIngress.swift`)は「受け取ったら既存処理を呼ぶだけ」になる(§6 Step 8a′)。この転送が正しいこと
+  (エッジ1回につき対応処理が1回、Kotlin/Swift側で重複排除・エッジ判定をしていない)は、Rust側のテストからは見えない。
+- **決定**:
+  - **golden生成(Rust)**: Step 8a′の退出経路テスト(a)〜(f)とStep 11の記録器を使い、各シナリオのcallback列
+    (メソッド名・`ConnectionEdge`のvariant・`generation`・公開状態のタグ)をJSONのgoldenとしてリポジトリにコミットする
+    (置き場所の案: `rust-core/tests/golden/callback_contract/<scenario>.json`、Q17)。Rustテストは生成結果とコミット済み
+    goldenの一致をassertし、不一致なら`<scenario>.actual.json`を書いて失敗する(更新手順は§7)。
+  - goldenに入れるのは**順序が保証された列**だけ(§2.4-4、Step 11の順序注意)。別スレッド由来で順序が揺れうる部分は
+    世代ごとの射影(回数)として記録する。
+  - **Kotlin replay**: `android/src/test/`(JVM、`android-unit-test`=required)のテストがgoldenを読み、Kotlin側の
+    `OrchestratorCallback`実装へ順に流して、`Established`ごとに`registerUpstreamFailoverMonitor`等の処理が1回、`Lost`ごとに
+    close系の処理が1回呼ばれることをfake越しにassertする。goldenは`rust-core/`配下に置くので、`android-test-check.yml`の
+    pr-path-gate(`^rust-core/`を含む、確認済み)によりgolden変更PRでもKotlin側が走る。gradleテストからのファイル参照方法
+    (作業ディレクトリ基準の相対パス等)は [EXT]、PRで決める。
+  - **Swift replay**: `ios/Tests/IsekaiTerminalCoreLogicTests/`のテストが同じgoldenを`CallbackIngress.swift`へ流す。
+    `ios-logic-linux-check.yml`がLinuxで実行するのは`IsekaiTerminalCoreLogic`の`swift test`だけ(`:119-124`、確認済み)で、
+    `IsekaiTerminalCoreTests`(`SshVerticalSliceTests.swift`等)はこのジョブでは走らないので、replayはLogic層に置く。
+    同ワークフローのpull_requestのpathsは`rust-core/**`を含む(`:24-31`、確認済み)のでgolden変更PRで発火する。
+    SwiftPMのリソース宣言か`#filePath`基準の読み込みかは [EXT]、PRで決める。
+  - **マージ条件**: `ios-*`チェックはrequiredでない(`main-branch-protection.md`)ため、Swift側が赤のままマージされうる。
+    **Step 13のPRと、以後goldenを変更するPRでは`ios-logic-linux-check`(job `build-and-test`)の緑をマージ条件にする**
+    (8a′と同じ扱い)。required化そのもの(protection設定の変更)は本Stepでは行わない(`main-branch-protection.md`のPhase 6の
+    判断事項)。
+  - UniFFI公開APIは変えない(goldenはテスト用データで、UniFFIの型ではない)。バインディング再生成は不要。
+  - goldenは秘密を含まない(§3-3。hostはテスト用の固定値か記録しない)。
+- **得られるCI検証**: Rustのcallback契約と、Kotlin/Swiftの転送実装の食い違いが、`android-unit-test`(required)と
+  `ios-logic-linux-check`で検出される。Rust側の変更でcallback列が変わるとgoldenの更新が必要になり、PRの差分で契約の変化が
+  可視化される。8bの`_state.update`書き換えに対する安全網にもなる(§6の推奨順序13 → 8b)。
+- **リスク**: 低〜中。goldenの更新手順(CI artifact経由)の手間と、Kotlin/Swiftテストからのファイル参照の仕組み作り。
+  goldenを過剰に細かくすると無関係な変更でも更新が要るので、射影は契約に必要な項目に限る。
+- **前提**: Step 8a′(`on_connection_edge`とその実装者)。Step 11の記録器(推奨)。
+- **ロールバック**: テストとgoldenの削除のみ。
+
 ### 再評価(証拠を見てから決める): Step 3b/3c・5・7
 
 | Step | 内容 | 再評価の判断材料 |
@@ -877,6 +1145,18 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   - `isekai-terminal-core`のエントリは`build-isekai-pipe-musl.sh`と`--copy-target true`が必要(既存workflowと同じ)。
   - 結果はartifact、required化しない。
 - **clippy純粋性ジョブ / import allowlist**: §2.3。`rust-core-test-check.yml`内の軽量jobとして追加し、当面required化しない。
+- **(rev5)Step 7aのinterpreter網羅性lint**: 新しいジョブは作らず、上の純粋性ジョブの中で走る(関数単位の
+  `#[deny(clippy::wildcard_enum_match_arm)]`はソース側の指定なので、ジョブのコマンドラインは変えない)。
+  allowlistスクリプトに`[[interpreter]]`登録の検査(`if let`/`let .. else`/`matches!`によるEffectの選り分けの拒否)を足す。
+  D3のrequired化はこのジョブ単位なので、7aのためにprotectionのcontextを増やす必要は無い。
+- **(rev5)Step 10**: 差分テストは通常の`cargo nextest`内で走る(新ジョブ不要)。実ソケットを使うが、nextestの`retries`対象には
+  入れない(上のnextest方針と同じ。flakeは隠さずに直す)。有界網羅探索は宇宙のサイズをCI時間に収まる範囲に固定する。
+  stateright(Q15)を採る場合はdev-dependency追加なので、上の最小lockfile手順で`Cargo.lock`をCI生成する。
+- **(rev5)Step 13のgolden**: Rustテストがgoldenとの不一致時に`*.actual.json`を書いて失敗する。`rust-core-test-check.yml`の
+  `if: failure()`のartifact upload step(上の反例保存と同じstep)の対象に`**/golden/**/*.actual.json`を加える。
+  ダウンロードした`.actual.json`を内容確認の上で`.json`としてコミットする(ローカルでcargoを実行しない運用のため)。
+  Kotlin/Swift側のreplayテストは既存の`android-unit-test`(required)・`ios-logic-linux-check`(非required、Step 13の
+  PRと以後goldenを変更するPRでは緑をマージ条件にする)で走る。新しいworkflowは作らない。
 
 ---
 
@@ -900,7 +1180,7 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   タイミングにはこれで十分。ただし書いたシナリオしか検証できず、任意のインターリーブ(epoch×in_flight×pending_wake、
   fencing×park×sweep)の網羅はreducer+proptestが必要。→ 役割分担として両方採る。
 - **turmoil/madsim**: L1と同じ大投資。L1保留に従い比較しない。
-- **loom**: `pool.rs`の`try_lock`失敗→false-alive(L0-3)のようなロック粒度の競合には有効かもしれない。未評価。
+- **loom**: `pool.rs`の`try_lock`失敗→false-alive(L0-3)のようなロック粒度の競合には有効かもしれない。(rev5: Step 10-2で評価。`ServeAggregate`のshellには適用できず、`pool.rs`の同期部分のみ候補。採否はQ16)
 - **既存FSM/Redux系crate**: 個別評価はしていない。自作`timed-fsm`があり、標準形はさらに単純(plain `apply`)なので
   外部crateを足す利益は薄い。
 - **reducer専用crate**: 依存グラフ上の純粋性は自動では保たれず型移設コストが大きい。§2.3の2層検査で代替。
@@ -952,3 +1232,8 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 | D2 | Step 3b/3c・5・7を行うか(§6末尾の再評価表) | Step 2.5・3aの後 | 再評価表の判断材料で未検証のインターリーブや不具合が見つかった場合だけ行う |
 | D3 | 純粋性検査ジョブ(clippy+allowlist)とmutants週次ジョブをrequired checkにするか | Step 0のジョブ導入後 | **決定済み(Approve時): 純粋性検査ジョブのみrequired化する。mutants週次ジョブは非required。** 実施時は`main-branch-protection.md`に従い、ジョブに明示的な`name:`を付け、`gh api -X PUT .../branches/main/protection`の`checks[].context`へ同時に追加する(追加を忘れるとcontextが恒久pendingになる)。誤検知でmainが詰まらないよう、まず数回のCI実績で安定を確認してからprotectionに追加する |
 | D4 | `native/mux/mod.rs`の`RECONNECT_STABLE_THRESHOLD`(60秒)を200秒に揃える挙動変更を行うか | Step 6とは別PR | 本ADRの範囲外。`reconnect_backoff.rs:64-71`の既知follow-upとして別途 |
+| Q15(rev5) | Step 10-2の有界網羅探索を、手書きBFS(依存追加なし)で行うかstateright(dev-dependency)で行うか。stateright採用時、§8「新しいFSM/effectフレームワークcrateの導入」をしないとの関係を「テスト専用の検証道具は対象外」と解釈してよいか | Step 10のPR | 手書きBFS。反例経路の可読性やeventually性質(§4.2)が要るとわかった時点でstaterightを再提案する |
+| Q16(rev5) | loomを導入するか(Step 10の評価では、tokio非同期mutexで組まれた`ServeAggregate`のshellには適用できない。候補は`pool.rs`の同期部分のみ) | Step 4の後 | 導入しない(`pool.rs`のロック粒度の競合が実害として観測されたら再検討) |
+| Q17(rev5) | Step 13のgoldenの置き場所・形式・射影項目、Kotlin/Swiftテストからの参照方法 | Step 13のPR | `rust-core/tests/golden/callback_contract/<scenario>.json`、射影はメソッド名・edge variant・generation・公開状態タグのみ |
+| Q18(rev5) | Step 7aで`[[interpreter]]`登録をどこまで広げるか(`decide_connect_failure_recovery`のような「Effectではないが網羅性が不変条件を担うenum」の`match`を含めるか)、lintが捕まえない形の検出をスクリプトで行うか | Step 7aのPR(Step 12の判断も同様) | interpreter関数は全登録。非Effectのenumは`always-connects.md`に関わるもの(Step 12)だけ属性を付ける。`if let`等はスクリプトで拒否する |
+| D5(rev5) | Step 9の報告(`scratchpad/defect-history-rank.md`)を受けて§6の順序を変えるか | Step 9の報告後 | 変えない(報告を見てユーザーが決め、変える場合はamendmentとして記録する) |
