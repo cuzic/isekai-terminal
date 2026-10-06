@@ -4,6 +4,8 @@
   D3=純粋性検査ジョブのみrequired check化(mutants週次ジョブは非required)。それ以外の未解決事項は§10の既定案に従う。
   **rev5(2026-10-06、amendment)**: ユーザー承認済みの追加Step 7a・9・10・11・12・13をロードマップに追加(§0 rev5)。
   rev4までの決定は一切変更していない。
+  **rev6(2026-10-06、amendment)**: Step 9の不具合履歴報告を根拠に、ユーザーが§6の順序変更を決定(§0 rev6)。
+  Step 3aに`pending_wake`を取り込み、Step 5を再評価から昇格、Step 7をStep 6へ統合、Step 4を後ろへ、8bを再評価へ移した。
   (以下は承認前のレビュー経過)敵対的レビューは4ラウンドで収束済み。
   round 1〜4の敵対的レビュー(`scratchpad/opus-review-fcis-adr-round{1,2,3,4}.md`、Opus)の全指摘と、
   それを受けたユーザー決定を反映。round 4の判定は「converged」(残りは軽微6件で、rev4に取り込み済み)。
@@ -33,6 +35,27 @@
 ---
 
 ## 0. 改訂履歴
+
+### rev6(2026-10-06)— Step 9の不具合履歴報告による順序変更(ユーザー決定)
+
+Step 9の報告(`scratchpad/defect-history-rank.md`。mainの`fix:`/`revert:`コミット等を領域別に分類し、主要コミットの本文を
+手で読んだもの)を根拠に、ユーザーが次の順序変更を決めた。scratchpadはリポジトリ外なので、採用した根拠をここに書き写す
+(コミットハッシュは報告が挙げたもの。各コミットが「このStepがあれば防げた」という評価は報告自身がOPINIONと区別している)。
+
+**新しい順序**: `0 → 1 → 1.5 → 2a → 2b → 2c → 2.5 → 3a(+pending_wake) → 5 → 6+7 → 4 → 8a′`、8bは再評価へ。
+rev5の追加Stepは依存に従って差し込む(§6の順序行)。
+
+| 変更 | 根拠(報告より) |
+|---|---|
+| 0〜2cの先頭配置は維持 | 報告の第1位領域(serve engine)。fencing slot⇔SessionTableの不整合という同じ型の不具合が6回以上: 33973aec、2308e7d4、886bbb15、b449d7da、8eb81411、857f6ae6(D-2)。いずれも`always-connects.md`違反で、多くはshell原子性(報告の分類A)のためStep 1.5も重視 |
+| **Step 3aに`pending_wake`を取り込む** | eecba351(実機分析由来): `retry_attempt_in_flight`中にwakeの許可が落ち、ネットワーク復帰に数分気づかない。`pending_wake`はこれを受けて追加されたフィールドで、rev4までの再評価表が3b/3cの判断材料に挙げていた`epoch`/`in_flight`/`pending_wake`の三つ組そのもの。tick会計・`woke_early`(3b/3cの残り)は再評価のまま |
+| **Step 5(`resume_loop.rs`の`ResumePlanner`)を再評価から昇格し、3aの直後へ** | 判断ロジック(報告の分類D)の修正が約12件。give-up方針が3回直し直された(cc5fb926 → 71292e68 → dbb80d56)、BUSY_OTHER_SESSIONの再試行期限も3回(75d08a39 → fd32ce11 → 3d5e0da5)、ほか03224b11、204d8f59、a266f1f3(一部)、857f6ae6(D-4)。rev4の再評価基準「既存の`start_paused`テストと純粋helperで足りない不具合が出たか」を履歴が既に満たしている |
+| **Step 7をStep 6へ統合(6+7)** | a266f1f3(redeploy+retryが1回しか走らない、ユーザー観測)と857f6ae6 D-4(jitter欠落)は、どちらも同じ不具合を重複した2つのループ/2つの`ReconnectBackoff`で別々に直す必要があった |
+| **Step 4(`pool.rs`)を6+7の後へ** | `pool.rs`の不具合は履歴上1件だけ(#120、4793ebcd)で、#124(0ac06820)のモデルテストで既に固定済み。タイマー世代競合の事例は無い。2.5 → 4の固定依存は後ろへずらしても満たされる |
+| **8a′は維持、8bは再評価へ** | `observeConnectionTransitions`のStateFlow conflationによるエッジ取りこぼしの記録は0件(ADR自身も「実発生は未計測」)。Android側の不具合は配線漏れ(W)とプラットフォーム(P)が主。8a′は`rust-ssot.md`上の理由で残す |
+| 新規の未解決事項D5(§10) | 報告の横断的観察: 「callback/フラグを実装したが配線していない」(分類W)が大きく、どのStepも対象にしていない(例: 2a07a5e3、8baa49d8、db3a6d87、ce214ef5、ae8ed13b、119205f6、e1c370e5、7b10472a)。CIでの検出案を**提案**として載せ、決定はユーザーに委ねる |
+
+rev5のD5(「Step 9の報告で順序を変えるか」)はこの決定で解決済みとし、D5の番号は上の新規事項に振り直した。
 
 ### rev5(2026-10-06)— Approve後のamendment: 追加Step 7a・9・10・11・12・13
 
@@ -490,24 +513,28 @@ reducer化した再接続系FSMには有界到達性のプロパティを課す:
 
 ## 6. 移行ロードマップ
 
-順序: **0 → 7a → 1 → 1.5 → 2a → 10 → 2b(→ 2c) → 2.5 → 3a → 4 → 6 → 8a′ → 11 → 13 → 8b**(rev5で7a・10・11・13を挿入)。
-Step 12は独立(どこに入れてもよい)。Step 9はコード変更を伴わない調査で、結果が出た時点でこの順序行自体の
-見直し材料になる(見直しはユーザーが決めるADR amendment)。
-3b/3c/5/7は**証拠を見て再評価**(§6末尾)。
+順序(rev6): **0 → 7a → 1 → 1.5 → 2a → 10 → 2b → 2c → 2.5 → 3a(+pending_wake) → 5 → 6+7 → 4 → 8a′ → 11 → 13**。
+8bは**再評価**へ移した(rev6)。3b/3cのうち`pending_wake`以外(tick会計・`woke_early`)は再評価のまま(§6末尾)。
+rev5で7a・10・11・13を挿入し、rev6でユーザー決定の順序(`0 → 1 → 1.5 → 2a → 2b → 2c → 2.5 → 3a(+pending_wake) → 5 → 6+7 → 4 → 8a′`)
+に組み替えた。rev5の追加Stepの位置は下の依存から決まる。
+Step 12は独立(どこに入れてもよい。ただし6+7と同時には進めない、下記)。Step 9(調査)は完了し、その結果がrev6の順序変更の根拠になった(§0 rev6)。
 rev5の固定依存: **0 → 7a**(7aはStep 0のclippyジョブ・`pure_modules.toml`・allowlistスクリプトに乗る)、
 **2a → 10**(10の差分テストと網羅探索の対象は2aの`ServeAggregate`)、**3a → 11**・**8a′ → 11**(11が検査するEffect/
 callback列は3aの`ReconnectEffect`と8a′の`on_connection_edge`)、**8a′ → 13**(goldenの中身が8a′のcallback)。
 推奨順序(固定依存ではない): 7aは2aより前(2aで`activate`が`Discard`も受け取るようになる前にlintを効かせる)、
-10は2bより前(2b/2cの挙動変更に対する安全網になる)、11 → 13(13のgolden生成は11の記録器を再利用する)、
-13 → 8b(13のKotlin replayテストが8bの`_state.update`書き換えの安全網になる。13はテストファイルだけを足し
-`TerminalSession.kt`本体を変えないので、8a′ → 8bのファイル衝突規則には当たらない)。
+10は2bより前(2b/2cの挙動変更に対する安全網になる)、11 → 13(13のgolden生成は11の記録器を再利用する)。
+8bを再評価の結果行う場合は13の後に行う(13のKotlin replayテストが8bの`_state.update`書き換えの安全網になる。
+13はテストファイルだけを足し`TerminalSession.kt`本体を変えないので、8a′ → 8bのファイル衝突規則には当たらない)。
 固定の依存関係(round 2 m-R2-7): **2.5 → 4**(どちらも`pool::release`のシグネチャ/spawn箇所`pool.rs:175-196`を
-変えるので、逆順や並行は確実に衝突する)、**3a → 8a′**(8a′は3aが作る`reconnect_fsm.rs`にedge状態を足す)。
+変えるので、逆順や並行は確実に衝突する。rev6でStep 4を6+7の後へ移しても満たされる)、**3a → 8a′**(8a′は3aが作る
+`reconnect_fsm.rs`にedge状態を足す)。
 **8a′ → 8b**(どちらも`android/.../session/TerminalSession.kt`を変える。8a′は新callbackの実装者として、
-8bは`_state.update`22箇所の書き換えとして。round 3 m-R3-5)。
-並行してよいのは、Step 0の後のStep 6だけ(他のStepと触るファイルが重ならない)。
-rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs`・`isekai-ssh/src/native/connect.rs`のみ。
-Step 6の`reconnect_backoff.rs`/`native/mux/mod.rs`とも重ならない)とStep 9(調査のみ)も、いつでも並行してよい。
+8bは`_state.update`22箇所の書き換えとして。round 3 m-R3-5。8bは再評価に移ったが、行う場合はこの依存が残る)。
+並行してよいのは、Step 0の後のStep 6(rev6以降は6+7)だけ(他のStepと触るファイルが重ならない)。
+rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs`・`isekai-ssh/src/native/connect.rs`のみ)も
+いつでも並行してよい。**ただしrev6でStep 7(回復ループ本体の共通化)が6に統合されたため、6+7とStep 12はどちらも
+`wrapper.rs`/`native/connect.rs`を変える。この2つは同時に進めず、Step 12を先に行う**(12の網羅表テストが、
+6+7のループ共通化に対する回帰検査になる)。
 各Stepはそれぞれ独立PR、コミットは細かく分ける。
 
 ### Step 0: 純粋性検査の導入(本番コード変更は最小)
@@ -544,7 +571,7 @@ Step 6の`reconnect_backoff.rs`/`native/mux/mod.rs`とも重ならない)とStep
 
 ### Step 7a(rev5新規): Effect interpreterの網羅性lint
 
-§6末尾の再評価対象「Step 7」(isekai-ssh回復ループの共通化)とは無関係。番号は「Step 0の検査基盤に乗る小さなlint」
+旧Step 7(isekai-ssh回復ループの共通化。rev6でStep 6へ統合)とは無関係。番号は「Step 0の検査基盤に乗る小さなlint」
 であることを示すために付けた。
 
 - **問題(確認済み)**: Effectを解釈する側が`match`以外でEffectを選り分けると、reducerが新しいEffectを返し始めたときに
@@ -744,7 +771,7 @@ unresumableなエントリを到達不能にすれば、これも解消できる
   `block_on`を使っていればcurrent_threadランタイム下でpanicしうる(推測、現テストは偽の`reconnect_attempt`
   クロージャを使うので回避されている可能性が高い)。`rt.block_on`型テスト約20本の挙動不変を受け入れ条件にする。
 
-### Step 3a: `handle_unexpected_disconnect`の判断を純粋化(3b/3cは再評価)
+### Step 3a: `handle_unexpected_disconnect`の判断を純粋化(rev6: `pending_wake`の遷移を含む。3b/3cの残りは再評価)
 
 **集約の定義(この時点で全体を定義し、移行は3aの範囲だけ行う)**:
 **新設ファイル`src/reconnect_fsm.rs`(`pure_modules.toml`に登録)**に
@@ -795,6 +822,49 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   「Connected未到達の失敗だけにLocal Networkヒント」を検証。
 - **リスク**: 小〜中。既存テストは残し両方緑を条件にする。3aは2.5の後なので、既存テストは既に`start_paused`化済み。
 
+**rev6: `pending_wake`の取り込み(ユーザー決定、根拠eecba351、§0 rev6)**
+- 背景: eecba351が、試行中(`retry_attempt_in_flight`)に届いたネットワーク復帰のwakeが落ちてネットワーク復帰に数分気づかない
+  不具合を受けて`pending_wake`を追加した。rev4まではこの`epoch`/`in_flight`/`pending_wake`の三つ組を3b/3cの再評価の判断材料に
+  していたが、履歴がその判断材料を既に満たしているので、wakeに関わる遷移は3aで移す。
+- `pending_wake`/`retry_attempt_in_flight`を書く箇所(確認済み、`orchestrator.rs`本番コード、main `b413c2ac`):
+  `on_connected`(`:534-535`、両方クリア)、`handle_unexpected_disconnect`(`:779-802`、`reconnect_loop_active && pending_wake`なら
+  `Action::Suppress { wake_reconnect_loop: true }`で、`:839-843`で`reconnect_wake.notify_one()`)、再接続ループのネットワークwake分岐
+  (`:1026-1036`、試行中なら`pending_wake = true`)、tick分岐(`:1090-1091`、`:1114-1117`、`due || pending_wake`で試行開始)。
+- 3aで追加で移す遷移: 上表の`ReconnectWake{epoch}`(試行中でなければ試行開始Effect、試行中なら`pending_wake`を立てる)と、
+  `AttemptConnected`/`AttemptDisconnected`/`AttemptFailedSync{epoch}`の`retry_attempt_in_flight`・`pending_wake`の更新、
+  tick時の「`pending_wake`なら試行開始」の判断。tickの**会計**(`elapsed`/`tick_count`による`due`の計算、`woke_early`分岐)は
+  3b/3cの範囲として再評価に残し、3aではshellが計算した`due: bool`を`ReconnectTick{epoch, due}`に載せて渡す。
+- 追加の不変条件(proptest): 「ループ動作中(`reconnect_loop_active`)に届いた`ReconnectWake{epoch}`(現行epoch)は、試行中でも
+  失われない: その後の試行結果(`AttemptDisconnected`/`AttemptFailedSync`)のapplyか次の`ReconnectTick`のapplyで、
+  必ず試行開始かwake通知のEffectになる」。非現行epochの`ReconnectWake`/`ReconnectTick`はStateを変えない(§2.2必須プロパティ)。
+- 範囲外: `resume_client.rs`の再アタッチwake(報告ではe221d2ec、a1293255、773f807cの3件。`notify_waiters`/`notify_one`という
+  通知プリミティブの意味の問題)はreducerでは捕まらない種類なので3aに含めず、Step 2.5と同じ`start_paused`のshellテストで扱う
+  (報告の評価をそのまま採用。どのStepに割り当てるかは決めていない)。
+
+### Step 5(rev6で再評価から昇格): `resume_loop.rs`の判断を`ResumePlanner`へ
+
+- **経緯**: rev4までは「証拠を見て再評価」の1つで、判断材料は「既存の`start_paused`9本+純粋helperで足りない不具合が出たか」だった
+  (§6末尾の旧再評価表)。Step 9の報告で、この基準を履歴が既に満たしていることが分かり、ユーザーが3aの直後へ昇格させた(§0 rev6)。
+- **根拠(報告より)**: `isekai-pipe/src/resume_loop.rs`の判断ロジック(分類D)の修正が約12件。Epic N-3のUnknownSession give-up方針が
+  同日に3回直し直された(cc5fb926 → 71292e68 → dbb80d56、各修正が前の修正の方針を訂正)。Epic N-4のBUSY_OTHER_SESSION再試行期限も
+  3回(75d08a39 → fd32ce11 → 3d5e0da5、時間演算)。ほか03224b11(resume windowの超過が`Ok`を返しwrapperが自動再接続しない、
+  結果の分類)、204d8f59(pumpの失敗をLocal/Remoteに分類していない)、a266f1f3(一部、15秒の猶予なしに再接続通知)、
+  857f6ae6 D-4(jitter欠落)。報告によれば、このファイル最初の`start_paused`テスト(f335aa51)より後の修正の大半はレビューか
+  本番で見つかったもので、それらのテストでは見つかっていない(「テストで捕まえられたか」は報告もOPINIONとしている)。
+- **現状(確認済み、§1.2)**: `Instant::now`はファイル全体で22箇所、本番コード(`:2110`の最初の`#[cfg(test)]`より前)では13箇所。
+  既に`start_paused`テストと多数の純粋helper(`reconnect_notify_due(disconnected_at, now)`等)がある。`ResumePlanner`という型は
+  現コードに無く、本Stepで新設する名前(確認済み)。
+- **決定**: give-up判定・再試行期限・再接続通知の猶予・失敗分類という、上の不具合が集中した判断を、§2.1の形のreducer
+  (`ResumePlanner`、`*_fsm.rs`命名に従い置き場所はPRで決める)へ移し、`pure_modules.toml`に登録する。時間は§2.2の形
+  (`now: Millis`の刻印と、token付きタイマーEffect)でのみ入れる。13箇所の`Instant::now`は、shellの刻印関数1箇所に集約する。
+  移行は判断ごとに分けたPRで行い、各PRで該当する過去の修正(上のコミット)の挙動をproptest/表テストで固定する。
+- **得られるCI検証**: give-up・期限・猶予の判断を、非単調な`now`列(§2.2必須プロパティ)と任意のサーバー応答列でproptest。
+  過去3回ずつ直し直された2つの方針(UnknownSessionのgive-up、BUSY_OTHER_SESSIONの期限)を、境界値を含めて不変条件として固定する。
+- **リスク**: 中。`resume_loop.rs`は接続耐性の中核で、既存の`start_paused`9本と純粋helperがすでに多くの期待値を持っている。
+  既存テストは残し、両方緑をマージ条件にする。`ConnectOutcomeClass`の分類(§4.2、Step 12の網羅表)は変えない。
+- **前提**: Step 0(純粋性検査)。3aと触るファイルは重ならない(順序はユーザー決定による優先度)。
+- **ロールバック**: 判断ごとにPRを分けるので、PR単位でrevertする。
+
 ### Step 4: `pool.rs`のidle timerをtoken付きEffectへ
 
 - `release`はrefcountが0になったら`ArmIdleTimer{key, token: idle_generation, after: idle_grace}`を返し、shellが
@@ -802,9 +872,10 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 - **得られるCI検証**: PR #124の参照モデルに「タイマー発火」操作を加え、release→attach→release→古いタイマー発火の
   世代競合を任意順で検証。§2.2必須プロパティ(stale token無視)もここで満たす。
 - **リスク**: 低。**Step 2.5の後に行う**(2.5も`pool::release`のspawn先を変えるため、round 2 m-R2-7)。
+  rev6で6+7の後へ移した(履歴上の`pool.rs`の不具合は#120の1件だけで、#124のモデルテストで固定済み、§0 rev6)。
   2.5の後ならshell側も`start_paused`で配線テストできる。
 
-### Step 6: backoff/jitterの統一
+### Step 6(+7): backoff/jitterの統一と回復ループ本体の共通化(rev6でStep 7を統合)
 
 - 依存関係はmanifestで確定済み(Q4回答): `isekai-ssh/Cargo.toml`は`isekai-pipe-core`を非optionalで依存し、
   `isekai-pipe-core/Cargo.toml`は`isekai-transport = { path = "../isekai-transport" }`(optional/feature指定無し)。
@@ -821,6 +892,20 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 - **得られるCI検証**: isekai-ssh側の2コピーがseed付きで決定論テスト可能になる(`BackoffPolicy`自体は既に
   seed付き`StdRng`テストを持つので、新規の利得はこの2コピー分に限られる)。
 - **リスク**: 低。
+
+**rev6: 旧Step 7(isekai-ssh回復ループの共通化)の統合**
+- 根拠(報告より、§0 rev6): a266f1f3(redeploy+retryが1回しか走らない、ユーザー観測の「クラッシュのような終了」)と
+  857f6ae6 D-4(jitter欠落)は、どちらも同じ不具合を重複した2コピーで別々に直す必要があった。
+- 内容は旧再評価表の記述のまま: 残る重複はループ本体2つ(`wrapper.rs::run_ssh_with_connect_failure_recovery`、
+  `native/connect.rs::drive_connect_recovery`)と`MAX_LIGHTWEIGHT_RETRIES`(`wrapper.rs:594`、`native/connect.rs:382`)のみ
+  (`RedeployGate`/`reset_budget_if_stable`は共有済み、`reconnect_backoff.rs:111-128`)。`RedeployGate::due()`は
+  `tokio::time::Instant::now()`を内部で読むが`start_paused`下で既に決定論的。移す場合は「jitter付き期限を一度だけ解決する」
+  意味(`reconnect_backoff.rs:121-128`)を保つこと。
+- PR列: backoff統一(上記)→ ループ本体と`MAX_LIGHTWEIGHT_RETRIES`の共通化、の順に分ける。値と挙動は変えない。
+- Step 12と同時に進めない(どちらも`wrapper.rs`/`native/connect.rs`を変える)。Step 12を先に行い、その網羅表テストを
+  ループ共通化の回帰検査にする(§6)。
+- **リスク**: 低〜中(ループ共通化はUnix/Windows両経路の挙動保存が要る。既存の`drive_connect_recovery`のfakeテストと
+  `wrapper.rs`のテストを両方緑で保つ)。
 
 ### Step 8a′(8aを置換): Rustが接続エッジを明示的に通知する
 
@@ -906,7 +991,10 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   Rust側のproptestとorchestratorテストで検証可能になり、conflationによる取りこぼしが構造的に無くなる。
 - **リスク**: 中(UniFFI変更、両プラットフォーム同時対応)。
 
-### Step 8b: `TerminalSession`のUI状態をreducerへ
+### Step 8b: `TerminalSession`のUI状態をreducerへ(rev6: 再評価へ移した)
+
+- **rev6**: Step 9の報告でエッジ取りこぼしの事例が0件、Android側の不具合は配線漏れとプラットフォーム由来が主だったため、
+  ユーザー決定で再評価へ移した(§6末尾、§0 rev6)。以下は行う場合の内容(rev4までのまま)。
 
 - `TerminalSession.kt`の`_state.update`22箇所を、`ConnectionStateMapper`を拡張した`UiMsg`→`TerminalUiState`の
   純粋な畳み込みに寄せる。**対象はUI表示状態のみ**(`rust-ssot.md`の例外条項)。
@@ -917,8 +1005,8 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 
 - **内容**: 過去の不具合履歴(コミット・issue・PR・`PLAN.md`等の記録)を、本ADRの各Stepが「防げた/検出できた」かで
   分類し、Stepの期待効果を実績ベースで並べ直す材料を作る。コード変更もPRも伴わない調査。
-- **成果物**: 別エージェントが`scratchpad/defect-history-rank.md`を作成中(rev5執筆時点で未完了)。**本ADRはその結果を
-  先取りして書かない。**
+- **成果物**: `scratchpad/defect-history-rank.md`(rev5執筆時点では作成中だったため、rev5では結果を先取りしなかった)。
+  **rev6で完了**し、ユーザーがその結果に基づく順序変更を決めた。採用した根拠の要約は§0 rev6にある。
 - **位置付け**: 結果は§6の順序行・D2(3b/3c/5/7の再評価)の**入力**にすぎない。順序を変える場合は、ユーザーが決めた上で
   本ADRのamendment(rev6以降)として記録する。報告が順序変更を勧めても、amendmentが入るまでは§6の順序行が有効。
   scratchpadはリポジトリ外なので、amendmentで採用した根拠は要約してADR本文に書き写す(参照だけで済ませない)。
@@ -1044,7 +1132,7 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
      表の更新を強制する**ためのもの。
   2. `isekai-ssh`: `decide_connect_failure_recovery`の`Some(_)`をvariantごとの明示armに書き換える(現在の結果と同じ値を返す、
      挙動保存)。Step 7aの後なら`#[deny(clippy::wildcard_enum_match_arm)]`を付ける。`Unknown`+remote commandのガード条件は
-     純粋な述語関数に抽出して2箇所から呼ぶ(ループ本体2つの共通化は再評価Step 7の範囲で、ここでは行わない)。
+     純粋な述語関数に抽出して2箇所から呼ぶ(ループ本体2つの共通化はStep 6+7の範囲で、ここでは行わない。rev6)。
   3. **網羅表テスト**: 全`ConnectOutcomeClass`(テスト内の`all_classes()`はvariantごとの明示`match`で作り、variant追加で
      コンパイルが落ちるようにする)× `should_bootstrap` × remote commandの有無 → 期待する`ConnectFailureRecoveryAction`。
      この表の上で`always-connects.md`の性質を明示的にassertする: 「記録されたどのクラスについても、`should_bootstrap = true`
@@ -1096,19 +1184,20 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   - goldenは秘密を含まない(§3-3。hostはテスト用の固定値か記録しない)。
 - **得られるCI検証**: Rustのcallback契約と、Kotlin/Swiftの転送実装の食い違いが、`android-unit-test`(required)と
   `ios-logic-linux-check`で検出される。Rust側の変更でcallback列が変わるとgoldenの更新が必要になり、PRの差分で契約の変化が
-  可視化される。8bの`_state.update`書き換えに対する安全網にもなる(§6の推奨順序13 → 8b)。
+  可視化される。8bを再評価の結果行う場合は、その`_state.update`書き換えに対する安全網にもなる(§6、rev6で8bは再評価へ)。
 - **リスク**: 低〜中。goldenの更新手順(CI artifact経由)の手間と、Kotlin/Swiftテストからのファイル参照の仕組み作り。
   goldenを過剰に細かくすると無関係な変更でも更新が要るので、射影は契約に必要な項目に限る。
 - **前提**: Step 8a′(`on_connection_edge`とその実装者)。Step 11の記録器(推奨)。
 - **ロールバック**: テストとgoldenの削除のみ。
 
-### 再評価(証拠を見てから決める): Step 3b/3c・5・7
+### 再評価(証拠を見てから決める): Step 3b/3c(残り)・8b
+
+rev6で、Step 5は昇格(3aの後)、Step 7はStep 6へ統合、3b/3cのうち`pending_wake`はStep 3aへ取り込み、8bを再評価へ移した。
 
 | Step | 内容 | 再評価の判断材料 |
 |---|---|---|
-| 3b/3c | 再接続ループのtick会計・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと3aのproptestで、`epoch`/`in_flight`/`pending_wake`の三つ組の未検証インターリーブが実際に残っているか |
-| 5 | `resume_loop.rs`の`ResumePlanner`(本番13箇所の`Instant::now`) | 既存の`start_paused`9本+純粋helperで足りない不具合が出たか |
-| 7 | isekai-ssh回復ループの共通化 | 残る重複はループ本体2つと`MAX_LIGHTWEIGHT_RETRIES`のみ(`RedeployGate`/`reset_budget_if_stable`は共有済み)。`RedeployGate::due()`は`tokio::time::Instant::now()`を内部で読むが`start_paused`下で既に決定論的。移す場合は「jitter付き期限を一度だけ解決する」意味(`reconnect_backoff.rs:121-128`)を保つこと |
+| 3b/3c(残り) | 再接続ループのtick会計(`elapsed`/`tick_count`による`due`の計算)・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと、`pending_wake`を含めた3aのproptestの後に、tick会計まわりの未検証インターリーブや不具合が実際に残っているか |
+| 8b | `TerminalSession.kt`のUI状態のreducer化(§6 Step 8b) | UI状態(`_state.update`22箇所)由来の不具合が観測されたか。行う場合は8a′ → 8bの依存と、13の後に行う推奨順序に従う |
 
 ---
 
@@ -1214,6 +1303,7 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   採らない: 連番は「通知が抜けたこと」をKotlinに検出させるだけで、何を閉じるべきかの判断がKotlin側に戻り、
   `rust-ssot.md`に反する。
 - **Rejected由来のリーク(round 2 N-3)**: ユーザー決定(a)によりStep 2aで修正(I-g)。
+- **旧D5(rev5、Step 9の報告で§6の順序を変えるか)**: ユーザー決定でrev6の順序に変更(§0 rev6)。D5の番号は新規事項に振り直した。
 
 ### 未解決(ユーザー判断待ち、この一覧がすべて)
 
@@ -1229,11 +1319,11 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 | Q13 | crate rootの公開値型を項目単位許可のまま運用するか、`src/public_state.rs`へ移設するか | Step 3aと`session_state.rs`登録の時点 | 項目単位許可のまま。許可リストが10項目を超えたら移設 |
 | Q14 | Step 0のclippy設定で、解決できない`disallowed-*`パスの警告をどう抑止するか([EXT]) | Step 0のPR | エントリごとの`allow-invalid`等で抑止できるか試し、不可ならcrateごとの`clippy.toml`に分ける |
 | D1 | Step 2c(admission時の容量予約でunresumableを到達不能にする)を行うか | Step 2bの後 | **決定済み(Approve時): Step 2bの後で実施する**(当初の既定案「観測まで延期」は採らない) |
-| D2 | Step 3b/3c・5・7を行うか(§6末尾の再評価表) | Step 2.5・3aの後 | 再評価表の判断材料で未検証のインターリーブや不具合が見つかった場合だけ行う |
+| D2 | Step 3b/3c(残り)・8bを行うか(§6末尾の再評価表)。**rev6で範囲を変更**: Step 5は昇格、Step 7はStep 6へ統合、3b/3cのうち`pending_wake`はStep 3aに取り込み済みなので、3b/3cはもう全体が延期ではなく、残りのtick会計・`woke_early`だけが対象 | Step 2.5・3aの後(8bは8a′・13の後) | 再評価表の判断材料で未検証のインターリーブや不具合が見つかった場合だけ行う |
 | D3 | 純粋性検査ジョブ(clippy+allowlist)とmutants週次ジョブをrequired checkにするか | Step 0のジョブ導入後 | **決定済み(Approve時): 純粋性検査ジョブのみrequired化する。mutants週次ジョブは非required。** 実施時は`main-branch-protection.md`に従い、ジョブに明示的な`name:`を付け、`gh api -X PUT .../branches/main/protection`の`checks[].context`へ同時に追加する(追加を忘れるとcontextが恒久pendingになる)。誤検知でmainが詰まらないよう、まず数回のCI実績で安定を確認してからprotectionに追加する |
 | D4 | `native/mux/mod.rs`の`RECONNECT_STABLE_THRESHOLD`(60秒)を200秒に揃える挙動変更を行うか | Step 6とは別PR | 本ADRの範囲外。`reconnect_backoff.rs:64-71`の既知follow-upとして別途 |
 | Q15(rev5) | Step 10-2の有界網羅探索を、手書きBFS(依存追加なし)で行うかstateright(dev-dependency)で行うか。stateright採用時、§8「新しいFSM/effectフレームワークcrateの導入」をしないとの関係を「テスト専用の検証道具は対象外」と解釈してよいか | Step 10のPR | 手書きBFS。反例経路の可読性やeventually性質(§4.2)が要るとわかった時点でstaterightを再提案する |
 | Q16(rev5) | loomを導入するか(Step 10の評価では、tokio非同期mutexで組まれた`ServeAggregate`のshellには適用できない。候補は`pool.rs`の同期部分のみ) | Step 4の後 | 導入しない(`pool.rs`のロック粒度の競合が実害として観測されたら再検討) |
 | Q17(rev5) | Step 13のgoldenの置き場所・形式・射影項目、Kotlin/Swiftテストからの参照方法 | Step 13のPR | `rust-core/tests/golden/callback_contract/<scenario>.json`、射影はメソッド名・edge variant・generation・公開状態タグのみ |
 | Q18(rev5) | Step 7aで`[[interpreter]]`登録をどこまで広げるか(`decide_connect_failure_recovery`のような「Effectではないが網羅性が不変条件を担うenum」の`match`を含めるか)、lintが捕まえない形の検出をスクリプトで行うか | Step 7aのPR(Step 12の判断も同様) | interpreter関数は全登録。非Effectのenumは`always-connects.md`に関わるもの(Step 12)だけ属性を付ける。`if let`等はスクリプトで拒否する |
-| D5(rev5) | Step 9の報告(`scratchpad/defect-history-rank.md`)を受けて§6の順序を変えるか | Step 9の報告後 | 変えない(報告を見てユーザーが決め、変える場合はamendmentとして記録する) |
+| D5(rev6) | **「callback/フラグを実装したが配線していない」不具合クラス(Step 9報告の分類W)への対処**。報告によればリポジトリ全体で多く(例: 2a07a5e3、8baa49d8、db3a6d87、ce214ef5、ae8ed13b、119205f6、e1c370e5、7b10472a)、reducer・純粋性検査・原子性テストのどれも「Eventが一度も届かない」ことは捕まえないため、本ADRのどのStepも対象にしていない。**提案のみ(未決定)**: CIで「`OrchestratorCallback`の各メソッドと、プラットフォームから呼ばれるべきUniFFI公開メソッド(例: `notify_did_enter_background`等のライフサイクル入口)が、それぞれKotlin/Swift側に1つ以上の呼び出し箇所(またはそれを呼ぶテスト)を持つ」ことを検査する。実装手段の候補はStep 0のallowlistスクリプトと同じ簡易字句解析、またはStep 13のgolden replayの拡張。対象メソッドの列挙方法(UniFFI生成物から取るか手書きリストか)と、意図的に片方のプラットフォームだけで呼ぶメソッドの例外の書き方も未定 | ユーザーが決める(本ADRの範囲に入れるか、別ADRにするかを含む) | 既定案なし(ユーザー判断待ち) |
