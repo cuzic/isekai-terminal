@@ -38,7 +38,9 @@ on:
 
 concurrency:
   group: android-test-${{ github.ref }}
-  cancel-in-progress: true
+  # PRの再pushでは古い実行を捨てるが、mainへのpushは最後まで走らせる(連続マージで合成状態の検証が
+  # 毎回キャンセルされ、2026-10-06に5連続で未検証になった)。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
