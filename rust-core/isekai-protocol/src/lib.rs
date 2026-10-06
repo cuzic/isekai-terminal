@@ -17,6 +17,7 @@ pub mod ctl_vars;
 pub mod error;
 pub mod handshake;
 pub mod hello;
+pub mod millis;
 pub mod offset;
 pub mod resume;
 pub mod session_id;
@@ -40,6 +41,7 @@ pub use bootstrap_request::{
 pub use error::ProtocolError;
 pub use handshake::HandshakeJson;
 pub use hello::{AckResponse, Proof};
+pub use millis::Millis;
 pub use offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 pub use resume::ResumeRejectReason;
 pub use session_id::SessionId;

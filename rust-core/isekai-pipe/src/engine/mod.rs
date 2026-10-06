@@ -1,6 +1,8 @@
 mod attach_arbiter;
 mod attach_runtime;
 mod resume;
+#[allow(dead_code)] // Step 2a: 次のコミットでAttachRuntimeへ配線する
+mod serve_fsm;
 #[cfg(test)]
 mod sweep_resume_race_tests;
 
