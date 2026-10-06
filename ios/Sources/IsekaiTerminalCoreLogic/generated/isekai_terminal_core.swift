@@ -9629,7 +9629,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 797) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 33882) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 42589) {
         return InitializationResult.apiChecksumMismatch
     }
 
