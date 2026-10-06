@@ -76,7 +76,7 @@ class TerminalTabsViewModelTest {
             { _, _, _ ->
                 val fake = FakeOrchestrator()
                 orchestrators.add(fake)
-                TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+                testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
             }
         // ViewModel内部のviewModelScope.launch(ioDispatcher)にも同じtestScheduler駆動の
         // ディスパッチャーを使わせ、テストの仮想時間と実スレッドの完了タイミングが競合して
@@ -133,7 +133,7 @@ class TerminalTabsViewModelTest {
         val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, ConnectionProfile) -> TerminalSession = { _, _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
-            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+            testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
         return TerminalTabsViewModel(
             app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore, freshnessPolicy, batteryGuidancePolicy,

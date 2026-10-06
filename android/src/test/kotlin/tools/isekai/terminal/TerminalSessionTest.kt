@@ -38,7 +38,7 @@ class TerminalSessionTest {
     fun setup() {
         fakeOrchestrator = FakeOrchestrator()
         fakeHostKeyChecker = FakeHostKeyChecker()
-        session = TerminalSession(fakeHostKeyChecker, orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
+        session = testTerminalSession(fakeHostKeyChecker, orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
     }
 
     @After
@@ -341,7 +341,7 @@ class TerminalSessionTest {
             )
         )
         val fakeOrc2 = FakeOrchestrator()
-        val s = TerminalSession(changedChecker, orchestratorFactory = { cb -> fakeOrc2.also { it.callback = cb } })
+        val s = testTerminalSession(changedChecker, orchestratorFactory = { cb -> fakeOrc2.also { it.callback = cb } })
         s.connect(testConfig())
         val result = fakeOrc2.simulateHostKey(fingerprint = "new-fp")
         assertFalse(result)
@@ -776,7 +776,7 @@ class TerminalSessionTest {
 
         // 再接続（新しいセッションインスタンスで）
         val newOrchestrator = FakeOrchestrator()
-        val s = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> newOrchestrator.also { it.callback = cb } })
+        val s = testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> newOrchestrator.also { it.callback = cb } })
         s.connect(testConfig())
         newOrchestrator.simulateConnected()
         withTimeout(3000) { s.state.first { it.connected } }
@@ -834,7 +834,7 @@ class TerminalSessionTest {
     @Test
     fun onScreenUpdate_panelGenerationAdvances_populatesAiPanelState() = runBlocking {
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
         )
@@ -855,7 +855,7 @@ class TerminalSessionTest {
     @Test
     fun dismissAiPanel_clearsStateAndSameGenerationDoesNotReappear() = runBlocking {
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
         )
@@ -884,7 +884,7 @@ class TerminalSessionTest {
     @Test
     fun onScreenUpdate_formPanel_populatesFields() = runBlocking {
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
         )
@@ -910,7 +910,7 @@ class TerminalSessionTest {
     fun onScreenUpdate_bellGenerationAdvances_firesOnBellOnce() = runBlocking {
         val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onBell = { bellCount.incrementAndGet() },
@@ -933,7 +933,7 @@ class TerminalSessionTest {
     fun onNotify_forwardsKindToInjectedCallback() {
         val received = mutableListOf<NotifyKind>()
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onNotifyRequested = { kind -> received.add(kind) },
@@ -949,7 +949,7 @@ class TerminalSessionTest {
     @Test
     fun onNotify_withoutInjectedCallback_doesNotThrow() {
         val orch = FakeOrchestrator()
-        val s = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> orch.also { it.callback = cb } })
+        val s = testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> orch.also { it.callback = cb } })
 
         // 既定は no-op なので、何も注入しなくても例外にならないこと(他の副作用注入
         // パラメータ`onBell`/`onClipboardWriteRequested`と同じ既定動作)。
@@ -961,7 +961,7 @@ class TerminalSessionTest {
     fun onScreenUpdate_sameBellGenerationReapplied_doesNotFireAgain() = runBlocking {
         val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onBell = { bellCount.incrementAndGet() },
@@ -990,7 +990,7 @@ class TerminalSessionTest {
     fun onScreenUpdate_multipleIncreasingBellGenerations_firesForEach() = runBlocking {
         val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onBell = { bellCount.incrementAndGet() },
@@ -1015,7 +1015,7 @@ class TerminalSessionTest {
     fun onScreenUpdate_whileDisconnected_doesNotFireBell() = runBlocking {
         val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onBell = { bellCount.incrementAndGet() },
@@ -1044,7 +1044,7 @@ class TerminalSessionTest {
     fun reconnect_resetsLastFiredBellGeneration_newSessionLowGenerationStillFires() = runBlocking {
         val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
         val orch = FakeOrchestrator()
-        val s = TerminalSession(
+        val s = testTerminalSession(
             FakeHostKeyChecker(),
             orchestratorFactory = { cb -> orch.also { it.callback = cb } },
             onBell = { bellCount.incrementAndGet() },

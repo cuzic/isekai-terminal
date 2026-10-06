@@ -43,46 +43,47 @@ class TerminalSession(
     orchestratorFactory: (OrchestratorCallback) -> SessionOrchestratorInterface = { createSessionOrchestrator(it) },
     /**
      * リモートが OSC 52 でクリップボード書き込みを要求したときに呼ばれる
-     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定は no-op — 実際に Android の
+     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定値は持たない(渡し忘れで機能が黙って消えるのを防ぐ、
+     * `ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g))。実際に Android の
      * `ClipboardManager` へ書くかどうか(opt-in設定のチェック含む)は呼び出し元の責務とし、
      * `Context` を持たないこのクラス自体には持ち込まない([RealHostKeyChecker]を
      * `TerminalTabsViewModel`側から注入するのと同じ構成)。
      */
-    private val onClipboardWriteRequested: (ClipboardPayload) -> Unit = {},
+    private val onClipboardWriteRequested: (ClipboardPayload) -> Unit,
     /**
      * リモートが OSC 52 query、またはtmux迂回チャンネルの`ClipboardPullRequest`で
      * クリップボードの読み出しを要求したときに呼ばれる。Rust側の`onHostKey`/
      * `onAgentSignRequest`と同じ同期ブロッキング呼び出し(Rust側の`spawn_blocking`
-     * スレッドから呼ばれる)。既定はno-op(常に`null`=応答なし)。opt-in設定が無効、
+     * スレッドから呼ばれる)。応答しない場合は`null`を返す。opt-in設定が無効、
      * またはクリップボードが空/取得不可なら`null`を返すこと(呼び出し元はその場合
      * デバイス側から一切応答を送らない)。
      */
-    private val onClipboardPullRequested: () -> ClipboardPayload? = { null },
+    private val onClipboardPullRequested: () -> ClipboardPayload?,
     /**
      * #10/#22: RebindManager(Rust側)がWiFi-bound fdを要求した。判断は一切せず、
      * 取得できたfdを返すだけ(`rust-ssot.md`準拠)。Rust側の`spawn_blocking`スレッドから
-     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。既定はno-op
-     * (常に`null` — マルチパス以外のセッションでは呼ばれない)。
+     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。取得できなければ
+     * `null`を返す(マルチパス以外のセッションでは呼ばれない)。
      */
-    private val acquireWifiFd: () -> PlatformFd? = { null },
+    private val acquireWifiFd: () -> PlatformFd?,
     /** 同、セルラー-bound fd版。 */
-    private val acquireCellularFd: () -> PlatformFd? = { null },
+    private val acquireCellularFd: () -> PlatformFd?,
     /**
      * #25: 端末ベル(BEL, 0x07)受信時に呼ばれる(可視/触覚フィードバック用)。呼び出し元は
      * [ioScope] のコルーチン上から呼ばれる(メインスレッド保証は無い)。判断ロジック
      * (取りこぼし無く1回だけ発火させる `bell_generation` の単調増加チェック)はこのクラス
      * 内で完結させ、ここでは実際にバイブレーション等を鳴らすだけの副作用注入とする
      * (`onClipboardWriteRequested` と同じ構成 — `Context` を持たないこのクラス自体には
-     * 持ち込まない)。既定は no-op。
+     * 持ち込まない)。
      */
-    private val onBell: () -> Unit = {},
+    private val onBell: () -> Unit,
     /**
      * `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由でリモートから届いたAI/汎用の
      * 注目通知(`CtlMessage::Notify`、kindが`Waiting`/`Done`/`Info`)を受信した時に呼ばれる。
      * 判断ロジック(取りこぼし無く1回だけ発火させる`notifyGeneration`の単調増加チェック)は
      * このクラス内([maybeFireNotify]参照)で完結させ、ここではタブバッジ更新・システム
      * 通知等の副作用注入のみを行う(`onBell`と同じ構成)。呼び出し元は[ioScope]の
-     * コルーチン上(メインスレッド保証なし)。既定はno-op。
+     * コルーチン上(メインスレッド保証なし)。
      *
      * [onNotifyRequested](tmux hook由来、kindが`Bell`/`Activity`/`Silence`/`JobDone`)とは
      * 独立した別経路(統合の経緯は`isekai_protocol::ctl::NotifyKind`のRust側docコメント
@@ -90,7 +91,7 @@ class TerminalSession(
      * `OrchestratorCallback.onNotify`経由(`orchestrator.rs`の重複排除・フォアグラウンド
      * 抑制を経由済み)。
      */
-    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit = { _, _, _ -> },
+    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit,
     /**
      * タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火。
      * 「今この瞬間ユーザーへ見せるべきか」の抑制判断(アプリがフォアグラウンドかつ
@@ -98,9 +99,9 @@ class TerminalSession(
      * (`OrchestratorAdapter::on_notify`)が既に済ませてから呼ばれるため、ここでは
      * 実際にAndroid通知を出すかどうか(プロファイル単位opt-in・通知権限)の判断だけを
      * 行う副作用注入とする(`onClipboardWriteRequested`/`onBell`と同じ構成、
-     * `Context`を持たないこのクラス自体には持ち込まない)。既定は no-op。
+     * `Context`を持たないこのクラス自体には持ち込まない)。
      */
-    private val onNotifyRequested: (NotifyKind) -> Unit = {},
+    private val onNotifyRequested: (NotifyKind) -> Unit,
 ) : AutoCloseable {
 
     companion object {

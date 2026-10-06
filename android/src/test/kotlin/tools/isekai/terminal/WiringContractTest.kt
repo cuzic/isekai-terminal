@@ -229,7 +229,7 @@ class WiringContractTest {
         val sessionFactory: (AppExecutor, RebindFdSource, ConnectionProfile) -> TerminalSession = { _, _, _ ->
             val recording = RecordingOrchestrator()
             panes.add(recording)
-            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> recording.fake.callback = cb; recording.proxy })
+            testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> recording.fake.callback = cb; recording.proxy })
         }
         return TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
