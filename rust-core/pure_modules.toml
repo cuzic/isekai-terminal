@@ -111,3 +111,8 @@ file = "isekai-pipe/src/engine/attach_runtime.rs"
 fn = "activate"
 effect = "AttachEffect"
 
+# Step 2a: ServeAggregateのin-lock effect interpreter(ソケットマップへの登録/Discard/park格納/RESUME引き渡し)。
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "interpret_in_lock"
+effect = "ServeEffect"
