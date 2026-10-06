@@ -88,12 +88,8 @@ jobs:
           rustc --version
           cargo --version
 
-      # 保存はmainへのpush時のみ(ジョブ末尾の`Save cargo cache`参照)。PR上で保存した
-      # キャッシュは`refs/pull/N/merge`スコープで他のPRから読めず、リポジトリ上限10GBを
-      # 食い潰してmainのキャッシュをLRUで追い出していた(rust-core-test-check.yml参照)。
       - name: Cache cargo (rust-core)
-        id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -146,17 +142,6 @@ jobs:
             git diff -- "$GENERATED_DIR"
             exit 1
           fi
-
-      - name: Save cargo cache (rust-core, main only)
-        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            rust-core/target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Upload regenerated bindings on failure
         if: failure()
