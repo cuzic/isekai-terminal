@@ -19,14 +19,20 @@
 //! **要求**(`ResumeRequested`)は1回の`apply`で解決し、続きに必要な世代トークン(lease)を
 //! reducerが返す(§2.2 R3-2)。
 //!
-//! 不変条件(§4.1 I-a〜I-j)はこのモジュールのproptestで検証する。
+//! 新規sessionのadmission(`--max-sessions`)も、容量判定・最古parkedの立ち退き・fencing slotの
+//! 確保(`HelloReceived`)を**1回の`apply`**で行う([`ServeEvent::AdmitRequested`]、Step 2b)。
+//! 旧`admit_new_session`は判定(`session_count() < max_sessions()`)とslot確保(`hello()`)の間で
+//! ロックを手放していたため、同時に来た2つの新規sessionが両方とも判定を通り、max+1になり得た。
+//!
+//! 不変条件(§4.1 I-a〜I-j、およびStep 2bのI-k「slot数は`max_sessions`を超えない」)は
+//! このモジュールのproptestで検証する。
 // 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use isekai_protocol::attach::{AttachKey, AttachToken};
+use isekai_protocol::attach::{AttachKey, AttachRejectReason, AttachToken};
 use isekai_protocol::{Millis, SessionId};
 
 use super::attach_arbiter::{AttachArbiter, AttachEffect, AttachEvent, AttachState, LeaseId, TargetHandleId};
@@ -72,8 +78,17 @@ pub enum TerminateReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeEvent {
+    // ---- 要求: ATTACH_HELLOのadmission(Step 2b) ----
+    /// 新規sessionのadmissionと`HelloReceived`を**同じapply**で行う(Step 2b)。
+    /// arbiterが既にslotを持つsession_id(再送・再ATTACH・supersede)は容量判定を素通りして
+    /// そのまま`HelloReceived`へ。新規session_idは、slot数が`max_sessions`未満ならそのまま、
+    /// 満杯なら最古parkedを`Discard{Evicted}`してから、立ち退けるparkedが無ければ
+    /// `SendReject{BusyOtherSession}`(slotは確保しない)。
+    ///
+    /// ADRの`AdmitRequested{id}`に対し`key`全体を運ぶのは、判定とslot確保(`HelloReceived`は
+    /// `key`を要する)を分けると、そのapplyの間で同じcheck-then-actが再発するため。
+    AdmitRequested { key: AttachKey },
     // ---- ATTACH v2(`AttachArbiter`へ委譲するもの) ----
-    Hello { key: AttachKey },
     TargetConnected { lease: LeaseId, target: TargetHandleId, attach_token: AttachToken },
     TargetConnectFailed { lease: LeaseId },
     CancelReceived { key: AttachKey },
@@ -90,9 +105,6 @@ pub enum ServeEvent {
     Sweep { now: Millis, max_parked: Duration },
     // ---- 要求(1回のapplyで解決する) ----
     ResumeRequested { id: SessionKey },
-    /// admissionのための立ち退き要求(旧`SessionTable::claim_oldest_parked`)。
-    /// admissionのcheck-then-act自体の解消はStep 2bの範囲。
-    EvictOldestParked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,11 +144,13 @@ impl ServeAggregate {
         Self { arbiter: AttachArbiter::new(), index: BTreeMap::new(), max_sessions }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn max_sessions(&self) -> usize {
         self.max_sessions
     }
 
-    /// 読み取りクエリ(admissionの`session_count`/`has_session`、`established_lease_for`等)。
+    /// 読み取りクエリ(`is_vacant`の`session_count`、`established_lease_for`等)。admissionの判定には
+    /// 使わない(判定は`AdmitRequested`の同じapply内で行う、Step 2b)。
     pub fn arbiter(&self) -> &AttachArbiter {
         &self.arbiter
     }
@@ -147,7 +161,7 @@ impl ServeAggregate {
 
     pub fn apply(&mut self, event: ServeEvent) -> Vec<ServeEffect> {
         match event {
-            ServeEvent::Hello { key } => self.forward(AttachEvent::HelloReceived { key }),
+            ServeEvent::AdmitRequested { key } => self.on_admit_requested(key),
             ServeEvent::TargetConnected { lease, target, attach_token } => {
                 self.forward(AttachEvent::TargetConnected { lease, target, attach_token })
             }
@@ -163,12 +177,11 @@ impl ServeAggregate {
             ServeEvent::RelayTerminated { id, lease, reason } => self.on_relay_terminated(id, lease, reason),
             ServeEvent::Sweep { now, max_parked } => self.on_sweep(now, max_parked),
             ServeEvent::ResumeRequested { id } => self.on_resume_requested(id),
-            ServeEvent::EvictOldestParked => self.on_evict_oldest_parked(),
         }
     }
 
     /// `Established`に触れない(=indexと無関係な)ATTACH Eventをarbiterへそのまま渡す。
-    /// `HelloReceived`は`Established`を拒否するだけ、他は`Connecting`/`PendingActivation`/
+    /// `HelloReceived`(`on_admit_requested`経由)は`Established`を拒否するだけ、他は`Connecting`/`PendingActivation`/
     /// `ClosingForSupersede`しか遷移させないので、I-c(Established ⇔ indexエントリ)を壊さない。
     fn forward(&mut self, event: AttachEvent) -> Vec<ServeEffect> {
         self.arbiter.apply(event).into_iter().map(ServeEffect::Attach).collect()
@@ -295,11 +308,38 @@ impl ServeAggregate {
         }
     }
 
-    fn on_evict_oldest_parked(&mut self) -> Vec<ServeEffect> {
-        match self.oldest_parked() {
-            Some(victim) => self.discard(victim, DiscardCause::Evicted),
-            None => vec![],
+    /// Step 2b: 容量判定・立ち退き・slot確保を1回のapplyで(旧`admit_new_session`の
+    /// check-then-act解消)。判定に使うのはarbiterのslot数(Connecting/PendingActivation/
+    /// Established(unresumable含む)/ClosingForSupersedeすべて、I-cのadmission側の計数)で、
+    /// 現状と同じ。立ち退きは現状どおり1つだけ: このapplyだけがslot数を増やすので、
+    /// slot数は常に`max_sessions`以下(I-k)であり、満杯=ちょうど`max_sessions`から1つ空ければ足りる。
+    fn on_admit_requested(&mut self, key: AttachKey) -> Vec<ServeEffect> {
+        let mut out = Vec::new();
+        if !self.arbiter.has_session(key.session_id) && self.arbiter.session_count() >= self.max_sessions {
+            match self.oldest_parked() {
+                Some(victim) => out.extend(self.discard(victim, DiscardCause::Evicted)),
+                None => {
+                    // 本当に満杯(全sessionがactive)。新しいwire reasonは足さず、クライアントの
+                    // 既存の`retry_while_busy_other_session`(resume_loop.rs)に任せる(旧挙動どおり)。
+                    return vec![ServeEffect::Attach(AttachEffect::SendReject {
+                        key,
+                        reason: AttachRejectReason::BusyOtherSession,
+                    })];
+                }
+            }
         }
+        out.extend(self.forward(AttachEvent::HelloReceived { key }));
+        out
+    }
+}
+
+#[cfg(test)]
+impl ServeAggregate {
+    /// admissionを通さずに`HelloReceived`だけを適用する(テスト専用)。Step 2b以前の
+    /// check-then-act競合が作れた「容量超過のslot」(→unresumable登録)を再現するためだけに使う。
+    /// unresumable経路そのものはStep 2cで扱う。
+    pub(crate) fn hello_bypassing_admission(&mut self, key: AttachKey) -> Vec<ServeEffect> {
+        self.forward(AttachEvent::HelloReceived { key })
     }
 }
 
@@ -336,13 +376,33 @@ mod tests {
         [s; 16]
     }
 
-    /// HELLO → TargetConnected → Activated で`s`を`Established`にし、そのleaseを返す。
+    /// admission+HELLO → TargetConnected → Activated で`s`を`Established`にし、そのleaseを返す。
     fn establish(agg: &mut ServeAggregate, s: u8, grace: Option<u32>) -> (LeaseId, Vec<ServeEffect>) {
         let k = key(s, 0, 1);
-        let lease = match agg.apply(ServeEvent::Hello { key: k }).as_slice() {
+        let lease = match agg.apply(ServeEvent::AdmitRequested { key: k }).as_slice() {
+            [ServeEffect::Attach(AttachEffect::ConnectTarget { lease })] => *lease,
+            other => panic!("unexpected admission effects {other:?}"),
+        };
+        finish_establish(agg, s, k, lease, grace)
+    }
+
+    /// admissionを通さずに`establish`する(Step 2b以前の競合でしか作れなかった容量超過のslot)。
+    fn establish_bypassing_admission(agg: &mut ServeAggregate, s: u8, grace: Option<u32>) -> (LeaseId, Vec<ServeEffect>) {
+        let k = key(s, 0, 1);
+        let lease = match agg.hello_bypassing_admission(k).as_slice() {
             [ServeEffect::Attach(AttachEffect::ConnectTarget { lease })] => *lease,
             other => panic!("unexpected hello effects {other:?}"),
         };
+        finish_establish(agg, s, k, lease, grace)
+    }
+
+    fn finish_establish(
+        agg: &mut ServeAggregate,
+        s: u8,
+        k: AttachKey,
+        lease: LeaseId,
+        grace: Option<u32>,
+    ) -> (LeaseId, Vec<ServeEffect>) {
         agg.apply(ServeEvent::TargetConnected { lease, target: TargetHandleId(s as u64), attach_token: token(s) });
         let effects = agg.apply(ServeEvent::Activated { key: k, attach_token: token(s), negotiated_grace_secs: grace });
         (lease, effects)
@@ -462,17 +522,25 @@ mod tests {
         assert!(agg.index_entry(&id(1)).is_some());
     }
 
-    #[test]
-    fn evict_oldest_parked_returns_nothing_when_nothing_is_parked() {
-        let mut agg = ServeAggregate::new(8);
-        establish(&mut agg, 1, None);
-        assert_eq!(agg.apply(ServeEvent::EvictOldestParked), vec![]);
-        assert!(agg.index_entry(&id(1)).is_some(), "an active session must never be evicted");
+    // ---- Step 2b: admission(旧`admit_new_session` + `claim_oldest_parked`)----
+
+    fn busy(k: AttachKey) -> Vec<ServeEffect> {
+        vec![ServeEffect::Attach(AttachEffect::SendReject { key: k, reason: AttachRejectReason::BusyOtherSession })]
     }
 
     #[test]
-    fn evict_oldest_parked_picks_the_oldest_with_id_tie_break() {
-        let mut agg = ServeAggregate::new(8);
+    fn admission_rejects_busy_without_touching_state_when_full_of_active_sessions() {
+        let mut agg = ServeAggregate::new(1);
+        let (active, _) = establish(&mut agg, 1, None);
+        assert_eq!(agg.apply(ServeEvent::AdmitRequested { key: key(2, 0, 1) }), busy(key(2, 0, 1)));
+        assert!(!agg.arbiter.has_session(SessionId::from_bytes(id(2))), "a rejected admission claims no slot");
+        assert_eq!(established(&agg, 1), Some(active), "an active session must never be evicted");
+        assert_eq!(agg.arbiter.session_count(), 1);
+    }
+
+    #[test]
+    fn admission_when_full_evicts_the_oldest_parked_with_id_tie_break_in_the_same_apply() {
+        let mut agg = ServeAggregate::new(3);
         let (l3, _) = establish(&mut agg, 3, None);
         let (l2, _) = establish(&mut agg, 2, None);
         let (l1, _) = establish(&mut agg, 1, None);
@@ -480,13 +548,56 @@ mod tests {
         agg.apply(ServeEvent::Parked { id: id(2), lease: l2, now: Millis(10) });
         agg.apply(ServeEvent::Parked { id: id(1), lease: l1, now: Millis(20) });
         // parked_sinceが同じ(10)なら小さいidが先(HashMap反復順に依存しない)。
-        assert_eq!(
-            agg.apply(ServeEvent::EvictOldestParked),
-            vec![ServeEffect::Discard { id: id(2), lease: l2, cause: DiscardCause::Evicted }]
-        );
+        let effects = agg.apply(ServeEvent::AdmitRequested { key: key(4, 0, 1) });
+        assert_eq!(effects[0], ServeEffect::Discard { id: id(2), lease: l2, cause: DiscardCause::Evicted });
+        assert!(matches!(&effects[1..], [ServeEffect::Attach(AttachEffect::ConnectTarget { .. })]));
         assert_eq!(established(&agg, 2), None);
+        assert_eq!(agg.arbiter.session_count(), 3, "evict one, claim one: still exactly max_sessions");
     }
 
+    #[test]
+    fn admission_passes_a_session_that_already_holds_a_slot_through_even_when_full() {
+        // 再送・再ATTACH・supersedeは容量判定の対象外(旧`has_session`の素通しと同じ)。
+        let mut agg = ServeAggregate::new(1);
+        establish(&mut agg, 1, None);
+        let effects = agg.apply(ServeEvent::AdmitRequested { key: key(1, 1, 2) });
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                ServeEffect::Discard { .. }
+                    | ServeEffect::Attach(AttachEffect::SendReject { reason: AttachRejectReason::BusyOtherSession, .. })
+            )),
+            "a known session_id is never rejected as busy nor evicts anyone: {effects:?}"
+        );
+    }
+
+    /// Step 2bが閉じる競合の再現(reducer単体、決定論的): 旧`admit_new_session`のように
+    /// 2つの新規sessionの「判定」が両方とも「slot確保」より先に走るとmax+1になる。
+    /// 同じ2つの要求を`AdmitRequested`(判定と確保が1回のapply)で流すと、2つ目は拒否される。
+    #[test]
+    fn split_check_then_hello_admits_max_plus_one_but_atomic_admission_does_not() {
+        let old_check = |agg: &ServeAggregate, s: u8| {
+            agg.arbiter.has_session(SessionId::from_bytes(id(s))) || agg.arbiter.session_count() < agg.max_sessions()
+        };
+        let mut old = ServeAggregate::new(1);
+        let (a_ok, b_ok) = (old_check(&old, 1), old_check(&old, 2));
+        assert!(a_ok && b_ok, "both checks pass before either claims a slot");
+        old.hello_bypassing_admission(key(1, 0, 1));
+        old.hello_bypassing_admission(key(2, 0, 1));
+        assert_eq!(old.arbiter.session_count(), 2, "the pre-2b split admission over-admits (max+1)");
+
+        let mut new = ServeAggregate::new(1);
+        assert!(matches!(
+            new.apply(ServeEvent::AdmitRequested { key: key(1, 0, 1) }).as_slice(),
+            [ServeEffect::Attach(AttachEffect::ConnectTarget { .. })]
+        ));
+        assert_eq!(new.apply(ServeEvent::AdmitRequested { key: key(2, 0, 1) }), busy(key(2, 0, 1)));
+        assert_eq!(new.arbiter.session_count(), 1);
+    }
+
+    // Step 2b以降、`Activated`時の立ち退き・unresumable登録はshellからは到達しない(admissionが
+    // 先に容量を空けるので、Activated時点のlive数は常にmax_sessions未満)。reducerの分岐自体は
+    // Step 2cまで残るので、admissionを迂回して作った容量超過のslotで検証し続ける。
     #[test]
     fn activation_when_full_evicts_oldest_parked_first() {
         let mut agg = ServeAggregate::new(2);
@@ -494,7 +605,7 @@ mod tests {
         let (newer, _) = establish(&mut agg, 2, None);
         agg.apply(ServeEvent::Parked { id: id(1), lease: older, now: Millis(0) });
         agg.apply(ServeEvent::Parked { id: id(2), lease: newer, now: Millis(10) });
-        let (lease3, effects) = establish(&mut agg, 3, None);
+        let (lease3, effects) = establish_bypassing_admission(&mut agg, 3, None);
         assert_eq!(effects[0], ServeEffect::Discard { id: id(1), lease: older, cause: DiscardCause::Evicted });
         assert_eq!(effects[1], ServeEffect::RegisterIo { id: id(3), lease: lease3, unresumable: false });
         assert_eq!(established(&agg, 1), None);
@@ -505,7 +616,7 @@ mod tests {
     fn activation_when_full_of_active_sessions_registers_unresumable() {
         let mut agg = ServeAggregate::new(1);
         let (active, _) = establish(&mut agg, 1, None);
-        let (lease2, effects) = establish(&mut agg, 2, None);
+        let (lease2, effects) = establish_bypassing_admission(&mut agg, 2, None);
         assert_eq!(effects[0], ServeEffect::RegisterIo { id: id(2), lease: lease2, unresumable: true });
         assert!(agg.index_entry(&id(1)).is_some(), "active sessions are never evicted");
         assert_eq!(established(&agg, 1), Some(active));
@@ -514,8 +625,8 @@ mod tests {
         assert_eq!(agg.apply(ServeEvent::ResumeRequested { id: id(2) }), vec![ServeEffect::ResumeRejected { id: id(2) }]);
         // LRU対象外(parkedのid(1)が選ばれる)。
         assert_eq!(
-            agg.apply(ServeEvent::EvictOldestParked),
-            vec![ServeEffect::Discard { id: id(1), lease: active, cause: DiscardCause::Evicted }]
+            agg.apply(ServeEvent::AdmitRequested { key: key(3, 0, 1) })[0],
+            ServeEffect::Discard { id: id(1), lease: active, cause: DiscardCause::Evicted }
         );
     }
 
@@ -524,16 +635,17 @@ mod tests {
         // Step 2aの意図した挙動変更その2(I-g、旧: 孤児park→恒久的なslotリーク)。
         let mut agg = ServeAggregate::new(1);
         establish(&mut agg, 1, None);
-        let (lease2, _) = establish(&mut agg, 2, None);
+        let (lease2, _) = establish_bypassing_admission(&mut agg, 2, None);
         assert_eq!(
             agg.apply(ServeEvent::Parked { id: id(2), lease: lease2, now: Millis(0) }),
             vec![ServeEffect::Discard { id: id(2), lease: lease2, cause: DiscardCause::Unresumable }]
         );
         assert_eq!(established(&agg, 2), None);
         assert_eq!(agg.index_entry(&id(2)), None);
-        // 同じsession_idの再ATTACHが受理される(旧: AttachAlreadyEstablishedで永久拒否)。
+        // 同じsession_idのslotが空いた(旧: AttachAlreadyEstablishedで永久拒否)。
+        assert!(!agg.arbiter.has_session(SessionId::from_bytes(id(2))));
         assert!(matches!(
-            agg.apply(ServeEvent::Hello { key: key(2, 1, 1) }).as_slice(),
+            agg.hello_bypassing_admission(key(2, 1, 1)).as_slice(),
             [ServeEffect::Attach(AttachEffect::ConnectTarget { .. })]
         ));
     }
@@ -544,7 +656,11 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum Op {
-        Hello { s: u8, g: u8, at: u8 },
+        /// `AdmitRequested`(admission+HELLO、Step 2b)。
+        Admit { s: u8, g: u8, at: u8 },
+        /// admissionを迂回したHELLO(Step 2b以前の競合でしか作れなかった容量超過slot。
+        /// I-gなどunresumable経路の到達性のため。I-kのproptestでは生成しない)。
+        HelloBypass { s: u8, g: u8, at: u8 },
         /// 現在`Connecting`のleaseに対するTargetConnected(到達性を上げるため)。
         ConnectCurrent { s: u8, tok: u8 },
         TargetConnected { l: usize, tok: u8 },
@@ -560,16 +676,21 @@ mod tests {
         RelayTerminated { s: u8, l: usize, dropped: bool },
         Sweep { now: u64, max_parked_ms: u64 },
         Resume { s: u8 },
-        Evict,
     }
 
-    fn op_strategy() -> impl Strategy<Value = Op> {
+    /// `allow_bypass`: `HelloBypass`を生成するか(偽なら代わりに`Admit`=実際のshellと同じ入口だけ)。
+    fn op_strategy(allow_bypass: bool) -> impl Strategy<Value = Op> {
         let s = || 0u8..SESSIONS;
         let l = || 0usize..64;
         // 非単調な`now`: 各Eventが独立に任意の値を取る(後のEventほど小さいこともある)。
         let now = || 0u64..100_000;
         prop_oneof![
-            3 => (s(), 0u8..3, 0u8..2).prop_map(|(s, g, at)| Op::Hello { s, g, at }),
+            3 => (s(), 0u8..3, 0u8..2).prop_map(|(s, g, at)| Op::Admit { s, g, at }),
+            1 => (s(), 0u8..3, 0u8..2).prop_map(move |(s, g, at)| if allow_bypass {
+                Op::HelloBypass { s, g, at }
+            } else {
+                Op::Admit { s, g, at }
+            }),
             3 => (s(), 0u8..3).prop_map(|(s, tok)| Op::ConnectCurrent { s, tok }),
             1 => (l(), 0u8..3).prop_map(|(l, tok)| Op::TargetConnected { l, tok }),
             1 => l().prop_map(|l| Op::TargetConnectFailed { l }),
@@ -583,7 +704,6 @@ mod tests {
             2 => (s(), l(), any::<bool>()).prop_map(|(s, l, dropped)| Op::RelayTerminated { s, l, dropped }),
             3 => (now(), 0u64..60_000).prop_map(|(now, max_parked_ms)| Op::Sweep { now, max_parked_ms }),
             3 => s().prop_map(|s| Op::Resume { s }),
-            1 => Just(Op::Evict),
         ]
     }
 
@@ -607,7 +727,7 @@ mod tests {
                 generation: ConnectionGeneration::new(n),
                 attempt_id: AttemptId::from_bytes([0xFF; 16]),
             };
-            for e in other.apply(ServeEvent::Hello { key: k }) {
+            for e in other.hello_bypassing_admission(k) {
                 if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e { last = Some(lease); }
                 if let ServeEffect::Attach(AttachEffect::CancelLease { lease }) = e {
                     for e2 in other.apply(ServeEvent::LeaseStopped { lease }) {
@@ -621,7 +741,7 @@ mod tests {
 
     /// 主proptestと同じ生成器(`(max_sessions, ops)`)。カバレッジテストが同じ分布を測るために共有する。
     fn sequence_strategy() -> impl Strategy<Value = (usize, Vec<Op>)> {
-        (0usize..4, proptest::collection::vec(op_strategy(), 0..120))
+        (0usize..4, proptest::collection::vec(op_strategy(true), 0..120))
     }
 
     type Snapshot = (Vec<Option<AttachState>>, Vec<(SessionKey, IndexEntry)>);
@@ -632,9 +752,11 @@ mod tests {
         (states, index)
     }
 
+    /// `HelloBypass`は`ServeEvent`ではないので呼び出し側で別に扱う(ここでは`None`)。
     fn resolve(agg: &ServeAggregate, op: &Op, issued: &[LeaseId], fabricated: LeaseId) -> Option<ServeEvent> {
         Some(match *op {
-            Op::Hello { s, g, at } => ServeEvent::Hello { key: key(s, g as u64, at) },
+            Op::Admit { s, g, at } => ServeEvent::AdmitRequested { key: key(s, g as u64, at) },
+            Op::HelloBypass { .. } => return None,
             Op::ConnectCurrent { s, tok } => match agg.arbiter.state_for(SessionId::from_bytes(id(s))) {
                 Some(AttachState::Connecting { lease, .. }) => {
                     ServeEvent::TargetConnected { lease: *lease, target: TargetHandleId(s as u64), attach_token: token(tok) }
@@ -680,7 +802,6 @@ mod tests {
                 ServeEvent::Sweep { now: Millis(now), max_parked: Duration::from_millis(max_parked_ms) }
             }
             Op::Resume { s } => ServeEvent::ResumeRequested { id: id(s) },
-            Op::Evict => ServeEvent::EvictOldestParked,
         })
     }
 
@@ -702,172 +823,236 @@ mod tests {
         Ok(())
     }
 
+    /// 任意のop列を流し、各apply後にI-a〜I-j(と`check_capacity`ならI-k)を検査する。
+    /// `check_capacity`: admissionを迂回しない列(`HelloBypass`無し)でだけ真にできる。
+    fn run_ops(max_sessions: usize, ops: Vec<Op>, check_capacity: bool) -> Result<(), TestCaseError> {
+        let mut agg = ServeAggregate::new(max_sessions);
+        let mut issued: Vec<LeaseId> = Vec::new();
+        let mut issued_set: HashSet<LeaseId> = HashSet::new();
+        let fabricated = fabricated_lease();
+
+        for op in ops {
+            if let Op::HelloBypass { s, g, at } = op {
+                prop_assert!(!check_capacity, "HelloBypass in a capacity-checked run");
+                for e in agg.hello_bypassing_admission(key(s, g as u64, at)) {
+                    if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e {
+                        prop_assert!(issued_set.insert(lease), "lease minted twice");
+                        prop_assert_ne!(lease, fabricated);
+                        issued.push(lease);
+                    }
+                }
+                check_structural_invariants(&agg)?;
+                continue;
+            }
+            let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
+            let before_count = agg.arbiter.session_count();
+            let before = snapshot(&agg);
+            let before_index = agg.index.clone();
+            let effects = agg.apply(event);
+            let after = snapshot(&agg);
+
+            for e in &effects {
+                if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e {
+                    prop_assert!(issued_set.insert(*lease), "lease minted twice");
+                    prop_assert_ne!(*lease, fabricated);
+                    issued.push(*lease);
+                }
+            }
+
+            check_structural_invariants(&agg)?;
+
+            if check_capacity {
+                // I-k(Step 2b): fencing slotの数は決して`max_sessions`を超えない。旧`admit_new_session`の
+                // check-then-actでは、2つの新規sessionの判定が両方ともslot確保より先に走るとmax+1になった。
+                prop_assert!(
+                    agg.arbiter.session_count() <= max_sessions,
+                    "slots {} exceed max_sessions {} after {:?}", agg.arbiter.session_count(), max_sessions, event
+                );
+                // 系: admissionが先に容量を空けるので、Activated時点で容量超過になることはなく、
+                // unresumable登録には到達しない(この経路の削除自体はStep 2c)。
+                prop_assert!(
+                    !effects.iter().any(|e| matches!(e, ServeEffect::RegisterIo { unresumable: true, .. })),
+                    "unresumable registration reached through admission"
+                );
+            }
+
+            for e in &effects {
+                if let ServeEffect::Discard { id: did, lease, cause } = *e {
+                    // I-a: Discard後、idはindexにもarbiterのEstablishedにも無い……
+                    // ただしActivatedの立ち退きでは別idが登録されるだけなので、そのidについて見る。
+                    prop_assert!(agg.index.get(&did).map(|x| x.lease) != Some(lease));
+                    prop_assert!(agg.established_lease(did) != Some(lease));
+                    prop_assert!(agg.index.get(&did).is_none(), "discarded id still indexed");
+                    prop_assert!(agg.established_lease(did).is_none(), "discarded id still Established");
+                    // Discardは直前に存在したincarnationに対してのみ出る(同じlease)。
+                    prop_assert_eq!(before_index.get(&did).map(|x| x.lease), Some(lease));
+                    match cause {
+                        // I-d: activeなidにはEvicted/Expiredを出さない。
+                        DiscardCause::Evicted | DiscardCause::Expired => {
+                            let since = before_index[&did].parked_since;
+                            prop_assert!(since.is_some(), "evicted/expired an active session");
+                            if let (DiscardCause::Expired, ServeEvent::Sweep { now, max_parked }) = (cause, event) {
+                                // I-h: 非単調nowでも、park後の経過が締切未満なら出さない。
+                                let since = since.unwrap_or(Millis(0));
+                                let deadline = effective_deadline(&before_index[&did], max_parked);
+                                prop_assert!(now.0 >= since.0, "expired with time going backwards");
+                                prop_assert!(Duration::from_millis(now.0 - since.0) >= deadline);
+                            }
+                            if cause == DiscardCause::Evicted {
+                                // 決定論的タイブレーク: (parked_since, id)最小のparkedを選ぶ。
+                                let oldest = before_index
+                                    .iter()
+                                    .filter_map(|(k, v)| v.parked_since.map(|s| (s, *k)))
+                                    .min()
+                                    .map(|(_, k)| k);
+                                prop_assert_eq!(oldest, Some(did));
+                            }
+                        }
+                        DiscardCause::Unresumable => {
+                            prop_assert!(before_index[&did].unresumable);
+                            prop_assert!(matches!(event, ServeEvent::Parked { .. }), "Unresumable discard from non-Parked event");
+                        }
+                        DiscardCause::TcpDied | DiscardCause::GuardDropped => {}
+                    }
+                }
+            }
+
+            match event {
+                // I-e / I-f: 非現行leaseを運ぶ事実EventはStateを変えず、Effectも返さず、
+                // 決してDiscardを起こさない。
+                ServeEvent::Parked { id: pid, lease, .. } | ServeEvent::RelayTerminated { id: pid, lease, .. } => {
+                    if before_index.get(&pid).map(|e| e.lease) != Some(lease) {
+                        prop_assert_eq!(&before, &after, "stale fact mutated state: {:?}", event);
+                        prop_assert!(effects.is_empty(), "stale fact produced effects: {:?}", effects);
+                    }
+                }
+                ServeEvent::RelayEnded { lease } => {
+                    match before_index.iter().find(|(_, e)| e.lease == lease) {
+                        // I-j: 現Established leaseのRelayEndedは同じapplyでindexエントリも除く。
+                        Some((rid, _)) => {
+                            prop_assert!(agg.index.get(rid).is_none());
+                            prop_assert_eq!(effects.len(), 1);
+                        }
+                        None => {
+                            // indexに無いleaseはEstablishedでもない(I-c)ので、arbiterでも状態は
+                            // 変わらない(RelayEndedはEstablishedにしか作用しない)。
+                            prop_assert_eq!(&before, &after);
+                            prop_assert!(effects.is_empty());
+                        }
+                    }
+                }
+                // I-i: ResumeGrantedは、parked かつ Established かつ !unresumable のときだけ、
+                // そのEstablished leaseで出る。それ以外は状態を変えない。
+                ServeEvent::ResumeRequested { id: rid } => {
+                    let b = before_index.get(&rid).copied();
+                    match effects.as_slice() {
+                        [ServeEffect::ResumeGranted { id: gid, lease }] => {
+                            prop_assert_eq!(*gid, rid);
+                            let b = b.expect("granted without entry");
+                            prop_assert!(b.parked_since.is_some() && !b.unresumable);
+                            prop_assert_eq!(b.lease, *lease);
+                            let before_est = match &before.0[usize::from(rid[0])] {
+                                Some(AttachState::Established { lease, .. }) => Some(*lease),
+                                _ => None,
+                            };
+                            prop_assert_eq!(before_est, Some(*lease));
+                            prop_assert_eq!(agg.index[&rid].parked_since, None);
+                            prop_assert_eq!(agg.index[&rid].lease, *lease);
+                        }
+                        [ServeEffect::RequestPreempt { id: gid, lease }] => {
+                            prop_assert_eq!(*gid, rid);
+                            let b = b.expect("preempt without entry");
+                            prop_assert!(b.parked_since.is_none() && !b.unresumable);
+                            prop_assert_eq!(b.lease, *lease);
+                            prop_assert_eq!(&before, &after);
+                        }
+                        [ServeEffect::ResumeRejected { id: gid }] => {
+                            prop_assert_eq!(*gid, rid);
+                            prop_assert!(b.map_or(true, |e| e.unresumable));
+                            prop_assert_eq!(&before, &after);
+                        }
+                        other => prop_assert!(false, "unexpected resume effects {:?}", other),
+                    }
+                }
+                ServeEvent::AdmitRequested { key: k } => {
+                    let known = before.0.get(usize::from(k.session_id.as_bytes()[0])).is_some_and(Option::is_some);
+                    let any_parked = before_index.values().any(|e| e.parked_since.is_some());
+                    let rejected_busy = effects.iter().any(|e| {
+                        matches!(e, ServeEffect::Attach(AttachEffect::SendReject { reason: AttachRejectReason::BusyOtherSession, .. }))
+                    });
+                    if rejected_busy {
+                        // 本当に満杯(新規session_id・slot数>=max・立ち退けるparked無し)のときだけ拒否し、
+                        // 状態は一切変えない。
+                        prop_assert!(!known && before_count >= max_sessions && !any_parked);
+                        prop_assert_eq!(effects.len(), 1);
+                        prop_assert_eq!(&before, &after);
+                    } else if !known && before_count >= max_sessions {
+                        // 満杯の新規session_idは、同じapplyで最古parkedを1つだけ立ち退かせてから入る
+                        // (Evictedの検査は上のDiscardループ)。
+                        let evicted = effects.iter().filter(|e| matches!(e, ServeEffect::Discard { .. })).count();
+                        prop_assert_eq!(evicted, 1);
+                    } else {
+                        prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })), "admission with room evicted");
+                        prop_assert_eq!(&before.1, &after.1);
+                    }
+                }
+                ServeEvent::TargetConnected { .. }
+                | ServeEvent::TargetConnectFailed { .. }
+                | ServeEvent::CancelReceived { .. }
+                | ServeEvent::LeaseStopped { .. }
+                | ServeEvent::PendingExpired { .. } => {
+                    // indexを変えない(Established以外にしか作用しない)。
+                    prop_assert_eq!(&before.1, &after.1);
+                    prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })), "ATTACH event produced a Discard");
+                }
+                // Sweepの完全性(レビューD-2): 締切に達したparkedエントリは**全て**除かれ、
+                // それ以外(期限前のparked・active・unresumable)は**一切**変わらない。
+                // 「何も期限切れにしない」reducerはここで落ちる。
+                ServeEvent::Sweep { now, max_parked } => {
+                    let is_expired = |e: &IndexEntry| {
+                        e.parked_since.is_some_and(|since| {
+                            Duration::from_millis(now.0.saturating_sub(since.0)) >= effective_deadline(e, max_parked)
+                        })
+                    };
+                    let expected: BTreeSet<SessionKey> =
+                        before_index.iter().filter(|(_, e)| is_expired(e)).map(|(k, _)| *k).collect();
+                    let discarded: BTreeSet<SessionKey> = effects
+                        .iter()
+                        .filter_map(|e| match e {
+                            ServeEffect::Discard { id, cause: DiscardCause::Expired, .. } => Some(*id),
+                            _ => None,
+                        })
+                        .collect();
+                    prop_assert_eq!(&discarded, &expected, "sweep did not discard exactly the expired entries");
+                    let mut survivors = before_index.clone();
+                    survivors.retain(|k, _| !expected.contains(k));
+                    prop_assert_eq!(&agg.index, &survivors, "sweep touched a non-expired entry");
+                    prop_assert!(!agg.index.values().any(is_expired), "an expired parked entry survived the sweep");
+                }
+                ServeEvent::Activated { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     proptest! {
+        /// I-a〜I-j。admissionを迂回したHELLOも混ぜ、unresumable経路(I-g)にも到達させる。
         #[test]
         fn serve_aggregate_invariants_hold_for_arbitrary_event_sequences(
             (max_sessions, ops) in sequence_strategy(),
         ) {
-            let mut agg = ServeAggregate::new(max_sessions);
-            let mut issued: Vec<LeaseId> = Vec::new();
-            let mut issued_set: HashSet<LeaseId> = HashSet::new();
-            let fabricated = fabricated_lease();
+            run_ops(max_sessions, ops, false)?;
+        }
 
-            for op in ops {
-                let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
-                let before = snapshot(&agg);
-                let before_index = agg.index.clone();
-                let effects = agg.apply(event);
-                let after = snapshot(&agg);
-
-                for e in &effects {
-                    if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e {
-                        prop_assert!(issued_set.insert(*lease), "lease minted twice");
-                        prop_assert_ne!(*lease, fabricated);
-                        issued.push(*lease);
-                    }
-                }
-
-                check_structural_invariants(&agg)?;
-
-                for e in &effects {
-                    if let ServeEffect::Discard { id: did, lease, cause } = *e {
-                        // I-a: Discard後、idはindexにもarbiterのEstablishedにも無い……
-                        // ただしActivatedの立ち退きでは別idが登録されるだけなので、そのidについて見る。
-                        prop_assert!(agg.index.get(&did).map(|x| x.lease) != Some(lease));
-                        prop_assert!(agg.established_lease(did) != Some(lease));
-                        prop_assert!(agg.index.get(&did).is_none(), "discarded id still indexed");
-                        prop_assert!(agg.established_lease(did).is_none(), "discarded id still Established");
-                        // Discardは直前に存在したincarnationに対してのみ出る(同じlease)。
-                        prop_assert_eq!(before_index.get(&did).map(|x| x.lease), Some(lease));
-                        match cause {
-                            // I-d: activeなidにはEvicted/Expiredを出さない。
-                            DiscardCause::Evicted | DiscardCause::Expired => {
-                                let since = before_index[&did].parked_since;
-                                prop_assert!(since.is_some(), "evicted/expired an active session");
-                                if let (DiscardCause::Expired, ServeEvent::Sweep { now, max_parked }) = (cause, event) {
-                                    // I-h: 非単調nowでも、park後の経過が締切未満なら出さない。
-                                    let since = since.unwrap_or(Millis(0));
-                                    let deadline = effective_deadline(&before_index[&did], max_parked);
-                                    // 締切0(`grace == Some(0)`等)は経過0(時刻逆行の飽和値)でも満了する。
-                                    prop_assert!(
-                                        now.0 >= since.0 || deadline.is_zero(),
-                                        "expired with time going backwards"
-                                    );
-                                    prop_assert!(Duration::from_millis(now.0.saturating_sub(since.0)) >= deadline);
-                                }
-                                if cause == DiscardCause::Evicted {
-                                    // 決定論的タイブレーク: (parked_since, id)最小のparkedを選ぶ。
-                                    let oldest = before_index
-                                        .iter()
-                                        .filter_map(|(k, v)| v.parked_since.map(|s| (s, *k)))
-                                        .min()
-                                        .map(|(_, k)| k);
-                                    prop_assert_eq!(oldest, Some(did));
-                                }
-                            }
-                            DiscardCause::Unresumable => {
-                                prop_assert!(before_index[&did].unresumable);
-                                prop_assert!(matches!(event, ServeEvent::Parked { .. }), "Unresumable discard from non-Parked event");
-                            }
-                            DiscardCause::TcpDied | DiscardCause::GuardDropped => {}
-                        }
-                    }
-                }
-
-                match event {
-                    // I-e / I-f: 非現行leaseを運ぶ事実EventはStateを変えず、Effectも返さず、
-                    // 決してDiscardを起こさない。
-                    ServeEvent::Parked { id: pid, lease, .. } | ServeEvent::RelayTerminated { id: pid, lease, .. } => {
-                        if before_index.get(&pid).map(|e| e.lease) != Some(lease) {
-                            prop_assert_eq!(&before, &after, "stale fact mutated state: {:?}", event);
-                            prop_assert!(effects.is_empty(), "stale fact produced effects: {:?}", effects);
-                        }
-                    }
-                    ServeEvent::RelayEnded { lease } => {
-                        match before_index.iter().find(|(_, e)| e.lease == lease) {
-                            // I-j: 現Established leaseのRelayEndedは同じapplyでindexエントリも除く。
-                            Some((rid, _)) => {
-                                prop_assert!(agg.index.get(rid).is_none());
-                                prop_assert_eq!(effects.len(), 1);
-                            }
-                            None => {
-                                // indexに無いleaseはEstablishedでもない(I-c)ので、arbiterでも状態は
-                                // 変わらない(RelayEndedはEstablishedにしか作用しない)。
-                                prop_assert_eq!(&before, &after);
-                                prop_assert!(effects.is_empty());
-                            }
-                        }
-                    }
-                    // I-i: ResumeGrantedは、parked かつ Established かつ !unresumable のときだけ、
-                    // そのEstablished leaseで出る。それ以外は状態を変えない。
-                    ServeEvent::ResumeRequested { id: rid } => {
-                        let b = before_index.get(&rid).copied();
-                        match effects.as_slice() {
-                            [ServeEffect::ResumeGranted { id: gid, lease }] => {
-                                prop_assert_eq!(*gid, rid);
-                                let b = b.expect("granted without entry");
-                                prop_assert!(b.parked_since.is_some() && !b.unresumable);
-                                prop_assert_eq!(b.lease, *lease);
-                                let before_est = match &before.0[usize::from(rid[0])] {
-                                    Some(AttachState::Established { lease, .. }) => Some(*lease),
-                                    _ => None,
-                                };
-                                prop_assert_eq!(before_est, Some(*lease));
-                                prop_assert_eq!(agg.index[&rid].parked_since, None);
-                                prop_assert_eq!(agg.index[&rid].lease, *lease);
-                            }
-                            [ServeEffect::RequestPreempt { id: gid, lease }] => {
-                                prop_assert_eq!(*gid, rid);
-                                let b = b.expect("preempt without entry");
-                                prop_assert!(b.parked_since.is_none() && !b.unresumable);
-                                prop_assert_eq!(b.lease, *lease);
-                                prop_assert_eq!(&before, &after);
-                            }
-                            [ServeEffect::ResumeRejected { id: gid }] => {
-                                prop_assert_eq!(*gid, rid);
-                                prop_assert!(b.map_or(true, |e| e.unresumable));
-                                prop_assert_eq!(&before, &after);
-                            }
-                            other => prop_assert!(false, "unexpected resume effects {:?}", other),
-                        }
-                    }
-                    ServeEvent::Hello { .. }
-                    | ServeEvent::TargetConnected { .. }
-                    | ServeEvent::TargetConnectFailed { .. }
-                    | ServeEvent::CancelReceived { .. }
-                    | ServeEvent::LeaseStopped { .. }
-                    | ServeEvent::PendingExpired { .. } => {
-                        // indexを変えない(Established以外にしか作用しない)。
-                        prop_assert_eq!(&before.1, &after.1);
-                        prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })), "ATTACH event produced a Discard");
-                    }
-                    // Sweepの完全性(レビューD-2): 締切に達したparkedエントリは**全て**除かれ、
-                    // それ以外(期限前のparked・active・unresumable)は**一切**変わらない。
-                    // 「何も期限切れにしない」reducerはここで落ちる。
-                    ServeEvent::Sweep { now, max_parked } => {
-                        let is_expired = |e: &IndexEntry| {
-                            e.parked_since.is_some_and(|since| {
-                                Duration::from_millis(now.0.saturating_sub(since.0)) >= effective_deadline(e, max_parked)
-                            })
-                        };
-                        let expected: BTreeSet<SessionKey> =
-                            before_index.iter().filter(|(_, e)| is_expired(e)).map(|(k, _)| *k).collect();
-                        let discarded: BTreeSet<SessionKey> = effects
-                            .iter()
-                            .filter_map(|e| match e {
-                                ServeEffect::Discard { id, cause: DiscardCause::Expired, .. } => Some(*id),
-                                _ => None,
-                            })
-                            .collect();
-                        prop_assert_eq!(&discarded, &expected, "sweep did not discard exactly the expired entries");
-                        let mut survivors = before_index.clone();
-                        survivors.retain(|k, _| !expected.contains(k));
-                        prop_assert_eq!(&agg.index, &survivors, "sweep touched a non-expired entry");
-                        prop_assert!(!agg.index.values().any(is_expired), "an expired parked entry survived the sweep");
-                    }
-                    ServeEvent::Activated { .. } | ServeEvent::EvictOldestParked => {}
-                }
-            }
+        /// I-k(Step 2b): 実際のshellと同じ入口(`AdmitRequested`)だけからなる任意の列で、
+        /// slot数が`max_sessions`を超えない。要求同士・事実との任意の交錯を含む(shellの並行admissionは
+        /// 集約ロック下のapplyの列に直列化されるので、この列がその全インターリーブを表す)。
+        #[test]
+        fn concurrent_admissions_never_exceed_max_sessions(
+            max_sessions in 0usize..4,
+            ops in proptest::collection::vec(op_strategy(false), 0..160),
+        ) {
+            run_ops(max_sessions, ops, true)?;
         }
 
         /// Sweepの完全性を、主proptestより多いsession数で独立oracle(生の`u64`演算)と照合する
@@ -961,6 +1146,14 @@ mod tests {
             let mut issued: Vec<LeaseId> = Vec::new();
             let mut last_lease: BTreeMap<SessionKey, LeaseId> = BTreeMap::new();
             for op in ops {
+                if let Op::HelloBypass { s, g, at } = op {
+                    for e in agg.hello_bypassing_admission(key(s, g as u64, at)) {
+                        if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e {
+                            issued.push(lease);
+                        }
+                    }
+                    continue;
+                }
                 let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
                 let before_index = agg.index.clone();
                 let effects = agg.apply(event);
@@ -972,6 +1165,9 @@ mod tests {
                 for e in &effects {
                     match *e {
                         ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) => issued.push(lease),
+                        ServeEffect::Attach(AttachEffect::SendReject { reason: AttachRejectReason::BusyOtherSession, .. }) => {
+                            bump(&mut hits, "admission rejected busy");
+                        }
                         ServeEffect::Attach(_) => {}
                         ServeEffect::RegisterIo { id: rid, lease, unresumable } => {
                             if unresumable {
@@ -998,6 +1194,7 @@ mod tests {
             "registered unresumable",
             "id re-established with a new lease",
             "stale fact for a live id",
+            "admission rejected busy",
             "discard Expired",
             "discard Evicted",
             "discard TcpDied",

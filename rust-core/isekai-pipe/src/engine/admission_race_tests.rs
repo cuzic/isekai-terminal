@@ -18,6 +18,14 @@
 //! two tasks' lock acquisitions strictly alternate once the test lets go.
 //! With the old split admission that means both checks run before either
 //! `HelloReceived` — the max+1 outcome every time, not just sometimes.
+//!
+//! # After Step 2b
+//!
+//! `hello()` applies `AdmitRequested`, which judges capacity, evicts the
+//! oldest parked session if needed and claims the slot (`HelloReceived`) in
+//! **one** apply under that lock. Whichever admission is applied first takes
+//! the last slot; the second sees it taken and is rejected with
+//! `BusyOtherSession` without claiming anything.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,11 +64,10 @@ fn key_for(id: SessionId) -> AttachKey {
 }
 
 /// What `handle_attach_stream` does for an `ATTACH_HELLO` once the proof
-/// checks out: admission, then the fencing transition.
+/// checks out. Before Step 2b this was `admit_new_session(..)` followed by
+/// `hello(..)` (this test was first committed against exactly that and
+/// failed); now admission and the fencing transition are one apply.
 async fn admit_and_hello(rt: &Arc<AttachRuntime>, key: AttachKey) -> HelloOutcome {
-    if let Err(reason) = super::admit_new_session(rt, key.session_id).await {
-        return HelloOutcome::Reject(reason);
-    }
     rt.hello(key).await
 }
 

@@ -61,7 +61,7 @@ impl Session {
 // `SessionTable`(session_id → `Arc<Mutex<Session>>`の独立したロック付きテーブル)は
 // Step 2aで撤去した。容量ベースのLRU立ち退き(`insert_existing`)・admission用の
 // 立ち退き(`claim_oldest_parked`)・park期限切れの掃除(`sweep_expired_parked`)は
-// `serve_fsm::ServeAggregate`の`Activated`/`EvictOldestParked`/`Sweep`遷移になり、
+// `serve_fsm::ServeAggregate`の`Activated`/`AdmitRequested`(Step 2bでadmission判定と統合)/`Sweep`遷移になり、
 // どれもfencing slotの解放と同じapplyで行われる(呼び出し元が`release_slot_for`を
 // 覚えておく必要が無くなった、`.claude/rules/always-connects.md`)。旧テーブルの
 // 単体テストは`serve_fsm.rs`へMillisベースで移植してある。
