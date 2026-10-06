@@ -1,6 +1,7 @@
 mod attach_arbiter;
 mod attach_runtime;
 mod resume;
+mod serve_fsm;
 #[cfg(test)]
 mod sweep_resume_race_tests;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use attach_runtime::{AttachRuntime, EstablishedLease, HelloOutcome};
+use attach_runtime::{Activation, AttachRuntime, EstablishedLease, HelloOutcome, ResumeDecision, ResumeGrant};
 use base64::Engine as _;
 use crate::RelayTransportKind;
 use hmac::{Hmac, Mac};
@@ -22,7 +23,8 @@ use isekai_protocol::attach::{
 };
 use quicmux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxListener, MuxServerConfig};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
-use resume::{Session, SessionTable};
+use resume::Session;
+use serve_fsm::TerminateReason;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,7 +58,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// S→C output buffer の既定上限（HELPER_PROTOCOL.md §7.4 の既定案）。
 const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-/// `SessionTable` に同時保持できるセッション数の既定上限（Phase S-4b）。
+/// resume index に同時保持できるセッション数の既定上限（Phase S-4b）。
 /// 通常運用でこれだけ同時に resume 待ちセッションが積まれることは想定しにくい
 /// ため、小さめの値にして DoS/リソース枯渇対策を優先する。
 const DEFAULT_MAX_SESSIONS: usize = 16;
@@ -72,9 +74,10 @@ const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long `handle_resume_stream` waits, after asking an in-flight relay to
-/// yield (`Session::preempt`), for it to actually park the connection
-/// (`Session::reparked`) before giving up and falling back to the ordinary
-/// `UnknownToken` rejection (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2).
+/// yield (`SessionIo::preempt`), for it to actually park the connection
+/// (`SessionIo::reparked`) before re-sending the request once (ADR Q9; a
+/// second `RequestPreempt` is then rejected with `UnknownToken`,
+/// ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2).
 /// Short — this blocks a client that may genuinely be the live one — but
 /// generous enough for a relay loop's current `select!` iteration (at most
 /// one in-flight read/write) to notice `preempt` and return.
@@ -96,7 +99,7 @@ struct Args {
     max_idle_lifetime: u64,
     /// S→C 方向（helper→client）の resume 用 output buffer 上限。
     resume_buffer_size: usize,
-    /// `SessionTable` に同時保持できるセッション数の上限（Phase S-4b）。
+    /// resume index に同時保持できるセッション数の上限（Phase S-4b）。
     max_sessions: usize,
     once: bool,
     log_level: String,
@@ -268,7 +271,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     // ノートPC/スマホのスリープのような分〜時間オーダーの中断には短すぎた
     // (実機で1時間48分のスリープ後、resumeが即座にUnknownSessionで失敗する
     // 不具合として顕在化)。実際の資源保護は容量ベースのLRU立ち退き
-    // (`SessionTable::insert_existing`が`--max-sessions`超過時に最古のparked
+    // (`Activated`遷移が`--max-sessions`超過時に最古のparked
     // sessionを立ち退かせる、既存実装)が一次防御として機能しているため、この
     // 値は「本当に誰も戻ってこないセッションを最終的に回収するバックストップ」
     // という位置づけに変更し、trzsz-ssh/tsshd(同種のUDP常駐resumeデーモン)の
@@ -766,12 +769,13 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         cert_sha256
     );
 
-    let attach_runtime = AttachRuntime::new(args.target);
+    // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）と
+    // fencing(`AttachArbiter`)は、Step 2a以降1つの集約(`serve_fsm::ServeAggregate`)・
+    // 1つのロックにまとまっている(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2a)。
+    // Phase S-4b: 同時保持数を `--max-sessions` で上限を設ける（DoS/リソース枯渇対策）。
+    let attach_runtime = AttachRuntime::new(args.target, args.max_sessions);
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let idle_shutdown = Arc::new(Notify::new());
-    // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）。
-    // Phase S-4b: 同時保持数を `--max-sessions` で上限を設ける（DoS/リソース枯渇対策）。
-    let sessions = SessionTable::with_max_sessions(args.max_sessions);
 
     // Phase 8-3/8-4: park された（data stream が切れて resume 待ちの）セッションの
     // 定期掃除。`--resume-window` の長さだけ resume が来なければ TCP を close して
@@ -784,21 +788,20 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // 必ず REJECT_UNKNOWN_SESSION になる致命的な不具合を確認した。resume-window は
     // 検知にかかる時間 + reattach のリトライ予算（指数バックオフ計15秒）より
     // 十分長くなければならない、という下限の理屈は変わらないが、この掃除自体は
-    // もはや一次防御ではない——`SessionTable::insert_existing`の容量ベースLRU
+    // もはや一次防御ではない——`Activated`遷移の容量ベースLRU
     // 立ち退き（`--max-sessions`超過時に最古のparked sessionを立ち退かせる）が
     // 資源圧迫時にはこちらより先に効く。この掃除は「容量に余裕があるままいつまでも
     // 戻ってこないセッション」を最終的に回収するためだけのバックストップなので、
     // 既定値は`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`（trzsz-ssh/tsshdの
     // `UdpAliveTimeout`に倣った10日間）まで伸ばしてある。
     {
-        let sessions = sessions.clone();
         let attach_runtime = attach_runtime.clone();
         let max_parked = Duration::from_secs(args.resume_window);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 // Each sweep runs in its own `tokio::spawn`'d task so a panic
-                // inside `sweep_expired_parked` or `release_slot_for` (e.g. a
+                // inside `sweep_expired_parked` (e.g. a
                 // future bug in either) surfaces as a `JoinError` here rather
                 // than unwinding this loop's own task and permanently killing
                 // this backstop — since nothing supervises/restarts this
@@ -807,13 +810,12 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 // stopped running for the rest of the process's lifetime,
                 // the exact "backstop stops recovering leaked fencing slots"
                 // failure `.claude/rules/always-connects.md` warns about.
-                let sessions = sessions.clone();
                 let attach_runtime = attach_runtime.clone();
                 if let Err(e) = tokio::spawn(async move {
-                    let expired = sessions.sweep_expired_parked(max_parked).await;
-                    for id in expired {
-                        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
-                    }
+                    // 期限判定・indexからの除去・fencing slotの解放を集約ロック下の
+                    // 1回のapplyで行う(旧: 2段階のsweep + `release_slot_for`。その間に
+                    // RESUMEが割り込めたTOCTOUはStep 2aで解消、ADR §4.1)。
+                    attach_runtime.sweep_expired_parked(max_parked).await;
                 })
                 .await
                 {
@@ -865,7 +867,6 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let secret = session_secret;
                 let attach_runtime = attach_runtime.clone();
                 let last_activity = last_activity.clone();
-                let sessions = sessions.clone();
                 let serve_config = ServeConfig {
                     resume_buffer_size: args.resume_buffer_size,
                     max_resume_grace_secs: args.resume_window,
@@ -875,7 +876,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                         Ok(conn) => {
                             let remote = conn.remote_addr();
                             log::info!("QUIC connection established from {remote:?}");
-                            if let Err(e) = handle_connection(conn, target, secret, attach_runtime, sessions, serve_config).await {
+                            if let Err(e) = handle_connection(conn, target, secret, attach_runtime, serve_config).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
@@ -919,7 +920,6 @@ async fn handle_connection(
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
-    sessions: SessionTable,
     config: ServeConfig,
 ) -> Result<()> {
     // 最初の1バイトでフレーム種別（ATTACH_HELLO=新規 / RESUME=reattach）を
@@ -958,11 +958,11 @@ async fn handle_connection(
             let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
             hello_bytes[0] = FRAME_ATTACH_HELLO;
             hello_bytes[1..].copy_from_slice(&rest);
-            handle_attach_stream(conn, send, recv, hello_bytes, target, session_secret, attach_runtime, sessions, config)
+            handle_attach_stream(conn, send, recv, hello_bytes, target, session_secret, attach_runtime, config)
                 .await
         }
         quicmux::FRAME_RESUME => {
-            handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime, sessions).await
+            handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime).await
         }
         FRAME_ATTACH_CANCEL => {
             let mut cancel_bytes = [0u8; CANCEL_ATTACH_FRAME_LEN];
@@ -1016,25 +1016,6 @@ async fn reject_attach(send: &mut AnyByteStreamWriteHalf, reason: AttachRejectRe
     reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
 }
 
-/// Frees `session_id`'s `AttachArbiter` fencing slot if it's still holding
-/// it. Shared by every path that discards a session's `SessionTable` entry
-/// out from under a live `Established` slot (`sweep_expired_parked`'s park
-/// timeout, `insert_existing`'s `--max-sessions` LRU eviction, and
-/// `handle_attach_stream`'s fresh-ATTACH preemption of a merely-parked
-/// session, below) — `SessionTable` alone can never do this itself, since
-/// it has no handle to `AttachArbiter` (`resume.rs`'s module docs). Calling
-/// this exactly once per discard is correctness-critical: skipping it
-/// leaves the slot `Established`-but-orphaned, permanently rejecting every
-/// future ATTACH for this target with `BUSY_OTHER_SESSION` until the
-/// process restarts — `.claude/rules/always-connects.md` records two prior
-/// bugs (`sweep_expired_parked` and `insert_existing`, before either called
-/// this) where exactly that happened.
-async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: isekai_protocol::SessionId) {
-    if let Some(lease) = attach_runtime.established_lease_for(session_id).await {
-        attach_runtime.relay_ended(lease).await;
-    }
-}
-
 /// Epic N-5 admission control. `AttachArbiter` used to hold a single global
 /// fencing slot per target (Epic N-4's world): a brand-new `session_id`
 /// could be blocked by whatever *other* session_id was occupying that slot,
@@ -1046,20 +1027,23 @@ async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: iseka
 /// all — that whole preemption dance no longer has anything to preempt.
 ///
 /// What still needs bounding is the *number* of concurrent slots.
-/// `SessionTable` already enforces `--max-sessions` (Phase S-4b) via
+/// The session index already enforces `--max-sessions` (Phase S-4b) via
 /// LRU-eviction of the oldest parked session, but only once a new session
 /// has already gone all the way through the ATTACH handshake and connected
-/// to `target` (`insert_existing`, called near the end of
+/// to `target` (the `Activated` transition, near the end of
 /// `handle_attach_stream`). Left alone, that would let unbounded concurrent
 /// target TCP connects/handshakes pile up before the cap ever bites, since
 /// `AttachArbiter` itself has no notion of "parked" vs "actively relying"
-/// (only `SessionTable` tracks that) and so cannot police its own capacity.
+/// (only the session index tracks that) and so cannot police its own capacity.
 /// This runs the same evict-oldest-parked-else-reject policy *before*
 /// `attach_runtime.hello()` even starts a target connect, for any
 /// `session_id` the arbiter doesn't already know about — a retransmit or
 /// reattach of a session already holding a slot always passes through
-/// untouched, matching `insert_existing`'s own `!inner.contains_key(&id)`
-/// guard.
+/// untouched.
+///
+/// The check-then-act between `session_count()` and the eviction below
+/// (two concurrent new sessions may both pass, max+1) is deliberately left
+/// as-is here: fixing it is ADR_FUNCTIONAL_CORE_EFFECTS.md Step 2b.
 ///
 /// Reuses `AttachRejectReason::BusyOtherSession` for the "genuinely full,
 /// nothing to evict" case rather than adding a new wire reason — every
@@ -1068,59 +1052,53 @@ async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: iseka
 /// sensible response ("come back once something frees up").
 async fn admit_new_session(
     attach_runtime: &Arc<AttachRuntime>,
-    sessions: &SessionTable,
     session_id: isekai_protocol::SessionId,
 ) -> Result<(), AttachRejectReason> {
-    if attach_runtime.has_session(session_id).await || attach_runtime.session_count().await < sessions.max_sessions()
+    if attach_runtime.has_session(session_id).await
+        || attach_runtime.session_count().await < attach_runtime.max_sessions().await
     {
         return Ok(());
     }
-    match sessions.claim_oldest_parked().await {
-        Some(evicted_id) => {
-            release_slot_for(attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
-            Ok(())
-        }
+    // 立ち退き(indexからの除去・parked TCPのclose・fencing slotの解放)は
+    // 集約の1回のapplyで行われる(旧: `claim_oldest_parked` + `release_slot_for`)。
+    match attach_runtime.evict_oldest_parked().await {
+        Some(_evicted_id) => Ok(()),
         None => Err(AttachRejectReason::BusyOtherSession),
     }
 }
 
-/// `EstablishedLease`と対になる、`SessionTable`側エントリのRAIIガード。
-/// `AttachArbiter`のfencing slot(`EstablishedLease`が守る)と`SessionTable`
-/// のresumeバッファ付きエントリは別々のデータ構造で(`resume.rs`のモジュール
-/// docs参照)、`EstablishedLease`のDropはfencing slotしか解放しない。
+/// `EstablishedLease`と対になる、session index側エントリのRAIIガード。
 ///
-/// `insert_existing`でエントリを登録してから、通常の後始末(`TcpDied`での
-/// 明示的な`sessions.remove`、または`DataStreamDied`でのpark — parkされた
-/// エントリは既存の`sweep_expired_parked`/`insert_existing`のLRU立ち退きで
-/// 回収可能になる)に到達する前にタスクがpanicすると、`parked_tcp: None`・
-/// `parked_since: None`のまま、つまり現在アクティブに中継中のセッションと
-/// 区別が付かない状態でエントリが残る。`find_oldest_parked`(`resume.rs`)は
-/// parkされたエントリしか立ち退き対象にしないため、この孤児エントリは
-/// **`sweep_expired_parked`にも`insert_existing`のLRU立ち退きにも一切
-/// 引っかからず永久に残り続ける**。`--max-sessions`分たまると、以後の
-/// `insert_existing`が新規セッションの登録自体を拒否するようになり
-/// (`Rejected`)、その戻り値は呼び出し元で見過ごされたまま中継自体は
-/// 継続するため実害が気付かれにくいが、そのセッションはresume不能になる
-/// (`.claude/rules/always-connects.md`が禁じる「復旧しない状態」の一形態)。
+/// 通常の後始末(`TcpDied`での`relay_ended`、または`DataStreamDied`/`Preempted`での
+/// park)に到達する前にタスクがpanicすると、エントリは「activeなsession」と区別が
+/// 付かない状態で残る。activeなエントリはsweepにもLRU立ち退きにも引っかからない
+/// (activeは決して立ち退かせない設計)ので、`--max-sessions`分たまると以後の新規
+/// sessionはresume不能(unresumable)でしか登録されなくなる(`.claude/rules/always-connects.md`
+/// が禁じる「復旧しない状態」の一形態)。
 ///
-/// `disarm()`を呼ばずにDropされた場合(=panicで正常な後始末に到達しなかった
-/// 場合)のフォールバックとして、Drop側でエントリそのものを`SessionTable`
-/// から取り除く。
+/// `disarm()`を呼ばずにDropされた場合のフォールバックとして、Drop側で
+/// `RelayTerminated{GuardDropped}`を集約へ送る。Step 2a以降このEventは**そのincarnationの
+/// lease**を運ぶ(ADR §2.2 N-2): fire-and-forgetのspawnが任意に遅れて着いても、同じ
+/// session_idで既に始まった**新しい**incarnationには触れない(reducerがleaseで照合する)。
+/// 破棄はindexエントリ・parked TCP・fencing slotを1つの遷移でまとめて解放する。
+/// `EstablishedLease::drop`(→`RelayEnded`)と両方が発火しても、先に着いた方だけが
+/// 効き、後の方は冪等なno-op。
 struct SessionTableEntryGuard {
-    sessions: SessionTable,
-    id: Option<[u8; 16]>,
+    runtime: Arc<AttachRuntime>,
+    id: [u8; 16],
+    lease: attach_arbiter::LeaseId,
+    armed: bool,
 }
 
 impl SessionTableEntryGuard {
-    fn new(sessions: SessionTable, id: [u8; 16]) -> Self {
-        Self { sessions, id: Some(id) }
+    fn new(runtime: Arc<AttachRuntime>, id: [u8; 16], lease: attach_arbiter::LeaseId) -> Self {
+        Self { runtime, id, lease, armed: true }
     }
 
-    /// 通常の後始末(`sessions.remove`済み、または`DataStreamDied`でpark済み
-    /// — どちらも既存の仕組みで正しく扱われる状態)に到達したことを示し、
+    /// 通常の後始末(`relay_ended`済み、またはpark済み)に到達したことを示し、
     /// Dropフォールバックを無効化する。
     fn disarm(mut self) {
-        self.id = None;
+        self.armed = false;
     }
 }
 
@@ -1129,7 +1107,10 @@ impl Drop for SessionTableEntryGuard {
     /// ため、Drop自身は絶対にpanicしない/直接awaitしない)でfire-and-forget
     /// spawnにする。
     fn drop(&mut self) {
-        let Some(id) = self.id.take() else { return };
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        let id = self.id;
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             log::warn!(
                 "SessionTableEntryGuard dropped outside a tokio runtime; session {} could not be removed",
@@ -1138,13 +1119,14 @@ impl Drop for SessionTableEntryGuard {
             return;
         };
         log::warn!(
-            "SessionTableEntryGuard dropped without disarm() (session={}); removing orphaned entry via \
+            "SessionTableEntryGuard dropped without disarm() (session={}); discarding orphaned entry via \
              Drop fallback — the owning task likely panicked or returned early",
             hex_lower(&id)
         );
-        let sessions = self.sessions.clone();
+        let runtime = self.runtime.clone();
+        let lease = self.lease;
         handle.spawn(async move {
-            sessions.remove(&id).await;
+            runtime.relay_terminated(id, lease, TerminateReason::GuardDropped).await;
         });
     }
 }
@@ -1162,7 +1144,6 @@ async fn handle_attach_stream(
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
-    sessions: SessionTable,
     config: ServeConfig,
 ) -> Result<()> {
     let hello = match decode_attach_hello(&hello_bytes) {
@@ -1186,7 +1167,7 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
-    if let Err(reason) = admit_new_session(&attach_runtime, &sessions, hello.session_id).await {
+    if let Err(reason) = admit_new_session(&attach_runtime, hello.session_id).await {
         reject_attach(&mut send, reason).await;
         return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
     }
@@ -1229,13 +1210,20 @@ async fn handle_attach_stream(
     })
     .await;
 
+    // `Activated`が成功した同じapplyでresume indexへ登録する(旧: `activate()`の後に
+    // 別ロックの`insert_existing`。その間はテーブルに居ない窓があった、ADR §4.1)。
+    // ACKで実際に約束した値を刻んでおき、sweepがグローバルな`--resume-window`だけでなく
+    // これも尊重できるようにする。
+    let handle = Arc::new(Mutex::new(Session::new(config.resume_buffer_size)));
     let activated = match activate {
         Ok(Ok(activate))
             if activate.session_id == key.session_id
                 && activate.generation == key.generation
                 && activate.attempt_id == key.attempt_id =>
         {
-            attach_runtime.activate(key, activate.attach_token).await
+            attach_runtime
+                .activate(key, activate.attach_token, Some(negotiated_resume_grace_secs), handle.clone())
+                .await
         }
         Ok(Ok(_)) => None,
         Ok(Err(e)) => {
@@ -1252,46 +1240,16 @@ async fn handle_attach_stream(
     // docs). Everything above this point (timeout/decode-failure/superseded)
     // is a routine non-panic early return that never held a slot to begin
     // with, so it must not go through this guard.
-    let Some((tcp, lease)) = activated else {
+    let Some(Activation { tcp, lease, preempt }) = activated else {
         return Err(anyhow!("attach never activated (timeout, decode failure, or superseded)"));
     };
 
     let (tcp_read, tcp_write) = tcp.into_split();
-    let mut new_session = Session::new(config.resume_buffer_size);
-    // ACKで実際に約束した値をセッションに刻んでおく — `sweep_expired_parked`
-    // がグローバルな`--resume-window`だけでなくこれも尊重できるようにする
-    // (`Session::negotiated_resume_grace_secs`のdocs参照)。
-    new_session.negotiated_resume_grace_secs = Some(negotiated_resume_grace_secs);
-    let handle = Arc::new(Mutex::new(new_session));
     let session_id_bytes = *hello.session_id.as_bytes();
-    // `Rejected`(既存のギャップ、このガード追加の対象外)ではテーブルに
-    // エントリが実在しないので守るものが無く、`table_guard`は`None`のまま
-    // 中継を継続する(=このsessionはresume不能になるが、それは今回のスコープ
-    // 外の既存動作)。
-    let table_guard = match sessions.insert_existing(session_id_bytes, handle.clone()).await {
-        resume::InsertOutcome::InsertedAfterEvicting(evicted_id) => {
-            release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
-            Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes))
-        }
-        resume::InsertOutcome::Inserted => Some(SessionTableEntryGuard::new(sessions.clone(), session_id_bytes)),
-        resume::InsertOutcome::Rejected => {
-            // No `SessionTable` entry exists to guard, so relaying continues
-            // below (unchanged, existing behavior) — but this session is now
-            // silently unresumable for its entire lifetime: a client-side
-            // network blip that would normally RESUME instead permanently
-            // loses the connection, exactly the kind of "recovers only with
-            // manual intervention" state `.claude/rules/always-connects.md`
-            // treats as a bug. This was previously unobserved (the return
-            // value was discarded); logging it at least makes an operator
-            // able to notice a host is chronically hitting `--max-sessions`.
-            log::warn!(
-                "attach established but SessionTable rejected the entry (at capacity), \
-                 session_id={} will not be resumable if its data stream drops",
-                hex_lower(&session_id_bytes)
-            );
-            None
-        }
-    };
+    // 容量超過で登録された(unresumable)sessionもindexには載っている(ADR I-c)ので、
+    // ガードは常に作る。unresumableなsessionのdata streamが切れた場合のparkは
+    // reducerが`Discard{Unresumable}`にする(slot解放+TCP close、ADR I-g)。
+    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id_bytes, lease.id());
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 
     // control stream(APP_ACK用)は既知のsession_idを再利用するだけで、新規
@@ -1314,7 +1272,7 @@ async fn handle_attach_stream(
         })
     };
 
-    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
+    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), preempt, target).await;
     control_task.abort();
 
     // `handle_resume_stream`の末尾と全く同じ後始末 — 以前はここに同じ
@@ -1323,7 +1281,7 @@ async fn handle_attach_stream(
     // `.claude/rules/always-connects.md`が記録している過去2件の
     // fencing slotリーク(`sweep_expired_parked`/`insert_existing`)の
     // 原因なので、共通のヘルパーへ一本化した。
-    finish_or_park_session(&sessions, lease, table_guard, session_id_bytes, handle, outcome).await;
+    finish_or_park_session(&attach_runtime, lease, table_guard, session_id_bytes, outcome).await;
     Ok(())
 }
 
@@ -1331,7 +1289,7 @@ async fn handle_attach_stream(
 /// (frame typeバイトは呼び出し元`handle_connection`が既に読み取り済み)を
 /// 検証し、既存セッションに park された TCP 接続を取り戻して中継を再開する。
 /// `token`=session_id・`auth_blob`=resume proof はquicmuxにとって完全に
-/// opaqueなbytesなので、その意味付け(HMAC検証・SessionTable/AttachRuntime
+/// opaqueなbytesなので、その意味付け(HMAC検証・AttachRuntime(serve集約)
 /// との突き合わせ)はすべてこの関数(呼び出し側)の責務になる —
 /// `quicmux::resume`モジュールdocsが「呼び出し側が持つ」と定めている責務
 /// そのもの。`handle_connection`は既にATTACH_HELLO/CancelAttachと同じ一本の
@@ -1347,7 +1305,6 @@ async fn handle_resume_stream(
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
-    sessions: SessionTable,
 ) -> Result<()> {
     // resume_proof = HMAC(session_secret, exporter(新connection) || session_id)
     // （HELPER_PROTOCOL.md §7.3。session_id を混ぜることで、同じ session_secret を
@@ -1374,67 +1331,42 @@ async fn handle_resume_stream(
     }
     let client_delivered_offset = request.client_delivered_offset;
 
-    let Some(handle) = sessions.get(&session_id).await else {
-        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
-        return Err(anyhow!(
-            "unknown session_id for resume: {}",
-            hex_lower(&session_id)
-        ));
-    };
-
-    let parked = {
-        let mut session = handle.lock().await;
-        session.parked_since = None;
-        session.parked_tcp.take()
-    };
-    let parked = match parked {
-        Some(parked) => Some(parked),
-        None => {
-            // Nothing parked *right now* — but if this session_id is
-            // currently `Established` (i.e. some other connection is
-            // actively relaying it), it may well be a zombie: looks alive
-            // to this server, but the peer never actually receives
-            // anything (the exact scenario ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
-            // documents). Ask it to yield ("preemption", D-2) rather than
-            // immediately rejecting this — likely more recent, more likely
-            // live — resume attempt.
-            let is_established = attach_runtime
-                .established_lease_for(isekai_protocol::SessionId::from_bytes(session_id))
-                .await
-                .is_some();
-            if is_established {
-                let reparked = handle.lock().await.reparked.clone();
-                let notified = reparked.notified();
-                handle.lock().await.preempt.notify_waiters();
-                if tokio::time::timeout(PREEMPT_WAIT_TIMEOUT, notified).await.is_ok() {
-                    let mut session = handle.lock().await;
-                    session.parked_since = None;
-                    session.parked_tcp.take()
-                } else {
-                    None
+    // RESUMEは「parked確認→unpark→slot確認→ソケットと出力バッファの引き渡し」を
+    // 集約ロック下の1回のapply(`ResumeRequested`)で解決する(ADR §2.2 R3-2、I-i)。
+    // 旧実装は`sessions.get`→per-sessionロックでunpark→別ロックで
+    // `established_lease_for`の3段階で、sweepが間に割り込めた(TOCTOU)うえ、slotが
+    // 無ければslotの無いsessionへソケットを戻す分岐があった(どちらもStep 2aで解消)。
+    //
+    // 中継中のsessionへのRESUMEは「後着優先」(ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2):
+    // 現在の中継に明け渡しを求め、`reparked`を最大`PREEMPT_WAIT_TIMEOUT`待ってから、
+    // 起床でもタイムアウトでも**必ず1回だけ**要求を送り直す(ADR Q9既定案)。
+    // `notify_waiters`は既に存在する`Notified`しか起こさないので、`RequestPreempt`の
+    // 返却から`notified()`生成までの間に中継が別理由でparkすると起床を取りこぼすが、
+    // 再送は前回の結果に依存しない原子的な要求なので、取りこぼしは「拒否」ではなく
+    // 「最大2秒の遅延」になる。再送の結果が再び`RequestPreempt`ならそれ以上は待たずに拒否する。
+    let mut preempted_once = false;
+    let grant = loop {
+        match attach_runtime.resume_request(session_id).await {
+            ResumeDecision::Granted(grant) => break Some(grant),
+            ResumeDecision::Rejected => break None,
+            ResumeDecision::Preempt { preempt, reparked } => {
+                if preempted_once {
+                    break None;
                 }
-            } else {
-                None
+                preempted_once = true;
+                let notified = reparked.notified();
+                preempt.notify_waiters();
+                let _ = tokio::time::timeout(PREEMPT_WAIT_TIMEOUT, notified).await;
             }
         }
     };
-    let Some((tcp_read, tcp_write)) = parked else {
+    let Some(ResumeGrant { lease: lease_id, tcp: (tcp_read, tcp_write), handle, preempt }) = grant
+    else {
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
         return Err(anyhow!(
-            "session {} not resumable (no parked TCP connection)",
+            "session {} not resumable (unknown, unresumable, or no parked TCP connection)",
             hex_lower(&session_id)
         ));
-    };
-
-    // `RESUME`は`ATTACH_HELLO`のfencing判定(`AttachRuntime::hello`)を経由
-    // しない — この`session_id`が現在まさに`Established`スロットを占有して
-    // いる、その`lease`を確認するだけでよい(module docs: 同一sessionへの
-    // resumeはfencing上の競合になり得ない)。
-    let Some(lease_id) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
-    else {
-        repark(&handle, tcp_read, tcp_write).await;
-        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
-        return Err(anyhow!("no established attach slot for session {}", hex_lower(&session_id)));
     };
 
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
@@ -1447,7 +1379,7 @@ async fn handle_resume_stream(
         )
     };
     let Some(replay_bytes) = replay_bytes else {
-        repark(&handle, tcp_read, tcp_write).await;
+        attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::OffsetGone).await;
         return Err(anyhow!(
             "requested offset {client_delivered_offset} no longer in output buffer for session {}",
@@ -1464,22 +1396,21 @@ async fn handle_resume_stream(
     );
 
     if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
-        repark(&handle, tcp_read, tcp_write).await;
+        attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
     }
 
-    // ここでようやくRAIIガードを作る — この行より前にある`repark`+早期return
+    // ここでようやくRAIIガードを作る — この行より前にある`park`+早期return
     // 経路(UnknownToken/OffsetGone/RESUME_ACK書き込み失敗)はいずれも
     // 「slotを`Established`のまま維持したい」正常系であり、ガードをここより
     // 前で作ると、それらの正常な早期returnのたびにDropが誤ってslotを
     // 解放してしまう(`EstablishedLease`/`AttachRuntime::resumed_lease`docs参照)。
     let lease = attach_runtime.resumed_lease(lease_id);
-    // `parked_tcp.take()`(上、repark前提の一時的な取り出し)によって、この
-    // session_idの`SessionTable`エントリは既に「parkされていない」状態に
-    // 戻っている。ここから`finish_or_park_session`が outcome を解決する
+    // `ResumeGranted`によって、このsession_idのindexエントリは既に「parkされていない」
+    // 状態に戻っている。ここから`finish_or_park_session`が outcome を解決する
     // までの間にタスクがpanicすると、`EstablishedLease`と全く同じ理由で
     // このエントリも孤児化する(`SessionTableEntryGuard`docs参照)。
-    let table_guard = SessionTableEntryGuard::new(sessions.clone(), session_id);
+    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id, lease_id);
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
@@ -1507,25 +1438,13 @@ async fn handle_resume_stream(
         tcp_read,
         tcp_write,
         handle.clone(),
+        preempt,
         target,
     )
     .await;
     control_task.abort();
-    finish_or_park_session(&sessions, lease, Some(table_guard), session_id, handle, outcome).await;
+    finish_or_park_session(&attach_runtime, lease, table_guard, session_id, outcome).await;
     Ok(())
-}
-
-/// `handle_resume_stream` の各早期リターン経路で共通の後始末: 取り出した
-/// TCP 接続をもう一度 `Session::parked_tcp` に戻し、`parked_since` を今の
-/// 時刻に更新する（次に来る resume 試行、またはタイムアウトでの破棄に備える）。
-async fn repark(
-    handle: &Arc<Mutex<Session>>,
-    tcp_read: tokio::net::tcp::OwnedReadHalf,
-    tcp_write: tokio::net::tcp::OwnedWriteHalf,
-) {
-    let mut session = handle.lock().await;
-    session.parked_tcp = Some((tcp_read, tcp_write));
-    session.parked_since = Some(std::time::Instant::now());
 }
 
 /// クライアントが`HELLO`で希望したresume-grace期間を、このサーバー自身の
@@ -1630,45 +1549,38 @@ async fn accept_control_stream(
 }
 
 /// data stream 側の中継ループ終了後、TCP 接続がまだ生きているとみなせるなら
-/// `Session::parked_tcp` に戻して resume を待てるようにし(`AttachArbiter`は
-/// `Established`のまま、`lease`もfencing slotを占有し続ける)、TCP 自体が
-/// 死んでいるなら`AttachRuntime::relay_ended`でslotを解放しテーブルから
-/// 破棄する。
+/// parkしてresumeを待てるようにし(`AttachArbiter`は`Established`のまま、
+/// `lease`もfencing slotを占有し続ける)、TCP 自体が死んでいるなら
+/// `AttachRuntime::relay_ended`でslotを解放する(同じ遷移でindexエントリも除かれる)。
 ///
 /// `handle_attach_stream`(新規ATTACH)と`handle_resume_stream`(RESUME)の
 /// **唯一**の後始末経路。「どちらの呼び出し元も同じ後始末を独立に覚えている」
 /// 形は`.claude/rules/always-connects.md`が禁じている(過去2件の
 /// fencing slotリークが実際にその形で起きた)。
 ///
-/// `id`は以前`Option<SessionId>`だったが、`None`分岐は#18-4以降(session_idは
-/// 常に`ATTACH_HELLO`の時点で存在する)到達不能な死んだ分岐であり、しかも
-/// その分岐は`lease.keep()`だけしてpark情報を書かない
-/// =slotを`Established`のまま孤児化させる、まさにこのルールが禁じる
-/// 挙動だったため、`Option`ごと取り除いた(現在の呼び出し元2箇所はどちらも
-/// 具体的な`session_id`を持っている)。
-///
-/// `table_guard`が`None`になるのは`insert_existing`が`InsertOutcome::Rejected`
-/// を返した場合だけ(このsessionは`SessionTable`に載っていない=守るエントリが
-/// 無い)。その場合の`sessions.remove`は空振りするだけで害はない。
+/// parkは`Parked{id, lease, now}`という事実を集約へ送るだけで、受理するかどうかは
+/// reducerが決める: unresumable(容量超過で登録された)なsessionは`Discard{Unresumable}`
+/// (slot解放+TCP close)になる。旧実装はここでテーブルに無い`handle`へTCPをparkし、
+/// slotとTCPをプロセス終了まで孤児化させていた(ADR §4.1 N-3、Step 2aで修正)。
 async fn finish_or_park_session(
-    sessions: &SessionTable,
+    attach_runtime: &Arc<AttachRuntime>,
     lease: EstablishedLease,
-    table_guard: Option<SessionTableEntryGuard>,
+    table_guard: SessionTableEntryGuard,
     id: resume::SessionId,
-    handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
+    let lease_id = lease.id();
     match outcome {
         RelayOutcome::TcpDied => {
             log::info!(
                 "session {} target connection died, discarding",
                 hex_lower(&id)
             );
+            // `RelayEnded`(slot解放)とindexエントリの除去は1遷移(ADR I-j)。続く
+            // `RelayTerminated{TcpDied}`はエントリが既に無いので冪等なno-op。
             lease.release().await;
-            sessions.remove(&id).await;
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
+            attach_runtime.relay_terminated(id, lease_id, TerminateReason::TcpDied).await;
+            table_guard.disarm();
         }
         RelayOutcome::DataStreamDied {
             tcp_read,
@@ -1679,21 +1591,8 @@ async fn finish_or_park_session(
                 hex_lower(&id)
             );
             lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            let reparked = session.reparked.clone();
-            drop(session);
-            reparked.notify_waiters();
-            // park済み(=parked_sinceがSome)になったので、既存の
-            // sweep_expired_parked/insert_existingのLRU立ち退きで正しく
-            // 回収可能な状態になった — `table_guard`のDropフォールバックは
-            // もう不要。
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
-            // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
-            // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
+            attach_runtime.park(id, lease_id, (tcp_read, tcp_write)).await;
+            table_guard.disarm();
         }
         RelayOutcome::Preempted {
             tcp_read,
@@ -1704,15 +1603,8 @@ async fn finish_or_park_session(
                 hex_lower(&id)
             );
             lease.keep();
-            let mut session = handle.lock().await;
-            session.parked_tcp = Some((tcp_read, tcp_write));
-            session.parked_since = Some(std::time::Instant::now());
-            let reparked = session.reparked.clone();
-            drop(session);
-            reparked.notify_waiters();
-            if let Some(table_guard) = table_guard {
-                table_guard.disarm();
-            }
+            attach_runtime.park(id, lease_id, (tcp_read, tcp_write)).await;
+            table_guard.disarm();
         }
     }
 }
@@ -1777,7 +1669,7 @@ fn spawn_app_ack_tasks(
 }
 
 /// `relay_buffered` の終了理由。呼び出し側はこれを見て、TCP 接続を
-/// `Session::parked_tcp` に戻して resume を待つか、破棄するかを決める。
+/// park して resume を待つか、破棄するかを決める。
 enum RelayOutcome {
     /// target への TCP 接続自体が終わった（相手が正常/異常終了）。
     /// resume する意味が無いので session ごと破棄してよい。
@@ -1789,9 +1681,9 @@ enum RelayOutcome {
         tcp_write: tokio::net::tcp::OwnedWriteHalf,
     },
     /// 同一 session_id への新しい RESUME 要求が「後着優先」で明け渡しを
-    /// 要求した（`Session::preempt`、ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2）。
-    /// `DataStreamDied`と全く同じ扱い（park して resume を待つ）だが、
-    /// 呼び出し側が`Session::reparked`を通知する点だけが異なる。
+    /// 要求した（`SessionIo::preempt`、ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2）。
+    /// `DataStreamDied`と全く同じ扱い（park して resume を待つ。parkが受理されると
+    /// `SessionIo::reparked`が通知される）。
     Preempted {
         tcp_read: tokio::net::tcp::OwnedReadHalf,
         tcp_write: tokio::net::tcp::OwnedWriteHalf,
@@ -1815,13 +1707,13 @@ async fn relay_buffered(
     mut tcp_read: tokio::net::tcp::OwnedReadHalf,
     mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
     session: Arc<Mutex<Session>>,
+    preempt: Arc<Notify>,
     target: SocketAddr,
 ) -> RelayOutcome {
     let mut c2s_buf = vec![0u8; 16 * 1024];
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
     let output_space_available = session.lock().await.output_space_available.clone();
-    let preempt = session.lock().await.preempt.clone();
 
     loop {
         let s2c_read_len = {
@@ -1863,7 +1755,7 @@ async fn relay_buffered(
                 continue;
             }
             // A later RESUME for this same session_id wants this connection
-            // to yield (`Session::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
+            // to yield (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
             // D-2) — most likely because this connection is a zombie (looks
             // established here but the peer never actually receives
             // anything) and the later attempt is the real live one. Give up

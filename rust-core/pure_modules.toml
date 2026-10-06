@@ -14,6 +14,12 @@ package = "isekai-pipe"
 file = "isekai-pipe/src/engine/attach_arbiter.rs"
 module = "engine::attach_arbiter"
 
+# Step 2a: isekai-pipe serveの単一集約(AttachArbiter + session index)。
+[[module]]
+package = "isekai-pipe"
+file = "isekai-pipe/src/engine/serve_fsm.rs"
+module = "engine::serve_fsm"
+
 [[module]]
 package = "isekai-terminal-core"
 file = "src/rebind_manager.rs"
@@ -111,6 +117,12 @@ effect = "AttachEffect"
 file = "isekai-pipe/src/engine/attach_runtime.rs"
 fn = "activate"
 effect = "AttachEffect"
+
+# Step 2a: ServeAggregateのin-lock effect interpreter(ソケットマップへの登録/Discard/park格納/RESUME引き渡し)。
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "interpret_in_lock"
+effect = "ServeEffect"
 
 # ADR §6 Step 3a: orchestratorの再接続Effect interpreter。
 [[interpreter]]
