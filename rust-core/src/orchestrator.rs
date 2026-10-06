@@ -440,6 +440,18 @@ pub(crate) struct OrchestratorShared {
     /// 状態で複数回呼ぶ」場合でも1許可分にしかならないため、フラッピングする
     /// ネットワークで無限にウェイクし続ける心配は無い。
     reconnect_wake: tokio::sync::Notify,
+    /// このオーケストレータが自分のバックグラウンドtask(自動再接続ループ
+    /// [`spawn_reconnect_loop`]と、TCP網断debounceの遅延発火)をspawnする先の
+    /// tokioランタイム(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2.5)。
+    ///
+    /// 本番(`create_session_orchestrator`)は常にグローバル[`RUNTIME`]のHandleで、
+    /// 以前の`RUNTIME.spawn`と挙動は同一。テストは`#[tokio::test(start_paused = true)]`の
+    /// current_threadランタイムのHandleを**明示的に**渡し、ループのtick/debounceを
+    /// 仮想時間で決定論的に進める。`Handle::try_current()`による暗黙のフォールバックは
+    /// 採らない(ADR_CONNECTION_RESILIENCE_SIMULATION.md §5): 呼び出し元のランタイムに
+    /// 黙って乗り換えると、本番でUniFFIスレッドからの呼び出しとtokio task内からの
+    /// 呼び出しでspawn先が変わってしまうため。
+    rt: tokio::runtime::Handle,
 }
 
 // ── OrchestratorAdapter ───────────────────────────────────
@@ -701,7 +713,7 @@ impl SessionCallback for OrchestratorAdapter {
 
 /// `notify_network_path_changed`の実際の切断処理。`&Arc<OrchestratorShared>`だけを
 /// 取る自由関数にしてあるのは、debounce後の発火が`SessionOrchestrator`自身ではなく
-/// `RUNTIME.spawn`されたtokio task(`Arc<OrchestratorShared>`のcloneしか持たない)から
+/// `shared.rt`へspawnされたtokio task(`Arc<OrchestratorShared>`のcloneしか持たない)から
 /// 呼ばれるため — `SessionOrchestrator::disconnect`(セッションを切るだけの2行)と
 /// 中身は同じだが、`&self`経由ではなく`shared`に対して直接操作する。
 ///
@@ -950,7 +962,7 @@ async fn sleep_tick_or_network_restored(tick: Duration, wake: &tokio::sync::Noti
     }
 }
 
-/// 自動再接続ループ本体。`RUNTIME.spawn`されたtokio task。tsshのUDPモード
+/// 自動再接続ループ本体。`shared.rt`(本番はグローバル`RUNTIME`)へspawnされたtokio task。tsshのUDPモード
 /// reconnectと同じく、1秒ごとに`Reconnecting`をライブ通知しつつ、
 /// `retry_interval`ごとに実際の再接続(`connect_via`)を試みる。
 /// `retry_attempt_in_flight`により、1回の試行の結果(成功/失敗)が判明するまで
@@ -966,7 +978,8 @@ fn spawn_reconnect_loop(
     reason: Option<String>,
     epoch: u64,
 ) {
-    RUNTIME.spawn(async move {
+    let rt = shared.rt.clone();
+    rt.spawn(async move {
         let mut policy = shared.state.lock().reconnect_policy;
         let mut timeout_secs = policy.timeout.as_secs() as u32;
         // tickの整数倍でretry_intervalを表す(「何tickごとに1回試みるか」)。
@@ -1194,6 +1207,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
         reconnect_attempt: Box::new(connect_via),
         reconnect_wake: tokio::sync::Notify::new(),
+        rt: RUNTIME.handle().clone(),
     });
     let orchestrator = Arc::new(SessionOrchestrator { shared });
     crate::debug_reconnect::register_orchestrator(&orchestrator);
@@ -1675,7 +1689,7 @@ impl SessionOrchestrator {
                     net_health_policy::Decision::Ignore => {}
                     net_health_policy::Decision::NotifyAfterDebounce(dur) => {
                         let shared = self.shared.clone();
-                        RUNTIME.spawn(async move {
+                        self.shared.rt.spawn(async move {
                             tokio::time::sleep(dur).await;
                             if shared.path_observer.lock().is_current(epoch) {
                                 log::warn!(
@@ -2076,6 +2090,18 @@ mod tests {
     /// 依存しているため(例: `on_disconnected_sets_phase_idle_and_forwards_reason`)。
     /// プレーンSSHのattemptが要るテストは各自`ssh_attempt`で設定する。
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
+        shared_with_phase_on(RUNTIME.handle().clone(), phase, is_quic)
+    }
+
+    /// [`shared_with_phase`]の、spawn先ランタイムを明示指定する版(Step 2.5)。
+    /// 仮想時間(`#[tokio::test(start_paused = true)]`)で走らせたいテストは
+    /// `tokio::runtime::Handle::current()`を渡す。暗黙の`try_current()`は使わない
+    /// ([`OrchestratorShared::rt`]のdoc参照)。
+    fn shared_with_phase_on(
+        rt: tokio::runtime::Handle,
+        phase: ConnPhase,
+        is_quic: bool,
+    ) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
         let callback = Arc::new(RecordingCallback::default());
         let shared = Arc::new(OrchestratorShared {
             state: Mutex::new(OrchestratorState {
@@ -2104,6 +2130,7 @@ mod tests {
             app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             reconnect_attempt: Box::new(connect_via),
             reconnect_wake: tokio::sync::Notify::new(),
+            rt,
         });
         (shared, callback)
     }
@@ -2116,9 +2143,10 @@ mod tests {
     /// `Connected && !is_quic`のdebounceを検証するテスト用に、debounce時間を短く
     /// 差し替えたオーケストレータを作る。
     fn orchestrator_connected_tcp_with_debounce(
+        rt: tokio::runtime::Handle,
         debounce: std::time::Duration,
     ) -> (SessionOrchestrator, Arc<RecordingCallback>) {
-        let (shared, callback) = shared_with_phase(ConnPhase::Connected, false);
+        let (shared, callback) = shared_with_phase_on(rt, ConnPhase::Connected, false);
         *shared.path_observer.lock() =
             net_health_policy::PathObserver::new(net_health_policy::NetPathPolicy { debounce });
         (SessionOrchestrator { shared }, callback)
@@ -2160,6 +2188,18 @@ mod tests {
     fn orchestrator_connected_with_reconnect_policy(
         policy: ReconnectPolicy,
     ) -> (SessionOrchestrator, Arc<RecordingCallback>, Arc<std::sync::atomic::AtomicUsize>) {
+        orchestrator_connected_with_reconnect_policy_on(RUNTIME.handle().clone(), policy)
+    }
+
+    /// [`orchestrator_connected_with_reconnect_policy`]の、再接続ループのspawn先
+    /// ランタイムを明示指定する版(Step 2.5)。tick/retry_interval/timeoutの経過を
+    /// 待つテストは`#[tokio::test(start_paused = true)]`から
+    /// `tokio::runtime::Handle::current()`を渡し、実時間の`std::thread::sleep`ではなく
+    /// 仮想時間の`tokio::time::sleep`で進める(CI負荷によるflakyさを排除する)。
+    fn orchestrator_connected_with_reconnect_policy_on(
+        rt: tokio::runtime::Handle,
+        policy: ReconnectPolicy,
+    ) -> (SessionOrchestrator, Arc<RecordingCallback>, Arc<std::sync::atomic::AtomicUsize>) {
         let callback = Arc::new(RecordingCallback::default());
         let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = attempt_count.clone();
@@ -2174,6 +2214,7 @@ mod tests {
                 Ok(())
             }),
             reconnect_wake: tokio::sync::Notify::new(),
+            rt,
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }
@@ -2235,16 +2276,16 @@ mod tests {
         assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
     }
 
-    #[test]
-    fn notify_network_path_changed_disconnects_plain_tcp_after_debounce_elapses() {
-        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+    #[tokio::test(start_paused = true)]
+    async fn notify_network_path_changed_disconnects_plain_tcp_after_debounce_elapses() {
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(tokio::runtime::Handle::current(), std::time::Duration::from_millis(30));
         orch.notify_network_path_changed(false);
         assert!(
             cb.connection_states.lock().unwrap().is_empty(),
             "debounce前は即座に切断されないはず"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let events = cb.connection_states.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -2252,13 +2293,13 @@ mod tests {
         assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
     }
 
-    #[test]
-    fn notify_network_path_changed_does_not_disconnect_plain_tcp_if_recovered_before_debounce_elapses() {
-        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+    #[tokio::test(start_paused = true)]
+    async fn notify_network_path_changed_does_not_disconnect_plain_tcp_if_recovered_before_debounce_elapses() {
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(tokio::runtime::Handle::current(), std::time::Duration::from_millis(30));
         orch.notify_network_path_changed(false);
         orch.notify_network_path_changed(true); // 瞬断から復旧 — 保留中のdebounceをキャンセルする
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert!(
             cb.connection_states.lock().unwrap().is_empty(),
@@ -2267,17 +2308,17 @@ mod tests {
         assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
     }
 
-    #[test]
-    fn notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt() {
+    #[tokio::test(start_paused = true)]
+    async fn notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt() {
         // レビューで指摘された不具合の再現: プレーンTCP接続中に瞬断でdebounceが
         // 保留中の間、手動で別のセッションへ再接続しても、古いdebounceの発火で
         // 新しいセッションを誤って切断してはいけない。
-        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(tokio::runtime::Handle::current(), std::time::Duration::from_millis(30));
         orch.notify_network_path_changed(false);
         orch.begin_connect(ssh_attempt("other.example.com"))
             .expect("Connected中の新規connectは許可されるはず");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let events = cb.connection_states.lock().unwrap();
         assert!(
@@ -2928,15 +2969,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unexpected_disconnect_after_connected_starts_reconnect_loop_and_attempts_retry() {
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+    #[tokio::test(start_paused = true)]
+    async fn unexpected_disconnect_after_connected_starts_reconnect_loop_and_attempts_retry() {
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), fast_test_policy());
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
 
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(orch.shared.state.lock().reconnect_loop_active, "ループが起動しているはず");
 
-        std::thread::sleep(Duration::from_millis(80));
+        tokio::time::sleep(Duration::from_millis(80)).await;
 
         let events = cb.connection_states.lock().unwrap();
         assert!(
@@ -2949,12 +2990,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_unexpected_disconnect_suppresses_when_a_reconnect_loop_is_already_active() {
+    #[tokio::test(start_paused = true)]
+    async fn handle_unexpected_disconnect_suppresses_when_a_reconnect_loop_is_already_active() {
         // 自動再接続ループの1リトライ試行自体が失敗して起きる切断(=既に
         // reconnect_loop_activeがtrue)は、二重にループを起動せず・Disconnectedも
         // 通知せず、ループ自身のtickに任せるはず(`Action::Suppress`)。
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), fast_test_policy());
         orch.shared.state.lock().reconnect_loop_active = true;
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
 
@@ -2964,7 +3005,7 @@ mod tests {
             cb.connection_states.lock().unwrap().is_empty(),
             "Suppress時はDisconnectedを通知してはいけない(ループ自身のtickに任せる)"
         );
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(
             attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
             "handle_unexpected_disconnect自身は新しいループを二重起動してはいけない"
@@ -2972,16 +3013,16 @@ mod tests {
         assert!(orch.shared.state.lock().phase == ConnPhase::Idle, "phase自体は他の分岐と同様Idleへ戻るはず");
     }
 
-    #[test]
-    fn user_initiated_disconnect_does_not_start_reconnect_loop() {
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+    #[tokio::test(start_paused = true)]
+    async fn user_initiated_disconnect_does_not_start_reconnect_loop() {
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), fast_test_policy());
         orch.disconnect(); // session が None なので実際の切断処理は起きないが、フラグは立つ
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
 
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(!orch.shared.state.lock().reconnect_loop_active);
 
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         let events = cb.connection_states.lock().unwrap();
         assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
@@ -2998,25 +3039,25 @@ mod tests {
         assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
     }
 
-    #[test]
-    fn graceful_remote_exit_does_not_start_reconnect_loop() {
+    #[tokio::test(start_paused = true)]
+    async fn graceful_remote_exit_does_not_start_reconnect_loop() {
         // リモートシェルの正常終了(`run_ssh_channel_loop`の`ChannelMsg::ExitStatus`)は
         // ネットワーク障害ではないので自動再接続してはいけない
         // (実際にこの区別が無かったことで`transport::pooling_e2e_tests::
         // one_tab_remote_exit_does_not_disconnect_sibling_tabs`が壊れた)。
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), fast_test_policy());
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("remote process exited (status 0)".to_string()));
 
         assert!(!orch.shared.state.lock().reconnect_loop_active);
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         let events = cb.connection_states.lock().unwrap();
         assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
     }
 
-    #[test]
-    fn reconnect_loop_gives_up_after_timeout_and_notifies_disconnected() {
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_gives_up_after_timeout_and_notifies_disconnected() {
         let policy = ReconnectPolicy {
             tick: Duration::from_millis(10),
             // retry_intervalをtimeoutより長くして、試行を一切発火させずに
@@ -3024,11 +3065,11 @@ mod tests {
             retry_interval: Duration::from_secs(60),
             timeout: Duration::from_millis(40),
         };
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("peer closed".to_string()));
 
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!orch.shared.state.lock().reconnect_loop_active, "タイムアウト後はループが終了しているはず");
@@ -3039,8 +3080,8 @@ mod tests {
         ), "ギブアップ後は理由付きでDisconnectedが通知されるはず, got: {events:?}");
     }
 
-    #[test]
-    fn network_path_restored_while_idle_triggers_an_immediate_retry_bypassing_the_tick_cadence() {
+    #[tokio::test(start_paused = true)]
+    async fn network_path_restored_while_idle_triggers_an_immediate_retry_bypassing_the_tick_cadence() {
         // retry_intervalをこのテストのsleep幅よりずっと長くしておくことで、
         // 通常のtick cadenceだけでは絶対に試行が発火しない状況を作る —
         // それでも試行が観測されれば、`notify_network_path_changed(true)`の
@@ -3050,20 +3091,20 @@ mod tests {
             retry_interval: Duration::from_secs(60),
             timeout: Duration::from_secs(60),
         };
-        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(orch.shared.state.lock().reconnect_loop_active);
 
         // ループが最初のtick待機に入るのを少し待ってから、ネットワーク復帰を通知する。
-        std::thread::sleep(Duration::from_millis(30));
+        tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
             attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
             "retry_intervalが60秒なので、通知前はまだ試行が発火していないはず"
         );
 
         orch.notify_network_path_changed(true);
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(
             attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -3081,14 +3122,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancel_reconnect_stops_loop_and_notifies_disconnected() {
+    #[tokio::test(start_paused = true)]
+    async fn cancel_reconnect_stops_loop_and_notifies_disconnected() {
         let policy = ReconnectPolicy {
             tick: Duration::from_millis(10),
             retry_interval: Duration::from_secs(60),
             timeout: Duration::from_secs(60),
         };
-        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(orch.shared.state.lock().reconnect_loop_active);
@@ -3104,12 +3145,12 @@ mod tests {
 
         // ループ自体もepoch不一致で自然終了するはず(次tickでretryが発火しない)。
         drop(events);
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         // cancel_reconnect後に新規の接続試行は発火しない。
     }
 
-    #[test]
-    fn a_new_manual_connect_invalidates_a_pending_reconnect_loop() {
+    #[tokio::test(start_paused = true)]
+    async fn a_new_manual_connect_invalidates_a_pending_reconnect_loop() {
         // レビューで指摘された既存の`notify_network_path_changed`パターンと同型:
         // 再接続ループが動いている最中に手動で新しい接続を始めたら、古いループの
         // 通知/試行が新しいセッションを誤って巻き戻してはいけない。
@@ -3118,7 +3159,7 @@ mod tests {
             retry_interval: Duration::from_millis(20),
             timeout: Duration::from_secs(60),
         };
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(orch.shared.state.lock().reconnect_loop_active);
@@ -3128,7 +3169,7 @@ mod tests {
             .expect("Idle中の新規connectは許可されるはず");
         assert!(!orch.shared.state.lock().reconnect_loop_active, "新しい手動接続でループは無効化されるはず");
 
-        std::thread::sleep(Duration::from_millis(80));
+        tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(
             attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
             "無効化された古いループはconnect_via相当を発火してはいけない"
@@ -3140,29 +3181,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_network_lost_on_connected_tcp_session_also_starts_reconnect_loop() {
+    #[tokio::test(start_paused = true)]
+    async fn apply_network_lost_on_connected_tcp_session_also_starts_reconnect_loop() {
         // always-connects.mdの実インシデント(網断debounce経路だけが自動復旧の
         // 対象外だった)の再発防止: apply_network_lost経由でも同じ
         // handle_unexpected_disconnectを通ることを確認する。
-        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), fast_test_policy());
         apply_network_lost(&orch.shared);
         assert!(orch.shared.state.lock().reconnect_loop_active);
 
-        std::thread::sleep(Duration::from_millis(80));
+        tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         let events = cb.connection_states.lock().unwrap();
         assert!(events.iter().any(|e| matches!(e, ConnectionPublicState::Reconnecting { .. })));
     }
 
-    #[test]
-    fn reconnect_success_stops_the_loop() {
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_success_stops_the_loop() {
         let policy = ReconnectPolicy {
             tick: Duration::from_millis(10),
             retry_interval: Duration::from_millis(500), // このテストでは試行が発火する前に成功させる
             timeout: Duration::from_secs(60),
         };
-        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy_on(tokio::runtime::Handle::current(), policy);
         let adapter = OrchestratorAdapter::new(orch.shared.clone());
         adapter.on_disconnected(Some("peer closed".to_string()));
         assert!(orch.shared.state.lock().reconnect_loop_active);
@@ -3175,9 +3216,12 @@ mod tests {
         // それは無害(UIは直後にConnectedへ収束する)。ここで決定的に検証できる/すべき
         // 性質は「ループ自身が停止すること」と「成功後に(タイムアウト由来の)Disconnectedが
         // 絶対に飛ばないこと」の2つ。
+        // (Step 2.5以降このテストはcurrent_threadの仮想時間ランタイムで走るため、実際には
+        // ループtaskはテストが最初に`.await`するまで動かない。上の「紛れ込み」の許容は
+        // 本番のmulti-thread `RUNTIME`での性質として残しておく。)
         assert!(!orch.shared.state.lock().reconnect_loop_active);
 
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let events = cb.connection_states.lock().unwrap();
         assert!(
             events.iter().any(|e| matches!(e, ConnectionPublicState::Connected { .. })),
@@ -3456,6 +3500,7 @@ mod tests {
                 Err(SshError::ConnectionFailed)
             }),
             reconnect_wake: tokio::sync::Notify::new(),
+            rt: RUNTIME.handle().clone(),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }
