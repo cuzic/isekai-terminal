@@ -98,10 +98,27 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+
+      # Gradleのキャッシュ(依存jar・wrapper・**ビルドキャッシュ**)はsetup-gradleに任せる
+      # (以前の`setup-java`の`cache: gradle`は~/.gradle/caches全体を固定キーで
+      # 保存するだけで、ビルドキャッシュも効かず、一度キーが当たると二度と更新
+      # されなかった)。既定値どおり、キャッシュの書き込みはデフォルトブランチ(main)の
+      # 実行だけで行い、PRの実行はmainのキャッシュを読むだけ(cache-read-only)。
+      # configuration cacheは、runner間で持ち越すには暗号化キー(secret)が必要なので
+      # 使わない。
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
       - name: ./gradlew :android:testDebugUnitTest
-        run: ./gradlew :android:testDebugUnitTest --stacktrace
+        # `--build-cache`: kspDebugKotlin/compileDebugKotlin等のコンパイル系タスクを
+        # mainのキャッシュから復元できるようにする(コマンドライン指定なのでローカル/
+        # F-Droidビルドの挙動は変えない)。
+        # `testDebugUnitTest --rerun`: テストタスク自体は入力が同一でもキャッシュ/
+        # UP-TO-DATEで飛ばさず**毎回必ず実行**する(テストを実際に走らせることが
+        # このjobの目的であり、フレーキーなテストの再現機会も失わないため)。
+        run: ./gradlew :android:testDebugUnitTest --rerun --build-cache --stacktrace
 
       - name: Summarize test count and slowest test classes
         # CI時間の計測・テスト件数の回帰検知用(テストが黙って減っていないかを
