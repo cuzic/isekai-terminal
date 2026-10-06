@@ -1,0 +1,133 @@
+name: isekai-pipe musl binaries (cached)
+
+# rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で無条件に埋め込む
+# isekai-pipe の x86_64/aarch64 musl静的バイナリ(`rust-core/scripts/build-isekai-pipe-musl.sh`
+# の出力)を用意する。isekai-terminal-coreをビルド/チェックするあらゆるジョブの前提。
+#
+# 以前は各ジョブが毎回 zig ダウンロード + `cargo zigbuild --release`(lto=true,
+# codegen-units=1)を2ターゲット分逐次実行しており、rust-core-test-linux /
+# rust-core-purity-check / android-uniffi-drift / android-unit-test の各ジョブで
+# 実測250〜560秒(ジョブ時間の約半分)を占めていた。しかも`rust-core/target`の
+# キャッシュがヒットしても、checkoutでworkspaceクレートのmtimeが更新されるため
+# isekai-pipe側はほぼ毎回フルにリンクし直しになっていた。
+#
+# このactionは、isekai-pipeの成果物を決めうる入力(isekai-pipeとそのworkspace内
+# path依存クロージャの全trackedファイル・Cargo.lock・rustc/zigのバージョン等、
+# 詳細は`compute_key.py`)のハッシュをキーにして、ビルド済みバイナリ4ファイル
+# (2ターゲット × 本体+`.sha256`)だけを actions/cache でキャッシュする。
+# キーが一致する=入力が同一なので、ビルドし直しても(埋め込みgit SHA以外は)同じ
+# バイナリになる。isekai-pipeのクロージャに触れないPR(isekai-terminal-core /
+# isekai-ssh / isekai-bootstrap等だけを変更するPR)と、mainへのpush後の後続PRは
+# ビルドを丸ごとスキップできる。キャッシュは数十MBと小さいので、PR上でも保存する
+# (同じPRの再push・同一run内の並行ジョブ以外には共有されないが、害はない)。
+#
+# 埋め込みgit SHA(isekai-pipe/build.rsの`ISEKAI_GIT_SHA`、`--version`表示専用)は
+# キャッシュヒット時は「そのクロージャを最初にビルドしたコミット」のものになる。
+# テストはこれに依存していない。このため、配布・実機投入される成果物を作る
+# build-android.yml / release-build.yml では意図的にこのactionを使わない。
+#
+# ミス時の zig ツールチェーン自体のキャッシュ(~/zig-toolchain)は PR #126 の案を
+# 取り込んだもの。
+
+inputs:
+  zig-version:
+    description: zig version used by cargo-zigbuild on a cache miss (part of the cache key)
+    required: false
+    default: "0.16.0"
+
+outputs:
+  cache-hit:
+    description: "'true' if the binaries were restored from cache and verified"
+    value: ${{ steps.verify.outputs.ok }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute isekai-pipe musl cache key
+      id: key
+      shell: bash
+      run: python3 -I "$GITHUB_ACTION_PATH/compute_key.py" --zig-version "${{ inputs.zig-version }}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore isekai-pipe musl binaries
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          rust-core/target/x86_64-unknown-linux-musl/release/isekai-pipe
+          rust-core/target/x86_64-unknown-linux-musl/release/isekai-pipe.sha256
+          rust-core/target/aarch64-unknown-linux-musl/release/isekai-pipe
+          rust-core/target/aarch64-unknown-linux-musl/release/isekai-pipe.sha256
+        key: ${{ steps.key.outputs.key }}
+
+    # 復元したバイナリが`.sha256`サイドカーと一致することを確認する(壊れた
+    # キャッシュを素通しさせない)。一致しなければビルドにフォールバックする。
+    - name: Verify restored isekai-pipe musl binaries
+      id: verify
+      shell: bash
+      run: |
+        set -uo pipefail
+        ok=false
+        if [ "${{ steps.restore.outputs.cache-hit }}" = "true" ]; then
+          ok=true
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            bin="rust-core/target/$t/release/isekai-pipe"
+            if [ -s "$bin" ] && [ -s "$bin.sha256" ] \
+              && [ "$(sha256sum "$bin" | awk '{print $1}')" = "$(cat "$bin.sha256")" ]; then
+              echo "restored $bin (sha256=$(cat "$bin.sha256"))"
+            else
+              echo "::warning::restored $bin failed sha256 verification; rebuilding"
+              ok=false
+            fi
+          done
+        fi
+        echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+    - name: Restore zig toolchain
+      id: zig-cache
+      if: steps.verify.outputs.ok != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/zig-toolchain
+        key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ inputs.zig-version }}
+
+    - name: Build isekai-pipe musl binaries (cache miss)
+      if: steps.verify.outputs.ok != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -x "$HOME/zig-toolchain/zig" ]; then
+          curl -fL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${{ inputs.zig-version }}/zig-x86_64-linux-${{ inputs.zig-version }}.tar.xz"
+          mkdir -p "$HOME/zig-toolchain"
+          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+        fi
+        echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
+        export PATH="$HOME/zig-toolchain:$PATH"
+        zig version
+        if ! command -v cargo-zigbuild >/dev/null; then
+          cargo install cargo-zigbuild --locked
+        fi
+        rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+        bash rust-core/scripts/build-isekai-pipe-musl.sh
+
+    - name: Save zig toolchain
+      if: steps.verify.outputs.ok != 'true' && steps.zig-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ~/zig-toolchain
+        key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ inputs.zig-version }}
+
+    - name: Save isekai-pipe musl binaries
+      if: steps.verify.outputs.ok != 'true'
+      uses: actions/cache/save@v4
+      # 同一キーを並行ジョブが先に保存済みの場合などに失敗しうるが、ビルド自体は
+      # 成功しているのでジョブは落とさない。
+      continue-on-error: true
+      with:
+        path: |
+          rust-core/target/x86_64-unknown-linux-musl/release/isekai-pipe
+          rust-core/target/x86_64-unknown-linux-musl/release/isekai-pipe.sha256
+          rust-core/target/aarch64-unknown-linux-musl/release/isekai-pipe
+          rust-core/target/aarch64-unknown-linux-musl/release/isekai-pipe.sha256
+        key: ${{ steps.key.outputs.key }}

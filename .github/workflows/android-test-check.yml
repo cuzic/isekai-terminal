@@ -27,6 +27,7 @@ on:
       - "gradle.properties"
       - "settings.gradle.kts"
       - ".github/workflows/android-test-check.yml"
+      - ".github/actions/isekai-pipe-musl/**"
   # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
   # protectionのrequired status checkにする際、path-filter付きpull_requestは
   # 対象パスに触れないPRでcheck-run自体が作られず恒久pendingになる。代わりに
@@ -76,6 +77,7 @@ jobs:
             ^settings\.gradle\.kts$
             ^\.github/workflows/android-test-check\.yml$
             ^\.github/actions/pr-path-gate/
+            ^\.github/actions/isekai-pipe-musl/
 
   test:
     needs: changes
@@ -122,18 +124,10 @@ jobs:
         # rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で埋め込む
         # isekai-pipe の x86_64/aarch64 musl静的バイナリ。ターゲットに関わらず
         # isekai-terminal-coreをビルドするだけで常に必要(rust-core-test-check.yml/
-        # ios-*-check.yml各ワークフロー参照)。
-        run: |
-          set -euo pipefail
-          curl -fL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          mkdir -p "$HOME/zig-toolchain"
-          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
-          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
-          export PATH="$HOME/zig-toolchain:$PATH"
-          cargo install cargo-zigbuild --locked
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-pipe-musl.sh
+        # ios-*-check.yml各ワークフロー参照)。isekai-pipeの依存クロージャのハッシュを
+        # キーにしたキャッシュ(rust-core-test-check.ymlと共有)がヒットすればビルドを
+        # スキップする(.github/actions/isekai-pipe-musl/action.yml参照)。
+        uses: ./.github/actions/isekai-pipe-musl
 
       - name: ./gradlew :android:testDebugUnitTest
         run: ./gradlew :android:testDebugUnitTest --stacktrace
