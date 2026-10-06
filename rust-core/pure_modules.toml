@@ -139,3 +139,14 @@ effect = "ServeEffect"
 file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
 effect = "ReconnectEffect"
+
+# Step 5: ResumePlanner(resume_fsm.rs)のResumeCmdを解釈するshell。
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "resume_with_backoff_until_deadline"
+effect = "ResumeCmd"
+
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "interpret_tick_cmds"
+effect = "ResumeCmd"
