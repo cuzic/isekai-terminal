@@ -172,8 +172,32 @@ where
 ///
 /// `pool`は`'static`参照であることを要求する(プロセス全体シングルトンの`LazyLock`
 /// static以外から呼ぶ想定が無いため)。
+///
+/// アイドルタイマーはグローバル[`crate::RUNTIME`]へspawnする(以前と同一の挙動)。
+/// spawn先を明示したい場合(仮想時間テスト)は[`release_on`]を使う。
 pub(crate) fn release<K, T>(pool: &'static PoolMap<K, T>, key: K, idle_grace: Duration)
 where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    release_on(crate::RUNTIME.handle(), pool, key, idle_grace)
+}
+
+/// [`release`]の、アイドルタイマーのspawn先ランタイムを明示的に受け取る版
+/// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2.5)。本番の呼び出し元は全て[`release`]
+/// (=グローバル`RUNTIME`)経由で、これを直接呼ぶのは`#[tokio::test(start_paused = true)]`
+/// から`Handle::current()`を渡してidle graceを仮想時間で進めるテストだけ。
+/// `Handle::try_current()`による暗黙のフォールバックは採らない
+/// (ADR_CONNECTION_RESILIENCE_SIMULATION.md §5)。
+///
+/// Step 4(タイマーのEffect化)はこの関数のspawn箇所を置き換える前提で、
+/// [`release`]の公開シグネチャ(`pool, key, idle_grace`)はこのStepでは変えていない。
+pub(crate) fn release_on<K, T>(
+    rt: &tokio::runtime::Handle,
+    pool: &'static PoolMap<K, T>,
+    key: K,
+    idle_grace: Duration,
+) where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
@@ -186,7 +210,7 @@ where
     entry.idle_generation = entry.idle_generation.wrapping_add(1);
     let my_generation = entry.idle_generation;
     drop(map);
-    crate::RUNTIME.spawn(async move {
+    rt.spawn(async move {
         tokio::time::sleep(idle_grace).await;
         let mut map = pool.lock();
         if let Some(entry) = map.get(&key) {
@@ -448,12 +472,20 @@ mod tests {
 
     static RELEASE_TEST_POOL: LazyLock<PoolMap<&'static str, u32>> = LazyLock::new(new_pool_map);
 
-    #[tokio::test]
+    /// `RELEASE_TEST_POOL`への[`release_on`]を、呼び出し元テストのランタイム
+    /// (`#[tokio::test(start_paused = true)]`のcurrent_thread)へアイドルタイマーを
+    /// spawnする形で行う(Step 2.5)。これにより猶予時間の経過が仮想時間で決定論的になり、
+    /// グローバル`RUNTIME`の実時間タイマーとテスト側のポーリング間隔の競争が無くなる。
+    fn release_virtual(key: &'static str, idle_grace: Duration) {
+        release_on(&tokio::runtime::Handle::current(), &RELEASE_TEST_POOL, key, idle_grace);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn release_to_zero_removes_entry_after_idle_grace_elapses() {
         try_attach_with(&RELEASE_TEST_POOL, &"release-removes-after-grace", alive);
         publish_success(&RELEASE_TEST_POOL, &"release-removes-after-grace", 1u32);
 
-        release(&RELEASE_TEST_POOL, "release-removes-after-grace", Duration::from_millis(30));
+        release_virtual("release-removes-after-grace", Duration::from_millis(30));
 
         // 猶予中はまだ残っている。
         assert!(
@@ -468,13 +500,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn release_with_remaining_refcount_does_not_start_a_removal_timer() {
         try_attach_with(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", alive);
         try_attach_with(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", alive); // refcount = 2
         publish_success(&RELEASE_TEST_POOL, &"release-keeps-while-refcount-positive", 2u32);
 
-        release(&RELEASE_TEST_POOL, "release-keeps-while-refcount-positive", Duration::from_millis(20));
+        release_virtual("release-keeps-while-refcount-positive", Duration::from_millis(20));
 
         // refcountはまだ1残っているはずなので、猶予時間を過ぎても消えない。
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -484,12 +516,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reattaching_during_idle_grace_cancels_the_pending_removal() {
         try_attach_with(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", alive);
         publish_success(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", 3u32);
 
-        release(&RELEASE_TEST_POOL, "release-reattach-cancels-timer", Duration::from_millis(30));
+        release_virtual("release-reattach-cancels-timer", Duration::from_millis(30));
         // タイマー発火前に新規タブがアタッチ(=世代が進む)。
         tokio::time::sleep(Duration::from_millis(5)).await;
         match try_attach_with(&RELEASE_TEST_POOL, &"release-reattach-cancels-timer", alive) {
@@ -505,7 +537,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn publish_failure_tombstone_is_removed_after_final_release() {
         let key = "publish-failure-tombstone-removed";
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
@@ -516,8 +548,8 @@ mod tests {
 
         publish_failure(&RELEASE_TEST_POOL, &key, "boom".to_string());
         assert_eq!(wait_for_establish(rx).await.expect_err("waiter should see failure"), "boom");
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
 
         assert!(
             wait_until_removed(key).await,
@@ -525,20 +557,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn replacing_dead_ready_preserves_refcount_for_late_release() {
         let key = "dead-ready-replace-preserves-refcount";
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
         publish_success(&RELEASE_TEST_POOL, &key, 1u32);
 
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
         match try_attach_with(&RELEASE_TEST_POOL, &key, |_| false) {
             AttachOutcome::Establisher => {}
             _ => panic!("dead Ready should be replaced in-place by a new establisher"),
         }
         publish_success(&RELEASE_TEST_POOL, &key, 2u32);
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let map = RELEASE_TEST_POOL.lock();
@@ -549,14 +581,14 @@ mod tests {
             _ => panic!("replacement entry should be Ready"),
         }
         drop(map);
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
         assert!(
             wait_until_removed(key).await,
             "replacement entry should be removable after the final holder releases it"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn out_of_band_tombstone_is_removed_after_final_release() {
         let key = "out-of-band-tombstone-removed";
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
@@ -570,22 +602,22 @@ mod tests {
             assert_eq!(entry.refcount, 1);
         }
 
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
         assert!(
             wait_until_removed(key).await,
             "Dead entry should be removed by the normal idle timer"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn publish_failure_refcount_can_reach_zero() {
         let key = "publish-failure-refcount-zero";
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
         try_attach_with(&RELEASE_TEST_POOL, &key, alive);
         publish_failure(&RELEASE_TEST_POOL, &key, "boom".to_string());
 
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
-        release(&RELEASE_TEST_POOL, key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
+        release_virtual(key, Duration::from_millis(30));
 
         {
             let map = RELEASE_TEST_POOL.lock();
