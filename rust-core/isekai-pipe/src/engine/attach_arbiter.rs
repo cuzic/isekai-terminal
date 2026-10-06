@@ -729,4 +729,223 @@ mod tests {
         let effects = a.apply(AttachEvent::HelloReceived { key: k });
         assert_eq!(effects, vec![AttachEffect::SendReady { key: k, attach_token: tok }]);
     }
+
+    // ---- proptest invariants (ADR_FUNCTIONAL_CORE_EFFECTS.md Step 1) ----
+    //
+    // These live inside this module because `LeaseId`'s field is private:
+    // leases are recovered from issued `ConnectTarget` effects and referred
+    // to by "k-th issued lease" (plus never-issued fabricated ones).
+
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Hello { s: u8, g: u8, at: u8 },
+        TargetConnected { l: usize, tok: u8 },
+        TargetConnectFailed { l: usize },
+        Activated { s: u8, g: u8, at: u8, tok: u8 },
+        Cancel { s: u8, g: u8, at: u8 },
+        LeaseStopped { l: usize },
+        PendingExpired { l: usize },
+        RelayEnded { l: usize },
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        let (s, g, at, tok, l) = (0u8..3, 0u8..4, 0u8..3, 0u8..3, 0usize..64);
+        prop_oneof![
+            4 => (s, g, at).prop_map(|(s, g, at)| Op::Hello { s, g, at }),
+            3 => (l, tok).prop_map(|(l, tok)| Op::TargetConnected { l, tok }),
+            1 => l.prop_map(|l| Op::TargetConnectFailed { l }),
+            3 => (s, g, at, tok).prop_map(|(s, g, at, tok)| Op::Activated { s, g, at, tok }),
+            1 => (s, g, at).prop_map(|(s, g, at)| Op::Cancel { s, g, at }),
+            2 => l.prop_map(|l| Op::LeaseStopped { l }),
+            1 => l.prop_map(|l| Op::PendingExpired { l }),
+            2 => l.prop_map(|l| Op::RelayEnded { l }),
+        ]
+    }
+
+    /// Resolve "k-th issued lease"; some indices fabricate a never-issued
+    /// lease (must be treated as stale).
+    fn lease_at(issued: &[LeaseId], l: usize) -> LeaseId {
+        if issued.is_empty() || l % 8 == 7 {
+            LeaseId(1_000_000 + l as u64)
+        } else {
+            issued[l % issued.len()]
+        }
+    }
+
+    fn state_lease(state: &AttachState) -> LeaseId {
+        match state {
+            AttachState::Connecting { lease, .. }
+            | AttachState::PendingActivation { lease, .. }
+            | AttachState::Established { lease, .. } => *lease,
+            AttachState::ClosingForSupersede { old_lease, .. } => *old_lease,
+        }
+    }
+
+    fn snapshot(a: &AttachArbiter) -> Vec<(SessionId, AttachState)> {
+        let mut v: Vec<_> = a.sessions.iter().map(|(k, v)| (*k, v.clone())).collect();
+        v.sort_by_key(|(k, _)| *k.as_bytes());
+        v
+    }
+
+    /// The session (if any) whose slot currently holds `lease` in a state
+    /// matching `pred`.
+    fn owner_in(a: &AttachArbiter, lease: LeaseId, pred: fn(&AttachState) -> bool) -> Option<SessionId> {
+        a.sessions.iter().find(|(_, st)| state_lease(st) == lease && pred(st)).map(|(k, _)| *k)
+    }
+
+    proptest! {
+        #[test]
+        fn arbiter_invariants_hold_for_arbitrary_event_sequences(
+            ops in proptest::collection::vec(op_strategy(), 0..80)
+        ) {
+            let mut a = AttachArbiter::new();
+            let mut issued: Vec<LeaseId> = Vec::new();
+            let mut issued_set: HashSet<LeaseId> = HashSet::new();
+            let mut relay_started: HashSet<LeaseId> = HashSet::new();
+
+            for op in ops {
+                let before = snapshot(&a);
+                // (event, whether it names a lease, current owner of that lease in the state kind that makes it "current")
+                let (event, names_lease, current_owner): (AttachEvent, bool, Option<SessionId>) = match op {
+                    Op::Hello { s, g, at } => (AttachEvent::HelloReceived { key: key(s, g as u64, at) }, false, None),
+                    Op::TargetConnected { l, tok } => {
+                        let lease = lease_at(&issued, l);
+                        (
+                            AttachEvent::TargetConnected { lease, target: TargetHandleId(l as u64), attach_token: token(tok) },
+                            true,
+                            owner_in(&a, lease, |st| matches!(st, AttachState::Connecting { .. })),
+                        )
+                    }
+                    Op::TargetConnectFailed { l } => {
+                        let lease = lease_at(&issued, l);
+                        (
+                            AttachEvent::TargetConnectFailed { lease },
+                            true,
+                            owner_in(&a, lease, |st| matches!(st, AttachState::Connecting { .. })),
+                        )
+                    }
+                    Op::Activated { s, g, at, tok } => {
+                        (AttachEvent::Activated { key: key(s, g as u64, at), attach_token: token(tok) }, false, None)
+                    }
+                    Op::Cancel { s, g, at } => (AttachEvent::CancelReceived { key: key(s, g as u64, at) }, false, None),
+                    Op::LeaseStopped { l } => {
+                        let lease = lease_at(&issued, l);
+                        (
+                            AttachEvent::LeaseStopped { lease },
+                            true,
+                            owner_in(&a, lease, |st| matches!(st, AttachState::ClosingForSupersede { .. })),
+                        )
+                    }
+                    Op::PendingExpired { l } => {
+                        let lease = lease_at(&issued, l);
+                        (
+                            AttachEvent::PendingExpired { lease },
+                            true,
+                            owner_in(&a, lease, |st| matches!(st, AttachState::PendingActivation { .. })),
+                        )
+                    }
+                    Op::RelayEnded { l } => {
+                        let lease = lease_at(&issued, l);
+                        (
+                            AttachEvent::RelayEnded { lease },
+                            true,
+                            owner_in(&a, lease, |st| matches!(st, AttachState::Established { .. })),
+                        )
+                    }
+                };
+
+                let effects = a.apply(event);
+                let after = snapshot(&a);
+
+                // (1) Stale-lease rule: an event naming a non-current lease
+                // changes nothing and produces no effects.
+                if names_lease && current_owner.is_none() {
+                    prop_assert_eq!(&before, &after, "stale event mutated state: {:?}", event);
+                    prop_assert!(effects.is_empty(), "stale event produced effects: {:?} -> {:?}", event, effects);
+                }
+
+                // (2) RelayEnded on the current Established lease removes the
+                // entry (and nothing else).
+                if let AttachEvent::RelayEnded { .. } = event {
+                    if let Some(sid) = current_owner {
+                        prop_assert!(a.state_for(sid).is_none());
+                        prop_assert_eq!(after.len() + 1, before.len());
+                        prop_assert!(effects.is_empty());
+                    }
+                }
+
+                // (3) Lease ids are unique across all sessions (one entry per
+                // session by construction of the map).
+                let mut seen = HashSet::new();
+                for (_, st) in &after {
+                    prop_assert!(seen.insert(state_lease(st)), "lease held by two sessions");
+                }
+
+                // (4) ConnectTarget only arises from Hello on a vacant
+                // session or from LeaseStopped on a ClosingForSupersede one,
+                // and the lease is freshly minted.
+                for e in &effects {
+                    if let AttachEffect::ConnectTarget { lease } = e {
+                        match event {
+                            AttachEvent::HelloReceived { key } => {
+                                prop_assert!(!before.iter().any(|(k, _)| *k == key.session_id));
+                            }
+                            AttachEvent::LeaseStopped { .. } => prop_assert!(current_owner.is_some()),
+                            _ => prop_assert!(false, "ConnectTarget from unexpected event {:?}", event),
+                        }
+                        prop_assert!(issued_set.insert(*lease), "lease {:?} minted twice", lease);
+                        issued.push(*lease);
+                    }
+                }
+
+                // (5) A session in ClosingForSupersede stays so (same
+                // old_lease) until its own LeaseStopped arrives.
+                for (sid, st) in &before {
+                    if let AttachState::ClosingForSupersede { old_lease, .. } = st {
+                        if !matches!(event, AttachEvent::LeaseStopped { lease } if lease == *old_lease) {
+                            match a.state_for(*sid) {
+                                Some(AttachState::ClosingForSupersede { old_lease: o2, .. }) => {
+                                    prop_assert_eq!(o2, old_lease)
+                                }
+                                other => prop_assert!(false, "Closing session left Closing without LeaseStopped: {:?}", other),
+                            }
+                        }
+                    }
+                }
+
+                // (6) StartRelay: only on the Activated transition into
+                // Established, at most once per lease over the whole trace.
+                for e in &effects {
+                    if let AttachEffect::StartRelay { lease, .. } = e {
+                        prop_assert!(matches!(event, AttachEvent::Activated { .. }));
+                        prop_assert!(relay_started.insert(*lease), "StartRelay twice for {:?}", lease);
+                        let held = after.iter().any(|(_, st)| {
+                            matches!(st, AttachState::Established { lease: l, .. } if l == lease)
+                        });
+                        prop_assert!(held);
+                    }
+                }
+                if let AttachEvent::Activated { .. } = event {
+                    // Anything other than a successful activation (stale key,
+                    // wrong token, wrong state) is a no-op.
+                    if !effects.iter().any(|e| matches!(e, AttachEffect::StartRelay { .. })) {
+                        prop_assert_eq!(&before, &after);
+                        prop_assert!(effects.is_empty());
+                    }
+                }
+
+                // (7) PendingExpired on the current PendingActivation lease
+                // drops the slot and cancels exactly that lease.
+                if let AttachEvent::PendingExpired { lease } = event {
+                    if let Some(sid) = current_owner {
+                        prop_assert!(a.state_for(sid).is_none());
+                        prop_assert_eq!(effects, vec![AttachEffect::CancelLease { lease }]);
+                    }
+                }
+            }
+        }
+    }
 }

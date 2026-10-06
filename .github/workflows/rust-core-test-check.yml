@@ -266,6 +266,18 @@ jobs:
         working-directory: rust-core
         run: cargo test --doc --workspace
 
+      # proptestの反例保存(ADR_FUNCTIONAL_CORE_EFFECTS.md §7 m-5): CI専用運用では
+      # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
+      # `cc`行をソースツリーへ手でコミットする。
+      - name: Upload proptest regressions on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: rust-core/**/proptest-regressions/**
+          if-no-files-found: ignore
+          retention-days: 14
+
   test-macos:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
