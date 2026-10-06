@@ -6,8 +6,7 @@ name: isekai-pipe musl binaries (cached)
 #
 # 以前は各ジョブが毎回 zig ダウンロード + `cargo zigbuild --release`(lto=true,
 # codegen-units=1)を2ターゲット分逐次実行しており、rust-core-test-linux /
-# rust-core-purity-check / android-uniffi-drift / android-unit-test の各ジョブで
-# 実測250〜560秒(ジョブ時間の約半分)を占めていた。しかも`rust-core/target`の
+# rust-core-purity-check の各ジョブで実測250〜560秒(ジョブ時間の約半分)を占めていた。しかも`rust-core/target`の
 # キャッシュがヒットしても、checkoutでworkspaceクレートのmtimeが更新されるため
 # isekai-pipe側はほぼ毎回フルにリンクし直しになっていた。
 #
