@@ -5,6 +5,8 @@ import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.KeyEntry
 import tools.isekai.terminal.data.Repositories
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
@@ -81,11 +83,20 @@ class ProfileEditViewModelTest {
         assertEquals(2, list.size)
     }
 
+    // [SavingEditViewModel.save]は`_isSaving.value = false`を**先に**書いてから`onSaved()`を
+    // 呼ぶ。テスト用Mainディスパッチャ(UnconfinedTestDispatcher)上ではwithContext(IO)から
+    // 戻った継続がIOスレッド上でそのまま走るため、`isSaving.first { !it }`で待つと
+    // runBlockingスレッドが`onSaved()`の実行前に起きてしまい、コールバックの副作用を
+    // 読み損ねる競合があった(CI 2026-10-06 run 37440961829で実際に
+    // save_calledTwiceConcurrently_onlyOneSavesが失敗)。onSaved()の完了自体を
+    // CompletableDeferredで待つ。persist()はonSaved()より前に完了しているので、
+    // その後のDB読み出しも決定的に見える。
     @Test fun save_callsOnSaved() = runBlocking {
-        var saved = false
-        vm.save(sampleProfile()) { saved = true }
-        withTimeout(3000) { vm.isSaving.first { !it } }
-        assertTrue(saved)
+        val saved = CompletableDeferred<Unit>()
+        vm.save(sampleProfile()) { saved.complete(Unit) }
+        withTimeout(3000) { saved.await() }
+        assertTrue(saved.isCompleted)
+        assertFalse(vm.isSaving.value)
     }
 
     @Test fun save_persistsProfileToDb() = runBlocking {
@@ -102,11 +113,15 @@ class ProfileEditViewModelTest {
     }
 
     @Test fun save_calledTwiceConcurrently_onlyOneSaves() = runBlocking {
-        var callCount = 0
-        vm.save(sampleProfile()) { callCount++ }
-        vm.save(sampleProfile()) { callCount++ }
-        withTimeout(3000) { vm.isSaving.first { !it } }
-        assertEquals(1, callCount)
+        // 2回目のsave()は1回目が立てたisSavingフラグを見て同期的にreturnする
+        // (launchすらしない)ので、1回目のonSaved()完了を待てば2回目のコールバックが
+        // 後から届く余地は無い。
+        val callCount = AtomicInteger(0)
+        val firstSaved = CompletableDeferred<Unit>()
+        vm.save(sampleProfile()) { callCount.incrementAndGet(); firstSaved.complete(Unit) }
+        vm.save(sampleProfile()) { callCount.incrementAndGet(); firstSaved.complete(Unit) }
+        withTimeout(3000) { firstSaved.await() }
+        assertEquals(1, callCount.get())
         val all = Repositories.profiles.getAll()
         assertEquals(1, all.size)
     }
