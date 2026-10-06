@@ -115,8 +115,16 @@ jobs:
       # 置く(以前はこのステップがそれらより後にあり、`rust-core/target`を含むキャッシュが
       # 一切効かないままcargo-zigbuildの毎回のcompile-from-scratchとisekai-pipeの
       # musl再ビルドが走っていた)。
+      #
+      # 復元(restore)は全イベントで行うが、保存(save)はmainへのpush時のみ(ジョブ末尾の
+      # `Save cargo cache`参照)。PR上で保存したキャッシュは`refs/pull/N/merge`スコープに
+      # なり他のPRからは一切読めないうえ、リポジトリ上限10GBを食い潰してmainのキャッシュを
+      # LRUで追い出していた(2026-10-06実測: 使用量16.4GB/上限10GB、Windows/macOSは
+      # ほぼ毎回ミス)。PRは常にmainのキャッシュ(完全一致またはrestore-keysの前方一致)
+      # から復元する。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -269,6 +277,19 @@ jobs:
         working-directory: rust-core
         run: cargo test --doc --workspace
 
+      # actions/cache@v4の暗黙のpost-saveと同じ条件(ジョブ成功・完全一致ヒット時は保存しない)
+      # に、mainへのpushに限るという条件を足したもの。
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
       # proptestの反例保存(ADR_FUNCTIONAL_CORE_EFFECTS.md §7 m-5): CI専用運用では
       # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
       # `cc`行をソースツリーへ手でコミットする。
@@ -303,8 +324,10 @@ jobs:
           python3 rust-core/scripts/check_pure_modules.py --self-test
           python3 rust-core/scripts/check_pure_modules.py
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -340,6 +363,17 @@ jobs:
         working-directory: rust-core
         run: cargo clippy --workspace --lib --bins -- -A clippy::all
 
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   test-macos:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
@@ -365,8 +399,10 @@ jobs:
           /usr/sbin/sshd -V || true
           ssh-keygen -V || true
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -403,6 +439,16 @@ jobs:
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   test-windows:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
@@ -426,8 +472,11 @@ jobs:
           rustc --version
           cargo --version
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。このジョブでは
+      # 特に、PR上での2.4GBの保存(post-save)だけで毎回300〜380秒かかっていた。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -551,3 +600,13 @@ jobs:
           done
           exit $failed
           exit $failed
+
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
