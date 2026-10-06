@@ -1051,9 +1051,11 @@ mod tests {
         /// I-k(Step 2b): 実際のshellと同じ入口(`AdmitRequested`)だけからなる任意の列で、
         /// slot数が`max_sessions`を超えない。要求同士・事実との任意の交錯を含む(shellの並行admissionは
         /// 集約ロック下のapplyの列に直列化されるので、この列がその全インターリーブを表す)。
+        /// `max_sessions < SESSIONS`に限る: idの種類がmax以下だとreducerが何をしてもslot数はmaxを
+        /// 超えられず、そのケースはI-kについて何も検査しない(空振り)ため。
         #[test]
         fn concurrent_admissions_never_exceed_max_sessions(
-            max_sessions in 0usize..4,
+            max_sessions in 0usize..usize::from(SESSIONS),
             ops in proptest::collection::vec(op_strategy(false), 0..160),
         ) {
             run_ops(max_sessions, ops, true)?;
@@ -1161,6 +1163,13 @@ mod tests {
                 let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
                 let before_index = agg.index.clone();
                 let effects = agg.apply(event);
+                if let ServeEvent::AdmitRequested { .. } = event {
+                    // `discard Evicted`はバイパス限定のActivated経路でも出るので、admission自身の
+                    // 立ち退き分岐(Step 2b)に届いていることは別に数える。
+                    if effects.iter().any(|e| matches!(e, ServeEffect::Discard { cause: DiscardCause::Evicted, .. })) {
+                        bump(&mut hits, "admission evicted");
+                    }
+                }
                 if let ServeEvent::Parked { id: pid, lease, .. } | ServeEvent::RelayTerminated { id: pid, lease, .. } = event {
                     if before_index.get(&pid).is_some_and(|e| e.lease != lease) {
                         bump(&mut hits, "stale fact for a live id");
@@ -1199,6 +1208,7 @@ mod tests {
             "id re-established with a new lease",
             "stale fact for a live id",
             "admission rejected busy",
+            "admission evicted",
             "discard Expired",
             "discard Evicted",
             "discard TcpDied",
