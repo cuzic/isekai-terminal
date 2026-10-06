@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn run_connect_has_a_single_call_site() {
         let src = include_str!("connect.rs");
-        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module marker")];
+        let prod = &src[..src.find("\nmod tests {").expect("tests module marker")];
         let calls = prod.matches("run_connect(").count();
         // 1 definition + 1 call (+ doc/comment mentions are written without the paren-call form
         // `run_connect(` only where they are real code or the `run_connect(launch)` call).
