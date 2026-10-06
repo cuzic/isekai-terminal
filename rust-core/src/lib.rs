@@ -27,6 +27,7 @@ pub(crate) mod tmux_session;
 // `transport::ssh_handler::run_ssh_channel_loop`。
 pub(crate) mod tmux_notify;
 pub mod orchestrator;
+pub(crate) mod reconnect_fsm;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
 pub mod multipath_transport;

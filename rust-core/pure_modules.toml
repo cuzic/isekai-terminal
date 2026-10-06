@@ -39,6 +39,12 @@ package = "isekai-transport"
 file = "isekai-transport/src/path_health_fsm.rs"
 module = "path_health_fsm"
 
+# ADR §6 Step 3a: orchestratorの自動再接続判断(`ReconnectState::apply`)。
+[[module]]
+package = "isekai-terminal-core"
+file = "src/reconnect_fsm.rs"
+module = "reconnect_fsm"
+
 # ── 外部パスの許可リスト(セグメント単位の前方一致) ──────────────────
 [external]
 allow = [
@@ -86,8 +92,9 @@ package = "isekai-transport"
 path = "crate::path_health::has_zero_response"
 reason = "同上"
 
-# 例(未登録・将来のStepで追加): crate rootの公開値型
-# [[allow_item]]
-# package = "isekai-terminal-core"
-# path = "crate::ConnectionIssueHint"
-# reason = "値型のみ"
+# crate rootの公開値型(ADR §2.3 / §6 Step 3a)。`crate`(root)のモジュール単位許可は禁止なので、
+# reconnect_fsm.rsが使う値型だけを項目単位で許可する(同じcrate rootの`RUNTIME`・`SshConfig`/`SshAuth`は不可)。
+[[allow_item]]
+package = "isekai-terminal-core"
+path = "crate::ConnectionIssueHint"
+reason = "UniFFI公開の値型enum(フィールド無し・I/O無し)。reconnect_fsm.rsが切断時のLocal Networkヒントとして返す(ADR §6 Step 3a)"
