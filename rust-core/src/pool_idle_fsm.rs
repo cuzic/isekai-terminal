@@ -187,18 +187,18 @@ mod tests {
                 match ev {
                     IdleEvent::Attached => {
                         holders += 1;
-                        prop_assert!(fx.is_empty());
-                        prop_assert_ne!(l.generation(), before.generation());
+                        prop_assert!(fx.is_empty(), "Attached must not emit effects");
+                        prop_assert_ne!(l.generation(), before.generation(), "Attached must advance the generation");
                     }
                     IdleEvent::Released { .. } => {
                         holders = holders.saturating_sub(1);
                         if holders == 0 {
-                            prop_assert_eq!(fx.clone(), vec![IdleEffect::ArmIdleTimer { generation: l.generation(), after: GRACE }]);
+                            prop_assert_eq!(fx.clone(), vec![IdleEffect::ArmIdleTimer { generation: l.generation(), after: GRACE }], "release to zero must arm the current generation");
                             // tokenは1台帳の中では再利用されない(古いタイマーと取り違えない)。
-                            prop_assert!(!armed.contains(&l.generation()));
+                            prop_assert!(!armed.contains(&l.generation()), "a token must never be reused");
                             armed.push(l.generation());
                         } else {
-                            prop_assert!(fx.is_empty());
+                            prop_assert!(fx.is_empty(), "release with holders left must not arm");
                         }
                     }
                     IdleEvent::IdleExpired { generation } => {
@@ -206,13 +206,13 @@ mod tests {
                         if generation != before.generation() {
                             prop_assert!(fx.is_empty(), "stale token must not emit effects");
                         } else if before.refcount() == 0 {
-                            prop_assert_eq!(fx.clone(), vec![IdleEffect::Remove]);
+                            prop_assert_eq!(fx.clone(), vec![IdleEffect::Remove], "current-token expiry at zero must remove");
                         } else {
-                            prop_assert!(fx.is_empty());
+                            prop_assert!(fx.is_empty(), "expiry with holders must not remove");
                         }
                     }
                 }
-                prop_assert_eq!(l.refcount(), holders);
+                prop_assert_eq!(l.refcount(), holders, "refcount must match attaches minus releases");
             }
         }
     }
