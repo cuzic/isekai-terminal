@@ -752,16 +752,20 @@ mod tests {
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
-        let (s, g, at, tok, l) = (0u8..3, 0u8..4, 0u8..3, 0u8..3, 0usize..64);
+        let s = || 0u8..3;
+        let g = || 0u8..4;
+        let at = || 0u8..3;
+        let tok = || 0u8..3;
+        let l = || 0usize..64;
         prop_oneof![
-            4 => (s, g, at).prop_map(|(s, g, at)| Op::Hello { s, g, at }),
-            3 => (l, tok).prop_map(|(l, tok)| Op::TargetConnected { l, tok }),
-            1 => l.prop_map(|l| Op::TargetConnectFailed { l }),
-            3 => (s, g, at, tok).prop_map(|(s, g, at, tok)| Op::Activated { s, g, at, tok }),
-            1 => (s, g, at).prop_map(|(s, g, at)| Op::Cancel { s, g, at }),
-            2 => l.prop_map(|l| Op::LeaseStopped { l }),
-            1 => l.prop_map(|l| Op::PendingExpired { l }),
-            2 => l.prop_map(|l| Op::RelayEnded { l }),
+            4 => (s(), g(), at()).prop_map(|(s, g, at)| Op::Hello { s, g, at }),
+            3 => (l(), tok()).prop_map(|(l, tok)| Op::TargetConnected { l, tok }),
+            1 => l().prop_map(|l| Op::TargetConnectFailed { l }),
+            3 => (s(), g(), at(), tok()).prop_map(|(s, g, at, tok)| Op::Activated { s, g, at, tok }),
+            1 => (s(), g(), at()).prop_map(|(s, g, at)| Op::Cancel { s, g, at }),
+            2 => l().prop_map(|l| Op::LeaseStopped { l }),
+            1 => l().prop_map(|l| Op::PendingExpired { l }),
+            2 => l().prop_map(|l| Op::RelayEnded { l }),
         ]
     }
 
