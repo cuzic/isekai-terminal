@@ -390,6 +390,13 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod18)(uint64_t, in
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD19
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD19
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod19)(uint64_t, RustBuffer, uint64_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
@@ -432,6 +439,7 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod16 _Nonnull onPromptOutputCopyReady;
     UniffiCallbackInterfaceOrchestratorCallbackMethod17 _Nonnull onFilePreviewResult;
     UniffiCallbackInterfaceOrchestratorCallbackMethod18 _Nonnull onForegroundResume;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod19 _Nonnull onConnectionEdge;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -1677,6 +1685,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_fil
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FOREGROUND_RESUME
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_FOREGROUND_RESUME
 uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CONNECTION_EDGE
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CONNECTION_EDGE
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge(void
     
 );
 #endif
