@@ -12,7 +12,7 @@
 - `isekai-pipe connect`(`ssh`のProxyCommand)側で新しい失敗系統を追加・変更するときは、
   「この失敗は`isekai-ssh`のwrapperが自動的にサイレント再bootstrap+再試行できるように
   `ConnectOutcome`を書いているか」を必ず確認する。`isekai-pipe-core::ConnectOutcomeClass`
-  ・`isekai-pipe/src/main.rs::write_connect_outcome_for_wrapper`・
+  ・`isekai-pipe/src/connect.rs::write_connect_outcome_for_wrapper`・
   `isekai-ssh/src/wrapper.rs::run_ssh_with_connect_failure_recovery`が実装本体。
   `run_connect`が失敗する経路である限り(=SSHバイトが一度も流れる前の失敗である限り)、
   新しい失敗理由を追加しても**書き込み自体は自動的にカバーされる**(`write_connect_outcome_for_wrapper`
@@ -65,7 +65,7 @@
 ## 参照実装
 
 - `isekai-pipe-core/src/outcome.rs`: `ConnectOutcomeClass`(`StaleTrust`/`Unreachable`)
-- `isekai-pipe/src/main.rs`: `write_connect_outcome_for_wrapper`
+- `isekai-pipe/src/connect.rs`: `write_connect_outcome_for_wrapper`
 - `isekai-ssh/src/wrapper.rs`: `run_ssh_with_connect_failure_recovery`,
   `decide_connect_failure_recovery`, `outcome_summary`
 - `isekai-pipe/src/engine/resume.rs`: `SessionTable::sweep_expired_parked`,

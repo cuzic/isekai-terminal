@@ -1,0 +1,118 @@
+# 純粋モジュールの登録簿(docs/adr/0019-functional-core-effects.md §2.3)。
+#
+# 検査は2層:
+#   1. clippy disallowed_methods/types(clippy.toml + 各モジュール先頭の #![deny(..)])
+#   2. import allowlist(scripts/check_pure_modules.py): 推移的な不純(不純モジュール経由)を検出
+#
+# パスはすべて rust-core/ からの相対。`module`はそのcrate内のモジュールパス
+# (`crate::`以降、`::`区切り)。
+# crate root(`crate`)をモジュール単位で許可することは禁止(RUNTIMEや秘密を含む型が通るため)。
+# crate rootや不純な項目と値型が同居するモジュールは[[allow_item]]で項目単位に許可する。
+
+[[module]]
+package = "isekai-pipe"
+file = "isekai-pipe/src/engine/attach_arbiter.rs"
+module = "engine::attach_arbiter"
+
+# Step 2a: isekai-pipe serveの単一集約(AttachArbiter + session index)。
+[[module]]
+package = "isekai-pipe"
+file = "isekai-pipe/src/engine/serve_fsm.rs"
+module = "engine::serve_fsm"
+
+[[module]]
+package = "isekai-terminal-core"
+file = "src/rebind_manager.rs"
+module = "rebind_manager"
+
+[[module]]
+package = "isekai-terminal-core"
+file = "src/trzsz.rs"
+module = "trzsz"
+
+[[module]]
+package = "isekai-terminal-core"
+file = "src/net_health_policy.rs"
+module = "net_health_policy"
+
+[[module]]
+package = "isekai-terminal-core"
+file = "src/background_reliability_policy.rs"
+module = "background_reliability_policy"
+
+[[module]]
+package = "isekai-transport"
+file = "isekai-transport/src/path_health_fsm.rs"
+module = "path_health_fsm"
+
+# ── 外部パスの許可リスト(セグメント単位の前方一致) ──────────────────
+[external]
+allow = [
+    "core",
+    "isekai_protocol",
+    "base64",
+    "serde",
+    "timed_fsm",
+    # --- ADR §2.3の初期案に無いが、登録済みモジュールが実際に使うため追加(PR本文に記載) ---
+    "flate2",              # trzsz.rs: zlib圧縮(純粋な計算)
+    "md5",                 # trzsz.rs: ハッシュ計算(純粋な計算)
+    "log",                 # trzsz.rs: ログマクロ。判断には影響しない出力のみ(ADR初期案に無い。要再検討)
+    "std::str",
+    "std::mem",
+    "std::fmt",
+    "std::cmp",
+    "std::ops",
+    "std::iter",
+    "std::convert",
+    "std::num",
+    "std::io::Read",       # trzsz.rs: flate2のtraitメソッド用(I/O型そのものではない)
+    "std::io::Write",
+    "std::time::Duration",
+    "std::collections",
+    "std::sync::Arc",
+    "std::rc::Rc",
+    # 項目単位の外部許可(ADR §6 Step 0 / Q10): 統計値の値型
+    "noq::PathStats",
+]
+# allowより優先して拒否する(時計/タスク実行を持つサブモジュール)
+deny = [
+    "timed_fsm::tokio_support",
+    "timed_fsm::clock",
+]
+
+# ── 項目単位のcrate内許可(理由コメント必須) ─────────────────────────
+# Q10(既定案): path_health.rs(tokio driverを含む不純モジュール)から値判定関数2つだけを許可する。
+[[allow_item]]
+package = "isekai-transport"
+path = "crate::path_health::classify_path_health"
+reason = "純粋な判定関数。path_health.rsはtokio driverを含む不純モジュールなので項目単位で許可(ADR Q10)"
+
+[[allow_item]]
+package = "isekai-transport"
+path = "crate::path_health::has_zero_response"
+reason = "同上"
+
+# 例(未登録・将来のStepで追加): crate rootの公開値型
+# [[allow_item]]
+# package = "isekai-terminal-core"
+# path = "crate::ConnectionIssueHint"
+# reason = "値型のみ"
+
+# ── Effect interpreter登録簿(ADR §3-8 / Step 7a) ───────────────────
+# 登録した関数の本体では、`effect`のenumを`if let`/`let .. else`/`matches!`で選り分けてはならない
+# (明示的な`match`armのみ)。関数には`#[deny(clippy::wildcard_enum_match_arm)]`も付けること。
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "execute_effects"
+effect = "AttachEffect"
+
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "activate"
+effect = "AttachEffect"
+
+# Step 2a: ServeAggregateのin-lock effect interpreter(ソケットマップへの登録/Discard/park格納/RESUME引き渡し)。
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "interpret_in_lock"
+effect = "ServeEffect"

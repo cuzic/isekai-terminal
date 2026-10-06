@@ -1008,8 +1008,19 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&isekai_pipe
     match outcome_class {
         None => ConnectFailureRecoveryAction::NoRecoverableSignal,
         Some(isekai_pipe_core::ConnectOutcomeClass::MidSessionDisconnect) => ConnectFailureRecoveryAction::RetryConnectLightweight,
-        Some(_) if !should_bootstrap => ConnectFailureRecoveryAction::AutoBootstrapDisabled,
-        Some(_) => ConnectFailureRecoveryAction::RebootstrapAndRetry,
+        // Explicit per-variant arms (no `Some(_)` wildcard) so adding a
+        // `ConnectOutcomeClass` forces a conscious recovery decision here
+        // (always-connects, Step 12). `Unknown` must behave like `Unreachable`.
+        Some(
+            isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+            | isekai_pipe_core::ConnectOutcomeClass::Unreachable
+            | isekai_pipe_core::ConnectOutcomeClass::Unknown,
+        ) if !should_bootstrap => ConnectFailureRecoveryAction::AutoBootstrapDisabled,
+        Some(
+            isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+            | isekai_pipe_core::ConnectOutcomeClass::Unreachable
+            | isekai_pipe_core::ConnectOutcomeClass::Unknown,
+        ) => ConnectFailureRecoveryAction::RebootstrapAndRetry,
     }
 }
 
@@ -2671,6 +2682,45 @@ mod tests {
             decide_connect_failure_recovery(Some(&isekai_pipe_core::ConnectOutcomeClass::Unknown), false),
             ConnectFailureRecoveryAction::AutoBootstrapDisabled
         );
+    }
+
+    /// Step 12 exhaustive table. `all_classes()` uses an explicit `match`, so
+    /// adding a `ConnectOutcomeClass` variant fails compilation here.
+    fn all_classes() -> Vec<isekai_pipe_core::ConnectOutcomeClass> {
+        use isekai_pipe_core::ConnectOutcomeClass as C;
+        let probe = C::Unreachable;
+        match probe {
+            C::StaleTrust | C::Unreachable | C::MidSessionDisconnect | C::Unknown => {}
+        }
+        vec![C::StaleTrust, C::Unreachable, C::MidSessionDisconnect, C::Unknown]
+    }
+
+    #[test]
+    fn decide_connect_failure_recovery_exhaustive_table_upholds_always_connects() {
+        use isekai_pipe_core::ConnectOutcomeClass as C;
+        use ConnectFailureRecoveryAction as A;
+        for class in all_classes() {
+            for should_bootstrap in [true, false] {
+                let expected = match (&class, should_bootstrap) {
+                    (C::MidSessionDisconnect, _) => A::RetryConnectLightweight,
+                    (C::StaleTrust | C::Unreachable | C::Unknown, true) => A::RebootstrapAndRetry,
+                    // Exception: the user explicitly opted out of auto-bootstrap.
+                    (C::StaleTrust | C::Unreachable | C::Unknown, false) => A::AutoBootstrapDisabled,
+                };
+                let got = decide_connect_failure_recovery(Some(&class), should_bootstrap);
+                assert_eq!(got, expected, "class {class:?}, should_bootstrap {should_bootstrap}");
+                // Property: a recorded class is never `NoRecoverableSignal`.
+                assert_ne!(got, A::NoRecoverableSignal, "recorded class {class:?} must be recoverable");
+            }
+        }
+        // Exception: no record (ParentGoneSignal, or a remote command that
+        // merely exited non-zero) is the only `NoRecoverableSignal` source.
+        for should_bootstrap in [true, false] {
+            assert_eq!(decide_connect_failure_recovery(None, should_bootstrap), A::NoRecoverableSignal);
+        }
+        // Not expressible here: `Unknown` + remote command is refused
+        // *after* this decision, by a guard duplicated in the Unix and native
+        // loops (non-idempotent command protection); that is Step 6+7's scope.
     }
 
     // Epic R PR2, Task 2.13: live reconnect status formatting.

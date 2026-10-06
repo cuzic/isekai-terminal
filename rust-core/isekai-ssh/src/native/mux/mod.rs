@@ -122,23 +122,13 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
 const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Backoff between `OwnerLost` reconnect attempts — same exponential shape
-/// (no jitter) as `isekai-pipe::resume_loop::RESUME_BACKOFF`, reimplemented
-/// locally rather than depending on `isekai-transport` (whose `BackoffPolicy`
-/// lives in `isekai_transport::backoff`) purely to reuse ~10 lines of pure
-/// math: that crate pulls in `noq`/`quicmux`/`timed-fsm` and the rest of the
-/// QUIC transport stack, none of which `isekai-ssh`'s binary otherwise links
-/// against — not worth the dependency weight for this.
-struct ReconnectBackoff {
-    initial: Duration,
-    max: Duration,
-    /// Fraction in `0.0..=1.0` of random jitter applied on top of the
-    /// exponential delay (ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4) — same
-    /// rationale and shape as `isekai_transport::backoff::BackoffPolicy`'s
-    /// own `jitter` field (not reused directly: this struct exists
-    /// specifically to avoid depending on `isekai-transport`, see its own
-    /// doc comment above). `0.0` disables jitter entirely.
-    jitter: f64,
-}
+/// (±25% jitter, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4) as
+/// `isekai-pipe::resume_loop::RESUME_BACKOFF`, and the very same type:
+/// `isekai-ssh` already links `isekai-transport` via `isekai-pipe-core`, so
+/// the old local copy of the pure math (and its "doesn't link against"
+/// rationale) is gone (docs/adr/0019-functional-core-effects.md Step 6). Draw the
+/// jitter with `next_delay(attempt, seed)`.
+use isekai_transport::backoff::BackoffPolicy as ReconnectBackoff;
 const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.25 };
 
 /// An `OwnerLost` attempt that stayed connected at least this long before
@@ -154,34 +144,6 @@ const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration
 /// failed attempts (each shorter than this) never spuriously resets the
 /// budget that's meant to bound exactly that case.
 const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
-
-impl ReconnectBackoff {
-    fn base_delay(&self, attempt: u32) -> Duration {
-        let shift = attempt.min(32);
-        let multiplier: u64 = 1u64 << shift;
-        let initial_millis = u64::try_from(self.initial.as_millis()).unwrap_or(u64::MAX);
-        let max_millis = u64::try_from(self.max.as_millis()).unwrap_or(u64::MAX);
-        Duration::from_millis(initial_millis.saturating_mul(multiplier).min(max_millis))
-    }
-
-    /// `base_delay` with random jitter applied (mirrors
-    /// `isekai_transport::backoff::BackoffPolicy::delay_for_attempt`) — a
-    /// sleep/resume or a roaming network change wakes every open tab's
-    /// reconnect loop at once, and a jitter-free exponential backoff would
-    /// have them all retry (and silently re-deploy, `native::connect::
-    /// drive_connect_recovery`) on the exact same schedule.
-    fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        use rand::Rng as _;
-        let base = self.base_delay(attempt);
-        if self.jitter <= 0.0 {
-            return base;
-        }
-        let jitter = self.jitter.min(1.0);
-        let factor = 1.0 + rand::thread_rng().gen_range(-jitter..=jitter);
-        let jittered_secs = (base.as_secs_f64() * factor).max(0.0);
-        Duration::from_secs_f64(jittered_secs).min(self.max)
-    }
-}
 
 /// [`run`]'s actual body, generic the same way [`dispatch`] is so it's unit
 /// testable without the concrete Windows named-pipe channel.
@@ -375,7 +337,7 @@ async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: &mut Option
         );
         return ReconnectDecision::GiveUp(crate::EXIT_MUX_OWNER_LOST);
     }
-    let delay = RECONNECT_BACKOFF.delay_for_attempt(*attempt);
+    let delay = RECONNECT_BACKOFF.next_delay(*attempt, rand::random());
     *attempt += 1;
     log_line!("isekai-ssh: reconnecting in {delay:?}...");
     if wait_or_abort(delay).await == WaitOutcome::Aborted {
@@ -1521,8 +1483,8 @@ mod tests {
     fn reconnect_backoff_jitter_stays_within_the_configured_fraction_and_never_exceeds_max() {
         let backoff = ReconnectBackoff { initial: Duration::from_millis(200), max: Duration::from_secs(2), jitter: 0.5 };
         let base = backoff.base_delay(3);
-        for _ in 0..200 {
-            let jittered = backoff.delay_for_attempt(3);
+        for seed in 0..200u64 {
+            let jittered = backoff.next_delay(3, seed);
             assert!(jittered <= backoff.max, "jittered delay must never exceed max");
             let lower = base.mul_f64(0.5);
             let upper = base.min(backoff.max).mul_f64(1.5).min(backoff.max);
@@ -1537,7 +1499,7 @@ mod tests {
     fn reconnect_backoff_zero_jitter_returns_exactly_the_base_delay() {
         let backoff = ReconnectBackoff { initial: Duration::from_millis(50), max: Duration::from_secs(1), jitter: 0.0 };
         for attempt in 0..5 {
-            assert_eq!(backoff.delay_for_attempt(attempt), backoff.base_delay(attempt));
+            assert_eq!(backoff.next_delay(attempt, 99), backoff.base_delay(attempt));
         }
     }
 
@@ -1561,7 +1523,7 @@ mod tests {
         // guard test — `attempt.min(32)` before the `1u64 << shift` is what
         // makes this safe; a regression here would panic in debug builds.
         let backoff = ReconnectBackoff { initial: Duration::from_millis(1), max: Duration::from_secs(1), jitter: 0.0 };
-        assert_eq!(backoff.delay_for_attempt(u32::MAX), backoff.max);
+        assert_eq!(backoff.next_delay(u32::MAX, 1), backoff.max);
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,34 +1,47 @@
-//! Real (I/O-performing) effect executor around [`AttachArbiter`]
-//! (`#18-3`), replacing `engine/mod.rs`'s single `active: Arc<AtomicBool>`
-//! compare-exchange. One [`AttachRuntime`] is created per `isekai-pipe serve`
-//! process (mirrors `active`'s old lifetime) and shared across every
-//! accepted QUIC connection.
+//! Real (I/O-performing) effect executor around [`ServeAggregate`]
+//! (`#18-3`, docs/adr/0019-functional-core-effects.md §6 Step 2a), replacing
+//! `engine/mod.rs`'s single `active: Arc<AtomicBool>` compare-exchange and —
+//! since Step 2a — the separate `SessionTable` lock. One [`AttachRuntime`] is
+//! created per `isekai-pipe serve` process and shared across every accepted
+//! QUIC connection.
 //!
 //! Ownership split, so the pure reducer never touches a socket:
-//! - [`AttachArbiter`] (this crate's `attach_arbiter` module): decides *what*
-//!   should happen.
+//! - [`ServeAggregate`] (`serve_fsm` module: `AttachArbiter` fencing + the
+//!   resume session index): decides *what* should happen.
 //! - [`AttachRuntime`] (this module): does it — spawns the target `TcpStream`
 //!   connect, mints `AttachToken`s, arms/cancels the pending-activation
-//!   timer, and routes `AttachReadyV2`/reject outcomes back to whichever
-//!   connection's `hello()` call is waiting for them (which may be a
-//!   *different* task than the one that ultimately caused the resolution —
-//!   e.g. a superseded attempt's eventual `ConnectTarget` success is reported
-//!   by a background task, not by the connection that is still blocked in
-//!   `hello()`).
+//!   timer, routes `AttachReadyV2`/reject outcomes back to whichever
+//!   connection's `hello()` call is waiting for them, and owns the parked
+//!   target sockets / per-session output buffers ([`SessionIo`]).
+//!
+//! **Locking (ADR §2.4)**: the aggregate *and* the socket map live under one
+//! lock (`core`). [`AttachRuntime::apply_with`] stamps `now` *after*
+//! acquiring it, applies the event, and interprets the in-lock effects
+//! (`RegisterIo`/`Discard`/`StoreParked`/`ResumeGranted`/`RequestPreempt`/
+//! `ResumeRejected`, see [`interpret_in_lock`]) in the same critical section;
+//! out-of-lock effects (`AttachEffect`s, `Notify` wake-ups) run after the
+//! lock is released. `leases`/`waiters` stay separate locks and are never
+//! taken while `core` is held (and vice versa); the per-session
+//! `Arc<Mutex<Session>>` (output buffer hot path) is likewise never locked
+//! while `core` is held.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use isekai_protocol::attach::{AttachKey, AttachRejectReason, AttachToken, ATTACH_TOKEN_LEN};
+use isekai_protocol::Millis;
 use rand::RngCore;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use super::attach_arbiter::{AttachArbiter, AttachEffect, AttachEvent, AttachState, LeaseId, TargetHandleId};
+use super::attach_arbiter::{AttachEffect, AttachState, LeaseId, TargetHandleId};
+use super::resume::Session;
+use super::serve_fsm::{DiscardCause, ServeAggregate, ServeEffect, ServeEvent, SessionKey, TerminateReason};
 
 /// How long a `PendingActivation` lease may wait for `AttachActivate` before
 /// the runtime gives up and closes the target connection
@@ -48,6 +61,10 @@ const PENDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// over the network to `target`.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The target TCP connection of a session whose data stream is gone, kept
+/// for a possible `RESUME`.
+pub type ParkedTcp = (OwnedReadHalf, OwnedWriteHalf);
+
 /// What a `hello()` caller needs in order to build the wire-level
 /// `AttachResponse` — deliberately *not* the full wire type, since
 /// `negotiated_resume_grace_secs` depends on `requested_resume_grace_secs`
@@ -61,6 +78,84 @@ pub enum HelloOutcome {
 enum LeaseResource {
     Connecting { task: JoinHandle<()> },
     PendingTarget { tcp: TcpStream, timer: Option<JoinHandle<()>> },
+}
+
+/// Shell-side resources of one session incarnation (ADR §6 Step 2a). Lives
+/// in the same map, under the same lock, as the aggregate's index entry —
+/// registered by `Activated`'s `RegisterIo`, removed only by the single
+/// `Discard` interpreter ([`discard_io`]).
+pub struct SessionIo {
+    /// The incarnation this entry belongs to; `Discard` matches on
+    /// `(id, lease)` so a late discard never touches a reused session_id.
+    lease: LeaseId,
+    /// Output buffer / committed offset (relay hot path; its own lock, never
+    /// taken while `core` is held).
+    handle: Arc<Mutex<Session>>,
+    parked_tcp: Option<ParkedTcp>,
+    /// Ask the currently-relaying connection to yield (D-2 preemption).
+    preempt: Arc<Notify>,
+    /// Signalled (out-of-lock) whenever `parked_tcp` becomes `Some`.
+    reparked: Arc<Notify>,
+}
+
+/// The single lock's contents: the pure aggregate plus the sockets it
+/// refers to.
+pub(crate) struct ServeCore {
+    agg: ServeAggregate,
+    io: BTreeMap<SessionKey, SessionIo>,
+}
+
+/// Resources a shell call hands to the in-lock interpreter (the reducer's
+/// events are plain data and cannot carry them).
+#[derive(Default)]
+struct Staged {
+    /// For `Activated` → `RegisterIo`.
+    handle: Option<Arc<Mutex<Session>>>,
+    /// For `Parked` → `StoreParked`. Dropped (= TCP closed) after the lock is
+    /// released if the reducer did not accept the park.
+    tcp: Option<ParkedTcp>,
+}
+
+/// A granted `RESUME`: the parked socket *and* that same incarnation's
+/// output buffer handle, handed over together in one apply (ADR §2.2,
+/// round 4 m-R4-1).
+pub struct ResumeGrant {
+    pub lease: LeaseId,
+    pub tcp: ParkedTcp,
+    pub handle: Arc<Mutex<Session>>,
+    pub preempt: Arc<Notify>,
+}
+
+pub enum ResumeDecision {
+    Granted(ResumeGrant),
+    /// The session is actively relaying; the caller should notify
+    /// `preempt`, wait (bounded) on `reparked`, then re-send the request
+    /// exactly once (ADR Q9 default).
+    Preempt { preempt: Arc<Notify>, reparked: Arc<Notify> },
+    Rejected,
+}
+
+/// What the in-lock interpreter produced, for the caller to act on after
+/// releasing the lock.
+#[derive(Default)]
+struct InLockOutcome {
+    attach: Vec<AttachEffect>,
+    discarded: Vec<SessionKey>,
+    wake: Vec<Arc<Notify>>,
+    /// `preempt` of the `SessionIo` registered by this apply (`Activated`).
+    registered: Option<Arc<Notify>>,
+    resume: Option<ResumeDecision>,
+    /// `ResumeGranted` whose `SessionIo` unexpectedly had no parked socket:
+    /// the caller discards that incarnation with a new apply (ADR §2.4-3:
+    /// never nest an apply inside interpretation).
+    orphaned: Option<(SessionKey, LeaseId)>,
+}
+
+/// What `activate()` hands back on success.
+pub struct Activation {
+    pub tcp: TcpStream,
+    pub lease: EstablishedLease,
+    pub preempt: Arc<Notify>,
 }
 
 /// RAII guard over an `Established` fencing slot. `AttachRuntime::activate`
@@ -78,29 +173,37 @@ enum LeaseResource {
 /// task panicked while relaying — `Drop` falls back to releasing the slot
 /// itself, so `.claude/rules/always-connects.md`'s "a missed `relay_ended`
 /// permanently orphans the slot" failure mode degrades to "released a
-/// little late by the Drop fallback" instead.
+/// little late by the Drop fallback" instead. (Since Step 2a, releasing the
+/// slot also discards the session's index entry and parked socket in the
+/// same transition.)
 pub struct EstablishedLease {
     runtime: Arc<AttachRuntime>,
-    lease: Option<LeaseId>,
+    lease: LeaseId,
+    armed: bool,
 }
 
 impl EstablishedLease {
     fn new(runtime: Arc<AttachRuntime>, lease: LeaseId) -> Self {
-        Self { runtime, lease: Some(lease) }
+        Self { runtime, lease, armed: true }
+    }
+
+    /// The incarnation token every later fact about this session carries.
+    pub fn id(&self) -> LeaseId {
+        self.lease
     }
 
     /// The target TCP connection died for good — release the slot now.
     pub async fn release(mut self) {
-        if let Some(lease) = self.lease.take() {
-            self.runtime.relay_ended(lease).await;
+        if std::mem::take(&mut self.armed) {
+            self.runtime.relay_ended(self.lease).await;
         }
     }
 
-    /// The data stream died but the target TCP is still alive and parked
-    /// for a possible `RESUME` — the slot must stay `Established`, so
-    /// consume this guard without releasing.
+    /// The data stream died but the target TCP is still alive and is about
+    /// to be parked for a possible `RESUME` — the slot must stay
+    /// `Established`, so consume this guard without releasing.
     pub fn keep(mut self) {
-        self.lease = None;
+        self.armed = false;
     }
 }
 
@@ -111,10 +214,12 @@ impl Drop for EstablishedLease {
     /// avoid) and never awaits directly (`relay_ended` is async; `Drop`
     /// isn't). If no tokio runtime is reachable (e.g. this guard outlives
     /// the runtime during process shutdown), the slot simply can't be
-    /// released here — logged so it's visible, left to the existing
-    /// `sweep_expired_parked` backstop.
+    /// released here — logged so it's visible.
     fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else { return };
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        let lease = self.lease;
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             log::warn!(
                 "EstablishedLease dropped outside a tokio runtime; lease {lease:?} could not be released"
@@ -133,37 +238,85 @@ impl Drop for EstablishedLease {
 }
 
 pub struct AttachRuntime {
-    arbiter: Mutex<AttachArbiter>,
+    core: Mutex<ServeCore>,
     leases: Mutex<HashMap<LeaseId, LeaseResource>>,
     waiters: Mutex<HashMap<AttachKey, oneshot::Sender<HelloOutcome>>>,
     next_target_id: AtomicU64,
     target: SocketAddr,
+    /// Epoch of this shell's `Millis` (ADR §2.2). `tokio::time::Instant`, so
+    /// it follows the paused clock in `start_paused` tests.
+    epoch: tokio::time::Instant,
 }
 
 impl AttachRuntime {
-    pub fn new(target: SocketAddr) -> Arc<Self> {
+    /// `max_sessions`: `--max-sessions` (Phase S-4b) — the table-side cap
+    /// `Activated` enforces by evicting the oldest parked session (or
+    /// registering the new one as unresumable), and the admission cap
+    /// `engine/mod.rs::admit_new_session` compares `session_count()` with.
+    pub fn new(target: SocketAddr, max_sessions: usize) -> Arc<Self> {
         Arc::new(Self {
-            arbiter: Mutex::new(AttachArbiter::new()),
+            core: Mutex::new(ServeCore { agg: ServeAggregate::new(max_sessions), io: BTreeMap::new() }),
             leases: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             next_target_id: AtomicU64::new(0),
             target,
+            epoch: tokio::time::Instant::now(),
         })
+    }
+
+    /// The only place this shell reads the clock (ADR §2.2); called only
+    /// from inside [`Self::apply_with`], after the lock is acquired, so the
+    /// `now`s entering the aggregate are monotone.
+    fn stamp(&self) -> Millis {
+        Millis(u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Acquire the aggregate lock, stamp `now`, apply, interpret the in-lock
+    /// effects, release the lock, then run the out-of-lock wake-ups. The
+    /// caller runs the returned `attach` effects (`execute_effects`, or
+    /// `activate`'s own interpreter).
+    async fn apply_with(&self, make: impl FnOnce(Millis) -> ServeEvent, mut staged: Staged) -> InLockOutcome {
+        let mut out = {
+            let mut core = self.core.lock().await;
+            let now = self.stamp();
+            let event = make(now);
+            let ServeCore { agg, io } = &mut *core;
+            let effects = agg.apply(event);
+            interpret_in_lock(io, effects, &mut staged)
+        };
+        // Lock released. Anything the reducer did not take (e.g. a socket
+        // whose park was stale) is dropped here — closing it.
+        drop(staged);
+        for notify in std::mem::take(&mut out.wake) {
+            notify.notify_waiters();
+        }
+        out
+    }
+
+    /// Applies an event that only ever yields `AttachEffect`s and executes them.
+    async fn apply_and_execute(self: &Arc<Self>, event: ServeEvent) -> InLockOutcome {
+        let mut out = self.apply_with(move |_| event, Staged::default()).await;
+        self.execute_effects(std::mem::take(&mut out.attach)).await;
+        out
+    }
+
+    pub async fn max_sessions(&self) -> usize {
+        self.core.lock().await.agg.max_sessions()
     }
 
     /// Whether the arbiter currently holds no session at all — used for the
     /// `--max-idle-lifetime` monitor, mirroring `active.load(..)`'s old role
     /// (self-terminate only once nothing is attached/attaching/established).
     pub async fn is_vacant(&self) -> bool {
-        self.arbiter.lock().await.session_count() == 0
+        self.core.lock().await.agg.arbiter().session_count() == 0
     }
 
     /// How many sessions currently hold a slot (connecting, pending, or
-    /// established/parked) — used by `engine/mod.rs`'s Epic N-5 admission
-    /// control to decide whether a brand-new `session_id` fits under
-    /// `--max-sessions` without needing to evict anything first.
+    /// established/parked/unresumable) — used by `engine/mod.rs`'s Epic N-5
+    /// admission control to decide whether a brand-new `session_id` fits
+    /// under `--max-sessions` without needing to evict anything first.
     pub async fn session_count(&self) -> usize {
-        self.arbiter.lock().await.session_count()
+        self.core.lock().await.agg.arbiter().session_count()
     }
 
     /// Whether `session_id` already holds a slot (of any kind) — a
@@ -171,20 +324,20 @@ impl AttachRuntime {
     /// never counts against the `--max-sessions` admission check, only a
     /// genuinely new `session_id` does.
     pub async fn has_session(&self, session_id: isekai_protocol::SessionId) -> bool {
-        self.arbiter.lock().await.has_session(session_id)
+        self.core.lock().await.agg.arbiter().has_session(session_id)
     }
 
-    /// The lease currently backing `session_id`'s `Established` slot, if any
-    /// — `RESUME` (a wire family entirely separate from ATTACH v2) uses this
-    /// to confirm it is reattaching to the session that actually occupies
-    /// the slot, without itself going through `HelloReceived`/fencing at all
-    /// (module docs: resuming the *same* session is never a fencing
-    /// conflict, since the whole point of `RESUME` is that it already won
-    /// its round).
+    /// The lease currently backing `session_id`'s `Established` slot, if any.
+    /// A read-only query; `RESUME` no longer uses it to decide anything (the
+    /// decision is `ResumeRequested`, resolved atomically in one apply).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn established_lease_for(&self, session_id: isekai_protocol::SessionId) -> Option<LeaseId> {
-        match self.arbiter.lock().await.state_for(session_id) {
+        match self.core.lock().await.agg.arbiter().state_for(session_id) {
             Some(AttachState::Established { lease, .. }) => Some(*lease),
-            _ => None,
+            Some(AttachState::Connecting { .. })
+            | Some(AttachState::PendingActivation { .. })
+            | Some(AttachState::ClosingForSupersede { .. })
+            | None => None,
         }
     }
 
@@ -195,61 +348,152 @@ impl AttachRuntime {
     pub async fn hello(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(key, tx);
-        let effects = self.arbiter.lock().await.apply(AttachEvent::HelloReceived { key });
-        self.execute_effects(effects).await;
+        self.apply_and_execute(ServeEvent::Hello { key }).await;
         rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
     }
 
     /// Applies `AttachActivate`; on success (the activation matched the
-    /// current `PendingActivation` lease), returns the target `TcpStream`
-    /// the connection task should now relay through — ownership fully
-    /// transfers out of this runtime's bookkeeping at this point — paired
-    /// with an [`EstablishedLease`] minted at exactly this transition
-    /// (the arbiter has just moved this session to `Established`, per
-    /// `AttachArbiter::on_activated`).
-    pub async fn activate(self: &Arc<Self>, key: AttachKey, attach_token: AttachToken) -> Option<(TcpStream, EstablishedLease)> {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::Activated { key, attach_token });
-        for effect in effects {
-            if let AttachEffect::StartRelay { lease, .. } = effect {
-                if let Some(LeaseResource::PendingTarget { tcp, timer }) = self.leases.lock().await.remove(&lease) {
-                    if let Some(timer) = timer {
-                        timer.abort();
+    /// current `PendingActivation` lease) the session is registered in the
+    /// resume index **in the same apply** (with `handle` as its output
+    /// buffer; evicting the oldest parked session first if the table is
+    /// full, or registering it unresumable if nothing can be evicted), and
+    /// this returns the target `TcpStream` the connection task should now
+    /// relay through, paired with an [`EstablishedLease`] minted at exactly
+    /// this transition and the session's `preempt` signal.
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub async fn activate(
+        self: &Arc<Self>,
+        key: AttachKey,
+        attach_token: AttachToken,
+        negotiated_grace_secs: Option<u32>,
+        handle: Arc<Mutex<Session>>,
+    ) -> Option<Activation> {
+        let out = self
+            .apply_with(
+                move |_| ServeEvent::Activated { key, attach_token, negotiated_grace_secs },
+                Staged { handle: Some(handle), tcp: None },
+            )
+            .await;
+        let mut started = None;
+        // Effect interpreter: every `AttachEffect` variant is listed explicitly
+        // (docs/adr/0019-functional-core-effects.md §3-8, Step 7a) so adding a new effect
+        // forces a decision here instead of being silently dropped. (The
+        // in-lock `ServeEffect`s — `RegisterIo`, an eviction's `Discard` — were
+        // already interpreted by `interpret_in_lock`.)
+        for effect in out.attach {
+            match effect {
+                AttachEffect::StartRelay { lease, .. } => {
+                    if started.is_none() {
+                        let resource = self.leases.lock().await.remove(&lease);
+                        match resource {
+                            Some(LeaseResource::PendingTarget { tcp, timer }) => {
+                                if let Some(timer) = timer {
+                                    timer.abort();
+                                }
+                                let preempt = out.registered.clone().unwrap_or_else(|| Arc::new(Notify::new()));
+                                started =
+                                    Some(Activation { tcp, lease: EstablishedLease::new(self.clone(), lease), preempt });
+                            }
+                            Some(LeaseResource::Connecting { task }) => {
+                                // Not reachable (Activated requires PendingActivation,
+                                // i.e. the connect already finished); never leave an
+                                // Established slot without a guard.
+                                task.abort();
+                                log::warn!("attach_runtime: StartRelay for a lease still connecting; releasing it");
+                                self.relay_ended(lease).await;
+                            }
+                            None => {
+                                log::warn!("attach_runtime: StartRelay without a pending target; releasing it");
+                                self.relay_ended(lease).await;
+                            }
+                        }
                     }
-                    return Some((tcp, EstablishedLease::new(self.clone(), lease)));
+                }
+                AttachEffect::ConnectTarget { .. }
+                | AttachEffect::CancelLease { .. }
+                | AttachEffect::SendReady { .. }
+                | AttachEffect::SendReject { .. }
+                | AttachEffect::SchedulePendingTimeout { .. } => {
+                    // `on_activated` currently only emits `StartRelay`; reaching
+                    // this arm means the reducer grew a new effect for
+                    // `Activated` that this interpreter must now handle.
+                    log::warn!("attach_runtime: unexpected non-StartRelay effect from Activated in activate()");
                 }
             }
         }
-        None
+        started
     }
 
-    /// Mints an [`EstablishedLease`] for a lease already known to be
-    /// `Established` — used by the `RESUME` path, which reattaches to a
-    /// slot `hello()`/`activate()` established on a *previous* connection
-    /// (`established_lease_for` looked it up) rather than transitioning it
-    /// itself. Callers must only call this once the slot is genuinely about
-    /// to be relayed through again (right before `relay_buffered`, after
-    /// every earlier repark-and-return path) — see `engine/mod.rs`'s
-    /// `handle_resume_stream` for why minting this too early would let a
-    /// guard dropped on a rejected/reparked `RESUME` wrongly release a slot
-    /// that must stay `Established`.
+    /// Mints an [`EstablishedLease`] for the lease a granted `RESUME` returned
+    /// (`ResumeGrant::lease`). Callers must only call this once the slot is
+    /// genuinely about to be relayed through again (right before
+    /// `relay_buffered`, after every earlier repark-and-return path) — see
+    /// `engine/mod.rs`'s `handle_resume_stream` for why minting this too
+    /// early would let a guard dropped on a rejected/reparked `RESUME`
+    /// wrongly release a slot that must stay `Established`.
     pub fn resumed_lease(self: &Arc<Self>, lease: LeaseId) -> EstablishedLease {
         EstablishedLease::new(self.clone(), lease)
     }
 
     pub async fn cancel(self: &Arc<Self>, key: AttachKey) {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::CancelReceived { key });
-        self.execute_effects(effects).await;
+        self.apply_and_execute(ServeEvent::CancelReceived { key }).await;
     }
 
     /// The connection task that reached `Established` calls this once its
     /// relay loop actually ends *for good* (target TCP died — not merely
-    /// parked for a possible resume, which leaves the arbiter `Established`
-    /// so a matching `RESUME` can still find its slot).
+    /// parked for a possible resume). Since Step 2a this releases the
+    /// fencing slot **and** discards the session's index entry in one
+    /// transition (ADR I-j).
     pub async fn relay_ended(self: &Arc<Self>, lease: LeaseId) {
-        let effects = self.arbiter.lock().await.apply(AttachEvent::RelayEnded { lease });
-        self.execute_effects(effects).await;
+        self.apply_and_execute(ServeEvent::RelayEnded { lease }).await;
     }
 
+    /// Fact: the relay of incarnation `lease` of `id` ended without parking.
+    /// Idempotent (a no-op if that incarnation is already gone).
+    pub async fn relay_terminated(self: &Arc<Self>, id: SessionKey, lease: LeaseId, reason: TerminateReason) {
+        self.apply_and_execute(ServeEvent::RelayTerminated { id, lease, reason }).await;
+    }
+
+    /// Fact: incarnation `lease` of `id` lost its data stream (or yielded to
+    /// a preemption) and `tcp` is still alive. The reducer either accepts the
+    /// park (the socket is stored and `reparked` is signalled), discards the
+    /// session (`Unresumable` — fencing slot released, socket closed), or
+    /// ignores a stale lease (socket closed).
+    pub async fn park(self: &Arc<Self>, id: SessionKey, lease: LeaseId, tcp: ParkedTcp) {
+        let mut out =
+            self.apply_with(move |now| ServeEvent::Parked { id, lease, now }, Staged { handle: None, tcp: Some(tcp) }).await;
+        self.execute_effects(std::mem::take(&mut out.attach)).await;
+    }
+
+    /// Discards every parked session whose park is at least `max_parked`
+    /// old (or its negotiated grace, if shorter) — judging and removing in
+    /// **one** apply, so a concurrent `RESUME` can never unpark a session in
+    /// between (the sweep×RESUME TOCTOU, ADR §4.1). The fencing slot of each
+    /// discarded session is released in the same transition. Returns the
+    /// discarded ids (for logging/tests only — nothing else to do with them).
+    pub async fn sweep_expired_parked(self: &Arc<Self>, max_parked: Duration) -> Vec<SessionKey> {
+        let mut out = self.apply_with(move |now| ServeEvent::Sweep { now, max_parked }, Staged::default()).await;
+        self.execute_effects(std::mem::take(&mut out.attach)).await;
+        out.discarded
+    }
+
+    /// Evicts the globally oldest parked session (tie-break `(parked_since,
+    /// id)`) to make room for a brand-new session at admission time (Epic
+    /// N-5; formerly `SessionTable::claim_oldest_parked` + `release_slot_for`).
+    pub async fn evict_oldest_parked(self: &Arc<Self>) -> Option<SessionKey> {
+        self.apply_and_execute(ServeEvent::EvictOldestParked).await.discarded.into_iter().next()
+    }
+
+    /// `RESUME` for `id`, resolved in one apply (ADR §2.2 R3-2 / I-i).
+    pub async fn resume_request(self: &Arc<Self>, id: SessionKey) -> ResumeDecision {
+        let out = self.apply_and_execute(ServeEvent::ResumeRequested { id }).await;
+        if let Some((orphan_id, lease)) = out.orphaned {
+            self.relay_terminated(orphan_id, lease, TerminateReason::GuardDropped).await;
+        }
+        out.resume.unwrap_or(ResumeDecision::Rejected)
+    }
+
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn execute_effects<'a>(
         self: &'a Arc<Self>,
         effects: Vec<AttachEffect>,
@@ -299,24 +543,18 @@ impl AttachRuntime {
                     rand::rngs::OsRng.fill_bytes(&mut token_bytes);
                     let attach_token = AttachToken::new(token_bytes);
                     this.leases.lock().await.insert(lease, LeaseResource::PendingTarget { tcp, timer: None });
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnected {
-                        lease,
-                        target: target_id,
-                        attach_token,
-                    });
-                    this.execute_effects(effects).await;
+                    this.apply_and_execute(ServeEvent::TargetConnected { lease, target: target_id, attach_token })
+                        .await;
                 }
                 Ok(Err(e)) => {
                     log::info!("attach_runtime: target connect failed for lease {lease:?}: {e}");
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
-                    this.execute_effects(effects).await;
+                    this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
                 }
                 Err(_elapsed) => {
                     log::info!(
                         "attach_runtime: target connect timed out after {TARGET_CONNECT_TIMEOUT:?} for lease {lease:?}"
                     );
-                    let effects = this.arbiter.lock().await.apply(AttachEvent::TargetConnectFailed { lease });
-                    this.execute_effects(effects).await;
+                    this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
                 }
             }
         });
@@ -329,16 +567,14 @@ impl AttachRuntime {
             Some(LeaseResource::Connecting { task }) => {
                 task.abort();
                 let _ = task.await;
-                let effects = self.arbiter.lock().await.apply(AttachEvent::LeaseStopped { lease });
-                self.execute_effects(effects).await;
+                self.apply_and_execute(ServeEvent::LeaseStopped { lease }).await;
             }
             Some(LeaseResource::PendingTarget { tcp, timer }) => {
                 if let Some(timer) = timer {
                     timer.abort();
                 }
                 drop(tcp);
-                let effects = self.arbiter.lock().await.apply(AttachEvent::LeaseStopped { lease });
-                self.execute_effects(effects).await;
+                self.apply_and_execute(ServeEvent::LeaseStopped { lease }).await;
             }
             None => {}
         }
@@ -353,12 +589,160 @@ impl AttachRuntime {
         let this = self.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(PENDING_ACTIVATION_TIMEOUT).await;
-            let effects = this.arbiter.lock().await.apply(AttachEvent::PendingExpired { lease });
-            this.execute_effects(effects).await;
+            this.apply_and_execute(ServeEvent::PendingExpired { lease }).await;
         });
         match self.leases.lock().await.get_mut(&lease) {
             Some(LeaseResource::PendingTarget { timer: slot, .. }) => *slot = Some(timer),
             _ => timer.abort(),
         }
+    }
+}
+
+/// **The** `Discard` interpreter (ADR §6 Step 2a): one place, idempotent,
+/// matched on `(id, lease)` — a different lease means a different
+/// incarnation of a reused session_id, which must not be touched (same
+/// policy as `AttachArbiter::on_relay_ended` ignoring an absent lease).
+/// Dropping the `SessionIo` closes its parked target TCP, if any. The
+/// fencing slot was already released by the same apply's state transition.
+fn discard_io(io: &mut BTreeMap<SessionKey, SessionIo>, id: SessionKey, lease: LeaseId) -> bool {
+    if io.get(&id).is_some_and(|slot| slot.lease == lease) {
+        drop(io.remove(&id));
+        true
+    } else {
+        false
+    }
+}
+
+/// In-lock interpreter for [`ServeEffect`] (ADR §2.4-2, §3-8): runs inside
+/// `apply_with`'s critical section, touches only the socket map guarded by
+/// the same lock, never awaits, never takes another lock.
+#[deny(clippy::wildcard_enum_match_arm)]
+fn interpret_in_lock(
+    io: &mut BTreeMap<SessionKey, SessionIo>,
+    effects: Vec<ServeEffect>,
+    staged: &mut Staged,
+) -> InLockOutcome {
+    let mut out = InLockOutcome::default();
+    for effect in effects {
+        match effect {
+            ServeEffect::Attach(attach) => out.attach.push(attach),
+            ServeEffect::RegisterIo { id, lease, unresumable } => {
+                if unresumable {
+                    log::warn!(
+                        "session table full and no parked session to evict (all sessions active): session_id={} \
+                         will not be resumable if its data stream drops",
+                        super::hex_lower(&id)
+                    );
+                }
+                if let Some(handle) = staged.handle.take() {
+                    let preempt = Arc::new(Notify::new());
+                    io.insert(
+                        id,
+                        SessionIo {
+                            lease,
+                            handle,
+                            parked_tcp: None,
+                            preempt: preempt.clone(),
+                            reparked: Arc::new(Notify::new()),
+                        },
+                    );
+                    out.registered = Some(preempt);
+                } else {
+                    log::error!("attach_runtime: RegisterIo without a staged session handle");
+                }
+            }
+            ServeEffect::Discard { id, lease, cause } => {
+                if discard_io(io, id, lease) {
+                    match cause {
+                        DiscardCause::Expired => {
+                            log::info!("session {} expired while parked, discarded", super::hex_lower(&id));
+                        }
+                        DiscardCause::Evicted => {
+                            log::warn!(
+                                "session table full, evicted oldest parked session {}",
+                                super::hex_lower(&id)
+                            );
+                        }
+                        DiscardCause::TcpDied => {}
+                        DiscardCause::GuardDropped => {
+                            log::warn!("session {} discarded by its guard's Drop fallback", super::hex_lower(&id));
+                        }
+                        DiscardCause::Unresumable => {
+                            log::info!(
+                                "session {} lost its data stream but is unresumable (registered over capacity); \
+                                 discarding and releasing its slot",
+                                super::hex_lower(&id)
+                            );
+                        }
+                    }
+                }
+                out.discarded.push(id);
+            }
+            ServeEffect::StoreParked { id, lease } => {
+                let accepted = match io.get_mut(&id) {
+                    Some(slot) if slot.lease == lease => match staged.tcp.take() {
+                        Some(tcp) => {
+                            slot.parked_tcp = Some(tcp);
+                            out.wake.push(slot.reparked.clone());
+                            true
+                        }
+                        None => false,
+                    },
+                    Some(_) | None => false,
+                };
+                if !accepted {
+                    log::error!("attach_runtime: StoreParked for {} found no matching SessionIo/socket", super::hex_lower(&id));
+                }
+            }
+            ServeEffect::ResumeGranted { id, lease } => {
+                let grant = match io.get_mut(&id) {
+                    Some(slot) if slot.lease == lease => slot.parked_tcp.take().map(|tcp| ResumeGrant {
+                        lease,
+                        tcp,
+                        handle: slot.handle.clone(),
+                        preempt: slot.preempt.clone(),
+                    }),
+                    Some(_) | None => None,
+                };
+                match grant {
+                    Some(grant) => out.resume = Some(ResumeDecision::Granted(grant)),
+                    None => {
+                        log::error!("attach_runtime: ResumeGranted for {} without a parked socket", super::hex_lower(&id));
+                        out.orphaned = Some((id, lease));
+                        out.resume = Some(ResumeDecision::Rejected);
+                    }
+                }
+            }
+            ServeEffect::RequestPreempt { id, lease } => {
+                out.resume = Some(match io.get(&id) {
+                    Some(slot) if slot.lease == lease => {
+                        ResumeDecision::Preempt { preempt: slot.preempt.clone(), reparked: slot.reparked.clone() }
+                    }
+                    Some(_) | None => ResumeDecision::Rejected,
+                });
+            }
+            ServeEffect::ResumeRejected { .. } => out.resume = Some(ResumeDecision::Rejected),
+        }
+    }
+    out
+}
+
+// テスト専用のフック(本番の挙動は変えない)。
+#[cfg(test)]
+impl AttachRuntime {
+    /// Holds the aggregate lock so a test can queue other tasks behind it
+    /// (tokio's `Mutex` is FIFO-fair) and release them in a known order.
+    pub(crate) async fn lock_core_for_test(&self) -> tokio::sync::MutexGuard<'_, ServeCore> {
+        self.core.lock().await
+    }
+
+    pub(crate) async fn index_contains(&self, id: &SessionKey) -> bool {
+        self.core.lock().await.agg.index_entry(id).is_some()
+    }
+
+    pub(crate) async fn is_parked(&self, id: &SessionKey) -> bool {
+        let core = self.core.lock().await;
+        core.agg.index_entry(id).is_some_and(|e| e.parked_since.is_some())
+            && core.io.get(id).is_some_and(|s| s.parked_tcp.is_some())
     }
 }

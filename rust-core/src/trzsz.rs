@@ -1,3 +1,6 @@
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
+// 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 use std::collections::VecDeque;
 use std::time::Duration;
 use base64::Engine;
@@ -750,6 +753,7 @@ fn parse_trzsz_trigger(bytes: &[u8]) -> Option<TrzszDetection> {
 // ── Golden Tests ─────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use proptest::prelude::*;
     use super::*;

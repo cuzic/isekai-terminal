@@ -16,6 +16,9 @@
 //! パターン)の役目。疎通確認・実際の rebind 実行・fd 取得などの実I/Oも
 //! すべて Driver 側が持つ trait 実装(`WifiProbeExecutor`/`RebindExecutor`/
 //! `PlatformFdSource`)を介して行われ、この型自身は一切呼び出さない。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
+// 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
 use timed_fsm::{Response, TimedStateMachine};
@@ -381,6 +384,7 @@ impl TimedStateMachine for RebindManager {
 // ── テスト ───────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use timed_fsm::TimerCommand;

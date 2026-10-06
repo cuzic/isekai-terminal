@@ -1,5 +1,18 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/deny-agent-merge.py\" || exit 0; python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/deny-agent-merge.py\"",
+            "timeout": 10,
+            "statusMessage": "worktreeエージェントの権限チェック"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit",

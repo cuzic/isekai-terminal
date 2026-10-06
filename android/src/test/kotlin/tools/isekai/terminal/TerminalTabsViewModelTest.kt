@@ -6,6 +6,7 @@ import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -1167,6 +1168,25 @@ class TerminalTabsViewModelTest {
 
     // ── 項目2: OEMバッテリー最適化への案内UI ──────────────────────────
 
+    /**
+     * 新鮮なKEY認証レコードからの黙示的復元([TerminalTabsViewModel.restorePersistedReattachTabs])
+     * が最後まで走り切った(=復元タブが作られた)ことを待つ。
+     *
+     * 以前は`store.load()`が空になるまでポーリングしていたが、復元処理は`reattachStore.clear()`
+     * の直後に`openTab()`→`persistReattachRecord()`で**新しいtabIdのレコードを書き戻す**ため、
+     * 「storeが空」は一瞬しか成立しない過渡状態だった。Roomのスレッドが先に`findById`→
+     * `openTab`→upsertまで進むと、テスト側が空を一度も観測できず`withTimeout(3000)`が
+     * 必ずタイムアウトしていた(CI 2026-10-06 run 37431485334 / 37435568297 attempt 3、
+     * cleanShutdownMarkerPresent_doesNotCountAsUnexpectedKill)。
+     *
+     * 復元タブの出現は同じコルーチン内で`checkBatteryGuidance()`より後に起きる安定した
+     * 終端状態なので、これを待てばバッテリー案内の判定(ポリシー呼び出し・カウンタ更新)が
+     * 既に完了していることが保証され、追加の`delay()`は不要になる。
+     */
+    private suspend fun awaitImplicitReattachCompleted(vm2: TerminalTabsViewModel) {
+        withTimeout(3000) { vm2.tabs.first { it.isNotEmpty() } }
+    }
+
     private fun clearBatteryGuidancePrefs() {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
         ctx.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE).edit().clear().apply()
@@ -1209,8 +1229,7 @@ class TerminalTabsViewModelTest {
 
         val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { false })
 
-        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
-        delay(300)
+        awaitImplicitReattachCompleted(vm2)
         assertTrue(!vm2.showBatteryGuidance.value)
     }
 
@@ -1229,8 +1248,7 @@ class TerminalTabsViewModelTest {
         var policyCalled = false
         val vm2 = newViewModel(store, batteryGuidancePolicy = BatteryGuidancePolicy { policyCalled = true; true })
 
-        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
-        delay(300)
+        awaitImplicitReattachCompleted(vm2)
         assertTrue("clean shutdown must not be counted as an unexpected kill", !policyCalled)
         assertEquals(0, tools.isekai.terminal.data.BatteryGuidanceSettings.unexpectedKillCount(ctx))
         assertTrue(!vm2.showBatteryGuidance.value)
