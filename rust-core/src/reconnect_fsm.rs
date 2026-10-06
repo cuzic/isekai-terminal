@@ -5,9 +5,10 @@
 //!
 //! `OrchestratorState`(`orchestrator.rs`)は`reconnect: ReconnectState`を**フィールドとして**
 //! 持つ。別ストアではなく、所有者は常に`OrchestratorState`1つ(ADR §4.3、`rust-ssot.md`)。
-//! Step 3aの時点では集約の**定義**は全体だが、`apply`経由に移行した遷移は下の
-//! 「3aの範囲」だけで、それ以外の書き手(`begin_connect`・`cancel_reconnect`・
+//! Step 3aの時点では集約の**定義**は全体だが、`apply`経由に移行した遷移は下表の
+//! 「`apply`経由か」が「はい」のものだけで、それ以外の書き手(`cancel_reconnect`・
 //! バックグラウンド系・ループのタイムアウト等)は従来どおり`pub(crate)`フィールドを直接書く。
+//! ただし**`phase`の書き手はStep 8a′ですべて`apply`経由**になった(下の「接続エッジ」参照)。
 //!
 //! `session_generation`(古いアダプタからの遅延コールバックを捨てる世代カウンタ)は
 //! **この集約に含めない**。`reconnect_epoch`(ループの生存確認)とは別物で、統合すると
@@ -24,11 +25,13 @@
 //! | `OrchestratorAdapter::on_connected` | [`ReconnectEvent::AttemptConnected`] | はい |
 //! | `OrchestratorAdapter::on_disconnected` → `handle_unexpected_disconnect` | [`ReconnectEvent::AttemptDisconnected`] | はい |
 //! | `apply_network_lost`(debounce満了) → `handle_unexpected_disconnect` | `AttemptDisconnected{generation: 現行, kind: NetworkLost}` | はい(同じ遷移) |
-//! | `OrchestratorAdapter::new` | [`ReconnectEvent::SessionCreated`] | はい(3aでは定義のみ=no-op、8a′でedge判定) |
+//! | `OrchestratorAdapter::new` | [`ReconnectEvent::SessionCreated`] | はい(8a′: 別世代のedgeが開いていれば`Lost(old)`) |
+//! | `connect_via`(再接続ループの試行・フォアグラウンド復帰) | [`ReconnectEvent::ReconnectSessionStarting`] | はい(8a′、→Connecting) |
+//! | フォアグラウンド復帰の再接続の同期失敗 | [`ReconnectEvent::ForegroundReconnectFailedSync`] | はい(8a′、→Idle) |
 //! | 再接続ループのネットワークwake | [`ReconnectEvent::ReconnectWake`] | はい(rev6: `pending_wake`) |
 //! | 再接続ループのtick | [`ReconnectEvent::ReconnectTick`] | はい(`due`はshellが計算。tick会計は3b/3c) |
 //! | 再接続ループの同期エラー | [`ReconnectEvent::AttemptFailedSync`] | はい |
-//! | `begin_connect` | `ManualConnectStarted{attempt}` | いいえ(未移行、フィールド直接書き) |
+//! | `begin_connect` | [`ReconnectEvent::ManualConnectStarted`] | はい(8a′、→Connecting) |
 //! | `disconnect` | `UserDisconnect` | いいえ |
 //! | `cancel_reconnect` | `CancelReconnect` | いいえ |
 //! | `notify_did_enter_background` | `EnteredBackground{budget_ms}` | いいえ |
@@ -49,6 +52,27 @@
 //! spawnし、tickごとに[`ReconnectEvent::ReconnectTick`]`{epoch}`を戻す)にあたり、
 //! 非現行epochの`ReconnectTick`/`ReconnectWake`/`AttemptFailedSync`はStateを変えず
 //! Effectも返さない(proptestで検証)。
+//!
+//! ## 接続エッジ(ADR §6 Step 8a′)
+//!
+//! Kotlin/Swiftが`ConnectionPublicState`の変化から「未接続→接続」「接続→未接続」の
+//! エッジを自前のミラー状態(`prevConnected`)で検出する代わりに、このreducerが
+//! 世代(`session_generation`)付きのエッジを明示的に出す
+//! ([`ReconnectEffect::EdgeEstablished`]/[`ReconnectEffect::EdgeLost`]。shellが
+//! `OrchestratorCallback::on_connection_edge`として公開する)。
+//!
+//! - `Established(g)`: 世代`g`の`AttemptConnected`で、まだその世代以降のエッジを出していなければ出す
+//!   (同一世代の`AttemptConnected`重複ではエッジを出し直さない)。
+//! - `Lost(g)`: 特定のEventではなく**phase遷移**で定義する(round 3 R3-1)。`edge_open == Some(g)`の
+//!   まま`phase`をConnectedから他の値へ動かすapplyは、**同じapplyで**`Lost(g)`を出し`edge_open`を
+//!   `None`にする(`ReconnectState::set_phase`が唯一の実装)。phaseの書き手5箇所
+//!   (`on_connected`・`handle_unexpected_disconnect`・`connect_via`・`begin_connect`・
+//!   フォアグラウンド復帰の同期失敗)はすべて`apply`経由なので、この定義は経路に依らず成り立つ。
+//! - `SessionCreated`は、phase遷移を伴わずに新しいセッションが作られる経路が将来できた場合の保険
+//!   (別世代のedgeが開いていれば`Lost(old)`)。現状の2経路(`begin_connect`/`connect_via`)では、
+//!   直前のphase遷移のapplyで既に`Lost(old)`が出ているので何も出さない。
+//! - 不変条件(proptest): 任意のEvent列で「各`g`について`Established(g)`は高々1回、その後
+//!   `Established(g'>g)`より前に`Lost(g)`が正確に1回」。
 // 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -179,6 +203,12 @@ pub(crate) struct ReconnectState {
     /// 起動できる。shell側`OrchestratorState::last_connect_attempt`と常に同時に書く
     /// (`OrchestratorState::set_last_connect_attempt`)。
     pub(crate) last_attempt: Option<AttemptRef>,
+    /// Step 8a′: `Established(g)`を出してまだ`Lost(g)`を出していない世代。phaseをConnected以外へ
+    /// 動かす遷移は必ずこれを閉じる(`ReconnectState::set_phase`)ので、`Some`の間は`phase == Connected`。
+    pub(crate) edge_open: Option<u64>,
+    /// Step 8a′: 最後に`Established`を出した世代。これ以下の世代には`Established`を出し直さない
+    /// (「各世代について`Established`は高々1回」を、遅延・重複した`AttemptConnected`に対しても守る)。
+    pub(crate) last_established: Option<u64>,
 }
 
 impl Default for ReconnectState {
@@ -192,6 +222,8 @@ impl Default for ReconnectState {
             user_initiated_disconnect: false,
             background_state: BackgroundState::Foreground,
             last_attempt: None,
+            edge_open: None,
+            last_established: None,
         }
     }
 }
@@ -200,28 +232,31 @@ impl Default for ReconnectState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReconnectEvent {
     /// 現行世代のセッションが接続を確立した(`OrchestratorAdapter::on_connected`)。
-    /// `generation`の照合(`is_current()`)はshellが既に済ませている。3aでは`generation`を
-    /// 判断に使わない(8a′の`Established`/`Lost`判定で使う)。
-    AttemptConnected {
-        #[allow(dead_code)] // Step 8a′のedge判定で使う(ADR §6 Step 3a/8a′)
-        generation: u64,
-    },
+    /// `generation`の照合(`is_current()`)はshellが既に済ませている。`generation`は
+    /// 接続エッジ(`Established`/`Lost`)の判定に使う(Step 8a′)。
+    AttemptConnected { generation: u64 },
     /// 現行世代のセッションが切断した(アダプタ経由)、またはnetwork-lost debounceが満了した
     /// (`apply_network_lost`、`generation`は現行の`session_generation`)。
     /// `targets_local_network`はshellが`last_connect_attempt`から事前計算した
     /// 「接続先がプライベート/リンクローカル/mDNS名か」(#19のLocal Networkヒント判定材料)。
+    /// `Lost`はphase遷移で決まる(ADR round 3 R3-1)ので、`generation`は判断に使わない。
     AttemptDisconnected {
-        #[allow(dead_code)] // Step 8a′のedge判定で使う(ADR §6 Step 3a/8a′)
+        #[allow(dead_code)] // 判断には使わない(Lostはphase遷移で定義、ADR round 3 R3-1)
         generation: u64,
         kind: DisconnectKind,
         targets_local_network: bool,
     },
     /// `OrchestratorAdapter::new`が`session_generation`を進めた(同じ臨界区間でapplyする)。
-    /// 3aでは定義のみ(no-op)。8a′でedgeが開いていれば`Lost(old)`を出す保険になる。
-    SessionCreated {
-        #[allow(dead_code)] // Step 8a′のedge判定で使う(ADR §6 Step 3a/8a′)
-        new_generation: u64,
-    },
+    /// 別世代のedgeが開いていれば`Lost(old)`を出す保険(Step 8a′)。
+    SessionCreated { new_generation: u64 },
+    /// 手動接続(`begin_connect`)の開始。`attempt`はshellが[`AttemptRef::next_after`]で発行した
+    /// 新しい参照で、受理された場合だけ`last_attempt`になる(実体の`LastConnectAttempt`はshellが
+    /// 同じ臨界区間で記録する)。既に`Connecting`なら拒否する(Task #9の二重start防止)。
+    ManualConnectStarted { attempt: AttemptRef },
+    /// 自動再接続の1試行・フォアグラウンド復帰が新しいセッションを作る直前(`connect_via`、→Connecting)。
+    ReconnectSessionStarting,
+    /// フォアグラウンド復帰契機の再接続(`connect_via`)が同期的に失敗した(→Idle)。
+    ForegroundReconnectFailedSync,
     /// 再接続ループ(`epoch`)がネットワーク復帰通知で早期に起床した。
     ReconnectWake { epoch: u64 },
     /// 再接続ループ(`epoch`)の通常のtick。`due`は「`retry_interval`に達したか」で、
@@ -253,17 +288,48 @@ pub(crate) enum ReconnectEffect {
     StartAttempt { epoch: u64, source: AttemptSource },
     /// 試行中に届いたwakeを`pending_wake`として保持した(ログ用。shellは記録するだけ)。
     PendingWakeRecorded { epoch: u64 },
+    /// `ConnectionPublicState::Connecting`を公開する(`begin_connect`)。
+    PublishConnecting,
+    /// `ManualConnectStarted`を拒否した(既に`Connecting`)。Stateは変えていない。shell
+    /// (`begin_connect`)は解釈せずに`Err(SshError::ConnectionFailed)`を返す。
+    ManualConnectRejected,
+    /// Step 8a′: 接続エッジ`Established(generation)`を公開する(`host`はshellが解決する)。
+    /// `PublishConnected`の**後に**同じapplyから出る(ADR §2.4-4の固定順)。
+    EdgeEstablished { generation: u64 },
+    /// Step 8a′: 接続エッジ`Lost(generation)`を公開する。`edge_open == Some(generation)`のまま
+    /// phaseをConnectedから動かしたapply(または別世代の`SessionCreated`/`AttemptConnected`)が出す。
+    EdgeLost { generation: u64 },
 }
 
 impl ReconnectState {
     /// 1つのEventを適用し、shellが解釈すべきEffect列を返す(ADR §2.1)。
     pub(crate) fn apply(&mut self, ev: ReconnectEvent) -> Vec<ReconnectEffect> {
         match ev {
-            ReconnectEvent::AttemptConnected { generation: _ } => self.on_attempt_connected(),
+            ReconnectEvent::AttemptConnected { generation } => self.on_attempt_connected(generation),
             ReconnectEvent::AttemptDisconnected { generation: _, kind, targets_local_network } => {
                 self.on_attempt_disconnected(kind, targets_local_network)
             }
-            ReconnectEvent::SessionCreated { new_generation: _ } => Vec::new(),
+            ReconnectEvent::SessionCreated { new_generation } => {
+                let mut effects = Vec::new();
+                if self.edge_open.is_some_and(|g| g != new_generation) {
+                    self.close_edge(&mut effects);
+                }
+                effects
+            }
+            ReconnectEvent::ManualConnectStarted { attempt } => self.on_manual_connect_started(attempt),
+            ReconnectEvent::ReconnectSessionStarting => {
+                let mut effects = Vec::new();
+                self.set_phase(ConnPhase::Connecting, &mut effects);
+                effects
+            }
+            ReconnectEvent::ForegroundReconnectFailedSync => {
+                // #20 codexレビュー指摘: 一回限りの呼び出しなので、`Connecting`のまま
+                // 固まらないようこの場で`Idle`へ戻し失敗を通知する(`reason`はshellが持つ)。
+                let mut effects = Vec::new();
+                self.set_phase(ConnPhase::Idle, &mut effects);
+                effects.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
+                effects
+            }
             ReconnectEvent::ReconnectWake { epoch } => self.on_reconnect_wake(epoch),
             ReconnectEvent::ReconnectTick { epoch, due } => self.on_reconnect_tick(epoch, due),
             ReconnectEvent::AttemptFailedSync { epoch } => {
@@ -275,14 +341,71 @@ impl ReconnectState {
         }
     }
 
-    fn on_attempt_connected(&mut self) -> Vec<ReconnectEffect> {
-        self.phase = ConnPhase::Connected;
+    /// `phase`の唯一の書き手(Step 8a′)。Connected以外へ動かすとき、edgeが開いていれば
+    /// 同じapplyの出力に`Lost(g)`を積んでedgeを閉じる(ADR round 3 R3-1の定義そのもの)。
+    fn set_phase(&mut self, phase: ConnPhase, effects: &mut Vec<ReconnectEffect>) {
+        if phase != ConnPhase::Connected {
+            self.close_edge(effects);
+        }
+        self.phase = phase;
+    }
+
+    fn close_edge(&mut self, effects: &mut Vec<ReconnectEffect>) {
+        if let Some(generation) = self.edge_open.take() {
+            effects.push(ReconnectEffect::EdgeLost { generation });
+        }
+    }
+
+    fn on_attempt_connected(&mut self, generation: u64) -> Vec<ReconnectEffect> {
+        let mut effects = Vec::new();
+        // 別世代のedgeが開いたままなら、新しい世代の`Established`より前に閉じる(ADR N-4)。
+        if self.edge_open.is_some_and(|g| g != generation) {
+            self.close_edge(&mut effects);
+        }
+        self.set_phase(ConnPhase::Connected, &mut effects);
         // 再接続ループが動いていたなら、成功したのでここで止める。
         self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
         self.reconnect_loop_active = false;
         self.retry_attempt_in_flight = false;
         self.pending_wake = false;
-        vec![ReconnectEffect::PublishConnected]
+        effects.push(ReconnectEffect::PublishConnected);
+        // 同一世代の`AttemptConnected`重複(edgeが既にその世代で開いている、または既に
+        // その世代以降のedgeを出した)ではエッジを出し直さない(round 3 m-R3-2)。
+        if self.edge_open.is_none() && !matches!(self.last_established, Some(last) if generation <= last) {
+            self.edge_open = Some(generation);
+            self.last_established = Some(generation);
+            effects.push(ReconnectEffect::EdgeEstablished { generation });
+        }
+        effects
+    }
+
+    /// 手動接続の開始(`begin_connect`)。`Connecting`中(=前の`connect_*`がまだ実行中)は
+    /// 拒否し、Stateを一切変えない。`Connected`中は「別セッションへの手動切り替え」として
+    /// 意図的に受理する(この遷移で旧世代の`Lost`が出る、ADR round 2 N-4)。
+    fn on_manual_connect_started(&mut self, attempt: AttemptRef) -> Vec<ReconnectEffect> {
+        if self.phase == ConnPhase::Connecting {
+            return vec![ReconnectEffect::ManualConnectRejected];
+        }
+        let mut effects = Vec::new();
+        self.set_phase(ConnPhase::Connecting, &mut effects);
+        self.last_attempt = Some(attempt);
+        // 新しい手動接続が始まった以上、直前のdisconnect()由来のフラグや
+        // 実行中だったかもしれない自動再接続ループは無関係になる。
+        self.user_initiated_disconnect = false;
+        self.reconnect_epoch = self.reconnect_epoch.wrapping_add(1);
+        self.reconnect_loop_active = false;
+        self.retry_attempt_in_flight = false;
+        self.pending_wake = false;
+        // #20: 手動接続はフォアグラウンドの操作でしか起こり得ない。直前の
+        // バックグラウンド遷移状態は無関係になる。
+        self.background_state = BackgroundState::Foreground;
+        // 新しい接続試行が始まった時点で、直前のセッションに対して保留中だった
+        // network-path debounceは無効化する。そうしないと、瞬断のdebounce待機中に
+        // 手動で切断/別transportへ再接続した場合、無関係な新しいセッションを
+        // 誤って切断してしまう(レビューで指摘された実際の不具合)。
+        effects.push(ReconnectEffect::InvalidatePathObserver);
+        effects.push(ReconnectEffect::PublishConnecting);
+        effects
     }
 
     /// 予期しない切断(アダプタ経由・network-lost debounce満了の両方)の共通遷移。
@@ -300,10 +423,10 @@ impl ReconnectState {
         let graceful_exit = kind == DisconnectKind::GracefulRemoteExit;
         let wake_reconnect_loop = self.reconnect_loop_active && self.pending_wake;
         self.user_initiated_disconnect = false;
-        self.phase = ConnPhase::Idle;
+        let mut effects = vec![ReconnectEffect::InvalidatePathObserver];
+        self.set_phase(ConnPhase::Idle, &mut effects);
         self.retry_attempt_in_flight = false;
 
-        let mut effects = vec![ReconnectEffect::InvalidatePathObserver];
         if self.reconnect_loop_active {
             // `pending_wake`はここでは下ろさない: 起こされたループの`ReconnectWake`が
             // 試行開始と同時に下ろす(試行が始まらなかった場合も次のtickで消化される)。
@@ -462,7 +585,17 @@ mod tests {
         }
     }
 
+    /// Step 8a′の接続エッジEffectを除いた列(3a以前の判断との比較用)。
+    fn without_edges(effects: &[ReconnectEffect]) -> Vec<ReconnectEffect> {
+        effects.iter().filter(|e| !is_edge(e)).cloned().collect()
+    }
+
+    fn is_edge(e: &ReconnectEffect) -> bool {
+        matches!(e, ReconnectEffect::EdgeEstablished { .. } | ReconnectEffect::EdgeLost { .. })
+    }
+
     fn effect_to_legacy(effects: &[ReconnectEffect]) -> LegacyAction {
+        let effects = without_edges(effects);
         assert_eq!(effects.first(), Some(&ReconnectEffect::InvalidatePathObserver));
         match &effects[1..] {
             [] => LegacyAction::Suppress { wake_reconnect_loop: false },
@@ -506,16 +639,24 @@ mod tests {
             any::<bool>(),
             background_strategy(),
             proptest::option::of(0u64..3),
+            (proptest::option::of(0u64..4), proptest::option::of(0u64..4)),
         )
-            .prop_map(|(phase, epoch, loop_active, in_flight, pending_wake, user, bg, attempt)| ReconnectState {
-                phase,
-                reconnect_epoch: epoch,
-                reconnect_loop_active: loop_active,
-                retry_attempt_in_flight: in_flight,
-                pending_wake,
-                user_initiated_disconnect: user,
-                background_state: bg,
-                last_attempt: attempt.map(AttemptRef),
+            .prop_map(|(phase, epoch, loop_active, in_flight, pending_wake, user, bg, attempt, (edge, last))| {
+                // Step 8a′のedge不変条件(`edge_open`が`Some`なら`phase == Connected`で、
+                // `last_established`はその世代)を満たす範囲で任意に取る。
+                let edge_open = if phase == ConnPhase::Connected { edge } else { None };
+                ReconnectState {
+                    phase,
+                    reconnect_epoch: epoch,
+                    reconnect_loop_active: loop_active,
+                    retry_attempt_in_flight: in_flight,
+                    pending_wake,
+                    user_initiated_disconnect: user,
+                    background_state: bg,
+                    last_attempt: attempt.map(AttemptRef),
+                    edge_open,
+                    last_established: edge_open.or(last),
+                }
             })
     }
 
@@ -530,6 +671,30 @@ mod tests {
             (0u64..6).prop_map(|epoch| ReconnectEvent::ReconnectWake { epoch }),
             (0u64..6, any::<bool>()).prop_map(|(epoch, due)| ReconnectEvent::ReconnectTick { epoch, due }),
             (0u64..6).prop_map(|epoch| ReconnectEvent::AttemptFailedSync { epoch }),
+            (0u64..3).prop_map(|a| ReconnectEvent::ManualConnectStarted { attempt: AttemptRef(a) }),
+            Just(ReconnectEvent::ReconnectSessionStarting),
+            Just(ReconnectEvent::ForegroundReconnectFailedSync),
+        ]
+    }
+
+    /// shellの`session_generation`のように世代が単調に進むEvent列(Step 8a′のedge契約用)。
+    /// `NewSession`だけが`SessionCreated`で世代を進め、`Connected`/`Disconnected`は現行世代を運ぶ。
+    #[derive(Debug, Clone)]
+    enum ShellStep {
+        NewSession,
+        Connected,
+        StaleConnected { back: u64 },
+        Disconnected(DisconnectKind),
+        Other(ReconnectEvent),
+    }
+
+    fn shell_step_strategy() -> impl Strategy<Value = ShellStep> {
+        prop_oneof![
+            Just(ShellStep::NewSession),
+            Just(ShellStep::Connected),
+            (1u64..3).prop_map(|back| ShellStep::StaleConnected { back }),
+            kind_strategy().prop_map(ShellStep::Disconnected),
+            event_strategy().prop_map(ShellStep::Other),
         ]
     }
 
@@ -565,6 +730,8 @@ mod tests {
                                                 user_initiated_disconnect: user,
                                                 background_state: bg,
                                                 last_attempt: has_attempt.then(|| AttemptRef::next_after(None)),
+                                                edge_open: None,
+                                                last_established: None,
                                             };
                                             let mut legacy = initial.clone();
                                             let expected = legacy_handle_unexpected_disconnect(
@@ -779,7 +946,7 @@ mod tests {
             s.apply(ReconnectEvent::AttemptFailedSync { epoch });
             prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectTick { epoch, due: true })), "試行結果の観測+tickで試行開始に到達しなかった");
             prop_assert_eq!(
-                s.apply(ReconnectEvent::AttemptConnected { generation }),
+                without_edges(&s.apply(ReconnectEvent::AttemptConnected { generation })),
                 vec![ReconnectEffect::PublishConnected]
             );
             prop_assert_eq!(s.phase, ConnPhase::Connected);
@@ -787,12 +954,149 @@ mod tests {
             prop_assert_ne!(s.reconnect_epoch, epoch, "成功で旧ループのepochは無効化される");
         }
 
-        /// `SessionCreated`は3aでは定義のみ(no-op)。
+        /// `SessionCreated`はedge以外のStateを変えず、別世代のedgeが開いているときだけ`Lost(old)`を出す。
         #[test]
-        fn session_created_is_a_noop_in_step_3a(initial in state_strategy(), g in any::<u64>()) {
+        fn session_created_only_closes_a_stale_edge(initial in state_strategy(), g in 0u64..6) {
             let mut s = initial.clone();
-            prop_assert!(s.apply(ReconnectEvent::SessionCreated { new_generation: g }).is_empty(), "SessionCreatedがEffectを返した");
+            let effects = s.apply(ReconnectEvent::SessionCreated { new_generation: g });
+            match initial.edge_open {
+                Some(old) if old != g => {
+                    prop_assert_eq!(effects, vec![ReconnectEffect::EdgeLost { generation: old }]);
+                    prop_assert_eq!(s.edge_open, None);
+                }
+                _ => {
+                    prop_assert!(effects.is_empty());
+                    prop_assert_eq!(s.edge_open, initial.edge_open);
+                }
+            }
+            s.edge_open = initial.edge_open;
             prop_assert_eq!(s, initial);
+        }
+
+        /// Step 8a′ 不変条件(2): applyの前後で`phase`がConnectedから離れ、apply前に`edge_open`が
+        /// `Some(g)`だったなら、そのapplyの出力に`Lost(g)`が含まれ、edgeは閉じる。逆に`Lost`を
+        /// 出すのは開いていたedgeの世代だけで、edgeが開いている間は常に`phase == Connected`。
+        #[test]
+        fn leaving_connected_with_an_open_edge_emits_lost_in_the_same_apply(
+            initial in state_strategy(),
+            events in proptest::collection::vec(event_strategy(), 0..40),
+        ) {
+            let mut s = initial;
+            for ev in events {
+                let before = s.clone();
+                let effects = s.apply(ev.clone());
+                let lost: Vec<u64> = effects
+                    .iter()
+                    .filter_map(|e| match e { ReconnectEffect::EdgeLost { generation } => Some(*generation), _ => None })
+                    .collect();
+                if let Some(g) = before.edge_open {
+                    if s.phase != ConnPhase::Connected {
+                        prop_assert_eq!(&lost, &vec![g], "Connectedを離れたapplyでLost({})が出なかった: {:?}", g, ev);
+                    }
+                }
+                prop_assert!(lost.len() <= 1);
+                for g in &lost {
+                    prop_assert_eq!(before.edge_open, Some(*g), "開いていないedgeのLostを出した");
+                }
+                if s.edge_open.is_some() {
+                    prop_assert_eq!(s.phase, ConnPhase::Connected, "edgeが開いたままConnected以外になった");
+                }
+            }
+        }
+
+        /// Step 8a′ 不変条件(1)(ADR round 2 N-4): shellと同じく世代が単調に進む任意のEvent列で、
+        /// 出力されたエッジ列は「各`g`について`Established(g)`は高々1回、その後
+        /// `Established(g'>g)`より前に`Lost(g)`が正確に1回」。最後に切断で終われば全edgeが閉じる。
+        #[test]
+        fn every_established_is_followed_by_exactly_one_lost(
+            steps in proptest::collection::vec(shell_step_strategy(), 0..60),
+            final_kind in kind_strategy(),
+        ) {
+            let mut s = ReconnectState::default();
+            let mut generation = 0u64;
+            let mut edges: Vec<ReconnectEffect> = Vec::new();
+            for step in steps {
+                let ev = match step {
+                    ShellStep::NewSession => {
+                        generation += 1;
+                        ReconnectEvent::SessionCreated { new_generation: generation }
+                    }
+                    ShellStep::Connected => ReconnectEvent::AttemptConnected { generation },
+                    // shellは`is_current()`で古い世代を捨てるが、reducerはそれに依存しない。
+                    ShellStep::StaleConnected { back } => {
+                        ReconnectEvent::AttemptConnected { generation: generation.saturating_sub(back) }
+                    }
+                    ShellStep::Disconnected(kind) => {
+                        ReconnectEvent::AttemptDisconnected { generation, kind, targets_local_network: false }
+                    }
+                    ShellStep::Other(ev) => ev,
+                };
+                edges.extend(s.apply(ev).into_iter().filter(is_edge));
+            }
+            edges.extend(
+                s.apply(ReconnectEvent::AttemptDisconnected { generation, kind: final_kind, targets_local_network: false })
+                    .into_iter()
+                    .filter(is_edge),
+            );
+
+            let mut open: Option<u64> = None;
+            let mut established: Vec<u64> = Vec::new();
+            for e in &edges {
+                match e {
+                    ReconnectEffect::EdgeEstablished { generation: g } => {
+                        prop_assert_eq!(open, None, "Lostより前に次のEstablished({})が出た: {:?}", g, edges);
+                        prop_assert!(!matches!(established.last(), Some(last) if g <= last),"Establishedの世代が単調増加でない: {:?}", edges);
+                        established.push(*g);
+                        open = Some(*g);
+                    }
+                    ReconnectEffect::EdgeLost { generation: g } => {
+                        prop_assert_eq!(open, Some(*g), "対応するEstablishedの無いLost({}): {:?}", g, edges);
+                        open = None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            prop_assert_eq!(open, None, "切断で終わったのにedgeが開いたまま: {:?}", edges);
+            prop_assert_eq!(s.edge_open, None);
+        }
+
+        /// 同一世代の`AttemptConnected`重複は`Established`を出し直さない(round 3 m-R3-2)。
+        #[test]
+        fn duplicate_attempt_connected_does_not_reemit_established(initial in state_strategy(), g in 0u64..6) {
+            let mut s = initial;
+            s.apply(ReconnectEvent::AttemptConnected { generation: g });
+            let again = s.apply(ReconnectEvent::AttemptConnected { generation: g });
+            prop_assert!(!again.iter().any(is_edge), "重複したAttemptConnectedでエッジが出た: {:?}", again);
+        }
+
+        /// `ManualConnectStarted`: `Connecting`中は拒否してStateを変えない。それ以外では旧`begin_connect`と
+        /// 同じフィールドを書き、`Connecting`を公開する(Connectedからなら同じapplyで`Lost(old)`)。
+        #[test]
+        fn manual_connect_started_matches_legacy_begin_connect(initial in state_strategy(), a in 0u64..3) {
+            let attempt = AttemptRef(a);
+            let mut s = initial.clone();
+            let effects = s.apply(ReconnectEvent::ManualConnectStarted { attempt });
+            if initial.phase == ConnPhase::Connecting {
+                prop_assert_eq!(effects, vec![ReconnectEffect::ManualConnectRejected]);
+                prop_assert_eq!(s, initial);
+                return Ok(());
+            }
+            let mut legacy = initial.clone();
+            legacy.last_attempt = Some(attempt);
+            legacy.phase = ConnPhase::Connecting;
+            legacy.user_initiated_disconnect = false;
+            legacy.reconnect_epoch = legacy.reconnect_epoch.wrapping_add(1);
+            legacy.reconnect_loop_active = false;
+            legacy.retry_attempt_in_flight = false;
+            legacy.pending_wake = false;
+            legacy.background_state = BackgroundState::Foreground;
+            legacy.edge_open = None;
+            prop_assert_eq!(&s, &legacy);
+            let mut expected: Vec<ReconnectEffect> =
+                initial.edge_open.map(|generation| ReconnectEffect::EdgeLost { generation }).into_iter().collect();
+            expected.push(ReconnectEffect::InvalidatePathObserver);
+            expected.push(ReconnectEffect::PublishConnecting);
+            prop_assert_eq!(effects, expected);
         }
     }
 }
