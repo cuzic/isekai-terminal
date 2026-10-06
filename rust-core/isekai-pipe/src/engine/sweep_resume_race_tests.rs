@@ -1,270 +1,252 @@
-//! L0 characterization tests for the sweep × RESUME race
-//! (`ADR_FUNCTIONAL_CORE_EFFECTS.md` §4.1 / §6 Step 1.5, round 1 B-2,
-//! round 2 m-R2-9).
+//! L0 tests for the sweep × RESUME race
+//! (`ADR_FUNCTIONAL_CORE_EFFECTS.md` §4.1 / §6 Step 1.5 → Step 2a, round 1
+//! B-2, round 2 m-R2-9).
 //!
-//! **These tests assert today's (buggy) behavior on purpose.** Step 2a
-//! (single aggregate under a single lock) is expected to flip every
-//! `CURRENT BEHAVIOR` assertion below; that flip is the evidence that the
-//! refactor *closed* the window rather than moving it. Do not "fix" these
-//! assertions without also landing that change.
+//! **History**: Step 1.5 landed these as *characterization* tests asserting
+//! the then-current (buggy) behavior, each marked `CURRENT BEHAVIOR`. Step 2a
+//! (single aggregate under a single lock) flipped every one of those
+//! assertions — that flip is the evidence that the refactor *closed* the
+//! window rather than moving it. The old interleaving and what each
+//! assertion used to say are kept in the comments below.
 //!
-//! # The race
+//! # The race (before Step 2a)
 //!
-//! `SessionTable::sweep_expired_parked` is two-phase: phase 1 collects
-//! expired ids while holding the table lock (and each session's lock in
-//! turn), then drops both; phase 2 calls `remove(&id)` for each collected id
-//! **without re-checking** that the session is still parked. The RESUME path
-//! (`engine/mod.rs::handle_resume_stream`: `sessions.get` → `handle.lock()` →
-//! `parked_since = None; parked_tcp.take()` → `established_lease_for`) can
-//! run entirely inside that gap. Phase 2 then discards a session that has
-//! just been resumed, and the sweep backstop's caller
-//! (`release_slot_for`) releases the fencing slot of a lease that is
-//! actively relaying again.
+//! `SessionTable::sweep_expired_parked` was two-phase: phase 1 collected
+//! expired ids under the table lock, then dropped it; phase 2 called
+//! `remove(&id)` for each collected id **without re-checking** that the
+//! session was still parked. RESUME (`sessions.get` → `handle.lock()` →
+//! `parked_since = None; parked_tcp.take()` → `established_lease_for`) could
+//! run entirely inside that gap, after which the sweep discarded a session
+//! that had just been resumed and `release_slot_for` freed the fencing slot
+//! of a lease that was actively relaying again (and the session_id became
+//! re-admittable mid-relay).
 //!
-//! # How the window is hit deterministically
+//! # After Step 2a
 //!
-//! No production hook is needed. `tokio::sync::Mutex` is documented as fair
-//! (FIFO): a released permit is handed directly to the oldest waiter, so a
-//! later `lock()` cannot barge ahead of it. With the default
-//! `current_thread` test runtime:
+//! Sweep (judge expiry + remove + release slot) and RESUME (check parked +
+//! unpark + hand over socket and output buffer) are each **one** apply on
+//! `ServeAggregate` under `AttachRuntime`'s single lock. Whichever is applied
+//! first wins *entirely*; the other observes the result:
 //!
-//! 1. The test holds the session's own lock.
-//! 2. The sweep task starts phase 1: takes the table lock, then blocks on
-//!    the session lock (still holding the table lock).
-//! 3. The "resumer" task (modelling RESUME) blocks on the table lock behind
-//!    the sweep.
-//! 4. The test releases the session lock. Phase 1 sees the session expired,
-//!    then releases the table lock — which is handed to the resumer. Phase 2's
-//!    `remove` therefore queues *behind* the resumer.
-//! 5. The resumer's `get` releases the table lock (handed to phase 2's
-//!    `remove`) and, in the same poll, unparks the session uncontended.
-//! 6. Phase 2 removes the now-live session.
+//! - RESUME first → granted; the sweep sees an active session and discards
+//!   nothing; the slot stays `Established`.
+//! - sweep first → discarded and slot released; the RESUME is rejected
+//!   (`UnknownToken`) and nobody is relaying.
 //!
-//! The resumer asserts that it really did unpark a TCP connection, so if the
-//! interleaving ever stopped being the one described above the test would
-//! fail loudly instead of passing vacuously.
+//! "Both" (RESUME got the socket *and* the sweep discarded the session) is
+//! no longer reachable.
 //!
-//! # Why not `start_paused`
+//! # How the order is forced deterministically
 //!
-//! The ADR suggests `#[tokio::test(start_paused = true)]`. The sweep's
-//! deadline is computed from `Session::parked_since: std::time::Instant`
-//! (`since.elapsed()`), which tokio's paused clock does not control, so a
-//! paused clock would add nothing here — expiry is set up by back-dating
-//! `parked_since`, exactly as the existing `resume.rs` sweep tests do. A
-//! paused clock would also be actively harmful for the `AttachRuntime` half:
-//! auto-advance can fire `TARGET_CONNECT_TIMEOUT`/`PENDING_ACTIVATION_TIMEOUT`
-//! while the real loopback `TcpStream::connect` is still in flight.
-//! Determinism comes from mutex fairness instead (see above).
+//! `tokio::sync::Mutex` is documented as fair (FIFO). The test holds the
+//! aggregate lock (`lock_core_for_test`), queues the two tasks behind it in
+//! the desired order (with the default `current_thread` runtime, a spawned
+//! task enqueues on the lock the first time it is polled), then releases it.
 //!
-//! # Not covered here
-//!
-//! - Concurrent `admit_new_session` (max+1 check-then-act, Step 2b) and the
-//!   `InsertOutcome::Rejected` → `DataStreamDied` orphan park (N-3, Step 2a/2c)
-//!   are not characterized in this file; they need the full QUIC
-//!   `handle_attach_stream` path. Step 2a's proptest (I-g) covers the latter.
+//! The sweep uses `max_parked = 0`, so any parked session counts as expired
+//! regardless of the clock (the old tests back-dated `parked_since` instead;
+//! `parked_since` is now a `Millis` stamped by the shell, ADR §2.2).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use isekai_protocol::attach::{AttachKey, AttemptId, ConnectionGeneration, ATTEMPT_ID_LEN};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use super::attach_runtime::{AttachRuntime, HelloOutcome};
-use super::release_slot_for;
-use super::resume::{Session, SessionId, SessionTable};
-
-const MAX_PARKED: StdDuration = StdDuration::from_secs(30);
+use super::attach_runtime::{AttachRuntime, HelloOutcome, ResumeDecision};
+use super::resume::{Session, SessionId};
 
 /// Lets every other ready task on the current-thread runtime run until it
-/// next blocks. A handful of yields is far more than needed for the short,
-/// I/O-free lock sequences used below.
+/// next blocks.
 async fn settle() {
     for _ in 0..16 {
         tokio::task::yield_now().await;
     }
 }
 
-async fn loopback_tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, tokio::net::TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    let (r, w) = server.into_split();
-    (r, w, client)
-}
-
-/// Spawns the sweep task (phase 1 + phase 2) and, if given an
-/// `AttachRuntime`, the same per-id `release_slot_for` loop as the
-/// production backstop in `engine/mod.rs::run_serve`.
-fn spawn_sweep(
-    table: SessionTable,
-    attach_runtime: Option<Arc<AttachRuntime>>,
-) -> tokio::task::JoinHandle<Vec<SessionId>> {
-    tokio::spawn(async move {
-        let expired = table.sweep_expired_parked(MAX_PARKED).await;
-        if let Some(rt) = attach_runtime {
-            for id in &expired {
-                release_slot_for(&rt, isekai_protocol::SessionId::from_bytes(*id)).await;
-            }
-        }
-        expired
-    })
-}
-
-/// What the modelled RESUME observed.
-struct Resumed {
-    tcp: Option<(OwnedReadHalf, OwnedWriteHalf)>,
-    lease_seen: bool,
-}
-
-/// Models the first half of `handle_resume_stream`: look the session up,
-/// unpark it, then confirm its `Established` slot.
-fn spawn_resumer(
-    table: SessionTable,
-    id: SessionId,
-    attach_runtime: Option<Arc<AttachRuntime>>,
-) -> tokio::task::JoinHandle<Resumed> {
-    tokio::spawn(async move {
-        let handle = table.get(&id).await.expect("RESUME must find the session (it is still in the table)");
-        let tcp = {
-            let mut session = handle.lock().await;
-            session.parked_since = None;
-            session.parked_tcp.take()
-        };
-        let lease_seen = match attach_runtime {
-            Some(rt) => rt.established_lease_for(isekai_protocol::SessionId::from_bytes(id)).await.is_some(),
-            None => false,
-        };
-        Resumed { tcp, lease_seen }
-    })
-}
-
-/// Drives the interleaving described in the module docs and returns
-/// `(sweep result, resumer result)`.
-async fn race_sweep_against_resume(
-    table: &SessionTable,
-    id: SessionId,
-    handle: &Arc<Mutex<Session>>,
-    attach_runtime: Option<Arc<AttachRuntime>>,
-) -> (Vec<SessionId>, Resumed) {
-    // 1. Hold the session lock so phase 1 parks inside the table lock.
-    let held = handle.lock().await;
-    let sweep = spawn_sweep(table.clone(), attach_runtime.clone());
-    settle().await;
-    assert!(!sweep.is_finished(), "sweep phase 1 must be blocked on the session lock");
-
-    // 2. Queue the resumer on the table lock, behind the sweep.
-    let resumer = spawn_resumer(table.clone(), id, attach_runtime);
-    settle().await;
-    assert!(!resumer.is_finished(), "RESUME must be queued on the table lock held by sweep phase 1");
-
-    // 3. Let phase 1 finish; FIFO hand-off puts the resumer ahead of phase 2.
-    drop(held);
-    let resumed = resumer.await.unwrap();
-    let discarded = sweep.await.unwrap();
-    (discarded, resumed)
-}
-
-/// `SessionTable`-only half: a session that RESUME has just unparked (i.e.
-/// is live again) is still discarded by the in-flight sweep.
-#[tokio::test]
-async fn sweep_after_concurrent_unpark_currently_discards_live_session() {
-    let table = SessionTable::new();
-    let id = SessionTable::generate_session_id();
-    let (r, w, _peer) = loopback_tcp_pair().await;
-    let mut session = Session::new(1024);
-    session.parked_tcp = Some((r, w));
-    session.parked_since = Some(std::time::Instant::now() - StdDuration::from_secs(60));
-    let handle = table.insert(id, session).await;
-
-    let (discarded, resumed) = race_sweep_against_resume(&table, id, &handle, None).await;
-
-    // Precondition of the race (not expected to change in Step 2a's *model*,
-    // but Step 2a may reject the RESUME instead — see below): RESUME won the
-    // unpark, so from its point of view the session is live and relaying.
-    assert!(resumed.tcp.is_some(), "RESUME must have unparked the target TCP inside the sweep's window");
-    assert_eq!(handle.lock().await.parked_since, None, "session is live (unparked) after RESUME");
-
-    // CURRENT BEHAVIOR (Step 2a flips these): phase 2 removes the id without
-    // re-checking, so a live session disappears from the table — every later
-    // RESUME for it gets UnknownToken, and the same session_id becomes
-    // re-admittable while it is still being relayed.
-    assert_eq!(discarded, vec![id], "CURRENT BEHAVIOR: sweep reports the live session as discarded");
-    assert!(!table.contains(&id).await, "CURRENT BEHAVIOR: the live session is gone from the table");
-}
-
-/// `AttachRuntime` half (round 2 m-R2-9): the same race, plus the
-/// production backstop's `release_slot_for`, frees the `Established` fencing
-/// slot of a lease that RESUME has just confirmed and is relaying through.
-#[tokio::test]
-async fn sweep_after_concurrent_unpark_currently_releases_slot_of_relaying_lease() {
-    // Local target the AttachRuntime connects to; keep accepted streams alive.
+/// A local target the `AttachRuntime` connects to; accepted streams are kept
+/// alive so the relayed "target TCP" stays open.
+async fn spawn_target() -> SocketAddr {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target_addr: SocketAddr = target.local_addr().unwrap();
+    let target_addr = target.local_addr().unwrap();
     let accepted = Arc::new(Mutex::new(Vec::new()));
-    {
-        let accepted = accepted.clone();
-        tokio::spawn(async move {
-            while let Ok((s, _)) = target.accept().await {
-                accepted.lock().await.push(s);
-            }
-        });
-    }
-    let attach_runtime = AttachRuntime::new(target_addr);
+    tokio::spawn(async move {
+        while let Ok((s, _)) = target.accept().await {
+            accepted.lock().await.push(s);
+        }
+    });
+    target_addr
+}
 
-    let table = SessionTable::new();
-    let id = SessionTable::generate_session_id();
-    let session_id = isekai_protocol::SessionId::from_bytes(id);
-    let key = AttachKey {
-        session_id,
+fn key_for(id: SessionId) -> AttachKey {
+    AttachKey {
+        session_id: isekai_protocol::SessionId::from_bytes(id),
         generation: ConnectionGeneration::new(1),
         attempt_id: AttemptId::from_bytes([7u8; ATTEMPT_ID_LEN]),
-    };
+    }
+}
 
-    // ATTACH_HELLO → target connect → AttachActivate: slot is Established.
-    let attach_token = match attach_runtime.hello(key).await {
+/// ATTACH_HELLO → target connect → AttachActivate (slot `Established`,
+/// session registered in the index), then the data stream "dies" and the
+/// target TCP is parked — exactly what `finish_or_park_session`'s
+/// `DataStreamDied` arm does. Returns the established lease.
+async fn establish_and_park(
+    rt: &Arc<AttachRuntime>,
+    id: SessionId,
+) -> super::attach_arbiter::LeaseId {
+    let key = key_for(id);
+    let attach_token = match rt.hello(key).await {
         HelloOutcome::Ready { attach_token } => attach_token,
         HelloOutcome::Reject(reason) => panic!("hello rejected: {reason:?}"),
     };
-    let (tcp, lease) = attach_runtime.activate(key, attach_token).await.expect("activate must establish the slot");
-    let established = attach_runtime.established_lease_for(session_id).await.expect("slot is Established");
+    let handle = Arc::new(Mutex::new(Session::new(1024)));
+    let activation = rt.activate(key, attach_token, Some(3600), handle).await.expect("activate must establish the slot");
+    let lease_id = activation.lease.id();
+    assert_eq!(rt.established_lease_for(key.session_id).await, Some(lease_id));
+    let (r, w) = activation.tcp.into_split();
+    activation.lease.keep();
+    rt.park(id, lease_id, (r, w)).await;
+    assert!(rt.is_parked(&id).await, "precondition: session is parked");
+    lease_id
+}
 
-    // Data stream died, target TCP still alive: park it and keep the slot
-    // (what `finish_or_park_session`'s `DataStreamDied` arm does).
-    let (r, w) = tcp.into_split();
-    let mut session = Session::new(1024);
-    session.parked_tcp = Some((r, w));
-    session.parked_since = Some(std::time::Instant::now() - StdDuration::from_secs(60));
-    let handle = table.insert(id, session).await;
-    lease.keep();
-    assert_eq!(attach_runtime.established_lease_for(session_id).await, Some(established));
+/// The interleaving Step 1.5 characterized (RESUME's unpark lands before the
+/// sweep's removal). Before Step 2a the sweep still discarded the
+/// just-resumed session and released its slot; now the sweep, applied after
+/// the RESUME, sees an active session and does nothing.
+#[tokio::test]
+async fn sweep_after_concurrent_unpark_no_longer_discards_live_session() {
+    let rt = AttachRuntime::new(spawn_target().await, 16);
+    let id: SessionId = [0x11; 16];
+    let session_id = isekai_protocol::SessionId::from_bytes(id);
+    let established = establish_and_park(&rt, id).await;
 
-    let (discarded, resumed) =
-        race_sweep_against_resume(&table, id, &handle, Some(attach_runtime.clone())).await;
+    let held = rt.lock_core_for_test().await;
+    let resumer = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.resume_request(id).await })
+    };
+    settle().await;
+    assert!(!resumer.is_finished(), "RESUME must be queued on the aggregate lock");
+    let sweep = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.sweep_expired_parked(StdDuration::ZERO).await })
+    };
+    settle().await;
+    assert!(!sweep.is_finished(), "sweep must be queued behind RESUME");
+    drop(held);
 
-    // RESUME unparked the TCP *and* saw the Established slot, so in
-    // production it proceeds past `established_lease_for` into
-    // `resumed_lease` + `relay_buffered`: the session is actively relaying.
-    assert!(resumed.tcp.is_some(), "RESUME must have unparked the target TCP inside the sweep's window");
-    assert!(resumed.lease_seen, "RESUME must have found the Established slot and be relaying through it");
+    let decision = resumer.await.unwrap();
+    let discarded = sweep.await.unwrap();
 
-    // CURRENT BEHAVIOR (Step 2a flips these): the sweep discarded the live
-    // session and `release_slot_for` → `relay_ended` freed its fencing slot
-    // while it is still relaying.
-    assert_eq!(discarded, vec![id], "CURRENT BEHAVIOR: sweep reports the live session as discarded");
-    assert!(!table.contains(&id).await, "CURRENT BEHAVIOR: the live session is gone from the table");
+    // RESUME won the unpark and got the socket *and* the same incarnation's
+    // lease (unchanged precondition from Step 1.5).
+    let grant = match decision {
+        ResumeDecision::Granted(grant) => grant,
+        ResumeDecision::Preempt { .. } | ResumeDecision::Rejected => panic!("RESUME must have been granted"),
+    };
+    assert_eq!(grant.lease, established);
+
+    // FLIPPED by Step 2a (was: `discarded == vec![id]` /
+    // "CURRENT BEHAVIOR: sweep reports the live session as discarded").
+    assert!(discarded.is_empty(), "the sweep must not discard a session RESUME has just unparked");
+    // FLIPPED (was: `!table.contains(&id)` / "the live session is gone from the table").
+    assert!(rt.index_contains(&id).await, "the live session stays in the index");
+    // FLIPPED (was: `established_lease_for == None` / "the relaying lease's
+    // Established slot was released by the sweep backstop").
     assert_eq!(
-        attach_runtime.established_lease_for(session_id).await,
-        None,
-        "CURRENT BEHAVIOR: the relaying lease's Established slot was released by the sweep backstop"
+        rt.established_lease_for(session_id).await,
+        Some(established),
+        "the relaying lease keeps its Established slot"
     );
-    assert!(
-        !attach_runtime.has_session(session_id).await,
-        "CURRENT BEHAVIOR: the arbiter forgot the session, so the same session_id is re-admittable mid-relay"
-    );
+    // FLIPPED (was: `!has_session` / "the same session_id is re-admittable mid-relay").
+    assert!(rt.has_session(session_id).await, "the session_id is not re-admittable while it is relaying");
 
-    drop(resumed);
+    drop(grant);
+}
+
+/// The opposite order: the sweep's apply runs first. The session is
+/// discarded and its slot released atomically, and the RESUME that follows
+/// is rejected without ever receiving a socket — so nothing relays through a
+/// released slot.
+#[tokio::test]
+async fn sweep_before_resume_discards_atomically_and_rejects_the_resume() {
+    let rt = AttachRuntime::new(spawn_target().await, 16);
+    let id: SessionId = [0x22; 16];
+    let session_id = isekai_protocol::SessionId::from_bytes(id);
+    establish_and_park(&rt, id).await;
+
+    let held = rt.lock_core_for_test().await;
+    let sweep = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.sweep_expired_parked(StdDuration::ZERO).await })
+    };
+    settle().await;
+    assert!(!sweep.is_finished(), "sweep must be queued on the aggregate lock");
+    let resumer = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.resume_request(id).await })
+    };
+    settle().await;
+    assert!(!resumer.is_finished(), "RESUME must be queued behind the sweep");
+    drop(held);
+
+    let discarded = sweep.await.unwrap();
+    let decision = resumer.await.unwrap();
+
+    assert_eq!(discarded, vec![id], "the sweep discards the expired parked session");
+    assert!(
+        matches!(decision, ResumeDecision::Rejected),
+        "RESUME after the discard must be rejected and receive no socket"
+    );
+    assert!(!rt.index_contains(&id).await);
+    assert_eq!(rt.established_lease_for(session_id).await, None, "slot released in the same apply as the discard");
+    assert!(!rt.has_session(session_id).await);
+}
+
+/// Step 2a's intended behavior change (2) at the shell level (ADR I-g,
+/// round 2 N-3): a session registered over capacity (formerly
+/// `InsertOutcome::Rejected` — not in any table) whose data stream dies used
+/// to be parked into a handle no table referenced, leaking its fencing slot
+/// and target TCP until process exit (the same session_id's re-ATTACH was
+/// rejected with `AttachAlreadyEstablished` forever). Now the park is a
+/// `Discard{Unresumable}`: slot released, TCP closed.
+#[tokio::test]
+async fn parking_an_unresumable_session_releases_its_slot() {
+    let rt = AttachRuntime::new(spawn_target().await, 1);
+    // Fill the table with one actively relaying session.
+    let active: SessionId = [0x31; 16];
+    let key_active = key_for(active);
+    let token = match rt.hello(key_active).await {
+        HelloOutcome::Ready { attach_token } => attach_token,
+        HelloOutcome::Reject(reason) => panic!("hello rejected: {reason:?}"),
+    };
+    let active_activation =
+        rt.activate(key_active, token, Some(3600), Arc::new(Mutex::new(Session::new(1024)))).await.unwrap();
+
+    // A second session is registered over capacity (unresumable).
+    let over: SessionId = [0x32; 16];
+    let key_over = key_for(over);
+    let token = match rt.hello(key_over).await {
+        HelloOutcome::Ready { attach_token } => attach_token,
+        HelloOutcome::Reject(reason) => panic!("hello rejected: {reason:?}"),
+    };
+    let over_activation =
+        rt.activate(key_over, token, Some(3600), Arc::new(Mutex::new(Session::new(1024)))).await.unwrap();
+    let over_lease = over_activation.lease.id();
+    assert!(rt.index_contains(&over).await, "unresumable sessions are indexed too (ADR I-c)");
+
+    // Its data stream dies: `finish_or_park_session` keeps the lease and parks.
+    let (r, w) = over_activation.tcp.into_split();
+    over_activation.lease.keep();
+    rt.park(over, over_lease, (r, w)).await;
+
+    assert!(!rt.index_contains(&over).await);
+    assert_eq!(rt.established_lease_for(key_over.session_id).await, None, "fencing slot released (was: leaked)");
+    assert!(!rt.has_session(key_over.session_id).await, "the same session_id can ATTACH again");
+    // The active session is untouched.
+    assert_eq!(rt.established_lease_for(key_active.session_id).await, Some(active_activation.lease.id()));
+    active_activation.lease.keep();
 }
