@@ -250,3 +250,78 @@ async fn parking_an_unresumable_session_releases_its_slot() {
     assert_eq!(rt.established_lease_for(key_active.session_id).await, Some(active_activation.lease.id()));
     active_activation.lease.keep();
 }
+
+/// Step 2a follow-up H-1: `handle_resume_stream` now mints its
+/// `SessionTableEntryGuard` right after `ResumeGranted`. If the task dies
+/// (panics) anywhere between the grant and `finish_or_park_session` — here
+/// modelled by dropping the still-armed guard — the active entry and its
+/// `Established` slot are released in one transition instead of leaking
+/// forever (an active entry is never swept or evicted).
+#[tokio::test]
+async fn guard_dropped_after_resume_grant_releases_entry_and_slot() {
+    let rt = AttachRuntime::new(spawn_target().await, 16);
+    let id: SessionId = [0x41; 16];
+    let session_id = isekai_protocol::SessionId::from_bytes(id);
+    let established = establish_and_park(&rt, id).await;
+
+    let ResumeDecision::Granted(grant) = rt.resume_request(id).await else {
+        panic!("RESUME must have been granted");
+    };
+    assert_eq!(grant.lease, established);
+    let guard = super::SessionTableEntryGuard::new(rt.clone(), id, grant.lease);
+    assert!(rt.index_contains(&id).await, "precondition: granted session is active in the index");
+
+    // Simulated panic before any park/relay: the guard drops armed.
+    drop(guard);
+    drop(grant);
+    settle().await;
+
+    assert!(!rt.index_contains(&id).await, "the orphaned active entry is discarded");
+    assert_eq!(rt.established_lease_for(session_id).await, None, "its Established slot is released");
+    assert!(!rt.has_session(session_id).await, "the same session_id can ATTACH again");
+}
+
+/// The normal early-return paths of `handle_resume_stream` (OffsetGone /
+/// RESUME_ACK write failure) re-park the socket and then `disarm()` the
+/// guard: the session must stay parked and keep its `Established` slot.
+#[tokio::test]
+async fn disarmed_guard_after_repark_keeps_session_resumable() {
+    let rt = AttachRuntime::new(spawn_target().await, 16);
+    let id: SessionId = [0x42; 16];
+    let session_id = isekai_protocol::SessionId::from_bytes(id);
+    let established = establish_and_park(&rt, id).await;
+
+    let ResumeDecision::Granted(grant) = rt.resume_request(id).await else {
+        panic!("RESUME must have been granted");
+    };
+    let guard = super::SessionTableEntryGuard::new(rt.clone(), id, grant.lease);
+    rt.park(id, grant.lease, grant.tcp).await;
+    guard.disarm();
+    settle().await;
+
+    assert!(rt.is_parked(&id).await, "the re-parked session stays parked");
+    assert_eq!(rt.established_lease_for(session_id).await, Some(established), "and keeps its slot");
+}
+
+/// Step 2a follow-up H-2: a park the reducer accepts but whose socket the
+/// shell cannot store (no matching `SessionIo` — unreachable unless
+/// `RegisterIo` ran without a staged handle) used to leave the entry
+/// "parked" with no socket and the slot held until the next RESUME or the
+/// sweep window. It is now discarded right away, like an orphaned grant.
+#[tokio::test]
+async fn refused_store_parked_discards_the_orphan() {
+    let rt = AttachRuntime::new(spawn_target().await, 16);
+    let id: SessionId = [0x43; 16];
+    let session_id = isekai_protocol::SessionId::from_bytes(id);
+    establish_and_park(&rt, id).await;
+
+    let ResumeDecision::Granted(grant) = rt.resume_request(id).await else {
+        panic!("RESUME must have been granted");
+    };
+    rt.remove_io_for_test(&id).await;
+    rt.park(id, grant.lease, grant.tcp).await;
+
+    assert!(!rt.index_contains(&id).await, "the socket-less 'parked' entry is discarded");
+    assert_eq!(rt.established_lease_for(session_id).await, None, "its slot is released");
+    assert!(!rt.has_session(session_id).await);
+}

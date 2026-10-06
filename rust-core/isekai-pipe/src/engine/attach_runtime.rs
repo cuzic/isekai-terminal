@@ -145,9 +145,10 @@ struct InLockOutcome {
     /// `preempt` of the `SessionIo` registered by this apply (`Activated`).
     registered: Option<Arc<Notify>>,
     resume: Option<ResumeDecision>,
-    /// `ResumeGranted` whose `SessionIo` unexpectedly had no parked socket:
-    /// the caller discards that incarnation with a new apply (ADR §2.4-3:
-    /// never nest an apply inside interpretation).
+    /// `ResumeGranted` whose `SessionIo` unexpectedly had no parked socket,
+    /// or `StoreParked` that found no matching `SessionIo` to store the
+    /// socket in: the caller discards that incarnation with a new apply
+    /// (ADR §2.4-3: never nest an apply inside interpretation).
     orphaned: Option<(SessionKey, LeaseId)>,
 }
 
@@ -459,10 +460,21 @@ impl AttachRuntime {
     /// park (the socket is stored and `reparked` is signalled), discards the
     /// session (`Unresumable` — fencing slot released, socket closed), or
     /// ignores a stale lease (socket closed).
+    ///
+    /// If the reducer accepted the park but the shell had no matching
+    /// `SessionIo` to store the socket in (unreachable unless `RegisterIo`
+    /// ran without a staged handle — a programming error), the index would
+    /// say "parked" while no socket exists and the slot stays held until
+    /// the next RESUME or the sweep window (Step 2a review H-2). Such an
+    /// orphan is discarded right away with a follow-up apply, exactly like
+    /// `resume_request`'s orphaned grant.
     pub async fn park(self: &Arc<Self>, id: SessionKey, lease: LeaseId, tcp: ParkedTcp) {
         let mut out =
             self.apply_with(move |now| ServeEvent::Parked { id, lease, now }, Staged { handle: None, tcp: Some(tcp) }).await;
         self.execute_effects(std::mem::take(&mut out.attach)).await;
+        if let Some((orphan_id, orphan_lease)) = out.orphaned {
+            self.relay_terminated(orphan_id, orphan_lease, TerminateReason::GuardDropped).await;
+        }
     }
 
     /// Discards every parked session whose park is at least `max_parked`
@@ -691,7 +703,11 @@ fn interpret_in_lock(
                     Some(_) | None => false,
                 };
                 if !accepted {
-                    log::error!("attach_runtime: StoreParked for {} found no matching SessionIo/socket", super::hex_lower(&id));
+                    log::error!(
+                        "attach_runtime: StoreParked for {} found no matching SessionIo/socket; discarding the orphan",
+                        super::hex_lower(&id)
+                    );
+                    out.orphaned = Some((id, lease));
                 }
             }
             ServeEffect::ResumeGranted { id, lease } => {
@@ -744,5 +760,11 @@ impl AttachRuntime {
         let core = self.core.lock().await;
         core.agg.index_entry(id).is_some_and(|e| e.parked_since.is_some())
             && core.io.get(id).is_some_and(|s| s.parked_tcp.is_some())
+    }
+
+    /// Removes `id`'s `SessionIo` behind the reducer's back, to reach the
+    /// (otherwise unreachable) "StoreParked finds no SessionIo" state.
+    pub(crate) async fn remove_io_for_test(&self, id: &SessionKey) {
+        self.core.lock().await.io.remove(id);
     }
 }
