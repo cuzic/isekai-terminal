@@ -318,7 +318,7 @@ mod tests {
     use super::*;
     use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
     use proptest::prelude::*;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     fn key(session: u8, generation: u64, attempt: u8) -> AttachKey {
         AttachKey {
@@ -596,6 +596,34 @@ mod tests {
         }
     }
 
+    /// 一度も発行されないlease: 発行済みleaseを100万個ずらした値は得られないので、
+    /// 「別のServeAggregateで十分先まで発行したlease」を使う。
+    fn fabricated_lease() -> LeaseId {
+        let mut other = ServeAggregate::new(0);
+        let mut last = None;
+        for n in 0..=200u64 {
+            let k = AttachKey {
+                session_id: SessionId::from_bytes([0xFF; 16]),
+                generation: ConnectionGeneration::new(n),
+                attempt_id: AttemptId::from_bytes([0xFF; 16]),
+            };
+            for e in other.apply(ServeEvent::Hello { key: k }) {
+                if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e { last = Some(lease); }
+                if let ServeEffect::Attach(AttachEffect::CancelLease { lease }) = e {
+                    for e2 in other.apply(ServeEvent::LeaseStopped { lease }) {
+                        if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e2 { last = Some(lease); }
+                    }
+                }
+            }
+        }
+        last.expect("fabricated lease")
+    }
+
+    /// 主proptestと同じ生成器(`(max_sessions, ops)`)。カバレッジテストが同じ分布を測るために共有する。
+    fn sequence_strategy() -> impl Strategy<Value = (usize, Vec<Op>)> {
+        (0usize..4, proptest::collection::vec(op_strategy(), 0..120))
+    }
+
     type Snapshot = (Vec<Option<AttachState>>, Vec<(SessionKey, IndexEntry)>);
 
     fn snapshot(agg: &ServeAggregate) -> Snapshot {
@@ -677,34 +705,12 @@ mod tests {
     proptest! {
         #[test]
         fn serve_aggregate_invariants_hold_for_arbitrary_event_sequences(
-            max_sessions in 0usize..4,
-            ops in proptest::collection::vec(op_strategy(), 0..120),
+            (max_sessions, ops) in sequence_strategy(),
         ) {
             let mut agg = ServeAggregate::new(max_sessions);
             let mut issued: Vec<LeaseId> = Vec::new();
             let mut issued_set: HashSet<LeaseId> = HashSet::new();
-            // 一度も発行されないlease: 発行済みleaseを100万個ずらした値は得られないので、
-            // 「別のServeAggregateで十分先まで発行したlease」を使う。
-            let fabricated = {
-                let mut other = ServeAggregate::new(0);
-                let mut last = None;
-                for n in 0..=200u64 {
-                    let k = AttachKey {
-                        session_id: SessionId::from_bytes([0xFF; 16]),
-                        generation: ConnectionGeneration::new(n),
-                        attempt_id: AttemptId::from_bytes([0xFF; 16]),
-                    };
-                    for e in other.apply(ServeEvent::Hello { key: k }) {
-                        if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e { last = Some(lease); }
-                        if let ServeEffect::Attach(AttachEffect::CancelLease { lease }) = e {
-                            for e2 in other.apply(ServeEvent::LeaseStopped { lease }) {
-                                if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e2 { last = Some(lease); }
-                            }
-                        }
-                    }
-                }
-                last.expect("fabricated lease")
-            };
+            let fabricated = fabricated_lease();
 
             for op in ops {
                 let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
@@ -742,8 +748,12 @@ mod tests {
                                     // I-h: 非単調nowでも、park後の経過が締切未満なら出さない。
                                     let since = since.unwrap_or(Millis(0));
                                     let deadline = effective_deadline(&before_index[&did], max_parked);
-                                    prop_assert!(now.0 >= since.0, "expired with time going backwards");
-                                    prop_assert!(Duration::from_millis(now.0 - since.0) >= deadline);
+                                    // 締切0(`grace == Some(0)`等)は経過0(時刻逆行の飽和値)でも満了する。
+                                    prop_assert!(
+                                        now.0 >= since.0 || deadline.is_zero(),
+                                        "expired with time going backwards"
+                                    );
+                                    prop_assert!(Duration::from_millis(now.0.saturating_sub(since.0)) >= deadline);
                                 }
                                 if cause == DiscardCause::Evicted {
                                     // 決定論的タイブレーク: (parked_since, id)最小のparkedを選ぶ。
@@ -831,15 +841,79 @@ mod tests {
                         prop_assert_eq!(&before.1, &after.1);
                         prop_assert!(!effects.iter().any(|e| matches!(e, ServeEffect::Discard { .. })), "ATTACH event produced a Discard");
                     }
-                    ServeEvent::Activated { .. }
-                    | ServeEvent::Sweep { .. }
-                    | ServeEvent::EvictOldestParked => {}
+                    // Sweepの完全性(レビューD-2): 締切に達したparkedエントリは**全て**除かれ、
+                    // それ以外(期限前のparked・active・unresumable)は**一切**変わらない。
+                    // 「何も期限切れにしない」reducerはここで落ちる。
+                    ServeEvent::Sweep { now, max_parked } => {
+                        let is_expired = |e: &IndexEntry| {
+                            e.parked_since.is_some_and(|since| {
+                                Duration::from_millis(now.0.saturating_sub(since.0)) >= effective_deadline(e, max_parked)
+                            })
+                        };
+                        let expected: BTreeSet<SessionKey> =
+                            before_index.iter().filter(|(_, e)| is_expired(e)).map(|(k, _)| *k).collect();
+                        let discarded: BTreeSet<SessionKey> = effects
+                            .iter()
+                            .filter_map(|e| match e {
+                                ServeEffect::Discard { id, cause: DiscardCause::Expired, .. } => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        prop_assert_eq!(&discarded, &expected, "sweep did not discard exactly the expired entries");
+                        let mut survivors = before_index.clone();
+                        survivors.retain(|k, _| !expected.contains(k));
+                        prop_assert_eq!(&agg.index, &survivors, "sweep touched a non-expired entry");
+                        prop_assert!(!agg.index.values().any(is_expired), "an expired parked entry survived the sweep");
+                    }
+                    ServeEvent::Activated { .. } | ServeEvent::EvictOldestParked => {}
                 }
             }
         }
 
+        /// Sweepの完全性を、主proptestより多いsession数で独立oracle(生の`u64`演算)と照合する
+        /// (レビューD-2): 締切に達したparkedエントリ**全て**が、**それだけ**が、slotごと除かれる。
+        #[test]
+        fn sweep_discards_every_expired_entry_and_only_those(
+            entries in proptest::collection::vec(
+                (proptest::option::of(0u64..100_000), proptest::option::of(0u32..120)),
+                1..8,
+            ),
+            now in 0u64..200_000,
+            max_parked_ms in 0u64..120_000,
+        ) {
+            let mut agg = ServeAggregate::new(8);
+            let mut leases = Vec::new();
+            for (s, (park_at, grace)) in entries.iter().enumerate() {
+                let s = u8::try_from(s).expect("< 8 sessions");
+                let (lease, _) = establish(&mut agg, s, *grace);
+                if let Some(at) = park_at {
+                    agg.apply(ServeEvent::Parked { id: id(s), lease, now: Millis(*at) });
+                }
+                leases.push(lease);
+            }
+            let effects = agg.apply(ServeEvent::Sweep { now: Millis(now), max_parked: Duration::from_millis(max_parked_ms) });
+            let mut expired_count = 0;
+            for (s, (park_at, grace)) in entries.iter().enumerate() {
+                let deadline_ms = match grace {
+                    Some(g) => max_parked_ms.min(u64::from(*g) * 1000),
+                    None => max_parked_ms,
+                };
+                let expired = park_at.is_some_and(|at| now.saturating_sub(at) >= deadline_ms);
+                expired_count += usize::from(expired);
+                let s8 = u8::try_from(s).expect("< 8 sessions");
+                let discard = ServeEffect::Discard { id: id(s8), lease: leases[s], cause: DiscardCause::Expired };
+                prop_assert_eq!(effects.contains(&discard), expired, "session {} discard mismatch", s);
+                prop_assert_eq!(agg.index.contains_key(&id(s8)), !expired, "session {} index mismatch", s);
+                prop_assert_eq!(established(&agg, s8).is_some(), !expired, "session {} slot mismatch", s);
+            }
+            let discards = effects.iter().filter(|e| matches!(e, ServeEffect::Discard { .. })).count();
+            prop_assert_eq!(discards, expired_count);
+        }
+
         /// §2.2必須プロパティ: 非単調な`now`列を与えても、park後`max_parked`未満の
-        /// エントリに`Discard{Expired}`を出さない(I-h)。単調でないnow列だけを生成する。
+        /// エントリに`Discard{Expired}`を出さない(I-h)。now列は任意(独立な一様乱数なので
+        /// ほぼ常に非単調だが、単調な列も排除はしない)。時刻逆行は経過0として扱うので、
+        /// 締切0(`grace == Some(0)`)のparkだけは逆行時刻のsweepでも満了しうる。
         #[test]
         fn non_monotone_now_never_expires_a_fresh_park(
             park_at in 0u64..1_000_000,
@@ -854,12 +928,83 @@ mod tests {
             for now in sweeps {
                 let alive_before = agg.index.contains_key(&id(1));
                 let effects = agg.apply(ServeEvent::Sweep { now: Millis(now), max_parked: Duration::from_millis(max_parked_ms) });
-                let fresh = now < park_at || Duration::from_millis(now - park_at) < deadline;
+                let fresh = Duration::from_millis(now.saturating_sub(park_at)) < deadline;
                 if alive_before && fresh {
                     prop_assert!(effects.is_empty(), "fresh park expired at now={} (parked at {})", now, park_at);
                     prop_assert!(agg.index.contains_key(&id(1)));
                 }
             }
         }
+    }
+
+    fn bump(hits: &mut BTreeMap<String, usize>, what: &str) {
+        *hits.entry(what.to_owned()).or_default() += 1;
+    }
+
+    /// レビューD-1: 主proptest(`sequence_strategy`)が空振り(vacuous)していないことの確認。
+    /// 同じ生成器から決定論的なseedで主proptestの既定ケース数(256)分の列を生成して実際に適用し、
+    /// 不変条件が意味を持つ状態(park・RESUMEの3結果・各`DiscardCause`・unresumable登録・
+    /// 同じidの別lease再確立(ABA)・生きているidへのstale事実)に**実際に**到達していることを
+    /// 数える。生成器の重みや`resolve`を変えてこれらに届かなくなったら、ここで落ちる。
+    #[test]
+    fn sequence_strategy_reaches_the_interesting_states() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::deterministic();
+        let strategy = sequence_strategy();
+        let fabricated = fabricated_lease();
+        let mut hits: BTreeMap<String, usize> = BTreeMap::new();
+        for _ in 0..256 {
+            let (max_sessions, ops) = strategy.new_tree(&mut runner).expect("generate a sequence").current();
+            let mut agg = ServeAggregate::new(max_sessions);
+            let mut issued: Vec<LeaseId> = Vec::new();
+            let mut last_lease: BTreeMap<SessionKey, LeaseId> = BTreeMap::new();
+            for op in ops {
+                let Some(event) = resolve(&agg, &op, &issued, fabricated) else { continue };
+                let before_index = agg.index.clone();
+                let effects = agg.apply(event);
+                if let ServeEvent::Parked { id: pid, lease, .. } | ServeEvent::RelayTerminated { id: pid, lease, .. } = event {
+                    if before_index.get(&pid).is_some_and(|e| e.lease != lease) {
+                        bump(&mut hits, "stale fact for a live id");
+                    }
+                }
+                for e in &effects {
+                    match *e {
+                        ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) => issued.push(lease),
+                        ServeEffect::Attach(_) => {}
+                        ServeEffect::RegisterIo { id: rid, lease, unresumable } => {
+                            if unresumable {
+                                bump(&mut hits, "registered unresumable");
+                            }
+                            if last_lease.insert(rid, lease).is_some_and(|old| old != lease) {
+                                bump(&mut hits, "id re-established with a new lease");
+                            }
+                        }
+                        ServeEffect::StoreParked { .. } => bump(&mut hits, "parked"),
+                        ServeEffect::ResumeGranted { .. } => bump(&mut hits, "resume granted"),
+                        ServeEffect::RequestPreempt { .. } => bump(&mut hits, "resume preempt"),
+                        ServeEffect::ResumeRejected { .. } => bump(&mut hits, "resume rejected"),
+                        ServeEffect::Discard { cause, .. } => bump(&mut hits, &format!("discard {cause:?}")),
+                    }
+                }
+            }
+        }
+        let required = [
+            "parked",
+            "resume granted",
+            "resume preempt",
+            "resume rejected",
+            "registered unresumable",
+            "id re-established with a new lease",
+            "stale fact for a live id",
+            "discard Expired",
+            "discard Evicted",
+            "discard TcpDied",
+            "discard GuardDropped",
+            "discard Unresumable",
+        ];
+        let missing: Vec<&str> = required.iter().copied().filter(|k| !hits.contains_key(*k)).collect();
+        assert!(missing.is_empty(), "the generated sequences never reached {missing:?} (hits: {hits:?})");
     }
 }

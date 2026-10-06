@@ -1368,6 +1368,15 @@ async fn handle_resume_stream(
             hex_lower(&session_id)
         ));
     };
+    // grant直後(=indexエントリがactiveかつslotが`Established`になった瞬間)にRAIIガードを
+    // 作る(Step 2a follow-up、レビューH-1)。ここから下の`handle.lock()`・`replay_from`・
+    // `respond_resume_accepted`等でpanicしても、Dropが`RelayTerminated{GuardDropped}`を
+    // このincarnationのleaseで送り、indexエントリとslotを1遷移で解放する(以前はこの区間に
+    // ガードが無く、panicするとactiveのまま誰にもsweep/立ち退きされず恒久リークした —
+    // `.claude/rules/always-connects.md`のリーク類型)。正常な早期return(OffsetGone/
+    // RESUME_ACK書き込み失敗)はslotを`Established`のまま維持したいので、`park`完了後に
+    // `disarm()`する(`finish_or_park_session`と同じ順序)。
+    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id, lease_id);
 
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
         let session = handle.lock().await;
@@ -1380,6 +1389,7 @@ async fn handle_resume_stream(
     };
     let Some(replay_bytes) = replay_bytes else {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
+        table_guard.disarm();
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::OffsetGone).await;
         return Err(anyhow!(
             "requested offset {client_delivered_offset} no longer in output buffer for session {}",
@@ -1397,20 +1407,14 @@ async fn handle_resume_stream(
 
     if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
+        table_guard.disarm();
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
     }
 
-    // ここでようやくRAIIガードを作る — この行より前にある`park`+早期return
-    // 経路(UnknownToken/OffsetGone/RESUME_ACK書き込み失敗)はいずれも
-    // 「slotを`Established`のまま維持したい」正常系であり、ガードをここより
-    // 前で作ると、それらの正常な早期returnのたびにDropが誤ってslotを
-    // 解放してしまう(`EstablishedLease`/`AttachRuntime::resumed_lease`docs参照)。
+    // `EstablishedLease`は従来どおりここで作る(`AttachRuntime::resumed_lease`docs参照)。
+    // grantからここまでの区間のpanicは上の`table_guard`が覆う(Dropの`GuardDropped`は
+    // indexエントリの除去とslot解放を同じ遷移で行う)。
     let lease = attach_runtime.resumed_lease(lease_id);
-    // `ResumeGranted`によって、このsession_idのindexエントリは既に「parkされていない」
-    // 状態に戻っている。ここから`finish_or_park_session`が outcome を解決する
-    // までの間にタスクがpanicすると、`EstablishedLease`と全く同じ理由で
-    // このエントリも孤児化する(`SessionTableEntryGuard`docs参照)。
-    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id, lease_id);
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
