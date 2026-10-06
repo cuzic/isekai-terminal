@@ -25,7 +25,6 @@ on:
       - "rust-core/**"
       - "android/src/main/kotlin/uniffi/**"
       - ".github/workflows/android-uniffi-drift-check.yml"
-      - ".github/actions/isekai-pipe-musl/**"
   # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。branch
   # protectionのrequired status checkにする際、path-filter付きpull_requestは
   # 対象パスに触れないPRでcheck-run自体が作られず恒久pendingになる。代わりに
@@ -70,7 +69,6 @@ jobs:
             ^android/src/main/kotlin/uniffi/
             ^\.github/workflows/android-uniffi-drift-check\.yml$
             ^\.github/actions/pr-path-gate/
-            ^\.github/actions/isekai-pipe-musl/
 
   drift-check:
     needs: changes
@@ -102,11 +100,19 @@ jobs:
           restore-keys: |
             android-uniffi-drift-${{ runner.os }}-
 
-      # rust-core-test-check.ymlと同じキャッシュキー(isekai-pipeの依存クロージャの
-      # ハッシュ)を共有する。ミス時のzigは以前の`mlugg/setup-zig` latestではなく、
-      # rust-core-test-linuxと同じ0.16.0固定(キャッシュキーの一部にするため)。
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
-        uses: ./.github/actions/isekai-pipe-musl
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: Build isekai-terminal-core (host debug)
         working-directory: rust-core
