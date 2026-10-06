@@ -1880,6 +1880,7 @@ dependencies = [
  "libc",
  "log",
  "notify-rust",
+ "proptest",
  "quicmux",
  "quinn",
  "rand 0.8.6",
