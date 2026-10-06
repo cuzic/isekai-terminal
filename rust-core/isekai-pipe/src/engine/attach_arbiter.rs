@@ -924,7 +924,7 @@ mod tests {
                 // Established, at most once per lease over the whole trace.
                 for e in &effects {
                     if let AttachEffect::StartRelay { lease, .. } = e {
-                        prop_assert!(matches!(event, AttachEvent::Activated { .. }));
+                        prop_assert!(matches!(event, AttachEvent::Activated { .. }), "StartRelay from non-Activated event");
                         prop_assert!(relay_started.insert(*lease), "StartRelay twice for {:?}", lease);
                         let held = after.iter().any(|(_, st)| {
                             matches!(st, AttachState::Established { lease: l, .. } if l == lease)
