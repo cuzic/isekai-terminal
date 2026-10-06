@@ -75,3 +75,6 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # self_signed_server_configを使うため有効化する(`[dependencies]`のquicmuxは
 # `noq`featureのみ)。
 quicmux = { path = "../quicmux", features = ["test-support"] }
+# attach_arbiter.rsのproptest不変条件(ADR_FUNCTIONAL_CORE_EFFECTS.md Step 1)。
+# ルートcrateと同じ指定(rusty-fork/tempfileを引き込まずCargo.lock差分を抑える)。
+proptest = { version = "1", default-features = false, features = ["std"] }

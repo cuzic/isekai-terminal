@@ -98,3 +98,22 @@ reason = "同上"
 package = "isekai-terminal-core"
 path = "crate::ConnectionIssueHint"
 reason = "UniFFI公開の値型enum(フィールド無し・I/O無し)。reconnect_fsm.rsが切断時のLocal Networkヒントとして返す(ADR §6 Step 3a)"
+
+# ── Effect interpreter登録簿(ADR §3-8 / Step 7a) ───────────────────
+# 登録した関数の本体では、`effect`のenumを`if let`/`let .. else`/`matches!`で選り分けてはならない
+# (明示的な`match`armのみ)。関数には`#[deny(clippy::wildcard_enum_match_arm)]`も付けること。
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "execute_effects"
+effect = "AttachEffect"
+
+[[interpreter]]
+file = "isekai-pipe/src/engine/attach_runtime.rs"
+fn = "activate"
+effect = "AttachEffect"
+
+# ADR §6 Step 3a: orchestratorの再接続Effect interpreter。
+[[interpreter]]
+file = "src/orchestrator.rs"
+fn = "execute_reconnect_effects"
+effect = "ReconnectEffect"

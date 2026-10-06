@@ -47,8 +47,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: rust-core-test-${{ github.ref }}
-  cancel-in-progress: true
+  group: rust-core-test-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  # PRの再pushでは古い実行を捨てる。mainへのpushはcommit(sha)ごとに別groupにして、キャンセルも前の実行待ち
+  # (macOSキューで数十分詰まる)もさせない。連続マージで合成状態の検証が
+  # 毎回キャンセルされ、2026-10-06に5連続で未検証になった)。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -265,6 +268,18 @@ jobs:
       - name: cargo test --doc --workspace
         working-directory: rust-core
         run: cargo test --doc --workspace
+
+      # proptestの反例保存(ADR_FUNCTIONAL_CORE_EFFECTS.md §7 m-5): CI専用運用では
+      # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
+      # `cc`行をソースツリーへ手でコミットする。
+      - name: Upload proptest regressions on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: rust-core/**/proptest-regressions/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   # 純粋モジュールの純粋性検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3 / §6 Step 0)。
   # 層1: clippy disallowed_methods/types(rust-core/clippy.toml、各純粋モジュール先頭の#![deny])。
