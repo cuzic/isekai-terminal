@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod admission_race_tests;
 mod attach_arbiter;
 mod attach_runtime;
 mod resume;
