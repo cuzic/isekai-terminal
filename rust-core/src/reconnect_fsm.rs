@@ -708,7 +708,7 @@ mod tests {
                     prop_assert!(!starts_attempt(&effects), "in-flight中に試行開始: {:?}", before);
                 }
                 if before.reconnect_loop_active {
-                    prop_assert!(!effects.iter().any(|e| matches!(e, ReconnectEffect::StartReconnectLoop { .. })));
+                    prop_assert!(!effects.iter().any(|e| matches!(e, ReconnectEffect::StartReconnectLoop { .. })), "ループ動作中にループを二重起動した");
                 }
                 for e in &effects {
                     if let ReconnectEffect::StartAttempt { epoch, .. } = e {
@@ -760,10 +760,10 @@ mod tests {
             let effects = s.apply(result);
             if effects.contains(&ReconnectEffect::WakeReconnectLoop) {
                 // shellがループを起こすと`ReconnectWake`が届き、試行が始まる。
-                prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectWake { epoch })));
+                prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectWake { epoch })), "wake通知後のReconnectWakeで試行が始まらなかった");
             } else {
                 prop_assert!(!result_is_disconnect, "試行結果の切断でwakeが通知されなかった");
-                prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectTick { epoch, due })));
+                prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectTick { epoch, due })), "同期失敗後のtickで保持中のwakeが試行にならなかった");
             }
         }
 
@@ -775,7 +775,7 @@ mod tests {
             s.reconnect_loop_active = true;
             let epoch = s.reconnect_epoch;
             s.apply(ReconnectEvent::AttemptFailedSync { epoch });
-            prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectTick { epoch, due: true })));
+            prop_assert!(starts_attempt(&s.apply(ReconnectEvent::ReconnectTick { epoch, due: true })), "試行結果の観測+tickで試行開始に到達しなかった");
             prop_assert_eq!(
                 s.apply(ReconnectEvent::AttemptConnected { generation }),
                 vec![ReconnectEffect::PublishConnected]
@@ -789,7 +789,7 @@ mod tests {
         #[test]
         fn session_created_is_a_noop_in_step_3a(initial in state_strategy(), g in any::<u64>()) {
             let mut s = initial.clone();
-            prop_assert!(s.apply(ReconnectEvent::SessionCreated { new_generation: g }).is_empty());
+            prop_assert!(s.apply(ReconnectEvent::SessionCreated { new_generation: g }).is_empty(), "SessionCreatedがEffectを返した");
             prop_assert_eq!(s, initial);
         }
     }
