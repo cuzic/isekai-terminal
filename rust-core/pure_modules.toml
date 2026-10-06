@@ -45,6 +45,18 @@ package = "isekai-transport"
 file = "isekai-transport/src/path_health_fsm.rs"
 module = "path_health_fsm"
 
+# Step 6+7: isekai-sshの接続失敗回復ループ(Unix wrapper.rs / Windows native::connect共通)の
+# 純粋reducerと、その会計(RedeployGate/RecoveryBudget/backoff定数)。
+[[module]]
+package = "isekai-ssh"
+file = "isekai-ssh/src/connect_recovery_fsm.rs"
+module = "connect_recovery_fsm"
+
+[[module]]
+package = "isekai-ssh"
+file = "isekai-ssh/src/reconnect_backoff.rs"
+module = "reconnect_backoff"
+
 # ── 外部パスの許可リスト(セグメント単位の前方一致) ──────────────────
 [external]
 allow = [
@@ -73,6 +85,10 @@ allow = [
     "std::rc::Rc",
     # 項目単位の外部許可(ADR §6 Step 0 / Q10): 統計値の値型
     "noq::PathStats",
+    # Step 6+7: 値型(serde enum)。isekai_pipe_core自体はファイルI/Oを含むので項目単位で許可
+    "isekai_pipe_core::ConnectOutcomeClass",
+    # Step 6+7: `BackoffPolicy::next_delay(attempt, seed)`はseed付きStdRngの純粋関数
+    "isekai_transport::backoff::BackoffPolicy",
 ]
 # allowより優先して拒否する(時計/タスク実行を持つサブモジュール)
 deny = [
@@ -116,3 +132,9 @@ effect = "AttachEffect"
 file = "isekai-pipe/src/engine/attach_runtime.rs"
 fn = "interpret_in_lock"
 effect = "ServeEffect"
+
+# Step 6+7: isekai-ssh接続失敗回復のshell(Unix/Windows native共通)。
+[[interpreter]]
+file = "isekai-ssh/src/connect_recovery_driver.rs"
+fn = "drive_connect_recovery"
+effect = "RecoveryEffect"
