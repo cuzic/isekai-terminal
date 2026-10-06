@@ -266,6 +266,65 @@ jobs:
         working-directory: rust-core
         run: cargo test --doc --workspace
 
+  # 純粋モジュールの純粋性検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3 / §6 Step 0)。
+  # 層1: clippy disallowed_methods/types(rust-core/clippy.toml、各純粋モジュール先頭の#![deny])。
+  # `-A clippy::all`でも、ソース内のdenyが優先されるため純粋モジュールだけが検査される。
+  # 層2: import allowlist(rust-core/scripts/check_pure_modules.py、rust-core/pure_modules.toml)。
+  # 当面required化しない(ADR D3: 数回のCI実績で安定を確認してからbranch protectionへ追加する。
+  # 追加する際は、このname:と`checks[].context`を同時に更新すること)。
+  purity-check:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    name: rust-core-purity-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import allowlist check (self-test + real run)
+        run: |
+          python3 rust-core/scripts/check_pure_modules.py --self-test
+          python3 rust-core/scripts/check_pure_modules.py
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: rust-core-purity-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-purity-${{ runner.os }}-
+            rust-core-test-${{ runner.os }}-
+
+      # isekai-terminal-coreはisekai-pipeのmusl静的バイナリをinclude_bytes!で埋め込むため、
+      # `test`ジョブと同じ前提ビルドが要る。
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        run: |
+          set -euo pipefail
+          curl -fL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          mkdir -p "$HOME/zig-toolchain"
+          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
+          export PATH="$HOME/zig-toolchain:$PATH"
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
+
+      - name: Show clippy version
+        run: cargo clippy --version
+
+      - name: cargo clippy (pure modules only; all other lints allowed)
+        working-directory: rust-core
+        run: cargo clippy --workspace --lib --bins -- -A clippy::all
+
   test-macos:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
