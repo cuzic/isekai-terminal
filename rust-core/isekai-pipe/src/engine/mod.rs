@@ -1,6 +1,8 @@
 mod attach_arbiter;
 mod attach_runtime;
 mod resume;
+#[cfg(test)]
+mod sweep_resume_race_tests;
 
 use std::io::Write as _;
 use std::net::SocketAddr;

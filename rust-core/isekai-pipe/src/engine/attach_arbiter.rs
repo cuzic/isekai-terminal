@@ -30,6 +30,9 @@
 //! entry for a `session_id` is this module's "vacant" (there used to be an
 //! explicit `AttachState::Vacant` for the single-slot design; a per-session
 //! table just omits the key instead).
+// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::HashMap;
 
@@ -394,6 +397,7 @@ impl AttachArbiter {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use isekai_protocol::attach::{AttemptId, ConnectionGeneration};

@@ -8,6 +8,9 @@
 //! I/Oなしの純粋なデータ型 + 判断関数として実装し、実際のタイマー(`tokio::time::sleep`)は
 //! 呼び出し側(`orchestrator.rs`)が`RUNTIME.spawn`で扱う — `AttachArbiter`系コードと同じ
 //! 「判断はpure、I/Oは呼び出し側」の分離。
+// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
 
@@ -85,6 +88,7 @@ impl PathObserver {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
 
