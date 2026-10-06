@@ -323,9 +323,9 @@ struct OrchestratorState {
     /// Kotlin側について警告している「もう1つの状態のコピー」と同じ問題がRust内部で
     /// 起きていた)。
     ///
-    /// **書き手は[`OrchestratorState::set_last_connect_attempt`]だけ**: reducer側の
-    /// 不透明な参照`reconnect.last_attempt`と常に同時に書く(秘密を含むConfigはreducerに
-    /// 載せない、ADR §3-3)。
+    /// **書き手は[`SessionOrchestrator::begin_connect`]だけ**: reducer側の不透明な参照
+    /// `reconnect.last_attempt`(`ManualConnectStarted`のapplyが書く)と常に同じ臨界区間で
+    /// 書く(秘密を含むConfigはreducerに載せない、ADR §3-3)。
     last_connect_attempt: Option<LastConnectAttempt>,
     /// 再接続ループのタイミング。テストでは短い値に差し替える。
     reconnect_policy: ReconnectPolicy,
@@ -358,8 +358,11 @@ struct OrchestratorState {
 }
 
 impl OrchestratorState {
-    /// 直前の接続試行を記録する唯一の書き手。shell側の実体(`last_connect_attempt`)と
-    /// reducer側の不透明な参照(`reconnect.last_attempt`)を同じ臨界区間で同時に進める。
+    /// テスト専用: 直前の接続試行を、`begin_connect`を経由せずに記録する。shell側の実体
+    /// (`last_connect_attempt`)とreducer側の不透明な参照(`reconnect.last_attempt`)を同時に進める
+    /// (本番の書き手は[`SessionOrchestrator::begin_connect`]だけで、そちらは
+    /// [`ReconnectEvent::ManualConnectStarted`]のapplyと同じ臨界区間で両者を書く)。
+    #[cfg(test)]
     fn set_last_connect_attempt(&mut self, attempt: LastConnectAttempt) {
         self.reconnect.last_attempt = Some(AttemptRef::next_after(self.reconnect.last_attempt));
         self.last_connect_attempt = Some(attempt);
@@ -442,18 +445,21 @@ impl OrchestratorAdapter {
     /// 新しいセッションを1つ作るたびに呼ぶ。`session_generation`をインクリメントし、
     /// その値をこのアダプタ自身にキャプチャする(このアダプタ経由のコールバックが
     /// 「今まさに有効なセッションからのものか」を後から判定できるようにする)。
+    ///
+    /// Step 8a′: `session_generation += 1`と同じ臨界区間で[`ReconnectEvent::SessionCreated`]を
+    /// applyする(ADR round 3 m-R3-2)。別世代のedgeが開いていれば`Lost(old)`が返るので、
+    /// **ロック解放後に**ここで公開する(ADR m-R4-4・§2.4-2。呼び出し元はいずれもロックを
+    /// 保持せずにこれを呼ぶ)。現状の2経路(`begin_connect`/`connect_via`)では直前のphase遷移で
+    /// 既に`Lost(old)`が出ているので、ここでは何も出ない(phase遷移を伴わない将来の経路への保険)。
     fn new(shared: Arc<OrchestratorShared>) -> Self {
-        let generation = {
+        let (generation, effects) = {
             let mut s = shared.state.lock();
             s.session_generation += 1;
             let generation = s.session_generation;
-            // `session_generation += 1`と同じ臨界区間でapplyする(ADR round 3 m-R3-2)。
-            // Step 3aでは定義のみでEffectは返らない(8a′でedgeが開いていれば`Lost(old)`を返し、
-            // そのときはこのEffectを呼び出し元へ返してロック解放後に公開する、ADR m-R4-4)。
             let effects = s.reconnect.apply(ReconnectEvent::SessionCreated { new_generation: generation });
-            debug_assert!(effects.is_empty(), "Step 3a: SessionCreated must not emit effects yet: {effects:?}");
-            generation
+            (generation, effects)
         };
+        execute_reconnect_effects(&shared, effects, EffectContext::default());
         Self { shared, generation }
     }
 
@@ -788,7 +794,7 @@ struct EffectContext<'a> {
     reason: Option<String>,
     /// `StartReconnectLoop`の`AttemptRef`をin-lockで解決したもの。
     resolved_attempt: Option<(AttemptRef, LastConnectAttempt)>,
-    /// `PublishConnected`で公開するホスト名(in-lockで`current_target`から解決)。
+    /// `PublishConnected`/`EdgeEstablished`で公開するホスト名(in-lockで`current_target`から解決)。
     connected_host: String,
     /// `StartAttempt`で試行する接続設定(再接続ループが起動時に受け取ったclone)。
     loop_attempt: Option<&'a LastConnectAttempt>,
@@ -845,8 +851,27 @@ fn execute_reconnect_effects(
             }
             ReconnectEffect::PublishConnected => {
                 shared.callback.on_connection_state_changed(ConnectionPublicState::Connected {
-                    host: std::mem::take(&mut ctx.connected_host),
+                    host: ctx.connected_host.clone(),
                 });
+            }
+            ReconnectEffect::PublishConnecting => {
+                shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+            }
+            ReconnectEffect::EdgeEstablished { generation } => {
+                crate::debug_reconnect::record(format!("connection_edge established generation={generation}"));
+                shared.callback.on_connection_edge(
+                    crate::ConnectionEdge::Established { host: ctx.connected_host.clone() },
+                    generation,
+                );
+            }
+            ReconnectEffect::EdgeLost { generation } => {
+                crate::debug_reconnect::record(format!("connection_edge lost generation={generation}"));
+                shared.callback.on_connection_edge(crate::ConnectionEdge::Lost, generation);
+            }
+            ReconnectEffect::ManualConnectRejected => {
+                // `begin_connect`はこのEffectを見たら解釈せずに`Err`を返すので、ここへは来ない。
+                debug_assert!(false, "ManualConnectRejected must be handled by begin_connect");
+                log::error!("orchestrator: ManualConnectRejected reached the interpreter; ignoring");
             }
             ReconnectEffect::StartAttempt { epoch, source } => {
                 if let Some(attempt) = ctx.loop_attempt {
@@ -925,9 +950,20 @@ fn run_reconnect_attempt(
 /// 「接続先のSSOTは`last_connect_attempt`」という原則の下では、その唯一の
 /// 書き手は手動接続(`begin_connect`)だけにしておくのが安全。
 fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) -> Result<(), SshError> {
-    shared.state.lock().reconnect.phase = ConnPhase::Connecting;
-    let adapter = OrchestratorAdapter::new(shared.clone());
+    let adapter = begin_reconnect_session(shared);
     build_and_store_session(shared, attempt, adapter)
+}
+
+/// [`connect_via`]のうち、セッション生成より前の「phaseを`Connecting`へ動かし、新しい世代の
+/// アダプタを作る」部分(ADR §6 Step 8a′)。phase遷移は[`ReconnectEvent::ReconnectSessionStarting`]
+/// のapplyで行い、Connectedのまま入った場合(フォアグラウンド復帰)はそのapplyが`Lost(old)`を返すので、
+/// ロック解放後・新しい世代へ進む前に公開する。この経路は状態公開(`Connecting`)を伴わない
+/// (既存の挙動、ADR m-R4-4)。テストのフェイク`reconnect_attempt`も、実接続をせずに本番と同じ
+/// 遷移を踏むためにこれを呼ぶ。
+fn begin_reconnect_session(shared: &Arc<OrchestratorShared>) -> OrchestratorAdapter {
+    let effects = shared.state.lock().reconnect.apply(ReconnectEvent::ReconnectSessionStarting);
+    execute_reconnect_effects(shared, effects, EffectContext::default());
+    OrchestratorAdapter::new(shared.clone())
 }
 
 /// `attempt`が指すトランスポートのセッションを1つ生成・接続し、成功したら
@@ -1195,35 +1231,26 @@ impl SessionOrchestrator {
     /// 正当な経路であり(下記invalidate呼び出し、および
     /// `notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt`
     /// テスト参照)、`Idle`と同様に受理してよい。
+    ///
+    /// 判断(拒否するか・どのフィールドを書くか・Connectedからの切り替えなら旧世代の`Lost`)は
+    /// [`ReconnectEvent::ManualConnectStarted`]のapplyが行う(ADR §6 Step 8a′)。返ったEffect
+    /// (`Lost(old)`→path_observerの無効化→`Connecting`公開)はロック解放後に、新しい世代の
+    /// アダプタを作る前に解釈する(旧世代の`Lost`が新しい世代より先に届く)。
     fn begin_connect(&self, attempt: LastConnectAttempt) -> Result<OrchestratorAdapter, SshError> {
-        {
+        let effects = {
             let mut s = self.shared.state.lock();
-            if s.reconnect.phase == ConnPhase::Connecting {
+            let attempt_ref = AttemptRef::next_after(s.reconnect.last_attempt);
+            let effects = s.reconnect.apply(ReconnectEvent::ManualConnectStarted { attempt: attempt_ref });
+            if effects.contains(&ReconnectEffect::ManualConnectRejected) {
                 return Err(SshError::ConnectionFailed);
             }
             // 接続先(host/port/QUIC種別)と再接続用のConfigは同じ1つの
-            // `last_connect_attempt`が担う。以前は呼び出し側が別途
-            // `last_connect_attempt`を書いており、このロックを一度解放した後に
-            // 書かれるまでの間だけ両者が食い違って見え得た(SSOT違反)。
-            s.set_last_connect_attempt(attempt);
-            s.reconnect.phase = ConnPhase::Connecting;
-            // 新しい手動接続が始まった以上、直前のdisconnect()由来のフラグや
-            // 実行中だったかもしれない自動再接続ループは無関係になる。
-            s.reconnect.user_initiated_disconnect = false;
-            s.reconnect.reconnect_epoch += 1;
-            s.reconnect.reconnect_loop_active = false;
-            s.reconnect.retry_attempt_in_flight = false;
-            s.reconnect.pending_wake = false;
-            // #20: 手動接続はフォアグラウンドの操作でしか起こり得ない。直前の
-            // バックグラウンド遷移状態は無関係になる。
-            s.reconnect.background_state = BackgroundState::Foreground;
-        }
-        // 新しい接続試行が始まった時点で、直前のセッションに対して保留中だった
-        // network-path debounceは無効化する。そうしないと、瞬断のdebounce待機中に
-        // 手動で切断/別transportへ再接続した場合、無関係な新しいセッションを
-        // 誤って切断してしまう(レビューで指摘された実際の不具合)。
-        self.shared.path_observer.lock().invalidate();
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+            // `last_connect_attempt`が担う。reducer側の参照(`last_attempt`)と同じ臨界区間で
+            // 書く(ロックを一度解放した後に書くと、その間だけ両者が食い違って見え得る)。
+            s.last_connect_attempt = Some(attempt);
+            effects
+        };
+        execute_reconnect_effects(&self.shared, effects, EffectContext::default());
         Ok(OrchestratorAdapter::new(self.shared.clone()))
     }
 
@@ -1443,13 +1470,15 @@ impl SessionOrchestrator {
                 Ok(()) => {}
                 Err(e) => {
                     log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
-                    let mut s = self.shared.state.lock();
-                    s.reconnect.phase = ConnPhase::Idle;
-                    drop(s);
-                    self.shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
-                        reason: Some(format!("foreground resume reconnect failed: {e}")),
-                        issue_hint: None,
-                    });
+                    let effects = self.shared.state.lock().reconnect.apply(ReconnectEvent::ForegroundReconnectFailedSync);
+                    execute_reconnect_effects(
+                        &self.shared,
+                        effects,
+                        EffectContext {
+                            reason: Some(format!("foreground resume reconnect failed: {e}")),
+                            ..EffectContext::default()
+                        },
+                    );
                 }
             }
         }
@@ -1962,6 +1991,8 @@ mod tests {
         no_viable_paths: StdMutex<u32>,
         forward_state_ids: StdMutex<Vec<String>>,
         prompt_output_copies: StdMutex<Vec<Option<String>>>,
+        /// Step 8a′: `on_connection_edge`へ渡された`(edge, generation)`。
+        edges: StdMutex<Vec<(crate::ConnectionEdge, u64)>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -2026,6 +2057,13 @@ mod tests {
         fn on_foreground_resume(&self, did_reconnect: bool) {
             self.event_order.lock().unwrap().push("foreground_resume");
             self.foreground_resumes.lock().unwrap().push(did_reconnect);
+        }
+        fn on_connection_edge(&self, edge: crate::ConnectionEdge, generation: u64) {
+            self.event_order.lock().unwrap().push(match edge {
+                crate::ConnectionEdge::Established { .. } => "edge_established",
+                crate::ConnectionEdge::Lost => "edge_lost",
+            });
+            self.edges.lock().unwrap().push((edge, generation));
         }
     }
 
@@ -3250,6 +3288,216 @@ mod tests {
         );
     }
 
+    // ── Step 8a′: 接続エッジ(on_connection_edge)の退出経路ごとのshell配線テスト ──
+    //
+    // reducerのproptest(`reconnect_fsm::tests`)は「reducerが正しい」ことしか示さず、「shellが
+    // 全経路でreducerにEventを渡している」ことは示さない(ADR §6 Step 8a′「shell側の検証」)。
+    // そこで退出経路(a)〜(f)ごとに1本ずつ、`Established(g)`の後に`Lost(g)`が届くことを確かめる。
+
+    /// 接続エッジのテスト用オーケストレータ。`Idle`・接続試行無しから始め、`begin_connect`で
+    /// 本番と同じ遷移を踏む。`reconnect_attempt`は実接続をせず、本番の`connect_via`と同じ
+    /// [`begin_reconnect_session`](phase遷移+新しい世代のアダプタ生成)だけを行い、そのアダプタを
+    /// `adapters`へ積む(テストがそれに`on_connected`を呼んで「試行成功」を模す)。
+    /// TCP網断のdebounceは30msに短縮してある。
+    fn edge_test_orchestrator(
+        rt: tokio::runtime::Handle,
+        policy: ReconnectPolicy,
+    ) -> (SessionOrchestrator, Arc<RecordingCallback>, Arc<StdMutex<Vec<OrchestratorAdapter>>>) {
+        let callback = Arc::new(RecordingCallback::default());
+        let adapters = Arc::new(StdMutex::new(Vec::new()));
+        let sink = adapters.clone();
+        let mut state = reconnect_test_state(policy);
+        state.reconnect = ReconnectState::default();
+        state.last_connect_attempt = None;
+        let shared = Arc::new(OrchestratorShared {
+            state: Mutex::new(state),
+            callback: callback.clone(),
+            session: Mutex::new(None),
+            path_observer: Mutex::new(net_health_policy::PathObserver::new(net_health_policy::NetPathPolicy {
+                debounce: Duration::from_millis(30),
+            })),
+            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
+            reconnect_attempt: Box::new(move |shared, _attempt| {
+                let adapter = begin_reconnect_session(shared);
+                sink.lock().unwrap().push(adapter);
+                Ok(())
+            }),
+            reconnect_wake: tokio::sync::Notify::new(),
+            rt,
+        });
+        (SessionOrchestrator { shared }, callback, adapters)
+    }
+
+    /// `begin_connect`→`on_connected`で新しい世代のedgeを開く(本番の手動接続と同じ経路)。
+    fn connect_and_establish(orch: &SessionOrchestrator, host: &str) -> OrchestratorAdapter {
+        let adapter = orch.begin_connect(ssh_attempt(host)).expect("Idle/Connected中のconnectは受理されるはず");
+        adapter.on_connected();
+        adapter
+    }
+
+    fn edges_of(cb: &RecordingCallback) -> Vec<(crate::ConnectionEdge, u64)> {
+        cb.edges.lock().unwrap().clone()
+    }
+
+    fn established(host: &str, generation: u64) -> (crate::ConnectionEdge, u64) {
+        (crate::ConnectionEdge::Established { host: host.to_string() }, generation)
+    }
+
+    fn lost(generation: u64) -> (crate::ConnectionEdge, u64) {
+        (crate::ConnectionEdge::Lost, generation)
+    }
+
+    /// 届いたエッジ列の契約を検査する(ADR §6 Step 11 T1と同じ形):
+    /// 各世代の`Established`は高々1回・単調増加で、`Lost(g)`は直前の`Established(g)`に対して正確に1回。
+    fn assert_edge_contract(edges: &[(crate::ConnectionEdge, u64)]) {
+        let mut open: Option<u64> = None;
+        let mut last_established: Option<u64> = None;
+        for (edge, g) in edges {
+            match edge {
+                crate::ConnectionEdge::Established { .. } => {
+                    assert_eq!(open, None, "Lostより前に次のEstablished({g})が来た: {edges:?}");
+                    assert!(!matches!(last_established, Some(last) if *g <= last),"Establishedの世代が単調増加でない: {edges:?}");
+                    open = Some(*g);
+                    last_established = Some(*g);
+                }
+                crate::ConnectionEdge::Lost => {
+                    assert_eq!(open, Some(*g), "対応するEstablishedの無いLost({g}): {edges:?}");
+                    open = None;
+                }
+            }
+        }
+    }
+
+    /// `Connected`の公開の**後に**同じ呼び出し箇所から`Established`が届く(ADR §2.4-4の固定順)。
+    /// 同一世代の`on_connected`重複では`Established`を出し直さない。
+    #[tokio::test(start_paused = true)]
+    async fn edge_established_follows_connected_publication_and_is_not_repeated() {
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let adapter = connect_and_establish(&orch, "example.com");
+        assert_eq!(
+            cb.event_order.lock().unwrap().as_slice(),
+            &["connection_state_changed", "connection_state_changed", "edge_established"],
+            "Connecting → Connected → Established の順で届くはず"
+        );
+        adapter.on_connected();
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1)]);
+    }
+
+    /// (a) ユーザー`disconnect()`。
+    #[tokio::test(start_paused = true)]
+    async fn edge_lost_on_user_disconnect() {
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let adapter = connect_and_establish(&orch, "example.com");
+        orch.disconnect(); // sessionはNoneなので、実セッションの代わりに下でon_disconnectedを届ける
+        adapter.on_disconnected(Some("closed by user".to_string()));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1), lost(1)]);
+        assert!(!orch.shared.state.lock().reconnect.reconnect_loop_active);
+        let order = cb.event_order.lock().unwrap().clone();
+        assert_eq!(&order[order.len() - 2..], &["edge_lost", "connection_state_changed"], "Lostは同じ箇所のDisconnected公開より前");
+    }
+
+    /// (b) トランスポートエラー(`on_disconnected`)。自動再接続ループが始まっても`Lost`は1回だけ。
+    #[tokio::test(start_paused = true)]
+    async fn edge_lost_on_transport_error() {
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let adapter = connect_and_establish(&orch, "example.com");
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        assert!(orch.shared.state.lock().reconnect.reconnect_loop_active);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let edges = edges_of(&cb);
+        assert_eq!(edges, vec![established("example.com", 1), lost(1)]);
+        assert_edge_contract(&edges);
+    }
+
+    /// (c) TCPのnetwork-lost debounce満了(`apply_network_lost`、ADR round 3 R3-1)。アダプタも世代も
+    /// 経由しない経路でも`Lost`が即座に出て、後から旧セッションの`on_disconnected`が同じ世代で
+    /// 届いても二重に出ない。
+    #[tokio::test(start_paused = true)]
+    async fn edge_lost_on_network_lost_debounce() {
+        let policy = ReconnectPolicy {
+            tick: Duration::from_millis(10),
+            // 試行を発火させず、旧アダプタを現行世代のまま保つ。
+            retry_interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+        };
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), policy);
+        let adapter = connect_and_establish(&orch, "example.com");
+        orch.notify_network_path_changed(false);
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1)], "debounce前はLostを出さない");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1), lost(1)]);
+        assert!(orch.shared.state.lock().reconnect.reconnect_loop_active);
+
+        // 旧セッションの遅延した切断通知(まだ現行世代)。
+        assert!(adapter.is_current());
+        adapter.on_disconnected(Some("broken pipe".to_string()));
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1), lost(1)], "同じ世代のLostを二重に出してはいけない");
+    }
+
+    /// (d) Connected中の手動`connect_*`(`begin_connect`はConnected中の呼び出しを受理する)。
+    /// 旧世代の`Lost`は`Connecting`公開より前、新しい世代の`Established`より前に届く(ADR round 2 N-4)。
+    #[tokio::test(start_paused = true)]
+    async fn edge_lost_on_manual_connect_while_connected() {
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let old = connect_and_establish(&orch, "example.com");
+        let new = orch.begin_connect(ssh_attempt("other.example.com")).expect("Connected中のconnectは受理されるはず");
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1), lost(1)]);
+        {
+            let order = cb.event_order.lock().unwrap();
+            assert_eq!(&order[order.len() - 2..], &["edge_lost", "connection_state_changed"], "Lost(old)はConnecting公開より前");
+        }
+
+        old.on_connected(); // 旧世代の遅延コールバックは無視される
+        new.on_connected();
+        let edges = edges_of(&cb);
+        assert_eq!(edges, vec![established("example.com", 1), lost(1), established("other.example.com", 2)]);
+        assert_edge_contract(&edges);
+    }
+
+    /// (e) Suspended後のフォアグラウンド復帰による`connect_via`(ADR round 4 m-R4-5の手順どおり、
+    /// 切断を起こさずConnectedのまま復帰する)。
+    #[tokio::test(start_paused = true)]
+    async fn edge_lost_on_foreground_resume_reconnect() {
+        let (orch, cb, adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let _old = connect_and_establish(&orch, "example.com");
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1)]);
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().reconnect.background_state, BackgroundState::Suspended);
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Connected, "切断を起こさずに復帰する手順");
+
+        orch.notify_will_enter_foreground();
+        assert_eq!(edges_of(&cb), vec![established("example.com", 1), lost(1)], "connect_viaのphase遷移でLost(old)");
+
+        let new = adapters.lock().unwrap().pop().expect("フォアグラウンド復帰で再接続を試みるはず");
+        new.on_connected();
+        let edges = edges_of(&cb);
+        assert_eq!(edges, vec![established("example.com", 1), lost(1), established("example.com", 2)]);
+        assert_edge_contract(&edges);
+    }
+
+    /// (f) 切断→自動再接続ループの試行成功。
+    #[tokio::test(start_paused = true)]
+    async fn edge_reestablished_after_reconnect_loop_success() {
+        let (orch, cb, adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let adapter = connect_and_establish(&orch, "example.com");
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let attempt = adapters.lock().unwrap().pop().expect("retry_interval経過後に再接続を試みるはず");
+        assert!(attempt.is_current());
+        let generation = orch.shared.state.lock().session_generation;
+        attempt.on_connected();
+        assert!(!orch.shared.state.lock().reconnect.reconnect_loop_active);
+        let edges = edges_of(&cb);
+        assert_eq!(edges, vec![established("example.com", 1), lost(1), established("example.com", generation)]);
+        assert_edge_contract(&edges);
+    }
+
     // ── #20: バックグラウンド/フォアグラウンド遷移 ─────────────
 
     #[test]
@@ -3513,7 +3761,7 @@ mod tests {
             // 本当に固着状態を解消しているかを検証できるようにする。
             reconnect_attempt: Box::new(move |shared, _attempt| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                shared.state.lock().reconnect.phase = ConnPhase::Connecting;
+                let _ = begin_reconnect_session(shared);
                 Err(SshError::ConnectionFailed)
             }),
             reconnect_wake: tokio::sync::Notify::new(),

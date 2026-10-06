@@ -4971,6 +4971,90 @@ public func FfiConverterTypeClipboardMimeKind_lower(_ value: ClipboardMimeKind) 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * `OrchestratorCallback::on_connection_edge`で通知する接続エッジ
+ * (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
+ * 変化からエッジを自前で検出せず(`StateFlow`のconflationで`Connected→Reconnecting→Connected`
+ * を取りこぼしうる)、これを受け取ったら接続/切断に伴う既存の処理を呼ぶだけにする(`rust-ssot.md`)。
+ */
+
+public enum ConnectionEdge: Equatable, Hashable {
+    
+    /**
+     * 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
+     * `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
+     */
+    case established(host: String
+    )
+    /**
+     * `Established`を出した世代のセッションが`Connected`を離れた。`Established(g)`の後、
+     * 次の`Established(g'>g)`より前に正確に1回届く。
+     */
+    case lost
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConnectionEdge: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConnectionEdge: FfiConverterRustBuffer {
+    typealias SwiftType = ConnectionEdge
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConnectionEdge {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .established(host: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .lost
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConnectionEdge, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .established(host):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(host, into: &buf)
+            
+        
+        case .lost:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnectionEdge_lift(_ buf: RustBuffer) throws -> ConnectionEdge {
+    return try FfiConverterTypeConnectionEdge.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnectionEdge_lower(_ value: ConnectionEdge) -> RustBuffer {
+    return FfiConverterTypeConnectionEdge.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * #19: 接続失敗の原因をユーザーが自己解決しやすくするための追加ヒント。
  * 判断材料(接続先アドレスの種別等)はRust側(`orchestrator.rs`)に閉じており、
  * Kotlin/Swiftは届いたヒントに応じた案内UIを出すだけでよい(`rust-ssot.md`)。
@@ -7603,6 +7687,21 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onForegroundResume(didReconnect: Bool) 
     
+    /**
+     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
+     * 世代(`generation`=`session_generation`)付きの接続エッジ。実装は受け取ったら接続/切断に伴う
+     * 既存の処理(upstream監視の登録/解除・tmuxウィンドウensure等)を呼ぶだけにし、重複排除や
+     * エッジ判定を自前で行わない(`rust-ssot.md`)。
+     *
+     * 保証: 各`generation`について`Established`は高々1回で、その後`Established(g'>g)`より前に
+     * `Lost(generation)`が正確に1回届く(予期しない切断・network-lost・ユーザー切断・Connected中の
+     * 手動`connect_*`・フォアグラウンド復帰の再接続のいずれの経路でも)。`Established`は同じ呼び出し
+     * 箇所から`on_connection_state_changed(Connected)`の**後**に届く。`Lost`は、それを起こした遷移の
+     * 状態公開(`Disconnected`/`Connecting`)と同じ呼び出し箇所から**前**に届く(自動再接続ループの
+     * `Reconnecting`は別スレッドから公開されるので、それとの順序は保証しない)。
+     */
+    func onConnectionEdge(edge: ConnectionEdge, generation: UInt64) 
+    
 }
 
 
@@ -8075,6 +8174,32 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 }
                 return uniffiObj.onForegroundResume(
                      didReconnect: try FfiConverterBool.lift(didReconnect)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onConnectionEdge: { (
+            uniffiHandle: UInt64,
+            edge: RustBuffer,
+            generation: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onConnectionEdge(
+                     edge: try FfiConverterTypeConnectionEdge_lift(edge),
+                     generation: try FfiConverterUInt64.lift(generation)
                 )
             }
 
@@ -9630,6 +9755,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 33882) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 39423) {
         return InitializationResult.apiChecksumMismatch
     }
 

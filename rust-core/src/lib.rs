@@ -1418,6 +1418,20 @@ pub enum ConnectionPublicState {
     Reconnecting { elapsed_secs: u32, timeout_secs: u32, reason: Option<String> },
 }
 
+/// `OrchestratorCallback::on_connection_edge`で通知する接続エッジ
+/// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
+/// 変化からエッジを自前で検出せず(`StateFlow`のconflationで`Connected→Reconnecting→Connected`
+/// を取りこぼしうる)、これを受け取ったら接続/切断に伴う既存の処理を呼ぶだけにする(`rust-ssot.md`)。
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionEdge {
+    /// 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
+    /// `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
+    Established { host: String },
+    /// `Established`を出した世代のセッションが`Connected`を離れた。`Established(g)`の後、
+    /// 次の`Established(g'>g)`より前に正確に1回届く。
+    Lost,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum TrzszPublicState {
     Idle,
@@ -1519,6 +1533,18 @@ pub trait OrchestratorCallback: Send + Sync {
     /// **前**に発火する(round-3 レビュー S1)——順序を逆にすると「Disconnected
     /// 直後に『再接続しています』」という矛盾した一過性表示になる。
     fn on_foreground_resume(&self, did_reconnect: bool);
+    /// ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
+    /// 世代(`generation`=`session_generation`)付きの接続エッジ。実装は受け取ったら接続/切断に伴う
+    /// 既存の処理(upstream監視の登録/解除・tmuxウィンドウensure等)を呼ぶだけにし、重複排除や
+    /// エッジ判定を自前で行わない(`rust-ssot.md`)。
+    ///
+    /// 保証: 各`generation`について`Established`は高々1回で、その後`Established(g'>g)`より前に
+    /// `Lost(generation)`が正確に1回届く(予期しない切断・network-lost・ユーザー切断・Connected中の
+    /// 手動`connect_*`・フォアグラウンド復帰の再接続のいずれの経路でも)。`Established`は同じ呼び出し
+    /// 箇所から`on_connection_state_changed(Connected)`の**後**に届く。`Lost`は、それを起こした遷移の
+    /// 状態公開(`Disconnected`/`Connecting`)と同じ呼び出し箇所から**前**に届く(自動再接続ループの
+    /// `Reconnecting`は別スレッドから公開されるので、それとの順序は保証しない)。
+    fn on_connection_edge(&self, edge: ConnectionEdge, generation: u64);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
