@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PreToolUse(Bash) hook rev2: エージェントからのGitHub書き込み系操作を許可リスト方式で制限する。
+"""PreToolUse(Bash) hook rev3: エージェントからのGitHub書き込み系操作を許可リスト方式で制限する。
 
-ADR_PARALLEL_AGENT_DELIVERY.md B1/NM1/NM2 対策。拒否リストはバイパスが多い(gh -R, git -C, タグpush,
-gh release/secret, gh auth token+curl 等)ため、gh/git pushは「許可した形だけ通す」。
-対象判定: (a) stdinに agent_id/agent_type があればエージェント、(b) cwd が .claude/worktrees/ 配下。
-どちらでもなければ(=リード)対象外。※ (a)のフィールドの有無は導入時に実測で確認する(HOOK_DEBUG=1)。
-限界: コマンド文字列の静的検査。変数展開/スクリプト経由/別ツール(curl等)は防げない(多層防御の一層)。
+ADR_PARALLEL_AGENT_DELIVERY.md B1/NM1/NM2 対策。gh/git pushは「許可した形だけ通す」。
+rev3: shlexで字句解析(引用符内/ヒアドキュメント本文の文字列は命令として扱わない)、env/timeout/絶対パス/
+command等の前置ラッパーを剥がす、`--method=PUT`形式、リリースタグ(isekai-*-v*)のpushを拒否。
+対象判定: stdinの agent_id/agent_type、または cwd が .claude/worktrees/ 配下。それ以外(リード)は対象外。
+限界: 静的検査。変数展開・スクリプト経由・別ツール(curl等)・eval は防げない(多層防御の一層)。fail-open。
 """
 import json, os, re, shlex, sys
 
@@ -18,99 +18,134 @@ def deny(reason):
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)  # fail-open
+    sys.exit(0)
 if os.environ.get("HOOK_DEBUG"):
     open("/tmp/deny-agent-merge.debug", "a").write(json.dumps({k: (v if k != "tool_input" else "...") for k, v in data.items()}) + "\n")
 if data.get("tool_name") != "Bash":
     sys.exit(0)
-
 is_agent = bool(data.get("agent_id") or data.get("agent_type")) or "/.claude/worktrees/" in (data.get("cwd") or "") + "/"
 if not is_agent:
     sys.exit(0)
-
 cmd = (data.get("tool_input") or {}).get("command") or ""
 
-GH_ALLOW = {  # (group, sub) -- 読み取り系 + 自分のPRの作成/更新
+GH_ALLOW = {
     ("pr", "create"), ("pr", "view"), ("pr", "checks"), ("pr", "diff"), ("pr", "list"), ("pr", "status"),
     ("pr", "comment"), ("pr", "edit"),
     ("run", "list"), ("run", "view"), ("run", "watch"), ("run", "download"),
     ("workflow", "list"), ("workflow", "view"),
     ("repo", "view"), ("issue", "view"), ("issue", "list"), ("auth", "status"),
 }
-SEGMENT_SPLIT = re.compile(r"(?:&&|\|\||;|\||\n|\$\(|`|\()")
+WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "time", "nice", "sudo", "xargs", "stdbuf", "timeout", "doas"}
+WRAPPER_ARG1 = {"timeout", "nice", "stdbuf"}  # 直後に1引数(秒数など)を取るもの
+RELEASE_TAG = re.compile(r"^(?:refs/tags/)?(?:isekai-(?:ssh|pipe)-v.*|v\d.*)$")
 
-def strip_globals(toks, flags_with_arg):
+def strip_heredocs(s):
+    return re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\b", " ", s, flags=re.S)
+
+def tokenize(s):
+    lex = shlex.shlex(s, posix=True, punctuation_chars=";&|()\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    return list(lex)
+
+def split_commands(tokens):
+    cur, out = [], []
+    for t in tokens:
+        if t and set(t) <= set(";&|()\n"):
+            if cur: out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur: out.append(cur)
+    return out
+
+def unwrap(toks):
+    """env VAR=1 timeout 5 /usr/bin/gh ... -> ['gh', ...]; bash -c '...' は別途再帰。"""
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if re.fullmatch(r"\w+=.*", t):
+            i += 1; continue
+        base = os.path.basename(t)
+        if base in WRAPPERS:
+            i += 1
+            while i < len(toks) and toks[i].startswith("-"):
+                i += 1
+            if base in WRAPPER_ARG1 and i < len(toks):
+                i += 1
+            continue
+        break
+    rest = toks[i:]
+    if rest:
+        rest = [os.path.basename(rest[0])] + rest[1:]
+    return rest
+
+def strip_flags(toks, with_arg):
     out, i = [], 0
     while i < len(toks):
         t = toks[i]
-        if t in flags_with_arg:
+        if t in with_arg:
             i += 2; continue
-        if any(t.startswith(f + "=") for f in flags_with_arg if f.startswith("--")):
+        if any(t.startswith(f + "=") for f in with_arg if f.startswith("--")):
             i += 1; continue
         out.append(t); i += 1
     return out
 
 def check_gh(toks):
-    toks = strip_globals(toks, {"-R", "--repo", "--hostname"})
-    sub = tuple(toks[1:3]) if len(toks) >= 3 else tuple(toks[1:2])
+    toks = strip_flags(toks, {"-R", "--repo", "--hostname"})
     if toks[1:2] == ["api"]:
         rest = toks[2:]
         for i, t in enumerate(rest):
             if t in ("-X", "--method") and i + 1 < len(rest) and rest[i + 1].upper() != "GET":
                 deny("gh api の書き込み系メソッドは禁止")
-            if t.upper().startswith("-X") and len(t) > 2 and t[2:].upper() != "GET":
+            if t.startswith("--method=") and t.split("=", 1)[1].upper() != "GET":
+                deny("gh api の書き込み系メソッドは禁止")
+            if re.fullmatch(r"-X\w+", t) and t[2:].upper() != "GET":
                 deny("gh api の書き込み系メソッドは禁止")
             if t in ("-f", "-F", "--field", "--raw-field", "--input") or t.startswith(("--field=", "--raw-field=", "--input=")):
                 deny("gh api の -f/-F/--input は POST になるため禁止")
         return
+    sub = tuple(toks[1:3])
     if sub not in GH_ALLOW:
         deny(f"許可リストにない gh 操作: gh {' '.join(sub)}")
 
 def check_git(toks):
-    toks = strip_globals(toks, {"-C", "-c", "--git-dir", "--work-tree"})
+    toks = strip_flags(toks, {"-C", "-c", "--git-dir", "--work-tree"})
     if toks[1:2] != ["push"]:
         return
-    args = [t for t in toks[2:]]
+    args = toks[2:]
     opts = [a for a in args if a.startswith("-")]
     pos = [a for a in args if not a.startswith("-")]
     for o in opts:
-        if o in ("--mirror", "--all", "--tags", "--follow-tags", "--delete", "-d", "--prune") or o == "--force" or (o.startswith("-") and not o.startswith("--") and "f" in o[1:] and o not in ("-u",)):
+        if o in ("--mirror", "--all", "--tags", "--follow-tags", "--delete", "-d", "--prune", "--force") \
+           or (re.fullmatch(r"-[a-zA-Z]+", o) and "f" in o[1:]):
             deny(f"git push のオプション {o} は禁止(--force-with-lease のみ可)")
-    for ref in pos[1:]:  # pos[0] はremote
-        dst = ref.split(":")[-1].lstrip("+")
-        if dst in ("main", "master") or dst.startswith(("refs/heads/main", "refs/heads/master", "refs/tags/", "tags/")) or re.fullmatch(r"v\d[\w.\-]*", dst):
-            deny(f"git push の宛先 {dst} は禁止(main/master/タグ)")
+    for ref in pos[1:]:
         if ref.startswith("+"):
             deny("git push の +refspec(force)は禁止")
-    if len(pos) < 2 and not any(o in ("-u", "--set-upstream") for o in opts) and False:
-        pass
+        dst = ref.split(":")[-1]
+        if re.fullmatch(r"(?:refs/heads/)?(?:main|master)", dst) or dst.startswith(("refs/tags/", "tags/")) or RELEASE_TAG.match(dst):
+            deny(f"git push の宛先 {dst} は禁止(main/master/タグ)")
 
-for seg in SEGMENT_SPLIT.split(cmd):
-    s = seg.strip()
-    if not s:
-        continue
-    # bash -c '...' / sh -c "..." の中身も再帰的に検査
-    m = re.match(r"^(?:env\s+\S+=\S+\s+)*(?:bash|sh|zsh)\s+-\w*c\s+(.+)$", s)
-    if m:
-        try:
-            inner = shlex.split(m.group(1))[0]
-        except Exception:
-            inner = m.group(1)
-        for sub_seg in SEGMENT_SPLIT.split(inner):
-            s2 = sub_seg.strip()
-            if s2:
-                try: toks = shlex.split(s2)
-                except ValueError: toks = s2.split()
-                if toks[:1] == ["gh"]: check_gh(toks)
-                if toks[:1] == ["git"]: check_git(toks)
-        continue
-    try: toks = shlex.split(s)
-    except ValueError: toks = s.split()
-    toks = [t for t in toks if not re.fullmatch(r"\w+=\S*", t)] if toks and re.fullmatch(r"\w+=\S*", toks[0]) else toks
-    if toks[:1] == ["gh"]:
+def check(toks, depth=0):
+    toks = unwrap(toks)
+    if not toks:
+        return
+    head = toks[0]
+    if head in ("bash", "sh", "zsh", "dash") and depth < 3:
+        for i, t in enumerate(toks):
+            if re.fullmatch(r"-\w*c", t) and i + 1 < len(toks):
+                for sub in split_commands(tokenize(strip_heredocs(toks[i + 1]))):
+                    check(sub, depth + 1)
+                return
+    elif head == "gh":
         check_gh(toks)
-    elif toks[:1] == ["git"]:
+    elif head == "git":
         check_git(toks)
-    elif re.search(r"\bgh\s+auth\s+token\b", s):
-        deny("gh auth token の取得は禁止")
+
+try:
+    for c in split_commands(tokenize(strip_heredocs(cmd))):
+        check(c)
+except ValueError:
+    pass  # 字句解析できない(未閉じ引用符等)は素通り(fail-open)
 sys.exit(0)
