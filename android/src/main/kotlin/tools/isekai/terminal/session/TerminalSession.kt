@@ -14,12 +14,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -31,6 +33,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.withTimeoutOrNull
+
+/** [TerminalSession.connectionEdges]の1件(Rustの`on_connection_edge`の引数をそのまま運ぶ)。 */
+data class ConnectionEdgeEvent(val edge: ConnectionEdge, val generation: ULong)
 
 /**
  * SSH セッションのドメインオブジェクト。
@@ -126,6 +131,17 @@ class TerminalSession(
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
+
+    /**
+     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustが判断した接続エッジ
+     * (`OrchestratorCallback.onConnectionEdge`)を、届いた順にそのまま渡すだけの経路。
+     * [state]は`StateFlow`でconflateされるため、そこから「未接続→接続」を検出すると
+     * `Connected→Reconnecting→Connected`を取りこぼしうる。こちらは無制限バッファの
+     * [Channel]なので1件も落とさない(購読開始前に届いたエッジも保持する)。購読者は
+     * `TerminalTabsViewModel`の1つだけ(重複排除・エッジ判定はしない、`rust-ssot.md`)。
+     */
+    private val connectionEdgeChannel = Channel<ConnectionEdgeEvent>(Channel.UNLIMITED)
+    val connectionEdges: Flow<ConnectionEdgeEvent> = connectionEdgeChannel.receiveAsFlow()
 
     private val transferAccepted = AtomicBoolean(false)
 
@@ -392,6 +408,12 @@ class TerminalSession(
         // 別follow-up、ADR_IOS_PARITY_IMPLEMENTATION.md §5.1-4/D-6-5参照)。
         override fun onForegroundResume(didReconnect: Boolean) {
             RemoteLogger.i("IsekaiTerminalSSH", "onForegroundResume: didReconnect=$didReconnect")
+        }
+
+        // Step 8a′: 判断はRust側(`reconnect_fsm.rs`)で済んでいるので、ここは転送するだけ。
+        override fun onConnectionEdge(edge: ConnectionEdge, generation: ULong) {
+            RemoteLogger.i("IsekaiTerminalSSH", "connection edge: $edge generation=$generation")
+            connectionEdgeChannel.trySend(ConnectionEdgeEvent(edge, generation))
         }
     }
 

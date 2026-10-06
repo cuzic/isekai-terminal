@@ -53,7 +53,8 @@ internal class ConnectionCoordinator(
         // `TerminalSession.guardedConnect`と同種)。
         if (current.connected || current.isConnecting || current.isReconnecting) return
         // Task #10: 前回の接続試行が一度もConnectedへ遷移しないまま再接続された場合、
-        // observeConnectionTransitionsのdisconnect分岐を経由しないため、ここで明示的に
+        // Rustは接続エッジ`Lost`を出さない(Establishedを出していない世代にLostは無い、
+        // `TerminalTabsViewModel.observeConnectionEdges`参照)ため、ここで明示的に
         // 古いhandleを閉じてから次の接続試行に入る(閉じ忘れによるリーク防止)。
         pane.physicalMultipathHandle?.close()
         pane.physicalMultipathHandle = null

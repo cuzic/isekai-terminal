@@ -90,4 +90,7 @@ impl OrchestratorCallback for ForwardingOrchestratorCallback {
         let _ = self.tx.send(OrchestratorTestEvent::FilePreview(request_id, outcome));
     }
     fn on_foreground_resume(&self, _did_reconnect: bool) {}
+    // Step 8a′の接続エッジ契約は`orchestrator.rs`のテスト(`RecordingCallback`)で検証する。
+    // ここで転送すると、`OrchestratorTestEvent`を網羅的にmatchする既存テストへ波及するため転送しない。
+    fn on_connection_edge(&self, _edge: crate::ConnectionEdge, _generation: u64) {}
 }

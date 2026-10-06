@@ -109,4 +109,5 @@ private actor SshVerticalSliceRecorder: OrchestratorCallback {
     nonisolated func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
     nonisolated func onNotify(kind: NotifyKind) {}
     nonisolated func onForegroundResume(didReconnect: Bool) {}
+    nonisolated func onConnectionEdge(edge: ConnectionEdge, generation: UInt64) {}
 }
