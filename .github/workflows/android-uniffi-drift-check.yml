@@ -14,9 +14,9 @@ name: Android UniFFI binding drift check
 # ホストのデフォルトターゲット向けdebugビルド
 # (rust-core/target/debug/libisekai_terminal_core.so)で十分で、Android向けの
 # NDKクロスビルドは不要(そのためこのジョブはandroid-test-check.ymlより大幅に軽い)。
-# ただし rust-core/src/isekai_pipe_quic_transport.rs が `include_bytes!` で
-# Linux muslの静的バイナリを無条件に埋め込むため、build-isekai-pipe-musl.sh は
-# 他ワークフローと同様に先に必要。
+# rust-core/src/isekai_pipe_quic_transport.rs が `include_bytes!` で
+# Linux muslの静的バイナリを無条件に埋め込むためファイルの存在は必要だが、
+# 中身はバインディングに影響しないのでプレースホルダで足りる(下のstep参照)。
 
 on:
   push:
@@ -35,8 +35,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: android-uniffi-drift-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-uniffi-drift-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  # PRの再pushでは古い実行を捨てる。mainへのpushはcommit(sha)ごとに別groupにして、キャンセルも前の実行待ち
+  # (macOSキューで数十分詰まる)もさせない。連続マージで合成状態の検証が
+  # 毎回キャンセルされ、2026-10-06に5連続で未検証になった)。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -100,19 +103,26 @@ jobs:
           restore-keys: |
             android-uniffi-drift-${{ runner.os }}-
 
-      - name: Install zig (mlugg/setup-zig)
-        uses: mlugg/setup-zig@v2
-        with:
-          version: latest
-
-      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+      - name: Create placeholder isekai-pipe musl binaries (only their existence matters here)
+        # rust-core/src/isekai_pipe_quic_transport.rs は musl静的isekai-pipeを
+        # `include_bytes!`で無条件に埋め込むため、ファイル自体は存在しなければ
+        # isekai-terminal-coreがコンパイルできない。しかしこのjobが比較するのは
+        # UniFFIのメタデータ(公開API・型・シグネチャ)から生成されるKotlinバインディング
+        # だけで、埋め込まれるバイト列の中身はメタデータにも生成物にも一切影響しない。
+        # そのため本物のmuslクロスビルド(zig+cargo-zigbuildで2ターゲットのrelease
+        # ビルド、このjobの7〜8割=5〜9分を占めていた)の代わりに固定内容の
+        # プレースホルダを置く。muslビルド自体が通ることの検証は
+        # rust-core-test-check.yml等の別ワークフローが担う。
+        # ここで作るバイナリは`--library`で読む.soに埋め込まれるだけで、
+        # どこにも配布・アップロードされない(このjobはartifactとして生成済み
+        # Kotlinバインディングしか出さない)。
         run: |
           set -euo pipefail
-          if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild --locked
-          fi
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-pipe-musl.sh
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            mkdir -p "rust-core/target/$target/release"
+            printf 'placeholder: android-uniffi-drift does not need a real isekai-pipe\n' \
+              > "rust-core/target/$target/release/isekai-pipe"
+          done
 
       - name: Build isekai-terminal-core (host debug)
         working-directory: rust-core
