@@ -15,6 +15,7 @@ import androidx.compose.ui.test.performSemanticsAction
 import androidx.test.core.app.ApplicationProvider
 import com.github.takahirom.roborazzi.captureRoboImage
 import kotlinx.coroutines.runBlocking
+import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -48,6 +49,29 @@ class ScreenshotGalleryTest {
             Repositories.keys.getAll().forEach { Repositories.keys.delete(it) }
         }
         ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE).edit().clear().apply()
+        vmOwner = PreloadedViewModelStoreOwner(ctx)
+    }
+
+    @After fun clearViewModels() { vmOwner.clear() }
+
+    /**
+     * 一覧画面のViewModelはinit{}でDispatchers.IO上にDB読み込みを投げ、これはComposeの
+     * アイドリング判定の対象外。CI 2026-10-06(run 37429490848)ではprofileList_withProfilesの
+     * waitUntil(5000)が一覧の出現を待ち切れずComposeTimeoutExceptionで落ちた。画面合成前に
+     * ViewModelを生成し、DB読み込みが[expectedCount]件をStateFlowへ反映するまで待ってから
+     * 合成することで、初回合成時点で一覧が描画されている状態にする
+     * ([PreloadedViewModelStoreOwner]参照)。
+     */
+    private lateinit var vmOwner: PreloadedViewModelStoreOwner
+
+    private fun preloadProfileList(expectedCount: Int) {
+        val vm = vmOwner.preload<ProfileListViewModel>()
+        vmOwner.awaitState(vm.profiles) { it.size == expectedCount }
+    }
+
+    private fun preloadKeyList(expectedCount: Int) {
+        val vm = vmOwner.preload<KeyListViewModel>()
+        vmOwner.awaitState(vm.keys) { it.size == expectedCount }
     }
 
     private fun insertProfile(profile: ConnectionProfile) = runBlocking { Repositories.profiles.save(profile) }
@@ -89,14 +113,17 @@ class ScreenshotGalleryTest {
     @Test fun profileList_withProfiles() {
         insertProfile(ConnectionProfile(label = "本番サーバー", host = "prod.example.com", username = "deploy", authType = "password"))
         insertProfile(ConnectionProfile(label = "開発サーバー", host = "dev.example.com", username = "dev", authType = "key", keyId = 1L))
+        preloadProfileList(2)
         composeTestRule.setContent {
-            ProfileListScreen(
-                onConnect = { _, _, _ -> },
-                onAddProfile = {},
-                onEditProfile = {},
-                onManageKeys = {},
-                applyTerminalTheme = {},
-            )
+            vmOwner.Provide {
+                ProfileListScreen(
+                    onConnect = { _, _, _ -> },
+                    onAddProfile = {},
+                    onEditProfile = {},
+                    onManageKeys = {},
+                    applyTerminalTheme = {},
+                )
+            }
         }
         waitForText("本番サーバー")
         composeTestRule.onRoot().captureRoboImage("profile_list_with_profiles.png")
@@ -104,14 +131,17 @@ class ScreenshotGalleryTest {
 
     @Test fun profileList_passwordDialog() {
         insertProfile(ConnectionProfile(label = "本番サーバー", host = "prod.example.com", username = "deploy", authType = "password"))
+        preloadProfileList(1)
         composeTestRule.setContent {
-            ProfileListScreen(
-                onConnect = { _, _, _ -> },
-                onAddProfile = {},
-                onEditProfile = {},
-                onManageKeys = {},
-                applyTerminalTheme = {},
-            )
+            vmOwner.Provide {
+                ProfileListScreen(
+                    onConnect = { _, _, _ -> },
+                    onAddProfile = {},
+                    onEditProfile = {},
+                    onManageKeys = {},
+                    applyTerminalTheme = {},
+                )
+            }
         }
         waitForText("本番サーバー")
         composeTestRule.onNodeWithText("本番サーバー").performScrollTo().performClick()
@@ -121,14 +151,17 @@ class ScreenshotGalleryTest {
 
     @Test fun profileList_deleteConfirmDialog() {
         insertProfile(ConnectionProfile(label = "削除対象サーバー", host = "host", username = "user", authType = "password"))
+        preloadProfileList(1)
         composeTestRule.setContent {
-            ProfileListScreen(
-                onConnect = { _, _, _ -> },
-                onAddProfile = {},
-                onEditProfile = {},
-                onManageKeys = {},
-                applyTerminalTheme = {},
-            )
+            vmOwner.Provide {
+                ProfileListScreen(
+                    onConnect = { _, _, _ -> },
+                    onAddProfile = {},
+                    onEditProfile = {},
+                    onManageKeys = {},
+                    applyTerminalTheme = {},
+                )
+            }
         }
         waitForText("削除対象サーバー")
         composeTestRule.onNodeWithText("削除").performScrollTo().performClick()
@@ -209,7 +242,8 @@ class ScreenshotGalleryTest {
 
     @Test fun keyList_withKeys() {
         insertKey("My SSH Key")
-        composeTestRule.setContent { KeyListScreen(onImportKey = {}, onBack = {}) }
+        preloadKeyList(1)
+        composeTestRule.setContent { vmOwner.Provide { KeyListScreen(onImportKey = {}, onBack = {}) } }
         waitForText("My SSH Key")
         composeTestRule.onRoot().captureRoboImage("key_list_with_keys.png")
     }
