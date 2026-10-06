@@ -14,7 +14,8 @@
       {"context": "rust-core-test-linux"},
       {"context": "android-uniffi-drift"},
       {"context": "lockfile-drift"},
-      {"context": "room-migration"}
+      {"context": "room-migration"},
+      {"context": "rust-core-purity-check"}
     ]
   },
   "enforce_admins": false,
@@ -39,7 +40,7 @@
 - **`allow_force_pushes: false` / `allow_deletions: false`**は維持(mainへの
   force-push/削除は常に禁止、enforce_adminsの状態に関わらず有効)。
 
-## required 5本の一覧と意味
+## required 6本の一覧と意味(2026-10-06に`rust-core-purity-check`を追加、元は5本)
 
 | context | 元job id / ワークフロー | 意味 | 実行時間目安 |
 |---|---|---|---|
@@ -48,8 +49,9 @@
 | `android-uniffi-drift` | `android-uniffi-drift-check.yml`の`drift-check` | UniFFI Kotlinバインディングのdrift検知 | 〜4分(pr-path-gate経由で無関係PRは20〜30秒) |
 | `lockfile-drift` | `lockfile-drift-check.yml`の`check` | `cargo metadata --locked`によるCargo.lock整合性検証 | 数秒〜十数秒 |
 | `room-migration` | `room-migration-check.yml`の`check` | Room migration番号の整合性検証 | 数秒〜数十秒 |
+| `rust-core-purity-check` | `rust-core-test-check.yml`の`purity-check` | 純粋モジュール(`rust-core/pure_modules.toml`登録)のclippy `disallowed_*`+importホワイトリスト+interpreter網羅性検査(`docs/adr/0019-functional-core-effects.md` Step 0/7a)。無関係なPRはpr-path-gate経由で`skipping`として報告されブロックしない | 〜10分 |
 
-5つとも元は各ワークフローのjob id(`test`/`drift-check`/`check`等)がGitHub上の
+5つ(+purity-check)とも元は各ワークフローのjob id(`test`/`drift-check`/`check`等)がGitHub上の
 check-run context名になっていたが、`android-test-check.yml`と`rust-core-test-check.yml`
 が両方job id `test`を使っており**context名が衝突していた**(2026-08-17発見)。
 同様に`lockfile-drift-check.yml`と`room-migration-check.yml`も両方job id `check`を

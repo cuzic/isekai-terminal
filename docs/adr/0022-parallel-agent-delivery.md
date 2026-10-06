@@ -1,6 +1,6 @@
 # ADR: ADR駆動の並列エージェント・デリバリー手順を成文化する(Skill+読み取り専用ヘルパー+権限hook)
 
-- **Status**: **Proposed(rev2、2026-10-06)**。敵対的レビューround 1(Opus、読み取り専用、
+- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。未決の質問(§の未解決表)は各Stepの着手時に決める。(以下は承認前のStatus記述) **Proposed(rev2、2026-10-06)**。敵対的レビューround 1(Opus、読み取り専用、
   scratchpad `adr3-review-round1.md`。判定「not converged: BLOCKER 2・MAJOR 9・MINOR 9」)の全指摘と、
   同日のユーザー決定U1〜U3(§4.4)をrev1で反映した。rev2では同じレビュアーのround 2
   (`adr3-review-round2.md`。判定「not converged: BLOCKER 0・MAJOR 4・MINOR 6」)の全指摘を反映した。round 3も同じレビュアーで行う。

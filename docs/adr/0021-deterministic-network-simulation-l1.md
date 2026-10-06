@@ -1,6 +1,6 @@
 # ADR: L1(仮想時間 + in-memoryネットワーク)の決定論的シミュレーションを再評価する
 
-- **Status**: **Proposed rev2(2026-10-06)**。round 1・2の敵対的レビュー(`scratchpad/adr2-review-round{1,2}.md`、Opus)を反映。
+- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。未決の質問(§の未解決表)は各Stepの着手時に決める。(以下は承認前のStatus記述) **Proposed rev2(2026-10-06)**。round 1・2の敵対的レビュー(`scratchpad/adr2-review-round{1,2}.md`、Opus)を反映。
   round 2は「N1・N2を文書で直せば収束」と判定しており、rev2でN1〜N6と残りの軽微指摘を取り込んだ(§0 rev2)。
   **rev0の推奨(「L1 SPIKEを今行う」)は撤回した**。rev1の推奨は「**クライアント/サーバーの時間定数の関係テストを今行い、
   Step 2a・5の後に2つのreducerを1つのproptestで合成する。L1は保留を続け、合成テストとL2では見えない不具合クラスが

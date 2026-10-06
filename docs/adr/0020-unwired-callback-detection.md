@@ -1,6 +1,6 @@
 # ADR: 「実装したが配線していない」不具合クラス(分類W)の構造的検出
 
-- **Status**: **Proposed(2026-10-06)**。rev2。敵対的レビューround 1(`scratchpad/adr1-review-round1.md`、Opus)の指摘F1〜F12と、
+- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。未決の質問(§の未解決表)は各Stepの着手時に決める。(以下は承認前のStatus記述) **Proposed(2026-10-06)**。rev2。敵対的レビューround 1(`scratchpad/adr1-review-round1.md`、Opus)の指摘F1〜F12と、
   round 2(`scratchpad/adr1-review-round2.md`、同じレビュアー。判定は「意図のレベルで収束、blockerなし」)の指摘R2-1〜R2-9を
   反映済み(§0 rev1/rev2)。追加のレビューroundは行わない。ユーザー判断待ちの事項は§10にまとめてある。
 - **起点**: `docs/adr/0019-functional-core-effects.md` §10の未解決事項D5(rev6)。同ADR Step 9の不具合履歴報告
