@@ -100,6 +100,14 @@ jobs:
       # debug/infoログでCI出力が読みにくくなるのを避ける(ローカル開発時のデフォルトは
       # env_logger未設定=warn相当のまま)。
       RUST_LOG: warn
+      # CIビルド高速化+キャッシュ縮小: CIは毎回ほぼフルビルドなのでincremental成果物は
+      # 再利用されず、`target/debug/incremental`がキャッシュを肥大化させるだけ。
+      # debuginfoは行番号テーブルのみに減らす(panic時のbacktraceのファイル:行は残る)。
+      # どちらもテストの実行対象・内容には影響しない。これらを変えたら下のキャッシュ
+      # キーの`dbg1`も上げること(完全一致ヒット時は保存されないため、古い設定の
+      # 成果物を含むキャッシュがLockfileが変わるまで使われ続けてしまう)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -131,9 +139,9 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             rust-core/target
-          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-dbg1-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-${{ runner.os }}-
+            rust-core-test-dbg1-${{ runner.os }}-
 
       # `test-windows`ジョブは`rust-core/isekai-ssh/tests/*.rs`をファイル名の明示list
       # (`mux_holder_windows_e2e`/`native_auth_windows_e2e`単独step + 5ファイルループ)
@@ -337,7 +345,7 @@ jobs:
           key: rust-core-purity-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
             rust-core-purity-${{ runner.os }}-
-            rust-core-test-${{ runner.os }}-
+            rust-core-test-dbg1-${{ runner.os }}-
 
       # isekai-terminal-coreはisekai-pipeのmusl静的バイナリをinclude_bytes!で埋め込むため、
       # `test`ジョブと同じ前提ビルドが要る。
@@ -388,6 +396,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_LOG: warn
+      # `test`ジョブの同名envのコメント参照(変えたらキャッシュキーの`dbg1`も上げる)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -408,9 +419,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust-core/target
-          key: rust-core-test-macos-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-macos-dbg1-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-macos-
+            rust-core-test-macos-dbg1-
 
       # isekai-transport配下のe2eテスト(multipath_e2e.rs・rebind_e2e.rs、また
       # isekai-terminal-core側のmultipath_transport.rsも同じ手法だが、そちらは
@@ -463,6 +474,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_LOG: warn
+      # `test`ジョブの同名envのコメント参照(変えたらキャッシュキーの`dbg1`も上げる)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -482,9 +496,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust-core/target
-          key: rust-core-test-windows-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-windows-dbg1-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-windows-
+            rust-core-test-windows-dbg1-
 
       # isekai-ssh/isekai-pipeはWindowsをクライアントプラットフォームとして
       # 公式サポートする(rust-core/isekai-ssh/README.md参照。接続先ホストは
