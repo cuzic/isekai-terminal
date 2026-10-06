@@ -580,8 +580,7 @@ impl ResumePlanner {
                 // 期限の時計は切断検知の瞬間から(warm standby昇格の時間も期限に数える)。
                 // 移設前はここで`print_reconnect_status`も呼んでいたが、経過0では猶予内なので
                 // 何も表示しなかった(到達しない分岐なのでCmdにしていない)。
-                let resume_window = self.resume_window;
-                self.begin_episode(now, by_network_change, resume_window, millis_after(now, resume_window), jitter_seed, &mut cmds);
+                self.begin_episode(now, by_network_change, now, jitter_seed, &mut cmds);
             }
             ResumeEvent::BackoffElapsed { token, now, network_changed } => {
                 let Phase::Recovering(mut ep) = self.phase else { return cmds };
@@ -703,11 +702,15 @@ impl ResumePlanner {
         cmds
     }
 
-    fn begin_episode(&mut self, now: Millis, by_network_change: bool, resume_window: Duration, deadline: Millis, jitter_seed: u64, cmds: &mut Vec<ResumeCmd>) {
+    /// `disconnected_at`から始まるepisodeを作る。windowと期限は常にsessionの現在値
+    /// (`self.resume_window`、STUNのclampやcross-family成功後の非clampを反映済み)から導出する。
+    /// `first_check_at`は最初のループ先頭判定の時刻(本番は常に`disconnected_at`)。
+    fn begin_episode(&mut self, disconnected_at: Millis, by_network_change: bool, first_check_at: Millis, jitter_seed: u64, cmds: &mut Vec<ResumeCmd>) {
+        let resume_window = self.resume_window;
         let mut ep = Episode {
-            disconnected_at: now,
+            disconnected_at,
             resume_window,
-            deadline,
+            deadline: millis_after(disconnected_at, resume_window),
             max_resume_window: self.max_resume_window,
             switched_this_call: false,
             stun_failures: 0,
@@ -723,7 +726,7 @@ impl ResumePlanner {
             cmds.push(ResumeCmd::Dial { token, path: DialPath::WarmStandby });
             self.phase = Phase::Recovering(ep);
         } else {
-            self.loop_top(ep, now, jitter_seed, cmds);
+            self.loop_top(ep, first_check_at, jitter_seed, cmds);
         }
     }
 
@@ -786,13 +789,16 @@ impl ResumePlanner {
         ResumeToken(self.next_token)
     }
 
-    /// テスト専用: 期限を明示した状態でepisodeを始める(shellの配線テストが、既に期限切れの
-    /// episodeを実時間を待たずに作るため)。`Disconnected`と同じ遷移で、`resume_window`と
-    /// `deadline`だけを差し替える。
+    /// テスト専用: `disconnected_at`に切断し、最初のループ先頭判定を`first_check_at`で行う
+    /// (shellの配線テストが、既に期限切れのepisodeを実時間を待たずに作るため)。windowと期限は
+    /// `Disconnected`と同じく**reducer自身が**sessionの値から計算する(差し替えない)。そのため
+    /// STUNのclampが失われればこの入口経由のテストも落ちる(PR #164レビューM1)。
     #[cfg(test)]
-    pub(crate) fn begin_episode_for_test(&mut self, now: Millis, resume_window: Duration, deadline: Millis, jitter_seed: u64) -> Vec<ResumeCmd> {
+    pub(crate) fn begin_episode_for_test(&mut self, disconnected_at: Millis, first_check_at: Millis, jitter_seed: u64) -> Vec<ResumeCmd> {
         let mut cmds = Vec::new();
-        self.begin_episode(now, false, resume_window, deadline, jitter_seed, &mut cmds);
+        if self.phase == Phase::Connected {
+            self.begin_episode(disconnected_at, false, first_check_at, jitter_seed, &mut cmds);
+        }
         cmds
     }
 
@@ -844,7 +850,12 @@ mod tests {
 
     /// Disconnected → (Backoff → Dial → 失敗)×n を、`times[i]`の時刻に失敗させて流す。
     fn fail_at(planner: &mut ResumePlanner, times: &[u64], kind: AttemptFailure) -> Vec<ResumeCmd> {
-        let mut cmds = planner.apply(ResumeEvent::Disconnected { now: Millis(0), by_network_change: false, jitter_seed: 1 });
+        let cmds = planner.apply(ResumeEvent::Disconnected { now: Millis(0), by_network_change: false, jitter_seed: 1 });
+        keep_failing(planner, cmds, times, kind)
+    }
+
+    /// `cmds`(Backoffを含む)の続きから、`times[i]`の時刻にdialさせて失敗させる。
+    fn keep_failing(planner: &mut ResumePlanner, mut cmds: Vec<ResumeCmd>, times: &[u64], kind: AttemptFailure) -> Vec<ResumeCmd> {
         for &t in times {
             let token = backoff_token(&cmds);
             let dial_cmds = planner.apply(ResumeEvent::BackoffElapsed { token, now: Millis(t), network_changed: false });
@@ -855,6 +866,90 @@ mod tests {
             }
         }
         cmds
+    }
+
+    fn give_up_cmd(cmds: &[ResumeCmd]) -> Option<ResumeCmd> {
+        cmds.iter().copied().find(|c| matches!(c, ResumeCmd::GiveUp { .. }))
+    }
+
+    // ── windowの値そのものの固定(PR #164レビューM1) ──────────────────────
+    // 期待値はreducerの関数ではなく、移設前の定数(STUN_RESUME_GIVE_UP_WINDOW = 120秒、
+    // CROSS_FAMILY_SWITCH_DEADLINE = 45秒、UNKNOWN_SESSION_MIN_ELAPSED_FLOOR = 30秒)の
+    // リテラル値で書く。
+
+    fn stun_config(has_cross_family_target: bool) -> ResumePlannerConfig {
+        ResumePlannerConfig {
+            effective_resume_grace_secs: GRACE_LONG,
+            max_resume_window: Some(Duration::from_secs(120)),
+            has_cross_family_target,
+            has_warm_standby: false,
+        }
+    }
+
+    /// STUNのclamp(120秒)が実際の期限になる。`ResumePlanner::new`がclampを落とすと、6時間の
+    /// grantまで諦めずに120秒でGiveUpが出ないので落ちる。relayはclampされない。
+    #[test]
+    fn stun_clamp_is_the_real_deadline_and_relay_is_unclamped() {
+        let mut p = ResumePlanner::new(stun_config(false));
+        assert_eq!(give_up(&fail_at(&mut p, &[119_999], AttemptFailure::Other)), None, "STUN must keep retrying just before 120s");
+        let mut p = ResumePlanner::new(stun_config(false));
+        assert_eq!(
+            give_up_cmd(&fail_at(&mut p, &[120_000], AttemptFailure::Other)),
+            Some(ResumeCmd::GiveUp {
+                reason: GiveUpReason::DeadlineExceeded { exceeded_by: Duration::ZERO },
+                resume_window: Duration::from_secs(120),
+                notify_os: false,
+                continuity_lost: None,
+            }),
+            "STUN must give up at exactly 120s, without a desktop notification"
+        );
+        let mut p = ResumePlanner::new(relay_config());
+        assert_eq!(give_up(&fail_at(&mut p, &[120_000, 3_600_000], AttemptFailure::Other)), None, "relay uses the unclamped grant");
+    }
+
+    /// C1/R1: 元のSTUN peerへの5回目の失敗(t=15.5s)でswitchし、その瞬間から45秒
+    /// (= 切断から60.5秒)を新しい期限にする。C1(switch時に`max_resume_window = None`)が戻ると
+    /// 6時間のgrantまで諦めないので60.5sでのGiveUpが無くなり、R1(切断時刻から45秒)が戻ると
+    /// 60.499sで既に諦めるので、どちらでも落ちる。
+    #[test]
+    fn cross_family_switch_budget_is_45s_from_the_switch_itself() {
+        let mut p = ResumePlanner::new(stun_config(true));
+        let cmds = fail_at(&mut p, &[500, 1_500, 3_500, 7_500, 15_500], AttemptFailure::Other);
+        assert!(
+            cmds.contains(&ResumeCmd::SwitchedToCrossFamily { trigger: SwitchTrigger::FailuresOrDeadline }),
+            "5 failures against the STUN peer must switch: {cmds:?}"
+        );
+        assert_eq!(p.episode().map(|e| e.resume_window), Some(Duration::from_millis(60_500)));
+        let mut before_deadline = p.clone();
+        assert_eq!(give_up(&keep_failing(&mut before_deadline, cmds.clone(), &[60_499], AttemptFailure::Other)), None);
+        assert_eq!(
+            give_up_cmd(&keep_failing(&mut p, cmds, &[60_500], AttemptFailure::Other)),
+            Some(ResumeCmd::GiveUp {
+                reason: GiveUpReason::DeadlineExceeded { exceeded_by: Duration::ZERO },
+                resume_window: Duration::from_millis(60_500),
+                notify_os: false,
+                continuity_lost: Some(ContinuityLost::RelayUnreachable),
+            })
+        );
+    }
+
+    /// task 7: cross-familyで一度成功したら、以後のepisodeはそこへ、clampなしのgrantでresumeする
+    /// (成功時の`self.resume_window`更新が消えると、次のepisodeが120秒で諦めて落ちる)。
+    #[test]
+    fn after_a_cross_family_success_later_episodes_use_the_unclamped_grant() {
+        let mut p = ResumePlanner::new(stun_config(true));
+        let cmds = fail_at(&mut p, &[500, 1_500, 3_500, 7_500, 15_500], AttemptFailure::Other);
+        let token = backoff_token(&cmds);
+        let (token, path) = dial(&p.apply(ResumeEvent::BackoffElapsed { token, now: Millis(16_000), network_changed: false }));
+        assert_eq!(path, DialPath::CrossFamily);
+        let ok = p.apply(ResumeEvent::AttemptOk { token, now: Millis(16_000) });
+        assert!(ok.contains(&ResumeCmd::Resumed { via: DialPath::CrossFamily, announce: true, cross_family_switched: true }), "{ok:?}");
+
+        let cmds = p.apply(ResumeEvent::Disconnected { now: Millis(100_000), by_network_change: false, jitter_seed: 1 });
+        assert_eq!(p.episode().map(|e| e.resume_window), Some(Duration::from_secs(u64::from(GRACE_LONG))));
+        let cmds = keep_failing(&mut p, cmds, &[100_000 + 120_000, 100_000 + 3_600_000], AttemptFailure::Other);
+        assert_eq!(give_up(&cmds), None, "the second episode must not be clamped to 120s");
+        assert!(!cmds.iter().any(|c| matches!(c, ResumeCmd::SwitchedToCrossFamily { .. })), "never switch again");
     }
 
     // ── 過去に3回直し直された方針の表テスト(境界値) ───────────────────
@@ -960,6 +1055,30 @@ mod tests {
         stun_failures: u32,
         switched: bool,
         ever_switched: bool,
+        /// cross-familyへの切り替えが成功した(以後のepisodeはclampなしのgrant、task 7)。
+        cf_succeeded: bool,
+    }
+
+    /// 移設前の`run_resume_loop`が各episodeに使ったwindowを、**移設前の定数と式から独立に**
+    /// 計算する(reducerの`effective_resume_window`を呼ばない。PR #164レビューM1): grace 0は
+    /// `crate::DEFAULT_RESUME_WINDOW`、STUN(`max`あり)はそれでclamp、cross-family成功後はclampなし。
+    fn expected_episode_window(cfg: &ResumePlannerConfig, cf_succeeded: bool) -> Duration {
+        let grant = if cfg.effective_resume_grace_secs == 0 {
+            crate::DEFAULT_RESUME_WINDOW
+        } else {
+            Duration::from_secs(u64::from(cfg.effective_resume_grace_secs))
+        };
+        match (cf_succeeded, cfg.max_resume_window) {
+            (false, Some(max)) => grant.min(max),
+            (true, _) | (false, None) => grant,
+        }
+    }
+
+    /// 移設前の`cross_family_switch_budget`の式(C1: 切り替え時に必ず有界にする、R1: 切り替えの
+    /// 瞬間から45秒、下限30秒、grantでclamp)を、移設前のリテラル値で独立に計算する。
+    fn expected_switch_window(cfg: &ResumePlannerConfig, elapsed_since_disconnect: Duration) -> Duration {
+        let grant = expected_episode_window(cfg, true);
+        grant.min((elapsed_since_disconnect + Duration::from_secs(45)).max(Duration::from_secs(30)))
     }
 
     proptest! {
@@ -1007,6 +1126,12 @@ mod tests {
                         model.disconnected_at = Some(t);
                         model.stun_failures = 0;
                         model.switched = false;
+                        // (V1) episodeのwindowと期限は、移設前の式(STUN clamp / 成功後は非clamp)の値そのもの。
+                        let expected = expected_episode_window(&cfg, model.cf_succeeded);
+                        let ep = p.episode().expect("a disconnect from Connected must start an episode");
+                        prop_assert_eq!(ep.resume_window, expected, "episode window != pre-Step-5 formula");
+                        prop_assert_eq!(ep.disconnected_at, t, "episode not anchored at the disconnect");
+                        prop_assert_eq!(ep.deadline, millis_after(t, expected), "deadline != disconnect + window");
                     }
                 }
                 let mut unknown_failure_now = false;
@@ -1026,6 +1151,8 @@ mod tests {
                 }
 
                 let elapsed = model.disconnected_at.map(|d| Millis(now).saturating_sub(d)).unwrap_or_default();
+                let ever_switched_before = model.ever_switched;
+                let mut switched_now = false;
                 let mut gave_up = false;
                 for cmd in &cmds {
                     match *cmd {
@@ -1037,7 +1164,7 @@ mod tests {
                                 GiveUpReason::SessionGone => {
                                     // (G1) UnknownSessionのgive-upは「今回もUnknownSession」「閾値回連続」
                                     //      「切断から下限時間経過」の3つがすべて揃ったときだけ。
-                                    prop_assert!(unknown_failure_now, "invariant violated at line 1040");
+                                    prop_assert!(unknown_failure_now, "SessionGone give-up on an attempt that was not an UnknownSession rejection");
                                     prop_assert!(model.unknown_streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD, "gave up at streak {}", model.unknown_streak);
                                     prop_assert!(elapsed >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR, "gave up only {elapsed:?} after disconnect");
                                 }
@@ -1045,7 +1172,7 @@ mod tests {
                                     // (G2) 期限のgive-upは now >= disconnected_at + resume_window のときだけ
                                     //      (時刻が逆行しても誤発火しない)。
                                     prop_assert_eq!(elapsed, resume_window + exceeded_by);
-                                    prop_assert!(Millis(now) >= millis_after(model.disconnected_at.unwrap(), resume_window), "invariant violated at line 1048");
+                                    prop_assert!(Millis(now) >= millis_after(model.disconnected_at.unwrap(), resume_window), "deadline give-up before disconnected_at + resume_window");
                                 }
                             }
                             prop_assert_eq!(p.phase, Phase::GaveUp);
@@ -1054,36 +1181,56 @@ mod tests {
                             let ep = p.episode().expect("Backoff outside an episode");
                             // (B1) backoffは期限を越えない、かつ期限到達後にはbackoffしない(=諦める)。
                             prop_assert!(Millis(now) < ep.deadline, "backed off at/after the deadline instead of giving up");
-                            prop_assert!(after <= ep.deadline.saturating_sub(Millis(now)), "invariant violated at line 1057");
-                            prop_assert!(after <= RESUME_BACKOFF.max, "invariant violated at line 1058");
-                            prop_assert!(ep.resume_window <= grant, "invariant violated at line 1059");
+                            prop_assert!(after <= ep.deadline.saturating_sub(Millis(now)), "backoff {after:?} overshoots the deadline");
+                            prop_assert!(after <= RESUME_BACKOFF.max, "backoff {after:?} exceeds RESUME_BACKOFF.max");
+                            prop_assert!(ep.resume_window <= grant, "episode window exceeds the server grant");
                             prop_assert_eq!(ep.deadline, millis_after(ep.disconnected_at, ep.resume_window));
                         }
                         ResumeCmd::SwitchedToCrossFamily { trigger } => {
                             // (W) switchは cross-familyがあり、未switchで、元の経路へ1回以上失敗し、
                             //     切り替え時点でprobeが1回入る残り期限があるときだけ、episodeに1回。
-                            prop_assert!(cfg.has_cross_family_target && !model.ever_switched, "invariant violated at line 1065");
-                            prop_assert!(model.stun_failures >= 1, "invariant violated at line 1066");
+                            prop_assert!(cfg.has_cross_family_target && !model.ever_switched, "switched without a cross-family target, or switched twice");
+                            prop_assert!(model.stun_failures >= 1, "switched with zero failed attempts against the original target (M3/R2)");
                             let ep0 = ep_before.expect("switch outside an episode");
-                            prop_assert!(cross_family_probe_fits(ep0.deadline.saturating_sub(Millis(now))), "invariant violated at line 1068");
+                            prop_assert!(cross_family_probe_fits(ep0.deadline.saturating_sub(Millis(now))), "switched when not even one cross-family probe fits before the deadline");
                             if trigger == SwitchTrigger::FailuresOrDeadline {
-                                prop_assert!(should_switch_to_cross_family(model.stun_failures, ep0.switch_attempts_before_cross_family, ep0.deadline.saturating_sub(Millis(now))), "invariant violated at line 1070");
+                                prop_assert!(should_switch_to_cross_family(model.stun_failures, ep0.switch_attempts_before_cross_family, ep0.deadline.saturating_sub(Millis(now))), "FailuresOrDeadline switch while should_switch_to_cross_family is false");
                             }
+                            // (V2) 切り替え後のwindowは移設前の`cross_family_switch_budget`の値そのもの
+                            //      (C1: Noneにしない、R1: 切り替え時刻からの45秒)。即give-upした場合は
+                            //      GiveUpが報告するwindowで見る。
+                            let expected = expected_switch_window(&cfg, Millis(now).saturating_sub(ep0.disconnected_at));
+                            let switched_window = match p.episode() {
+                                Some(ep) => {
+                                    prop_assert_eq!(ep.disconnected_at, ep0.disconnected_at, "switch must not move the disconnect anchor");
+                                    prop_assert_eq!(ep.deadline, millis_after(ep0.disconnected_at, expected), "post-switch deadline != disconnect + budget");
+                                    Some(ep.resume_window)
+                                }
+                                None => cmds.iter().find_map(|c| match c {
+                                    ResumeCmd::GiveUp { resume_window, .. } => Some(*resume_window),
+                                    _ => None,
+                                }),
+                            };
+                            prop_assert_eq!(switched_window, Some(expected), "post-switch window != pre-Step-5 switch budget");
                             model.switched = true;
                             model.ever_switched = true;
+                            switched_now = true;
                         }
                         ResumeCmd::ShowReconnecting { elapsed: shown, resume_window } => {
                             // (N) 再接続表示は切断から15秒の猶予を過ぎてから。
-                            prop_assert!(shown >= RECONNECT_NOTIFY_GRACE, "invariant violated at line 1077");
-                            prop_assert!(resume_window <= grant, "invariant violated at line 1078");
+                            prop_assert!(shown >= RECONNECT_NOTIFY_GRACE, "reconnect notice inside the 15s grace");
+                            prop_assert!(resume_window <= grant, "displayed window exceeds the server grant");
                         }
                         ResumeCmd::Resumed { announce, cross_family_switched, .. } => {
                             prop_assert_eq!(announce, elapsed >= RECONNECT_NOTIFY_GRACE);
                             prop_assert_eq!(cross_family_switched, model.switched);
+                            if cross_family_switched {
+                                model.cf_succeeded = true;
+                            }
                             prop_assert_eq!(p.phase, Phase::Connected);
                         }
                         ResumeCmd::Dial { path, .. } => {
-                            prop_assert!(path != DialPath::CrossFamily || model.ever_switched, "invariant violated at line 1086");
+                            prop_assert!(path != DialPath::CrossFamily || model.ever_switched, "dialed CrossFamily before any switch");
                         }
                         ResumeCmd::ReportAttemptFailure { .. } => {}
                     }
@@ -1093,9 +1240,29 @@ mod tests {
                 if unknown_failure_now && model.unknown_streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD && elapsed >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR {
                     prop_assert!(gave_up, "streak {} / {elapsed:?} must give up", model.unknown_streak);
                 }
+                // (W') switch liveness(PR #164レビューM3): 条件が揃ったら必ず切り替える
+                //      (ADR_STUN_REESTABLISH_CONTINUITY §3.2 task 1「windowを待ち切る劣化」の防止)。
+                if cfg.has_cross_family_target && !ever_switched_before && !gave_up {
+                    if let Some(ep0) = ep_before {
+                        let remaining = ep0.deadline.saturating_sub(Millis(now));
+                        let failure_trigger = match (ev, ep0.awaiting) {
+                            (ResumeEvent::AttemptFailed { kind: AttemptFailure::UnknownSession | AttemptFailure::Other, .. }, Awaiting::Dial(_, DialPath::Primary)) => {
+                                should_switch_to_cross_family(model.stun_failures, ep0.switch_attempts_before_cross_family, remaining)
+                            }
+                            _ => false,
+                        };
+                        let network_trigger = match ev {
+                            ResumeEvent::BackoffElapsed { network_changed: true, .. } => model.stun_failures >= 1 && cross_family_probe_fits(remaining),
+                            _ => false,
+                        };
+                        if failure_trigger || network_trigger {
+                            prop_assert!(switched_now, "switch conditions held (failures={}, remaining={remaining:?}) but no switch", model.stun_failures);
+                        }
+                    }
+                }
                 // (C) 接続済みへ戻るのは`Resumed`を返したときだけ(03224b11)。
                 if before.phase != Phase::Connected && p.phase == Phase::Connected {
-                    prop_assert!(cmds.iter().any(|c| matches!(c, ResumeCmd::Resumed { .. })), "invariant violated at line 1098");
+                    prop_assert!(cmds.iter().any(|c| matches!(c, ResumeCmd::Resumed { .. })), "returned to Connected without a Resumed command (03224b11)");
                 }
                 if gave_up {
                     model.disconnected_at = None;
@@ -1119,12 +1286,12 @@ mod tests {
                 now = now.saturating_add_signed(delta);
                 match r.on_failure(Millis(now), busy, seed) {
                     BusyRetryDecision::GiveUp => {
-                        prop_assert!(!busy || now >= deadline, "invariant violated at line 1122");
+                        prop_assert!(!busy || now >= deadline, "BUSY retry gave up while busy and before the deadline");
                     }
                     BusyRetryDecision::RetryAfter { after, .. } => {
-                        prop_assert!(busy && now < deadline, "invariant violated at line 1125");
-                        prop_assert!(Duration::from_millis(now) + after <= Duration::from_millis(deadline), "invariant violated at line 1126");
-                        prop_assert!(after <= RESUME_BACKOFF.max, "invariant violated at line 1127");
+                        prop_assert!(busy && now < deadline, "BUSY retry retried a non-BUSY failure or past the deadline");
+                        prop_assert!(Duration::from_millis(now) + after <= Duration::from_millis(deadline), "BUSY retry wait overshoots the deadline");
+                        prop_assert!(after <= RESUME_BACKOFF.max, "BUSY retry wait exceeds RESUME_BACKOFF.max");
                     }
                 }
             }

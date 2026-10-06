@@ -1028,7 +1028,10 @@ impl ResumeTargets<'_> {
             DialPath::WarmStandby | DialPath::Primary => self.primary,
             // The reducer only issues `CrossFamily` after a switch, which it only
             // makes when `has_cross_family_target` was set from `cross_family.is_some()`.
-            DialPath::CrossFamily => self.cross_family.unwrap_or(self.primary),
+            DialPath::CrossFamily => {
+                debug_assert!(self.cross_family.is_some(), "the planner switched to a cross-family target that does not exist");
+                self.cross_family.unwrap_or(self.primary)
+            }
         }
     }
 }
@@ -2339,16 +2342,21 @@ mod tests {
         }
 
         /// Drives the real `resume_with_backoff_until_deadline` interpreter
-        /// through one episode whose deadline is already reached
-        /// (`deadline == disconnected_at`), via the reducer's test-only
-        /// `begin_episode_for_test` (Step 5: the `ResumeDeadlinePolicy`
-        /// these tests used to build directly is now reducer state).
+        /// through one episode that disconnected at `Millis(0)` and whose
+        /// first loop-top check happens `first_check_after` later, via the
+        /// reducer's test-only `begin_episode_for_test`. The resume window
+        /// itself is **not** injected (Step 5, PR #164 review M1): the
+        /// planner computes it from `effective_resume_grace_secs`/
+        /// `max_resume_window` exactly as in production, so if that
+        /// computation loses a clamp the episode is not yet expired at
+        /// `first_check_after`, the interpreter keeps retrying instead of
+        /// giving up, and the `timeout` below fails the test.
         async fn run_expired_episode_for_test(
             factory: &AnyMuxFactory,
             target: &RelayTarget,
             effective_resume_grace_secs: u32,
             max_resume_window: Option<Duration>,
-            resume_window: Duration,
+            first_check_after: Duration,
             state: &mut ResumeLoopState,
         ) -> Result<(AnyByteStream, DialPath)> {
             let clock = ShellClock::new();
@@ -2358,10 +2366,10 @@ mod tests {
                 has_cross_family_target: false,
                 has_warm_standby: false,
             });
-            let now = clock.stamp();
-            let initial_cmds = planner.begin_episode_for_test(now, resume_window, now, 0);
+            let first_check_at = Millis(u64::try_from(first_check_after.as_millis()).unwrap());
+            let initial_cmds = planner.begin_episode_for_test(Millis(0), first_check_at, 0);
             let targets = ResumeTargets { primary: target, cross_family: None };
-            resume_with_backoff_until_deadline(
+            let episode = resume_with_backoff_until_deadline(
                 factory,
                 &targets,
                 None,
@@ -2372,8 +2380,10 @@ mod tests {
                 state,
                 &None,
                 &mut || -> Box<dyn isekai_netmon::NetworkChangeMonitor> { Box::new(isekai_netmon::NoopNetworkChangeMonitor) },
-            )
-            .await
+            );
+            tokio::time::timeout(Duration::from_secs(60), episode)
+                .await
+                .expect("the episode did not give up at its first check: the planner's own resume window is longer than expected")
         }
 
         #[tokio::test]
@@ -2408,8 +2418,8 @@ mod tests {
                 is_tty: false,
                 last_resume_error: Some("connection refused".to_string()),
             };
-            // deadline already reached (`deadline == disconnected_at`): must give up on the first check
-            let result = run_expired_episode_for_test(&factory, &target, 0, None, Duration::from_secs(0), &mut state).await;
+            // First check exactly at the (grace 0 → default) window: the deadline is already reached, so it must give up on the first check.
+            let result = run_expired_episode_for_test(&factory, &target, 0, None, DEFAULT_RESUME_WINDOW, &mut state).await;
 
             assert!(result.is_err(), "must return Err once the resume window is exceeded, not a silent Ok/None");
             state.app_ack_tasks.abort();
@@ -2417,17 +2427,18 @@ mod tests {
 
         /// Round 3 code review, significant finding (revised after a second
         /// round caught that the first cut of this test re-derived the
-        /// composition inline instead of calling `effective_resume_window`
-        /// — the same function `run_resume_loop` calls — which meant it
-        /// couldn't actually catch a regression that dropped the clamp from
-        /// `run_resume_loop` itself). The three `clamp_resume_window` unit
-        /// tests only cover that helper in isolation; this test additionally
-        /// pins `effective_resume_window` (the exact call `run_resume_loop`
-        /// makes) by driving the *real* `resume_with_backoff_until_deadline`
-        /// (same proven fixture as the test above) with its result, for a
+        /// composition inline instead of exercising the window computation
+        /// `run_resume_loop` actually uses, which meant it couldn't catch a
+        /// regression that dropped the clamp). Since Step 5 that computation
+        /// lives in `ResumePlanner` (built from the same
+        /// `effective_resume_grace_secs`/`max_resume_window` inputs
+        /// `run_resume_loop` passes): this test drives the *real*
+        /// `resume_with_backoff_until_deadline` interpreter with a planner
+        /// that computes its own window — nothing is injected — for a
         /// STUN-shaped scenario (a large server-granted grace, clamped down
-        /// by a short `max_resume_window`) — and asserts the give-up error
-        /// reports the *clamped* window, not the unclamped one.
+        /// by a short `max_resume_window`), checks it gives up at exactly
+        /// `STUN_RESUME_GIVE_UP_WINDOW` after the disconnect, and asserts the
+        /// give-up error reports the *clamped* window, not the unclamped one.
         #[tokio::test]
         async fn effective_resume_window_clamp_reaches_the_real_give_up_message_for_stun() {
             let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
@@ -2456,20 +2467,25 @@ mod tests {
             // real relay/STUN peer with a generous `--resume-window` would.
             let server_granted_grace_secs: u32 = 6 * 60 * 60;
             let max_resume_window = Some(STUN_RESUME_GIVE_UP_WINDOW);
-            // The exact function `run_resume_loop` calls — not a
-            // re-derivation of its composition — so this test actually
-            // fails if a future change drops the clamp from that call site.
+            // Sanity check of the helper composition; the test below does not
+            // feed this value to the planner (the planner computes its own).
             let resume_window = effective_resume_window(server_granted_grace_secs, max_resume_window);
             assert_eq!(resume_window, STUN_RESUME_GIVE_UP_WINDOW, "sanity check on the composition itself before using it below");
 
-            // `now` for both `disconnected_at` and `deadline`, exactly like
-            // the sibling test above — the give-up branch triggers on
-            // `now >= deadline`, and the message formats the `resume_window`
-            // *parameter* directly, not an elapsed delta, so there's no need
-            // to subtract from `Instant::now()` (which would panic on a host
-            // with under 121s of monotonic uptime).
-            let result =
-                run_expired_episode_for_test(&factory, &target, server_granted_grace_secs, max_resume_window, resume_window, &mut state).await;
+            // First loop-top check exactly 120s (the pre-Step-5
+            // `STUN_RESUME_GIVE_UP_WINDOW`) after the disconnect: with the
+            // clamp in place the planner's own deadline is reached and it
+            // gives up immediately; without it (a 6h window) it would keep
+            // retrying and `run_expired_episode_for_test`'s timeout fails.
+            let result = run_expired_episode_for_test(
+                &factory,
+                &target,
+                server_granted_grace_secs,
+                max_resume_window,
+                STUN_RESUME_GIVE_UP_WINDOW,
+                &mut state,
+            )
+            .await;
 
             let Err(err) = result else {
                 panic!("must give up immediately once the clamped (short) window is exceeded");
