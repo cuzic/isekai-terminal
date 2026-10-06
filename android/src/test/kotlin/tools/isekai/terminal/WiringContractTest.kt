@@ -138,9 +138,13 @@ class WiringContractTest {
         val classifiedCtors = WiringContract.diagnostics.keys.filter { it.endsWith(".new") }.toSet()
         if (ctorKeys != classifiedCtors) errors += "コンストラクタの分類が不一致: checksum=$ctorKeys 分類表=$classifiedCtors"
 
-        // (c) トップレベル関数(ファサード`Isekai_terminal_coreKt`の公開static。生成物の公開ヘルパー2つは固定の許可リストで除外)
+        // (c) トップレベル関数(ファサード`Isekai_terminal_coreKt`の公開static。UniFFI関数でない生成物のヘルパーは固定の許可リストで除外)
         val fromChecksum = symbols.filter { it.startsWith("func_") }.map { WiringContract.snakeToCamel(it.removePrefix("func_")) }.toSet()
-        val nonUniffiFacadeHelpers = setOf("uniffiEnsureInitialized", "use", "getUniffiContinuationHandleMap")
+        val nonUniffiFacadeHelpers = setOf(
+            "uniffiEnsureInitialized", "use", "getUniffiContinuationHandleMap",
+            // 生成物のinternalヘルパー(トップレベルのinternal関数はJVM上publicのstaticになる)
+            "uniffiRustCallAsync", "uniffiTraitInterfaceCall",
+        )
         val facade = Class.forName("uniffi.isekai_terminal_core.Isekai_terminal_coreKt", false, loader)
         val fromFacade = facade.declaredMethods
             .filter { Modifier.isStatic(it.modifiers) && Modifier.isPublic(it.modifiers) && !it.isSynthetic }
