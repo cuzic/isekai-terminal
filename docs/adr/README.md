@@ -36,3 +36,7 @@
 | [0016](0016-android-pool-stale-handle.md) | SSH接続プール(`pool.rs`)のstale handle再利用により`TransportPreference::Auto`の自動再接続が構造的に失敗する | Proposed | 2026-09-16 |
 | [0017](0017-android-pool-fix-followup-gaps.md) | pool.rs修正(issue #120/PR #119)実装後にコードレビューで見つかった残存ギャップ | Proposed | 2026-09-17 |
 | [0018](0018-connection-resilience-simulation.md) | 接続耐性を実機なしで検証する方法 | Proposed | 2026-09-21 |
+| [0019](0019-functional-core-effects.md) | Functional Core / Imperative Shell と「Effectをデータとして返すreducer」の段階的導入 | Accepted | 2026-10-06 |
+| [0020](0020-unwired-callback-detection.md) | 「実装したが配線していない」不具合クラス(分類W)の構造的検出 | Proposed | 2026-10-06 |
+| [0021](0021-deterministic-network-simulation-l1.md) | L1(仮想時間 + in-memoryネットワーク)の決定論的シミュレーションを再評価する | Proposed | 2026-10-06 |
+| [0022](0022-parallel-agent-delivery.md) | ADR駆動の並列エージェント・デリバリー手順を成文化する(Skill+読み取り専用ヘルパー+権限hook) | Proposed | 2026-10-06 |
