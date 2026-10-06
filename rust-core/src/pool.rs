@@ -20,6 +20,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+use crate::pool_idle_fsm::{IdleEffect, IdleEvent, IdleLedger};
 use crate::transport::PooledSshHandle;
 use crate::{JumpConfig, SshAuth};
 
@@ -35,12 +36,19 @@ enum EntryState<T> {
 
 pub(crate) struct PoolEntry<T> {
     state: EntryState<T>,
-    refcount: u32,
-    /// アイドルタイマーの世代。`release`が0への到達時にインクリメントしてタイマーを
-    /// spawnする。新規アタッチ(`try_attach_with`)や再度の0到達でも進む。タイマー発火時に
-    /// 世代が一致しなければ「その間に別のイベントが起きた」ことを意味するので何もしない
+    /// 参照カウントとアイドルタイマーの世代(stale-guard token)。判断は純粋reducer
+    /// [`IdleLedger`](`pool_idle_fsm.rs`、ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 4)にあり、
+    /// `release`の0到達で`ArmIdleTimer{generation}`を返す。新規アタッチ(`try_attach_with`)や
+    /// 再度の0到達で世代が進むので、古いタイマーの`IdleExpired`は世代不一致で何もしない
     /// (`AbortHandle`を持ち回らずに古いタイマーを無効化する)。
-    idle_generation: u64,
+    idle: IdleLedger,
+}
+
+/// shell(このモジュール)がロックの外で実行するEffect。[`IdleEffect`]にキーを付けたもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PoolEffect<K> {
+    /// `after`経過後に[`idle_expired_step`]へ`(key, generation)`を戻すタイマーをarmする。
+    ArmIdleTimer { key: K, generation: u64, after: Duration },
 }
 
 pub(crate) type PoolMap<K, T> = Mutex<HashMap<K, PoolEntry<T>>>;
@@ -82,13 +90,14 @@ where
             let (tx, _rx) = watch::channel(None);
             map.insert(
                 key.clone(),
-                PoolEntry { state: EntryState::Connecting(tx), refcount: 1, idle_generation: 0 },
+                PoolEntry { state: EntryState::Connecting(tx), idle: IdleLedger::first_holder() },
             );
             AttachOutcome::Establisher
         }
         Some(entry) => {
-            entry.refcount += 1;
-            entry.idle_generation = entry.idle_generation.wrapping_add(1);
+            // `Attached`はrefcount/世代を進めるだけでEffectを返さない(reducerの仕様)。
+            let effects = entry.idle.apply(IdleEvent::Attached);
+            debug_assert!(effects.is_empty(), "IdleEvent::Attached must not produce effects");
             match &entry.state {
                 EntryState::Connecting(tx) => AttachOutcome::Waiter(tx.subscribe()),
                 EntryState::Ready(v) if is_alive(v) => AttachOutcome::Ready(v.clone()),
@@ -151,7 +160,7 @@ where
     }
 }
 
-/// 外部経路で既存エントリが死んだと分かった時に呼ぶ。refcount/idle_generationは触らず、
+/// 外部経路で既存エントリが死んだと分かった時に呼ぶ。refcount/アイドル世代は触らず、
 /// 通常の[release]が最後の保持者から呼ばれることで削除タイマーをarmする。
 /// 既に別の確立が始まっていたり、新しい値へ置き換わっていたりする場合は触らない。
 pub(crate) fn mark_dead_if_same<K, T>(pool: &PoolMap<K, T>, key: &K, value: &Arc<T>)
@@ -190,8 +199,8 @@ where
 /// `Handle::try_current()`による暗黙のフォールバックは採らない
 /// (ADR_CONNECTION_RESILIENCE_SIMULATION.md §5)。
 ///
-/// Step 4(タイマーのEffect化)はこの関数のspawn箇所を置き換える前提で、
-/// [`release`]の公開シグネチャ(`pool, key, idle_grace`)はこのStepでは変えていない。
+/// Step 4: 判断は[`release_step`](ロック内でreducerへ`Released`を渡す)、タイマーは
+/// [`run_pool_effects`](`ArmIdleTimer`をspawnし、満了で[`idle_expired_step`]を呼ぶ)に分かれた。
 pub(crate) fn release_on<K, T>(
     rt: &tokio::runtime::Handle,
     pool: &'static PoolMap<K, T>,
@@ -201,24 +210,74 @@ pub(crate) fn release_on<K, T>(
     K: Hash + Eq + Clone + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
+    let effects = release_step(pool, &key, idle_grace);
+    run_pool_effects(rt, pool, effects);
+}
+
+/// `release`の判断部分: ロック内でreducerへ`IdleEvent::Released`を渡し、ロック外で実行すべき
+/// Effect(0到達なら`ArmIdleTimer`)を返す。エントリが無ければ何もしない。
+pub(crate) fn release_step<K, T>(pool: &PoolMap<K, T>, key: &K, idle_grace: Duration) -> Vec<PoolEffect<K>>
+where
+    K: Hash + Eq + Clone,
+{
     let mut map = pool.lock();
-    let Some(entry) = map.get_mut(&key) else { return };
-    entry.refcount = entry.refcount.saturating_sub(1);
-    if entry.refcount != 0 {
-        return;
-    }
-    entry.idle_generation = entry.idle_generation.wrapping_add(1);
-    let my_generation = entry.idle_generation;
-    drop(map);
-    rt.spawn(async move {
-        tokio::time::sleep(idle_grace).await;
-        let mut map = pool.lock();
-        if let Some(entry) = map.get(&key) {
-            if entry.refcount == 0 && entry.idle_generation == my_generation {
-                map.remove(&key);
+    apply_idle_in_lock(&mut map, key, IdleEvent::Released { idle_grace })
+}
+
+/// アイドルタイマー満了の判断部分: ロック内でreducerへ`IdleEvent::IdleExpired{generation}`を
+/// 渡す。現行世代かつrefcount==0なら`Remove`をロック内で実行してエントリを削除する。非現行の
+/// `generation`(=その間に新規アタッチや再度の0到達があった)は何も変えない。
+pub(crate) fn idle_expired_step<K, T>(pool: &PoolMap<K, T>, key: &K, generation: u64) -> Vec<PoolEffect<K>>
+where
+    K: Hash + Eq + Clone,
+{
+    let mut map = pool.lock();
+    apply_idle_in_lock(&mut map, key, IdleEvent::IdleExpired { generation })
+}
+
+/// [`IdleEffect`]のinterpreter(ロック内部分)。`Remove`はロック内でそのまま実行し、
+/// タイマーはキーを付けた[`PoolEffect`]としてロック外の[`run_pool_effects`]へ渡す。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn apply_idle_in_lock<K, T>(map: &mut HashMap<K, PoolEntry<T>>, key: &K, event: IdleEvent) -> Vec<PoolEffect<K>>
+where
+    K: Hash + Eq + Clone,
+{
+    let Some(entry) = map.get_mut(key) else { return Vec::new() };
+    let effects = entry.idle.apply(event);
+    let mut out = Vec::new();
+    for effect in effects {
+        match effect {
+            IdleEffect::ArmIdleTimer { generation, after } => {
+                out.push(PoolEffect::ArmIdleTimer { key: key.clone(), generation, after });
+            }
+            IdleEffect::Remove => {
+                map.remove(key);
             }
         }
-    });
+    }
+    out
+}
+
+/// [`PoolEffect`]のinterpreter(ロック外部分)。`ArmIdleTimer`は`rt`へタイマーをspawnし、
+/// 満了時に[`idle_expired_step`]へ`(key, generation)`を戻す。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn run_pool_effects<K, T>(rt: &tokio::runtime::Handle, pool: &'static PoolMap<K, T>, effects: Vec<PoolEffect<K>>)
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    for effect in effects {
+        match effect {
+            PoolEffect::ArmIdleTimer { key, generation, after } => {
+                let timer_rt = rt.clone();
+                rt.spawn(async move {
+                    tokio::time::sleep(after).await;
+                    let effects = idle_expired_step(pool, &key, generation);
+                    run_pool_effects(&timer_rt, pool, effects);
+                });
+            }
+        }
+    }
 }
 
 // ── プレーンSSH用プールキー ────────────────────────────
@@ -366,7 +425,7 @@ mod tests {
         }
         {
             let map = pool.lock();
-            assert_eq!(map.get(&"k").unwrap().refcount, 2);
+            assert_eq!(map.get(&"k").unwrap().idle.refcount(), 2);
         }
         let value = publish_success(&pool, &"k", 42u32);
         assert_eq!(*value, 42);
@@ -403,7 +462,7 @@ mod tests {
         let map = pool.lock();
         let entry = map.get(&"k").expect("failed entry should remain as tombstone");
         assert!(matches!(entry.state, EntryState::Dead));
-        assert_eq!(entry.refcount, 2);
+        assert_eq!(entry.idle.refcount(), 2);
     }
 
     #[tokio::test]
@@ -418,7 +477,7 @@ mod tests {
             AttachOutcome::Waiter(rx) => rx,
             _ => panic!("expected Waiter"),
         };
-        assert_eq!(pool.lock().get(&"k").unwrap().refcount, 3, "establisher + 2 waiters");
+        assert_eq!(pool.lock().get(&"k").unwrap().idle.refcount(), 3, "establisher + 2 waiters");
 
         publish_success(&pool, &"k", 99u32);
 
@@ -465,7 +524,7 @@ mod tests {
         let map = pool.lock();
         let entry = map.get(&"k").expect("entry should remain in-place");
         assert!(matches!(entry.state, EntryState::Connecting(_)));
-        assert_eq!(entry.refcount, 2);
+        assert_eq!(entry.idle.refcount(), 2);
     }
 
     // ── release: アイドルタイマーのライフサイクル ────────────
@@ -575,7 +634,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let map = RELEASE_TEST_POOL.lock();
         let entry = map.get(&key).expect("new Ready entry must not be removed by late release");
-        assert_eq!(entry.refcount, 1);
+        assert_eq!(entry.idle.refcount(), 1);
         match &entry.state {
             EntryState::Ready(v) => assert_eq!(**v, 2),
             _ => panic!("replacement entry should be Ready"),
@@ -599,7 +658,7 @@ mod tests {
             let map = RELEASE_TEST_POOL.lock();
             let entry = map.get(&key).expect("entry should remain as tombstone");
             assert!(matches!(entry.state, EntryState::Dead));
-            assert_eq!(entry.refcount, 1);
+            assert_eq!(entry.idle.refcount(), 1);
         }
 
         release_virtual(key, Duration::from_millis(30));
@@ -623,7 +682,7 @@ mod tests {
             let map = RELEASE_TEST_POOL.lock();
             let entry = map.get(&key).expect("entry should remain until idle grace elapses");
             assert!(matches!(entry.state, EntryState::Dead));
-            assert_eq!(entry.refcount, 0);
+            assert_eq!(entry.idle.refcount(), 0);
         }
 
         assert!(
@@ -640,8 +699,13 @@ mod tests {
     // 差し替え(Ready→Connecting)を跨いだ状態の食い違い(#120と同種の「エラー後に状態が
     // 残る」バグ)を、操作の組み合わせから探す。
     //
-    // 削除タイマーの満了は対象外: `release`のgraceを1時間にして発火させない(タイマー満了の
-    // 検証は上のgrace系テストが担当)。これによりモデルが決定論的になり、実時間に依存しない。
+    // 削除タイマーの満了(Step 4、ADR_FUNCTIONAL_CORE_EFFECTS.md §6 / L0-3・L0-4): `release`の
+    // 判断部分[`release_step`]が返す`PoolEffect::ArmIdleTimer{key, generation}`を実時間タイマーに
+    // せずモデル側で保持し、`FireLatest`/`FireArmed`/`FireArbitrary`操作で任意の順序・任意の
+    // (現行/古い/armされていない)世代の[`idle_expired_step`]を発火させる。これで
+    // release→attach→release→古いタイマー発火の世代競合を、実時間に依存せず決定論的に検証する。
+    // 必須プロパティ(§2.2): 非現行世代の満了は状態(存在・refcount・世代・EntryState)を変えず、
+    // Effectも返さない。
     mod model_based {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::{Arc, LazyLock};
@@ -650,8 +714,8 @@ mod tests {
         use proptest::prelude::*;
 
         use crate::pool::{
-            mark_dead_if_same, new_pool_map, publish_failure, publish_success, release,
-            try_attach_with, AttachOutcome, EntryState, PoolMap,
+            idle_expired_step, mark_dead_if_same, new_pool_map, publish_failure, publish_success,
+            release, release_step, try_attach_with, AttachOutcome, EntryState, PoolEffect, PoolMap,
         };
 
         struct ModelVal {
@@ -681,6 +745,12 @@ mod tests {
             /// 既に置き換わった古い値に対して`mark_dead_if_same`を呼ぶ(何も起きてはならない)。
             MarkDeadStale,
             Release,
+            /// 最後にarmされたタイマーを満了させる(その後にattachがあれば古い世代)。
+            FireLatest,
+            /// これまでにarmされたタイマーのどれか(index、armed列の長さで剰余)を満了させる。
+            FireArmed(usize),
+            /// 任意の世代値で満了させる(一度もarmされていない値も含む)。
+            FireArbitrary(u64),
         }
 
         enum ModelState {
@@ -699,6 +769,9 @@ mod tests {
                 1 => Just(Op::Kill),
                 1 => Just(Op::MarkDeadCurrent),
                 1 => Just(Op::MarkDeadStale),
+                2 => Just(Op::FireLatest),
+                1 => any::<usize>().prop_map(Op::FireArmed),
+                1 => (0u64..8).prop_map(Op::FireArbitrary),
             ]
         }
 
@@ -710,7 +783,7 @@ mod tests {
             }
         }
 
-        fn check_against_model(key: u32, state: &ModelState, holders: u32, ctx: &str) {
+        fn check_against_model(key: u32, state: &ModelState, holders: u32, generation: u64, ctx: &str) {
             let map = MODEL_POOL.lock();
             match map.get(&key) {
                 None => assert!(
@@ -718,7 +791,9 @@ mod tests {
                     "{ctx}: entry is absent but the model expects one (holders={holders})"
                 ),
                 Some(entry) => {
-                    assert_eq!(entry.refcount, holders, "{ctx}: refcount diverged from the model");
+                    assert!(!matches!(state, ModelState::Absent), "{ctx}: entry exists but the model expects it removed");
+                    assert_eq!(entry.idle.refcount(), holders, "{ctx}: refcount diverged from the model");
+                    assert_eq!(entry.idle.generation(), generation, "{ctx}: idle generation diverged from the model");
                     match (&entry.state, state) {
                         (EntryState::Connecting(_), ModelState::Connecting) => {}
                         (EntryState::Dead, ModelState::Dead) => {}
@@ -729,6 +804,19 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// 状態の観測値(存在・refcount・世代・EntryStateの種類・Readyの値)。stale満了の前後比較用。
+        fn snapshot(key: u32) -> Option<(u32, u64, &'static str, usize)> {
+            let map = MODEL_POOL.lock();
+            map.get(&key).map(|e| {
+                let (kind, ptr) = match &e.state {
+                    EntryState::Connecting(_) => ("Connecting", 0),
+                    EntryState::Ready(v) => ("Ready", Arc::as_ptr(v) as usize),
+                    EntryState::Dead => ("Dead", 0),
+                };
+                (e.idle.refcount(), e.idle.generation(), kind, ptr)
+            })
         }
 
         fn expect_waiters_see_failure(
@@ -753,6 +841,10 @@ mod tests {
             let mut state = ModelState::Absent;
             let mut holders: u32 = 0;
             let mut stale: Option<Arc<ModelVal>> = None;
+            // モデル側のアイドル世代(エントリ作成時0、既存へのattachと0到達で+1)と、
+            // これまでに`release_step`がarmしたタイマーの世代(発火済みも含む)。
+            let mut generation: u64 = 0;
+            let mut armed: Vec<u64> = Vec::new();
             // Connecting中にWaiterとして受け取った受信側。確立担当のpublish結果が全員に
             // 配信されること(watchのブロードキャスト)も検証する。
             let mut waiters = Vec::new();
@@ -763,6 +855,7 @@ mod tests {
                     Op::Attach => {
                         let outcome = try_attach_with(pool, &key, ModelVal::is_alive);
                         holders += 1;
+                        generation = if matches!(state, ModelState::Absent) { 0 } else { generation + 1 };
                         // 借用の都合で、状態の更新はmatchの外で行う。
                         let next_state = match (&state, outcome) {
                             (ModelState::Absent | ModelState::Dead, AttachOutcome::Establisher) => {
@@ -836,12 +929,49 @@ mod tests {
                     }
                     Op::Release => {
                         if holders > 0 {
-                            release(pool, key, NEVER_EXPIRES);
+                            let effects = release_step(pool, &key, NEVER_EXPIRES);
                             holders -= 1;
+                            if holders == 0 {
+                                generation += 1;
+                                assert_eq!(
+                                    effects,
+                                    vec![PoolEffect::ArmIdleTimer { key, generation, after: NEVER_EXPIRES }],
+                                    "{ctx}: release to zero must arm exactly one timer with the new generation"
+                                );
+                                armed.push(generation);
+                            } else {
+                                assert!(effects.is_empty(), "{ctx}: release with holders left must not arm a timer");
+                            }
+                        }
+                    }
+                    Op::FireLatest | Op::FireArmed(_) | Op::FireArbitrary(_) => {
+                        let fired = match *op {
+                            Op::FireLatest => armed.last().copied(),
+                            Op::FireArmed(i) if !armed.is_empty() => Some(armed[i % armed.len()]),
+                            Op::FireArbitrary(g) => Some(g),
+                            _ => None,
+                        };
+                        if let Some(fired) = fired {
+                            let before = snapshot(key);
+                            let effects = idle_expired_step(pool, &key, fired);
+                            assert!(effects.is_empty(), "{ctx}: an idle expiry never arms another timer");
+                            let current = !matches!(state, ModelState::Absent) && fired == generation;
+                            if current && holders == 0 {
+                                // 現行世代かつ保持者0: 削除される。Connectingのまま削除された場合は
+                                // 確立担当も既にreleaseしているので、待機者の受信側は送信側の
+                                // dropを観測する(残しておくと次の確立の結果と取り違える)。
+                                for rx in waiters.drain(..) {
+                                    assert!(rx.has_changed().is_err(), "{ctx}: a waiter of a removed entry must see the sender dropped");
+                                }
+                                state = ModelState::Absent;
+                            } else {
+                                // §2.2必須プロパティ: 非現行世代(または保持者あり)の満了は何も変えない。
+                                assert_eq!(snapshot(key), before, "{ctx}: a non-current idle expiry (gen {fired}) changed state");
+                            }
                         }
                     }
                 }
-                check_against_model(key, &state, holders, &ctx);
+                check_against_model(key, &state, holders, generation, &ctx);
             }
 
             // 後始末: 確立担当が残っていれば失敗を告げ、全保持者がreleaseしたときrefcountが
@@ -852,10 +982,14 @@ mod tests {
                 state = ModelState::Dead;
             }
             while holders > 0 {
+                // 公開API`release`(=`RUNTIME`へタイマーをspawnする本番経路)の形も通す。
                 release(pool, key, NEVER_EXPIRES);
                 holders -= 1;
+                if holders == 0 {
+                    generation += 1;
+                }
             }
-            check_against_model(key, &state, 0, "teardown");
+            check_against_model(key, &state, 0, generation, "teardown");
             // 共有staticのプールにエントリを残さない(`cargo test`の1プロセス実行でも蓄積しない)。
             // `release`が起動した1時間のタイマーは、世代/refcount条件で何もせず終わる。
             MODEL_POOL.lock().remove(&key);

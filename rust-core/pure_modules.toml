@@ -30,6 +30,12 @@ package = "isekai-terminal-core"
 file = "src/trzsz.rs"
 module = "trzsz"
 
+# Step 4: pool.rsのrefcount/アイドル削除タイマー判断(token付きArmIdleTimer/IdleExpired)。
+[[module]]
+package = "isekai-terminal-core"
+file = "src/pool_idle_fsm.rs"
+module = "pool_idle_fsm"
+
 [[module]]
 package = "isekai-terminal-core"
 file = "src/net_health_policy.rs"
@@ -56,6 +62,12 @@ module = "connect_recovery_fsm"
 package = "isekai-ssh"
 file = "isekai-ssh/src/reconnect_backoff.rs"
 module = "reconnect_backoff"
+
+# ADR §6 Step 3a: orchestratorの自動再接続判断(`ReconnectState::apply`)。
+[[module]]
+package = "isekai-terminal-core"
+file = "src/reconnect_fsm.rs"
+module = "reconnect_fsm"
 
 # ── 外部パスの許可リスト(セグメント単位の前方一致) ──────────────────
 [external]
@@ -108,11 +120,12 @@ package = "isekai-transport"
 path = "crate::path_health::has_zero_response"
 reason = "同上"
 
-# 例(未登録・将来のStepで追加): crate rootの公開値型
-# [[allow_item]]
-# package = "isekai-terminal-core"
-# path = "crate::ConnectionIssueHint"
-# reason = "値型のみ"
+# crate rootの公開値型(ADR §2.3 / §6 Step 3a)。`crate`(root)のモジュール単位許可は禁止なので、
+# reconnect_fsm.rsが使う値型だけを項目単位で許可する(同じcrate rootの`RUNTIME`・`SshConfig`/`SshAuth`は不可)。
+[[allow_item]]
+package = "isekai-terminal-core"
+path = "crate::ConnectionIssueHint"
+reason = "UniFFI公開の値型enum(フィールド無し・I/O無し)。reconnect_fsm.rsが切断時のLocal Networkヒントとして返す(ADR §6 Step 3a)"
 
 # ── Effect interpreter登録簿(ADR §3-8 / Step 7a) ───────────────────
 # 登録した関数の本体では、`effect`のenumを`if let`/`let .. else`/`matches!`で選り分けてはならない
@@ -138,3 +151,20 @@ effect = "ServeEffect"
 file = "isekai-ssh/src/connect_recovery_driver.rs"
 fn = "drive_connect_recovery"
 effect = "RecoveryEffect"
+
+# ADR §6 Step 3a: orchestratorの再接続Effect interpreter。
+[[interpreter]]
+file = "src/orchestrator.rs"
+fn = "execute_reconnect_effects"
+effect = "ReconnectEffect"
+
+# Step 4: pool.rsのアイドルタイマーinterpreter(ロック内: Remove実行 / ロック外: ArmIdleTimerのspawn)。
+[[interpreter]]
+file = "src/pool.rs"
+fn = "apply_idle_in_lock"
+effect = "IdleEffect"
+
+[[interpreter]]
+file = "src/pool.rs"
+fn = "run_pool_effects"
+effect = "PoolEffect"

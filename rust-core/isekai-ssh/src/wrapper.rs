@@ -601,10 +601,12 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
 /// lightweight — no re-deploy — using the same `RECONNECT_BUDGET`(24h)/
 /// backoff policy `native::mux::run_with_reconnect` already established
 /// for Windows mux (`reconnect_backoff`, Q1). `StaleTrust`/`Unreachable`
-/// keep the original single-shot `RebootstrapAndRetry` behavior — a
-/// pre-handshake failure means the cached deployment itself might be
-/// stale/dead, and looping a full re-deploy indefinitely would be both
-/// slow and, if the target is genuinely gone, pointless.
+/// /`Unknown` drive `RebootstrapAndRetry`: the first re-deploy of a storm is
+/// immediate, but later ones are throttled by `RedeployGate`
+/// (`REDEPLOY_BACKOFF`), and while the gate is closed a failure falls
+/// through to a plain lightweight reconnect — looping a full re-deploy on
+/// every retry would be both slow and, if the target is genuinely gone,
+/// pointless.
 ///
 /// Only reachable *after* `build_connection_intent` already succeeded once
 /// in `run()` — a brand-new (never-registered) profile's own, separately

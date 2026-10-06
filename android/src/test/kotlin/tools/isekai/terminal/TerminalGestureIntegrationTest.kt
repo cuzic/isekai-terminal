@@ -134,25 +134,7 @@ class TerminalGestureIntegrationTest {
         emptyList(), 0u, null,
     )
 
-    private fun noopActions(onSend: (ByteArray) -> Unit) = TerminalScreenActions(
-        onConnect = {},
-        onDisconnect = {},
-        onBack = {},
-        onSend = onSend,
-        onResize = { _, _ -> },
-        onScrollbackCells = { _, _ -> null },
-        onTrustUpdatedHostKey = {},
-        onDismissHostKeyWarning = {},
-        onTrustNewHostKey = {},
-        onDismissNewHostKeyPrompt = {},
-        onTrzszStartUpload = {},
-        onTrzszStartDownload = {},
-        onTrzszCancel = {},
-        onTrzszDismiss = {},
-        onGetSessionLog = { "" },
-        onSendSnippet = {},
-        onRespondAgentSignRequest = {},
-    )
+    private fun noopActions(onSend: (ByteArray) -> Unit) = noopTerminalScreenActions(onSend = onSend)
 
     private fun setScreen(
         mouseReportingMode: MouseReportingMode,

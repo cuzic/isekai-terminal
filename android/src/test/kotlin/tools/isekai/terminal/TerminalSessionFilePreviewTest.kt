@@ -29,7 +29,7 @@ class TerminalSessionFilePreviewTest {
     @Before
     fun setup() {
         fakeOrchestrator = FakeOrchestrator()
-        session = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
+        session = testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
     }
 
     @After

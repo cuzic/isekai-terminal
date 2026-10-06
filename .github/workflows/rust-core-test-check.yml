@@ -32,6 +32,7 @@ on:
       - "rust-core/**"
       - "!rust-core/noq-multipath-spike/**"
       - ".github/workflows/rust-core-test-check.yml"
+      - ".github/actions/isekai-pipe-musl/**"
   # pull_requestではpaths:フィルタを使わない(2026-08、項目3 Phase2)。`test`
   # job(context名`rust-core-test-linux`)はbranch protectionのrequired status
   # checkなので、path-filter付きpull_requestのままだとrust-core/**に触れない
@@ -85,6 +86,7 @@ jobs:
             ^rust-core/
             ^\.github/workflows/rust-core-test-check\.yml$
             ^\.github/actions/pr-path-gate/
+            ^\.github/actions/isekai-pipe-musl/
 
   test:
     needs: changes
@@ -100,6 +102,14 @@ jobs:
       # debug/infoログでCI出力が読みにくくなるのを避ける(ローカル開発時のデフォルトは
       # env_logger未設定=warn相当のまま)。
       RUST_LOG: warn
+      # CIビルド高速化+キャッシュ縮小: CIは毎回ほぼフルビルドなのでincremental成果物は
+      # 再利用されず、`target/debug/incremental`がキャッシュを肥大化させるだけ。
+      # debuginfoは行番号テーブルのみに減らす(panic時のbacktraceのファイル:行は残る)。
+      # どちらもテストの実行対象・内容には影響しない。これらを変えたら下のキャッシュ
+      # キーの`dbg1`も上げること(完全一致ヒット時は保存されないため、古い設定の
+      # 成果物を含むキャッシュがLockfileが変わるまで使われ続けてしまう)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -115,17 +125,25 @@ jobs:
       # 置く(以前はこのステップがそれらより後にあり、`rust-core/target`を含むキャッシュが
       # 一切効かないままcargo-zigbuildの毎回のcompile-from-scratchとisekai-pipeの
       # musl再ビルドが走っていた)。
+      #
+      # 復元(restore)は全イベントで行うが、保存(save)はmainへのpush時のみ(ジョブ末尾の
+      # `Save cargo cache`参照)。PR上で保存したキャッシュは`refs/pull/N/merge`スコープに
+      # なり他のPRからは一切読めないうえ、リポジトリ上限10GBを食い潰してmainのキャッシュを
+      # LRUで追い出していた(2026-10-06実測: 使用量16.4GB/上限10GB、Windows/macOSは
+      # ほぼ毎回ミス)。PRは常にmainのキャッシュ(完全一致またはrestore-keysの前方一致)
+      # から復元する。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
             rust-core/target
-          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-dbg1-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-${{ runner.os }}-
+            rust-core-test-dbg1-${{ runner.os }}-
 
       # `test-windows`ジョブは`rust-core/isekai-ssh/tests/*.rs`をファイル名の明示list
       # (`mux_holder_windows_e2e`/`native_auth_windows_e2e`単独step + 5ファイルループ)
@@ -237,21 +255,10 @@ jobs:
         # 依らずisekai-terminal-coreを cargo test するだけでも常に必要な前提
         # (ios-rust-core-check.yml/ios-app-build-check.yml/ios-ssh-vertical-slice-check.yml/
         # ios-logic-linux-check.ymlは既に対応済みだったが、このワークフローだけ追従が漏れていた)。
-        # `~/.cargo/bin`もキャッシュ対象なので、既にキャッシュヒットでcargo-zigbuildが
-        # 入っていれば再インストールしない(2026-07-14、ci-github-actions-speedupで追加)。
-        run: |
-          set -euo pipefail
-          curl -fL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          mkdir -p "$HOME/zig-toolchain"
-          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
-          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
-          export PATH="$HOME/zig-toolchain:$PATH"
-          if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild --locked
-          fi
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-pipe-musl.sh
+        # isekai-pipeの依存クロージャのハッシュをキーにしたキャッシュがヒットすれば
+        # zig/cargo-zigbuildのセットアップごとビルドをスキップする(詳細はaction.yml)。
+        # 上の`Cache cargo (rust-core)`より後に置くこと(target/の復元で上書きされないように)。
+        uses: ./.github/actions/isekai-pipe-musl
 
       # cargo-nextestへ移行(process-per-testで実行されるため、1つのlibtestプロセス内で
       # 1000件超のテストが同時実行されていた従来の`cargo test`よりタイムアウト・隔離の
@@ -268,6 +275,19 @@ jobs:
       - name: cargo test --doc --workspace
         working-directory: rust-core
         run: cargo test --doc --workspace
+
+      # actions/cache@v4の暗黙のpost-saveと同じ条件(ジョブ成功・完全一致ヒット時は保存しない)
+      # に、mainへのpushに限るという条件を足したもの。
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       # proptestの反例保存(ADR_FUNCTIONAL_CORE_EFFECTS.md §7 m-5): CI専用運用では
       # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
@@ -303,8 +323,10 @@ jobs:
           python3 rust-core/scripts/check_pure_modules.py --self-test
           python3 rust-core/scripts/check_pure_modules.py
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -314,24 +336,12 @@ jobs:
           key: rust-core-purity-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
             rust-core-purity-${{ runner.os }}-
-            rust-core-test-${{ runner.os }}-
+            rust-core-test-dbg1-${{ runner.os }}-
 
       # isekai-terminal-coreはisekai-pipeのmusl静的バイナリをinclude_bytes!で埋め込むため、
-      # `test`ジョブと同じ前提ビルドが要る。
+      # `test`ジョブと同じ前提ビルドが要る(同じキャッシュキーを共有する)。
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
-        run: |
-          set -euo pipefail
-          curl -fL -o /tmp/zig.tar.xz \
-            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          mkdir -p "$HOME/zig-toolchain"
-          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
-          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
-          export PATH="$HOME/zig-toolchain:$PATH"
-          if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild --locked
-          fi
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-pipe-musl.sh
+        uses: ./.github/actions/isekai-pipe-musl
 
       - name: Show clippy version
         run: cargo clippy --version
@@ -339,6 +349,17 @@ jobs:
       - name: cargo clippy (pure modules only; all other lints allowed)
         working-directory: rust-core
         run: cargo clippy --workspace --lib --bins -- -A clippy::all
+
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   test-macos:
     needs: changes
@@ -354,6 +375,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_LOG: warn
+      # `test`ジョブの同名envのコメント参照(変えたらキャッシュキーの`dbg1`も上げる)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -365,16 +389,18 @@ jobs:
           /usr/sbin/sshd -V || true
           ssh-keygen -V || true
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             rust-core/target
-          key: rust-core-test-macos-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-macos-dbg1-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-macos-
+            rust-core-test-macos-dbg1-
 
       # isekai-transport配下のe2eテスト(multipath_e2e.rs・rebind_e2e.rs、また
       # isekai-terminal-core側のmultipath_transport.rsも同じ手法だが、そちらは
@@ -403,6 +429,16 @@ jobs:
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   test-windows:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
@@ -417,6 +453,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_LOG: warn
+      # `test`ジョブの同名envのコメント参照(変えたらキャッシュキーの`dbg1`も上げる)。
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -426,16 +465,19 @@ jobs:
           rustc --version
           cargo --version
 
+      # 保存はmainへのpush時のみ(`test`ジョブの同名ステップのコメント参照)。このジョブでは
+      # 特に、PR上での2.4GBの保存(post-save)だけで毎回300〜380秒かかっていた。
       - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             rust-core/target
-          key: rust-core-test-windows-${{ hashFiles('rust-core/Cargo.lock') }}
+          key: rust-core-test-windows-dbg1-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
-            rust-core-test-windows-
+            rust-core-test-windows-dbg1-
 
       # isekai-ssh/isekai-pipeはWindowsをクライアントプラットフォームとして
       # 公式サポートする(rust-core/isekai-ssh/README.md参照。接続先ホストは
@@ -551,3 +593,13 @@ jobs:
           done
           exit $failed
           exit $failed
+
+      - name: Save cargo cache (rust-core, main only)
+        if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
