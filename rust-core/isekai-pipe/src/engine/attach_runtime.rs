@@ -207,19 +207,38 @@ impl AttachRuntime {
     /// with an [`EstablishedLease`] minted at exactly this transition
     /// (the arbiter has just moved this session to `Established`, per
     /// `AttachArbiter::on_activated`).
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub async fn activate(self: &Arc<Self>, key: AttachKey, attach_token: AttachToken) -> Option<(TcpStream, EstablishedLease)> {
         let effects = self.arbiter.lock().await.apply(AttachEvent::Activated { key, attach_token });
+        let mut started = None;
+        // Effect interpreter: every `AttachEffect` variant is listed explicitly
+        // (ADR_FUNCTIONAL_CORE_EFFECTS.md §3-8, Step 7a) so adding a new effect
+        // forces a decision here instead of being silently dropped.
         for effect in effects {
-            if let AttachEffect::StartRelay { lease, .. } = effect {
-                if let Some(LeaseResource::PendingTarget { tcp, timer }) = self.leases.lock().await.remove(&lease) {
-                    if let Some(timer) = timer {
-                        timer.abort();
+            match effect {
+                AttachEffect::StartRelay { lease, .. } => {
+                    if started.is_none() {
+                        if let Some(LeaseResource::PendingTarget { tcp, timer }) = self.leases.lock().await.remove(&lease) {
+                            if let Some(timer) = timer {
+                                timer.abort();
+                            }
+                            started = Some((tcp, EstablishedLease::new(self.clone(), lease)));
+                        }
                     }
-                    return Some((tcp, EstablishedLease::new(self.clone(), lease)));
+                }
+                AttachEffect::ConnectTarget { .. }
+                | AttachEffect::CancelLease { .. }
+                | AttachEffect::SendReady { .. }
+                | AttachEffect::SendReject { .. }
+                | AttachEffect::SchedulePendingTimeout { .. } => {
+                    // `on_activated` currently only emits `StartRelay`; reaching
+                    // this arm means the reducer grew a new effect for
+                    // `Activated` that this interpreter must now handle.
+                    log::warn!("attach_runtime: unexpected non-StartRelay effect from Activated in activate()");
                 }
             }
         }
-        None
+        started
     }
 
     /// Mints an [`EstablishedLease`] for a lease already known to be
@@ -250,6 +269,7 @@ impl AttachRuntime {
         self.execute_effects(effects).await;
     }
 
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn execute_effects<'a>(
         self: &'a Arc<Self>,
         effects: Vec<AttachEffect>,

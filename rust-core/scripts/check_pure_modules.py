@@ -13,6 +13,8 @@ rust-core/pure_modules.toml に登録された各モジュールが、
   - 許可済みモジュールを経由した再エクスポート(`pub use`)
   - マクロが生成するパス、`#[path]`属性
   - trait経由の動的呼び出し、許可リスト側モジュールに後から入った不純コード
+[[interpreter]]登録関数(Step 7a)は、本体で`<effect>::`を`if let`/`let .. else`/`matches!`で
+選り分けること、および`#[deny(clippy::wildcard_enum_match_arm)]`の欠落を検査する(`match`内の`_`はclippy側が検出)。
 入れ子のグループimport(`use crate::{a::{b, c}, D}`)は括弧対応で展開して全項目を個別に判定する。
 
 使い方: python3 scripts/check_pure_modules.py
@@ -179,6 +181,7 @@ class Config:
         ext = data.get("external", {})
         self.ext_allow = [tuple(p.split("::")) for p in ext.get("allow", [])]
         self.ext_deny = [tuple(p.split("::")) for p in ext.get("deny", [])]
+        self.interpreters = data.get("interpreter", [])
         self.items = data.get("allow_item", [])
         for it in self.items:
             if not it.get("reason"):
@@ -290,6 +293,35 @@ def check_file(cfg: Config, mod) -> list:
     return errs
 
 
+def check_interpreter(entry) -> list:
+    """Effect interpreter関数(ADR §3-8)が、Effectを明示matcharm以外で選り分けていないか検査する。"""
+    path = os.path.join(ROOT, entry["file"])
+    if not os.path.exists(path):
+        return [f"{entry['file']}: 登録されたinterpreterファイルが存在しない"]
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    s = remove_cfg_test_items(strip_comments_and_strings(src))
+    name, eff = entry["fn"], re.escape(entry["effect"])
+    m = re.search(r"((?:#\s*\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+" + re.escape(name) + r"\b", s)
+    if not m:
+        return [f"{entry['file']}: interpreter関数 `{name}` が見つからない"]
+    errs = []
+    if "wildcard_enum_match_arm" not in m.group(1) or "deny" not in m.group(1):
+        errs.append(f"{entry['file']}: `{name}` に #[deny(clippy::wildcard_enum_match_arm)] が無い")
+    brace = s.find("{", m.end())
+    body = s[brace:find_matching(s, brace, "{", "}") + 1]
+    for pat, what in (
+        (r"\bif\s+let\s+" + eff + r"\s*::", "if let"),
+        (r"\blet\s+[^;=]*?\b" + eff + r"\s*::[^;]*?\belse\b", "let .. else"),
+        (r"\bwhile\s+let\s+" + eff + r"\s*::", "while let"),
+        (r"\bmatches\s*!\s*\([^;]*?" + eff + r"\s*::", "matches!"),
+    ):
+        for bm in re.finditer(pat, body):
+            line = s.count("\n", 0, brace + bm.start()) + 1
+            errs.append(f"{entry['file']}:{line}: interpreter `{name}` が {entry['effect']} を `{what}` で選り分けている(明示matcharmのみ許可、ADR §3-8)")
+    return errs
+
+
 def run(config_path):
     with open(config_path, "rb") as f:
         cfg = Config(tomllib.load(f))
@@ -301,6 +333,8 @@ def run(config_path):
             errs.append(f"{mod['file']}: 登録されたファイルが存在しない")
             continue
         errs += check_file(cfg, mod)
+    for entry in cfg.interpreters:
+        errs += check_interpreter(entry)
     return errs
 
 
@@ -340,6 +374,25 @@ def self_test():
     assert check("static G: std::sync::Mutex<u8> = todo!();")
     assert check("thread_local!{ static X: u8 = 1; }")
     assert not check("static T: &'static str = \"a\"; fn f<'a>(x: &'a str) {}")
+    def check_interp(code):
+        global ROOT
+        with tempfile.TemporaryDirectory() as d:
+            old, ROOT = ROOT, d
+            try:
+                with open(os.path.join(d, "y"), "w") as f:
+                    f.write(code)
+                return check_interpreter({"file": "y", "fn": "run", "effect": "E"})
+            finally:
+                ROOT = old
+
+    deny = "#[deny(clippy::wildcard_enum_match_arm)]\n"
+    assert not check_interp(deny + "async fn run(x: Vec<E>) { for e in x { match e { E::A => {}, E::B { .. } => {} } } }")
+    assert check_interp("fn run(x: Vec<E>) { for e in x { match e { E::A => {} } } }")
+    assert check_interp(deny + "fn run(x: Vec<E>) { for e in x { if let E::A = e {} } }")
+    assert check_interp(deny + "fn run(x: Vec<E>) { for e in x { let E::A = e else { continue }; } }")
+    assert check_interp(deny + "fn run(x: Vec<E>) { let _ = matches!(x[0], E::A); }")
+    assert check_interp(deny + "fn other() {}")
+    assert not check_interp(deny + "fn run() { // if let E::A = e\n }")
     print("self-test ok")
 
 
