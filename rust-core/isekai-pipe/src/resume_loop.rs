@@ -2369,6 +2369,8 @@ mod tests {
             let first_check_at = Millis(u64::try_from(first_check_after.as_millis()).unwrap());
             let initial_cmds = planner.begin_episode_for_test(Millis(0), first_check_at, 0);
             let targets = ResumeTargets { primary: target, cross_family: None };
+            let no_warm_standby_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut make_monitor = || -> Box<dyn isekai_netmon::NetworkChangeMonitor> { Box::new(isekai_netmon::NoopNetworkChangeMonitor) };
             let episode = resume_with_backoff_until_deadline(
                 factory,
                 &targets,
@@ -2378,8 +2380,8 @@ mod tests {
                 &clock,
                 initial_cmds,
                 state,
-                &None,
-                &mut || -> Box<dyn isekai_netmon::NetworkChangeMonitor> { Box::new(isekai_netmon::NoopNetworkChangeMonitor) },
+                &no_warm_standby_task,
+                &mut make_monitor,
             );
             tokio::time::timeout(Duration::from_secs(60), episode)
                 .await
