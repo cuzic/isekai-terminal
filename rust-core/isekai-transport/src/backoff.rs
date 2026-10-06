@@ -54,13 +54,63 @@ impl BackoffPolicy {
         let jittered_secs = (base.as_secs_f64() * factor).max(0.0);
         Duration::from_secs_f64(jittered_secs).min(self.max)
     }
+
+    /// [`Self::delay_for_attempt`] with the RNG derived from a plain `u64`
+    /// `seed` — a pure function of `(self, attempt, seed)`. Production
+    /// callers draw `seed` fresh (`rand::random()`) once per delay; tests and
+    /// reducers pass a fixed one, so the jitter is reproducible without
+    /// threading an RNG type through.
+    pub fn next_delay(&self, attempt: u32, seed: u64) -> Duration {
+        use rand::SeedableRng as _;
+        self.delay_for_attempt(attempt, &mut rand::rngs::StdRng::seed_from_u64(seed))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    proptest! {
+        #[test]
+        fn next_delay_is_deterministic_per_seed(
+            initial_ms in 1u64..5_000, max_ms in 1u64..120_000, jitter in 0.0f64..=1.0,
+            attempt in any::<u32>(), seed in any::<u64>(),
+        ) {
+            let p = BackoffPolicy { initial: Duration::from_millis(initial_ms), max: Duration::from_millis(max_ms), jitter };
+            prop_assert_eq!(p.next_delay(attempt, seed), p.next_delay(attempt, seed));
+        }
+
+        #[test]
+        fn next_delay_never_exceeds_max_and_stays_within_jitter_band(
+            initial_ms in 1u64..5_000, max_ms in 1u64..120_000, jitter in 0.0f64..=1.0,
+            attempt in any::<u32>(), seed in any::<u64>(),
+        ) {
+            let p = BackoffPolicy { initial: Duration::from_millis(initial_ms), max: Duration::from_millis(max_ms), jitter };
+            let got = p.next_delay(attempt, seed).as_secs_f64();
+            let base = p.base_delay(attempt).as_secs_f64();
+            prop_assert!(got <= p.max.as_secs_f64() + 1e-9);
+            prop_assert!(got >= base * (1.0 - jitter) - 1e-9);
+            prop_assert!(got <= (base * (1.0 + jitter)).min(p.max.as_secs_f64()) + 1e-9);
+        }
+
+        #[test]
+        fn base_delay_is_monotonic_in_attempt(
+            initial_ms in 1u64..5_000, max_ms in 1u64..120_000, a in any::<u32>(), b in any::<u32>(),
+        ) {
+            let p = BackoffPolicy { initial: Duration::from_millis(initial_ms), max: Duration::from_millis(max_ms), jitter: 0.0 };
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(p.base_delay(lo) <= p.base_delay(hi));
+        }
+
+        #[test]
+        fn zero_jitter_next_delay_ignores_the_seed(attempt in any::<u32>(), s1 in any::<u64>(), s2 in any::<u64>()) {
+            let p = BackoffPolicy { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.0 };
+            prop_assert_eq!(p.next_delay(attempt, s1), p.next_delay(attempt, s2));
+        }
+    }
 
     #[test]
     fn base_delay_doubles_each_attempt_until_capped() {

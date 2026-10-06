@@ -76,6 +76,7 @@ quicsock = { path = "../quicsock" }
 qmux-relay = ["quicmux/qmux", "dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
 env_logger = "0.11"

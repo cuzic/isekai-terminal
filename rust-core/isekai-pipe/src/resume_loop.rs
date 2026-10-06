@@ -421,7 +421,7 @@ where
         if !err.signals_busy_other_session() || now >= deadline {
             return Err(err);
         }
-        let delay = RESUME_BACKOFF.delay_for_attempt(attempt_no, &mut rand::thread_rng()).min(deadline - now);
+        let delay = RESUME_BACKOFF.next_delay(attempt_no, rand::random()).min(deadline - now);
         attempt_no = attempt_no.saturating_add(1);
         eprintln!(
             "isekai-pipe connect: remote helper reports BUSY_OTHER_SESSION (likely this client's own prior \
@@ -1433,7 +1433,7 @@ async fn resume_with_backoff_until_deadline(
             ));
         }
 
-        let delay = RESUME_BACKOFF.delay_for_attempt(attempt, &mut rand::thread_rng()).min(deadline - now);
+        let delay = RESUME_BACKOFF.next_delay(attempt, rand::random()).min(deadline - now);
         attempt = attempt.saturating_add(1);
         let backoff_wait_outcome = wait_backoff_or_network_change(
             delay,
