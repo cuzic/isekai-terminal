@@ -79,6 +79,11 @@ const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on writing `RESUME_ACK` plus its replay bytes (review
+/// 2026-09-29, PIPE-12) — mirrors the client side's own replay-write bound
+/// in `resume_loop.rs`, which bounds the symmetric C→S replay write.
+const RESUME_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long `handle_resume_stream` waits, after asking an in-flight relay to
 /// yield (`SessionIo::preempt`), for it to actually park the connection
 /// (`SessionIo::reparked`) before re-sending the request once (ADR Q9; a
@@ -1271,7 +1276,14 @@ async fn handle_resume_stream(
         .export_keying_material(EXPORTER_LABEL, b"")
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let request = quicmux::decode_resume_request(&mut recv, exporter).await.context("failed to decode RESUME frame")?;
+    // `handle_connection`'s `HELLO_TIMEOUT` only covers reading the frame
+    // type byte; bound the (unauthenticated) RESUME body too, so a peer
+    // trickling it cannot hold this task open indefinitely (review
+    // 2026-09-29, PIPE-13 — the length caps live in `quicmux::resume`).
+    let request = tokio::time::timeout(HELLO_TIMEOUT, quicmux::decode_resume_request(&mut recv, exporter))
+        .await
+        .context("RESUME frame not received within timeout")?
+        .context("failed to decode RESUME frame")?;
 
     let session_id: [u8; 16] = request.token.as_slice().try_into().map_err(|_| {
         anyhow!("resume token has unexpected length {} (expected 16)", request.token.len())
@@ -1363,10 +1375,25 @@ async fn handle_resume_stream(
         replay_bytes.len()
     );
 
-    if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
+    // Bounded (review 2026-09-29, PIPE-12): up to `--resume-buffer-size`
+    // bytes of replay go out here, and a peer that stops reading used to hold
+    // this task — with the TCP connection neither parked nor relaying, so
+    // every later RESUME of this session was preempt-rejected — until the
+    // QUIC idle timeout. On expiry, park exactly like the write-error branch.
+    let ack_result = tokio::time::timeout(
+        RESUME_ACK_WRITE_TIMEOUT,
+        quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes),
+    )
+    .await;
+    let ack_error = match ack_result {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(anyhow!("failed to write RESUME_ACK: {e}")),
+        Err(_elapsed) => Some(anyhow!("timed out writing RESUME_ACK + replay after {RESUME_ACK_WRITE_TIMEOUT:?}")),
+    };
+    if let Some(e) = ack_error {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
         table_guard.disarm();
-        return Err(anyhow!("failed to write RESUME_ACK: {e}"));
+        return Err(e);
     }
 
     // `EstablishedLease`は従来どおりここで作る(`AttachRuntime::resumed_lease`docs参照)。
