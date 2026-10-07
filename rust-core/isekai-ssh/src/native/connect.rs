@@ -890,28 +890,6 @@ struct InteractivePrompts<'a> {
     handoff: &'a HandoffCredentials,
 }
 
-/// Establishes the SSH handshake over `stream` and authenticates as
-/// `username`, trying (in order) *every* configured/default private key from
-/// `host_config::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa`
-/// probe, then an SSH agent (Windows-only — see [`agent_auth::connect_agent`]).
-///
-/// Like real `ssh(1)`, each configured identity is offered in turn: a key
-/// the server *rejects* (`Ok(false)`) or one that fails to *parse*
-/// (`SessionError::InvalidPrivateKey`, e.g. a passphrase-protected key —
-/// M1's documented non-compat case) just moves on to the next candidate, and
-/// then to the SSH-agent fallback, rather than aborting the whole
-/// authentication (Codex review finding: the old code tried only the first
-/// *existing* file, and a parse failure there propagated straight out,
-/// skipping both the remaining keys and the agent entirely). Only a genuine
-/// transport/protocol error (any other `SessionError`) aborts — those are not
-/// "try the next key" situations.
-///
-/// Deliberately generic over `stream`/`verifier` so it's testable against an
-/// in-process mock SSH server without a real `isekai-pipe connect`
-/// subprocess or trust store — the same technique every other `native/*.rs`
-/// module in this crate uses. Everything in [`connect_attempt`] above this
-/// call (real subprocess, real trust store, real terminal I/O) is not
-/// unit-tested.
 /// The russh client config for the native path's SSH session, which always
 /// runs over an `isekai-pipe connect` child's stdio — never directly over a
 /// network socket.
@@ -942,6 +920,28 @@ fn native_ssh_client_config() -> client::Config {
     config
 }
 
+/// Establishes the SSH handshake over `stream` and authenticates as
+/// `username`, trying (in order) *every* configured/default private key from
+/// `host_config::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa`
+/// probe, then an SSH agent (Windows-only — see [`agent_auth::connect_agent`]).
+///
+/// Like real `ssh(1)`, each configured identity is offered in turn: a key
+/// the server *rejects* (`Ok(false)`) or one that fails to *parse*
+/// (`SessionError::InvalidPrivateKey`, e.g. a passphrase-protected key —
+/// M1's documented non-compat case) just moves on to the next candidate, and
+/// then to the SSH-agent fallback, rather than aborting the whole
+/// authentication (Codex review finding: the old code tried only the first
+/// *existing* file, and a parse failure there propagated straight out,
+/// skipping both the remaining keys and the agent entirely). Only a genuine
+/// transport/protocol error (any other `SessionError`) aborts — those are not
+/// "try the next key" situations.
+///
+/// Deliberately generic over `stream`/`verifier` so it's testable against an
+/// in-process mock SSH server without a real `isekai-pipe connect`
+/// subprocess or trust store — the same technique every other `native/*.rs`
+/// module in this crate uses. Everything in [`connect_attempt`] above this
+/// call (real subprocess, real trust store, real terminal I/O) is not
+/// unit-tested.
 async fn connect_and_authenticate<S, V>(
     stream: S,
     username: &str,
