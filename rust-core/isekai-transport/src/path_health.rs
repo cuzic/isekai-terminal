@@ -85,6 +85,13 @@ pub enum PathHealthEvent {
 pub struct PathHealthTracker {
     states: Arc<StdMutex<HashMap<PathLabel, PathState>>>,
     path_ids: Arc<StdMutex<HashMap<noq::PathId, PathLabel>>>,
+    /// Paths that already have a [`spawn_health_monitor`] task — see
+    /// [`PathHealthTracker::claim_monitor`].
+    monitored: Arc<StdMutex<std::collections::HashSet<noq::PathId>>>,
+    /// Whether [`notify_if_no_viable_path`] has already reported the
+    /// current "no viable path" episode; cleared as soon as any path is
+    /// Validated again.
+    no_viable_notified: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PathHealthTracker {
@@ -93,7 +100,19 @@ impl PathHealthTracker {
     }
 
     pub fn set(&self, label: PathLabel, state: PathState) {
+        if state == PathState::Validated {
+            self.no_viable_notified.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         self.states.lock().unwrap().insert(label, state);
+    }
+
+    /// Returns `true` exactly once per `path_id`: the caller that gets
+    /// `true` spawns the health monitor. `open_path`'s success and the
+    /// `PathEvent::Established` listener can both observe the same new path
+    /// (in either order), and each used to spawn its own monitor — two FSMs
+    /// pinging and demoting the same path independently.
+    pub fn claim_monitor(&self, path_id: noq::PathId) -> bool {
+        self.monitored.lock().unwrap().insert(path_id)
     }
 
     pub fn get(&self, label: &PathLabel) -> PathState {
@@ -118,15 +137,28 @@ impl PathHealthTracker {
 /// 現在Validatedなpathが1本も無くなった(＝手元のQUICコネクション視点で
 /// 「応答が一切返ってこない」)ことを検知したら[`PathHealthEvent::NoViablePath`]を送る。
 /// キャプティブポータル等はQUICから見れば100%ロスと区別が付かないため、OSの
-/// キャプティブポータル検知より先にこちらで直接検知できる。Degraded/Abandoned
-/// 遷移のたびに呼ばれる想定だが、`any_validated()`がtrueのままなら何もしないので
-/// 連呼にはならない。
+/// キャプティブポータル検知より先にこちらで直接検知できる。呼ばれるのは
+/// 「応答が一切無い」系の遷移(zero-responseによるDegraded、Abandoned/Discarded、
+/// open_pathの断念)だけで、RTT/ロス率によるDegraded(=まだ届いてはいる)では
+/// 呼ばない(`HealthActionExecutor`の`DegradeUnhealthy`参照)。zero-response側は
+/// FSMがエッジトリガーで1回だけ出すので、無応答が続いても連呼にはならない。
+///
+/// Sent once per episode: repeated calls while no path is Validated (the
+/// zero-response check fires every `HEALTH_CHECK_INTERVAL` for as long as
+/// the outage lasts) are suppressed until some path becomes Validated again
+/// ([`PathHealthTracker::set`] re-arms it). If the send itself fails
+/// (channel full), the episode stays un-notified so a later call retries.
 pub fn notify_if_no_viable_path(tracker: &PathHealthTracker, event_tx: &tokio::sync::mpsc::Sender<PathHealthEvent>) {
     if tracker.any_validated() {
         return;
     }
+    if tracker.no_viable_notified.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     warn!("path_health: no viable path left (all paths degraded/failed)");
-    let _ = event_tx.try_send(PathHealthEvent::NoViablePath);
+    if event_tx.try_send(PathHealthEvent::NoViablePath).is_err() {
+        tracker.no_viable_notified.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// 直近の統計から、そのpathが健全とみなせるかを判定する純粋関数
@@ -213,6 +245,13 @@ impl AsyncActionExecutor for HealthActionExecutor {
                     let _ = path.set_status(noq::PathStatus::Backup);
                 }
                 self.tracker.set(self.label.clone(), PathState::Degraded);
+                // Deliberately *no* `notify_if_no_viable_path` here (unlike the
+                // zero-response branch): RTT/loss degradation only demotes the
+                // path to Backup — it is still delivering — and NoViablePath
+                // drives the Android RebindManager's failover to cellular,
+                // which congested-but-working Wi-Fi (RTT > 800ms) must not
+                // trigger. Matches the real-hardware-verified Phase 9-5
+                // behavior this module was ported from.
                 ActionOutcome::Continue
             }
             PathHealthAction::Recover => {
@@ -291,6 +330,32 @@ mod tests {
         stats.lost_packets = lost_packets;
         stats.black_holes_detected = black_holes_detected;
         stats
+    }
+
+    #[test]
+    fn no_viable_path_is_notified_once_per_episode_and_rearmed_by_a_validated_path() {
+        let tracker = PathHealthTracker::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tracker.set("a".into(), PathState::Degraded);
+        notify_if_no_viable_path(&tracker, &tx);
+        notify_if_no_viable_path(&tracker, &tx);
+        notify_if_no_viable_path(&tracker, &tx);
+        assert_eq!(rx.try_recv(), Ok(PathHealthEvent::NoViablePath));
+        assert!(rx.try_recv().is_err(), "repeated checks in the same outage must not re-notify");
+
+        tracker.set("a".into(), PathState::Validated);
+        notify_if_no_viable_path(&tracker, &tx);
+        assert!(rx.try_recv().is_err(), "nothing to report while a path is Validated");
+        tracker.set("a".into(), PathState::Failed);
+        notify_if_no_viable_path(&tracker, &tx);
+        assert_eq!(rx.try_recv(), Ok(PathHealthEvent::NoViablePath), "a new outage is reported again");
+    }
+
+    #[test]
+    fn a_path_monitor_can_only_be_claimed_once() {
+        let tracker = PathHealthTracker::new();
+        assert!(tracker.claim_monitor(noq::PathId::ZERO));
+        assert!(!tracker.claim_monitor(noq::PathId::ZERO));
     }
 
     #[test]

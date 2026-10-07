@@ -65,7 +65,8 @@ const PUNCH_PROBE_PAYLOAD: &[u8] = b"isekai-punch";
 /// instance reached directly (peer-to-peer, no relay). Mirrors the subset of
 /// `isekai_stun_p2p_transport.rs::connect_stun_p2p_stream`'s inputs this
 /// crate is responsible for.
-#[derive(Debug, Clone)]
+/// `Debug` redacts `session_secret`.
+#[derive(Clone)]
 pub struct StunP2pTarget {
     /// The peer's (isekai-helper's) own STUN-observed address
     /// (`IsekaiPipeHandshake::stun_observed_addr` on the Android side), obtained
@@ -81,6 +82,17 @@ pub struct StunP2pTarget {
     pub cert_sha256_hex: String,
     /// Already base64-decoded `HandshakeJson::session_secret`.
     pub session_secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for StunP2pTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StunP2pTarget")
+            .field("peer_addr", &self.peer_addr)
+            .field("server_name", &self.server_name)
+            .field("cert_sha256_hex", &self.cert_sha256_hex)
+            .field("session_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Result of a successful `connect_stun_p2p` call: the HELLO/ACK'd byte
@@ -264,7 +276,10 @@ pub(crate) async fn connect_stun_p2p_with_round(
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, AttemptFailure> {
-    let bind_addr = quicmux::BindSpec::any_ipv4().local_addr;
+    // The same socket later carries the QUIC connection to `peer_addr`, so
+    // its family must match the peer's (an IPv4 socket can't reach an IPv6
+    // peer).
+    let bind_addr = quicmux::BindSpec::unspecified_for(target.peer_addr).local_addr;
     let socket = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|source| AttemptFailure::RetryablePreAttach {
         source: TransportError::Mux(quicmux::MuxError::Bind { addr: bind_addr, source }),
     })?;

@@ -59,16 +59,23 @@ pub const TOKEN_FILE_NAME: &str = "token.json";
 /// eagerly that every call does an extra network round trip.
 const REFRESH_SKEW_SECS: i64 = 60;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TokenFileV1 {
     relay_jwt: String,
+}
+
+impl std::fmt::Debug for TokenFileV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenFileV1").field("relay_jwt", &"<redacted>").finish()
+    }
 }
 
 /// The extended (phase S-5) on-disk schema: an OAuth2 access/refresh token
 /// pair plus enough metadata for `FileTokenProvider::get_relay_jwt` to
 /// auto-refresh a near-expiry token. See this module's docs for how this
 /// coexists with the original plain-`relay_jwt` schema.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `Debug` redacts `access_token`/`refresh_token`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,13 +99,25 @@ pub struct TokenSet {
     pub client_id: Option<String>,
 }
 
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("expires_at", &self.expires_at)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
 impl TokenSet {
     /// Whether `access_token` is at or past `expires_at` (minus
     /// `REFRESH_SKEW_SECS`). Always `false` when `expires_at` is `None`.
     pub fn needs_refresh(&self) -> bool {
         match self.expires_at {
             None => false,
-            Some(expires_at) => unix_now() >= expires_at - REFRESH_SKEW_SECS,
+            Some(expires_at) => unix_now() >= expires_at.saturating_sub(REFRESH_SKEW_SECS),
         }
     }
 
@@ -137,7 +156,9 @@ impl TokenSet {
         TokenSet {
             access_token: response.access_token,
             refresh_token,
-            expires_at: response.expires_in.map(|secs| unix_now() + secs as i64),
+            // Saturating: a huge `expires_in` from the server must not wrap
+            // into the past (which would force a refresh on every call).
+            expires_at: response.expires_in.map(|secs| unix_now().saturating_add(i64::try_from(secs).unwrap_or(i64::MAX))),
             token_endpoint: Some(token_endpoint),
             client_id,
         }
@@ -391,16 +412,60 @@ impl TokenProvider for FileTokenProvider {
     /// リフレッシュを試みる"). Legacy v1 (plain `relay_jwt`, no expiry) files
     /// are returned as-is, matching this method's pre-phase-S-5 behavior
     /// exactly — `needs_refresh()` is always `false` for them.
+    ///
+    /// The refresh itself (re-read → POST → save) runs under a cross-process
+    /// exclusive lock and re-reads the file once the lock is held: several
+    /// `isekai-ssh` processes (tabs) auto-bootstrapping at once used to each
+    /// POST the *same* refresh token, and an IdP with refresh-token reuse
+    /// detection then revokes the whole token family — forcing a manual
+    /// `isekai-ssh login`. With the lock, the first process refreshes and
+    /// the others pick up its freshly saved token.
+    ///
+    /// If the refresh fails while the stored token is still within its
+    /// validity (only inside the early-refresh skew), that token is returned
+    /// instead of failing.
     fn get_relay_jwt(&self) -> Result<String, AuthError> {
-        // Both `.clone()`s below, not moves: see the `impl Drop for
+        // All `.clone()`s below, not moves: see the `impl Drop for
         // TokenSet` comment above.
         let token_set = load_token_set(&self.path)?;
         if !token_set.needs_refresh() {
             return Ok(token_set.access_token.clone());
         }
-        Ok(self.refresh_and_save(token_set)?.access_token.clone())
+        drop(token_set);
+
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| isekai_fs_guard::FsGuardErrorAt::NoParentDir { path: self.path.clone() })?;
+        let locked = isekai_fs_guard::with_exclusive_lock(dir, TOKEN_REFRESH_LOCK_KEY, || -> Result<String, AuthError> {
+            let current = load_token_set(&self.path)?;
+            if !current.needs_refresh() {
+                // Another process refreshed while we waited for the lock.
+                return Ok(current.access_token.clone());
+            }
+            let still_valid = current.expires_at.is_some_and(|expires_at| unix_now() < expires_at);
+            let mut fallback = current.access_token.clone();
+            let result = match self.refresh_and_save(current) {
+                Ok(refreshed) => Ok(refreshed.access_token.clone()),
+                Err(_) if still_valid => Ok(std::mem::take(&mut fallback)),
+                Err(e) => Err(e),
+            };
+            fallback.zeroize();
+            result
+        });
+        match locked {
+            Ok(result) => result,
+            Err(source) => Err(AuthError::FsGuard(isekai_fs_guard::FsGuardErrorAt::Write {
+                path: dir.join(format!("{TOKEN_REFRESH_LOCK_KEY}.lock")),
+                source,
+            })),
+        }
     }
 }
+
+/// Lock key (`<config dir>/<key>.lock`) serializing token refreshes across
+/// processes — see [`FileTokenProvider::get_relay_jwt`].
+const TOKEN_REFRESH_LOCK_KEY: &str = "token-refresh";
 
 #[cfg(test)]
 mod tests {

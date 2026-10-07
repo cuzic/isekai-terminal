@@ -341,7 +341,7 @@ where
             }
             (term, cols, rows, want_pty, remote_command, tty_exec)
         }
-        other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {other:?}")),
+        other => return Err(anyhow!("isekai-ssh mux owner: expected Hello as the first frame, got {}", other.kind())),
     };
     let session_kind = session_kind_for_hello(&term, cols, rows, want_pty, remote_command.as_deref());
 
@@ -364,6 +364,7 @@ where
         // guard is dropped at the end of this block, before any `ctl_forward`
         // cleanup below re-locks the handle.
         let guard = handle.lock().await;
+        let open = async {
         if ctl.is_some() || tty_exec.is_some() {
             ctl_forward::open_login_shell(
                 &guard,
@@ -379,6 +380,15 @@ where
             .context("isekai-ssh mux owner: failed to open a login shell for the client")
         } else {
             open_channel(&guard, &session_kind).await.context("isekai-ssh mux owner: failed to open a session channel for the client")
+        }
+        };
+        // Bounded (review 2026-09-29, SSH-30): the handle lock is held for
+        // this whole open, so an open that never gets an answer (a stalled
+        // transport mid-resume) used to block every other tab's channel open
+        // and ctl forward behind it forever.
+        match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, open).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(ChannelOpenTimedOut)),
         }
     };
     // `HelloAck` is deliberately sent only *after* the channel-open above
@@ -405,12 +415,22 @@ where
                 ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
             }
             let _ = write_frame(&mut writer, &Frame::Rejected { reason: format!("{e:#}") }).await;
-            // A failed *channel open* (as opposed to a protocol
-            // version/token mismatch, both handled earlier and never
-            // reaching here) is evidence the shared handle itself is dead,
-            // not just this one client — see `serve_clients`'s `shutdown`
-            // branch and `handle_died`'s doc comment.
-            shutdown.notify_waiters();
+            // A failed channel open is evidence the shared handle itself is
+            // dead *only* when the server didn't answer it (review
+            // 2026-09-29, SSH-05). An explicit `SSH_MSG_CHANNEL_OPEN_FAILURE`
+            // or a refused channel request (e.g. sshd's `MaxSessions`,
+            // default 10, being exceeded — an entirely normal policy
+            // rejection) proves the connection is alive and well: tearing the
+            // holder down for it used to drop *every other* tab's live shell
+            // with it (each seeing `OwnerLost` and reconnecting into a brand
+            // new remote shell). This client alone gets `Rejected` (falling
+            // back to an unmultiplexed direct connect); the holder keeps
+            // serving everyone else.
+            if channel_open_failure_implies_dead_handle(&e) || handle.lock().await.is_closed() {
+                // See `serve_clients`'s `shutdown` branch and
+                // `handle_died`'s doc comment.
+                shutdown.notify_waiters();
+            }
             return Err(e);
         }
     };
@@ -447,6 +467,47 @@ where
     }
 
     result
+}
+
+/// How long [`relay_client`] waits for a per-client channel open (while
+/// holding the shared handle's lock) before giving up on it.
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A per-client channel open that got no answer within
+/// [`CHANNEL_OPEN_TIMEOUT`].
+#[derive(Debug)]
+struct ChannelOpenTimedOut;
+
+impl std::fmt::Display for ChannelOpenTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "isekai-ssh mux owner: opening a session channel for the client timed out after {CHANNEL_OPEN_TIMEOUT:?}")
+    }
+}
+
+impl std::error::Error for ChannelOpenTimedOut {}
+
+/// Whether a per-client channel-open failure (`relay_client`) should be
+/// treated as proof the *shared* SSH connection is dead (SSH-05). `false`
+/// when the server demonstrably answered — a `ChannelOpenFailure` (any
+/// reason code) or a `RequestDenied` for the pty/shell/exec request — since
+/// a peer that replies is by definition still connected; `true` for
+/// everything else (send failures, disconnects, ...), preserving the
+/// original fast-path for a genuinely dead handle.
+fn channel_open_failure_implies_dead_handle(err: &anyhow::Error) -> bool {
+    // A timed-out open proves nothing either way — the transport may just be
+    // mid-resume. `handle_died`'s own poll still catches a real death; tearing
+    // every tab down on a slow answer would defeat the resume (SSH-30).
+    if err.chain().any(|cause| cause.is::<ChannelOpenTimedOut>()) {
+        return false;
+    }
+    let server_answered = |e: &russh::Error| matches!(e, russh::Error::ChannelOpenFailure(_) | russh::Error::RequestDenied);
+    !err.chain().any(|cause| {
+        cause.downcast_ref::<russh::Error>().is_some_and(server_answered)
+            || matches!(
+                cause.downcast_ref::<russh_stream_session::SessionError>(),
+                Some(russh_stream_session::SessionError::Channel(e)) if server_answered(e)
+            )
+    })
 }
 
 /// Why [`relay_loop`]'s main loop ended (Epic R PR2, B1/B2). Round 0/1/2 of
@@ -515,6 +576,11 @@ where
     // whether a `TransportDead` break should trigger the shared-handle-death
     // fast path (`shutdown.notify_waiters()`). See `BreakReason`'s own docs.
     let mut break_reason = BreakReason::ClientGone;
+    // Set when the loop ends because of an error on *this client's* side
+    // (a malformed/unexpected frame, a failed write back to it) — returned
+    // after the remote channel has been closed rather than `?`-returned
+    // mid-loop, which used to skip that close and leak the remote shell.
+    let mut loop_error: Option<anyhow::Error> = None;
     // After the client sends `Shutdown` (its local stdin hit EOF) we stop
     // *forwarding* its input, but keep reading the connection so a subsequent
     // client disconnect is still noticed promptly (`None` below) — otherwise a
@@ -601,8 +667,10 @@ where
                     }
                     // A clean client close (`Ok(None)`) or the reader task ending
                     // (`None`) both mean the client is gone: tear down its remote
-                    // shell (dropping `channel` on return closes it) rather than
-                    // leaking a session (session cleanup).
+                    // shell rather than leaking a session (session cleanup). The
+                    // explicit `channel.close()` after the loop is what does
+                    // that — `russh::Channel` has no `Drop` impl, so merely
+                    // dropping it never sends `CHANNEL_CLOSE` (SSH-15).
                     Some(Ok(None)) | None => {
                         log_line!("isekai-ssh mux owner: client connection ended before the remote channel did; tearing down its remote shell");
                         break_reason = BreakReason::ClientGone;
@@ -610,17 +678,37 @@ where
                     }
                     // A truncated or malformed frame is a hard error, surfaced to
                     // `serve_clients` (which logs and contains it per-client).
-                    Some(Err(e)) => return Err(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}")),
-                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh mux owner: unexpected frame from client: {other:?}")),
+                    Some(Err(e)) => {
+                        loop_error = Some(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}"));
+                        break_reason = BreakReason::ClientGone;
+                        break;
+                    }
+                    Some(Ok(Some(other))) => {
+                        loop_error = Some(anyhow!("isekai-ssh mux owner: unexpected frame from client: {}", other.kind()));
+                        break_reason = BreakReason::ClientGone;
+                        break;
+                    }
                 }
             }
             msg = channel.wait() => {
                 match msg {
+                    // A failed write here is *this client's* connection failing
+                    // (not the shared remote one): same `ClientGone` handling
+                    // as a clean client close, including closing the remote
+                    // channel — an early `?` return used to skip that (SSH-15).
                     Some(russh::ChannelMsg::Data { data }) => {
-                        write_frame(writer, &Frame::Stdout(data.to_vec())).await?;
+                        if let Err(e) = write_frame(writer, &Frame::Stdout(data.to_vec())).await {
+                            loop_error = Some(anyhow::Error::new(e).context("isekai-ssh mux owner: writing stdout to the client failed"));
+                            break_reason = BreakReason::ClientGone;
+                            break;
+                        }
                     }
                     Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
-                        write_frame(writer, &Frame::Stderr(data.to_vec())).await?;
+                        if let Err(e) = write_frame(writer, &Frame::Stderr(data.to_vec())).await {
+                            loop_error = Some(anyhow::Error::new(e).context("isekai-ssh mux owner: writing stderr to the client failed"));
+                            break_reason = BreakReason::ClientGone;
+                            break;
+                        }
                     }
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                         log_line!("isekai-ssh mux owner: remote channel sent ExitStatus={exit_status}");
@@ -769,6 +857,17 @@ where
         }
     }
 
+    // Review 2026-09-29 (SSH-15): when the *client* went away first, nothing
+    // else will ever close its remote channel — `russh::Channel` has no
+    // `Drop` impl (unlike `ChannelTx`/`ChannelRx`), so without this the
+    // remote shell (or `tmux attach`) kept running for as long as the holder
+    // lived, one leaked session per closed tab. (`RemoteExitReported` /
+    // `TransportDead` already have a remote-side close; `CloseDeadline`
+    // closed it itself.)
+    if matches!(break_reason, BreakReason::ClientGone) {
+        let _ = channel.close().await;
+    }
+
     match break_reason {
         BreakReason::RemoteExitReported | BreakReason::ClientGone | BreakReason::CloseDeadline => {
             // Report the session's end to the client. 255 stands in for
@@ -847,7 +946,10 @@ where
             }
         }
     }
-    Ok(())
+    match loop_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// `recv` on the optional ctl-frame channel, or a future that never resolves
@@ -2390,5 +2492,103 @@ mod tests {
         );
 
         assert!(relay.await.unwrap().is_err(), "a failed ctl-socket login-shell open must fail the client relay");
+    }
+
+    /// Records every `CHANNEL_CLOSE` the server receives, for the SSH-15
+    /// regression test below.
+    #[derive(Clone)]
+    struct CloseRecordingServer {
+        closed_tx: mpsc::UnboundedSender<russh::ChannelId>,
+    }
+    impl server::Server for CloseRecordingServer {
+        type Handler = CloseRecordingServer;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CloseRecordingServer {
+            self.clone()
+        }
+    }
+    #[async_trait]
+    impl server::Handler for CloseRecordingServer {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+        async fn channel_open_session(&mut self, _c: RusshChannel<ServerMsg>, _s: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn channel_close(&mut self, channel: russh::ChannelId, _s: &mut ServerSession) -> Result<(), Self::Error> {
+            let _ = self.closed_tx.send(channel);
+            Ok(())
+        }
+    }
+
+    /// SSH-15 regression: closing a tab (the client connection ending) must
+    /// actually close its remote channel. `russh::Channel` has no `Drop`
+    /// impl, so the old "dropping `channel` on return closes it" never sent
+    /// `CHANNEL_CLOSE` and every closed tab leaked a live remote shell for as
+    /// long as the holder lived.
+    #[tokio::test]
+    async fn relay_client_closes_the_remote_channel_when_the_client_goes_away() {
+        use tokio::time::{timeout, Duration};
+
+        let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
+        let keypair = Ed25519Keypair::from_seed(&[141; 32]);
+        let config = Arc::new(server::Config { keys: vec![SshPrivateKey::from(keypair)], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = CloseRecordingServer { closed_tx };
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, verifying_handler(&verifier)).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None, None, None, &Notify::new()).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24, want_pty: true, remote_command: None, tty_exec: None })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {}", other.kind()),
+        }
+
+        // The tab closes.
+        drop(client);
+
+        timeout(Duration::from_secs(10), closed_rx.recv())
+            .await
+            .expect("the owner must send CHANNEL_CLOSE for a client that went away (no leaked remote shell)")
+            .expect("the close sender must still be live");
+        let _ = timeout(Duration::from_secs(10), relay).await;
+    }
+
+    /// SSH-05 regression: a channel-open failure the *server answered*
+    /// (`MaxSessions` exceeded, a refused pty/exec request) must not be read
+    /// as the shared connection being dead — that used to tear down the whole
+    /// holder and every other tab's live shell. Anything else keeps the
+    /// original dead-handle fast path.
+    #[test]
+    fn channel_open_failure_implies_dead_handle_only_when_the_server_did_not_answer() {
+        let rejected = anyhow::Error::new(russh_stream_session::SessionError::Channel(russh::Error::ChannelOpenFailure(
+            russh::ChannelOpenFailure::ResourceShortage,
+        )))
+        .context("isekai-ssh mux owner: failed to open a session channel for the client");
+        assert!(!channel_open_failure_implies_dead_handle(&rejected), "a server-sent CHANNEL_OPEN_FAILURE proves the connection is alive");
+
+        let denied = anyhow::Error::new(russh::Error::RequestDenied).context("pty request refused");
+        assert!(!channel_open_failure_implies_dead_handle(&denied), "a refused channel request proves the connection is alive");
+
+        let timed_out = anyhow::Error::new(ChannelOpenTimedOut);
+        assert!(!channel_open_failure_implies_dead_handle(&timed_out), "a slow answer (e.g. mid-resume) must not tear the holder down");
+
+        let dead = anyhow::Error::new(russh_stream_session::SessionError::Channel(russh::Error::Disconnect)).context("open failed");
+        assert!(channel_open_failure_implies_dead_handle(&dead), "a transport-level failure still means the shared handle is gone");
+        assert!(channel_open_failure_implies_dead_handle(&anyhow!("opaque failure")));
     }
 }

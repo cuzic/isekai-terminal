@@ -233,9 +233,28 @@ pub(crate) struct RusshEventHandler {
     /// (SSH接続プーリングで複数タブが同じ`Handle`を共有していても、パスがタブごとに
     /// 一意なので誤配送しない)。
     pub(crate) ctl_forwards: CtlForwardMap,
+    /// RC-21: agent-forwardの署名確認を届ける先の候補(このHandleを共有している各タブの
+    /// `event_tx`)。`run_ssh_channel_loop`がタブごとに登録する。
+    pub(crate) agent_routes: AgentRoutes,
     /// `Some((host, port))`ならこのハンドラはProxyJumpの踏み台ホスト用で、ホスト鍵確認を
     /// `TransportEvent::JumpHostKey`として踏み台自身の識別子付きで送る(RC-07)。
     jump_identity: Option<(String, u16)>,
+}
+
+/// RC-21(2026-09-29 コードレビュー): SSH接続プーリングで1つの`client::Handle`を複数タブが
+/// 共有する場合、`RusshEventHandler::event_tx`は**確立したタブ**のものに固定される。
+/// 以前はagent-forwardの署名確認を常にそこへ送っていたため、別タブの`ssh`由来の確認が
+/// 確立タブのUIに出る上、確立タブを閉じた後は(送信失敗=拒否扱いで)共有接続上の全ての
+/// 署名要求が黙って拒否され続けた。Handleを使っているタブの`event_tx`を登録しておき、
+/// 生きているもののうち最後に登録された(=最も新しく開いた)タブへ送る。
+pub(crate) type AgentRoutes = Arc<Mutex<Vec<tokio::sync::mpsc::Sender<TransportEvent>>>>;
+
+/// [AgentRoutes]から、まだ受信側(タブのevent loop)が生きている最も新しい送り先を選ぶ。
+/// 閉じたものはここで取り除く。
+pub(crate) fn pick_agent_route(routes: &AgentRoutes) -> Option<tokio::sync::mpsc::Sender<TransportEvent>> {
+    let mut routes = routes.lock();
+    routes.retain(|tx| !tx.is_closed());
+    routes.last().cloned()
 }
 
 impl RusshEventHandler {
@@ -247,6 +266,7 @@ impl RusshEventHandler {
             agent_key: Arc::new(Mutex::new(None)),
             remote_forwards: Arc::new(Mutex::new(HashMap::new())),
             ctl_forwards: Arc::new(Mutex::new(HashMap::new())),
+            agent_routes: Arc::new(Mutex::new(Vec::new())),
             jump_identity: None,
         }
     }
@@ -289,7 +309,8 @@ impl client::Handler for RusshEventHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let key = self.agent_key.lock().clone();
-        let event_tx = self.event_tx.clone();
+        // RC-21: 確立したタブに固定せず、現在Handleを使っている生きたタブへ送る。
+        let event_tx = pick_agent_route(&self.agent_routes).unwrap_or_else(|| self.event_tx.clone());
         tokio::spawn(agent_forward::serve_agent_channel(channel, key, event_tx));
         Ok(())
     }
@@ -433,6 +454,29 @@ impl client::Handler for RusshEventHandler {
     }
 }
 
+#[cfg(test)]
+mod agent_route_tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_newest_live_tab_and_prunes_closed_ones() {
+        let routes: AgentRoutes = Arc::new(Mutex::new(Vec::new()));
+        let (tab_a, rx_a) = tokio::sync::mpsc::channel::<TransportEvent>(1);
+        let (tab_b, rx_b) = tokio::sync::mpsc::channel::<TransportEvent>(1);
+        routes.lock().push(tab_a.clone());
+        routes.lock().push(tab_b.clone());
+
+        assert!(pick_agent_route(&routes).unwrap().same_channel(&tab_b));
+        // 新しいタブ(B)が閉じたら、まだ生きている確立タブ(A)へ送る。
+        drop(rx_b);
+        assert!(pick_agent_route(&routes).unwrap().same_channel(&tab_a));
+        // 確立タブ(A)が閉じても、他に生きたタブが無ければNone(呼び出し側の既定へ)。
+        drop(rx_a);
+        assert!(pick_agent_route(&routes).is_none());
+        assert!(routes.lock().is_empty(), "閉じた送り先は取り除かれる");
+    }
+}
+
 // ── SSH 認証（TCP・QUIC・ProxyJump 共通）────────────────
 
 /// `session` に対して `auth` で認証する。公開鍵認証が成功した場合はその鍵も返す
@@ -511,6 +555,7 @@ pub(crate) struct EstablishedSession {
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
+    pub(crate) agent_routes: AgentRoutes,
     /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
@@ -529,11 +574,12 @@ pub(crate) async fn connect_via_jump_or_direct(
         let agent_key = handler.agent_key.clone();
         let remote_forwards = handler.remote_forwards.clone();
         let ctl_forwards = handler.ctl_forwards.clone();
+        let agent_routes = handler.agent_routes.clone();
         let handle = client::connect(russh_config, addr.as_str(), handler)
             .await
             .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
         info!("ssh: TCP connected to {}", addr);
-        return Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: None });
+        return Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, agent_routes, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
@@ -559,12 +605,13 @@ pub(crate) async fn connect_via_jump_or_direct(
     let agent_key = target_handler.agent_key.clone();
     let remote_forwards = target_handler.remote_forwards.clone();
     let ctl_forwards = target_handler.ctl_forwards.clone();
+    let agent_routes = target_handler.agent_routes.clone();
     let handle = client::connect_stream(russh_config, stream, target_handler)
         .await
         .map_err(|e| format!("SSH handshake over jump tunnel to {target_host}:{target_port} failed: {e}"))?;
     info!("ssh: connected to {}:{} via jump {}", target_host, target_port, jump_addr);
 
-    Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: Some(jump_handle) })
+    Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, agent_routes, _jump_handle: Some(jump_handle) })
 }
 
 // ── SSH接続プーリング用: 認証済みHandleの確立とチャネルの追加 ──
@@ -583,6 +630,8 @@ pub(crate) struct PooledSshHandle {
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     pub(crate) ctl_forwards: CtlForwardMap,
+    /// RC-21: このHandleを共有しているタブの`event_tx`(agent-forward確認の送り先)。
+    agent_routes: AgentRoutes,
     /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
     /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
@@ -639,6 +688,7 @@ async fn finish_establishing_handle(
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     ctl_forwards: CtlForwardMap,
+    agent_routes: AgentRoutes,
     jump_handle: Option<client::Handle<RusshEventHandler>>,
     username: &str,
     auth: &mut SshAuth,
@@ -674,6 +724,7 @@ async fn finish_establishing_handle(
         agent_key,
         remote_forwards,
         ctl_forwards,
+        agent_routes,
         _jump_handle: jump_handle,
     })
 }
@@ -693,7 +744,7 @@ pub(crate) async fn establish_ssh_handle(
     let established = connect_via_jump_or_direct(jump, russh_config, host, port, event_tx.clone()).await?;
     finish_establishing_handle(
         established.handle, established.agent_key, established.remote_forwards, established.ctl_forwards,
-        established._jump_handle, username, auth, agent_forward,
+        established.agent_routes, established._jump_handle, username, auth, agent_forward,
     ).await
 }
 
@@ -716,10 +767,11 @@ where
     let agent_key = handler.agent_key.clone();
     let remote_forwards = handler.remote_forwards.clone();
     let ctl_forwards = handler.ctl_forwards.clone();
+    let agent_routes = handler.agent_routes.clone();
     let handle = client::connect_stream(russh_config, stream, handler)
         .await
         .map_err(|e| e.to_string())?;
-    finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, None, username, auth, agent_forward).await
+    finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, agent_routes, None, username, auth, agent_forward).await
 }
 
 // ── タスク#61: 既存の接続上での短命exec ──────────────────
@@ -865,6 +917,9 @@ pub(crate) async fn run_ssh_channel_loop(
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     app_pane_id: crate::tmux_locator::AppPaneId,
 ) -> FirstChannelOpen {
+    // RC-21: このタブをagent-forward確認の送り先候補に登録する(タブのevent loopが
+    // 終わって受信側が閉じれば`pick_agent_route`が自動的に取り除く)。
+    pooled.agent_routes.lock().push(event_tx.clone());
     let channel = match pooled.with_handle_timeout(RUN_EXEC_TIMEOUT, |handle| {
         Box::pin(async move { handle.channel_open_session().await })
     }).await {

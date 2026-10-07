@@ -49,7 +49,10 @@ fn random_attempt_id() -> AttemptId {
 /// `helper_bootstrap::IsekaiPipeHandshake` this crate actually consumes — SSH
 /// bootstrap and handshake-JSON parsing are the caller's responsibility
 /// (`isekai_protocol::handshake`), not this crate's.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts `session_secret` (this type is embedded in several
+/// `Debug`-deriving candidate/race types, any of which may end up in a log).
+#[derive(Clone)]
 pub struct RelayTarget {
     /// The relay-assigned public address of the remote isekai-helper
     /// (`HandshakeJson::relay_public_addr`), *not* the relay server itself —
@@ -76,11 +79,25 @@ pub struct RelayTarget {
     pub local_bind_port_range: Option<(u16, u16)>,
 }
 
+impl std::fmt::Debug for RelayTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayTarget")
+            .field("helper_addr", &self.helper_addr)
+            .field("server_name", &self.server_name)
+            .field("cert_sha256_hex", &self.cert_sha256_hex)
+            .field("session_secret", &"<redacted>")
+            .field("local_bind_port_range", &self.local_bind_port_range)
+            .finish()
+    }
+}
+
 impl RelayTarget {
     /// The `factory.create_endpoint(...)` argument every dial site in this
     /// crate (`relay.rs`/`resume.rs`/`race.rs`/`warm_standby.rs`) needs to
-    /// bind before dialing `self` — an OS-assigned-ephemeral-port IPv4
-    /// wildcard bind, narrowed to [`Self::local_bind_port_range`] if given.
+    /// bind before dialing `self` — an OS-assigned-ephemeral-port wildcard
+    /// bind of the same address family as [`Self::helper_addr`] (it used to
+    /// be IPv4 unconditionally, so an IPv6 helper address could never be
+    /// reached), narrowed to [`Self::local_bind_port_range`] if given.
     /// Was previously hand-rebuilt at each call site (six of them); one of
     /// those (`warm_standby.rs`'s own doc comment on its `dial` method)
     /// records that `local_bind_port_range` was silently dropped there until
@@ -88,7 +105,7 @@ impl RelayTarget {
     /// prevents that class of bug from recurring at whichever call site
     /// gets added or edited next.
     pub fn bind_spec(&self) -> BindSpec {
-        BindSpec::any_ipv4().with_port_range(self.local_bind_port_range)
+        BindSpec::unspecified_for(self.helper_addr).with_port_range(self.local_bind_port_range)
     }
 
     /// The `RemoteSpec` every dial site in this crate needs to name `self`
@@ -193,7 +210,16 @@ pub(crate) async fn connect_and_handshake(
     // carries this attempt's id).
     let attempt_id = random_attempt_id();
 
-    let conn = match endpoint.connect(remote).await {
+    // Bounded like every other dial in this crate (`resume::TRANSPORT_STEP_
+    // TIMEOUT`'s docs): the initial ATTACH used to be the one path with no
+    // bound at all, so a path that silently dropped packets (and the qmux
+    // backend's TCP leg in particular) could hang the connect for as long as
+    // the OS kept retrying.
+    let dialed = match tokio::time::timeout(crate::resume::TRANSPORT_STEP_TIMEOUT, endpoint.connect(remote)).await {
+        Ok(result) => result.map_err(TransportError::Mux),
+        Err(_) => Err(TransportError::TimedOut { stage: "attach: quic connect" }),
+    };
+    let conn = match dialed {
         Ok(conn) => conn,
         Err(e) => {
             log_candidate_attempt(&CandidateAttempt {
@@ -207,7 +233,7 @@ pub(crate) async fn connect_and_handshake(
                 failure_stage: Some("quic-connect"),
                 outcome: CandidateOutcome::Cancelled,
             });
-            return Err(ConnectAttemptError { stage: ConnectAttemptStage::QuicConnect, source: TransportError::Mux(e) });
+            return Err(ConnectAttemptError { stage: ConnectAttemptStage::QuicConnect, source: e });
         }
     };
     let quic_handshake_time = attempt_start.elapsed();
@@ -291,11 +317,19 @@ pub(crate) async fn attach_handshake(
         }
     };
 
-    let mut stream = match conn.open_bi().await {
-        Ok(stream) => stream,
-        Err(e) => {
+    let step_timeout = crate::resume::TRANSPORT_STEP_TIMEOUT;
+    let mut stream = match tokio::time::timeout(step_timeout, conn.open_bi()).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
             cancelled("open-stream".to_string());
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::OpenStream, source: TransportError::Mux(e) });
+        }
+        Err(_) => {
+            cancelled("open-stream-timeout".to_string());
+            return Err(ConnectAttemptError {
+                stage: ConnectAttemptStage::OpenStream,
+                source: TransportError::TimedOut { stage: "attach: open stream" },
+            });
         }
     };
     let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof: attach_proof };
@@ -304,11 +338,21 @@ pub(crate) async fn attach_handshake(
         return Err(ConnectAttemptError { stage: ConnectAttemptStage::HelloWrite, source: TransportError::Mux(e) });
     }
 
-    let response = match read_attach_response(&mut stream).await {
-        Ok(response) => response,
-        Err(e) => {
+    // HELLO has been sent: from here a timeout is "ambiguous after attach"
+    // (the server may have committed), which is exactly how the AckRead
+    // stage is already classified.
+    let response = match tokio::time::timeout(step_timeout, read_attach_response(&mut stream)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
             cancelled("ack-read".to_string());
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::AckRead, source: e });
+        }
+        Err(_) => {
+            cancelled("ack-read-timeout".to_string());
+            return Err(ConnectAttemptError {
+                stage: ConnectAttemptStage::AckRead,
+                source: TransportError::TimedOut { stage: "attach: read AttachReady" },
+            });
         }
     };
     match response {

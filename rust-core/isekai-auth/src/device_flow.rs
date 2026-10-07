@@ -34,8 +34,9 @@ pub struct DeviceFlowConfig {
     pub client_id: String,
 }
 
-/// RFC 8628 §3.2 device authorization response.
-#[derive(Debug, Clone, Deserialize)]
+/// RFC 8628 §3.2 device authorization response. `Debug` redacts
+/// `device_code` (the secret the token endpoint exchanges for tokens).
+#[derive(Clone, Deserialize)]
 pub struct DeviceAuthorization {
     pub device_code: String,
     pub user_code: String,
@@ -46,6 +47,27 @@ pub struct DeviceAuthorization {
     #[serde(default = "default_poll_interval")]
     pub interval: u64,
 }
+
+impl std::fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuthorization")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+/// Upper bound applied to a server-supplied `expires_in`, so an absurd value
+/// can't overflow `Instant` arithmetic (which panics) — no real device code
+/// lives longer than this anyway.
+const MAX_DEVICE_CODE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Upper bound applied to a server-supplied polling `interval`.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 fn default_poll_interval() -> u64 {
     // RFC 8628 §3.2: "If no value is provided, clients MUST use 5 as the
@@ -86,8 +108,8 @@ pub fn request_device_authorization(config: &DeviceFlowConfig) -> Result<DeviceA
 ///
 /// Blocking: sleeps the calling thread between polls (see module docs).
 pub fn poll_for_token(config: &DeviceFlowConfig, authz: &DeviceAuthorization) -> Result<TokenResponse, AuthError> {
-    let mut interval = Duration::from_secs(authz.interval.max(1));
-    let deadline = Instant::now() + Duration::from_secs(authz.expires_in);
+    let mut interval = Duration::from_secs(authz.interval.max(1)).min(MAX_POLL_INTERVAL);
+    let deadline = Instant::now() + Duration::from_secs(authz.expires_in).min(MAX_DEVICE_CODE_LIFETIME);
 
     loop {
         thread::sleep(interval);
@@ -115,7 +137,7 @@ pub fn poll_for_token(config: &DeviceFlowConfig, authz: &DeviceAuthorization) ->
                 // RFC 8628 §3.5: "the client's next request MUST be delayed
                 // by the interval specified in the previous response plus
                 // an additional 5 seconds."
-                interval += Duration::from_secs(5);
+                interval = (interval + Duration::from_secs(5)).min(MAX_POLL_INTERVAL);
                 continue;
             }
             "access_denied" => return Err(AuthError::DeviceFlowDenied),
@@ -153,6 +175,23 @@ mod tests {
             interval: 5,
         };
         assert_eq!(authz.display_uri(), "https://example.com/device");
+    }
+
+    #[test]
+    fn debug_output_redacts_the_device_code() {
+        let authz = DeviceAuthorization {
+            device_code: "super-secret-device-code".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: "https://example.com/device".to_string(),
+            verification_uri_complete: None,
+            expires_in: u64::MAX,
+            interval: 5,
+        };
+        let debug = format!("{authz:?}");
+        assert!(!debug.contains("super-secret-device-code"));
+        assert!(debug.contains("ABCD-EFGH"));
+        // A huge expires_in must not panic the deadline computation.
+        let _ = Instant::now() + Duration::from_secs(authz.expires_in).min(MAX_DEVICE_CODE_LIFETIME);
     }
 
     #[test]

@@ -161,6 +161,26 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// The variant name only, with no payload — what diagnostics must log
+    /// for an unexpected frame instead of `{frame:?}` (review 2026-09-29,
+    /// SSH-33): the derived `Debug` prints `Hello`'s auth `token` and
+    /// `Stdin`'s raw keystrokes (possibly a password typed at a remote
+    /// prompt) verbatim into the always-on holder/client log files.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Hello { .. } => "Hello",
+            Frame::HelloAck { .. } => "HelloAck",
+            Frame::Rejected { .. } => "Rejected",
+            Frame::Stdin(_) => "Stdin",
+            Frame::Resize { .. } => "Resize",
+            Frame::Shutdown => "Shutdown",
+            Frame::Stdout(_) => "Stdout",
+            Frame::Stderr(_) => "Stderr",
+            Frame::Exit(_) => "Exit",
+            Frame::Ctl(_) => "Ctl",
+        }
+    }
+
     /// The tag byte plus the encoded payload (everything after the `u32`
     /// length header). [`write_frame`] prepends the length.
     fn encode(&self) -> Vec<u8> {
@@ -465,6 +485,22 @@ pub fn token_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    /// SSH-33 regression: `kind()` (what unexpected-frame diagnostics log)
+    /// never carries a frame's payload — no token, no keystrokes.
+    #[test]
+    fn frame_kind_never_includes_the_payload() {
+        for frame in sample_frames() {
+            let kind = frame.kind();
+            assert!(!kind.contains("secret") && !kind.contains('[') && !kind.contains('{'), "{kind:?} must be a bare variant name");
+        }
+        assert_eq!(Frame::Stdin(b"hunter2\r".to_vec()).kind(), "Stdin");
+        assert_eq!(
+            Frame::Hello { version: 1, token: b"tok".to_vec(), term: String::new(), cols: 0, rows: 0, want_pty: true, remote_command: None, tty_exec: None }
+                .kind(),
+            "Hello"
+        );
+    }
 
     fn sample_frames() -> Vec<Frame> {
         vec![

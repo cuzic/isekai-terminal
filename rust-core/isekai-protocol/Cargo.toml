@@ -9,3 +9,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 thiserror = "2.0.18"
+# Constant-time comparison of proofs/tokens (`hello::Proof::ct_eq`,
+# `attach::AttachToken::ct_eq`/`AttachProof::ct_eq`) — the same crate
+# isekai-pipe serve already uses, instead of a hand-rolled XOR loop the
+# optimizer is free to short-circuit.
+subtle = "2.6"

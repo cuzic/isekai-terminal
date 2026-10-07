@@ -27,14 +27,24 @@ use crate::types::{BindSpec, RemoteSpec};
 pub fn candidate_ports(bind: &BindSpec) -> Vec<u16> {
     match bind.port_range {
         None => vec![bind.local_addr.port()],
+        // An inverted range is empty (callers validate it, but this must not
+        // underflow if one ever slips through) — `bind_with_port_range`
+        // turns an empty candidate list into a `MuxError::Bind`.
+        Some((start, end)) if start > end => Vec::new(),
         Some((start, end)) => {
             use rand::Rng as _;
             let span = u32::from(end) - u32::from(start) + 1;
             let offset = rand::rngs::OsRng.gen_range(0..span);
-            (0..span).map(|i| start + ((offset + i) % span) as u16).collect()
+            // Bounded: each candidate is a synchronous bind() syscall made
+            // from async context, so a huge range must not mean up to 65536
+            // attempts in a row.
+            (0..span.min(MAX_PORT_CANDIDATES)).map(|i| start + ((offset + i) % span) as u16).collect()
         }
     }
 }
+
+/// Upper bound on how many ports [`candidate_ports`] yields for one bind.
+pub const MAX_PORT_CANDIDATES: u32 = 1024;
 
 /// Tries [`candidate_ports`] in turn via `try_bind`, returning the first
 /// success or, once every candidate port has failed, [`MuxError::Bind`]
@@ -398,6 +408,15 @@ pub struct NoqListener {
 
 impl NoqListener {
     pub(crate) async fn bind(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        if bind.port_range.is_some() {
+            // `noq::Endpoint::server` only takes one fixed address; honor a
+            // requested port range the same way the client side does
+            // (`bind_with_port_range`), instead of silently ignoring it.
+            let std_socket = bind_udp_socket_sync(&bind)?;
+            std_socket.set_nonblocking(true).map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+            let async_socket = default_socket_adapter()(std_socket).map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+            return Self::from_abstract_socket(config, async_socket);
+        }
         let server_config = noq_server_config(&config)?;
         let endpoint = noq::Endpoint::server(server_config, bind.local_addr).map_err(|e| MuxError::EndpointSetup(e.to_string()))?;
         Ok(Self { endpoint })
@@ -881,6 +900,29 @@ mod tests {
         let mut ports = candidate_ports(&bind);
         ports.sort_unstable();
         assert_eq!(ports, vec![40000, 40001, 40002, 40003, 40004]);
+    }
+
+    #[test]
+    fn candidate_ports_of_an_inverted_range_is_empty_instead_of_underflowing() {
+        let bind = BindSpec { local_addr: "127.0.0.1:0".parse().unwrap(), port_range: Some((40010, 40000)) };
+        assert!(candidate_ports(&bind).is_empty());
+        assert!(matches!(bind_udp_socket_sync(&bind), Err(MuxError::Bind { .. })));
+    }
+
+    #[test]
+    fn candidate_ports_of_a_huge_range_is_bounded() {
+        let bind = BindSpec { local_addr: "127.0.0.1:0".parse().unwrap(), port_range: Some((1, u16::MAX)) };
+        let ports = candidate_ports(&bind);
+        assert_eq!(ports.len(), MAX_PORT_CANDIDATES as usize);
+        assert!(ports.iter().all(|p| *p >= 1));
+    }
+
+    #[tokio::test]
+    async fn listener_bind_honors_a_port_range() {
+        let (server_config, _cert) = test_server_config();
+        let listener = NoqListener::bind(server_config, local_bind(Some((40500, 40600)))).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!((40500..=40600).contains(&port), "listener port {port} outside requested range");
     }
 
     #[tokio::test]

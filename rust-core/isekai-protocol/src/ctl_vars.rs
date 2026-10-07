@@ -32,6 +32,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Maximum number of distinct keys one [`CtlVarStore`] holds.
+pub const MAX_CTL_VARS: usize = 1024;
+
 /// A single scope's worth of shared variables. Cheap to construct
 /// (`CtlVarStore::default()`); callers hold it behind whatever lifetime is
 /// appropriate for the scope it backs (see module docs).
@@ -45,10 +48,19 @@ impl CtlVarStore {
         Self::default()
     }
 
-    /// Stores `value` under `key`, overwriting any previous value.
-    pub fn set(&self, key: impl Into<String>, value: impl Into<String>) {
+    /// Stores `value` under `key`, overwriting any previous value. Returns
+    /// `false` (and stores nothing) when `key` is new and the store already
+    /// holds [`MAX_CTL_VARS`] keys: each key/value is size-capped by the ctl
+    /// validation, but without a cap on the *count* a remote peer could grow
+    /// this store without bound. Overwriting an existing key always works.
+    pub fn set(&self, key: impl Into<String>, value: impl Into<String>) -> bool {
         let mut guard = self.vars.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(key.into(), value.into());
+        let key = key.into();
+        if guard.len() >= MAX_CTL_VARS && !guard.contains_key(&key) {
+            return false;
+        }
+        guard.insert(key, value.into());
+        true
     }
 
     /// Returns the current value for `key`, or `None` if it was never set
@@ -91,6 +103,19 @@ mod tests {
         store.set("k", "first");
         store.set("k", "second");
         assert_eq!(store.get("k"), Some("second".to_string()));
+    }
+
+    #[test]
+    fn the_number_of_keys_is_capped_but_existing_keys_stay_writable() {
+        let store = CtlVarStore::new();
+        for i in 0..MAX_CTL_VARS {
+            assert!(store.set(format!("k{i}"), "v"));
+        }
+        assert!(!store.set("one-too-many", "v"), "a new key beyond the cap must be refused");
+        assert_eq!(store.get("one-too-many"), None);
+        assert!(store.set("k0", "updated"), "overwriting an existing key must still work");
+        assert_eq!(store.get("k0"), Some("updated".to_string()));
+        assert_eq!(store.len(), MAX_CTL_VARS);
     }
 
     #[test]
