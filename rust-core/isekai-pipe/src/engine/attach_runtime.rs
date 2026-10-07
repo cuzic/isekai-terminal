@@ -784,4 +784,31 @@ impl AttachRuntime {
     pub(crate) async fn remove_io_for_test(&self, id: &SessionKey) {
         self.core.lock().await.io.remove(id);
     }
+
+    /// One consistent read (under the aggregate lock) of everything the
+    /// Step 10-1 differential test compares against the pure model: the
+    /// arbiter state and index entry of each of `ids`, the slot count, and
+    /// the shell's own socket map (`(id, lease, has parked socket)` for every
+    /// `SessionIo`, including any stray one not in `ids`).
+    pub(crate) async fn snapshot_for_test(&self, ids: &[SessionKey]) -> ShellSnapshot {
+        let core = self.core.lock().await;
+        ShellSnapshot {
+            states: ids
+                .iter()
+                .map(|id| core.agg.arbiter().state_for(isekai_protocol::SessionId::from_bytes(*id)).cloned())
+                .collect(),
+            index: ids.iter().map(|id| core.agg.index_entry(id).copied()).collect(),
+            session_count: core.agg.arbiter().session_count(),
+            io: core.io.iter().map(|(id, slot)| (*id, slot.lease, slot.parked_tcp.is_some())).collect(),
+        }
+    }
+}
+
+/// See [`AttachRuntime::snapshot_for_test`].
+#[cfg(test)]
+pub(crate) struct ShellSnapshot {
+    pub(crate) states: Vec<Option<AttachState>>,
+    pub(crate) index: Vec<Option<super::serve_fsm::IndexEntry>>,
+    pub(crate) session_count: usize,
+    pub(crate) io: Vec<(SessionKey, LeaseId, bool)>,
 }
