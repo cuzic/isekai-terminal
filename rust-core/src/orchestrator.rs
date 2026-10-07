@@ -3395,7 +3395,7 @@ mod tests {
         let generation = adapter.generation;
         let weak = Arc::downgrade(&orch.shared);
         let fired = std::sync::atomic::AtomicBool::new(false);
-        *cb.on_state_hook.lock().unwrap() = Some(Box::new(move |state| {
+        *cb.on_state_hook.lock().unwrap() = Some(Box::new(move |state: &ConnectionPublicState| {
             if matches!(state, ConnectionPublicState::Connected { .. })
                 && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
