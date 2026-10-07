@@ -12,6 +12,7 @@
 #     (RoomのMigration(X, Y)と違いGRDBは`from`版数を取らない文字列名の連番方式)。
 #  3. ios/migration_registry.tomlの[[reserved]]にcurrent以下の版
 #     (＝マージ後の削除し忘れ)が残っていないこと。
+#  4. ios/migration_registry.tomlの[[reserved]]に同じ版数が重複していないこと(並列予約の衝突の検出)。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,6 +52,16 @@ if [ "$VERSIONS" != "$EXPECTED" ]; then
   echo "--- expected 1..$DB_MAX ---" >&2
   echo "$EXPECTED" >&2
   fail "registerMigration(\"vN_...\") chain in ProfileDatabase.swift is not a contiguous 1..$DB_MAX sequence with no gaps/duplicates."
+fi
+
+# reserved に同じ版数が2回以上現れていないか確認する(並列worktree/別マシンが同じ番号を
+# 予約し、それぞれ単独ではCIが緑のままマージされたケースの検出。strict: falseのbranch
+# protectionでは両PRが個別に緑になりうるため、main上のこのチェックが最後の砦になる)。
+DUPLICATES=$(grep -E '^version = ' "$REGISTRY" | sed -E 's/^version = ([0-9]+).*/\1/' | sort -n | uniq -d || true)
+if [ -n "$DUPLICATES" ]; then
+  echo "$DUPLICATES" >&2
+  fail "ios/migration_registry.toml has duplicate [[reserved]] versions (the same number was reserved twice); \
+re-reserve one of them with the reserve script."
 fi
 
 # reserved の中に current 以下(=既にマージ済みのはずの版)が残っていないか確認する。
