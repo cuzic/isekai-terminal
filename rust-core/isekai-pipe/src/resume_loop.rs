@@ -42,6 +42,11 @@ use crate::RelayTransportKind;
 #[cfg(test)]
 use crate::DEFAULT_RESUME_WINDOW;
 
+// client側の時間定数の関係テスト(ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.5(a))。
+// このファイルのprivate定数が見えるよう子モジュールにしてある。
+#[cfg(test)]
+mod timing_relations;
+
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Bounds `replay_and_advance`'s post-resume replay write — same rationale

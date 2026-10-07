@@ -831,3 +831,8 @@ pub(crate) struct ShellSnapshot {
     pub(crate) session_count: usize,
     pub(crate) io: Vec<(SessionKey, LeaseId, bool)>,
 }
+
+// serverとclientの時間定数の関係テスト(ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.5)。
+// このファイルとengine/mod.rsのprivate定数が`pub(crate)`化なしで見えるよう、子モジュールにしてある。
+#[cfg(test)]
+mod timing_relations;
