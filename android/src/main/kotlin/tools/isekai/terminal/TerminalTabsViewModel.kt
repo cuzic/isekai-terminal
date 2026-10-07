@@ -847,6 +847,11 @@ class TerminalTabsViewModel(
         // 通らない自動再接続の`Established`では再登録されず、upstream failoverが黙って止まっていた。
         // Rustは`Established`の前に必ず直前の世代の`Lost`を出す(=handleはそこで閉じ済み)が、念のため
         // 古いhandleを閉じてから登録し直す(同時に開いているのは高々1つ)。
+        // 順序: `Lost(g)`が`Established(g)`より先に届いて切断後に監視が残る、ということは起きない。Rustは
+        // 状態公開・エッジを`PublicationQueue`でreducerの適用順に1スレッドだけで配信し(PR #167レビューL-1、
+        // #174)、`TerminalSession`はそれを`Channel.UNLIMITED`へ受け取った順に積み、ここは1つのcollectorで
+        // 順に処理する(並べ替える段が無い)。配信順の契約自体はRust側の
+        // `edges_are_delivered_in_reducer_order_even_if_a_transition_interleaves_with_delivery`が固定している。
         pane.upstreamFailoverMonitorHandle?.close()
         pane.upstreamFailoverMonitorHandle = if (edge.upstreamFailover) {
             executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
