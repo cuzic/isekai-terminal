@@ -1,0 +1,65 @@
+name: Report macOS nightly failure
+description: >-
+  macOSランナーの夜間ジョブが失敗したとき、`macos-nightly`ラベル付きのトラッキングissueを
+  ワークフローごとに1件だけ作成し、以後の失敗はそのissueへコメントとして追記する
+  (rust-core-netlab-check.ymlのreport-failureジョブと同じパターン)。
+  呼び出し側のjobには`permissions: issues: write`(+ `actions: read`)が必要。
+  背景と調査手順は`.claude/rules/main-branch-protection.md`の「macOSジョブは夜間のみ」節を参照。
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v7
+      with:
+        script: |
+          const label = 'macos-nightly';
+          const { owner, repo } = context.repo;
+          const workflow = context.workflow;
+          // 重複排除キー: ワークフローごとに固定のタイトル。
+          const title = `macOS夜間ジョブの失敗: ${workflow}`;
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+            owner, repo, run_id: context.runId, per_page: 100,
+          });
+          const failed = jobs
+            .filter(j => ['failure', 'timed_out'].includes(j.conclusion))
+            .map(j => `- [${j.name}](${j.html_url}) (${j.conclusion})`);
+          const failedList = failed.length ? failed.join('\n') : '- (失敗jobを特定できず。run全体を確認)';
+
+          const body = [
+            `macOS夜間ジョブ(${workflow})が失敗しました。`,
+            ``,
+            `- run: ${runUrl}`,
+            `- commit: ${context.sha}`,
+            ``,
+            `失敗したjob:`,
+            failedList,
+            ``,
+            `調査手順: .claude/rules/main-branch-protection.md の「macOSジョブは夜間のみ」節を参照。`,
+          ].join('\n');
+
+          try {
+            await github.rest.issues.createLabel({
+              owner, repo, name: label, color: 'b60205',
+              description: 'macOS nightly CI failure tracking',
+            });
+          } catch (e) {
+            if (e.status !== 422) throw e;
+          }
+
+          const open = await github.paginate(github.rest.issues.listForRepo, {
+            owner, repo, labels: label, state: 'open', per_page: 100,
+          });
+          const existing = open.find(i => !i.pull_request && i.title === title);
+          if (existing) {
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: existing.number, body,
+            });
+            core.info(`commented on #${existing.number}`);
+          } else {
+            const created = await github.rest.issues.create({
+              owner, repo, title, labels: [label], body,
+            });
+            core.info(`created #${created.data.number}`);
+          }

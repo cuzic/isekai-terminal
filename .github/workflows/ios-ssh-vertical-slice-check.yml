@@ -13,19 +13,16 @@ name: iOS SSH vertical slice check
 # (TerminalSessionControllerのfixture E2Eテストは、CredentialVault/Keychainに
 # 触れるためios-app-build-check.yml側のIsekaiTerminalAppTestsに置いている。
 # そちらでも同じfixtureを別途起動する。)
+#
+# macOSランナーのジョブは夜間(schedule)+手動dispatchのみ(2026-10-07、ユーザー決定)。
+# PR/pushでは走らない。失敗時は`macos-nightly`ラベルのissueへ自動報告する。
+# 経緯・調査手順・ロールバック(pull_requestトリガーを戻す)は
+# .claude/rules/main-branch-protection.md「macOSジョブは夜間のみ」節を参照。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "rust-core/**"
-      - "ios/**"
-      - ".github/workflows/ios-ssh-vertical-slice-check.yml"
-  pull_request:
-    paths:
-      - "rust-core/**"
-      - "ios/**"
-      - ".github/workflows/ios-ssh-vertical-slice-check.yml"
+  schedule:
+    # 毎日 20:17 UTC(= 05:17 JST)。L2 netlab(18:17)と他のmacOS夜間とずらす。
+    - cron: "17 20 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -119,3 +116,20 @@ jobs:
       - name: Stop sshd fixture
         if: always()
         run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture
+
+  # スケジュール実行が赤のとき、`macos-nightly`ラベルのissueを重複なく作成/追記する。
+  report-failure:
+    name: report failure to tracking issue
+    needs: [vertical-slice]
+    if: ${{ always() && github.event_name == 'schedule' && needs.vertical-slice.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/report-macos-nightly-failure

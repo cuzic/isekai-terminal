@@ -7,19 +7,17 @@ name: iOS rust-core check
 #
 # 公開リポジトリなので標準GitHub-hostedのmacOSランナーは無課金で使える。
 # macos-14は2026-07-06から非推奨(2026-11-02にサポート終了)のためmacos-26を使う。
+#
+# macOSランナーのジョブは夜間(schedule)+手動dispatchのみ(2026-10-07、ユーザー決定)。
+# PR/pushでは走らない(Swiftバインディングのdrift-checkもPR時には走らなくなった点に注意。
+# Linux側のios-logic-linux-check.ymlは引き続きPRで走る)。失敗時は`macos-nightly`ラベルの
+# issueへ自動報告する。経緯・調査手順・ロールバック(pull_requestトリガーを戻す)は
+# .claude/rules/main-branch-protection.md「macOSジョブは夜間のみ」節を参照。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "rust-core/**"
-      - "ios/**"
-      - ".github/workflows/ios-rust-core-check.yml"
-  pull_request:
-    paths:
-      - "rust-core/**"
-      - "ios/**"
-      - ".github/workflows/ios-rust-core-check.yml"
+  schedule:
+    # 毎日 19:47 UTC(= 04:47 JST)。L2 netlab(18:17)と他のmacOS夜間とずらす。
+    - cron: "47 19 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -154,3 +152,20 @@ jobs:
           name: IsekaiTerminalCoreFFI-xcframework
           path: ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
           retention-days: 7
+
+  # スケジュール実行が赤のとき、`macos-nightly`ラベルのissueを重複なく作成/追記する。
+  report-failure:
+    name: report failure to tracking issue
+    needs: [build-and-test]
+    if: ${{ always() && github.event_name == 'schedule' && needs.build-and-test.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/report-macos-nightly-failure

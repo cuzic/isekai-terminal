@@ -91,7 +91,8 @@ keywords:
 
 1. **required 6本が緑**(PRの**現在のhead**で)。
 2. **関連プラットフォームcheckが終了**: `rust-core/isekai-ssh|isekai-pipe|quicmux|isekai-transport|isekai-pipe-core|isekai-protocol`
-   に触れるPRは`rust-core-test-macos`/`rust-core-test-windows`の`COMPLETED`を待つ。PR自身が追加・変更したテストの失敗はブロック。
+   に触れるPRは`rust-core-test-windows`の`COMPLETED`を待つ(`rust-core-test-macos`は2026-10-07からPRでは走らず夜間のみ。
+   macOSで確かめたいPRは`gh workflow run rust-core-test-check.yml --ref <branch>`でdispatchする。`.claude/rules/main-branch-protection.md`参照)。PR自身が追加・変更したテストの失敗はブロック。
    無関係な領域の失敗(iOSの30分timeout/cancel等)は記録してマージ可。`CANCELLED`/`TIMED_OUT`は1回再実行してから判断。
    長く終わらなければユーザーに「待つか、未検証でマージするか」を聞く(黙ってマージしない)。
 3. **挙動変更PRはOpusの読み取り専用レビュー**: PRごとに別のOpusエージェントに、結果を`scratchpad/review-prN.md`へ書かせ、
