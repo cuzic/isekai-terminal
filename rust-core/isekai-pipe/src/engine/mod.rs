@@ -1270,9 +1270,11 @@ async fn handle_attach_stream(
     // control stream(APP_ACK用)は既知のsession_idを再利用するだけで、新規
     // 発行は行わない(#18-4: session_idはクライアントがATTACH_HELLOで既に
     // 決めている)。8-1と同じ理由で、確立を待たずに中継を先に始める。
+    let app_ack_unavailable = AppAckUnavailable::for_new_connection();
     let control_task = {
         let conn = conn.clone();
         let handle = handle.clone();
+        let app_ack_unavailable = app_ack_unavailable.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret, session_id_bytes))
                 .await
@@ -1283,11 +1285,11 @@ async fn handle_attach_stream(
                 }
                 Ok(Err(e)) => {
                     log::info!("no resume support for this connection ({e:#})");
-                    handle.lock().await.app_ack_unavailable = true;
+                    app_ack_unavailable.set();
                 }
                 Err(_) => {
                     log::info!("control stream not opened within timeout, continuing without resume support");
-                    handle.lock().await.app_ack_unavailable = true;
+                    app_ack_unavailable.set();
                 }
             }
         })
@@ -1303,6 +1305,7 @@ async fn handle_attach_stream(
         target,
         &attach_runtime,
         (session_id_bytes, lease.id()),
+        &app_ack_unavailable,
     )
     .await;
     control_task.abort();
@@ -1501,9 +1504,12 @@ async fn handle_resume_stream(
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
     // 確立を待たずに中継を先に始める。既知のsession_idをそのまま再利用する
     // (#18-4: 新規発行はしない)。
+    // この接続(incarnation)専用のフラグ。前の接続で立った値は引き継がない(F-3)。
+    let app_ack_unavailable = AppAckUnavailable::for_new_connection();
     let control_task = {
         let conn = conn.clone();
         let handle = handle.clone();
+        let app_ack_unavailable = app_ack_unavailable.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret, session_id)).await
             {
@@ -1513,11 +1519,11 @@ async fn handle_resume_stream(
                 }
                 Ok(Err(e)) => {
                     log::info!("resume: control stream re-establish failed ({e:#})");
-                    handle.lock().await.app_ack_unavailable = true;
+                    app_ack_unavailable.set();
                 }
                 Err(_) => {
                     log::info!("resume: control stream not re-opened within timeout");
-                    handle.lock().await.app_ack_unavailable = true;
+                    app_ack_unavailable.set();
                 }
             }
         })
@@ -1533,6 +1539,7 @@ async fn handle_resume_stream(
         target,
         &attach_runtime,
         (session_id, lease.id()),
+        &app_ack_unavailable,
     )
     .await;
     control_task.abort();
@@ -1715,8 +1722,6 @@ fn spawn_app_ack_tasks(
     {
         let session = session.clone();
         tokio::spawn(async move {
-            // A (re-)established control stream brings APP_ACK back (PIPE-09).
-            session.lock().await.app_ack_unavailable = false;
             loop {
                 let mut frame = [0u8; 9];
                 match read_exact(&mut crecv, &mut frame).await {
@@ -1785,13 +1790,45 @@ enum RelayOutcome {
     },
 }
 
+/// 「この接続(incarnation)の control stream が確立しなかったので、output buffer を進める
+/// `APP_ACK`は来ない」という事実(review 2026-09-29, PIPE-09)。接続ごとに新しく作り、
+/// `relay_buffered`とその接続の control stream 確立タスクだけが共有する。
+///
+/// session単位(`Session`のフィールド)にしてはいけない: `Session`はRESUMEをまたいで
+/// 同じものが新しい接続へ引き継がれるので、前の接続で立った値が残り、新しい接続の
+/// `relay_buffered`が自分のcontrol streamが上がる前(1 RTT後)に、満杯のまま
+/// (RESUMEはbufferを進めない)の出力を見てunresumable化していた。次の切断で
+/// `Discard{Unresumable}`になり、利用者はsessionを失う(PR #208レビューF-3)。
+///
+/// control streamが一度確立した後に途切れた場合はここでは立てない。その途切れは
+/// ほぼ常にQUIC接続そのものの喪失(data streamも同時に死ぬ)であり、そこでフラグを
+/// 立てると、通信断の間にAPP_ACKが来ず満杯になったbufferを見て、まさにresumeすべき
+/// sessionをunresumableにする競合を作る(F-4)。確立後にcontrol streamだけが死んで
+/// data streamが生き続けた場合のS→C停止は、従来どおり残る既知の制限。
+#[derive(Clone)]
+struct AppAckUnavailable(Arc<std::sync::atomic::AtomicBool>);
+
+impl AppAckUnavailable {
+    fn for_new_connection() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
 /// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
 ///
 /// **control stream が無い(`APP_ACK`が来ない)セッション**(review 2026-09-29, PIPE-09):
 /// replay を進める者がいないので、output buffer が満杯になった時点で S→C は
 /// `output_space_available` を待ったまま永久に止まっていた(以前のdocstringは「teeは誰も
-/// 参照しないだけで実害は無い」としていたが誤り)。`Session::app_ack_unavailable` が
+/// 参照しないだけで実害は無い」としていたが誤り)。この接続の`AppAckUnavailable`が
 /// 立った状態で満杯になったら replay への tee をやめ、**最初の tee されないバイトを
 /// 送る前に** `AttachRuntime::resume_unavailable` でこの incarnation を unresumable に
 /// してもらう(穴のある replay で RESUME させない。後の park は `Discard{Unresumable}`)。
@@ -1827,6 +1864,7 @@ async fn relay_buffered(
     target: SocketAddr,
     attach_runtime: &Arc<AttachRuntime>,
     incarnation: (resume::SessionId, attach_arbiter::LeaseId),
+    app_ack_unavailable: &AppAckUnavailable,
 ) -> RelayOutcome {
     let mut c2s_buf = vec![0u8; 16 * 1024];
     let mut s2c_buf = vec![0u8; 16 * 1024];
@@ -1850,7 +1888,7 @@ async fn relay_buffered(
             let session = session.lock().await;
             if replay_disabled {
                 (s2c_buf.len(), false)
-            } else if session.app_ack_unavailable && session.output_buffer.is_full() {
+            } else if app_ack_unavailable.is_set() && session.output_buffer.is_full() {
                 (s2c_buf.len(), true)
             } else {
                 (session.output_buffer.remaining_capacity().min(s2c_buf.len()), false)
@@ -2270,6 +2308,138 @@ mod resume_ack_write_tests {
         .expect("the client must observe how the stream ended");
         assert!(outcome.is_err(), "a truncated replay must end with a reset, not a clean FIN");
         drop((server, client));
+    }
+}
+
+#[cfg(test)]
+mod relay_without_app_ack_tests {
+    use super::*;
+    use isekai_protocol::attach::{AttachKey, AttemptId, ConnectionGeneration, ATTEMPT_ID_LEN};
+    use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Client and server ends of one loopback QUIC connection, plus the client
+    /// endpoint (kept alive by the caller for the connection's lifetime).
+    async fn quic_pair() -> (AnyMuxConnection, AnyMuxConnection, impl Sized) {
+        let (mut config, cert_sha256_hex) = quicmux::test_support::self_signed_server_config("isekai-pipe.local");
+        config.alpn = ALPN.to_vec();
+        config.exporter_label = EXPORTER_LABEL.to_vec();
+        config.max_concurrent_bidi_streams = 4;
+        let listener = AnyMuxListener::bind_noq(config, quicmux::BindSpec::any_ipv4()).await.unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+        let factory = isekai_transport::system_quic_factory();
+        let endpoint = factory.create_endpoint(isekai_transport::BindSpec::any_ipv4()).await.unwrap();
+        let (client, server) = tokio::join!(
+            endpoint.connect(quicmux::RemoteSpec { addr, server_name: "isekai-pipe.local".to_string(), cert_sha256_hex }),
+            async { listener.accept().await.expect("incoming connection").accept().await },
+        );
+        (client.unwrap(), server.unwrap(), endpoint)
+    }
+
+    /// PIPE-09 shell side + review of #208 F-3. The output buffer of a session
+    /// is full from an earlier incarnation (nothing ever trimmed it), as after
+    /// a RESUME of a connection whose control stream never came up. The new
+    /// incarnation's `relay_buffered` must judge only by **its own**
+    /// connection's control stream: while that flag is unset it keeps the
+    /// session resumable (waiting for APP_ACK), and only once this connection
+    /// reports no control stream does it stop teeing — marking the
+    /// incarnation unresumable *and* letting S→C flow again instead of
+    /// stalling at the buffer cap.
+    ///
+    /// With the flag kept on `Session` (the first version of PIPE-09), the
+    /// earlier incarnation's "no control stream" carried over through the
+    /// RESUME and the first assertion below failed: the session was made
+    /// unresumable before the new connection's control stream could come up.
+    #[tokio::test]
+    async fn relay_gives_up_replay_only_for_its_own_connections_missing_control_stream() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let runtime = AttachRuntime::new(target_addr, 16);
+        let id = [7u8; 16];
+        let key = AttachKey {
+            session_id: isekai_protocol::SessionId::from_bytes(id),
+            generation: ConnectionGeneration::new(1),
+            attempt_id: AttemptId::from_bytes([1u8; ATTEMPT_ID_LEN]),
+        };
+        let (hello, accepted) = tokio::join!(runtime.hello(key), target.accept());
+        let (mut sshd, _) = accepted.unwrap();
+        let attach_token = match hello {
+            attach_runtime::HelloOutcome::Ready { attach_token } => attach_token,
+            attach_runtime::HelloOutcome::Reject(reason) => panic!("hello rejected: {reason:?}"),
+        };
+        let handle = Arc::new(Mutex::new(Session::new(64)));
+        let activation = runtime.activate(key, attach_token, Some(3600), handle.clone()).await.expect("established");
+        let lease_id = activation.lease.id();
+        // The earlier incarnation's never-acknowledged output.
+        assert!(handle.lock().await.output_buffer.append(&[0xEEu8; 64]));
+
+        let (client, server, _endpoint) = quic_pair().await;
+        let (mut client_recv, mut client_send) = client.open_bi().await.unwrap().split();
+        // A stream only becomes visible to `accept_bi` once it carries data.
+        client_send.write_all(b"x").await.unwrap();
+        let (mut server_recv, server_send) = server.accept_bi().await.unwrap().split();
+        // Consume the byte that made the stream visible, so the relay's C→S
+        // side does not forward it to the target.
+        let mut first = [0u8; 1];
+        server_recv.read(&mut first).await.unwrap();
+
+        let this_connection = AppAckUnavailable::for_new_connection();
+        let relay = tokio::spawn({
+            let runtime = runtime.clone();
+            let handle = handle.clone();
+            let flag = this_connection.clone();
+            let (tcp_read, tcp_write) = activation.tcp.into_split();
+            let preempt = activation.preempt.clone();
+            async move {
+                let (mut send, mut recv) = (server_send, server_recv);
+                let outcome = relay_buffered(
+                    &mut send,
+                    &mut recv,
+                    tcp_read,
+                    tcp_write,
+                    handle,
+                    preempt,
+                    target_addr,
+                    &runtime,
+                    (id, lease_id),
+                    &flag,
+                )
+                .await;
+                matches!(outcome, RelayOutcome::TcpDied)
+            }
+        });
+
+        let output = vec![0x42u8; 1000];
+        sshd.write_all(&output).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let unresumable = |runtime: Arc<AttachRuntime>| async move {
+            runtime.snapshot_for_test(&[id]).await.index[0].expect("indexed").unresumable
+        };
+        assert!(
+            !unresumable(runtime.clone()).await,
+            "a full buffer alone must not cost the session its resumability while this connection may still get APP_ACK"
+        );
+
+        this_connection.set();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while received.len() < output.len() {
+                let n = client_recv.read(&mut buf).await.expect("S→C stream");
+                assert!(n > 0, "unexpected end of the S→C stream");
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("S→C must flow again once replay is given up instead of stalling at the buffer cap");
+        assert_eq!(received, output);
+        assert!(unresumable(runtime.clone()).await, "giving up replay must mark the incarnation unresumable first");
+
+        drop(sshd);
+        let tcp_died = tokio::time::timeout(Duration::from_secs(10), relay).await.expect("relay ends").unwrap();
+        assert!(tcp_died);
+        drop(activation.lease);
+        drop((client, server));
     }
 }
 
