@@ -15,11 +15,6 @@ on:
     # 毎日 18:17 UTC(= 03:17 JST)。毎正時を避けてGitHubのcron混雑を回避する。
     - cron: "17 18 * * *"
   workflow_dispatch:
-  # TEMP-VALIDATION: 検証用の一時トリガー(最終pushの前に必ず削除する)。
-  pull_request:
-    paths:
-      - ".github/workflows/rust-core-netlab-check.yml"
-      - "tests/netlab/**"
 
 # 夜間実行同士(および手動dispatch)を重ねない。実行中のものは止めず、後続を待たせる。
 concurrency:

@@ -7,7 +7,7 @@ namespace(`topology.sh`)上で動かし、実カーネル・実QUIC・実時間�
 
 - ワークフロー: `.github/workflows/rust-core-netlab-check.yml`
   (`schedule` 毎日 18:17 UTC + `workflow_dispatch`。PR/pushでは動かず、required checkでもない)。
-- 共通部: `common.sh`(sshd/serve起動、trust store組み立て、pacedシナリオ実行器)。
+- 共通部: `common.sh`(sshd/serve起動、PersistentProfile組み立て、pacedシナリオ実行器)。
 - 概算実行時間: build 数分(キャッシュ命中時) + シナリオは並列で各 約 1.5〜3 分(合計の壁時計 < 20 分)。
 
 ## シナリオ
@@ -31,10 +31,10 @@ pacedシナリオは 4096B/秒 で流し続けるので、故障中のデータ�
    (`--log-level debug`)、`ssh.log`、`dmesg` 末尾を全部ダンプする。
 3. 症状の見分け方:
    - `ssh exited 124`(timeout): resumeしなかった/遅すぎた。`serve.stderr` の
-     `QUIC connection established` の回数と、`BUSY_OTHER_SESSION`/`preempt` の有無を確認。
+     `QUIC connection established` の回数(注入後に増えたか)と、`BUSY_OTHER_SESSION`/`preempt` の有無を確認。
      zombie系で出ているなら fencing slot / preempt(`isekai-pipe/src/engine/`)の回帰を疑う。
    - `checksum mismatch`: バイト損失・重複。resume replay の回帰。**最優先で調べる**。
-   - `session survived without a resume`: 故障が効いていない(シナリオ側の問題。
+   - `session survived without a resume after the fault`: 故障が効いていない(シナリオ側の問題。
      iptables/ip link の失敗やタイミング)。製品バグではなくテスト基盤の修正。
    - `could not find the client's QUIC UDP socket`(zombie): `ss -uHnap` の出力形式/権限の問題。
    - build/依存取得だけが赤: インフラのflake。再実行(`workflow_dispatch`)して再現するか確認。
