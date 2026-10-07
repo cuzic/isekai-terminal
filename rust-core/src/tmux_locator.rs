@@ -26,10 +26,11 @@
 //! 表示を持たせられない——それには追加でtmuxの「session group」
 //! (`tmux new-session -t <group-name> -s <per-client-session-name>`)が要る。
 //! グループのメンバーはウィンドウ/ペイン集合を共有しつつ、各メンバーは
-//! 自分専用の「現在のウィンドウ」を持てる。[`TmuxSessionScope`]はこの
-//! 区別（単独セッションか、グループのメンバーか）を表現できるようにしてあるが、
-//! 実際にグループを作成/attachする処理自体は別タスク(#60)の範囲であり、
-//! ここでは実装しない。
+//! 自分専用の「現在のウィンドウ」を持てる。[`TmuxSessionScope`]はグループの
+//! メンバーとしてのセッションを表現する(本番では常にgroup memberとしてattachする
+//! ため、かつての「単独セッション」バリアントは一度も構築されず削除した)。
+//! 実際にグループを作成/attachする処理自体は別タスク(#60、`tmux_session.rs`)の
+//! 範囲であり、ここでは実装しない。
 //!
 //! # #61（execチャンネル）との関係
 //!
@@ -110,12 +111,12 @@ impl TmuxTag {
     }
 }
 
-/// ロケータがウィンドウ単位かペイン単位か。
+/// ロケータが指す対象の単位。本番のロケータ(`tmux_session::ensure_tab_window`)は
+/// 常にウィンドウ単位で作られるため、現状は`Window`のみ(かつて存在した`Pane`は
+/// 一度も構築されないままee34304aの到達不能コードの原因になったため削除した)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TmuxTargetKind {
     Window,
-    #[allow(dead_code)] // UNWIRED: 本番で構築されない(テストのみ)。ee34304a(backfill削除、2026-08-09)の根本原因・ADR_UNWIRED_CALLBACK_DETECTION.md §1.4
-    Pane,
 }
 
 /// このロケータが指すウィンドウ/ペインが属するtmuxセッション(またはセッション
@@ -123,9 +124,6 @@ pub(crate) enum TmuxTargetKind {
 /// session groupの存在(上記モジュールdoc参照)を後から配線できるようにする。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TmuxSessionScope {
-    /// group化されていない、ただ1つのtmuxセッション。
-    #[allow(dead_code)] // UNWIRED: 本番で構築されない(テストのみ)。ADR_UNWIRED_CALLBACK_DETECTION.md §1.3(4)
-    Standalone { session_name: String },
     /// tmux session groupのメンバー。`group`はグループ内の全メンバーが共有する
     /// ウィンドウ/ペイン集合の識別(グループ名)、`session_name`はこの
     /// クライアント自身がattachに使った、グループ内で一意なセッション名。
@@ -142,7 +140,6 @@ impl TmuxSessionScope {
     /// 使っても共有ウィンドウ/ペインには同じように届く)。
     pub(crate) fn addressable_session_name(&self) -> &str {
         match self {
-            Self::Standalone { session_name } => session_name,
             Self::GroupMember { session_name, .. } => session_name,
         }
     }
@@ -258,13 +255,8 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// `locator.scope`配下の全ウィンドウ(またはペイン、`kind`次第)を列挙し、
+/// `locator.scope`配下の全ウィンドウを列挙し、
 /// それぞれのタグ値を一緒に出力させるtmuxコマンドを組み立てる。
-///
-/// ペインの列挙には`-a`ではなく`-s`を使う —— tmuxの`list-panes -a`は
-/// 「サーバー上の全セッションの全ペイン」を`-t`を無視して返すのに対し、
-/// `-s`は「`-t`で指定したセッション内の全ペイン(全ウィンドウ横断)」を返す。
-/// ここで欲しいのは後者(このセッション/グループのスコープ内)。
 pub(crate) fn build_list_command(scope: &TmuxSessionScope, kind: TmuxTargetKind) -> String {
     let session = shell_quote(scope.addressable_session_name());
     match kind {
@@ -272,14 +264,10 @@ pub(crate) fn build_list_command(scope: &TmuxSessionScope, kind: TmuxTargetKind)
             "tmux list-windows -t {session} -F '#{{window_index}}\t#{{{}}}'",
             WINDOW_TAG_OPTION
         ),
-        TmuxTargetKind::Pane => format!(
-            "tmux list-panes -s -t {session} -F '#{{window_index}}\t#{{pane_index}}\t#{{{}}}'",
-            PANE_TAG_OPTION
-        ),
     }
 }
 
-/// [`build_list_command`]の出力(`\t`区切りの行、`kind`に応じて2列/3列)を
+/// [`build_list_command`]の出力(`\t`区切りの2列の行)を
 /// パースし、末尾列が`tag`と一致する最初の行の座標を返す。一致が無ければ
 /// `None`。
 pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTag) -> Option<TmuxCoordinates> {
@@ -288,14 +276,6 @@ pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTa
         let coords = match (kind, fields.as_slice()) {
             (TmuxTargetKind::Window, [window_index, line_tag]) if *line_tag == tag.0 => {
                 window_index.parse().ok().map(|window_index| TmuxCoordinates { window_index, pane_index: None })
-            }
-            (TmuxTargetKind::Pane, [window_index, pane_index, line_tag]) if *line_tag == tag.0 => {
-                match (window_index.parse(), pane_index.parse()) {
-                    (Ok(window_index), Ok(pane_index)) => {
-                        Some(TmuxCoordinates { window_index, pane_index: Some(pane_index) })
-                    }
-                    _ => None,
-                }
             }
             _ => None,
         };
@@ -309,7 +289,7 @@ pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTa
 /// `coords`が指すウィンドウ/ペインに`tag`をuser-optionとして書き込む
 /// (`set-option`)コマンドを組み立てる。`coords.pane_index`の有無で
 /// ウィンドウ/ペインどちらを対象にするか、どちらのuser-option名を使うかが
-/// 決まる(この2つを別々の引数にして矛盾した組み合わせ(例: `Pane` kindなのに
+/// 決まる(この2つを別々の引数にして矛盾した組み合わせ(例: ペイン対象なのに
 /// `pane_index: None`)を型として表現できてしまうのを避けている)。
 pub(crate) fn build_set_tag_command(scope: &TmuxSessionScope, coords: &TmuxCoordinates, tag: &TmuxTag) -> String {
     let session = scope.addressable_session_name();
@@ -632,7 +612,7 @@ pub(crate) async fn push_ctl_socket_to_tmux<R: RemoteTmuxCommandRunner>(
 
 /// `tmux_locator.rs`・`tmux_notify.rs`・`tmux_scrollback.rs`がそれぞれ独自に
 /// 持っていた`RemoteTmuxCommandRunner`テストフィクスチャのうち、バイト単位で
-/// 同一だった部分(`standalone`/`pane`コンストラクタヘルパーと、値で消費される
+/// 同一だった部分(`member`/`pane`コンストラクタヘルパーと、値で消費される
 /// runnerでも呼び出し後に外から発行済みコマンドを見られる`RecordingRunner`)を
 /// ここに集約する。`RemoteTmuxCommandRunner`自体がこのファイルで定義されて
 /// いるため、他ファイルからは`crate::tmux_locator::test_support::...`で参照する。
@@ -641,8 +621,10 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    pub(crate) fn standalone(name: &str) -> TmuxSessionScope {
-        TmuxSessionScope::Standalone { session_name: name.to_string() }
+    /// グループ名とセッション名が同じ`name`のgroup member。`-t`アドレッシングは
+    /// `session_name`だけで決まるので、テストの期待コマンドは`name`だけで書ける。
+    pub(crate) fn member(name: &str) -> TmuxSessionScope {
+        TmuxSessionScope::GroupMember { group: name.to_string(), session_name: name.to_string() }
     }
 
     pub(crate) fn pane(tab: &str, pane: &str) -> AppPaneId {
@@ -676,13 +658,13 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::test_support::{pane, standalone, RecordingRunner};
+    use super::test_support::{member, pane, RecordingRunner};
     use std::sync::Mutex;
 
     // ── フェイクの RemoteTmuxCommandRunner ──────────────
     // このリポジトリの慣習(重量なモックフレームワークより実/フェイク実装を
     // 好む)に沿って、呼ばれたコマンドを記録しつつ固定の応答を返すだけの
-    // 最小限のフェイクにする。`standalone`/`pane`/`RecordingRunner`は
+    // 最小限のフェイクにする。`member`/`pane`/`RecordingRunner`は
     // tmux_notify.rs/tmux_scrollback.rsと共有するため`test_support`へ切り出した
     // (このファイル固有の`FakeRunner`は単一固定応答を返すだけなので共有対象外)。
 
@@ -719,17 +701,8 @@ mod tests {
 
     #[test]
     fn build_list_command_window_uses_list_windows() {
-        let cmd = build_list_command(&standalone("main"), TmuxTargetKind::Window);
+        let cmd = build_list_command(&member("main"), TmuxTargetKind::Window);
         assert_eq!(cmd, "tmux list-windows -t 'main' -F '#{window_index}\t#{@isekai_tab_id}'");
-    }
-
-    #[test]
-    fn build_list_command_pane_uses_list_panes_with_dash_s_not_dash_a() {
-        let cmd = build_list_command(&standalone("main"), TmuxTargetKind::Pane);
-        assert_eq!(
-            cmd,
-            "tmux list-panes -s -t 'main' -F '#{window_index}\t#{pane_index}\t#{@isekai_pane_id}'"
-        );
     }
 
     #[test]
@@ -744,14 +717,6 @@ mod tests {
         let output = "0\tother\n1\tabc123\n2\t\n";
         let coords = parse_list_output(TmuxTargetKind::Window, output, &tag).unwrap();
         assert_eq!(coords, TmuxCoordinates { window_index: 1, pane_index: None });
-    }
-
-    #[test]
-    fn parse_list_output_finds_matching_pane() {
-        let tag = TmuxTag("pane-tag".to_string());
-        let output = "0\t0\t\n0\t1\tpane-tag\n1\t0\t\n";
-        let coords = parse_list_output(TmuxTargetKind::Pane, output, &tag).unwrap();
-        assert_eq!(coords, TmuxCoordinates { window_index: 0, pane_index: Some(1) });
     }
 
     #[test]
@@ -782,7 +747,7 @@ mod tests {
     #[test]
     fn build_set_tag_command_window_targets_session_colon_window() {
         let cmd = build_set_tag_command(
-            &standalone("main"),
+            &member("main"),
             &TmuxCoordinates { window_index: 2, pane_index: None },
             &TmuxTag("tagval".to_string()),
         );
@@ -792,7 +757,7 @@ mod tests {
     #[test]
     fn build_set_tag_command_pane_targets_session_colon_window_dot_pane() {
         let cmd = build_set_tag_command(
-            &standalone("main"),
+            &member("main"),
             &TmuxCoordinates { window_index: 2, pane_index: Some(1) },
             &TmuxTag("tagval".to_string()),
         );
@@ -806,7 +771,7 @@ mod tests {
         let runner = FakeRunner::ok("0\tother\n3\tmy-tag\n");
         let resolver = TmuxLocatorResolver::new(runner);
         let locator = TmuxLocator {
-            scope: standalone("main"),
+            scope: member("main"),
             kind: TmuxTargetKind::Window,
             tag: TmuxTag("my-tag".to_string()),
         };
@@ -820,7 +785,7 @@ mod tests {
         let runner = FakeRunner::ok("0\tother\n");
         let resolver = TmuxLocatorResolver::new(runner);
         let locator = TmuxLocator {
-            scope: standalone("main"),
+            scope: member("main"),
             kind: TmuxTargetKind::Window,
             tag: TmuxTag("missing-tag".to_string()),
         };
@@ -833,7 +798,7 @@ mod tests {
         let runner = FakeRunner::err("ssh channel closed");
         let resolver = TmuxLocatorResolver::new(runner);
         let locator = TmuxLocator {
-            scope: standalone("main"),
+            scope: member("main"),
             kind: TmuxTargetKind::Window,
             tag: TmuxTag("t".to_string()),
         };
@@ -847,7 +812,7 @@ mod tests {
         let resolver = TmuxLocatorResolver::new(runner);
         resolver
             .assign_tag(
-                &standalone("main"),
+                &member("main"),
                 &TmuxCoordinates { window_index: 0, pane_index: None },
                 &TmuxTag("fresh-tag".to_string()),
             )
@@ -861,7 +826,7 @@ mod tests {
     #[test]
     fn build_set_ctl_socket_command_window_targets_session_colon_window() {
         let cmd = build_set_ctl_socket_command(
-            &standalone("main"),
+            &member("main"),
             &TmuxCoordinates { window_index: 2, pane_index: None },
             "/tmp/isekai-pipe-ctl-abc.sock",
         );
@@ -871,7 +836,7 @@ mod tests {
     #[test]
     fn build_set_ctl_socket_command_pane_targets_session_colon_window_dot_pane() {
         let cmd = build_set_ctl_socket_command(
-            &standalone("main"),
+            &member("main"),
             &TmuxCoordinates { window_index: 2, pane_index: Some(1) },
             "/tmp/isekai-pipe-ctl-abc.sock",
         );
@@ -889,7 +854,7 @@ mod tests {
         let runner = FakeRunner::ok("0\tother\n3\tmy-tag\n");
         let resolver = TmuxLocatorResolver::new(runner);
         let locator = TmuxLocator {
-            scope: standalone("main"),
+            scope: member("main"),
             kind: TmuxTargetKind::Window,
             tag: TmuxTag("my-tag".to_string()),
         };
@@ -905,7 +870,7 @@ mod tests {
         let runner = FakeRunner::ok("0\tother\n");
         let resolver = TmuxLocatorResolver::new(runner);
         let locator = TmuxLocator {
-            scope: standalone("main"),
+            scope: member("main"),
             kind: TmuxTargetKind::Window,
             tag: TmuxTag("missing-tag".to_string()),
         };
@@ -1043,7 +1008,7 @@ mod tests {
     // ── TmuxLocatorRegistry (マッピングテーブル) ─────────
 
     fn locator(tag: &str) -> TmuxLocator {
-        TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag(tag.to_string()) }
+        TmuxLocator { scope: member("main"), kind: TmuxTargetKind::Window, tag: TmuxTag(tag.to_string()) }
     }
 
     #[test]

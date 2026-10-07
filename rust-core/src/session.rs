@@ -16,8 +16,7 @@ use crate::theme::Theme;
 use crate::transport::{ExecError, ExecOutput, SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
-/// ローカルscrollbackの保持上限(行数)。[`SessionCore::inject_scrollback_history`]の
-/// バッチ注入も、独自の上限を新設せずこの値を再利用する。
+/// ローカルscrollbackの保持上限(行数)。
 pub(crate) const SCROLLBACK_LIMIT: usize = 1000;
 
 /// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
@@ -178,56 +177,6 @@ pub(crate) fn to_cell_data(c: &TermCell) -> CellData {
         invisible: c.invisible,
         link_id: c.link_id,
     }
-}
-
-/// タスク#58: tmux capture-paneが返したプレーンテキスト1行を、ローカル
-/// scrollbackが持つ`Vec<TermCell>`行表現に変換する。`cols`を超える分は
-/// 切り詰め、`cols`に満たない分は現在のテーマの既定色の空白セルで埋める
-/// (`Terminal::new`の`blank`セルと同じ組み立て方)。
-///
-/// opusレビューM4: 以前は`chars()`の個数(=文字コードポイント数)でしか列を
-/// 消費しておらず、CJK等の全角文字も半角と同じ1セル扱いになっていた
-/// (`is_wide_placeholder`も常にfalse)。日本語IME完全対応を差別化点に掲げる
-/// プロダクトのbackfillとしては桁ズレが致命的なため、`terminal.rs`の
-/// `cell_display_width`/`sanitize_wide_cells`が使うのと同じ`unicode_width`で
-/// 各文字の表示幅(1/2)を見て、全角文字は「本体セル(幅2) + 直後の
-/// `is_wide_placeholder`セル」の対で書き込む。
-fn plain_text_to_scrollback_row(line: &str, cols: usize, theme: Theme) -> Vec<TermCell> {
-    use unicode_width::UnicodeWidthChar;
-
-    let blank_cell = |ch: &str, is_wide_placeholder: bool| TermCell {
-        ch: smol_str::SmolStr::new(ch),
-        fg: theme.default_fg,
-        bg: theme.default_bg,
-        bold: false,
-        dim: false,
-        italic: false,
-        underline: false,
-        strikethrough: false,
-        blink: false,
-        invisible: false,
-        is_wide_placeholder,
-        link_id: None,
-    };
-    let mut row = vec![blank_cell(" ", false); cols];
-    let mut col = 0usize;
-    for ch in line.chars() {
-        if col >= cols {
-            break;
-        }
-        let width = ch.width().unwrap_or(1);
-        // 全角文字が最終列1つにしか収まらない場合は`sanitize_wide_cells`同様
-        // 片割れを持てないため書き込まず、そこで打ち切る(残りは既定の空白のまま)。
-        if width == 2 && col + 1 >= cols {
-            break;
-        }
-        row[col] = blank_cell(ch.encode_utf8(&mut [0u8; 4]), false);
-        if width == 2 {
-            row[col + 1] = blank_cell(" ", true);
-        }
-        col += width.max(1);
-    }
-    row
 }
 
 // ── TokioTimerRuntime ────────────────────────────────────
@@ -582,54 +531,6 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::FocusChanged(focused));
     }
 
-    /// フル再接続(byte-exact resumeが諦めた後の新規ATTACH)の直後、ライブのPTY
-    /// 出力(`TransportEvent::Stdout`)がまだ1バイトも届いていないうちに、
-    /// プレーンテキスト行のバッチをこのタブのローカルscrollbackへ注入する。
-    ///
-    /// 2026-08-09時点でtmux capture-paneベースの呼び出し元(旧`tmux_scrollback.rs`/
-    /// `orchestrator.rs::spawn_tmux_scrollback_backfill`)は、`tmux_session::
-    /// ensure_tab_window`が常に`TmuxTargetKind::Window`のロケータしか作らないため
-    /// 到達不能なdead codeと判明し削除された(WU-R7、2026-08-09ユーザー判断)。
-    /// このメソッド自体は`SessionCore`の一般的なAPI(WU-R1の
-    /// `impl_session_core_delegation!`が全6トランスポートへ委譲する対象)として残す。
-    ///
-    /// `lines`は古い→新しい、画面に一番近い行が最後の順序で渡すこと ——
-    /// `dispatch_result`が`Terminal::take_scrollback`の結果(同じく古い→新しい順)を
-    /// `push_front`していく既存の規約とまったく同じ順序規約で積む(=`lines`の各行を
-    /// 出現順に`push_front`していく)ため、呼び出し順を変えてはいけない。
-    ///
-    /// この関数は「まだ何も積まれていない空のscrollback」(フル再接続直後、
-    /// まだライブ出力が1バイトも届いていない新規`SessionCore`)への初回バッチ
-    /// 注入だけを想定している。既存のscrollbackが空でない状態で呼ぶと、
-    /// `lines`はどれだけ古い履歴であっても既存の行より*前*(=ライブ画面に
-    /// より近い、より新しい扱い)に積まれてしまい時系列が壊れる —— 呼び出し元は
-    /// 必ず`connect_via`直後の、まだ何も積まれていないタイミングでのみ呼ぶこと。
-    /// 既存状態自体を破棄することはない(クリアはしない)という意味でのみ「加算的」。
-    ///
-    /// ANSI装飾(色・太字等)は再現しない ——行をまたいだ色の持ち越し状態の復元が
-    /// 煩雑な割に得られる価値が小さいと判断し、プレーンテキストの入力を前提にして
-    /// いる。各行はこのタブの現在の`screen_cols`幅に切り詰め/空白埋めし、色は
-    /// 現在のテーマの既定前景/背景で塗る。
-    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
-        if lines.is_empty() {
-            return;
-        }
-        let theme = *self.current_theme.lock();
-        let cols = *self.screen_cols.lock() as usize;
-        let mut sb = self.scrollback.lock();
-        for line in &lines {
-            sb.push_front(plain_text_to_scrollback_row(line, cols, theme));
-        }
-        let overflow = sb.len().saturating_sub(SCROLLBACK_LIMIT);
-        if overflow > 0 {
-            for _ in 0..overflow {
-                sb.pop_back();
-            }
-            debug!("scrollback: backfill dropped {} row(s) past the limit, total={}", overflow, sb.len());
-        }
-        info!("scrollback: backfilled {} row(s) of tmux history", lines.len());
-    }
-
     /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには触れず、この
     /// セッションが今使っている同じ(プール済み)SSH接続上で短命なコマンドを
     /// 実行し、stdoutと終了ステータスを回収する。`connect()`前/`disconnect()`後
@@ -699,12 +600,6 @@ macro_rules! impl_session_core_delegation {
 
             pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<crate::CellData> {
                 self.core.scrollback_cells(offset, rows)
-            }
-
-            /// タスク#58: フル再接続直後のtmux scrollback backfill。
-            /// `SessionCore::inject_scrollback_history`参照。
-            pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
-                self.core.inject_scrollback_history(lines)
             }
 
             pub(crate) fn search_scrollback(
@@ -1635,44 +1530,6 @@ mod tests {
         );
     }
 
-    // ── タスク#58: plain_text_to_scrollback_rowの全角文字幅(opusレビューM4) ──
-
-    #[test]
-    fn plain_text_to_scrollback_row_ascii_uses_one_cell_per_char() {
-        let row = plain_text_to_scrollback_row("abc", 5, Theme::default());
-        assert_eq!(row.len(), 5);
-        assert_eq!(row[0].ch.as_str(), "a");
-        assert_eq!(row[1].ch.as_str(), "b");
-        assert_eq!(row[2].ch.as_str(), "c");
-        assert_eq!(row[3].ch.as_str(), " ");
-        assert!(row.iter().all(|c| !c.is_wide_placeholder));
-    }
-
-    #[test]
-    fn plain_text_to_scrollback_row_cjk_consumes_two_cells_with_placeholder() {
-        // "あ"(U+3042)は全角(表示幅2)。以前はchars()の個数だけで列を消費しており
-        // 半角と同じ1セル扱いになっていた(is_wide_placeholderも常にfalse)ため、
-        // 続く文字がすべて1列ずれていた。
-        let row = plain_text_to_scrollback_row("あx", 5, Theme::default());
-        assert_eq!(row[0].ch.as_str(), "あ");
-        assert!(!row[0].is_wide_placeholder);
-        assert!(row[1].is_wide_placeholder, "全角本体の直後はplaceholderセルであるべき");
-        assert_eq!(row[1].ch.as_str(), " ");
-        assert_eq!(row[2].ch.as_str(), "x", "全角文字は2列消費するので、次の文字は列2から始まるべき");
-        assert_eq!(row[3].ch.as_str(), " ");
-    }
-
-    #[test]
-    fn plain_text_to_scrollback_row_cjk_at_last_column_is_dropped_not_split() {
-        // 全角文字の片割れ(is_wide_placeholder)を置く列が無い場合、
-        // sanitize_wide_cells(terminal.rs)と同じく孤立した本体セルを残さない
-        // ——書き込まずに空白のままにする。
-        let row = plain_text_to_scrollback_row("xあ", 2, Theme::default());
-        assert_eq!(row[0].ch.as_str(), "x");
-        assert_eq!(row[1].ch.as_str(), " ", "最終列1つにしか収まらない全角文字は書き込まれないはず");
-        assert!(!row[1].is_wide_placeholder);
-    }
-
     #[test]
     fn make_screen_update_link_table_stays_bounded_when_remote_floods_distinct_urls() {
         // タスク#70: `make_screen_update`は`Terminal::link_table()`を`to_vec()`で
@@ -1972,70 +1829,6 @@ mod tests {
         assert_eq!(cells[2].ch, " ");
         assert_eq!(cells[3].ch, " ");
         assert_eq!(cells[4].ch, " ");
-    }
-
-    // ── タスク#58: inject_scrollback_history (tmux scrollback backfill) ──
-
-    #[test]
-    fn inject_scrollback_history_orders_oldest_to_newest_same_as_live_scrolling() {
-        // tmux capture-paneの出力順(古い→新しい、可視画面に一番近い行が最後)で
-        // 渡すと、`scrollback_cells`から見て「新しいほどライブ画面に近い」という
-        // 既存の並び規約(`scrollback_cells_orders_oldest_to_newest_top_to_bottom`
-        // 参照)と矛盾しないことを確認する。
-        let core = SessionCore::new();
-        *core.screen_cols.lock() = 3;
-        core.inject_scrollback_history(vec!["old".to_string(), "mid".to_string(), "new".to_string()]);
-
-        assert_eq!(core.scrollback_len(), 3);
-        let cells = core.scrollback_cells(0, 3);
-        // viewport最下段(ライブ画面に一番近い) = 一番新しい行("new")
-        assert_eq!(cells[2 * 3].ch, "n");
-        // viewport最上段(一番過去) = 一番古い行("old")
-        assert_eq!(cells[0 * 3].ch, "o");
-    }
-
-    #[test]
-    fn inject_scrollback_history_pads_short_lines_with_theme_blank() {
-        let core = SessionCore::new();
-        *core.screen_cols.lock() = 5;
-        core.inject_scrollback_history(vec!["ab".to_string()]);
-        let cells = core.scrollback_cells(0, 1);
-        let theme = Theme::default();
-        assert_eq!(cells.len(), 5);
-        assert_eq!(cells[0].ch, "a");
-        assert_eq!(cells[1].ch, "b");
-        for c in &cells[2..] {
-            assert_eq!(c.ch, " ");
-            assert_eq!(c.fg, theme.default_fg);
-            assert_eq!(c.bg, theme.default_bg);
-        }
-    }
-
-    #[test]
-    fn inject_scrollback_history_truncates_lines_longer_than_screen_cols() {
-        let core = SessionCore::new();
-        *core.screen_cols.lock() = 3;
-        core.inject_scrollback_history(vec!["abcdef".to_string()]);
-        let cells = core.scrollback_cells(0, 1);
-        assert_eq!(cells.len(), 3);
-        assert_eq!(cells.iter().map(|c| c.ch.as_str()).collect::<String>(), "abc");
-    }
-
-    #[test]
-    fn inject_scrollback_history_respects_scrollback_limit_by_dropping_the_oldest() {
-        let core = SessionCore::new();
-        *core.screen_cols.lock() = 1;
-        let lines: Vec<String> = (0..SCROLLBACK_LIMIT + 10).map(|i| format!("{}", i % 10)).collect();
-        core.inject_scrollback_history(lines);
-        assert_eq!(core.scrollback_len() as usize, SCROLLBACK_LIMIT, "must be capped, not left over the limit");
-    }
-
-    #[test]
-    fn inject_scrollback_history_of_empty_batch_is_a_noop() {
-        let core = SessionCore::new();
-        *core.screen_cols.lock() = 3;
-        core.inject_scrollback_history(Vec::new());
-        assert_eq!(core.scrollback_len(), 0);
     }
 
     // ── search_scrollback(タスク#37) ────────────────────────
