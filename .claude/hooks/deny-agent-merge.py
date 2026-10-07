@@ -106,6 +106,8 @@ def check_gh(toks):
                 deny("gh api の -f/-F/--input は POST になるため禁止")
         return
     sub = tuple(toks[1:3])
+    if toks[1:2] in (["--version"], ["--help"], ["-h"], ["version"], ["help"]) and len(toks) == 2:
+        return  # 無害(読み取り専用)
     if sub == ("run", "rerun"):
         # 自分のPRの失敗したジョブの再実行だけ許可(--failed必須)。全体再実行/キャンセル等は不可。
         if "--failed" in toks[3:] and not any(t in toks[3:] for t in ("--debug", "--job")) :
