@@ -1511,6 +1511,24 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
     assert!(matches!(response, AttachResponse::Ready { .. }), "expected AttachReadyV2, got {response:?}");
 }
 
+/// Regression (review 2026-09-29, PIPE-01): `isekai-pipe serve`'s own
+/// argument front-end (`main.rs::parse_serve`) used to reject
+/// `--bind-port-range` as "unsupported option" even though the engine
+/// implemented it and `isekai-bootstrap` generates it for
+/// `#@isekai remote-bind-port-range` — the helper exited before printing a
+/// handshake, so every such bootstrap failed. Exercises the real compiled
+/// binary (the previous coverage only inspected the generated argv string).
+#[tokio::test]
+async fn serve_accepts_bind_port_range_and_binds_inside_it() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &["--bind-port-range", "47000-47999"]);
+    let port = helper
+        .handshake
+        .direct_by_bootstrap_host_port()
+        .expect("handshake should advertise the bound port");
+    assert!((47000..=47999).contains(&port), "bound port {port} outside --bind-port-range");
+}
+
 /// `#20a-4`: when launched with `--bootstrap-request-file` (the real
 /// `isekai-bootstrap::openssh` call shape, `#20a-2`), `isekai-pipe serve`
 /// must wrap its handshake in a `BootstrapReportV2` envelope echoing back

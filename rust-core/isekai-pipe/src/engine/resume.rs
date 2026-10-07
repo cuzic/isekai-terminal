@@ -26,10 +26,11 @@ pub type SessionId = [u8; 16];
 /// `resume_loop.rs`(`C2hReplayBuffer`)とquicmuxに、ほぼ同一の
 /// `VecDeque<u8>`+`start_offset`+`capacity`実装が3つ並存していた。しかも
 /// `advance_start`の範囲外挙動だけが静かに食い違っており、片方
-/// (`C2hReplayBuffer`のjump-ahead)はこのサーバー側の使い方では
-/// offsetを壊す(`quicmux::ReplayBuffer::advance_start`のdocs参照 —
-/// このサーバーはack読み取りタスクと中継ループが別タスクで同じsession lockを
-/// 奪い合うため、「peerへ送出済みだがappend前」の窓が実際に開く)。
+/// (`C2hReplayBuffer`のjump-ahead)は、ackが`end_offset()`を超えたときに
+/// 以後appendするバイトのoffsetを狂わせる(`quicmux::ReplayBuffer::advance_start`
+/// のdocs参照。当時のこのサーバーは送信→appendの順で、ack読み取りタスクと
+/// 中継ループが別タスクのため「peerへ送出済みだがappend前」の窓が実際に開いた。
+/// 現在はappend→送信の順(review 2026-09-29, PIPE-03)でこの窓は無い)。
 /// 正しい方(clamp)へ一本化した。
 pub type OutputBuffer = ReplayBuffer;
 
@@ -46,6 +47,11 @@ pub struct Session {
     pub helper_committed_offset: u64,
     /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
     pub output_space_available: Arc<Notify>,
+    // 「この接続の control stream が確立しなかった」(PIPE-09)はここ(session単位、RESUMEを
+    // またいで同じ`Session`が引き継がれる)には置かない: 接続(incarnation)ごとの
+    // `engine/mod.rs::AppAckUnavailable`。session単位にすると、前の接続で立った値が
+    // RESUME後の接続に残り、新しい接続自身のcontrol streamが上がる前にunresumableに
+    // されてしまう(PR #208レビューF-3)。
 }
 
 impl Session {

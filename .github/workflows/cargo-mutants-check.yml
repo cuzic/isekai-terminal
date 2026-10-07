@@ -76,15 +76,18 @@ jobs:
           fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # SHA固定時はref名(`@stable`)からtoolchainを推定できないため、明示的に渡す。
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
+        with:
+          toolchain: stable
 
       - name: Add musl targets
         run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
       - name: Install zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: latest
+          version: 0.16.0
 
       - name: Cache Cargo (github-hosted only)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
@@ -99,9 +102,9 @@ jobs:
             cargo-mutants-${{ runner.os }}-
 
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild@0.23.4
 
       # cargo-mutantsの事前ビルド済みgnuバイナリはglibc 2.39を要求し、self-hosted VM
       # (Debian 12、glibc 2.36)では動かない。ソースからインストールする(32コアで約26秒)。
@@ -117,14 +120,28 @@ jobs:
 
       - name: Run cargo mutants
         working-directory: rust-core
+        # workflow_dispatchの入力は`run:`へ直接`${{ }}`展開せず`env:`経由で渡す
+        # (引用符等を含む入力がシェルスクリプトとして解釈されるのを防ぐ。このjobは
+        # 永続ディスクを持つself-hosted runnerでも動くため特に重要)。
+        env:
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_FILE_FILTER: ${{ inputs.file_filter }}
+          INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
+          set -euo pipefail
           rm -rf mutants.out mutants.out.old
           FILTER_ARGS=()
-          if [ -n "${{ inputs.file_filter }}" ]; then
-            FILTER_ARGS=(-f "${{ inputs.file_filter }}")
+          if [ -n "$INPUT_FILE_FILTER" ]; then
+            FILTER_ARGS=(-f "$INPUT_FILE_FILTER")
           fi
-          cargo mutants -p "${{ inputs.package }}" "${FILTER_ARGS[@]}" \
-            --jobs 8 --copy-target true ${{ inputs.extra_args }}
+          # extra_argsは意図的に空白で分割して複数引数として渡す(グロブ展開はしない)。
+          # 分割は`read -a`で行い、シェルの再評価(eval等)は一切しない。
+          EXTRA_ARGS=()
+          if [ -n "$INPUT_EXTRA_ARGS" ]; then
+            read -r -a EXTRA_ARGS <<< "$INPUT_EXTRA_ARGS"
+          fi
+          cargo mutants -p "$INPUT_PACKAGE" "${FILTER_ARGS[@]}" \
+            --jobs 8 --copy-target true "${EXTRA_ARGS[@]}"
 
       - name: Summarize outcome
         if: always()

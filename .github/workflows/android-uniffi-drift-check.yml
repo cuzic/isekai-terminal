@@ -75,7 +75,7 @@ jobs:
 
   drift-check:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: android-uniffi-drift

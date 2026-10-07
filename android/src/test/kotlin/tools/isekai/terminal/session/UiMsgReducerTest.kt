@@ -81,9 +81,10 @@ class UiMsgReducerTest {
     }
 
     @Test
-    fun `LocalDisconnectRequested only touches connected isConnecting statusMsg`() {
+    fun `LocalDisconnectRequested only touches connected isConnecting isReconnecting statusMsg`() {
+        // AND-M8a: 再接続中の切断で「切断済み」かつReconnectingにならないよう`isReconnecting`も落とす。
         assertEquals(
-            busy.copy(connected = false, isConnecting = false, statusMsg = "切断済み"),
+            busy.copy(connected = false, isConnecting = false, isReconnecting = false, statusMsg = "切断済み"),
             reduce(busy, UiMsg.LocalDisconnectRequested),
         )
     }
@@ -188,8 +189,9 @@ class UiMsgReducerTest {
         is UiMsg.ConnectionStateChanged -> ConnectionStateMapper.apply(it, msg.state)
         // L471 guardedConnect catch(SshException)
         is UiMsg.ConnectFailed -> it.copy(isConnecting = false, statusMsg = "エラー: ${msg.message ?: "不明なエラー"}")
-        // L503 disconnect()
-        UiMsg.LocalDisconnectRequested -> it.copy(connected = false, isConnecting = false, statusMsg = "切断済み")
+        // L503 disconnect()。AND-M8a(PR #128再分割)で`isReconnecting = false`を意図的に追加した
+        // (旧挙動は「切断済み」かつReconnectingという不整合な表示になりえた)。
+        UiMsg.LocalDisconnectRequested -> it.copy(connected = false, isConnecting = false, isReconnecting = false, statusMsg = "切断済み")
         // L427 screenUpdate消費ループ
         is UiMsg.ScreenUpdated -> it.copy(screenUpdate = msg.update, scrollbackLen = msg.scrollbackLen)
         // L283 onHostKey Trust(isNew)

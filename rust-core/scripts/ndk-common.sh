@@ -14,8 +14,14 @@ resolve_ndk_root() {
     fi
     if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
         # Pick the highest installed NDK version under $ANDROID_HOME/ndk.
-        find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1
-        return
+        local latest
+        latest="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+        if [ -n "$latest" ]; then
+            echo "$latest"
+            return
+        fi
+        echo "error: $ANDROID_HOME/ndk exists but contains no NDK version directory. Install an NDK (sdkmanager \"ndk;<version>\") or set ANDROID_NDK_HOME." >&2
+        exit 1
     fi
     echo "error: Android NDK not found. Set ANDROID_NDK_HOME (or ANDROID_NDK_ROOT, or ANDROID_HOME with an ndk/ subdir)." >&2
     exit 1

@@ -241,19 +241,26 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 ) {
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(fp, reply) = ev {
-                let accepted = match &callback {
-                    Some(cb) => {
-                        let cb = Arc::clone(cb);
-                        tokio::task::spawn_blocking(move || cb.on_host_key(fp)).await.unwrap_or(false)
-                    }
-                    None => {
-                        warn!("bootstrap host key check: no session callback available, rejecting for safety");
-                        false
-                    }
-                };
-                let _ = reply.send(accepted);
-            }
+            // RC-07: 踏み台経由のbootstrapでは踏み台自身の鍵(`JumpHostKey`)も届く。
+            // 踏み台の`host:port`で検証させる(targetの識別子で検証・pinしない)。
+            let (check, reply): (Box<dyn FnOnce(&dyn SessionCallback) -> bool + Send>, _) = match ev {
+                TransportEvent::HostKey(fp, reply) => (Box::new(move |cb: &dyn SessionCallback| cb.on_host_key(fp)), reply),
+                TransportEvent::JumpHostKey { host, port, fingerprint, reply } => {
+                    (Box::new(move |cb: &dyn SessionCallback| cb.on_jump_host_key(host, port, fingerprint)), reply)
+                }
+                _ => continue,
+            };
+            let accepted = match &callback {
+                Some(cb) => {
+                    let cb = Arc::clone(cb);
+                    tokio::task::spawn_blocking(move || check(cb.as_ref())).await.unwrap_or(false)
+                }
+                None => {
+                    warn!("bootstrap host key check: no session callback available, rejecting for safety");
+                    false
+                }
+            };
+            let _ = reply.send(accepted);
         }
     });
 }
@@ -792,6 +799,11 @@ mod tests {
     impl SessionCallback for FixedResponseCallback {
         fn on_data(&self, _data: Vec<u8>) {}
         fn on_host_key(&self, fingerprint: String) -> bool { fingerprint == self.trusted_fingerprint }
+        /// RC-07: 踏み台の鍵は`bastion.test:2222`のときだけ`trusted_fingerprint`で承認する
+        /// (forwarderが踏み台自身の識別子を渡していることの検証用)。
+        fn on_jump_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
+            host == "bastion.test" && port == 2222 && fingerprint == self.trusted_fingerprint
+        }
         fn on_connected(&self) {}
         fn on_disconnected(&self, _reason: Option<String>) {}
         fn on_screen_update(&self, _update: crate::ScreenUpdate) {}
@@ -838,6 +850,42 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         event_tx.send(TransportEvent::HostKey("known-good-fp".to_string(), reply_tx)).await.unwrap();
         assert!(reply_rx.await.unwrap(), "matching known host key must be accepted");
+    }
+
+    /// RC-07: ProxyJump経由のbootstrapでは踏み台の鍵が`JumpHostKey`として届き、
+    /// forwarderは`on_host_key`(=接続先の識別子)ではなく`on_jump_host_key`へ
+    /// 踏み台自身のhost/port付きで渡すこと。
+    #[tokio::test]
+    async fn bootstrap_host_key_forwarder_checks_jump_host_key_under_jump_identity() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        spawn_bootstrap_host_key_forwarder(
+            event_rx,
+            Some(Arc::new(FixedResponseCallback { trusted_fingerprint: "jump-fp".to_string() })),
+        );
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        event_tx
+            .send(TransportEvent::JumpHostKey {
+                host: "bastion.test".to_string(),
+                port: 2222,
+                fingerprint: "jump-fp".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap(), "jump host key must be checked under the jump host's own host:port");
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        event_tx
+            .send(TransportEvent::JumpHostKey {
+                host: "target.test".to_string(),
+                port: 22,
+                fingerprint: "jump-fp".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(!reply_rx.await.unwrap(), "a different host identity must not be accepted");
     }
 
     /// callback を取得できなかった場合(プログラミングエラー等)は、フェイルセーフとして
