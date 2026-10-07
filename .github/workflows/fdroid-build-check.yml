@@ -18,24 +18,36 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-  # TODO: the recipe now builds the musl isekai-pipe binaries in its
-  # `build:` block, so the "always fails, no musl step" reason for keeping
-  # this off push/PR is gone — but the fixed recipe has never had a green
-  # run yet. Trigger this once via workflow_dispatch and, when it passes,
-  # uncomment the paths-filtered pull_request trigger below. It stays
-  # path-filtered rather than running on every PR because the job does two
-  # release musl builds plus a release Android build from a cold toolchain,
-  # which is far too slow for a per-PR required check.
-  # pull_request:
-  #   paths:
-  #     - "fdroid/**"
-  #     - ".github/workflows/fdroid-build-check.yml"
-  #     - "**/*.gradle.kts"
-  #     - "gradle/libs.versions.toml"
-  #     - "gradle.properties"
-  #     - "rust-core/Cargo.lock"
-  #     - "rust-core/.cargo/config.toml"
-  #     - "rust-core/scripts/**"
+  # First went green 2026-08-17 via workflow_dispatch on
+  # chore/fdroid-green-verification, run 32005908484 (fix: this workflow's own
+  # "Confirm cargo/rustc/zig/cargo-zigbuild are reachable without sudo"
+  # diagnostic step called `cargo zigbuild --version`, which cargo's
+  # subcommand dispatch forwards into the pinned cargo-zigbuild 0.23.0's
+  # `zigbuild` subcommand parser — that parser only defines `--verbose`, not
+  # `--version`, and exits 2. Switched to calling the `cargo-zigbuild` binary
+  # directly. This was a bug in the diagnostic step only; the actual build
+  # via build-isekai-pipe-musl.sh never passed `--version` and was unaffected).
+  # Re-enabling the paths-filtered pull_request trigger below now that a green
+  # run is on record. It stays path-filtered rather than running on every PR
+  # because the job does two release musl builds plus a release Android build
+  # from a cold toolchain, which is far too slow for a per-PR required check.
+  # `rust-core/src/**` is deliberately NOT in this list: rust-core source
+  # changes are already covered by cheaper existing workflows (e.g.
+  # android-test-check.yml, android-uniffi-drift-check.yml) that catch
+  # compile breaks well before this slower F-Droid-recipe-fidelity check
+  # would; adding it here would make nearly every Rust PR pay this job's
+  # 60-100 minute cold-cache cost for no additional signal.
+  pull_request:
+    paths:
+      - "fdroid/**"
+      - ".github/workflows/fdroid-build-check.yml"
+      - "**/*.gradle.kts"
+      - "gradle/libs.versions.toml"
+      - "gradle.properties"
+      - "android/proguard-rules.pro"
+      - "rust-core/Cargo.lock"
+      - "rust-core/.cargo/config.toml"
+      - "rust-core/scripts/**"
 
 permissions:
   contents: read
@@ -116,11 +128,19 @@ jobs:
           # zig and cargo-zigbuild are checked the same way: they are installed
           # into /opt by the recipe and reached via /usr/local/bin symlinks, and
           # the musl builds below need them as a non-root user.
+          # NOTE: this must call the `cargo-zigbuild` binary directly, not
+          # `cargo zigbuild --version` — cargo's subcommand dispatch forwards
+          # `--version` into the `zigbuild` subcommand's own clap parser
+          # (pinned cargo-zigbuild 0.23.0), which only defines `--verbose`
+          # there and rejects `--version` with exit code 2. Confirmed against
+          # a real CI run of this step. The actual build
+          # (build-isekai-pipe-musl.sh) never passes `--version`, so this was
+          # a bug in this diagnostic step only, not in the recipe/build.
           which cargo rustc zig cargo-zigbuild
           cargo --version
           rustc --version
           zig version
-          cargo zigbuild --version
+          cargo-zigbuild --version
 
       - name: Cache Gradle and Cargo
         uses: actions/cache@v4
