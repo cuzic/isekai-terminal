@@ -168,7 +168,9 @@ fun ProfileEditScreen(
     // 使えないため、実際の暗号化処理はデフォルト引数として注入し、テストでは恒等関数
     // ({ it })に差し替える(ProfileListScreen の applyTerminalTheme と同じパターン)。
     encryptRelayJwt: (String) -> String = RelayCredentialVault::encrypt,
-    decryptRelayJwt: (String) -> String = RelayCredentialVault::decrypt,
+    // AND-H3: 復号失敗(Keystoreエントリ欠落等)で編集画面を開いた瞬間にクラッシュしないよう、
+    // 既定は失敗を空欄に落とす版を使う。
+    decryptRelayJwt: (String) -> String = RelayCredentialVault::decryptOrEmpty,
 ) {
     val vm: ProfileEditViewModel = viewModel()
     val keys by vm.keys.collectAsStateWithLifecycle()
@@ -197,7 +199,7 @@ fun ProfileEditScreen(
     var stunServer by remember { mutableStateOf(profile?.stunServer ?: "") }
     var relayAddr by remember { mutableStateOf(profile?.relayAddr ?: "") }
     var relaySni by remember { mutableStateOf(profile?.relaySni ?: "") }
-    var relayJwt by remember { mutableStateOf(profile?.relayJwt?.let(decryptRelayJwt) ?: "") }
+    var relayJwt by remember { mutableStateOf(profile?.relayJwt?.let { runCatching { decryptRelayJwt(it) }.getOrNull() } ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }

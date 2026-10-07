@@ -922,7 +922,23 @@ async fn dial_and_replay(
     let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
     match reconnect_and_resume(factory, target, state.session_id, client_sent_offset, client_delivered_offset).await {
         Ok(mut resumed) => {
-            if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+            let committed = resumed.helper_committed_offset.get();
+            // The helper claims to have committed an offset this client can no
+            // longer replay from: bytes were lost and the two sides' offsets can
+            // never be reconciled again — deterministic for this session, so the
+            // reducer gives up at once instead of retrying for the whole resume
+            // window (review 2026-09-29, PIPE-10). A replay *write* failure below
+            // stays an ordinary, retried `ReplayFailed`.
+            if committed_offset_out_of_replay_range(&state.replay.lock().unwrap(), committed) {
+                return Err((
+                    AttemptFailure::Unrecoverable,
+                    format!(
+                        "the helper's committed offset {committed} is outside this client's replay buffer \
+                         (bytes were lost; the two sides' offsets can no longer be reconciled)"
+                    ),
+                ));
+            }
+            if !replay_and_advance(&state.replay, committed, &mut resumed.data_stream).await {
                 // resume自体は成功したがreplayが不整合 —実質「この試行は
                 // 失敗した」ので、通常の失敗と同じTTY/非TTY分岐・
                 // last_resume_error更新を行う(codexレビューで指摘: この
@@ -936,7 +952,16 @@ async fn dial_and_replay(
             })
         }
         Err(e) => {
-            let kind = if is_unknown_session_rejection(&e) { AttemptFailure::UnknownSession } else { AttemptFailure::Other };
+            let kind = if is_unknown_session_rejection(&e) {
+                AttemptFailure::UnknownSession
+            } else if is_offset_gone_rejection(&e) {
+                // The server can no longer replay from the offset this client
+                // last received — every later RESUME of this session gets the
+                // same answer (PIPE-10).
+                AttemptFailure::Unrecoverable
+            } else {
+                AttemptFailure::Other
+            };
             Err((kind, format!("{e:#}")))
         }
     }
@@ -957,16 +982,35 @@ async fn dial_and_replay(
 /// per a Codex review finding) — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
 /// consecutive occurrences are treated as such by the reducer
 /// (`resume_fsm::update_unknown_session_streak`).
-/// `Auth`/`OffsetGone` and any non-rejection `TransportError` (network/mux
-/// failures) are left to the existing deadline-bound retry loop unchanged —
-/// those are rejections of a *specific attempt*, not proof the session
-/// itself is gone, so this function deliberately doesn't guess at their
-/// retriability.
+/// `Auth` and any non-rejection `TransportError` (network/mux failures) are
+/// left to the existing deadline-bound retry loop unchanged — those are
+/// rejections of a *specific attempt*, not proof the session itself is gone,
+/// so this function deliberately doesn't guess at their retriability.
+/// `OffsetGone` is different — deterministic for this session — and is
+/// classified separately (`is_offset_gone_rejection`, PIPE-10).
 fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
     matches!(
         e,
         isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
     )
+}
+
+/// `OffsetGone` — unlike `UnknownSession` (see above), deterministic for this
+/// session: the server's S→C replay buffer no longer reaches back to the
+/// offset this client last delivered, and nothing a retry does can change
+/// that (PIPE-10, `AttemptFailure::Unrecoverable`).
+fn is_offset_gone_rejection(e: &isekai_transport::TransportError) -> bool {
+    matches!(
+        e,
+        isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::OffsetGone)
+    )
+}
+
+/// Whether the helper's claimed `committed_offset` lies outside what this
+/// client's C→S replay buffer can reproduce — exactly
+/// `ReplayBuffer::replay_from`'s `None` cases (PIPE-10).
+fn committed_offset_out_of_replay_range(replay: &C2hReplayBuffer, committed_offset: u64) -> bool {
+    committed_offset < replay.start_offset() || committed_offset > replay.end_offset()
 }
 
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
@@ -1176,7 +1220,9 @@ async fn resume_with_backoff_until_deadline(
                     // ログでは個々の失敗を追えることの方が重要なため。
                     let line = match kind {
                         AttemptFailure::ReplayFailed => format!("isekai-pipe connect: resume attempt {attempt} {msg}"),
-                        AttemptFailure::UnknownSession | AttemptFailure::Other => {
+                        // `Unrecoverable` ends the episode with a give-up instead
+                        // (no `ReportAttemptFailure`); listed for exhaustiveness.
+                        AttemptFailure::UnknownSession | AttemptFailure::Other | AttemptFailure::Unrecoverable => {
                             format!("isekai-pipe connect: resume attempt {attempt} failed: {msg}")
                         }
                     };
@@ -1274,6 +1320,30 @@ async fn resume_with_backoff_until_deadline(
                              retrying would never succeed."
                         )
                     }
+                    GiveUpReason::SessionUnrecoverable => {
+                        // The attempt that ended the episode is not reported via
+                        // `ReportAttemptFailure`; its message is still pending.
+                        let what = last_failure
+                            .take()
+                            .map(|(_, msg)| msg)
+                            .unwrap_or_else(|| "the session can no longer be resumed".to_string());
+                        give_up(
+                            state.is_tty,
+                            warm_standby_task,
+                            &format!(
+                                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - {what}; \
+                                 retrying this session would never succeed. Ending this connect attempt; \
+                                 ssh will treat this as a lost connection.",
+                            ),
+                        );
+                        if notify {
+                            notify_os(
+                                "isekai-pipe connect",
+                                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): {what}."),
+                            );
+                        }
+                        anyhow::anyhow!("resume of session_id={session_id} for '{profile}' can never succeed: {what}")
+                    }
                 };
                 if let Some(reason) = continuity_lost {
                     record_continuity_lost(session_id, reason);
@@ -1307,6 +1377,34 @@ fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_alread
     }
 }
 
+/// Process-global "the SSH byte bridge has gone live" latch (PIPE-18) —
+/// set once `run_resume_loop` starts bridging stdin/stdout, never reset.
+/// One `isekai-pipe connect` process serves exactly one `ssh(1)` session,
+/// so a process-wide flag is the right scope. Read by
+/// `connect::write_connect_outcome_for_wrapper` to stamp
+/// `ConnectOutcome::session_established`, which lets `isekai-ssh`'s wrapper
+/// avoid re-running a remote command after a mid-session failure that the
+/// outcome `class` alone (e.g. the relay route's `Unreachable`) cannot
+/// distinguish from a pre-handshake one.
+///
+/// Semantics: `true` means the bridge was **armed**, not that any byte
+/// flowed — it is set on entry to `run_resume_loop`, before the first stdin
+/// read. That errs on the safe side for "never re-run a non-idempotent
+/// remote command", but a consumer (the #130 re-split's D-1) will then also
+/// skip automatic re-exec when the very first post-handshake read fails with
+/// zero bytes exchanged; that cost to always-connects auto-recovery is
+/// deliberate and must be weighed there.
+///
+/// Scope caveat for tests: being process-global and never reset, any
+/// in-process test that enters `run_resume_loop` leaves it `true` for every
+/// later test in the same test binary — a test must not assert
+/// `session_established == false` after such a test could have run.
+static SSH_BRIDGE_WENT_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn ssh_bridge_went_live() -> bool {
+    SSH_BRIDGE_WENT_LIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1330,6 +1428,10 @@ pub(crate) async fn run_resume_loop(
         tethering_interface.is_none() || cross_family_target.is_none(),
         "tethering_interface and cross_family_target must never both be set until warm-standby is made switch-aware"
     );
+    // From here on stdin/stdout are bridged to the remote sshd — the one
+    // point every connect route (relay, relay fallback, STUN) passes through
+    // before any SSH byte can flow (PIPE-18).
+    SSH_BRIDGE_WENT_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     let session_id = established.session_id;
     let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);
@@ -1644,15 +1746,20 @@ async fn pump_c2h(
             let _ = quic_write.shutdown().await;
             return Ok(());
         }
-        quic_write
-            .write_all(&buf[..n])
-            .await
-            .context("writing to remote stream failed")
-            .map_err(PumpFailure::Remote)?;
+        // Append to the replay buffer *before* sending (review 2026-09-29,
+        // PIPE-03). The old send-then-append order lost bytes whenever the
+        // send failed or — the common case — `run_resume_loop`'s outer
+        // `select!` cancelled this whole pump on a network change while
+        // `write_all` was blocked on flow control (i.e. exactly when the link
+        // drops): whatever had partially gone out was never buffered, so the
+        // helper's committed offset could run past this buffer's end and
+        // the replay failed the resume. Buffered first, every byte read from
+        // stdin is replayable no matter where the send stops.
+        //
         // `read_len`が`remaining_capacity()`で頭打ちにしてあり、`advance_start`は
         // 空きを増やすことしかしないため、ここが`false`になることは無い。それでも
         // 握り潰さないのは、もし起きた場合の被害が「replayバッファに載らないまま
-        // QUICへ送出済みのバイトができる」=`end_offset()`由来の
+        // QUICへ送出されるバイトができる」=`end_offset()`由来の
         // `client_sent_offset`がhelper側とずれる、というresume不能状態だから
         // (`.claude/rules/always-connects.md`)。接続ごと畳んでしまえば
         // `run_resume_loop`が再接続からやり直せるので、そちらの方が安全側に倒れる
@@ -1663,6 +1770,11 @@ async fn pump_c2h(
                  dropping this connection rather than desyncing client_sent_offset"
             )));
         }
+        quic_write
+            .write_all(&buf[..n])
+            .await
+            .context("writing to remote stream failed")
+            .map_err(PumpFailure::Remote)?;
     }
 }
 
@@ -1705,12 +1817,11 @@ async fn pump_h2c(
 /// clamp側へ一本化した — 詳しい理由は
 /// [`quicmux::ReplayBuffer::advance_start`]のdocs参照。
 ///
-/// ここでjump-aheadが問題にならなかったのは、このファイル固有の構造の
-/// おかげでしかない: `pump_c2h`は単一タスク内で「appendしてから次の周回で
-/// advance_start」の順に実行するため、`engine/mod.rs`側にある
-/// 「peerへ送出済みだがappend前」の窓がそもそも開かない。加えて
-/// `replay_and_advance`が`replay_from`で範囲外offsetを先に弾くため、
-/// この分岐は到達不能だった。
+/// 現在は`pump_c2h`も`engine/mod.rs`の`relay_buffered`(S→C)も「replayへappend
+/// してから送信」の順(review 2026-09-29, PIPE-03)なので、「peerへ送出済みだが
+/// append前」の窓はどちら側にも無く、正当なackが`end_offset()`を超えることは無い。
+/// 超えるackが来た場合の扱い(clamp)は上記docs参照。加えて`replay_and_advance`が
+/// `replay_from`で範囲外offsetを先に弾く。
 type C2hReplayBuffer = quicmux::ReplayBuffer;
 
 #[cfg(test)]
@@ -1932,6 +2043,30 @@ mod tests {
         .await;
         assert!(result.is_ok(), "a BUSY_OTHER_SESSION failure must be retried until it succeeds");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn offset_gone_is_classified_separately_from_unknown_session() {
+        use isekai_transport::{ResumeRejectReason, TransportError};
+        assert!(is_offset_gone_rejection(&TransportError::ResumeRejected(ResumeRejectReason::OffsetGone)));
+        assert!(!is_offset_gone_rejection(&TransportError::ResumeRejected(ResumeRejectReason::UnknownSession)));
+        assert!(!is_unknown_session_rejection(&TransportError::ResumeRejected(ResumeRejectReason::OffsetGone)));
+    }
+
+    /// PIPE-10: the replay-range check matches `ReplayBuffer::replay_from`'s
+    /// `None` cases exactly.
+    #[test]
+    fn committed_offset_out_of_replay_range_matches_replay_from() {
+        let mut replay = C2hReplayBuffer::new(1024);
+        assert!(replay.append(b"0123456789"));
+        replay.advance_start(4);
+        for committed in 0..=12u64 {
+            assert_eq!(
+                committed_offset_out_of_replay_range(&replay, committed),
+                replay.replay_from(committed).is_none(),
+                "committed={committed}"
+            );
+        }
     }
 
     #[test]
@@ -2283,6 +2418,52 @@ mod tests {
             assert!(
                 matches!(result, Err(PumpFailure::Local(_))),
                 "a stdin read failure must be classified Local, not Remote: {result:?}"
+            );
+        }
+
+        /// Endless stdin of zero bytes that counts how much it has handed out.
+        struct CountingZeroReader(Arc<std::sync::atomic::AtomicU64>);
+        impl tokio::io::AsyncRead for CountingZeroReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let n = buf.remaining();
+                buf.put_slice(&vec![0u8; n]);
+                self.0.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// Regression (review 2026-09-29, PIPE-03): every byte `pump_c2h`
+        /// reads from stdin must be in the replay buffer even when the QUIC
+        /// send of it fails. The fixture listener drops any stream whose
+        /// first bytes aren't a `CONTROL_HELLO` (→ STOP_SENDING), so the
+        /// pump's writes start failing; with the old send-then-append order
+        /// the chunk whose send failed was never buffered, leaving the
+        /// replay buffer's end short of what was actually read — exactly the
+        /// gap that made a later resume fail.
+        #[tokio::test]
+        async fn pump_c2h_buffers_every_read_byte_even_when_the_send_fails() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let stream = conn.open_bi().await.unwrap();
+            let (_recv, mut send) = stream.split();
+
+            let read_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut stdin = CountingZeroReader(read_total.clone());
+            let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(256 * 1024 * 1024)));
+            let counters = Arc::new(AppAckCounters::new());
+
+            let result = tokio::time::timeout(Duration::from_secs(20), pump_c2h(&mut stdin, &mut send, replay.clone(), counters))
+                .await
+                .expect("the peer's STOP_SENDING should make the pump's writes fail");
+            assert!(matches!(result, Err(PumpFailure::Remote(_))), "{result:?}");
+            assert_eq!(
+                replay.lock().unwrap().end_offset(),
+                read_total.load(std::sync::atomic::Ordering::SeqCst),
+                "every byte read from stdin must have been buffered for replay"
             );
         }
 

@@ -552,7 +552,7 @@ private fun TerminalPaneScreen(
                     onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(address) },
                     onTrzszCancel = { pane.session.trzszCancel() },
                     onTrzszDismiss = { pane.session.trzszDismiss() },
-                    onGetSessionLog = { pane.session.log.value },
+                    onGetSessionLog = { pane.session.logSnapshot() },
                     onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(address, snippet) },
                     onSendKeySequence = { steps -> tabsVm.sendKeySequenceToPane(address, steps) },
                     onRespondAgentSignRequest = { approved -> pane.session.respondAgentSignRequest(approved) },

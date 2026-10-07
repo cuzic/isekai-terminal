@@ -115,6 +115,11 @@ impl OpenSshBackend {
             args.push("-p".to_string());
             args.push(port.to_string());
         }
+        // `--` ends option parsing (review 2026-09-29, SSH-41): a destination
+        // that happens to start with `-` (from an `ssh -G`-resolved alias or a
+        // `bootstrap-candidate target=` directive) must never be read as an
+        // `ssh(1)` option such as `-oProxyCommand=...`.
+        args.push("--".to_string());
         args.push(target.ssh_destination());
         args.push(remote_command.to_string());
         args
@@ -250,6 +255,18 @@ impl BootstrapBackend for OpenSshBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SSH-41: the destination is always preceded by `--`, so it can never
+    /// be parsed as an `ssh(1)` option.
+    #[test]
+    fn build_args_terminates_options_before_the_destination() {
+        let backend = OpenSshBackend::new();
+        let args = backend.build_args(&HostSpec::new("-oProxyCommand=evil").with_port(22), &[], "uname -m");
+        let dashdash = args.iter().position(|a| a == "--").expect("`--` must be present");
+        assert_eq!(args.len(), dashdash + 3, "only the destination and the remote command may follow `--`: {args:?}");
+        assert_eq!(args[dashdash + 2], "uname -m");
+        assert!(args[..dashdash].iter().all(|a| !a.contains("evil")), "the destination must not appear among the options: {args:?}");
+    }
 
     #[test]
     fn join_via_chain_is_none_for_an_empty_chain() {

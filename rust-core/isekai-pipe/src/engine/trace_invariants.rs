@@ -85,6 +85,7 @@ pub(crate) fn observe_event(agg: &ServeAggregate, event: &ServeEvent) -> ServeTr
         ServeEvent::LeaseStopped { .. } => ServeTraceEvent::Other("LeaseStopped"),
         ServeEvent::Activated { .. } => ServeTraceEvent::Other("Activated"),
         ServeEvent::Parked { .. } => ServeTraceEvent::Other("Parked"),
+        ServeEvent::ResumeUnavailable { .. } => ServeTraceEvent::Other("ResumeUnavailable"),
         ServeEvent::Sweep { .. } => ServeTraceEvent::Other("Sweep"),
         ServeEvent::ResumeRequested { .. } => ServeTraceEvent::Other("ResumeRequested"),
     }
