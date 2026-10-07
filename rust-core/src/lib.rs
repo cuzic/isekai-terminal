@@ -1725,7 +1725,7 @@ pub(crate) async fn run_russh_transport(
             }
             pool::AttachOutcome::Waiter(rx) => {
                 transport::zeroize_ssh_auth(&mut config.auth);
-                match pool::wait_for_establish(rx).await {
+                match pool::wait_for_establish(rx, pool::ESTABLISH_TIMEOUT).await {
                     Ok(v) => v,
                     Err(msg) => {
                         pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);

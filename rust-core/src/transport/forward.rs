@@ -732,4 +732,76 @@ mod local_forward_e2e_tests {
             orchestrator.disconnect();
         });
     }
+    #[test]
+    fn dynamic_forward_drops_a_client_that_never_finishes_socks_negotiation() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let echo_addr = spawn_echo_server().await;
+            let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
+
+            let probe = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bind_port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
+            let orchestrator = create_session_orchestrator(callback);
+
+            let config = SshConfig {
+                host: ssh_addr.ip().to_string(),
+                port: ssh_addr.port(),
+                username: "tester".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+                cols: 80,
+                rows: 24,
+                forwards: vec![PortForward {
+                    forward_type: ForwardType::Dynamic,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port,
+                    remote_host: String::new(),
+                    remote_port: 0,
+                }],
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            };
+
+            orchestrator.connect(config).expect("connect() should not fail synchronously");
+
+            let mut listening = false;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Listening))) => { listening = true; break; }
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Failed { reason }))) => {
+                        panic!("dynamic forward reported Failed before Listening: {}", reason);
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(listening, "dynamic forward did not report Listening within timeout");
+
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(5),
+                TokioTcpStream::connect(("127.0.0.1", bind_port)),
+            ).await.expect("connect to SOCKS port timed out")
+             .expect("connect to SOCKS port failed");
+
+            // RC-35: 挨拶の1バイト目だけ送って止まるクライアント。以前はネゴシエーションに
+            // 上限が無く、このタスクが永久にacceptした接続を握り続けた。上限(10秒)の後に
+            // サーバー側から閉じられ、こちらのreadはEOF(または接続リセット)で終わる。
+            client.write_all(&[0x05]).await.unwrap();
+            let mut buf = [0u8; 16];
+            let read = tokio::time::timeout(
+                SOCKS_NEGOTIATION_TIMEOUT + Duration::from_secs(10),
+                client.read(&mut buf),
+            ).await.expect("a stalled SOCKS client must be dropped once SOCKS_NEGOTIATION_TIMEOUT elapses");
+            match read {
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("unexpected {n} bytes for an incomplete SOCKS greeting"),
+            }
+
+            orchestrator.disconnect();
+        });
+    }
 }

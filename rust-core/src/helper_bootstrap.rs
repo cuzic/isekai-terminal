@@ -175,7 +175,7 @@ async fn run_exec(
 
 /// bootstrapの1回のexec(バイナリのアップロードを含む)の上限時間。遅いモバイル回線での
 /// 数MBのアップロードも収まるよう長めにしてある。
-const BOOTSTRAP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const BOOTSTRAP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// bootstrapのexecが返すstdout(uname・バージョン・ハンドシェイクJSON等、いずれも小さい)の上限。
 const BOOTSTRAP_EXEC_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 

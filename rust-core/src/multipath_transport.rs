@@ -958,6 +958,10 @@ struct PhysicalFds {
 
 impl PhysicalFds {
     /// `config`の生fdの所有権をここで引き取る。以後どの経路で失敗してもdropでcloseされる。
+    ///
+    /// 同じ`config`で2回呼ぶと二重closeになる。現状それが起きないのは、再接続が必ず
+    /// `orchestrator.rs`の`LastConnectAttempt::for_reconnect`を通り、そこで
+    /// `wifi_fd`/`cellular_fd`が消されるため(#175)。再接続経路を増やすときはこの前提を守ること。
     fn take_ownership(config: &MultipathIsekaiPipeQuicConfig) -> Self {
         let own = |fd: Option<i32>| fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
         PhysicalFds { wifi: own(config.wifi_fd), cellular: own(config.cellular_fd) }
@@ -1183,6 +1187,69 @@ mod tests {
             bind_port: None,
             enable_upstream_failover: false,
         }
+    }
+
+    /// RC-24テスト用: 実在するUDPソケットのfdを生fdとして取り出す(Kotlinの
+    /// `ParcelFileDescriptor.detachFd()`相当)。
+    #[cfg(target_os = "linux")]
+    fn detached_udp_fd() -> RawFd {
+        use std::os::fd::IntoRawFd;
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp").into_raw_fd()
+    }
+
+    /// RC-24テスト用: このプロセスで`fd`がまだ開いているか(Linuxの`/proc/self/fd`で確認)。
+    #[cfg(target_os = "linux")]
+    fn fd_is_open(fd: RawFd) -> bool {
+        std::path::Path::new(&format!("/proc/self/fd/{fd}")).exists()
+    }
+
+    /// RC-24: Kotlinから渡された生fdは`PhysicalFds`が所有し、早期return等で
+    /// dropされた時点でcloseされる(以前はどの経路でも閉じられずリークした)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_fds_close_the_detached_fds_on_drop() {
+        let wifi = detached_udp_fd();
+        let cellular = detached_udp_fd();
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(wifi);
+        config.cellular_fd = Some(cellular);
+        let fds = PhysicalFds::take_ownership(&config);
+        assert!(fd_is_open(wifi) && fd_is_open(cellular), "take_ownership must not close the fds itself");
+        drop(fds);
+        assert!(!fd_is_open(wifi), "wifi fd {wifi} must be closed when PhysicalFds is dropped");
+        assert!(!fd_is_open(cellular), "cellular fd {cellular} must be closed when PhysicalFds is dropped");
+    }
+
+    /// RC-24: 負のfd(「無し」を表すKotlin側の番兵)は所有しない(他人のfdを閉じない)。
+    #[test]
+    fn physical_fds_ignore_negative_fds() {
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(-1);
+        config.cellular_fd = None;
+        let fds = PhysicalFds::take_ownership(&config);
+        assert!(fds.wifi.is_none() && fds.cellular.is_none());
+    }
+
+    /// RC-24: ローカルIPが不正で候補にならなかったfdは、`physical_path_candidates`の
+    /// 終わりでcloseされる(候補になったfdは候補が所有し続ける)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn physical_candidates_close_the_fd_of_a_rejected_candidate() {
+        let wifi = detached_udp_fd();
+        let cellular = detached_udp_fd();
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(wifi);
+        config.wifi_local_ip = Some("not-an-ip".to_string());
+        config.cellular_fd = Some(cellular);
+        config.cellular_local_ip = Some("127.0.0.1".to_string());
+        let fds = PhysicalFds::take_ownership(&config);
+        let target: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let candidates = physical_path_candidates(&config, fds, target, 4433).await;
+        assert_eq!(candidates.len(), 1, "only the cellular candidate has a valid local ip");
+        assert!(!fd_is_open(wifi), "the rejected wifi fd {wifi} must be closed");
+        assert!(fd_is_open(cellular), "the accepted cellular fd is owned by its candidate");
+        drop(candidates);
+        assert!(!fd_is_open(cellular), "dropping the candidate closes its fd");
     }
 
     /// #9: `set_interactive_busy`/`is_interactive_busy`は接続の有無に関わらず

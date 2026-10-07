@@ -732,16 +732,17 @@ async fn establish_fresh(
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
 ) -> Result<PooledSshHandle, AcquireError> {
-    // RC-16: bootstrap(SSH)+QUICハンドシェイク+ネスト認証の全体に上限を設ける。
+    // RC-16: bootstrap(SSH)+QUICハンドシェイク+ネスト認証の全体に上限を設ける
+    // (アップロードexecを丸ごと含むので通常SSHより長い[crate::pool::QUIC_ESTABLISH_TIMEOUT])。
     // 止まったままだとプールエントリが`Connecting`のまま残り、後続タブ・再接続が
     // 永久に待つ。打ち切りは(Autoなら通常SSHへフォールバックできるよう)ダイヤル失敗扱い。
-    match tokio::time::timeout(crate::pool::ESTABLISH_TIMEOUT, establish_fresh_inner(config, host_key_callback, event_tx)).await {
+    match tokio::time::timeout(crate::pool::QUIC_ESTABLISH_TIMEOUT, establish_fresh_inner(config, host_key_callback, event_tx)).await {
         Ok(r) => r,
         Err(_) => {
             zeroize_ssh_auth(&mut config.auth);
             Err(AcquireError::DialFailed(format!(
                 "isekai-pipe QUIC connection establishment timed out after {}s",
-                crate::pool::ESTABLISH_TIMEOUT.as_secs()
+                crate::pool::QUIC_ESTABLISH_TIMEOUT.as_secs()
             )))
         }
     }
@@ -794,7 +795,7 @@ async fn acquire_pooled_handle(
             }
             crate::pool::AttachOutcome::Waiter(rx) => {
                 zeroize_ssh_auth(&mut config.auth);
-                match crate::pool::wait_for_establish(rx).await {
+                match crate::pool::wait_for_establish(rx, crate::pool::QUIC_ESTABLISH_TIMEOUT).await {
                     Ok(v) => AcquireOutcome::Attached(v, Some(key)),
                     Err(m) => {
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);

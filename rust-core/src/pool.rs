@@ -120,6 +120,26 @@ where
 /// 既定`LoginGraceTime`(サーバー側がこれ以上待たない)と同じ120秒にしてある。
 pub(crate) const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// RC-16(PR #200レビューF1): isekai-pipe QUIC系の確立上限。こちらは通常SSHの確立に加えて
+/// bootstrap(数MBの`isekai-pipe`をbase64でアップロードするexecを含む、1回あたり
+/// [crate::helper_bootstrap::BOOTSTRAP_EXEC_TIMEOUT]=300秒まで)・QUICハンドシェイク・
+/// ネストしたSSH認証・踏み台/接続先のホスト鍵ダイアログを1つの上限で覆う。120秒では
+/// 低速なモバイル上り回線での再アップロードが毎回打ち切られ、明示的に`IsekaiPipeQuic`を
+/// 選んだプロファイルが永久に接続できなくなるため、アップロード1回分の上限に通常SSHの
+/// 確立上限を足した値にする([quic_establish_timeout_covers_upload_plus_ssh]で固定)。
+pub(crate) const QUIC_ESTABLISH_TIMEOUT: Duration =
+    Duration::from_secs(crate::helper_bootstrap::BOOTSTRAP_EXEC_TIMEOUT.as_secs() + ESTABLISH_TIMEOUT.as_secs());
+
+/// 待機側(Waiter)の上限は、対応する確立側(Establisher)の上限より必ず長くする
+/// (確立側が先に結果を公開するのが正常系。待機側の上限は確立側タスク自体が止まった
+/// 場合の多重防御)。
+const WAITER_MARGIN: Duration = Duration::from_secs(30);
+
+/// 確立側の上限`establish_timeout`に対応する待機側の上限。
+pub(crate) const fn waiter_timeout_for(establish_timeout: Duration) -> Duration {
+    Duration::from_secs(establish_timeout.as_secs() + WAITER_MARGIN.as_secs())
+}
+
 /// 確立処理`fut`を[ESTABLISH_TIMEOUT]で打ち切る。打ち切った場合は`Err`を返すので、
 /// Establisherは通常の失敗と同じく[publish_failure]する(待機中のタブも解放される)。
 pub(crate) async fn with_establish_timeout<T>(
@@ -140,14 +160,16 @@ async fn with_timeout<T>(
 
 /// [AttachOutcome::Waiter]を受け取ったタブが、確立担当タブの結果を待つ。
 ///
-/// RC-16: Establisher側は[ESTABLISH_TIMEOUT]で必ず結果を公開するが、万一
+/// RC-16: Establisher側は`establish_timeout`(そのプールの確立上限、通常SSHなら
+/// [ESTABLISH_TIMEOUT]、QUIC系なら[QUIC_ESTABLISH_TIMEOUT])で必ず結果を公開するが、万一
 /// Establisherのタスク自体が結果を公開せずに止まった場合(`watch::Sender`は
 /// マップ内に残るため`changed()`はエラーにならない)にも永久に待たないよう、
-/// 待機側にも少し長めの上限を設ける(多重防御)。
+/// 待機側にもそれより少し長い上限([waiter_timeout_for])を設ける(多重防御)。
 pub(crate) async fn wait_for_establish<T>(
     rx: watch::Receiver<Option<Result<Arc<T>, String>>>,
+    establish_timeout: Duration,
 ) -> Result<Arc<T>, String> {
-    wait_for_establish_with_timeout(rx, ESTABLISH_TIMEOUT + Duration::from_secs(30)).await
+    wait_for_establish_with_timeout(rx, waiter_timeout_for(establish_timeout)).await
 }
 
 async fn wait_for_establish_with_timeout<T>(
@@ -464,6 +486,29 @@ mod tests {
         let (_tx, rx) = watch::channel::<Option<Result<Arc<u32>, String>>>(None);
         let err = wait_for_establish_with_timeout(rx, Duration::from_secs(5)).await.expect_err("waiter must time out");
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// PR #200レビューF1: QUIC系の確立上限は、bootstrapのアップロードexec 1回分の上限
+    /// (300秒)を丸ごと含み、さらに通常SSHの確立上限以上の余裕を持つ。120秒に戻すと
+    /// 低速回線での再アップロードが常に打ち切られる回帰になる。
+    #[test]
+    fn quic_establish_timeout_covers_upload_plus_ssh() {
+        assert!(
+            QUIC_ESTABLISH_TIMEOUT >= crate::helper_bootstrap::BOOTSTRAP_EXEC_TIMEOUT + ESTABLISH_TIMEOUT,
+            "QUIC establish cap {QUIC_ESTABLISH_TIMEOUT:?} must cover one upload exec plus a plain SSH establish"
+        );
+        assert!(QUIC_ESTABLISH_TIMEOUT >= Duration::from_secs(300));
+    }
+
+    /// 待機側の上限は、どのプールでも確立側の上限より長い(確立側が先に結果を公開する)。
+    #[test]
+    fn waiter_timeout_outlasts_establisher_for_every_pool() {
+        for establish in [ESTABLISH_TIMEOUT, QUIC_ESTABLISH_TIMEOUT] {
+            assert!(
+                waiter_timeout_for(establish) > establish,
+                "waiter cap must exceed establisher cap {establish:?}"
+            );
+        }
     }
 
     #[tokio::test]
