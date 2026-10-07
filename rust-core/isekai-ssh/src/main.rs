@@ -13,6 +13,8 @@ mod build_exec;
 mod build_profile;
 mod build_profile_cli;
 mod cli;
+mod connect_recovery_driver;
+mod connect_recovery_fsm;
 mod ctl_forward;
 mod doctor;
 mod helper_download;

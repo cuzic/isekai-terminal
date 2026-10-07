@@ -11,8 +11,19 @@
 //! item" — see this module's own callers (`wrapper.rs` on Unix,
 //! `native::connect` on Windows' single-process fallback) for why a
 //! simpler, console-independent wait is the right fit for both.
+//!
+//! Pure since ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7: the accounting here
+//! ([`RedeployGate`], [`RecoveryBudget`]) never reads a clock or an RNG
+//! itself. Time arrives as `now: Millis` stamped by the shell
+//! (`connect_recovery_driver.rs`), and jitter as an explicit `seed: u64`.
+//! The one reducer that drives both is `connect_recovery_fsm.rs`, shared by
+//! the Unix (`wrapper.rs`) and Windows-native (`native::connect`) paths.
+// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
+
+use isekai_protocol::Millis;
 
 /// How long a mid-session reconnect loop keeps retrying before giving up
 /// and returning control to the user — same value and rationale as
@@ -104,25 +115,46 @@ pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(200)
 /// session; `tssh` never re-deploys `tsshd`).
 pub(crate) const REDEPLOY_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_secs(60), max: Duration::from_secs(300), jitter: 0.25 };
 
+/// `Millis + Duration`, rounding the duration *up* to whole milliseconds and
+/// saturating — so a deadline computed here is never earlier than the
+/// `tokio::time::Instant + Duration` it replaced (Step 6+7: the shell's
+/// `now` stamps are floored to whole milliseconds, so ceiling the delay keeps
+/// every gate opening at-or-after the pre-Step-6+7 instant).
+fn add_ceil(at: Millis, delay: Duration) -> Millis {
+    let ms = u64::try_from(delay.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+    Millis(at.0.saturating_add(ms))
+}
+
+/// `true` if an attempt that started at `attempt_started` and failed at
+/// `now` ran long enough to count as a separate, later event (see
+/// [`RECONNECT_STABLE_THRESHOLD`]). `saturating_sub`, so a non-monotonic
+/// `now` reads as "not stable" rather than wrapping (ADR §2.2).
+fn was_stable(attempt_started: Millis, now: Millis) -> bool {
+    now.saturating_sub(attempt_started) >= RECONNECT_STABLE_THRESHOLD
+}
+
 /// The single authority for "is a full re-deploy allowed right now" —
 /// deliberately the *only* place this decision is made (`.claude/rules/
 /// rust-ssot.md`'s "don't duplicate a judgment across two call sites"
-/// principle): `wrapper.rs::run_ssh_with_connect_failure_recovery` and
-/// `native::connect::drive_connect_recovery` (Windows single-process
-/// fallback) share this exact type — not just the same policy — so a
-/// redeploy can never happen more often than [`REDEPLOY_BACKOFF`] allows on
-/// either platform, regardless of which `ConnectOutcomeClass` keeps
-/// triggering it.
+/// principle). Since Step 6+7 it is owned by the one shared reducer
+/// (`connect_recovery_fsm::ConnectRecoveryFsm`) that both
+/// `wrapper.rs::run_ssh_with_connect_failure_recovery` and
+/// `native::connect::run_native_connect_with_recovery` drive, so a redeploy
+/// can never happen more often than [`REDEPLOY_BACKOFF`] allows on either
+/// platform, regardless of which `ConnectOutcomeClass` keeps triggering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RedeployGate {
-    /// The instant at which the *next* redeploy becomes allowed, computed
+    /// The deadline at which the *next* redeploy becomes allowed, computed
     /// once by `record_attempt` — deliberately not "the last redeploy time
-    /// plus a delay recomputed on every `due()` call": `delay_for_attempt`
-    /// draws fresh jitter on every call, so recomputing it inside `due()`
-    /// made the gate's threshold wobble by ±25% on every single check (opus
-    /// review round 2, BLOCKER R2-1 — found because it made two freshly
-    /// added unit tests flaky, each failing roughly half the time). Storing
-    /// the resolved instant makes `due()` a pure, idempotent predicate.
-    next_due_at: Option<tokio::time::Instant>,
+    /// plus a delay recomputed on every `due()` call": the delay draws fresh
+    /// jitter, so recomputing it inside `due()` made the gate's threshold
+    /// wobble by ±25% on every single check (opus review round 2, BLOCKER
+    /// R2-1 — found because it made two freshly added unit tests flaky, each
+    /// failing roughly half the time). Storing the resolved deadline makes
+    /// `due()` a pure, idempotent predicate. Step 6+7 keeps this: the
+    /// jittered deadline is resolved exactly once, from the one `seed` passed
+    /// to `record_attempt`.
+    next_due_at: Option<Millis>,
     attempt: u32,
 }
 
@@ -132,104 +164,107 @@ impl RedeployGate {
     }
 
     /// `true` on the very first call (no redeploy has happened yet this
-    /// storm) or once the delay [`Self::record_attempt`] resolved for the
-    /// last recorded attempt has elapsed.
-    pub(crate) fn due(&self) -> bool {
+    /// storm) or once the deadline [`Self::record_attempt`] resolved for the
+    /// last recorded attempt has been reached.
+    pub(crate) fn due(&self, now: Millis) -> bool {
         match self.next_due_at {
             None => true,
-            Some(at) => tokio::time::Instant::now() >= at,
+            Some(at) => now >= at,
         }
     }
 
-    pub(crate) fn record_attempt(&mut self) {
-        self.next_due_at = Some(tokio::time::Instant::now() + REDEPLOY_BACKOFF.next_delay(self.attempt, rand::random()));
+    pub(crate) fn record_attempt(&mut self, now: Millis, seed: u64) {
+        self.next_due_at = Some(add_ceil(now, REDEPLOY_BACKOFF.next_delay(self.attempt, seed)));
         self.attempt += 1;
     }
 
     /// `due()` immediately followed by `record_attempt()` if it was —
-    /// atomically, as one call. Prefer this at call sites over pairing
-    /// `due()`/`record_attempt()` by hand: nothing enforces that pairing
-    /// (`/code-review` on `isekai-ssh` PR #115, round 2), so a future call
-    /// site that checks `due()` but forgets `record_attempt()` on some new
-    /// branch would silently leave the gate perpetually open, reintroducing
-    /// the unbounded-redeploy-storm bug this type exists to prevent.
-    /// `due()`/`record_attempt()` stay separate (pub(crate)) only for tests
-    /// that need to inspect gate state without mutating it.
-    pub(crate) fn try_consume(&mut self) -> bool {
-        if !self.due() {
+    /// atomically, as one call. Prefer this over pairing them by hand:
+    /// nothing enforces that pairing (`/code-review` on `isekai-ssh` PR #115,
+    /// round 2), so a call site that checks `due()` but forgets
+    /// `record_attempt()` would silently leave the gate perpetually open,
+    /// reintroducing the unbounded-redeploy-storm bug this type exists to
+    /// prevent.
+    pub(crate) fn try_consume(&mut self, now: Millis, seed: u64) -> bool {
+        if !self.due(now) {
             return false;
         }
-        self.record_attempt();
+        self.record_attempt(now, seed);
         true
     }
 
     /// Same "this attempt ran long enough to count as a separate, later
-    /// event" heuristic as [`reset_budget_if_stable`] — applied here too so
-    /// a long-lived session that reconnects successfully many times doesn't
-    /// have an unrelated, much-later blip immediately throttled as if it
-    /// were still the same old storm.
-    pub(crate) fn reset_if_stable(&mut self, attempt_started: tokio::time::Instant) {
-        if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
+    /// event" heuristic as [`RecoveryBudget::reset_if_stable`] — applied here
+    /// too so a long-lived session that reconnects successfully many times
+    /// doesn't have an unrelated, much-later blip immediately throttled as if
+    /// it were still the same old storm.
+    pub(crate) fn reset_if_stable(&mut self, attempt_started: Millis, now: Millis) {
+        if was_stable(attempt_started, now) {
             self.next_due_at = None;
             self.attempt = 0;
         }
     }
 }
 
-pub(crate) enum ReconnectDecision {
-    Retry,
-    GiveUp,
+/// The per-storm reconnect accounting both recovery paths used to keep as
+/// three loose locals (`attempt`/`lost_since`/`lightweight_retries`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RecoveryBudget {
+    /// Backoff attempt counter, bumped by every [`Self::next_backoff`] that
+    /// returns a delay.
+    pub(crate) attempt: u32,
+    /// When the current storm's `RECONNECT_BUDGET` clock started — set on
+    /// the first backoff of a storm, not on the first failure.
+    pub(crate) lost_since: Option<Millis>,
+    /// Lightweight (no-redeploy) retries taken this storm; compared against
+    /// `connect_recovery_fsm::MAX_LIGHTWEIGHT_RETRIES`.
+    pub(crate) lightweight_retries: u32,
 }
 
-/// Checks `RECONNECT_BUDGET` against `lost_since` (starting the clock on
-/// first use) and waits out the next backoff delay (bumping `attempt`).
-/// Unlike `native::mux::mod`'s equivalent, does not itself watch stdin for
-/// a Ctrl+C-during-wait abort — a plain `tokio::time::sleep` is
-/// interruptible enough on its own: `SIGINT`'s default disposition already
-/// terminates the whole process on Unix, and this function's Windows
-/// caller (`native::connect`'s single-process fallback loop) is not the
-/// full-terminal-raw-mode context `native::mux::mod::wait_or_abort` was
-/// built for.
-pub(crate) async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>) -> ReconnectDecision {
-    let lost_at = *lost_since.get_or_insert_with(tokio::time::Instant::now);
-    if lost_at.elapsed() >= RECONNECT_BUDGET {
-        return ReconnectDecision::GiveUp;
+impl RecoveryBudget {
+    /// `attempt`/`lost_since`/`lightweight_retries` reset — see
+    /// `RECONNECT_STABLE_THRESHOLD`'s own docs for why a stable-enough
+    /// interval since the last reconnect resets the budget rather than
+    /// letting `lost_since` stay pinned to the first-ever failure for the
+    /// process's whole remaining lifetime.
+    ///
+    /// `lightweight_retries` resets alongside `attempt`/`lost_since` (Epic R
+    /// PR2 round 2 review finding): without this, it was a
+    /// *per-process-lifetime* cap rather than a per-storm one — a long-lived
+    /// session that reconnects successfully five separate times, each stable
+    /// for hours in between, would still hit `MAX_LIGHTWEIGHT_RETRIES` on the
+    /// sixth *unrelated* blip and fall back to a full re-deploy (or, with
+    /// auto-bootstrap disabled, simply stop retrying).
+    pub(crate) fn reset_if_stable(&mut self, attempt_started: Millis, now: Millis) {
+        if was_stable(attempt_started, now) {
+            *self = Self::default();
+        }
     }
-    let delay = RECONNECT_BACKOFF.next_delay(*attempt, rand::random());
-    *attempt += 1;
-    tokio::time::sleep(delay).await;
-    ReconnectDecision::Retry
-}
 
-/// `attempt`/`lost_since`/`lightweight_retries` reset helper — see
-/// `RECONNECT_STABLE_THRESHOLD`'s own docs for why a stable-enough interval
-/// since the last reconnect resets the budget rather than letting
-/// `lost_since` stay pinned to the first-ever failure for the process's
-/// whole remaining lifetime.
-///
-/// `lightweight_retries` resets alongside `attempt`/`lost_since` (Epic R PR2
-/// round 2 review finding): without this, it was a *per-process-lifetime*
-/// cap rather than a per-storm one — a long-lived session (a `tmux` pane
-/// left open for days over a flaky link) that reconnects successfully five
-/// separate times, each stable for hours in between, would still hit
-/// `MAX_LIGHTWEIGHT_RETRIES` on the sixth *unrelated* blip and fall back to
-/// a full re-deploy (or, with auto-bootstrap disabled, simply stop
-/// retrying) even though every previous reconnect had nothing wrong with
-/// it. Resetting it on the same "was the last attempt stable" signal that
-/// already resets the backoff budget keeps both counters describing the
-/// same thing: how bad *this* reconnect storm has been, not how many
-/// reconnects have ever happened.
-pub(crate) fn reset_budget_if_stable(attempt_started: tokio::time::Instant, attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>, lightweight_retries: &mut u32) {
-    if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
-        *attempt = 0;
-        *lost_since = None;
-        *lightweight_retries = 0;
+    /// Checks `RECONNECT_BUDGET` against `lost_since` (starting the clock at
+    /// `now` on first use) and, if there is budget left, draws the next
+    /// backoff delay from `seed` and bumps `attempt`. `None` means give up.
+    /// The pure half of the former async `reconnect_backoff_or_give_up`; the
+    /// shell does the actual sleep (`RecoveryEffect::Backoff`).
+    pub(crate) fn next_backoff(&mut self, now: Millis, seed: u64) -> Option<Duration> {
+        let lost_at = *self.lost_since.get_or_insert(now);
+        if now.saturating_sub(lost_at) >= RECONNECT_BUDGET {
+            return None;
+        }
+        let delay = RECONNECT_BACKOFF.next_delay(self.attempt, seed);
+        self.attempt += 1;
+        Some(delay)
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
+
+    fn ms(d: Duration) -> u64 {
+        u64::try_from(d.as_millis()).unwrap()
+    }
 
     #[test]
     fn delay_for_attempt_grows_but_is_capped_at_max() {
@@ -239,41 +274,44 @@ mod tests {
         assert_eq!(backoff.next_delay(10, 0), Duration::from_secs(1), "must be capped at max, not keep doubling forever");
     }
 
-    #[tokio::test]
-    async fn reconnect_backoff_or_give_up_retries_within_budget_and_gives_up_after() {
-        tokio::time::pause();
-        let mut attempt = 0u32;
-        let mut lost_since = None;
+    #[test]
+    fn next_backoff_retries_within_budget_and_gives_up_after() {
+        let mut budget = RecoveryBudget::default();
         // First call starts the clock; RECONNECT_BUDGET hasn't elapsed yet.
-        assert!(matches!(reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await, ReconnectDecision::Retry));
-        assert_eq!(attempt, 1);
-
-        tokio::time::advance(RECONNECT_BUDGET + Duration::from_secs(1)).await;
-        assert!(matches!(reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await, ReconnectDecision::GiveUp));
+        assert!(budget.next_backoff(Millis(1_000), 7).is_some());
+        assert_eq!(budget.attempt, 1);
+        assert_eq!(budget.lost_since, Some(Millis(1_000)));
+        assert!(budget.next_backoff(Millis(1_000 + ms(RECONNECT_BUDGET) + 1_000), 7).is_none());
+        assert_eq!(budget.attempt, 1, "giving up must not bump the attempt counter");
     }
 
     #[test]
-    fn reset_budget_if_stable_resets_only_past_the_threshold() {
-        let mut attempt = 5u32;
-        let mut lost_since = Some(tokio::time::Instant::now());
-        let mut lightweight_retries = 5u32;
-        let started_long_ago = tokio::time::Instant::now() - (RECONNECT_STABLE_THRESHOLD + Duration::from_secs(1));
-        reset_budget_if_stable(started_long_ago, &mut attempt, &mut lost_since, &mut lightweight_retries);
-        assert_eq!(attempt, 0);
-        assert!(lost_since.is_none());
-        assert_eq!(lightweight_retries, 0, "a stable-enough attempt must also reset the lightweight-retry cap, not just the backoff budget (round 2 review: it used to be a per-process-lifetime cap)");
+    fn next_backoff_does_not_give_up_when_now_goes_backwards() {
+        let mut budget = RecoveryBudget::default();
+        assert!(budget.next_backoff(Millis(ms(RECONNECT_BUDGET)), 1).is_some());
+        // A `now` smaller than `lost_since` must read as "not elapsed".
+        assert!(budget.next_backoff(Millis(0), 1).is_some());
     }
 
     #[test]
-    fn reset_budget_if_stable_does_not_reset_a_short_lived_attempt() {
-        let mut attempt = 5u32;
-        let mut lost_since = Some(tokio::time::Instant::now());
-        let mut lightweight_retries = 5u32;
-        let started_recently = tokio::time::Instant::now();
-        reset_budget_if_stable(started_recently, &mut attempt, &mut lost_since, &mut lightweight_retries);
-        assert_eq!(attempt, 5, "an attempt shorter than RECONNECT_STABLE_THRESHOLD must not reset the budget");
-        assert!(lost_since.is_some());
-        assert_eq!(lightweight_retries, 5, "a short-lived attempt must not reset the lightweight-retry cap either");
+    fn reset_if_stable_resets_only_past_the_threshold() {
+        let mut budget = RecoveryBudget { attempt: 5, lost_since: Some(Millis(1)), lightweight_retries: 5 };
+        budget.reset_if_stable(Millis(0), Millis(ms(RECONNECT_STABLE_THRESHOLD) + 1_000));
+        assert_eq!(budget.attempt, 0);
+        assert!(budget.lost_since.is_none());
+        assert_eq!(budget.lightweight_retries, 0, "a stable-enough attempt must also reset the lightweight-retry cap, not just the backoff budget (round 2 review: it used to be a per-process-lifetime cap)");
+    }
+
+    #[test]
+    fn reset_if_stable_does_not_reset_a_short_lived_attempt() {
+        let mut budget = RecoveryBudget { attempt: 5, lost_since: Some(Millis(1)), lightweight_retries: 5 };
+        budget.reset_if_stable(Millis(10_000), Millis(10_000));
+        assert_eq!(budget.attempt, 5, "an attempt shorter than RECONNECT_STABLE_THRESHOLD must not reset the budget");
+        assert!(budget.lost_since.is_some());
+        assert_eq!(budget.lightweight_retries, 5, "a short-lived attempt must not reset the lightweight-retry cap either");
+        // Time going backwards must not look "stable" either.
+        budget.reset_if_stable(Millis(u64::MAX), Millis(0));
+        assert_eq!(budget.attempt, 5);
     }
 
     mod redeploy_gate_tests {
@@ -282,62 +320,79 @@ mod tests {
         #[test]
         fn due_is_true_before_any_redeploy_has_happened() {
             let gate = RedeployGate::new();
-            assert!(gate.due(), "the very first redeploy for a storm must not be delayed");
+            assert!(gate.due(Millis(0)), "the very first redeploy for a storm must not be delayed");
         }
 
         // `REDEPLOY_BACKOFF.next_delay(0, seed)` draws from `[45s, 75s]`
         // (60s base, ±25% jitter). Bracketing the assertions outside that
-        // whole range — instead of exactly at the 60s mean, which
-        // `record_attempt`'s fresh jitter draw made a ~50%-flaky boundary
-        // before this fix (opus adversarial review, PR #115 round 2,
-        // BLOCKER R2-1) — makes these deterministic regardless of which
-        // value was actually drawn.
-        #[tokio::test(start_paused = true)]
-        async fn due_stays_false_until_the_jitter_range_for_the_first_attempt_has_fully_elapsed() {
-            let mut gate = RedeployGate::new();
-            gate.record_attempt();
-            tokio::time::advance(Duration::from_secs(44)).await;
-            assert!(!gate.due(), "44s is below even the minimum possible draw (45s) for the first attempt's delay");
-            tokio::time::advance(Duration::from_secs(32)).await; // cumulative 76s
-            assert!(gate.due(), "76s is above even the maximum possible draw (75s) for the first attempt's delay");
+        // whole range — instead of exactly at the 60s mean (opus adversarial
+        // review, PR #115 round 2, BLOCKER R2-1) — makes these hold for every
+        // seed; looping over seeds checks exactly that.
+        #[test]
+        fn due_stays_false_until_the_jitter_range_for_the_first_attempt_has_fully_elapsed() {
+            for seed in 0..64 {
+                let mut gate = RedeployGate::new();
+                gate.record_attempt(Millis(0), seed);
+                assert!(!gate.due(Millis(44_000)), "44s is below even the minimum possible draw (45s) for the first attempt's delay");
+                assert!(gate.due(Millis(76_000)), "76s is above even the maximum possible draw (75s) for the first attempt's delay");
+            }
         }
 
-        // `delay_for_attempt(1)` (the second recorded attempt) draws from
-        // `[90s, 150s]` (120s base, ±25%) — same bracketing-outside-the-range
-        // approach, chosen to also prove the delay actually grew between the
-        // first and second call rather than staying pinned at the first
-        // attempt's `[45s, 75s]` range.
-        #[tokio::test(start_paused = true)]
-        async fn backoff_grows_with_each_recorded_attempt() {
+        /// The Step 6+7 hard constraint: the jittered deadline is resolved
+        /// once, at `record_attempt`, so repeated `due()` checks at the same
+        /// `now` can never flip, and `due()` never mutates the gate.
+        #[test]
+        fn due_is_idempotent_because_the_jittered_deadline_is_resolved_once() {
             let mut gate = RedeployGate::new();
-            gate.record_attempt(); // attempt 0 recorded -> next delay drawn from [45s, 75s]
-            gate.record_attempt(); // attempt 1 recorded -> next delay drawn from [90s, 150s]
-            tokio::time::advance(Duration::from_secs(89)).await;
-            assert!(!gate.due(), "89s is below even the minimum possible draw (90s) for the second attempt's delay");
-            tokio::time::advance(Duration::from_secs(62)).await; // cumulative 151s
-            assert!(gate.due(), "151s is above even the maximum possible draw (150s) for the second attempt's delay");
+            gate.record_attempt(Millis(0), 12345);
+            let snapshot = gate.clone();
+            for now in (40_000..80_000).step_by(250) {
+                let first = gate.due(Millis(now));
+                for _ in 0..4 {
+                    assert_eq!(gate.due(Millis(now)), first);
+                }
+            }
+            assert_eq!(gate, snapshot, "due() must not mutate the gate");
         }
 
-        #[tokio::test(start_paused = true)]
-        async fn reset_if_stable_reopens_the_gate_immediately_for_a_long_since_stable_storm() {
-            let mut gate = RedeployGate::new();
-            gate.record_attempt();
-            gate.record_attempt();
-            assert!(!gate.due());
-            let attempt_started = tokio::time::Instant::now();
-            tokio::time::advance(RECONNECT_STABLE_THRESHOLD + Duration::from_secs(1)).await;
-            gate.reset_if_stable(attempt_started);
-            assert!(gate.due(), "an attempt that stayed connected past the stable threshold must reset the gate to fresh");
+        // `next_delay(1, ..)` (the second recorded attempt) draws from
+        // `[90s, 150s]` (120s base, ±25%).
+        #[test]
+        fn backoff_grows_with_each_recorded_attempt() {
+            for seed in 0..64 {
+                let mut gate = RedeployGate::new();
+                gate.record_attempt(Millis(0), seed);
+                gate.record_attempt(Millis(0), seed);
+                assert!(!gate.due(Millis(89_000)), "89s is below even the minimum possible draw (90s) for the second attempt's delay");
+                assert!(gate.due(Millis(151_000)), "151s is above even the maximum possible draw (150s) for the second attempt's delay");
+            }
         }
 
-        #[tokio::test(start_paused = true)]
-        async fn reset_if_stable_does_not_reopen_the_gate_for_a_short_lived_attempt() {
+        #[test]
+        fn try_consume_records_only_when_due() {
             let mut gate = RedeployGate::new();
-            gate.record_attempt();
-            let attempt_started = tokio::time::Instant::now();
-            tokio::time::advance(Duration::from_secs(1)).await;
-            gate.reset_if_stable(attempt_started);
-            assert!(!gate.due(), "a same-storm attempt must not reset the gate just because it was checked");
+            assert!(gate.try_consume(Millis(0), 1));
+            assert!(!gate.try_consume(Millis(1_000), 1));
+            assert!(gate.try_consume(Millis(76_000), 1));
+        }
+
+        #[test]
+        fn reset_if_stable_reopens_the_gate_immediately_for_a_long_since_stable_storm() {
+            let mut gate = RedeployGate::new();
+            gate.record_attempt(Millis(0), 1);
+            gate.record_attempt(Millis(0), 1);
+            assert!(!gate.due(Millis(0)));
+            let now = Millis(ms(RECONNECT_STABLE_THRESHOLD) + 1_000);
+            gate.reset_if_stable(Millis(0), now);
+            assert!(gate.due(now), "an attempt that stayed connected past the stable threshold must reset the gate to fresh");
+        }
+
+        #[test]
+        fn reset_if_stable_does_not_reopen_the_gate_for_a_short_lived_attempt() {
+            let mut gate = RedeployGate::new();
+            gate.record_attempt(Millis(0), 1);
+            gate.reset_if_stable(Millis(0), Millis(1_000));
+            assert!(!gate.due(Millis(1_000)), "a same-storm attempt must not reset the gate just because it was checked");
         }
     }
 }
