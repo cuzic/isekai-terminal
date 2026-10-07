@@ -133,6 +133,20 @@ impl Sink {
             options.mode(0o600);
         }
         let file = options.open(path)?;
+        // `mode(0o600)` above only applies when the file is *created*; a
+        // pre-existing log (e.g. written by an older build, or created with a
+        // looser umask) kept whatever permissions it had (review 2026-09-29,
+        // SSH-43). Re-tighten it on every open — best-effort, since a log we
+        // can write to but not chmod (not our file) shouldn't block logging.
+        // Only a *regular file* is re-tightened: `--isekai-log-file` may point
+        // at a device node (`/dev/null`, `/dev/stderr` → the user's pty), and
+        // under root a successful fchmod(0600) would make `/dev/null`
+        // unwritable for every other user until reboot.
+        #[cfg(unix)]
+        if file.metadata().is_ok_and(|m| should_retighten(&m)) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         // `OnceLock::set` failing (already initialized) would mean the
         // caller opened this sink twice — a caller bug, not a runtime
         // condition to handle gracefully — so the second file handle is
@@ -333,5 +347,66 @@ pub async fn redirect_child_stderr(mut child_stderr: tokio::process::ChildStderr
             Ok(n) => n,
         };
         LOG_FILE.append_bytes(&buf[..n]);
+    }
+}
+
+/// Whether [`Sink::open`] may re-tighten the opened log to 0600: only for a
+/// regular file, never a device node / FIFO / socket the user pointed
+/// `--isekai-log-file` at.
+#[cfg(unix)]
+fn should_retighten(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_file()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Review of PR #201 (M1): `--isekai-log-file /dev/null` (e.g. under
+    /// `sudo`) must not be chmod'ed — only regular files are re-tightened.
+    #[test]
+    fn retighten_applies_to_regular_files_but_never_to_device_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isekai-ssh.log");
+        std::fs::write(&path, b"").unwrap();
+        assert!(should_retighten(&std::fs::metadata(&path).unwrap()));
+        assert!(!should_retighten(&std::fs::metadata("/dev/null").unwrap()));
+        assert!(!should_retighten(&std::fs::metadata(dir.path()).unwrap()));
+        // Opening /dev/null as the log sink still works and leaves it alone.
+        use std::os::unix::fs::PermissionsExt as _;
+        let before = std::fs::metadata("/dev/null").unwrap().permissions().mode();
+        Sink::new().open(std::path::Path::new("/dev/null"), None).unwrap();
+        assert_eq!(std::fs::metadata("/dev/null").unwrap().permissions().mode(), before);
+    }
+
+    /// Wiring for M1 that doesn't need root: a user-owned FIFO (fchmod on it
+    /// *succeeds* as a normal user, unlike `/dev/null`) opened as the log sink
+    /// keeps its 0644 — the pre-fix code re-tightened it to 0600.
+    #[test]
+    fn open_leaves_a_non_regular_log_target_alone() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("log.fifo");
+        let c_path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str())).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "{}", std::io::Error::last_os_error());
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A non-blocking reader first, so the sink's write-open doesn't block.
+        let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap();
+        Sink::new().open(&fifo, None).unwrap();
+        assert_eq!(std::fs::metadata(&fifo).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    /// SSH-43 regression: opening a pre-existing, looser-permissioned log
+    /// re-tightens it to 0600 (the create-time `mode` alone never did).
+    #[test]
+    fn open_retightens_an_existing_logs_permissions_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isekai-ssh.log");
+        std::fs::write(&path, b"old line\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Sink::new().open(&path, None).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

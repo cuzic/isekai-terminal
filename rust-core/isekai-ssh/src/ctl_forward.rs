@@ -292,6 +292,27 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward, host: String) {
     forward.listener_task = Some(task);
 }
 
+/// Upper bound on the ctl preamble line (the tab's remote socket path plus
+/// its newline) — far above any real path, far below "unbounded".
+#[cfg(unix)]
+const MAX_PREAMBLE_LINE_LEN: usize = 4096;
+
+/// `read_line`, but failing instead of buffering past `max` bytes (the
+/// newline included) — a line with no newline in sight can't grow the buffer
+/// without bound.
+#[cfg(unix)]
+async fn read_bounded_line<R>(reader: &mut R, buf: &mut String, max: usize) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let read = (&mut *reader).take(max as u64).read_line(buf).await?;
+    if read == max && !buf.ends_with('\n') {
+        bail!("isekai-ssh: ctl line exceeded {max} bytes");
+    }
+    Ok(())
+}
+
 /// Reads and checks the secret preamble line, then decodes exactly one
 /// `CtlMessage` line and acts on it — applying it as an OSC sequence
 /// (`SetTitle`/`ClipboardPush`), reading/writing this tab's `CTL_VARS` store
@@ -314,15 +335,22 @@ async fn handle_ctl_connection(
 
     // The preamble: whoever is on the other end of this connection must
     // already know this tab's random remote-path token (see module docs).
+    //
+    // Both reads are bounded and the comparison is constant-time (review
+    // 2026-09-29, transport hand-off): anything that can connect to the
+    // forwarded socket could otherwise stream an endless line into this
+    // process's memory before ever being authenticated, or time the
+    // comparison to learn the secret byte by byte.
     let mut secret_line = String::new();
-    reader.read_line(&mut secret_line).await.context("failed to read ctl connection preamble")?;
-    if secret_line.trim_end_matches('\n') != expected_secret {
+    read_bounded_line(&mut reader, &mut secret_line, MAX_PREAMBLE_LINE_LEN)
+        .await
+        .context("failed to read ctl connection preamble")?;
+    if !crate::native::mux::protocol::token_eq(secret_line.trim_end_matches('\n').as_bytes(), expected_secret.as_bytes()) {
         bail!("isekai-ssh: ctl connection preamble did not match this tab's expected secret");
     }
 
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    read_bounded_line(&mut reader, &mut line, isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN + 1)
         .await
         .context("failed to read ctl message")?;
     if line.is_empty() {
@@ -932,6 +960,20 @@ mod tests {
         drop(client);
         let result = server.await.unwrap();
         assert!(result.is_err());
+    }
+
+    /// An unauthenticated peer can't make this process buffer an endless
+    /// preamble line: past the cap it's rejected outright.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_ctl_connection_rejects_an_overlong_preamble_without_buffering_it() {
+        let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
+
+        use tokio::io::AsyncWriteExt as _;
+        let _ = client.write_all(&vec![b'a'; MAX_PREAMBLE_LINE_LEN + 10]).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), server).await.expect("must not wait for a newline forever").unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("exceeded"));
     }
 
     #[cfg(unix)]

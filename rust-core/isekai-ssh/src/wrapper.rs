@@ -508,6 +508,47 @@ pub(crate) fn init_logging(plan: &WrapperPlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether a persisted profile exists for `resolution`'s profile key, as far
+/// as [`build_intent_or_bootstrap`]'s choice of trust-confirmation mode is
+/// concerned (review 2026-09-29, SSH-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileFileState {
+    /// Genuinely never registered (no file at all) — first contact.
+    Missing,
+    /// A file exists — readable or not (corrupt JSON, schema mismatch, an
+    /// I/O error, or readable but unusable). This host was trusted once.
+    Present,
+}
+
+fn profile_file_state(resolution: &WrapperResolution) -> ProfileFileState {
+    let Ok(key) = isekai_trust::normalize_host_port(&resolution.isekai.profile) else {
+        return ProfileFileState::Missing;
+    };
+    let Ok(profiles_dir) = default_profiles_dir() else {
+        return ProfileFileState::Missing;
+    };
+    match load_persistent_profile(&profiles_dir, &key) {
+        Ok(None) => ProfileFileState::Missing,
+        Ok(Some(_)) | Err(_) => ProfileFileState::Present,
+    }
+}
+
+/// A profile that *exists* but can't be turned into a connection intent
+/// (corrupt, schema-mismatched, unreadable, or lacking a usable transport)
+/// belongs to a host the user already trusted once — re-deploying it is the
+/// same silent self-heal `.claude/rules/always-connects.md` requires for any
+/// other stale deployment. It used to fall into the first-contact
+/// `[y/N]` prompt instead (SSH-08), which is both wrong (not a first
+/// contact) and harmful: that prompt reads a line from stdin, so
+/// `cmd | isekai-ssh host ...` had its first line of real data eaten as the
+/// "answer". Only a genuinely missing profile keeps the caller's `tofu`.
+fn tofu_for_unusable_profile(state: ProfileFileState, requested: TofuConfirmation) -> TofuConfirmation {
+    match state {
+        ProfileFileState::Missing => requested,
+        ProfileFileState::Present => TofuConfirmation::Silent,
+    }
+}
+
 /// Resolves `resolution` into a [`ConnectionIntent`], auto-bootstrapping a
 /// brand-new (never-registered) destination inline when [`should_bootstrap`]
 /// allows it — `tofu` decides whether *that* bootstrap's own trust
@@ -536,6 +577,7 @@ pub(crate) async fn build_intent_or_bootstrap(
     match build_connection_intent(resolution) {
         Ok(intent) => Ok(intent),
         Err(err) if should_bootstrap(plan, resolution) => {
+            let tofu = tofu_for_unusable_profile(profile_file_state(resolution), tofu);
             if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, tofu).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
@@ -868,6 +910,25 @@ pub(crate) fn resolve_claimed_outcome(
     }
 }
 
+/// Whether `apply_ctl_socket_forward` must add `-t` itself. Only ever under
+/// `RequestTty::Auto` (an explicit `-t`/`-tt`/`-T` is the caller's call):
+///
+/// - `--isekai-tty`: always — `isekai-pipe tty attach` needs a PTY.
+/// - ctl-socket (review 2026-09-29, SSH-20): it turns what the user typed
+///   as a plain interactive `isekai-ssh host` into `ssh host '<login shell
+///   command>'`, and `ssh(1)` never allocates a PTY for a remote command
+///   without `-t` — so enabling ctl-socket silently gave the user a
+///   PTY-less shell (no prompt, no line editing, no job control). Added only
+///   when local stdin is a terminal, which is exactly when `ssh(1)` itself
+///   would have allocated one for the command-less session the user
+///   actually asked for (this is `ssh(1)`-parity, not the
+///   `TofuConfirmation`-style "may we prompt" decision
+///   `.claude/rules/always-connects.md` forbids inferring from a tty).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn needs_forced_tty(tty_exec: bool, ctl_forward: bool, request_tty: RequestTty, stdin_is_terminal: bool) -> bool {
+    request_tty == RequestTty::Auto && (tty_exec || (ctl_forward && stdin_is_terminal))
+}
+
 /// Writes `intent`, execs `ssh` with the `isekai-pipe connect` `ProxyCommand`
 /// injected, and waits for it to exit. All three of `ssh`'s stdio streams
 /// are inherited (interactive TTY passthrough) — `.status()` (not
@@ -955,7 +1016,7 @@ async fn apply_ctl_socket_forward(
         // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`).
         command.args(crate::ctl_forward::forward_option_args(forward));
     }
-    if tty_exec.is_some() && plan.request_tty == RequestTty::Auto {
+    if needs_forced_tty(tty_exec.is_some(), ctl_forward.is_some(), plan.request_tty, std::io::stdin().is_terminal()) {
         // Real `ssh(1)` only allocates a PTY for a remote command when `-t`
         // is given — `isekai-pipe tty attach` needs one to relay through
         // (`login_tty` on the daemon side). An explicit `-t`/`-tt`/`-T` the
@@ -1276,12 +1337,104 @@ async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
     resolved
 }
 
+/// Resolves the direct-launch helper address (`direct-by-bootstrap-host`) to
+/// a concrete [`SocketAddr`] at bootstrap time, so what gets cached as
+/// `helper_addr` is always something `isekai-pipe connect` can parse.
+///
+/// Every consumer of the cached address (`isekai-transport`'s candidate
+/// parsing, `isekai-pipe connect`) only ever does `str::parse::<SocketAddr>()`
+/// — no DNS resolution. Caching the raw `ssh -G` `HostName` verbatim
+/// (`format!("{host}:{port}")`) therefore made a DNS-named host (or an
+/// unbracketed IPv6 literal, `2001:db8::1:4433`) fail to parse on *every*
+/// connect: always `Unreachable`, and the silent re-bootstrap wrote the same
+/// unparseable string straight back — a permanent failure loop, exactly
+/// what `.claude/rules/always-connects.md` forbids (review 2026-09-29,
+/// SSH-01). Re-resolving on every re-bootstrap also means a host whose
+/// address later changes (DHCP, a moved VM) heals itself the next time the
+/// stale cached address fails.
+///
+/// A DNS failure is classified [`BootstrapFailure::JumpHostUnreachable`]
+/// (retryable): it is a transient-connectivity-shaped failure, not a
+/// trust/config one.
+///
+/// An IPv4 result is preferred over getaddrinfo's (RFC 6724, usually
+/// AAAA-first on a dual-stack client) first entry: `isekai-pipe serve` binds
+/// `0.0.0.0` by default and bootstrap never passes `--bind`, so the
+/// direct-launch helper only listens on IPv4. Caching a v6 address would make
+/// every connect `Unreachable` and every silent re-bootstrap re-resolve the
+/// same AAAA — a permanent loop (review of PR #201, M2). The first address is
+/// still used when the name has no A record at all.
+async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    // A `bootstrap-candidate target=[v6]:22` directive keeps its brackets
+    // through `rsplit_once(':')`; `ssh -G`'s own `hostname` never has them.
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    match tokio::time::timeout(STUN_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
+        Ok(Ok(addrs)) => prefer_ipv4(addrs).ok_or_else(|| {
+            anyhow!("isekai-ssh: DNS lookup for the bootstrap host {bare:?} returned no addresses")
+                .context(BootstrapFailure::JumpHostUnreachable)
+        }),
+        Ok(Err(e)) => Err(anyhow::Error::new(e)
+            .context(format!("isekai-ssh: could not resolve the bootstrap host {bare:?} for the direct helper address"))
+            .context(BootstrapFailure::JumpHostUnreachable)),
+        Err(_) => Err(anyhow!(
+            "isekai-ssh: DNS lookup for the bootstrap host {bare:?} timed out after {STUN_DNS_LOOKUP_TIMEOUT:?}"
+        )
+        .context(BootstrapFailure::JumpHostUnreachable)),
+    }
+}
+
+/// The `helper_addr` a direct launch caches, given the local resolution of the
+/// bootstrap host (`resolved`, from [`resolve_direct_helper_addr`]).
+///
+/// A local DNS failure never fails the bootstrap: the raw `host:port` is cached
+/// exactly as on main. A `HostName` reached through ProxyJump/`ProxyCommand` (an
+/// internal `*.lan` name, `cloudflared`/`tailscale nc`) often doesn't resolve on
+/// this machine, yet such a host still connects: STUN-primary with `#@isekai
+/// stun` (`isekai-pipe connect`'s `build_cross_family_target` deliberately
+/// ignores a direct address it can't parse), or through the configured relay
+/// endpoints on the `RelayWithFallback` route (`resolve_relay_candidates` uses
+/// only the relay endpoints there). Failing the bootstrap, even only when there
+/// was no STUN evidence, would turn such a working host into a permanent retry
+/// loop (re-reviews of PR #201, B1 and R3-1; always-connects rule).
+fn direct_helper_addr_for(resolved: Result<std::net::IpAddr>, host: &str, port: u16) -> String {
+    match resolved {
+        Ok(ip) => SocketAddr::new(ip, port).to_string(),
+        Err(e) => {
+            log_line_verbose!(
+                "isekai-ssh: {host:?} does not resolve locally ({e:#}); caching it unresolved (STUN/relay routes don't need it)"
+            );
+            format!("{host}:{port}")
+        }
+    }
+}
+
+/// The first IPv4 address in `addrs`, else the first address at all (see
+/// [`resolve_direct_helper_addr`]).
+fn prefer_ipv4(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first = None;
+    for addr in addrs {
+        if addr.is_ipv4() {
+            return Some(addr);
+        }
+        first.get_or_insert(addr);
+    }
+    first
+}
+
+/// Picks the bootstrap candidate to deploy through: highest `priority`, and
+/// — among equal priorities — the **first** one listed (first-match-wins,
+/// the same convention `ssh_config(5)` itself uses). `Iterator::max_by_key`
+/// alone returns the *last* of several equal maxima, the opposite of that
+/// convention (review 2026-09-29, SSH-25), hence the `rev()`.
+fn select_bootstrap_candidate(candidates: &[BootstrapCandidate]) -> Option<&BootstrapCandidate> {
+    candidates.iter().rev().max_by_key(|candidate| candidate.priority)
+}
+
 pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
-    let candidate = resolution
-        .isekai
-        .bootstrap_candidates
-        .iter()
-        .max_by_key(|candidate| candidate.priority)
+    let candidate = select_bootstrap_candidate(&resolution.isekai.bootstrap_candidates)
         .ok_or_else(|| anyhow!("no bootstrap candidates were resolved"))?;
 
     let (host, port) = candidate
@@ -1363,15 +1516,19 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         if e.downcast_ref::<BootstrapFailure>().is_some() {
             return e;
         }
-        let e = if helper_binary_was_explicit {
-            e
-        } else {
-            e.context(
-                "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host) and \
-                 auto-download failed; auto-bootstrap needs a local isekai-helper binary to upload",
-            )
-        };
-        e.context(BootstrapFailure::RemoteBinaryMissing)
+        if helper_binary_was_explicit {
+            // An explicit `--isekai-helper-binary` that can't be read is a
+            // local configuration problem, not something a retry fixes.
+            return e.context(BootstrapFailure::RemoteBinaryMissing);
+        }
+        // Auto-download failed (review 2026-09-29, SSH-26): overwhelmingly a
+        // transient network/GitHub failure, so classified retryable instead
+        // of the permanent `RemoteBinaryMissing` it used to share.
+        e.context(
+            "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host) and \
+             auto-download failed; auto-bootstrap needs a local isekai-helper binary to upload",
+        )
+        .context(BootstrapFailure::HelperDownloadFailed)
     })?;
     let helper_sha256 = isekai_trust::hex_sha256(&helper_binary);
 
@@ -1379,8 +1536,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
 
     let launch = match &resolution.isekai.bootstrap_relay {
         Some(relay_target) => {
-            let relay_jwt = isekai_auth::FileTokenProvider::from_default_path()
-                .and_then(|provider| provider.get_relay_jwt())
+            // On a blocking thread: `get_relay_jwt` may do a synchronous
+            // (`ureq`) token refresh plus file locking, which must not stall
+            // a tokio worker thread (review 2026-09-29, transport hand-off).
+            let relay_jwt = tokio::task::spawn_blocking(|| {
+                isekai_auth::FileTokenProvider::from_default_path().and_then(|provider| provider.get_relay_jwt())
+            })
+            .await
+            .context("isekai-ssh: the relay token lookup task panicked")?
                 .map_err(|e| {
                     anyhow::Error::new(e)
                         .context("failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first")
@@ -1422,6 +1585,15 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             );
         }
     }
+    // Direct launch: resolve the bootstrap host's IP locally. Best-effort, not
+    // `?`: a `HostName` reached only through ProxyJump/`ProxyCommand` may not
+    // resolve here at all, yet such a host still connects STUN-primary — see
+    // `direct_helper_addr_for`. Only the IP is needed; the port comes from the
+    // helper's handshake below.
+    let direct_helper_ip = match &resolution.isekai.bootstrap_relay {
+        Some(_) => None,
+        None => Some(resolve_direct_helper_addr(host, 0).await.map(|addr| addr.ip())),
+    };
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -1451,7 +1623,8 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             let direct_port = handshake
                 .direct_by_bootstrap_host_port()
                 .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
-            format!("{host}:{direct_port}")
+            let resolved = direct_helper_ip.expect("direct_helper_ip is resolved for every direct launch");
+            direct_helper_addr_for(resolved, host, direct_port)
         }
     };
 
@@ -1600,6 +1773,14 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
+        // Everything after the destination is the remote command, exactly as
+        // `ssh(1)` treats it (review 2026-09-29, SSH-45): `isekai-ssh host --
+        // grep --isekai-log-file x` must send `--isekai-log-file` to the
+        // remote `grep`, not swallow it (and its value) as a wrapper option.
+        if find_destination_index(&ssh_args).is_some() {
+            ssh_args.push(arg);
+            continue;
+        }
         match arg.as_str() {
             "--isekai-bootstrap" => isekai.bootstrap = true,
             "--isekai-no-bootstrap" => isekai.no_bootstrap = true,
@@ -2126,9 +2307,17 @@ fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String
     let force_posix_quoting = cfg!(windows) && is_posix_shell_ssh(openssh_path);
     format!(
         "{} connect --profile {} --service ssh --stdio",
-        quote_proxy_command_path(pipe_path, force_posix_quoting),
-        quote_proxy_command_arg(profile),
+        escape_ssh_percent_tokens(&quote_proxy_command_path(pipe_path, force_posix_quoting)),
+        escape_ssh_percent_tokens(&quote_proxy_command_arg(profile)),
     )
+}
+
+/// `ssh(1)` expands `%h`/`%p`/`%r`/... tokens in `ProxyCommand` *before*
+/// handing it to the shell, and shell quoting does nothing to stop that — a
+/// literal `%` in the pipe path or profile has to be written `%%` (review
+/// 2026-09-29, SSH-44).
+fn escape_ssh_percent_tokens(value: &str) -> String {
+    value.replace('%', "%%")
 }
 
 /// Characters that never need shell/argv escaping in *any* of the quoting
@@ -2138,8 +2327,13 @@ fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String
 /// without picking a quoting convention at all. Deliberately excludes `'`/
 /// `"`/`$`/`` ` ``/`;`/`|`/`&`/`<`/`>`/`(`/`)`/`{`/`}`/`\` (and, of course,
 /// whitespace) — every character either convention treats specially.
+///
+/// A *leading* `~` is excluded too (review 2026-09-29, SSH-44): `sh` would
+/// tilde-expand it. (A `~` elsewhere — Windows 8.3 short names like
+/// `PROGRA~1` — is harmless and stays allowed.)
 fn is_safe_bare_word(value: &str, extra_allowed: &[char]) -> bool {
     !value.is_empty()
+        && !value.starts_with('~')
         && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '~') || extra_allowed.contains(&c))
 }
 
@@ -2180,7 +2374,12 @@ fn quote_proxy_command_path(pipe_path: &Path, force_posix_quoting: bool) -> Stri
                 }
             }
         }
-        if is_safe_bare_word(&path_str, &['\\', '/']) {
+        // A backslash is only a harmless path separator for Win32-OpenSSH's
+        // own `ProxyCommand` splitter; to the `/bin/sh -c` a Unix `ssh(1)`
+        // uses it is an escape character, so a bare Unix path containing
+        // one would be silently mangled (review 2026-09-29, SSH-44).
+        let path_chars: &[char] = if cfg!(windows) { &['\\', '/'] } else { &['/'] };
+        if is_safe_bare_word(&path_str, path_chars) {
             return path_str;
         }
     }
@@ -2439,6 +2638,109 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// SSH-01 regression: the cached direct helper address must always be
+    /// something `str::parse::<SocketAddr>()` accepts — an unbracketed IPv6
+    /// `HostName` used to be cached as `2001:db8::1:4433` (unparseable).
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_brackets_ipv6_and_keeps_ipv4_literals() {
+        let v6 = resolve_direct_helper_addr("2001:db8::1", 4433).await.unwrap().to_string();
+        assert_eq!(v6, "[2001:db8::1]:4433");
+        assert!(v6.parse::<SocketAddr>().is_ok());
+        let bracketed = resolve_direct_helper_addr("[2001:db8::2]", 4433).await.unwrap().to_string();
+        assert_eq!(bracketed, "[2001:db8::2]:4433");
+        assert_eq!(resolve_direct_helper_addr("192.0.2.7", 4433).await.unwrap().to_string(), "192.0.2.7:4433");
+    }
+
+    /// Review of PR #201 (M2): a dual-stack name that getaddrinfo returns
+    /// AAAA-first must still cache the IPv4 address, because the
+    /// direct-launch helper only listens on `0.0.0.0`. A v6-only name keeps
+    /// its (only) address.
+    #[test]
+    fn prefer_ipv4_picks_the_a_record_even_when_aaaa_comes_first() {
+        let v6: SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:4433".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.7:4433".parse().unwrap();
+        assert_eq!(prefer_ipv4([v6, v6b, v4]), Some(v4));
+        assert_eq!(prefer_ipv4([v4, v6]), Some(v4));
+        assert_eq!(prefer_ipv4([v6, v6b]), Some(v6));
+        assert_eq!(prefer_ipv4(std::iter::empty()), None);
+    }
+
+    /// Wiring for `prefer_ipv4`: whatever order the resolver returns
+    /// `localhost` in (`::1` first on many dual-stack hosts), the cached
+    /// address is IPv4 whenever the name has an A record at all.
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_returns_ipv4_when_the_name_has_an_a_record() {
+        let all: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", 4433)).await.unwrap().collect();
+        let picked = resolve_direct_helper_addr("localhost", 4433).await.unwrap();
+        if all.iter().any(SocketAddr::is_ipv4) {
+            assert!(picked.is_ipv4(), "picked {picked} from {all:?}");
+        }
+    }
+
+    /// Re-reviews of PR #201 (B1, R3-1): a `HostName` that only resolves on the
+    /// far side of a ProxyJump/`ProxyCommand` must never fail the bootstrap. It
+    /// connects STUN-primary, or (with `#@isekai relay` / `RelayWithFallback`)
+    /// through the relay endpoints, which need no direct address, even when the
+    /// helper reported no STUN-observed address. The raw `host:port` is cached
+    /// as on main.
+    #[tokio::test]
+    async fn direct_helper_addr_for_a_host_resolvable_only_via_proxyjump() {
+        let host = "isekai-ssh-test-host.invalid";
+        let unresolved = resolve_direct_helper_addr(host, 0).await.map(|a| a.ip());
+        assert!(unresolved.is_err(), "a .invalid name must not resolve");
+        // No STUN evidence (e.g. a relay-configured host): still cached raw, not JumpHostUnreachable.
+        assert_eq!(direct_helper_addr_for(unresolved, host, 4433), "isekai-ssh-test-host.invalid:4433");
+
+        let ip: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(direct_helper_addr_for(Ok(ip), host, 4433), "192.0.2.7:4433");
+    }
+
+    /// SSH-01 regression: a DNS-named `HostName` is resolved at bootstrap
+    /// time rather than cached verbatim (which `isekai-pipe connect` could
+    /// never parse, failing every single connect forever).
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_resolves_a_dns_name_to_a_socket_addr() {
+        let addr = resolve_direct_helper_addr("localhost", 4433).await.unwrap();
+        assert!(addr.ip().is_loopback(), "localhost should resolve to a loopback address, got {addr}");
+        assert_eq!(addr.port(), 4433);
+        assert!(addr.to_string().parse::<SocketAddr>().is_ok());
+    }
+
+    /// SSH-01: an unresolvable name is a retryable connectivity failure, not
+    /// a permanent one — the next silent re-bootstrap tries resolving again.
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_classifies_a_dns_failure_as_retryable() {
+        let err = resolve_direct_helper_addr("isekai-ssh-test-host.invalid", 4433).await.unwrap_err();
+        let failure = err.downcast_ref::<BootstrapFailure>().expect("DNS failure must carry a BootstrapFailure classification");
+        assert!(failure.may_retry(), "a DNS failure must be retryable, got {failure:?}");
+    }
+
+    /// SSH-20 regression: ctl-socket's login-shell command must still get a
+    /// PTY for an interactive terminal session (it used to silently yield a
+    /// PTY-less shell), while explicit `-t`/`-T` stay the caller's choice.
+    #[test]
+    fn needs_forced_tty_covers_ctl_socket_sessions_on_a_terminal() {
+        assert!(needs_forced_tty(false, true, RequestTty::Auto, true), "ctl-socket on a terminal needs -t");
+        assert!(!needs_forced_tty(false, true, RequestTty::Auto, false), "piped stdin: ssh(1) would not allocate one either");
+        assert!(needs_forced_tty(true, false, RequestTty::Auto, false), "--isekai-tty always needs a PTY");
+        assert!(!needs_forced_tty(true, true, RequestTty::No, true), "an explicit -T is respected");
+        assert!(!needs_forced_tty(false, true, RequestTty::Yes, true), "an explicit -t is already there");
+        assert!(!needs_forced_tty(false, false, RequestTty::Auto, true));
+    }
+
+    /// SSH-25 regression: among equal priorities the *first* listed
+    /// candidate wins (`max_by_key` alone returns the last).
+    #[test]
+    fn select_bootstrap_candidate_prefers_the_first_of_equal_priorities() {
+        let candidate = |target: &str, priority: u32| BootstrapCandidate { target: target.to_string(), via: Vec::new(), priority, alias: None };
+        let candidates = vec![candidate("a:22", 100), candidate("b:22", 100), candidate("c:22", 50)];
+        assert_eq!(select_bootstrap_candidate(&candidates).unwrap().target, "a:22");
+        let candidates = vec![candidate("a:22", 10), candidate("b:22", 100), candidate("c:22", 100)];
+        assert_eq!(select_bootstrap_candidate(&candidates).unwrap().target, "b:22");
+        assert!(select_bootstrap_candidate(&[]).is_none());
     }
 
     #[test]
@@ -2794,6 +3096,21 @@ mod tests {
         );
     }
 
+    /// SSH-45 regression: `--isekai-*` after the destination belongs to the
+    /// remote command, not to the wrapper.
+    #[test]
+    fn isekai_flags_after_the_destination_are_part_of_the_remote_command() {
+        let plan = parse_wrapper(s(&["--isekai-no-bootstrap", "production", "grep", "--isekai-log-file", "x"])).unwrap();
+        assert!(plan.isekai.no_bootstrap, "a wrapper flag before the destination still applies");
+        assert_eq!(plan.isekai.log_file, None, "a flag after the destination must not be consumed");
+        assert_eq!(plan.ssh_args, s(&["production", "grep", "--isekai-log-file", "x"]));
+        assert_eq!(plan.remote_command(), Some(&s(&["grep", "--isekai-log-file", "x"])[..]));
+
+        let plan = parse_wrapper(s(&["-p", "2222", "--", "production", "--isekai-tty"])).unwrap();
+        assert!(plan.isekai.tty.is_none());
+        assert_eq!(plan.destination, "production");
+    }
+
     #[test]
     fn helper_release_source_defaults_to_this_projects_repo_and_latest() {
         let plan = parse_wrapper(s(&["production"])).unwrap();
@@ -2962,6 +3279,22 @@ mod tests {
         );
     }
 
+    /// SSH-44 regression: `%` is doubled (ssh's own `ProxyCommand` token
+    /// expansion runs before the shell), a leading `~` is never left bare,
+    /// and on Unix a backslash in the path is quoted rather than left for
+    /// `sh` to eat.
+    #[test]
+    fn proxy_command_escapes_percent_leading_tilde_and_unix_backslashes() {
+        assert_eq!(
+            proxy_command(Path::new("/usr/local/bin/isekai-pipe"), "100%host", Path::new("/usr/bin/ssh")),
+            "/usr/local/bin/isekai-pipe connect --profile '100%%host' --service ssh --stdio"
+        );
+        assert!(!is_safe_bare_word("~/bin/isekai-pipe", &['/']));
+        assert_eq!(quote_proxy_command_arg("~prod"), shell_quote("~prod"));
+        #[cfg(unix)]
+        assert_eq!(quote_proxy_command_path(Path::new(r"/opt/odd\name/isekai-pipe"), false), shell_quote(r"/opt/odd\name/isekai-pipe"));
+    }
+
     /// A path/profile with no space or shell metacharacter is emitted bare
     /// (no quoting at all) — safe on a POSIX shell either way, and sidesteps
     /// ever needing to guess Win32-OpenSSH's own `ProxyCommand`
@@ -3018,6 +3351,74 @@ mod tests {
     fn quote_proxy_command_arg_falls_back_to_shell_quote_when_unsafe() {
         assert_eq!(quote_proxy_command_arg("prod host"), shell_quote("prod host"));
         assert_eq!(quote_proxy_command_arg("safe-host"), "safe-host");
+    }
+
+    /// SSH-08 regression: only a genuinely missing profile may keep the
+    /// first-contact `[y/N]` prompt; a profile file that exists but can't be
+    /// loaded (corrupt JSON here) is a host trusted once and must re-bootstrap
+    /// silently instead of eating a line of piped stdin as the "answer".
+    #[test]
+    fn an_existing_but_corrupt_profile_rebootstraps_silently_not_with_a_first_contact_prompt() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home, _restore) = crate::test_home::with_temp_home();
+
+        let resolution_for = |profile: &str| WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: profile.to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: Vec::new(),
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+                ctl_socket_enabled: false,
+                tab_idle_color: None,
+                tab_attention_color: None,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                local_bind_port_range: None,
+                tty: None,
+            },
+        };
+
+        let trust = HelperTrust {
+            identity_pubkey: "pk".to_string(),
+            trusted_helper_sha256: "sha".to_string(),
+            trusted_helper_version: "0.1.0".to_string(),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: None,
+            trusted_at: "2026-07-04T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "127.0.0.1:1234".to_string(),
+            cached_cert_sha256: "ab".to_string(),
+            cached_session_secret: "c2VjcmV0".to_string(),
+            cached_stun_observed_addr: None,
+        };
+        let path = write_persistent_profile(
+            &default_profiles_dir().unwrap(),
+            &PersistentProfile::migrate_legacy_helper_trust("corrupt-host:22", &trust),
+        )
+        .unwrap();
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let corrupt = resolution_for("corrupt-host");
+        assert!(build_connection_intent(&corrupt).is_err(), "precondition: the corrupt profile must not load");
+        assert_eq!(profile_file_state(&corrupt), ProfileFileState::Present);
+        assert_eq!(profile_file_state(&resolution_for("never-seen-host")), ProfileFileState::Missing);
+
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Present, TofuConfirmation::AlwaysPrompt), TofuConfirmation::Silent);
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Missing, TofuConfirmation::AlwaysPrompt), TofuConfirmation::AlwaysPrompt);
+        assert_eq!(tofu_for_unusable_profile(ProfileFileState::Missing, TofuConfirmation::Silent), TofuConfirmation::Silent);
     }
 
     #[test]

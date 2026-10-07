@@ -33,6 +33,15 @@ pub enum BootstrapFailure {
     /// step is part of this plan (or the upload step itself is disabled).
     #[error("remote isekai-pipe binary missing")]
     RemoteBinaryMissing,
+    /// No local `isekai-pipe` binary was given/cached and automatically
+    /// downloading the release asset failed (review 2026-09-29, SSH-26).
+    /// Distinct from [`Self::RemoteBinaryMissing`] because it is almost
+    /// always a transient network/GitHub failure — retryable — whereas that
+    /// one routes to `isekai-ssh init` and is never retried, which made a
+    /// momentary download hiccup on an empty cache a *permanent* failure of
+    /// the silent re-deploy (`always-connects.md`).
+    #[error("downloading the isekai-pipe release asset failed")]
+    HelperDownloadFailed,
     /// A remote `isekai-pipe` binary exists but failed signature/digest
     /// verification (Epic D) — must not be executed.
     #[error("remote isekai-pipe binary failed trust verification")]
@@ -83,6 +92,7 @@ impl BootstrapFailure {
         matches!(
             self,
             Self::JumpHostUnreachable
+                | Self::HelperDownloadFailed
                 | Self::CandidateExchangeFailed
                 | Self::StunUnreachable
                 | Self::RelayUnavailable
@@ -290,6 +300,17 @@ mod tests {
         // back to.
         assert!(!BootstrapFailure::RelayUnavailable.should_fallback_to_relay());
         assert!(!BootstrapFailure::RelayUnauthorized.should_fallback_to_relay());
+    }
+
+    /// SSH-26: a failed automatic release download is retryable and does
+    /// not send the user to `isekai-ssh init`.
+    #[test]
+    fn helper_download_failure_is_retryable_not_an_init_redirect() {
+        let f = BootstrapFailure::HelperDownloadFailed;
+        assert!(f.may_retry());
+        assert!(!f.should_redirect_to_init());
+        assert!(!f.should_redirect_to_login());
+        assert!(!f.should_fallback_to_relay());
     }
 
     #[test]
