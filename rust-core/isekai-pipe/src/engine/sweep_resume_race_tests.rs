@@ -226,10 +226,14 @@ async fn parking_an_unresumable_session_releases_its_slot() {
     let active_activation =
         rt.activate(key_active, token, Some(3600), Arc::new(Mutex::new(Session::new(1024)))).await.unwrap();
 
-    // A second session is registered over capacity (unresumable).
+    // A second session is registered over capacity (unresumable). Since
+    // Step 2b admission is atomic, so `hello()` would reject it with
+    // `BusyOtherSession`; the over-capacity slot is only reachable by
+    // bypassing admission (what the pre-2b admission race produced). The
+    // unresumable path itself is Step 2c's concern.
     let over: SessionId = [0x32; 16];
     let key_over = key_for(over);
-    let token = match rt.hello(key_over).await {
+    let token = match rt.hello_bypassing_admission(key_over).await {
         HelloOutcome::Ready { attach_token } => attach_token,
         HelloOutcome::Reject(reason) => panic!("hello rejected: {reason:?}"),
     };

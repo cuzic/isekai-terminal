@@ -250,10 +250,10 @@ pub struct AttachRuntime {
 }
 
 impl AttachRuntime {
-    /// `max_sessions`: `--max-sessions` (Phase S-4b) — the table-side cap
-    /// `Activated` enforces by evicting the oldest parked session (or
-    /// registering the new one as unresumable), and the admission cap
-    /// `engine/mod.rs::admit_new_session` compares `session_count()` with.
+    /// `max_sessions`: `--max-sessions` (Phase S-4b) — the admission cap
+    /// [`Self::hello`] enforces atomically (ADR Step 2b), and the table-side
+    /// cap `Activated` checks (evict the oldest parked session, else register
+    /// unresumable — no longer reachable once admission is atomic; Step 2c).
     pub fn new(target: SocketAddr, max_sessions: usize) -> Arc<Self> {
         Arc::new(Self {
             core: Mutex::new(ServeCore { agg: ServeAggregate::new(max_sessions), io: BTreeMap::new() }),
@@ -301,10 +301,6 @@ impl AttachRuntime {
         out
     }
 
-    pub async fn max_sessions(&self) -> usize {
-        self.core.lock().await.agg.max_sessions()
-    }
-
     /// Whether the arbiter currently holds no session at all — used for the
     /// `--max-idle-lifetime` monitor, mirroring `active.load(..)`'s old role
     /// (self-terminate only once nothing is attached/attaching/established).
@@ -313,17 +309,17 @@ impl AttachRuntime {
     }
 
     /// How many sessions currently hold a slot (connecting, pending, or
-    /// established/parked/unresumable) — used by `engine/mod.rs`'s Epic N-5
-    /// admission control to decide whether a brand-new `session_id` fits
-    /// under `--max-sessions` without needing to evict anything first.
+    /// established/parked/unresumable). A read-only query: admission no
+    /// longer decides from it (that would be the pre-Step-2b check-then-act);
+    /// [`Self::hello`] decides inside the same apply that claims the slot.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn session_count(&self) -> usize {
         self.core.lock().await.agg.arbiter().session_count()
     }
 
-    /// Whether `session_id` already holds a slot (of any kind) — a
-    /// retransmit or reattach of a session already known to the arbiter
-    /// never counts against the `--max-sessions` admission check, only a
-    /// genuinely new `session_id` does.
+    /// Whether `session_id` already holds a slot (of any kind). A read-only
+    /// query (tests); admission makes the same distinction inside its apply.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn has_session(&self, session_id: isekai_protocol::SessionId) -> bool {
         self.core.lock().await.agg.arbiter().has_session(session_id)
     }
@@ -342,14 +338,26 @@ impl AttachRuntime {
         }
     }
 
-    /// Entry point for a data-stream `ATTACH_HELLO`: registers a waiter for
-    /// `key`, applies the event, executes whatever effects come back
-    /// immediately, then waits (possibly across further effects executed by
-    /// *other* tasks later) for the eventual `AttachReadyV2`/reject outcome.
+    /// Entry point for a data-stream `ATTACH_HELLO` (after its proof has been
+    /// verified): registers a waiter for `key`, applies `AdmitRequested`,
+    /// executes whatever effects come back immediately, then waits (possibly
+    /// across further effects executed by *other* tasks later) for the
+    /// eventual `AttachReadyV2`/reject outcome.
+    ///
+    /// Admission (`--max-sessions`, Epic N-5) happens in that **same apply**
+    /// (ADR_FUNCTIONAL_CORE_EFFECTS.md Step 2b): a session_id that already
+    /// holds a slot (retransmit/reattach/supersede) passes straight through;
+    /// a brand-new one claims a slot if fewer than `max_sessions` are held,
+    /// else evicts the oldest parked session first, else is rejected with
+    /// `BusyOtherSession` without claiming anything. This bounds concurrent
+    /// target connects/handshakes *before* any target connect starts, and —
+    /// unlike the former `engine/mod.rs::admit_new_session`, which checked
+    /// `session_count()` under the lock, dropped it, then called this — two
+    /// concurrent new sessions can no longer both pass the check (max+1).
     pub async fn hello(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.insert(key, tx);
-        self.apply_and_execute(ServeEvent::Hello { key }).await;
+        self.apply_and_execute(ServeEvent::AdmitRequested { key }).await;
         rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
     }
 
@@ -487,13 +495,6 @@ impl AttachRuntime {
         let mut out = self.apply_with(move |now| ServeEvent::Sweep { now, max_parked }, Staged::default()).await;
         self.execute_effects(std::mem::take(&mut out.attach)).await;
         out.discarded
-    }
-
-    /// Evicts the globally oldest parked session (tie-break `(parked_since,
-    /// id)`) to make room for a brand-new session at admission time (Epic
-    /// N-5; formerly `SessionTable::claim_oldest_parked` + `release_slot_for`).
-    pub async fn evict_oldest_parked(self: &Arc<Self>) -> Option<SessionKey> {
-        self.apply_and_execute(ServeEvent::EvictOldestParked).await.discarded.into_iter().next()
     }
 
     /// `RESUME` for `id`, resolved in one apply (ADR §2.2 R3-2 / I-i).
@@ -750,6 +751,22 @@ impl AttachRuntime {
     /// (tokio's `Mutex` is FIFO-fair) and release them in a known order.
     pub(crate) async fn lock_core_for_test(&self) -> tokio::sync::MutexGuard<'_, ServeCore> {
         self.core.lock().await
+    }
+
+    /// [`Self::hello`] without admission: claims a fencing slot even over
+    /// `--max-sessions`. Only for reproducing the over-capacity slot that the
+    /// pre-Step-2b admission race could create (→ an unresumable entry).
+    pub(crate) async fn hello_bypassing_admission(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().await.insert(key, tx);
+        let attach = {
+            let mut core = self.core.lock().await;
+            let ServeCore { agg, io } = &mut *core;
+            let effects = agg.hello_bypassing_admission(key);
+            interpret_in_lock(io, effects, &mut Staged::default()).attach
+        };
+        self.execute_effects(attach).await;
+        rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
     }
 
     pub(crate) async fn index_contains(&self, id: &SessionKey) -> bool {
