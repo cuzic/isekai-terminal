@@ -100,7 +100,7 @@ jobs:
   test:
     needs: changes
     # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
-    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'schedule'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') && github.event_name != 'schedule' }}
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: rust-core-test-linux
@@ -324,7 +324,7 @@ jobs:
   purity-check:
     needs: changes
     # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
-    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'schedule'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') && github.event_name != 'schedule' }}
     name: rust-core-purity-check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -408,7 +408,7 @@ jobs:
     # 夜間(schedule)と手動dispatchのみ。PR/pushでは走らない(2026-10-07、ユーザー決定:
     # macOSランナーの待ち行列でPRのマージが45分以上待たされたため。それ以前の2026-10-06には
     # まずmain pushでのスキップを入れていた)。ファイル冒頭のコメント参照。
-    if: needs.changes.outputs.relevant == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-macos`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
@@ -489,7 +489,7 @@ jobs:
     # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、WindowsはPRで済ませる。
     # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
     # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
-    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push' && github.event_name != 'schedule'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') && github.event_name != 'push' && github.event_name != 'schedule' }}
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-windows`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
