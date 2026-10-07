@@ -155,6 +155,8 @@ pub enum AttachEffect {
 /// clock, no RNG), which is what makes the stale-async-completion and
 /// concurrent-race invariants exhaustively unit-testable.
 #[derive(Debug, Default)]
+// テスト専用: `serve_fsm.rs`の有界網羅探索(ADR Step 10-2)が状態を複製するため。本番ビルドには影響しない。
+#[cfg_attr(test, derive(Clone))]
 pub struct AttachArbiter {
     sessions: HashMap<SessionId, AttachState>,
     next_lease: u64,
