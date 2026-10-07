@@ -183,6 +183,9 @@ final class WeakOrchestratorCallback: OrchestratorCallback, @unchecked Sendable 
         target?.onFilePreviewResult(requestId: requestId, outcome: outcome)
     }
     func onForegroundResume(didReconnect: Bool) { target?.onForegroundResume(didReconnect: didReconnect) }
+    func onConnectionEdge(edge: ConnectionEdge, generation: UInt64) {
+        target?.onConnectionEdge(edge: edge, generation: generation)
+    }
 }
 
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
