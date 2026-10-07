@@ -13,6 +13,9 @@ thiserror = "2.0.18"
 # from isekai-trust/isekai-auth (which used to each depend on this directly
 # for the exact same NamedTempFile::new_in-based sequence).
 tempfile = "3"
+# read_checked's best-effort chmod-to-0600 reports a failure as a warning
+# instead of refusing to read (PR #202 review F2).
+log = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # with_exclusive_lock's Unix backend (flock(2)). Same crate+version
