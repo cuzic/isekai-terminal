@@ -38,7 +38,8 @@ pub struct MuxClientConfig {
     /// The connection is declared dead after this much silence.
     pub max_idle_timeout: Duration,
     /// PING interval to keep the connection (and, for UDP-based backends,
-    /// any NAT mapping) alive.
+    /// any NAT mapping) alive. The `qmux` backend has no such knob — it
+    /// derives its keep-alive cadence from the negotiated idle timeout.
     pub keep_alive_interval: Duration,
     /// Maximum number of concurrent bidirectional streams the peer may open
     /// on this connection.

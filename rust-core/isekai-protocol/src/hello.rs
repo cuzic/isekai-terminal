@@ -47,11 +47,7 @@ impl Proof {
     /// Constant-time comparison, per the timing-attack mitigation mandated by
     /// `archive/HELPER_PROTOCOL.md` §4 ("proof の比較は constant-time equality で行う").
     pub fn ct_eq(&self, other: &Proof) -> bool {
-        let mut diff = 0u8;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            diff |= a ^ b;
-        }
-        diff == 0
+        subtle::ConstantTimeEq::ct_eq(&self.0[..], &other.0[..]).into()
     }
 }
 

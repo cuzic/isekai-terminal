@@ -123,6 +123,14 @@ pub fn validate_remote_path(path: &str) -> Result<(), ProtocolError> {
             reason: "must not be empty".to_string(),
         });
     }
+    // Interpolated unquoted as a command argument (`mkdir -p <dir>`, `mv
+    // ... <path>`): a leading `-` would be parsed as an option.
+    if path.starts_with('-') {
+        return Err(ProtocolError::InvalidBootstrapArg {
+            field: "remote_path",
+            reason: "must not start with '-' (would be parsed as a command-line option)".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -175,13 +183,38 @@ pub fn remote_parent_dir(path: &str) -> &str {
 /// like `isekai-bootstrap::openssh` already does; a crate's own trusted
 /// constant (e.g. `ISEKAI_PIPE_INSTALL_DIR`/`ISEKAI_PIPE_BIN_NAME`) needs no
 /// such validation.
+///
+/// The temporary file name carries a per-call random suffix
+/// (`<path>.tmp.<hex>`): with a fixed `<path>.tmp`, two concurrent
+/// bootstraps to the same host (two tabs, or the app and `isekai-ssh`) wrote
+/// into the *same* temp file and could `mv` an interleaved, corrupt binary
+/// into place. The suffix is generated here rather than with the shell's
+/// `$$`, because this command runs through the user's login shell, which is
+/// not necessarily POSIX `sh`.
 pub fn upload_binary_command(remote_binary_path: &str, remote_dir: &str) -> String {
+    upload_binary_command_with_suffix(remote_binary_path, remote_dir, &random_tmp_suffix())
+}
+
+fn upload_binary_command_with_suffix(remote_binary_path: &str, remote_dir: &str, suffix: &str) -> String {
+    let tmp = format!("{remote_binary_path}.tmp.{suffix}");
     format!(
         "umask 077 && mkdir -p {remote_dir} && \
-         base64 -d > {remote_binary_path}.tmp && \
-         chmod 0700 {remote_binary_path}.tmp && \
-         mv {remote_binary_path}.tmp {remote_binary_path}"
+         base64 -d > {tmp} && \
+         chmod 0700 {tmp} && \
+         mv {tmp} {remote_binary_path}"
     )
+}
+
+/// 16 hex digits of per-call randomness without pulling a RNG dependency
+/// into this I/O-free crate: `RandomState` is seeded from OS randomness per
+/// process and advanced per instance.
+fn random_tmp_suffix() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+    );
+    format!("{:016x}", hasher.finish())
 }
 
 /// Outcome of [`classify_launch_failure`]: what kind of `--bind` failure (if
@@ -243,11 +276,26 @@ mod tests {
 
     #[test]
     fn upload_binary_command_embeds_path_and_dir() {
-        let cmd = upload_binary_command("~/.local/bin/isekai-pipe", "~/.local/bin");
+        let cmd = upload_binary_command_with_suffix("~/.local/bin/isekai-pipe", "~/.local/bin", "abc");
         assert!(cmd.contains("mkdir -p ~/.local/bin"));
-        assert!(cmd.contains("base64 -d > ~/.local/bin/isekai-pipe.tmp"));
-        assert!(cmd.contains("chmod 0700 ~/.local/bin/isekai-pipe.tmp"));
-        assert!(cmd.contains("mv ~/.local/bin/isekai-pipe.tmp ~/.local/bin/isekai-pipe"));
+        assert!(cmd.contains("base64 -d > ~/.local/bin/isekai-pipe.tmp.abc"));
+        assert!(cmd.contains("chmod 0700 ~/.local/bin/isekai-pipe.tmp.abc"));
+        assert!(cmd.contains("mv ~/.local/bin/isekai-pipe.tmp.abc ~/.local/bin/isekai-pipe"));
+    }
+
+    #[test]
+    fn concurrent_uploads_never_share_a_temp_file() {
+        let a = upload_binary_command("~/.local/bin/isekai-pipe", "~/.local/bin");
+        let b = upload_binary_command("~/.local/bin/isekai-pipe", "~/.local/bin");
+        assert_ne!(a, b, "each upload must use its own temp file name");
+        assert!(!a.contains("isekai-pipe.tmp &&"), "the fixed .tmp name must not be used any more");
+    }
+
+    #[test]
+    fn remote_path_may_not_start_with_a_dash() {
+        assert!(validate_remote_path("-oProxyCommand=x").is_err());
+        assert!(validate_remote_path("~/.local/bin/isekai-pipe").is_ok());
+        assert!(validate_remote_path("/opt/isekai/-weird-but-fine").is_ok());
     }
 
     #[test]

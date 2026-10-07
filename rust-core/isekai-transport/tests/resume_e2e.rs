@@ -164,6 +164,7 @@ async fn handle_connection(conn: noq::Connection, session_secret: Vec<u8>, sessi
             let control_session = session.clone();
             let session_id_slot: Arc<Mutex<Option<[u8; SESSION_ID_LEN]>>> = Arc::new(Mutex::new(None));
             let session_id_slot_for_task = session_id_slot.clone();
+            let attached_session_id: [u8; SESSION_ID_LEN] = *hello.session_id.as_bytes();
             tokio::spawn(async move {
                 let Ok(Ok((mut csend, mut crecv))) =
                     tokio::time::timeout(Duration::from_secs(5), control_conn.accept_bi()).await
@@ -178,7 +179,10 @@ async fn handle_connection(conn: noq::Connection, session_secret: Vec<u8>, sessi
                 if !expected.ct_eq(&Proof::new(chello[1..33].try_into().unwrap())) {
                     return;
                 }
-                let session_id: [u8; SESSION_ID_LEN] = rand::random();
+                // Echo the session_id the client chose in ATTACH_HELLO, exactly
+                // like the real `isekai-pipe serve` (#18-4) — the client now
+                // rejects a CONTROL_ACK carrying any other value.
+                let session_id: [u8; SESSION_ID_LEN] = attached_session_id;
                 // NB: read both fields out of `control_session` into locals
                 // *before* touching `control_sessions` — nesting two
                 // `.lock()` calls inside one struct-literal statement would
