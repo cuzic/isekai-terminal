@@ -36,8 +36,9 @@
 //! | 再接続ループの同期エラー | [`ReconnectEvent::AttemptFailedSync`] | はい |
 //! | ループ起動の`AttemptRef`が解決できなかった(到達しない想定) | [`ReconnectEvent::LoopStartAborted`] | はい(3b/3c) |
 //! | `begin_connect` | [`ReconnectEvent::ManualConnectStarted`] | はい(8a′、→Connecting) |
-//! | `disconnect` | `UserDisconnect` | いいえ |
-//! | `cancel_reconnect` | [`ReconnectEvent::CancelReconnect`] | はい(3b/3c: epochを進める書き手) |
+//! | 手動接続(`start_manual_connect`)の同期失敗 | [`ReconnectEvent::ManualConnectFailedSync`] | はい(RC-29、→Idle) |
+//! | `disconnect` | [`ReconnectEvent::UserDisconnect`] | はい(RC-03: ループ動作中ならループを止め、進行中の試行を中断する) |
+//! | `cancel_reconnect` | [`ReconnectEvent::CancelReconnect`] | はい(3b/3c: epochを進める書き手。RC-04: 進行中の試行も中断する) |
 //! | `notify_did_enter_background` | `EnteredBackground{budget_ms}` | いいえ |
 //! | `notify_background_budget_expired` | `BackgroundBudgetExpired` | いいえ |
 //! | `notify_memory_warning` | `MemoryWarning` | いいえ |
@@ -362,6 +363,14 @@ pub(crate) enum ReconnectEvent {
     AttemptFailedSync { epoch: u64 },
     /// `cancel_reconnect()`(ユーザーによる自動再接続の中止)。
     CancelReconnect,
+    /// `disconnect()`(ユーザー操作による切断・タブclose、RC-03)。ループ動作中なら`CancelReconnect`と
+    /// 同じくループを止めて進行中の試行を中断し、Rust側から`Disconnected`を公開する(Kotlinに
+    /// `cancel_reconnect`の併用を求めない、`rust-ssot.md`)。ループ非動作中は`user_initiated_disconnect`を
+    /// 立てて現在のセッションを切断させ、結果はそのセッションの切断通知で届く。
+    UserDisconnect,
+    /// 手動接続(`start_manual_connect`)の`connect()`が同期的に失敗した(RC-29、→Idle)。shellは
+    /// その試行の世代がまだ現行であることを同じ臨界区間で確かめてからapplyする。
+    ManualConnectFailedSync,
     /// `StartReconnectLoop{epoch}`の`AttemptRef`をshellが解決できず、ループを起動しなかった
     /// (`set_last_connect_attempt`の不変条件が破れない限り到達しない。Step 3aレビューm2)。
     LoopStartAborted { epoch: u64 },
@@ -415,6 +424,14 @@ pub(crate) enum ReconnectEffect {
     LoopWokeEarly { epoch: u64 },
     /// Step 3b/3c(ログ用): ループ(`epoch`)のtickを1回数えた。
     LoopTicked { epoch: u64, tick_count: u64, elapsed_secs: u64 },
+    /// RC-03/RC-04: ループを止めた遷移(中止・ユーザー切断・ギブアップ)で、進行中だったかもしれない
+    /// 試行を中断する。shellは**applyと同じ臨界区間で**`session_generation`を進め(試行のセッションの
+    /// 遅延コールバックを無効化し、後から成功しても`Connected`へ戻らないようにする)、ロック解放後に
+    /// 現在のセッションを切断し、そのセッションに紐づく保留中の要求・転送状態を片付ける。
+    AbortInFlightAttempt,
+    /// RC-03: ループ非動作中のユーザー切断。shellは現在のセッションを切断する(結果は
+    /// `user_initiated_disconnect`付きの`AttemptDisconnected`で届き、自動再接続しない)。
+    DisconnectSession,
 }
 
 impl ReconnectState {
@@ -450,10 +467,17 @@ impl ReconnectState {
             ReconnectEvent::ReconnectWake { epoch, policy } => self.on_reconnect_wake(epoch, policy),
             ReconnectEvent::ReconnectTick { epoch, policy } => self.on_reconnect_tick(epoch, policy),
             ReconnectEvent::AttemptFailedSync { epoch } => {
+                let mut effects = Vec::new();
                 if epoch == self.reconnect_epoch {
                     self.retry_attempt_in_flight = false;
+                    // RC-29: 試行(`connect_via`)は`ReconnectSessionStarting`でphaseを`Connecting`にしてから
+                    // 同期的に失敗する。戻さないと、後の手動接続が`ManualConnectStarted`の二重start防止で
+                    // 永久に拒否される。
+                    if self.phase() == ConnPhase::Connecting {
+                        self.set_phase(ConnPhase::Idle, &mut effects);
+                    }
                 }
-                Vec::new()
+                effects
             }
             ReconnectEvent::CancelReconnect => {
                 // ループが動作中だった場合のみ`Disconnected`を通知する(動いていない時に呼ばれても
@@ -461,10 +485,34 @@ impl ReconnectState {
                 let was_active = self.reconnect_loop_active;
                 self.stop_loop();
                 if was_active {
-                    vec![ReconnectEffect::PublishDisconnected { issue_hint: None }]
+                    let mut effects = Vec::new();
+                    self.abort_loop_attempt(&mut effects);
+                    effects.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
+                    effects
                 } else {
                     Vec::new()
                 }
+            }
+            ReconnectEvent::UserDisconnect => {
+                if self.reconnect_loop_active {
+                    self.stop_loop();
+                    self.user_initiated_disconnect = false;
+                    let mut effects = vec![ReconnectEffect::InvalidatePathObserver];
+                    self.abort_loop_attempt(&mut effects);
+                    effects.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
+                    effects
+                } else {
+                    // 「これから来る切断通知はユーザー操作起因」の印(`AttemptDisconnected`が読んで下ろす)。
+                    self.user_initiated_disconnect = true;
+                    vec![ReconnectEffect::DisconnectSession]
+                }
+            }
+            ReconnectEvent::ManualConnectFailedSync => {
+                let mut effects = Vec::new();
+                if self.phase() == ConnPhase::Connecting {
+                    self.set_phase(ConnPhase::Idle, &mut effects);
+                }
+                effects
             }
             ReconnectEvent::LoopStartAborted { epoch } => {
                 if epoch != self.reconnect_epoch {
@@ -520,6 +568,16 @@ impl ReconnectState {
         self.retry_attempt_in_flight = false;
         self.pending_wake = false;
         self.loop_clock = None;
+    }
+
+    /// 止めたループ(`stop_loop`の後)が進めていたかもしれない試行を中断する(RC-03/RC-04)。phaseを
+    /// `Idle`へ戻し(試行中は`Connecting`)、ループが追跡していたバックグラウンド遷移状態も手放す
+    /// (自動ループが始まらなかった切断と同じ扱い)。試行のセッション自体の無効化・切断はshellが
+    /// [`ReconnectEffect::AbortInFlightAttempt`]で行う。
+    fn abort_loop_attempt(&mut self, effects: &mut Vec<ReconnectEffect>) {
+        self.set_phase(ConnPhase::Idle, effects);
+        self.background_state = BackgroundState::Foreground;
+        effects.push(ReconnectEffect::AbortInFlightAttempt);
     }
 
     /// ループ`epoch`が現行で、`LoopStarted`済みで動作中か。そうでないtick/wakeはstale扱い。
@@ -708,6 +766,8 @@ impl ReconnectState {
             // ギブアップ。epochを進めるので、既に送出済みの試行の遅延結果(同epochの
             // `AttemptFailedSync`)や、万一残ったtick/wakeは以後stale(Step 3aレビューm5)。
             self.stop_loop();
+            // RC-04: 送出済みの試行が後から成功して`Connected`へ戻らないよう中断する。
+            self.abort_loop_attempt(&mut effects);
             effects.push(ReconnectEffect::PublishReconnectTimedOut { timeout_secs });
             return effects;
         }
@@ -1103,6 +1163,8 @@ mod tests {
             Just(ReconnectEvent::ReconnectSessionStarting),
             Just(ReconnectEvent::ForegroundReconnectFailedSync),
             Just(ReconnectEvent::CancelReconnect),
+            Just(ReconnectEvent::UserDisconnect),
+            Just(ReconnectEvent::ManualConnectFailedSync),
             (0u64..6).prop_map(|epoch| ReconnectEvent::LoopStartAborted { epoch }),
         ]
     }
@@ -1724,16 +1786,115 @@ mod tests {
 
         /// `CancelReconnect`は旧`cancel_reconnect`と同じフィールドを書き(epochを進める)、ループが
         /// 動作中だったときだけ`Disconnected`を公開する。tick会計も捨てる。
+        /// RC-04: ループが動作中だったときは、進行中だったかもしれない試行を中断する(phaseを`Idle`へ戻し、
+        /// `AbortInFlightAttempt`を`Disconnected`の公開より前に出す)。
         #[test]
         fn cancel_reconnect_matches_legacy(initial in state_strategy()) {
             let mut legacy = initial.clone();
             let published = legacy_cancel(&mut legacy);
             legacy.loop_clock = None;
+            let mut expected = Vec::new();
+            if published {
+                if let Some(generation) = legacy.edge_open.take() {
+                    expected.push(ReconnectEffect::EdgeLost { generation });
+                }
+                legacy.phase = ReducerOwned(ConnPhase::Idle);
+                legacy.background_state = BackgroundState::Foreground;
+                expected.push(ReconnectEffect::AbortInFlightAttempt);
+                expected.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
+            }
             let mut s = initial.clone();
             let effects = s.apply(ReconnectEvent::CancelReconnect);
             prop_assert_eq!(&s, &legacy);
-            let expected = if published { vec![ReconnectEffect::PublishDisconnected { issue_hint: None }] } else { Vec::new() };
             prop_assert_eq!(effects, expected);
+        }
+
+        /// RC-03: `UserDisconnect`は、ループ動作中ならループを止めて進行中の試行を中断し、Rust側から
+        /// `Disconnected`を公開する(この遷移の後、ループはもう試行を始めない)。ループ非動作中は
+        /// `user_initiated_disconnect`を立ててセッションの切断だけを依頼し、他のフィールドは変えない。
+        #[test]
+        fn user_disconnect_stops_a_live_loop_or_marks_the_disconnect_as_user_initiated(
+            initial in state_strategy(),
+            policy in policy_strategy(),
+        ) {
+            let mut s = initial.clone();
+            let effects = s.apply(ReconnectEvent::UserDisconnect);
+            if initial.reconnect_loop_active {
+                prop_assert!(!s.reconnect_loop_active && !s.retry_attempt_in_flight && !s.pending_wake);
+                prop_assert_eq!(s.loop_clock, None);
+                prop_assert_ne!(s.reconnect_epoch, initial.reconnect_epoch, "ループのepochが無効化されなかった");
+                prop_assert_eq!(s.phase, ConnPhase::Idle);
+                prop_assert!(!s.user_initiated_disconnect);
+                prop_assert_eq!(s.background_state, BackgroundState::Foreground);
+                let abort = effects.iter().position(|e| *e == ReconnectEffect::AbortInFlightAttempt);
+                let publish = effects.iter().position(|e| matches!(e, ReconnectEffect::PublishDisconnected { .. }));
+                prop_assert!(abort.is_some() && publish.is_some() && abort < publish, "試行の中断がDisconnectedより前に出ない: {:?}", effects);
+                // 旧ループのtick/wakeはもう何もしない。
+                let after = s.clone();
+                for ev in [
+                    ReconnectEvent::ReconnectTick { epoch: initial.reconnect_epoch, policy },
+                    ReconnectEvent::ReconnectWake { epoch: initial.reconnect_epoch, policy },
+                ] {
+                    prop_assert!(s.apply(ev).is_empty(), "ユーザー切断の後に旧ループのEventがEffectを返した");
+                    prop_assert_eq!(&s, &after);
+                }
+            } else {
+                prop_assert_eq!(effects, vec![ReconnectEffect::DisconnectSession]);
+                let mut expected = initial.clone();
+                expected.user_initiated_disconnect = true;
+                prop_assert_eq!(s, expected);
+            }
+        }
+
+        /// RC-04: 動作中のループが試行中(phase `Connecting`)のとき、ループを止める遷移(中止・ユーザー切断・
+        /// ギブアップ)はどれもphaseを`Idle`へ戻し、試行の中断を依頼する。
+        #[test]
+        fn stopping_a_loop_with_an_attempt_in_flight_aborts_the_attempt(
+            initial in state_strategy(),
+            which in 0u8..3,
+        ) {
+            let policy = ReconnectPolicy {
+                tick: Duration::from_millis(10),
+                retry_interval: Duration::from_millis(10),
+                timeout: Duration::from_millis(10),
+            };
+            let mut s = initial;
+            s.apply(ReconnectEvent::ReconnectSessionStarting);
+            make_loop_live(&mut s, policy);
+            s.retry_attempt_in_flight = true;
+            let epoch = s.reconnect_epoch;
+            let ev = match which {
+                0 => ReconnectEvent::CancelReconnect,
+                1 => ReconnectEvent::UserDisconnect,
+                // timeout == tickなので最初のtickでギブアップする。
+                _ => ReconnectEvent::ReconnectTick { epoch, policy },
+            };
+            let effects = s.apply(ev.clone());
+            prop_assert_eq!(s.phase, ConnPhase::Idle, "ループを止めた後もConnectingのまま: {:?}", ev);
+            prop_assert!(effects.contains(&ReconnectEffect::AbortInFlightAttempt), "試行の中断を依頼しなかった: {:?} -> {:?}", ev, effects);
+            prop_assert!(!s.reconnect_loop_active);
+        }
+
+        /// RC-29: 手動接続・再接続ループの試行の同期失敗はphaseを`Connecting`から`Idle`へ戻すので、
+        /// 次の手動接続が二重start防止に拒否され続けない。
+        #[test]
+        fn sync_connect_failures_do_not_leave_the_phase_stuck_in_connecting(initial in state_strategy(), a in 0u64..3) {
+            let mut s = initial.clone();
+            s.apply(ReconnectEvent::ManualConnectFailedSync);
+            if initial.phase == ConnPhase::Connecting {
+                prop_assert_eq!(s.phase, ConnPhase::Idle);
+            } else {
+                prop_assert_eq!(&s, &initial);
+            }
+            let retried = s.apply(ReconnectEvent::ManualConnectStarted { attempt: AttemptRef(a) });
+            prop_assert!(!retried.contains(&ReconnectEffect::ManualConnectRejected), "同期失敗の後の手動接続が拒否された: {:?}", retried);
+
+            let mut s = initial.clone();
+            s.apply(ReconnectEvent::ReconnectSessionStarting);
+            let epoch = s.reconnect_epoch;
+            s.apply(ReconnectEvent::AttemptFailedSync { epoch });
+            prop_assert_eq!(s.phase, ConnPhase::Idle);
+            prop_assert!(!s.retry_attempt_in_flight);
         }
     }
 
@@ -1760,7 +1921,9 @@ mod tests {
             | ReconnectEffect::PendingWakeRecorded { .. }
             | ReconnectEffect::ArmLoopTimer { .. }
             | ReconnectEffect::LoopWokeEarly { .. }
-            | ReconnectEffect::LoopTicked { .. } => None,
+            | ReconnectEffect::LoopTicked { .. }
+            | ReconnectEffect::AbortInFlightAttempt
+            | ReconnectEffect::DisconnectSession => None,
         }
     }
 
