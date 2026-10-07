@@ -38,9 +38,12 @@ pub(crate) fn process_stdin_bytes(
             *pending_escape = false;
             match b {
                 b'.' => {
-                    action = EscapeAction::Disconnect;
-                    i += 1;
-                    continue;
+                    // Stop right here (review 2026-09-29, SSH-36): anything
+                    // after `~.` in the same read (e.g. the rest of a paste)
+                    // must not be sent to a session the user just asked to
+                    // disconnect — it used to be forwarded before the caller
+                    // got to act on `Disconnect`.
+                    return (to_send, EscapeAction::Disconnect);
                 }
                 b'~' => {
                     to_send.push(b'~');
@@ -59,10 +62,14 @@ pub(crate) fn process_stdin_bytes(
                     continue;
                 }
                 b'\r' | b'\n' => {
-                    // `~` followed by a newline sends just the `~` (OpenSSH
-                    // behavior: the escape character alone at the start of a
-                    // line is consumed). The newline starts a new line.
+                    // `~` followed by Enter is not an escape command, so —
+                    // like `ssh(1)`'s own `process_escapes` default case —
+                    // both the `~` *and* the newline are sent (review
+                    // 2026-09-29, SSH-36: the newline used to be swallowed,
+                    // so typing `~` + Enter at a prompt never submitted the
+                    // line).
                     to_send.push(b'~');
+                    to_send.push(b);
                     *at_line_start = true;
                     i += 1;
                     continue;
@@ -158,12 +165,22 @@ mod tests {
     }
 
     #[test]
-    fn tilde_alone_at_line_start_with_newline_sends_tilde() {
+    fn tilde_alone_at_line_start_with_newline_sends_tilde_and_the_newline() {
         let (bytes, action) = scan(b"cmd\n~\nnext");
-        // `~` at line start followed by newline → sends `~` literally,
-        // the newline is consumed as part of the escape sequence.
-        assert_eq!(bytes, b"cmd\n~next");
+        // SSH-36: `~` + Enter is not an escape command — both the `~` and
+        // the newline are sent (the newline used to be swallowed).
+        assert_eq!(bytes, b"cmd\n~\nnext");
         assert_eq!(action, EscapeAction::None);
+        let (bytes, _) = scan(b"~\r");
+        assert_eq!(bytes, b"~\r");
+    }
+
+    #[test]
+    fn nothing_after_tilde_dot_in_the_same_read_is_sent() {
+        // SSH-36: the rest of the read after `~.` must not reach the remote.
+        let (bytes, action) = scan(b"ls\n~.rm -rf ~/important\n");
+        assert_eq!(bytes, b"ls\n");
+        assert_eq!(action, EscapeAction::Disconnect);
     }
 
     #[test]

@@ -357,6 +357,11 @@ fn announce_native_reconnect(attempt: u32) {
     log_line!("isekai-ssh: connection lost, reconnecting... (attempt {})", attempt);
 }
 
+/// How long [`connect_attempt`] lets a failed attempt's `isekai-pipe connect`
+/// child finish exiting (and writing its `ConnectOutcome`) before
+/// `kill_on_drop` takes over.
+const CHILD_OUTCOME_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The real [`ConnectRecoveryOps`] backed by an actual `isekai-pipe connect`
 /// child, the on-disk `ConnectOutcome` side channel, and
 /// `bootstrap_and_register`.
@@ -496,7 +501,14 @@ async fn connect_attempt(
         // (finishing that write) before `kill_on_drop` takes over. Timing out
         // is fine — we fall through to the kill regardless; the point is only
         // to *let* a nearly-done child finish, never to wait on a hung one.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+        //
+        // 5s rather than the original 1s (review 2026-09-29, SSH-12): with
+        // the SSH-level keepalive gone (`native_ssh_client_config`), the SSH
+        // layer normally only errors *because* the child is already exiting,
+        // but that exit path (classify + write the outcome file + flush the
+        // log) can exceed 1s on a loaded Windows box — and losing the
+        // outcome turns a recoverable failure into `NoRecoverableSignal`.
+        let _ = tokio::time::timeout(CHILD_OUTCOME_GRACE, child.wait()).await;
     }
 
     // On success `child` (the isekai-pipe connect process) was kept alive for
@@ -625,19 +637,15 @@ async fn run_authenticated_session(
 
     // Same silent-aware seam again, for keyboard-interactive (PAM/OTP/2FA):
     // a silent/automated retry must never block waiting on a live server
-    // prompt it can't answer.
-    let kbi_responder: Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync> = if silent {
-        Arc::new(|prompts: &[KeyboardInteractivePrompt]| {
-            log_line!(
-                "isekai-ssh: server requested keyboard-interactive authentication in a silent/automated retry \
-                 — refusing without prompting. Run this connection from an interactive terminal once."
-            );
-            vec![String::new(); prompts.len()]
-        })
-    } else {
-        Arc::new(keyboard_interactive::console_responder)
-    };
-    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder, handoff };
+    // prompt it can't answer — and must not even *start* that exchange
+    // (review 2026-09-29, SSH-14). It used to answer every server prompt
+    // with an empty string instead, which PAM counts as a real failed
+    // password attempt: a holder (always silent) reconnecting in the
+    // background could quietly push the account into `pam_faillock`/
+    // fail2ban lockout. `None` skips the method entirely.
+    let kbi_responder: Option<Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync>> =
+        if silent { None } else { Some(Arc::new(keyboard_interactive::console_responder)) };
+    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: kbi_responder.as_deref(), handoff };
 
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
@@ -681,7 +689,24 @@ async fn run_authenticated_session(
     let ctl_routes_for_holder = resolution.ctl_socket_enabled().then(|| forward_routes.clone());
     if let Some(hook) = owner_hook.take() {
         let serve_handle = hook(handle.clone(), ctl_routes_for_holder);
-        let _ = serve_handle.await;
+        let join = serve_handle.await;
+        // Deliberately still `Ok(0)` even when the shared SSH connection
+        // died (review 2026-09-29, SSH-03): every channel the holder served
+        // lived on that one connection, so no holder-side reconnect could
+        // bring any tab's remote shell back — and a holder has no
+        // foreground session of its own to retry into (`owner_hook` is
+        // already consumed, so a recovery-loop retry would open a *new*
+        // shell inside a detached, console-less process). Each client
+        // observes `OwnerLost` and runs its own reconnect loop
+        // (`mux::run_with_reconnect`). What actually kept the shells alive
+        // across an outage was never this path but not killing the SSH
+        // layer in the first place — see `native_ssh_client_config`'s docs.
+        // Logged so the holder diagnostics log records *why* it ended.
+        let ssh_closed = handle.lock().await.is_closed();
+        log_line!(
+            "isekai-ssh mux holder: serve loop ended (join_ok={}, shared SSH connection closed={ssh_closed})",
+            join.is_ok()
+        );
         return Ok(0);
     }
 
@@ -780,7 +805,13 @@ async fn run_authenticated_session(
     }
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;
-    let exit_code = run_shell_io_loop(&mut channel).await?;
+    // `ssh(1)` only interprets `~` escapes when a PTY was requested
+    // (`EscapeChar` is effectively `none` for `-T`/an `Exec` channel) — with
+    // no PTY the stdin bytes are data (a piped file, `tar` output, ...), and
+    // rewriting any `\n~.` / `\n~~` inside it corrupted binary transfers
+    // (review 2026-09-29, SSH-35).
+    let escapes_enabled = wants_pty(plan.remote_command(), plan.request_tty);
+    let exit_code = run_shell_io_loop(&mut channel, escapes_enabled).await?;
 
     // Best-effort teardown of this tab's forward before the handle is dropped.
     if let Some(path) = &ctl_remote_path {
@@ -845,7 +876,10 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
 /// signature from growing further.
 struct InteractivePrompts<'a> {
     passphrase: &'a (dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
-    keyboard_interactive: &'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync),
+    /// `None` = never attempt keyboard-interactive at all (silent/automated
+    /// mode, SSH-14) — distinct from a responder that answers with nothing,
+    /// which still costs the account a failed PAM attempt.
+    keyboard_interactive: Option<&'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync)>,
     /// Already-decrypted identities (Phase 1b passphrase hand-off, see
     /// `super::mux::handoff`'s docs) — `connect_and_authenticate`'s candidate
     /// loop consults this *before* the on-disk `SessionError::EncryptedPrivateKey`
@@ -854,6 +888,36 @@ struct InteractivePrompts<'a> {
     /// with one. Empty (never populated) for every non-holder, non-fallback
     /// path.
     handoff: &'a HandoffCredentials,
+}
+
+/// The russh client config for the native path's SSH session, which always
+/// runs over an `isekai-pipe connect` child's stdio — never directly over a
+/// network socket.
+///
+/// **No SSH-level keepalive** (review 2026-09-29, SSH-03). This used to set
+/// `keepalive_interval = 60s`, `keepalive_max = 3` (an `ssh(1)`
+/// `ServerAliveInterval`/`ServerAliveCountMax` equivalent), which let russh
+/// tear the *SSH* session down after roughly 3-4 minutes without a reply. But
+/// the transport underneath is `isekai-pipe`'s resumable QUIC session, whose
+/// whole point is to survive outages far longer than that — Wi-Fi roaming, a
+/// laptop sleeping overnight — within its resume window (`#@isekai
+/// resume-grace`, default `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`, ten
+/// days). While `isekai-pipe connect` was quietly parked/resuming, the
+/// unanswered keepalives killed the SSH layer above it first: every channel
+/// died, the mux holder exited, and every tab reconnected into a *brand new*
+/// remote shell even though the resume itself would have succeeded — the
+/// "after waking from sleep I'm in a different shell" symptom.
+///
+/// Liveness is owned by the layer that can actually recover from an outage:
+/// when `isekai-pipe connect` finally gives up it exits, which closes this
+/// session's stdio (a clean EOF russh notices on its own). Same as
+/// `ssh(1)`'s own default (`ServerAliveInterval 0`) — the Unix `ProxyCommand`
+/// path never had an SSH-level keepalive either.
+fn native_ssh_client_config() -> client::Config {
+    let mut config = client::Config::default();
+    config.keepalive_interval = None;
+    config.inactivity_timeout = None;
+    config
 }
 
 /// Establishes the SSH handshake over `stream` and authenticates as
@@ -897,10 +961,7 @@ where
     // just to satisfy the signature, even though no caller ever inspected
     // it afterward.
     let rejection = RejectionReason::new();
-    let mut config = client::Config::default();
-    config.keepalive_interval = Some(std::time::Duration::from_secs(60));
-    config.keepalive_max = 3;
-    let config = Arc::new(config);
+    let config = Arc::new(native_ssh_client_config());
     // Install the ctl-socket route table on the handler so server-initiated
     // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
     // delivered in-process. Harmless (and unused) when ctl-socket is off — no
@@ -991,13 +1052,18 @@ where
     // since it's the one method that's neither "prove possession of a key
     // file" nor silent — matches `ssh(1)`'s own `PreferredAuthentications`
     // ordering (publickey before keyboard-interactive/password).
-    if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| {
-        (prompts.keyboard_interactive)(server_prompts)
-    })
-    .await
-    .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
-    {
-        return Ok(handle);
+    if let Some(kbi_responder) = prompts.keyboard_interactive {
+        if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| kbi_responder(server_prompts))
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
+        {
+            return Ok(handle);
+        }
+    } else {
+        log_line!(
+            "isekai-ssh: skipping keyboard-interactive authentication in a silent/automated connection \
+             — run this connection from an interactive terminal once if the server needs it."
+        );
     }
 
     Err(anyhow!(
@@ -1024,7 +1090,8 @@ async fn try_encrypted_identity<H: client::Handler>(
     prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
 ) -> Result<bool> {
     for attempt in 1..=3 {
-        let Some(passphrase) = prompt_passphrase(path, attempt) else {
+        // Wiped when this attempt's scope ends (review 2026-09-29, SSH-32).
+        let Some(passphrase) = prompt_passphrase(path, attempt).map(zeroize::Zeroizing::new) else {
             return Ok(false);
         };
         let result = match certificate_pem {
@@ -1138,9 +1205,9 @@ enum BreakReason {
 /// Delegates to [`run_shell_io_loop_inner`] (which the tests drive against
 /// in-memory buffers) with the real local `stdin`/`stdout`/`stderr`; driving
 /// a real terminal stdin/stdout pair isn't practical in a unit test.
-async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<u8> {
+async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>, escapes_enabled: bool) -> Result<u8> {
     let resize_rx = console::spawn_resize_watcher();
-    run_shell_io_loop_inner(channel, console_stdin::ConsoleStdin::open(), tokio::io::stdout(), tokio::io::stderr(), resize_rx).await
+    run_shell_io_loop_inner(channel, console_stdin::ConsoleStdin::open(), tokio::io::stdout(), tokio::io::stderr(), resize_rx, escapes_enabled).await
 }
 
 /// The body of [`run_shell_io_loop`] with the three local streams plus an
@@ -1161,6 +1228,7 @@ async fn run_shell_io_loop_inner<I, O, E>(
     mut stdout: O,
     mut stderr: E,
     mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+    escapes_enabled: bool,
 ) -> Result<u8>
 where
     I: tokio::io::AsyncRead + Unpin,
@@ -1197,7 +1265,11 @@ where
                         let _ = channel.eof().await;
                     }
                     Ok(n) => {
-                        let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
+                        let (to_send, action) = if escapes_enabled {
+                            process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape)
+                        } else {
+                            (buf[..n].to_vec(), EscapeAction::None)
+                        };
                         if !to_send.is_empty() {
                             if channel.data(&to_send[..]).await.is_err() {
                                 // Local stdin just produced real bytes, so
@@ -1316,6 +1388,18 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
+    /// SSH-03 regression: the native SSH session must not run its own
+    /// keepalive/inactivity timer — `isekai-pipe`'s resumable QUIC session
+    /// underneath owns liveness, and an SSH-level keepalive used to kill the
+    /// whole session (every tab's remote shell) minutes into an outage the
+    /// resume would have survived.
+    #[test]
+    fn native_ssh_client_config_leaves_liveness_to_isekai_pipe() {
+        let config = native_ssh_client_config();
+        assert!(config.keepalive_interval.is_none(), "no SSH-level keepalive may tear the session down during a QUIC resume");
+        assert!(config.inactivity_timeout.is_none(), "no SSH-level inactivity timeout either");
+    }
+
     /// A [`InteractivePrompts`] that never prompts (passphrase: `None`;
     /// keyboard-interactive: no answers) — the right default for every test
     /// that isn't itself exercising one of these two interactive paths, same
@@ -1331,7 +1415,7 @@ mod tests {
         EMPTY.get_or_init(HandoffCredentials::default)
     }
     fn no_interactive_prompts() -> InteractivePrompts<'static> {
-        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() }
+        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() }
     }
 
     struct AcceptAllHostKeys;
@@ -1390,18 +1474,22 @@ mod tests {
     #[derive(Clone)]
     struct KeyboardInteractiveOnlyServer {
         accepted_answer: String,
+        /// How many keyboard-interactive *responses* (i.e. real answered
+        /// attempts, each one a PAM failure if wrong) the server received.
+        responses_seen: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl server::Server for KeyboardInteractiveOnlyServer {
         type Handler = KeyboardInteractiveOnlyHandler;
         fn new_client(&mut self, _: Option<SocketAddr>) -> KeyboardInteractiveOnlyHandler {
-            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone() }
+            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone(), responses_seen: self.responses_seen.clone() }
         }
     }
 
     #[derive(Clone)]
     struct KeyboardInteractiveOnlyHandler {
         accepted_answer: String,
+        responses_seen: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -1418,6 +1506,7 @@ mod tests {
                     prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
                 }),
                 Some(resp) => {
+                    self.responses_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
                     let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
                     Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
@@ -1561,7 +1650,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(
@@ -1887,7 +1976,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = run_shell_io_loop(&mut channel).await;
+        let result = run_shell_io_loop(&mut channel, true).await;
         assert!(result.is_err(), "an abnormal disconnect must propagate as Err, not a successful-looking exit code");
     }
 
@@ -1915,7 +2004,7 @@ mod tests {
             .await
             .unwrap();
 
-        let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
+        let exit_code = run_shell_io_loop(&mut channel, true).await.unwrap();
         assert_eq!(exit_code, 255, "an ExitSignal must be reported as 255, matching ssh(1)'s own convention, and as Ok (not Err)");
     }
 
@@ -1953,7 +2042,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
+        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None, true).await.unwrap();
         assert_eq!(exit_code, 42, "an exit-status arriving after CHANNEL_EOF must still be honored, not reported as 255");
     }
 
@@ -1968,7 +2057,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
+        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None, true).await.unwrap();
         assert_eq!(stdout, b"hello-stdout", "remote stdout (Data) must land on local stdout");
         assert_eq!(stderr, b"hello-stderr", "remote stderr (ExtendedData) must land on local stderr, not stdout");
     }
@@ -2070,7 +2159,7 @@ mod tests {
         let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
 
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: empty_handoff() };
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
     }
@@ -2116,7 +2205,7 @@ mod tests {
             prompted.store(true, std::sync::atomic::Ordering::SeqCst);
             no_passphrase_prompt(path, attempt)
         };
-        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: &no_kbi_responder, handoff: &resolved };
+        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: Some(&no_kbi_responder), handoff: &resolved };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "a hand-off credential must authenticate directly: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
@@ -2203,14 +2292,14 @@ mod tests {
 
     #[tokio::test]
     async fn connect_and_authenticate_falls_through_to_keyboard_interactive_when_nothing_else_is_configured() {
-        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 220).await;
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string(), responses_seen: Default::default() }, 220).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         // No identity_file configured and no agent on Linux, so this proves
         // the fall-through all the way to keyboard-interactive.
         let host_config = openssh_config::HostConfig::default();
         let kbi_responder = |_prompts: &[KeyboardInteractivePrompt]| vec!["hunter2".to_string()];
-        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder, handoff: empty_handoff() };
+        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: Some(&kbi_responder), handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "keyboard-interactive with the right answer must authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
@@ -2222,13 +2311,28 @@ mod tests {
         // seam: the kbi responder always returns empty answers (never blocks
         // on a live server prompt it can't answer), so the overall attempt
         // fails cleanly rather than hanging.
-        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 221).await;
+        let responses_seen: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+        let addr = spawn_server(
+            KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string(), responses_seen: responses_seen.clone() },
+            221,
+        )
+        .await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        // SSH-14: silent mode is `keyboard_interactive: None` — the method is
+        // skipped entirely rather than answered with empty strings (each of
+        // which PAM counts as a failed password attempt).
+        let silent_prompts =
+            InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: None, handoff: empty_handoff() };
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &silent_prompts).await;
         assert!(result.is_err(), "a silently-refused keyboard-interactive prompt must fail cleanly, not hang or panic");
+        assert_eq!(
+            responses_seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "silent mode must never send a keyboard-interactive response (a PAM failed attempt)"
+        );
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
