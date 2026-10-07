@@ -252,6 +252,11 @@ pub struct AttachRuntime {
     /// zero-sized `()` in non-test builds (see [`TraceHook`]).
     #[cfg_attr(not(test), allow(dead_code))]
     trace: TraceHook,
+    /// Test builds: opt-in pause points inside `start_connect` for forcing
+    /// specific interleavings deterministically (review of #206, F1/F2).
+    /// Non-test builds: `()`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    hooks: TestHooks,
 }
 
 /// Test builds: the Step 11 trace recorder. Non-test builds: `()` (nothing is
@@ -261,6 +266,11 @@ pub struct AttachRuntime {
 type TraceHook = super::trace_invariants::ServeTraceRecorder;
 #[cfg(not(test))]
 type TraceHook = ();
+
+#[cfg(test)]
+type TestHooks = start_connect_tests::Hooks;
+#[cfg(not(test))]
+type TestHooks = ();
 
 impl AttachRuntime {
     /// `max_sessions`: `--max-sessions` (Phase S-4b) — the admission cap
@@ -276,6 +286,7 @@ impl AttachRuntime {
             target,
             epoch: tokio::time::Instant::now(),
             trace: Default::default(),
+            hooks: Default::default(),
         })
     }
 
@@ -568,7 +579,8 @@ impl AttachRuntime {
     /// returned, so a fast connect could store `PendingTarget { tcp }` first
     /// and then have it overwritten by `Connecting`: `activate()` then found no
     /// target and the attach failed. A failed/timed-out connect also used to
-    /// leave its stale `Connecting` entry behind; it is now removed first.
+    /// leave its stale `Connecting` entry behind; see [`Self::connect_failed`]
+    /// for how it is now removed without opening a new leak.
     async fn start_connect(self: &Arc<Self>, lease: LeaseId) {
         let this = self.clone();
         let target_addr = self.target;
@@ -596,19 +608,50 @@ impl AttachRuntime {
                 }
                 Ok(Err(e)) => {
                     log::info!("attach_runtime: target connect failed for lease {lease:?}: {e}");
-                    this.forget_connecting(lease).await;
-                    this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
+                    this.connect_failed(lease).await;
                 }
                 Err(_elapsed) => {
                     log::info!(
                         "attach_runtime: target connect timed out after {TARGET_CONNECT_TIMEOUT:?} for lease {lease:?}"
                     );
-                    this.forget_connecting(lease).await;
-                    this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
+                    this.connect_failed(lease).await;
                 }
             }
         });
+        #[cfg(test)]
+        self.hooks.after_connect_spawned().await;
         leases.insert(lease, LeaseResource::Connecting { task });
+    }
+
+    /// A target connect failed: report it to the reducer **first**, and drop
+    /// the `Connecting` entry only if that report actually consumed the
+    /// lease (review of #206, F1).
+    ///
+    /// Dropping the entry before the apply (the first version of PIPE-04)
+    /// opened a leak: a higher-generation `ATTACH_HELLO` applied in between
+    /// moved the session to `ClosingForSupersede` and issued `CancelLease`,
+    /// whose `cancel_lease` found no entry and so never sent `LeaseStopped`;
+    /// the late `TargetConnectFailed` was then stale, and the session stayed
+    /// in `ClosingForSupersede` forever (no later HELLO answered, `is_vacant`
+    /// never true again — unrecoverable by any client retry).
+    ///
+    /// `on_target_connect_failed` returns an effect exactly when it removed
+    /// `Connecting { lease }` (the `SendReject{Target}` for its waiter); after
+    /// that no `CancelLease` for this lease can ever be issued, so the entry
+    /// is ours to drop. If it returned nothing, the session already moved on
+    /// via a transition that issued `CancelLease { lease }` in the same apply
+    /// (supersede or CANCEL): that `cancel_lease` owns the entry — it removes
+    /// it, aborts/awaits this task and applies `LeaseStopped` — so the entry
+    /// must be left in place for it to find, whichever of the two runs first.
+    async fn connect_failed(self: &Arc<Self>, lease: LeaseId) {
+        #[cfg(test)]
+        self.hooks.before_connect_failure_applied().await;
+        let mut out = self.apply_with(move |_| ServeEvent::TargetConnectFailed { lease }, Staged::default()).await;
+        let consumed = !out.attach.is_empty();
+        if consumed {
+            self.forget_connecting(lease).await;
+        }
+        self.execute_effects(std::mem::take(&mut out.attach)).await;
     }
 
     /// Drops a finished connect's `Connecting` entry (PIPE-04) — only if it is
@@ -876,13 +919,108 @@ mod timing_relations;
 mod start_connect_tests {
     use super::*;
     use isekai_protocol::attach::{AttemptId, ConnectionGeneration, ATTEMPT_ID_LEN};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Semaphore;
+
+    /// Opt-in pause points in `start_connect` (all off by default, so every
+    /// other test sees production ordering).
+    pub(crate) struct Hooks {
+        /// Let the freshly spawned connect task run (to completion of its
+        /// connect and its own `leases` access, if it can) before
+        /// `start_connect` records `Connecting`.
+        yield_after_spawn: AtomicBool,
+        /// Park a failed connect right before it reports
+        /// `TargetConnectFailed`: `reached` gets a permit, then it waits for
+        /// one on `proceed`.
+        gate_connect_failure: AtomicBool,
+        reached: Semaphore,
+        proceed: Semaphore,
+    }
+
+    impl Default for Hooks {
+        fn default() -> Self {
+            Self {
+                yield_after_spawn: AtomicBool::new(false),
+                gate_connect_failure: AtomicBool::new(false),
+                reached: Semaphore::new(0),
+                proceed: Semaphore::new(0),
+            }
+        }
+    }
+
+    impl Hooks {
+        pub(super) async fn after_connect_spawned(&self) {
+            if self.yield_after_spawn.load(Ordering::SeqCst) {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        pub(super) async fn before_connect_failure_applied(&self) {
+            if self.gate_connect_failure.load(Ordering::SeqCst) {
+                self.reached.add_permits(1);
+                self.proceed.acquire().await.expect("never closed").forget();
+            }
+        }
+    }
 
     fn key(session: u8) -> AttachKey {
+        key_at(session, 1)
+    }
+
+    fn key_at(session: u8, generation: u64) -> AttachKey {
         AttachKey {
             session_id: isekai_protocol::SessionId::from_bytes([session; 16]),
-            generation: ConnectionGeneration::new(1),
+            generation: ConnectionGeneration::new(generation),
             attempt_id: AttemptId::from_bytes([1u8; ATTEMPT_ID_LEN]),
         }
+    }
+
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Review of #206 F1: a higher-generation `ATTACH_HELLO` applied while a
+    /// failed connect has not yet reported `TargetConnectFailed` must still
+    /// supersede it. With the entry dropped before the report, `CancelLease`
+    /// found nothing, no `LeaseStopped` was sent, and the session stayed in
+    /// `ClosingForSupersede` forever: the new HELLO was never answered.
+    #[tokio::test]
+    async fn supersede_racing_a_failed_connect_still_resolves_the_newer_hello() {
+        let runtime = AttachRuntime::new(closed_target().await, 16);
+        runtime.hooks.gate_connect_failure.store(true, Ordering::SeqCst);
+
+        let first = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.hello(key_at(3, 1)).await }
+        });
+        // The generation-1 connect has failed and is parked just before it
+        // reports that to the reducer.
+        runtime.hooks.reached.acquire().await.unwrap().forget();
+        // The generation-2 connect (if the supersede goes through) must not
+        // be parked too.
+        runtime.hooks.gate_connect_failure.store(false, Ordering::SeqCst);
+
+        let newer = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.hello(key_at(3, 2)).await }
+        });
+        // Let the newer HELLO apply and execute its `CancelLease` while the
+        // old failure is still unreported, then let the old task go on.
+        settle().await;
+        runtime.hooks.proceed.add_permits(1);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), newer)
+            .await
+            .expect("the newer HELLO must be answered, not left behind a stuck ClosingForSupersede")
+            .unwrap();
+        assert!(matches!(outcome, HelloOutcome::Reject(AttachRejectReason::Target)), "its own connect fails too");
+        assert!(runtime.is_vacant().await, "no slot may stay held");
+        assert_eq!(runtime.lease_resource_count_for_test().await, 0);
+        first.abort();
     }
 
     /// A target address nothing listens on (bound, then closed).
@@ -906,9 +1044,12 @@ mod start_connect_tests {
 
     /// PIPE-04 regression: a fast connect must always reach `PendingTarget`
     /// (the old insert-after-spawn order could overwrite it with
-    /// `Connecting`, so `activate()` found no target). Repeated because the
-    /// old bug was a scheduling race.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// `Connecting`, so `activate()` found no target). The hook lets the
+    /// spawned connect task run to its own `leases` insert before
+    /// `start_connect` records `Connecting` — the losing interleaving, made
+    /// deterministic (review of #206, F2). With `Connecting` recorded under
+    /// the same lock hold as the spawn, the task just waits for it.
+    #[tokio::test]
     async fn fast_target_connect_is_always_activatable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
@@ -919,7 +1060,8 @@ mod start_connect_tests {
             }
         });
         let runtime = AttachRuntime::new(target, 64);
-        for i in 0..32u8 {
+        runtime.hooks.yield_after_spawn.store(true, Ordering::SeqCst);
+        for i in 0..8u8 {
             let k = key(i);
             let attach_token = match runtime.hello(k).await {
                 HelloOutcome::Ready { attach_token } => attach_token,
