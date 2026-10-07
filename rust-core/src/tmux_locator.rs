@@ -110,12 +110,12 @@ impl TmuxTag {
     }
 }
 
-/// ロケータがウィンドウ単位かペイン単位か。
+/// ロケータが指す対象の単位。本番のロケータ(`tmux_session::ensure_tab_window`)は
+/// 常にウィンドウ単位で作られるため、現状は`Window`のみ(かつて存在した`Pane`は
+/// 一度も構築されないままee34304aの到達不能コードの原因になったため削除した)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TmuxTargetKind {
     Window,
-    #[allow(dead_code)] // UNWIRED: 本番で構築されない(テストのみ)。ee34304a(backfill削除、2026-08-09)の根本原因・ADR_UNWIRED_CALLBACK_DETECTION.md §1.4
-    Pane,
 }
 
 /// このロケータが指すウィンドウ/ペインが属するtmuxセッション(またはセッション
@@ -258,13 +258,8 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// `locator.scope`配下の全ウィンドウ(またはペイン、`kind`次第)を列挙し、
+/// `locator.scope`配下の全ウィンドウを列挙し、
 /// それぞれのタグ値を一緒に出力させるtmuxコマンドを組み立てる。
-///
-/// ペインの列挙には`-a`ではなく`-s`を使う —— tmuxの`list-panes -a`は
-/// 「サーバー上の全セッションの全ペイン」を`-t`を無視して返すのに対し、
-/// `-s`は「`-t`で指定したセッション内の全ペイン(全ウィンドウ横断)」を返す。
-/// ここで欲しいのは後者(このセッション/グループのスコープ内)。
 pub(crate) fn build_list_command(scope: &TmuxSessionScope, kind: TmuxTargetKind) -> String {
     let session = shell_quote(scope.addressable_session_name());
     match kind {
@@ -272,14 +267,10 @@ pub(crate) fn build_list_command(scope: &TmuxSessionScope, kind: TmuxTargetKind)
             "tmux list-windows -t {session} -F '#{{window_index}}\t#{{{}}}'",
             WINDOW_TAG_OPTION
         ),
-        TmuxTargetKind::Pane => format!(
-            "tmux list-panes -s -t {session} -F '#{{window_index}}\t#{{pane_index}}\t#{{{}}}'",
-            PANE_TAG_OPTION
-        ),
     }
 }
 
-/// [`build_list_command`]の出力(`\t`区切りの行、`kind`に応じて2列/3列)を
+/// [`build_list_command`]の出力(`\t`区切りの2列の行)を
 /// パースし、末尾列が`tag`と一致する最初の行の座標を返す。一致が無ければ
 /// `None`。
 pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTag) -> Option<TmuxCoordinates> {
@@ -288,14 +279,6 @@ pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTa
         let coords = match (kind, fields.as_slice()) {
             (TmuxTargetKind::Window, [window_index, line_tag]) if *line_tag == tag.0 => {
                 window_index.parse().ok().map(|window_index| TmuxCoordinates { window_index, pane_index: None })
-            }
-            (TmuxTargetKind::Pane, [window_index, pane_index, line_tag]) if *line_tag == tag.0 => {
-                match (window_index.parse(), pane_index.parse()) {
-                    (Ok(window_index), Ok(pane_index)) => {
-                        Some(TmuxCoordinates { window_index, pane_index: Some(pane_index) })
-                    }
-                    _ => None,
-                }
             }
             _ => None,
         };
@@ -309,7 +292,7 @@ pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTa
 /// `coords`が指すウィンドウ/ペインに`tag`をuser-optionとして書き込む
 /// (`set-option`)コマンドを組み立てる。`coords.pane_index`の有無で
 /// ウィンドウ/ペインどちらを対象にするか、どちらのuser-option名を使うかが
-/// 決まる(この2つを別々の引数にして矛盾した組み合わせ(例: `Pane` kindなのに
+/// 決まる(この2つを別々の引数にして矛盾した組み合わせ(例: ペイン対象なのに
 /// `pane_index: None`)を型として表現できてしまうのを避けている)。
 pub(crate) fn build_set_tag_command(scope: &TmuxSessionScope, coords: &TmuxCoordinates, tag: &TmuxTag) -> String {
     let session = scope.addressable_session_name();
@@ -724,15 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn build_list_command_pane_uses_list_panes_with_dash_s_not_dash_a() {
-        let cmd = build_list_command(&standalone("main"), TmuxTargetKind::Pane);
-        assert_eq!(
-            cmd,
-            "tmux list-panes -s -t 'main' -F '#{window_index}\t#{pane_index}\t#{@isekai_pane_id}'"
-        );
-    }
-
-    #[test]
     fn build_list_command_group_member_addresses_by_its_own_session_name() {
         let cmd = build_list_command(&group("hosts-foo", "client-a"), TmuxTargetKind::Window);
         assert!(cmd.contains("-t 'client-a'"));
@@ -744,14 +718,6 @@ mod tests {
         let output = "0\tother\n1\tabc123\n2\t\n";
         let coords = parse_list_output(TmuxTargetKind::Window, output, &tag).unwrap();
         assert_eq!(coords, TmuxCoordinates { window_index: 1, pane_index: None });
-    }
-
-    #[test]
-    fn parse_list_output_finds_matching_pane() {
-        let tag = TmuxTag("pane-tag".to_string());
-        let output = "0\t0\t\n0\t1\tpane-tag\n1\t0\t\n";
-        let coords = parse_list_output(TmuxTargetKind::Pane, output, &tag).unwrap();
-        assert_eq!(coords, TmuxCoordinates { window_index: 0, pane_index: Some(1) });
     }
 
     #[test]
