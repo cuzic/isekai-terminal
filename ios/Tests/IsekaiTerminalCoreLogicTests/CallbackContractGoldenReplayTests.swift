@@ -22,6 +22,7 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
         "f_reconnect_loop_success",
         "reconnect_gives_up",
         "fast_reconnect_cycles",
+        "upstream_failover_reconnects",
     ]
 
     private struct GoldenFile: Decodable {
@@ -35,17 +36,19 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
         let host: String?
         let edge: String?
         let generation: UInt64?
+        let upstreamFailover: Bool?
         let didReconnect: Bool?
 
         enum CodingKeys: String, CodingKey {
             case method, state, host, edge, generation
+            case upstreamFailover = "upstream_failover"
             case didReconnect = "did_reconnect"
         }
     }
 
     /// 転送層から実際に呼ばれた処理の記録。
     private enum Delivered: Equatable {
-        case established(host: String, generation: UInt64)
+        case established(host: String, upstreamFailover: Bool, generation: UInt64)
         case lost(generation: UInt64)
     }
 
@@ -95,8 +98,9 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
                 switch event.edge {
                 case "Established":
                     let host = try XCTUnwrap(event.host, "\(scenario): Establishedにhostが無い")
-                    edge = .established(host: host)
-                    expected.append(.established(host: host, generation: generation))
+                    let upstreamFailover = try XCTUnwrap(event.upstreamFailover, "\(scenario): Establishedにupstream_failoverが無い")
+                    edge = .established(host: host, upstreamFailover: upstreamFailover)
+                    expected.append(.established(host: host, upstreamFailover: upstreamFailover, generation: generation))
                 case "Lost":
                     edge = .lost
                     expected.append(.lost(generation: generation))
@@ -106,7 +110,9 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
                 ConnectionEdgeRouter.route(
                     edge: edge,
                     generation: generation,
-                    onEstablished: { host, generation in delivered.append(.established(host: host, generation: generation)) },
+                    onEstablished: { host, upstreamFailover, generation in
+                        delivered.append(.established(host: host, upstreamFailover: upstreamFailover, generation: generation))
+                    },
                     onLost: { generation in delivered.append(.lost(generation: generation)) }
                 )
             case "on_connection_state_changed":
@@ -128,7 +134,7 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
         var lastEstablished: UInt64?
         for item in delivered {
             switch item {
-            case .established(_, let generation):
+            case .established(_, _, let generation):
                 XCTAssertNil(open, "\(scenario): Lostより前に次のEstablished(\(generation))が来た")
                 if let last = lastEstablished {
                     XCTAssertGreaterThan(generation, last, "\(scenario): Establishedの世代が単調増加でない")
@@ -150,6 +156,7 @@ final class CallbackContractGoldenReplayTests: XCTestCase {
     func testFReconnectLoopSuccess() throws { try replayAndAssertContract("f_reconnect_loop_success") }
     func testReconnectGivesUp() throws { try replayAndAssertContract("reconnect_gives_up") }
     func testFastReconnectCycles() throws { try replayAndAssertContract("fast_reconnect_cycles") }
+    func testUpstreamFailoverReconnects() throws { try replayAndAssertContract("upstream_failover_reconnects") }
 
     /// goldenディレクトリの全シナリオを上のテストがreplayしている(Rust側でシナリオを足したらここにも足す)。
     func testEveryGoldenScenarioIsReplayed() throws {

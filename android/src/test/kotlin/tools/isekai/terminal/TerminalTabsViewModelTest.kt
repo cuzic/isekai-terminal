@@ -508,6 +508,37 @@ class TerminalTabsViewModelTest {
         assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
     }
 
+    /** #175: Rustの自動再接続(`connectPane`を通らない新しい世代の`Established`)の後も、
+     *  upstream監視が登録し直される(以前はKotlin側のミラーフラグが`Lost`で下ろされたままだった)。 */
+    @Test
+    fun automaticReconnect_withUpstreamFailoverEnabled_reRegistersTheMonitor() = runBlocking {
+        val id = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.isEmpty()) delay(10) }
+
+        orchestrators[0].simulateReconnecting(reason = "peer closed")
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.size < 2) delay(10) }
+
+        assertTrue("前の世代のhandleは閉じている", executor.upstreamFailoverHandles[0].closed)
+        assertFalse("再接続後の世代のhandleは開いている", executor.upstreamFailoverHandles[1].closed)
+        assertSame(executor.upstreamFailoverHandles[1], tab(id).primaryPane.upstreamFailoverMonitorHandle)
+    }
+
+    /** #175: upstream failoverを有効にしていないプロファイルでは、再接続しても監視を登録しない。 */
+    @Test
+    fun automaticReconnect_withUpstreamFailoverDisabled_neverRegistersTheMonitor() = runBlocking {
+        vm.openTab(multipathProfile("a", enableUpstreamFailover = false), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        orchestrators[0].simulateReconnecting(reason = "peer closed")
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (executor.connectedHosts.size < 2) delay(10) }
+
+        assertEquals(0, executor.upstreamFailoverHandles.size)
+    }
+
     /** クラッシュ観点レビュー(2026-07-31): `ConnectivityManager`コールバックスレッドから
      *  同期的に呼ばれる`notifyUpstreamHealthDegraded`が(本番の生成バインディングが実際
      *  投げ得る)`InternalException`を投げても、`TerminalTabsViewModel.forwardToRust`が

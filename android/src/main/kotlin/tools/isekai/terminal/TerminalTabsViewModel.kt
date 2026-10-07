@@ -149,13 +149,12 @@ class PaneState internal constructor(
     internal var pendingPostConnectBytes: ByteArray? = null
     internal val postConnectSent = AtomicBoolean(true)
 
-    // ── upstream フェイルオーバー ────────────────────────────
-    internal var upstreamFailoverEnabledForCurrentSession = false
-
     // ── Task #10: per-pane handle所有権(後勝ちバグ修正) ─────────
     /** 物理マルチパスfd取得のhandle。接続試行のたびに古いhandleを閉じてから発行し直す。 */
     internal var physicalMultipathHandle: AutoCloseable? = null
-    /** upstream failover監視のhandle。 */
+    /** upstream failover監視のhandle。登録するかどうかはRustが接続エッジ`Established`の
+     *  `upstreamFailover`で世代ごとに決める(Kotlin側に「今のセッションで有効か」のミラーフラグは
+     *  持たない、#175・`rust-ssot.md`)。 */
     internal var upstreamFailoverMonitorHandle: AutoCloseable? = null
 
     /** UI が購読する合成済み状態。 */
@@ -834,16 +833,30 @@ class TerminalTabsViewModel(
     private suspend fun observeConnectionEdges(tab: TabState, pane: PaneState) {
         pane.session.connectionEdges.collect { event ->
             when (val edge = event.edge) {
-                is ConnectionEdge.Established -> onConnectionEstablished(tab, pane, edge.host)
+                is ConnectionEdge.Established -> onConnectionEstablished(tab, pane, edge)
                 is ConnectionEdge.Lost -> onConnectionLost(tab, pane)
             }
         }
     }
 
-    private fun onConnectionEstablished(tab: TabState, pane: PaneState, host: String) {
-        executor.notifyConnected(host)
-        if (pane.upstreamFailoverEnabledForCurrentSession) {
-            pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
+    private fun onConnectionEstablished(tab: TabState, pane: PaneState, edge: ConnectionEdge.Established) {
+        executor.notifyConnected(edge.host)
+        // #175: upstream failover監視を登録するかはRustが決めてエッジに載せる(手動接続・自動再接続ループ・
+        // フォアグラウンド復帰のどの世代でも、直前の接続設定から同じ判断)。ここはエッジごとに適用するだけ。
+        // 以前はKotlin側のミラーフラグ(`connectPane`で立て`Lost`で下ろす)を見ていたため、`connectPane`を
+        // 通らない自動再接続の`Established`では再登録されず、upstream failoverが黙って止まっていた。
+        // Rustは`Established`の前に必ず直前の世代の`Lost`を出す(=handleはそこで閉じ済み)が、念のため
+        // 古いhandleを閉じてから登録し直す(同時に開いているのは高々1つ)。
+        // 順序: `Lost(g)`が`Established(g)`より先に届いて切断後に監視が残る、ということは起きない。Rustは
+        // 状態公開・エッジを`PublicationQueue`でreducerの適用順に1スレッドだけで配信し(PR #167レビューL-1、
+        // #174)、`TerminalSession`はそれを`Channel.UNLIMITED`へ受け取った順に積み、ここは1つのcollectorで
+        // 順に処理する(並べ替える段が無い)。配信順の契約自体はRust側の
+        // `edges_are_delivered_in_reducer_order_even_if_a_transition_interleaves_with_delivery`が固定している。
+        pane.upstreamFailoverMonitorHandle?.close()
+        pane.upstreamFailoverMonitorHandle = if (edge.upstreamFailover) {
+            executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
+        } else {
+            null
         }
         maybeSendPostConnectCommands(pane)
         // `AI_INTEGRATION_DESIGN.md` §3: このpaneのAIパネルopt-inを、接続の
@@ -872,7 +885,6 @@ class TerminalTabsViewModel(
         pane.physicalMultipathHandle = null
         pane.upstreamFailoverMonitorHandle?.close()
         pane.upstreamFailoverMonitorHandle = null
-        pane.upstreamFailoverEnabledForCurrentSession = false
         // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
         // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
         // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。

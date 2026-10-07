@@ -396,3 +396,7 @@ mod tests {
         }
     }
 }
+
+// 時間定数の関係テスト(ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.5(a))。
+#[cfg(test)]
+mod timing_relations;

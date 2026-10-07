@@ -99,7 +99,6 @@ internal class ConnectionCoordinator(
                     } else {
                         PhysicalMultipathFds()
                     }
-                    pane.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
                     pane.session.connectMultipathIsekaiPipeQuic(
                         profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth),
                     )

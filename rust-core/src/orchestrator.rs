@@ -209,6 +209,50 @@ impl LastConnectAttempt {
         }
         self.host_port_is_quic().0
     }
+
+    /// #175: この接続設定で確立した世代について、プラットフォーム側のupstream health監視
+    /// (`ConnectionEdge::Established::upstream_failover`)を登録すべきか。upstream failover
+    /// (`RebindManager`)はマルチパスのトランスポートにしか無いので、それ以外は常に`false`。
+    fn wants_upstream_failover_monitor(&self) -> bool {
+        match self {
+            Self::MultipathIsekaiPipeQuic(c) => c.enable_upstream_failover,
+            Self::Ssh(_)
+            | Self::Quic(_)
+            | Self::IsekaiPipeQuic(_)
+            | Self::IsekaiPipeQuicAuto(_)
+            | Self::IsekaiStunP2p(_)
+            | Self::IsekaiLinkRelay(_) => false,
+        }
+    }
+
+    /// #175: 自動再接続・フォアグラウンド復帰の再接続([`connect_via`])に渡す形にする。
+    ///
+    /// `MultipathIsekaiPipeQuicConfig`の`wifi_fd`/`cellular_fd`は、Kotlin側が`detachFd()`で
+    /// 所有権を手放した生fdで、最初のセッションが`udp_socket_from_raw_fd`で引き取り、そのセッションの
+    /// 破棄と同時にcloseされる(1回きりの資源)。再接続ループ・フォアグラウンド復帰は、一度`Connected`に
+    /// なった(=そのfdを既に引き取った)後にしか走らないので、同じfd番号をもう一度引き取ると、既にclose
+    /// 済みのfd、あるいはその番号を再利用した**無関係な**fdを奪って閉じてしまう。再接続では物理pathを
+    /// 外し、path0/path1だけのマルチパスで張り直す(物理Wi-Fi/セルラーpathは実験的・既定OFFで、
+    /// 使えなければ黙ってフォールバックする日和見的ポリシー、`PLAN.md` Phase 9-4)。Kotlin側も
+    /// 物理マルチパスのhandleを`Lost`で解放し、再接続では取り直さない(取り直してもこのConfigへ
+    /// 渡す経路が無い)。
+    fn for_reconnect(self) -> Self {
+        match self {
+            Self::MultipathIsekaiPipeQuic(mut c) => {
+                c.wifi_fd = None;
+                c.wifi_local_ip = None;
+                c.cellular_fd = None;
+                c.cellular_local_ip = None;
+                Self::MultipathIsekaiPipeQuic(c)
+            }
+            other @ (Self::Ssh(_)
+            | Self::Quic(_)
+            | Self::IsekaiPipeQuic(_)
+            | Self::IsekaiPipeQuicAuto(_)
+            | Self::IsekaiStunP2p(_)
+            | Self::IsekaiLinkRelay(_)) => other,
+        }
+    }
 }
 
 /// #19: 接続失敗の原因がiOSのLocal Network Privacy拒否である可能性を示す
@@ -850,9 +894,16 @@ fn stage_publications(s: &mut OrchestratorState, effects: &[ReconnectEffect], ct
                     issue_hint: classify_disconnect_issue_hint(ctx.loop_attempt),
                 })
             }
+            // #175: `upstream_failover`もhostと同じく、applyと同じ臨界区間で`last_connect_attempt`から
+            // 解決する(自動再接続・フォアグラウンド復帰の世代も同じ設定で張り直すので、どの世代の
+            // `Established`にも同じ判断が載る。秘密を含むConfigはreducerに載せない、ADR §3-3)。
             ReconnectEffect::EdgeEstablished { generation } => Publication::Edge(
                 crate::ConnectionEdge::Established {
                     host: s.current_target().map(|(host, _, _)| host).unwrap_or_default(),
+                    upstream_failover: s
+                        .last_connect_attempt
+                        .as_ref()
+                        .is_some_and(LastConnectAttempt::wants_upstream_failover_monitor),
                 },
                 *generation,
             ),
@@ -1075,9 +1126,12 @@ fn run_reconnect_attempt(
 /// `last_connect_attempt`を更新していた場合、古い値で上書きし返してしまう。
 /// 「接続先のSSOTは`last_connect_attempt`」という原則の下では、その唯一の
 /// 書き手は手動接続(`begin_connect`)だけにしておくのが安全。
+///
+/// 物理マルチパスの生fdは最初のセッションが引き取り済みなので外してから張り直す
+/// ([`LastConnectAttempt::for_reconnect`]、#175)。
 fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) -> Result<(), SshError> {
     let adapter = begin_reconnect_session(shared);
-    build_and_store_session(shared, attempt, adapter)
+    build_and_store_session(shared, attempt.for_reconnect(), adapter)
 }
 
 /// [`connect_via`]のうち、セッション生成より前の「phaseを`Connecting`へ動かし、新しい世代の
@@ -3413,7 +3467,7 @@ mod tests {
         assert_eq!(
             edges_of(&cb),
             vec![
-                (crate::ConnectionEdge::Established { host: "example.com".to_string() }, generation),
+                (crate::ConnectionEdge::Established { host: "example.com".to_string(), upstream_failover: false }, generation),
                 (crate::ConnectionEdge::Lost, generation),
             ],
             "Lost(g)がEstablished(g)より先に配信された"
@@ -3438,7 +3492,7 @@ mod tests {
     }
 
     fn established(host: &str, generation: u64) -> (crate::ConnectionEdge, u64) {
-        (crate::ConnectionEdge::Established { host: host.to_string() }, generation)
+        (crate::ConnectionEdge::Established { host: host.to_string(), upstream_failover: false }, generation)
     }
 
     fn lost(generation: u64) -> (crate::ConnectionEdge, u64) {
@@ -3479,6 +3533,97 @@ mod tests {
         );
         adapter.on_connected();
         assert_eq!(edges_of(&cb), vec![established("example.com", 1)]);
+    }
+
+    /// #175: マルチパス接続のattempt(物理fd無し)。`upstream_failover`はプロファイルの
+    /// `enable_upstream_failover`に相当する。
+    fn multipath_attempt(host: &str, upstream_failover: bool) -> LastConnectAttempt {
+        let mut config = test_multipath_config();
+        config.ssh_host = host.to_string();
+        config.enable_upstream_failover = upstream_failover;
+        LastConnectAttempt::MultipathIsekaiPipeQuic(config)
+    }
+
+    /// #175: 自動再接続ループの成功とフォアグラウンド復帰の再接続(どちらも`connect_*`=Kotlinの
+    /// `connectPane`を通らない)で新しく開いた世代の`Established`にも、手動接続の世代と同じ
+    /// `upstream_failover`が載る。Established/Lostの契約(各世代1回ずつ)もそのまま成り立つ。
+    #[tokio::test(start_paused = true)]
+    async fn edge_established_carries_upstream_failover_for_every_reconnected_generation() {
+        for enabled in [true, false] {
+            let (orch, cb, adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+            let first = orch.begin_connect(multipath_attempt("example.com", enabled)).expect("Idle中のconnectは受理されるはず");
+            first.on_connected();
+            // 自動再接続ループの成功。
+            first.on_disconnected(Some("peer closed".to_string()));
+            let looped = {
+                let mut waited = 0;
+                loop {
+                    if let Some(adapter) = adapters.lock().unwrap().pop() {
+                        break adapter;
+                    }
+                    assert!(waited < 1000, "再接続ループが試行しなかった");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    waited += 5;
+                }
+            };
+            looped.on_connected();
+            // フォアグラウンド復帰の再接続。
+            orch.notify_did_enter_background(30_000);
+            orch.notify_background_budget_expired();
+            orch.notify_will_enter_foreground();
+            let resumed = adapters.lock().unwrap().pop().expect("フォアグラウンド復帰で再接続を試みるはず");
+            resumed.on_connected();
+
+            let edges = edges_of(&cb);
+            assert_edge_contract(&edges);
+            let established: Vec<_> = edges
+                .iter()
+                .filter_map(|(edge, g)| match edge {
+                    crate::ConnectionEdge::Established { upstream_failover, .. } => Some((*g, *upstream_failover)),
+                    crate::ConnectionEdge::Lost => None,
+                })
+                .collect();
+            assert_eq!(established.len(), 3, "手動・ループ・フォアグラウンド復帰の3世代: {edges:?}");
+            assert!(
+                established.iter().all(|(_, flag)| *flag == enabled),
+                "全世代のEstablishedがupstream_failover={enabled}を運ぶはず: {edges:?}"
+            );
+        }
+    }
+
+    /// #175: upstream failover監視を求めるのは`enable_upstream_failover`なマルチパス接続だけ。
+    #[test]
+    fn wants_upstream_failover_monitor_only_for_multipath_with_failover_enabled() {
+        assert!(multipath_attempt("h", true).wants_upstream_failover_monitor());
+        assert!(!multipath_attempt("h", false).wants_upstream_failover_monitor());
+        assert!(!ssh_attempt("h").wants_upstream_failover_monitor());
+    }
+
+    /// #175: 再接続に渡すattemptからは、最初のセッションが引き取り済みの物理マルチパスfdを外す
+    /// (同じfd番号を再び引き取ると、close済みか無関係なfdを奪う)。他の設定はそのまま。
+    #[test]
+    fn for_reconnect_strips_consumed_physical_multipath_fds_and_keeps_the_rest() {
+        let mut config = test_multipath_config();
+        config.wifi_fd = Some(41);
+        config.wifi_local_ip = Some("192.168.0.2".to_string());
+        config.cellular_fd = Some(42);
+        config.cellular_local_ip = Some("10.0.0.2".to_string());
+        config.enable_upstream_failover = true;
+        let LastConnectAttempt::MultipathIsekaiPipeQuic(stripped) =
+            LastConnectAttempt::MultipathIsekaiPipeQuic(config).for_reconnect()
+        else {
+            panic!("variantは変わらないはず");
+        };
+        assert_eq!(
+            (stripped.wifi_fd, stripped.wifi_local_ip.as_deref(), stripped.cellular_fd, stripped.cellular_local_ip.as_deref()),
+            (None, None, None, None)
+        );
+        assert!(stripped.enable_upstream_failover, "upstream failoverの設定は再接続でも維持する");
+        assert_eq!(stripped.ssh_host, "example.com");
+        let LastConnectAttempt::Ssh(ssh) = ssh_attempt("plain.example.com").for_reconnect() else {
+            panic!("プレーンSSHはそのまま");
+        };
+        assert_eq!(ssh.host, "plain.example.com");
     }
 
     /// (a) ユーザー`disconnect()`。

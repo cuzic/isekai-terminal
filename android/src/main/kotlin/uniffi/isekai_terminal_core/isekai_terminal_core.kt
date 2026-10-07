@@ -6395,9 +6395,19 @@ sealed class ConnectionEdge {
     /**
      * 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
      * `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
+     *
+     * `upstream_failover`(#175): この世代について、プラットフォーム側のupstream health監視
+     * (Androidの`UpstreamHealthMonitor`。WiFiは繋がっているがupstreamが死んでいる、の検知)を
+     * 登録すべきか。Rustが直前の接続設定(`last_connect_attempt`。自動再接続・フォアグラウンド復帰も
+     * 同じ設定を使う)から決める: `connect_multipath_isekai_pipe_quic`で
+     * `enable_upstream_failover = true`だった場合だけ`true`。Kotlin/Swiftはこの値をエッジごとに
+     * そのまま適用するだけで、「今のセッションでupstream failoverが有効か」のミラーフラグを持たない
+     * (以前はKotlin側のミラーフラグが`Lost`で下ろされたまま、`connectPane`を通らない自動再接続の
+     * `Established`で再登録されなかった、`rust-ssot.md`)。
      */
     data class Established(
-        val `host`: kotlin.String) : ConnectionEdge()
+        val `host`: kotlin.String, 
+        val `upstreamFailover`: kotlin.Boolean) : ConnectionEdge()
         
     {
         
@@ -6430,6 +6440,7 @@ public object FfiConverterTypeConnectionEdge : FfiConverterRustBuffer<Connection
         return when(buf.getInt()) {
             1 -> ConnectionEdge.Established(
                 FfiConverterString.read(buf),
+                FfiConverterBoolean.read(buf),
                 )
             2 -> ConnectionEdge.Lost
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -6442,6 +6453,7 @@ public object FfiConverterTypeConnectionEdge : FfiConverterRustBuffer<Connection
             (
                 4UL
                 + FfiConverterString.allocationSize(value.`host`)
+                + FfiConverterBoolean.allocationSize(value.`upstreamFailover`)
             )
         }
         is ConnectionEdge.Lost -> {
@@ -6457,6 +6469,7 @@ public object FfiConverterTypeConnectionEdge : FfiConverterRustBuffer<Connection
             is ConnectionEdge.Established -> {
                 buf.putInt(1)
                 FfiConverterString.write(value.`host`, buf)
+                FfiConverterBoolean.write(value.`upstreamFailover`, buf)
                 Unit
             }
             is ConnectionEdge.Lost -> {

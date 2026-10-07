@@ -362,6 +362,25 @@ jobs:
         working-directory: rust-core
         run: cargo clippy -p isekai-terminal-core --lib -- -A clippy::all -D dead_code
 
+      # docs/adr/0020-unwired-callback-detection.md §3(b)/U4(report-only): isekai-sshのdead_code警告を
+      # 収集する。上のworkspace clippyと同一コマンド+json出力なので全crateがfreshで、cargoが
+      # キャッシュ済み診断を再生するだけ(再コンパイルしない)。失敗させない。
+      - name: Collect isekai-ssh dead_code warnings (Linux, report-only)
+        continue-on-error: true
+        working-directory: rust-core
+        run: |
+          cargo clippy --workspace --lib --bins --message-format=json -- -A clippy::all \
+            | python3 scripts/dead_code_intersection.py extract --out ../dead-code/linux.json
+
+      - name: Upload isekai-ssh dead_code warnings (Linux)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: isekai-ssh-dead-code-linux
+          path: dead-code/linux.json
+          if-no-files-found: ignore
+
       - name: Save cargo cache (rust-core, main only)
         if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -520,6 +539,26 @@ jobs:
         working-directory: rust-core
         run: cargo build --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
+      # docs/adr/0020-unwired-callback-detection.md §3(b)/U4(report-only): 直前のbuildと同一コマンド+
+      # json出力なのでfresh、キャッシュ済み診断の再生のみ(再コンパイルしない)。失敗させない。
+      # (cfg(windows)のnative/はここで初めて使われる)
+      - name: Collect isekai-ssh dead_code warnings (Windows, report-only)
+        continue-on-error: true
+        shell: bash
+        working-directory: rust-core
+        run: |
+          cargo build --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen --message-format=json \
+            | python scripts/dead_code_intersection.py extract --out ../dead-code/windows.json
+
+      - name: Upload isekai-ssh dead_code warnings (Windows)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: isekai-ssh-dead-code-windows
+          path: dead-code/windows.json
+          if-no-files-found: ignore
+
       - name: cargo test --lib --bins --workspace (Windows, unit tests only)
         shell: bash
         working-directory: rust-core
@@ -619,3 +658,34 @@ jobs:
             ~/.cargo/git
             rust-core/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # docs/adr/0020-unwired-callback-detection.md §3(b)/U4: isekai-sshのdead_code警告のLinux∩Windows積集合を
+  # job summaryに出す。**report-only**: 何があっても失敗させず、required status checkにもしない
+  # (branch protectionに追加しないこと)。両プラットフォームで未使用=本当に死んでいる候補。
+  isekai-ssh-dead-code-report:
+    needs: [changes, purity-check, test-windows]
+    if: always() && needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
+    name: isekai-ssh-dead-code-report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test
+        continue-on-error: true
+        run: python3 rust-core/scripts/dead_code_intersection.py --self-test
+
+      - name: Download warning lists
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: isekai-ssh-dead-code-*
+          path: dead-code
+          merge-multiple: true
+
+      - name: Intersection report
+        continue-on-error: true
+        run: |
+          python3 rust-core/scripts/dead_code_intersection.py report dead-code/linux.json dead-code/windows.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"

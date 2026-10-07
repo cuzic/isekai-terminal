@@ -4,7 +4,7 @@
   "events": [
     {"method": "on_connection_state_changed", "state": "Connecting"},
     {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
-    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "upstream_failover": false, "generation": 1},
     {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
     {"method": "on_connection_state_changed", "state": "Reconnecting"}
   ]

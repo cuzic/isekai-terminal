@@ -823,7 +823,9 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         ConnectionEdgeRouter.route(
             edge: edge,
             generation: generation,
-            onEstablished: { _, _ in
+            // `upstreamFailover`(#175): iOS版にはAndroidの`UpstreamHealthMonitor`に相当する
+            // プラットフォーム側の監視が無い(upstream failoverはRust側`RebindManager`だけで動く)ので使わない。
+            onEstablished: { _, _, _ in
                 // タスク#3(Android版タスク#60`TerminalTabsViewModel.observeConnectionEdges`と対称):
                 // 接続確立のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
                 // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
