@@ -17,10 +17,8 @@
 | `fix/resplit-isekai-bootstrap` | SSH-13、SSH-04、SSH-18/48、SSH-21(差し戻し込みの net 効果)、SSH-22、SSH-23、SSH-41、SSH-42、SSH-40、SSH-39 |
 | `fix/resplit-isekai-ssh-wrapper` | SSH-01/25、SSH-08、SSH-20、SSH-26、SSH-43、SSH-44、SSH-45、SSH-46、SSH-47 |
 
-- **D 保留: SSH-02**(旧 f9d963ad)。バグ自体は main にも残っている。relay route が「セッション確立後」の失敗を `Unreachable` として書くのに、`connect_recovery_fsm::remote_command_forbids_retry` は `Unreachable`/`StaleTrust` では再実行を許してしまう。旧コミットは #166 以前のインラインループを対象にしていたので、移植するなら reducer に heal-only の RedeployOrigin を足す形で作り直す必要がある。ユーザー判断待ちの論点は次の 2 案。
-  - 全クラスで再実行しない(heal-only)。旧コミットと同じ挙動。
-  - `ConnectOutcome.session_established`(旧 #127 bf28205b、PIPE-18)が true のときだけ再実行しない。こちらは #127 側の再分割 PR が先にマージされている必要がある。
-- **D 保留: SSH-10**。SSH-02 に連動する(remote command の 24h ハングの解消は SSH-02 次第)。
+- **SSH-02(旧 f9d963ad、D→決定済み・対応済み)**: ユーザー判断(2026-10-07)により「`ConnectOutcome.session_established` が true のときだけ remote command を再実行しない」案を採用し、#212(`8c2faf52`「セッション確立後の接続失敗ではremote commandを自動再実行しない」)として main にマージ済み。`connect_recovery_fsm` の `remote_command_forbids_retry_after` で判定し、SSHバイトが流れる前の失敗は従来どおりサイレント再デプロイ+再試行する(always-connects)。`session_established`(PIPE-18、旧 #127 bf28205b)も #206 で main にマージ済み。
+- **SSH-10**: remote command の 24h ハングは #212 で解消(セッション確立後は再実行しない)。stable 判定を handshake 成功時刻基準にする部分は、`session_established` が main に入ったので実装可能になったが未着手(フォローアップ)。
 - **C 見送り**: なし。旧コミットはどれも main 上でまだ有効だった。
 - **SSH-06/17/19/38/42 の isekai-auth・isekai-trust 部分、SSH-49/50**: 旧 #132(transport)担当。その再分割 PR がマージされたらフォローアップする。
 - **見送り(`[~]`)のまま**: SSH-07/09/11/24/27/31/34 は旧PRの判断どおり。
@@ -33,6 +31,7 @@
 - [x] **SSH-02** High `isekai-ssh/src/wrapper.rs:713-745` / `native/connect.rs:443-459`
   - 要約: relay route の resume window 枯渇、cross-family fallback、panic は `Unreachable` として書かれる。B5 ガード(remote command は再実行しない)が `Unknown` / `MidSessionDisconnect` にしか掛かっていないため、`isekai-ssh host -- ./deploy.sh` がサイレントに再実行される。
   - 方針: fail-safe として、remote command があるときは `StaleTrust`/`Unreachable`/`Unknown` のどれでも**再実行しない**。サイレント再デプロイ(自己修復)だけ行い、「再実行してください」と案内して終了する。こうすれば次回の起動は正常に繋がり、always-connects に沿う。isekai-pipe 担当が `ConnectOutcome.session_established`(serde default)を追加中なので、それがマージされたら「`session_established == false` のときだけ再実行する」ように緩めるフォローアップを行う。
+  - 追記(2026-10-07): 再分割時に旧コミットは移植せず、ユーザー判断どおり「`session_established == true` のときだけ再実行しない」形で #212 として実装・マージ済み。
 - [x] **SSH-03** High `isekai-ssh/src/native/connect.rs:859-863,1078-1079`
   - 要約: Windows holder は SSH handle がどう死んでも `Ok(0)` を返し、recovery を飛ばす。根本原因の候補は russh keepalive(60s×3)で、これが isekai-pipe の resume window(既定 864000s)より先に SSH 層を殺す。すると resume 可能だったセッションまで切れ、スリープ復帰後に新しいリモートシェルになる。
   - 方針: native 経路の russh keepalive を無効化し、liveness は isekai-pipe の QUIC/resume 層に一任する(`ssh(1)` 既定の `ServerAliveInterval 0` と同等)。holder の serve 終了時には、SSH handle が閉じたかどうかをログに残す。holder 自身が再接続しても channel は復元できないので、`Ok(0)` 終了(クライアントが OwnerLost → 新 holder)は維持し、その理由を doc に明記する。
@@ -57,6 +56,7 @@
   - 要約: pre-handshake 失敗が最大 24h 再試行になり、非対話コマンドがハングする。stable 判定が attempt の経過時間基準になっている。
   - 方針: remote command ありの場合は SSH-02 の fail-safe で再試行しなくなるので、`rsync`/`git` の 24h ハングは解消する。stable 判定を handshake 成功時刻基準にする部分は、`session_established` が入った後のフォローアップにする(部分対応)。
   - 状態: 部分対応。remote command の 24h ハングは SSH-02 で解消済み。stable 判定の基準変更は見送る。理由は、wrapper が handshake 成功時刻を知る手段が isekai-pipe 側の `ConnectOutcome.session_established`(PR #127、未マージ)以外にないため。その field がマージされたら SSH-02 の緩和と合わせてフォローアップする。
+  - 追記(2026-10-07): `session_established` は #206、SSH-02 の緩和は #212 で main にマージ済み。残るのは stable 判定の基準変更のみ。
 - [~] **SSH-11** Medium `isekai-pipe/src/connect.rs:463-473,564-567` — `ssh(1)` の ConnectTimeout 等が先に諦めると outcome が残らない。
   - 見送り理由: outcome の書き手である isekai-pipe 側(担当外)の修正が必要。wrapper 側で「intent は claim されたが outcome がない」を Unreachable 扱いにすると、リモート終了コード 255 と区別できず再実行事故を招く。isekai-pipe 担当に共有する。
 - [x] **SSH-12** Medium `native/connect.rs:676`
