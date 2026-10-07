@@ -292,12 +292,16 @@ jobs:
       # proptestの反例保存(docs/adr/0019-functional-core-effects.md §7 m-5): CI専用運用では
       # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
       # `cc`行をソースツリーへ手でコミットする。
+      # Step 13のcallback契約golden(`rust-core/tests/golden/callback_contract/`)の不一致時に
+      # Rustテストが書く`*.actual.json`も同じartifactで回収し、内容を確認して`.json`としてコミットする(§7)。
       - name: Upload proptest regressions on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: proptest-regressions
-          path: rust-core/**/proptest-regressions/**
+          path: |
+            rust-core/**/proptest-regressions/**
+            rust-core/**/golden/**/*.actual.json
           if-no-files-found: ignore
           retention-days: 14
 

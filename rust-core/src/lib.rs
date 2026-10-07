@@ -42,6 +42,8 @@ pub mod isekai_link_relay_transport;
 pub(crate) mod faulty_stream;
 #[cfg(test)]
 pub(crate) mod test_callbacks;
+#[cfg(test)]
+pub(crate) mod trace_invariants;
 pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
 pub mod debug_reconnect;

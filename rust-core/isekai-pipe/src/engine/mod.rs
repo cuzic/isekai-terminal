@@ -5,7 +5,11 @@ mod attach_runtime;
 mod resume;
 mod serve_fsm;
 #[cfg(test)]
+mod serve_shell_differential_tests;
+#[cfg(test)]
 mod sweep_resume_race_tests;
+#[cfg(test)]
+mod trace_invariants;
 
 use std::io::Write as _;
 use std::net::SocketAddr;

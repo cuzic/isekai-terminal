@@ -1736,4 +1736,76 @@ mod tests {
             prop_assert_eq!(effects, expected);
         }
     }
+
+    // ── Step 11: Effect列の不変条件検査(`trace_invariants`) ──
+
+    /// reducerのEffectを、shellが公開するcallbackと同じ形の[`TraceEvent`]へ写す(状態公開・接続エッジ)。
+    /// `PublishReconnectTimedOut`はshellが`Disconnected`として公開する。
+    fn effect_trace(effect: &ReconnectEffect) -> Option<crate::trace_invariants::TraceEvent> {
+        use crate::trace_invariants::{StateTag, TraceEvent};
+        match effect {
+            ReconnectEffect::PublishDisconnected { .. } | ReconnectEffect::PublishReconnectTimedOut { .. } => {
+                Some(TraceEvent::State(StateTag::Disconnected))
+            }
+            ReconnectEffect::PublishConnected => Some(TraceEvent::State(StateTag::Connected)),
+            ReconnectEffect::PublishConnecting => Some(TraceEvent::State(StateTag::Connecting)),
+            ReconnectEffect::PublishReconnecting { .. } => Some(TraceEvent::State(StateTag::Reconnecting)),
+            ReconnectEffect::EdgeEstablished { generation } => Some(TraceEvent::Established(*generation)),
+            ReconnectEffect::EdgeLost { generation } => Some(TraceEvent::Lost(*generation)),
+            ReconnectEffect::InvalidatePathObserver
+            | ReconnectEffect::WakeReconnectLoop
+            | ReconnectEffect::StartReconnectLoop { .. }
+            | ReconnectEffect::ManualConnectRejected
+            | ReconnectEffect::StartAttempt { .. }
+            | ReconnectEffect::PendingWakeRecorded { .. }
+            | ReconnectEffect::ArmLoopTimer { .. }
+            | ReconnectEffect::LoopWokeEarly { .. }
+            | ReconnectEffect::LoopTicked { .. } => None,
+        }
+    }
+
+    proptest! {
+        /// Step 11: shellと同じく世代が単調に進む任意のEvent列で、reducerのEffect列が
+        /// `trace_invariants::check_trace`の不変条件を満たす: エッジ契約(T1/T2)、edgeが開いている間に
+        /// `Reconnecting`を公開しないこと(状態公開の単調性)、非現行epochのtick/wake(ループタイマーの
+        /// token)がEffectを生まないこと。
+        #[test]
+        fn effect_trace_satisfies_step11_invariants(
+            steps in proptest::collection::vec(shell_step_strategy(), 0..80),
+        ) {
+            use crate::trace_invariants::{check_trace, TraceEvent};
+            let mut s = ReconnectState::default();
+            let mut generation = 0u64;
+            let mut trace: Vec<TraceEvent> = Vec::new();
+            for step in steps {
+                let ev = match step {
+                    ShellStep::NewSession => {
+                        generation += 1;
+                        ReconnectEvent::SessionCreated { new_generation: generation }
+                    }
+                    ShellStep::Connected => ReconnectEvent::AttemptConnected { generation },
+                    ShellStep::StaleConnected { back } => {
+                        ReconnectEvent::AttemptConnected { generation: generation.saturating_sub(back) }
+                    }
+                    ShellStep::Disconnected(kind) => {
+                        ReconnectEvent::AttemptDisconnected { generation, kind, targets_local_network: false }
+                    }
+                    ShellStep::Other(ev) => ev,
+                };
+                let timer_token = match &ev {
+                    ReconnectEvent::ReconnectTick { epoch, .. } | ReconnectEvent::ReconnectWake { epoch, .. } => Some(*epoch),
+                    _ => None,
+                };
+                let current = s.reconnect_epoch;
+                let effects = s.apply(ev);
+                if let Some(token) = timer_token {
+                    trace.push(TraceEvent::TimerFired { token, current, effects: effects.len() });
+                }
+                trace.extend(effects.iter().filter_map(effect_trace));
+            }
+            if let Err(violation) = check_trace(&trace) {
+                prop_assert!(false, "Step 11 trace invariant violated: {} / trace: {:?}", violation, trace);
+            }
+        }
+    }
 }

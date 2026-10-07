@@ -223,9 +223,9 @@ pub(crate) async fn install_notify_hooks<R: RemoteTmuxCommandRunner>(
 mod tests {
     use super::*;
     use crate::tmux_locator::{TmuxLocator, TmuxTag, TmuxTargetKind};
-    // tmux_locator.rs/tmux_scrollback.rsと同一定義だった`standalone`/`pane`/
+    // tmux_locator.rs/tmux_scrollback.rsと同一定義だった`member`(旧`standalone`)/`pane`/
     // `RecordingRunner`をtest_supportへ共通化した。
-    use crate::tmux_locator::test_support::{pane, standalone, RecordingRunner};
+    use crate::tmux_locator::test_support::{member, pane, RecordingRunner};
     use std::sync::{Arc, Mutex as StdMutex};
 
     // ── コマンド組み立て(実tmux 3.3aで検証済みの文字列を固定でpin) ──────
@@ -305,7 +305,7 @@ mod tests {
     async fn installs_session_hooks_then_resolves_then_installs_window_hooks() {
         let registry = Mutex::new(TmuxLocatorRegistry::new());
         let app_pane = pane("tab-1", "pane-primary");
-        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
+        let loc = TmuxLocator { scope: member("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
         registry.lock().set_notify_hooks_enabled(&app_pane, true);
 
@@ -331,7 +331,7 @@ mod tests {
     async fn propagates_not_found_when_window_no_longer_exists() {
         let registry = Mutex::new(TmuxLocatorRegistry::new());
         let app_pane = pane("tab-1", "pane-primary");
-        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("missing".to_string()) };
+        let loc = TmuxLocator { scope: member("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("missing".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
         registry.lock().set_notify_hooks_enabled(&app_pane, true);
 
@@ -348,7 +348,7 @@ mod tests {
         // タブでは、ロケータが解決済みでもリモートtmuxサーバーへ一切書き込まない。
         let registry = Mutex::new(TmuxLocatorRegistry::new());
         let app_pane = pane("tab-1", "pane-primary");
-        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
+        let loc = TmuxLocator { scope: member("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
         // set_notify_hooks_enabledを呼ばない(registerの既定はfalse)。
 
@@ -378,7 +378,7 @@ mod tests {
 
         // ── orchestrator.rs::ensure_tmux_tab_window相当: ロケータを登録し、
         //    プロファイルのenableTabNotificationsを反映する ──
-        let loc = TmuxLocator { scope: standalone("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
+        let loc = TmuxLocator { scope: member("main"), kind: TmuxTargetKind::Window, tag: TmuxTag("my-tag".to_string()) };
         registry.lock().register(app_pane.clone(), loc, None);
         registry.lock().set_notify_hooks_enabled(&app_pane, true);
 

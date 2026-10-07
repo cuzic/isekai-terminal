@@ -11,6 +11,9 @@
 # noq-multipath-spikeは独立したworkspace root(rust-core/noq-multipath-spike/Cargo.toml
 # の空[workspace]テーブル参照)のため、自分専用のtarget/を持つ。
 /rust-core/noq-multipath-spike/target/
+# callback契約goldenの不一致時にRustテストが書く実出力(docs/adr/0019-functional-core-effects.md §6 Step 13)。
+# 内容を確認してから`<scenario>.json`としてコミットする。
+/rust-core/tests/golden/**/*.actual.json
 # cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
 /android/src/main/jniLibs/
 # 手元ビルドをリポジトリCWD直下に手置きしてWindows実機へ配置する運用

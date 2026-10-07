@@ -161,13 +161,6 @@ impl ActiveSession {
             Self::IsekaiLinkRelay(s) => s.run_exec(command).await,
         }
     }
-    /// タスク#58: tmux scrollback backfillのバッチ注入。全トランスポート共通
-    /// (`SessionCore::inject_scrollback_history`)なので`dispatch_all!`でよい。
-    // この1箇所のallowで下流(SessionCore::inject_scrollback_history・plain_text_to_scrollback_row)も生きていると扱われる。
-    #[allow(dead_code)] // UNWIRED: 呼び出し元はee34304a(2026-08-09)でbackfillごと削除済み。元実装はf356766b(task #58)。docs/adr/0020-unwired-callback-detection.md §1.4
-    fn inject_scrollback_history(&self, lines: Vec<String>) {
-        dispatch_all!(self, inject_scrollback_history, lines)
-    }
 }
 
 // ── Shared internal state ─────────────────────────────────
@@ -1981,6 +1974,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    // docs/adr/0019-functional-core-effects.md §6 Step 13: callback契約goldenの生成・一致検査
+    // (`src/orchestrator/tests/callback_contract_golden.rs`)。
+    mod callback_contract_golden;
+
     #[test]
     fn disconnect_kind_classifies_graceful_remote_exit_by_prefix() {
         let reason = Some("remote process exited (status 0)".to_string());
@@ -2046,12 +2043,17 @@ mod tests {
         /// PR #167レビューL-1のテスト用: `on_connection_state_changed`の配信中に呼ぶフック
         /// (配信と別の遷移が割り込む状況を、同じスレッドからの再入で決定論的に作る)。
         on_state_hook: StdMutex<Option<Box<dyn Fn(&ConnectionPublicState) + Send>>>,
+        /// Step 11: 状態公開・接続エッジの列を記録し、不変条件(エッジ契約・状態公開の単調性)を
+        /// 記録のたびと`Drop`で検査する(`trace_invariants`)。これにより既存のorchestratorテストすべてが
+        /// 個々のassertに加えて列の不変条件の検査にもなる。
+        trace: crate::trace_invariants::TraceRecorder,
     }
 
     impl OrchestratorCallback for RecordingCallback {
         fn on_connection_state_changed(&self, state: ConnectionPublicState) {
             self.event_order.lock().unwrap().push("connection_state_changed");
             self.connection_states.lock().unwrap().push(state.clone());
+            self.trace.record_state(&state);
             // フックの実行中はMutexを持たない(フックが再入して公開を起こしてもデッドロックしない)。
             let hook = self.on_state_hook.lock().unwrap().take();
             if let Some(hook) = hook {
@@ -2122,6 +2124,7 @@ mod tests {
                 crate::ConnectionEdge::Established { .. } => "edge_established",
                 crate::ConnectionEdge::Lost => "edge_lost",
             });
+            self.trace.record_edge(&edge, generation);
             self.edges.lock().unwrap().push((edge, generation));
         }
     }
@@ -4375,7 +4378,7 @@ mod tests {
         async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
             let (addr, window_changes, channel_closed) = spawn_recording_server().await;
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            let orch = create_session_orchestrator(Box::new(TestCallback::new(tx)));
             orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
             wait_connected(&mut rx).await;
             (orch, rx, addr, window_changes, channel_closed)
@@ -4469,7 +4472,7 @@ mod tests {
         ) {
             let (addr, channel_handle, received) = spawn_scripted_server().await;
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            let orch = create_session_orchestrator(Box::new(TestCallback::new(tx)));
             orch.connect(ssh_config(addr, key_auth(1))).expect("connect should not fail synchronously");
             wait_connected(&mut rx).await;
             (orch, rx, channel_handle, received)

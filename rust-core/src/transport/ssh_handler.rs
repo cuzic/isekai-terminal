@@ -59,9 +59,6 @@ pub(crate) enum TransportCommand {
         bind_addr: String,
         bind_port: u16,
     },
-    /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
-    #[allow(dead_code)] // UNWIRED: 送信側(SshSession/ActiveSession::remove_forward)はe8ed36ee(2026-08-09)で削除済み。ハンドラ側の残骸
-    RemoveForward { id: String },
     /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには一切触れず、同じ
     /// 認証済み`client::Handle`上に新しい"exec"チャネルを1本開いて短命なコマンドを
     /// 実行する(tmux管理コマンドなど、リモートで1回だけ走らせて結果を回収したい
@@ -1144,15 +1141,6 @@ async fn run_ssh_channel_loop_after_first_open(
                             }
                         }
                     }
-                    Some(TransportCommand::RemoveForward { id }) => {
-                        info!("forward[{}]: remove requested", id);
-                        if let Some(old) = active_forwards.remove(&id) {
-                            teardown_forward(old, session.clone(), remote_forwards.clone());
-                            event_tx.send(TransportEvent::ForwardStateChanged {
-                                id, state: ForwardState::Stopped,
-                            }).await.ok();
-                        }
-                    }
                     Some(TransportCommand::RunExec { command, reply }) => {
                         info!("ssh: exec requested (auxiliary channel, {} bytes command)", command.len());
                         // `tokio::spawn`する: execの完了を待つ間もこの`select!`ループ
@@ -1605,12 +1593,12 @@ mod pooling_e2e_tests {
             let auth = key_auth(1);
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
             wait_connected(&mut rx_a).await;
 
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
             orch_b.connect(ssh_config(addr, auth)).expect("tab B connect should not fail synchronously");
             wait_connected(&mut rx_b).await;
 
@@ -1643,12 +1631,12 @@ mod pooling_e2e_tests {
             let addr = spawn_counting_echo_server(auth_count.clone()).await;
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             orch_a.connect(ssh_config(addr, key_auth(1))).expect("tab A connect should not fail synchronously");
             wait_connected(&mut rx_a).await;
 
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
             orch_b.connect(ssh_config(addr, key_auth(2))).expect("tab B connect should not fail synchronously");
             wait_connected(&mut rx_b).await;
 
@@ -1672,17 +1660,17 @@ mod pooling_e2e_tests {
             let auth = key_auth(80);
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
             wait_connected(&mut rx_a).await;
 
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
             orch_b.connect(ssh_config(addr, auth.clone())).expect("tab B connect should not fail synchronously");
             wait_connected(&mut rx_b).await;
 
             let (tx_c, mut rx_c) = unbounded_channel::<TestEvent>();
-            let orch_c = create_session_orchestrator(Box::new(TestCallback { tx: tx_c }));
+            let orch_c = create_session_orchestrator(Box::new(TestCallback::new(tx_c)));
             orch_c.connect(ssh_config(addr, auth)).expect("tab C connect should not fail synchronously");
             wait_connected(&mut rx_c).await;
 
@@ -1724,9 +1712,9 @@ mod pooling_e2e_tests {
             let auth = key_auth(90);
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
 
             // どちらも完了を待たずに立て続けにconnect()する。プール側の「確立中」状態
             // (Connecting/Waiter)を、synthetic な型ではなく実際の非同期I/Oのタイミングで踏む。
@@ -1761,12 +1749,12 @@ mod pooling_e2e_tests {
             config_b.agent_forward = true;
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             orch_a.connect(config_a).expect("tab A connect should not fail synchronously");
             wait_connected(&mut rx_a).await;
 
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
             orch_b.connect(config_b).expect("tab B connect should not fail synchronously");
             wait_connected(&mut rx_b).await;
 
@@ -2214,12 +2202,12 @@ mod pooling_e2e_tests {
             let auth = key_auth(130);
 
             let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
-            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let orch_a = create_session_orchestrator(Box::new(TestCallback::new(tx_a)));
             orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
             wait_connected(&mut rx_a).await;
 
             let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
-            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            let orch_b = create_session_orchestrator(Box::new(TestCallback::new(tx_b)));
             orch_b.connect(ssh_config(addr, auth)).expect("tab B connect should not fail synchronously");
             wait_connected(&mut rx_b).await;
 
@@ -2421,7 +2409,7 @@ mod pooling_e2e_tests {
             let auth = key_auth(140);
 
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            let orch = create_session_orchestrator(Box::new(TestCallback::new(tx)));
             orch.connect(ssh_config(addr, auth)).expect("connect should not fail synchronously");
             wait_connected(&mut rx).await;
 
@@ -2466,7 +2454,7 @@ mod pooling_e2e_tests {
         let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
         rt.block_on(async {
             let (tx, _rx) = unbounded_channel::<TestEvent>();
-            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            let orch = create_session_orchestrator(Box::new(TestCallback::new(tx)));
 
             let result = orch.run_exec("echo hello".to_string()).await;
             assert!(

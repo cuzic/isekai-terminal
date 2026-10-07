@@ -66,7 +66,12 @@ class DumbAppExecutor : AppExecutor {
     /** [AppExecutor]が返すhandle/sourceのclose記録用フェイク。テストから`.closed`を検証する。 */
     class TestHandle(val label: String) : AutoCloseable {
         var closed = false
-        override fun close() { closed = true }
+        /** close()が呼ばれた回数(二重closeの検出用、Step 13のgolden replay)。 */
+        var closeCount = 0
+        override fun close() {
+            closed = true
+            closeCount++
+        }
     }
 
     /** acquirePhysicalMultipathFds() が返すfds。テストで上書きして使う。既定は全滅（未取得）。 */

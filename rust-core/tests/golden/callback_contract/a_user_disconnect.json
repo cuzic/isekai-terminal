@@ -1,0 +1,11 @@
+{
+  "scenario": "a_user_disconnect",
+  "description": "(a) 接続後にユーザーがdisconnect()した。自動再接続はしない",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Disconnected"}
+  ]
+}
