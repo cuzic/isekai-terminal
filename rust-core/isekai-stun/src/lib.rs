@@ -89,6 +89,7 @@ fn parse_binding_response(
     let body_end = (HEADER_LEN + message_length).min(data.len());
     let mut attrs = &data[HEADER_LEN..body_end];
     let mut fallback_mapped_address: Option<SocketAddr> = None;
+    let mut xor_error: Option<StunError> = None;
 
     while attrs.len() >= 4 {
         let attr_type = u16::from_be_bytes([attrs[0], attrs[1]]);
@@ -100,9 +101,12 @@ fn parse_binding_response(
         let value = &attrs[4..4 + attr_len];
 
         match attr_type {
-            XOR_MAPPED_ADDRESS => {
-                return decode_xor_mapped_address(value, expected_transaction_id);
-            }
+            XOR_MAPPED_ADDRESS => match decode_xor_mapped_address(value, expected_transaction_id) {
+                Ok(addr) => return Ok(addr),
+                // A malformed XOR-MAPPED-ADDRESS must not hide a usable
+                // MAPPED-ADDRESS elsewhere in the same response.
+                Err(e) => xor_error = Some(e),
+            },
             MAPPED_ADDRESS if fallback_mapped_address.is_none() => {
                 fallback_mapped_address = decode_mapped_address(value).ok();
             }
@@ -115,7 +119,20 @@ fn parse_binding_response(
         attrs = &attrs[4 + padded_len..];
     }
 
-    fallback_mapped_address.ok_or(StunError::NoMappedAddress)
+    fallback_mapped_address.ok_or(xor_error.unwrap_or(StunError::NoMappedAddress))
+}
+
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a
+/// dual-stack socket reports for an IPv4 peer) folded back to plain IPv4, so
+/// it compares equal to the same peer written as an IPv4 `SocketAddr`.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 fn decode_xor_mapped_address(
@@ -200,17 +217,33 @@ pub async fn query_stun(
             continue;
         }
 
+        // Keep listening for the rest of this attempt's window: a stray
+        // datagram (e.g. an early hole-punch probe from the peer — this
+        // socket is shared with it) or a late response to an earlier
+        // attempt must not use up the attempt.
+        let deadline = tokio::time::Instant::now() + PER_ATTEMPT_TIMEOUT;
         let mut buf = [0u8; 512];
-        match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if from == stun_server => {
-                match parse_binding_response(&buf[..n], &transaction_id) {
-                    Ok(addr) => return Ok(addr),
-                    Err(e) => last_err = Some(e),
+        loop {
+            match tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if canonical(from) == canonical(stun_server) => {
+                    match parse_binding_response(&buf[..n], &transaction_id) {
+                        Ok(addr) => return Ok(addr),
+                        // A response to an earlier attempt's request: keep
+                        // waiting for ours.
+                        Err(StunError::TransactionIdMismatch) => continue,
+                        Err(e) => {
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
                 }
+                Ok(Ok(_)) => continue, // stray datagram from someone else
+                Ok(Err(e)) => {
+                    last_err = Some(StunError::Io(e.to_string()));
+                    break;
+                }
+                Err(_) => break, // this attempt's window elapsed; retry
             }
-            Ok(Ok(_)) => continue, // stray datagram from someone else; retry
-            Ok(Err(e)) => last_err = Some(StunError::Io(e.to_string())),
-            Err(_) => continue, // this attempt's timeout elapsed; retry
         }
     }
     Err(last_err.unwrap_or(StunError::Timeout(stun_server, ATTEMPTS)))
@@ -431,6 +464,58 @@ mod tests {
 
         let observed = query_stun(&client, stun_server).await.unwrap();
         assert_eq!(observed, client_addr);
+    }
+
+    #[test]
+    fn a_malformed_xor_mapped_address_falls_back_to_mapped_address() {
+        let transaction_id = [10u8; 12];
+        let legacy_addr: SocketAddr = "203.0.113.6:2222".parse().unwrap();
+        let mut response = stun_header(&transaction_id, 0);
+        // XOR-MAPPED-ADDRESS with an unknown family byte.
+        response.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&8u16.to_be_bytes());
+        response.extend_from_slice(&[0, 0x09, 0, 0, 0, 0, 0, 0]);
+        append_ipv4_attr(&mut response, MAPPED_ADDRESS, legacy_addr, None);
+        set_message_length(&mut response);
+        assert_eq!(parse_binding_response(&response, &transaction_id), Ok(legacy_addr));
+    }
+
+    #[test]
+    fn canonical_folds_ipv4_mapped_ipv6_addresses() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:3478".parse().unwrap();
+        let plain: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        assert_eq!(canonical(mapped), plain);
+        let v6: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        assert_eq!(canonical(v6), v6);
+    }
+
+    /// A datagram from someone else (e.g. the peer's early hole-punch probe
+    /// on this same socket) arriving first must not use up the attempt.
+    #[tokio::test]
+    async fn a_stray_datagram_does_not_consume_the_attempt() {
+        let stun_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun_server.local_addr().unwrap();
+        let stray = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = stun_server.recv_from(&mut buf).await.unwrap();
+            assert!(n >= HEADER_LEN);
+            // Someone else speaks first...
+            stray.send_to(b"isekai-punch", from).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // ...then the real answer arrives, still within the attempt.
+            let transaction_id: [u8; 12] = buf[8..20].try_into().unwrap();
+            let response = build_test_response_ipv4(&transaction_id, from, XOR_MAPPED_ADDRESS);
+            stun_server.send_to(&response, from).await.unwrap();
+        });
+
+        let started = tokio::time::Instant::now();
+        let observed = query_stun(&client, stun_addr).await.unwrap();
+        assert_eq!(observed, client_addr);
+        assert!(started.elapsed() < Duration::from_millis(700), "must be answered within the first attempt");
     }
 
     #[tokio::test]

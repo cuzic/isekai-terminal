@@ -910,6 +910,15 @@ class TerminalSessionTest {
         assertTrue(fakeOrchestrator.disconnectCalled)
     }
 
+    /** #203レビュー: ペイン破棄のclose()は、自動再接続ループがdestroy後にセッションを
+     *  張り直さないよう`cancelReconnect`→`disconnect`の順でRustへ転送する(判断はRust側)。
+     *  #207マージ後は`disconnect`単独でループが止まるが、それまではこの順序が必要。 */
+    @Test
+    fun close_cancelsReconnectBeforeDisconnect() {
+        session.close()
+        assertEquals(listOf("cancelReconnect", "disconnect"), fakeOrchestrator.teardownCalls)
+    }
+
     @Test
     fun close_whenIdle_doesNotThrow() {
         session.close()

@@ -14,12 +14,23 @@ use crate::error::TrustError;
 /// This is idempotent: normalizing an already-normalized `host:port` string
 /// returns it unchanged.
 ///
-/// Note: this does not special-case bracketed IPv6 literals
-/// (`[::1]:22`) — that is out of scope for the current MVP and not
-/// exercised by isekai-ssh's target host list yet.
+/// IPv6 literals are accepted bare (`::1`, no port) or bracketed
+/// (`[::1]` / `[::1]:2222`) and normalized to the bracketed form
+/// (`[::1]:22`), so the key stays unambiguous. (A bare IPv6 literal used to
+/// be split at its last `:` into a bogus host/port pair.)
+///
+/// Host names are deliberately **not** case-folded here even though DNS is
+/// case-insensitive: this string is the key of already-persisted trust
+/// entries, and changing it would silently orphan every existing entry for
+/// a host spelled with capitals (forcing a fresh TOFU confirmation).
 pub fn normalize_host_port(spec: &str) -> Result<String, TrustError> {
     let (host, port, _user) = split_user_host_port(spec)?;
-    Ok(format!("{host}:{}", port.unwrap_or(22)))
+    let port = port.unwrap_or(22);
+    if host.contains(':') {
+        Ok(format!("[{host}]:{port}"))
+    } else {
+        Ok(format!("{host}:{port}"))
+    }
 }
 
 /// Tokenizes a `[user@]host[:port]` spec into its parts, without collapsing
@@ -43,6 +54,36 @@ pub fn split_user_host_port(spec: &str) -> Result<(String, Option<u16>, Option<S
     };
     if after_user.is_empty() {
         return Err(TrustError::EmptyHost);
+    }
+
+    // `[v6]` / `[v6]:port`: the brackets delimit the literal; the returned
+    // host is the bare address (what `ssh`/a socket address wants).
+    if let Some(rest) = after_user.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(TrustError::InvalidPort { spec: spec.to_string(), reason: "unterminated '[' in IPv6 literal".to_string() });
+        };
+        if host.is_empty() {
+            return Err(TrustError::EmptyHost);
+        }
+        let port = match after {
+            "" => None,
+            _ => {
+                let port_str = after.strip_prefix(':').ok_or_else(|| TrustError::InvalidPort {
+                    spec: spec.to_string(),
+                    reason: format!("unexpected {after:?} after IPv6 literal"),
+                })?;
+                Some(port_str.parse().map_err(|_| TrustError::InvalidPort {
+                    spec: spec.to_string(),
+                    reason: format!("{port_str:?} is not a valid port number"),
+                })?)
+            }
+        };
+        return Ok((host.to_string(), port, user));
+    }
+    // A bare IPv6 literal (two or more ':') has no port — its last ':' is
+    // part of the address, not a port separator.
+    if after_user.matches(':').count() >= 2 {
+        return Ok((after_user.to_string(), None, user));
     }
 
     let (host, port) = match after_user.rsplit_once(':') {
@@ -118,6 +159,22 @@ mod tests {
             split_user_host_port("alice@myhost:2222").unwrap(),
             ("myhost".to_string(), Some(2222), Some("alice".to_string()))
         );
+    }
+
+    #[test]
+    fn ipv6_literals_are_not_split_at_their_last_colon() {
+        assert_eq!(normalize_host_port("::1").unwrap(), "[::1]:22");
+        assert_eq!(normalize_host_port("2001:db8::5").unwrap(), "[2001:db8::5]:22");
+        assert_eq!(normalize_host_port("[2001:db8::5]").unwrap(), "[2001:db8::5]:22");
+        assert_eq!(normalize_host_port("alice@[2001:db8::5]:2222").unwrap(), "[2001:db8::5]:2222");
+        assert_eq!(
+            split_user_host_port("alice@[::1]:2222").unwrap(),
+            ("::1".to_string(), Some(2222), Some("alice".to_string()))
+        );
+        // Idempotent on the normalized form.
+        assert_eq!(normalize_host_port("[::1]:22").unwrap(), "[::1]:22");
+        assert!(normalize_host_port("[::1").is_err());
+        assert!(normalize_host_port("[::1]x").is_err());
     }
 
     #[test]

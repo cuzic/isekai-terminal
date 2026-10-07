@@ -139,8 +139,10 @@ class FakeOrchestrator : SessionOrchestratorInterface, AutoCloseable {
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
 
-    override fun disconnect() { disconnectCalled = true }
-    override fun cancelReconnect() { cancelReconnectCalled = true }
+    /** `disconnect`/`cancelReconnect`の呼び出し順(close()の順序固定テスト用)。 */
+    val teardownCalls = mutableListOf<String>()
+    override fun disconnect() { disconnectCalled = true; teardownCalls.add("disconnect") }
+    override fun cancelReconnect() { cancelReconnectCalled = true; teardownCalls.add("cancelReconnect") }
     // iOSセッションライフサイクル用のRustコールバック(このファイルが対象とする複数タブ/pane
     // まわりのテストでは未検証、no-opで足りる)。
     // 実機検証(2026-07-28)のバグ修正で、TerminalTabsViewModelのファンアウトを検証

@@ -7,22 +7,29 @@
 //! lines in place, glob patterns expand in sorted order, cyclic includes
 //! are silently skipped on repeat).
 //!
-//! `Match` blocks evaluate `all`/`host`/`user`/`localuser` criteria (each
-//! taking a single comma-separated pattern-list argument, `!`-negatable, the
-//! same as other `ssh_config(5)` pattern-lists) — all criteria on a line must
-//! be satisfied (AND semantics). `user`/`localuser` are checked against
-//! whatever `User` an *earlier* matching block already resolved into the
-//! in-progress `HostConfig` / the real local username, respectively (`Match
-//! user` in file order can't be satisfied by a `User` set *later* in the same
-//! file — same first-obtained-value-wins state this crate uses everywhere
-//! else).
+//! `Match` blocks evaluate `all`/`host`/`originalhost`/`user`/`localuser`
+//! criteria (each taking a single comma-separated pattern-list argument,
+//! `!`-negatable, the same as other `ssh_config(5)` pattern-lists) — all
+//! criteria on a line must be satisfied (AND semantics). As in `ssh(1)`,
+//! `host` is checked against the `HostName` an *earlier* matching block
+//! already resolved (falling back to the destination as typed), while
+//! `originalhost` is checked against the destination as typed; `user` is
+//! checked against the `User` resolved so far, falling back to the local
+//! username; `localuser` against the real local username. (`Match user` in
+//! file order can't be satisfied by a `User` set *later* in the same file —
+//! same first-obtained-value-wins state this crate uses everywhere else.)
+//! Host names are matched case-insensitively.
 //!
-//! **Deliberate limitation**: `exec`/`canonical`/`final`/`originalhost`
-//! criteria are recognized structurally (so a line using them doesn't get
-//! misparsed) but are never satisfiable — this crate has no opinion on
-//! process execution or `ssh(1)`'s canonicalization runtime state, so any
-//! `Match` line using one of these always evaluates to false rather than
-//! guessing.
+//! `%` tokens: `HostName` expands `%h`/`%%`; `IdentityFile`/
+//! `CertificateFile`/`IdentityAgent` expand `%%`/`%d`/`%h`/`%n`/`%p`/`%r`/
+//! `%u` against the final resolved values. Tokens needing runtime state
+//! this crate doesn't have (`%C`, `%i`, `%l`, ...) are left as-is.
+//!
+//! **Deliberate limitation**: `exec`/`canonical`/`final` criteria are
+//! recognized structurally (so a line using them doesn't get misparsed) but
+//! are never satisfiable — this crate has no opinion on process execution
+//! or `ssh(1)`'s canonicalization runtime state, so any `Match` line using
+//! one of these always evaluates to false rather than guessing.
 //!
 //! Any keyword other than the ones listed above is silently ignored — this
 //! is not a general-purpose `ssh_config(5)` parser.
@@ -135,6 +142,7 @@ pub fn resolve(path: &Path, destination: &str) -> Result<HostConfig, Error> {
     // it once here and thread it unchanged through the recursion.
     let root_dir = path.parent();
     resolve_from_file(path, destination, root_dir, &mut visited, &mut config)?;
+    expand_path_tokens(&mut config, destination);
     Ok(config)
 }
 
@@ -177,19 +185,21 @@ fn resolve_from_file(
             }
             "host" => active = host_patterns_match(rest, destination),
             "match" => active = match_conditions_apply(rest, destination, config),
-            other if active => apply_keyword(config, other, rest),
+            other if active => apply_keyword(config, other, rest, destination),
             _ => {}
         }
     }
     Ok(())
 }
 
-fn apply_keyword(config: &mut HostConfig, keyword: &str, value: &str) {
+fn apply_keyword(config: &mut HostConfig, keyword: &str, value: &str, destination: &str) {
     let value = strip_quotes(value.trim());
     match keyword {
         "hostname" => {
             if config.host_name.is_none() {
-                config.host_name = Some(value.to_string());
+                // `HostName %h.example.com` (ssh_config(5)): `%h` is the
+                // destination as typed.
+                config.host_name = Some(expand_percent_tokens(value, &[('h', destination)]));
             }
         }
         "user" => {
@@ -425,15 +435,28 @@ fn match_conditions_apply(criteria: &str, destination: &str, config: &HostConfig
         i += 1;
         let satisfied = match keyword.as_str() {
             "all" => true,
+            // ssh(1) matches `Match host` against the HostName an earlier
+            // block already set (falling back to the destination as typed);
+            // the destination as typed is what `originalhost` matches.
             "host" => {
                 let Some(&pattern_list) = tokens.get(i) else { return false };
                 i += 1;
-                comma_pattern_list_match(pattern_list, destination)
+                comma_host_pattern_list_match(pattern_list, config.host_name.as_deref().unwrap_or(destination))
             }
+            "originalhost" => {
+                let Some(&pattern_list) = tokens.get(i) else { return false };
+                i += 1;
+                comma_host_pattern_list_match(pattern_list, destination)
+            }
+            // Like ssh(1): the User resolved so far, or the local username
+            // when none has been set yet.
             "user" => {
                 let Some(&pattern_list) = tokens.get(i) else { return false };
                 i += 1;
-                config.user.as_deref().is_some_and(|user| comma_pattern_list_match(pattern_list, user))
+                match config.user.clone().or_else(local_username) {
+                    Some(user) => comma_pattern_list_match(pattern_list, &user),
+                    None => false,
+                }
             }
             "localuser" => {
                 let Some(&pattern_list) = tokens.get(i) else { return false };
@@ -449,7 +472,7 @@ fn match_conditions_apply(criteria: &str, destination: &str, config: &HostConfig
                 false
             }
             // No opinion on ssh(1)'s canonicalization runtime state.
-            "canonical" | "final" | "originalhost" => false,
+            "canonical" | "final" => false,
             _ => return false,
         };
         if !satisfied {
@@ -489,18 +512,79 @@ pub fn local_username() -> Option<String> {
     std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
+/// Host names are matched case-insensitively (DNS names are; `ssh(1)`
+/// lowercases the host before matching `Host`/`Match host` patterns).
 fn host_patterns_match(patterns: &str, destination: &str) -> bool {
+    let destination = destination.to_ascii_lowercase();
     let mut matched = false;
     for pattern in patterns.split_whitespace() {
+        let pattern = pattern.to_ascii_lowercase();
         if let Some(negative) = pattern.strip_prefix('!') {
-            if wildcard_match(negative, destination) {
+            if wildcard_match(negative, &destination) {
                 return false;
             }
-        } else if wildcard_match(pattern, destination) {
+        } else if wildcard_match(&pattern, &destination) {
             matched = true;
         }
     }
     matched
+}
+
+/// [`comma_pattern_list_match`] for host names (case-insensitive, see
+/// [`host_patterns_match`]).
+fn comma_host_pattern_list_match(pattern_list: &str, host: &str) -> bool {
+    comma_pattern_list_match(&pattern_list.to_ascii_lowercase(), &host.to_ascii_lowercase())
+}
+
+/// Expands `ssh_config(5)` `%` tokens in `input`: `%%` → `%`, and each
+/// `(token, value)` in `tokens`. An unknown token is left as-is (not
+/// guessed).
+fn expand_percent_tokens(input: &str, tokens: &[(char, &str)]) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some(t) => match tokens.iter().find(|(k, _)| *k == t) {
+                Some((_, value)) => out.push_str(value),
+                None => {
+                    out.push('%');
+                    out.push(t);
+                }
+            },
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Expands `%` tokens in the path-valued keywords once the whole config has
+/// been resolved (they refer to *final* values: the resolved HostName, Port,
+/// User): `%%`, `%d` (home), `%h` (host name), `%n` (destination as typed),
+/// `%p` (port), `%r` (remote user), `%u` (local user). Tokens needing
+/// runtime state this crate doesn't have (`%C`, `%i`, `%j`, `%k`, `%l`,
+/// `%L`) are left untouched.
+fn expand_path_tokens(config: &mut HostConfig, destination: &str) {
+    let home = home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+    let local_user = local_username().unwrap_or_default();
+    let host = config.host_name.clone().unwrap_or_else(|| destination.to_string());
+    let port = config.port.unwrap_or(22).to_string();
+    let remote_user = config.user.clone().unwrap_or_else(|| local_user.clone());
+    let tokens: [(char, &str); 6] =
+        [('d', &home), ('h', &host), ('n', destination), ('p', &port), ('r', &remote_user), ('u', &local_user)];
+    let expand = |p: &PathBuf| -> PathBuf {
+        match p.to_str() {
+            Some(s) if s.contains('%') => PathBuf::from(expand_percent_tokens(s, &tokens)),
+            _ => p.clone(),
+        }
+    };
+    config.identity_file = config.identity_file.iter().map(expand).collect();
+    config.certificate_file = config.certificate_file.iter().map(expand).collect();
+    config.identity_agent = config.identity_agent.as_ref().map(expand);
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -700,20 +784,83 @@ Host example
     }
 
     #[test]
-    fn match_canonical_final_originalhost_are_never_evaluated() {
+    fn match_canonical_final_are_never_evaluated() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "config", "
 Match canonical
     User should-never-apply-1
 Match final
     User should-never-apply-2
-Match originalhost example
-    User should-never-apply-3
 Host example
     User alice
 ");
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
+    }
+
+    /// `Match host` sees the HostName an earlier block set (as ssh(1) does);
+    /// `Match originalhost` sees the destination as typed.
+    #[test]
+    fn match_host_uses_the_resolved_hostname_and_originalhost_the_typed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host alias
+    HostName real.example.com
+Match host real.example.com
+    Port 2222
+Match host alias
+    User wrong-user
+Match originalhost alias
+    IdentityFile /keys/alias
+");
+        let config = resolve(&path, "alias").unwrap();
+        assert_eq!(config.port, Some(2222));
+        assert_eq!(config.user, None);
+        assert_eq!(config.identity_file, vec![PathBuf::from("/keys/alias")]);
+    }
+
+    #[test]
+    fn host_patterns_are_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host MyServer.Example.COM
+    User alice
+");
+        assert_eq!(resolve(&path, "myserver.example.com").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "MYSERVER.example.com").unwrap().user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn percent_tokens_are_expanded_in_hostname_and_identity_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host web
+    HostName %h.internal.example.com
+    User deploy
+    Port 2200
+    IdentityFile /keys/%r@%h:%p-%n-100%%
+    IdentityFile /keys/%C-unknown-token
+");
+        let config = resolve(&path, "web").unwrap();
+        assert_eq!(config.host_name.as_deref(), Some("web.internal.example.com"));
+        assert_eq!(
+            config.identity_file,
+            vec![
+                PathBuf::from("/keys/deploy@web.internal.example.com:2200-web-100%"),
+                PathBuf::from("/keys/%C-unknown-token"),
+            ]
+        );
+    }
+
+    #[test]
+    fn match_user_falls_back_to_the_local_username_when_no_user_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let username = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).expect("test environment must have USER/USERNAME set");
+        let path = write_config(&dir, "config", &format!("
+Match user {username}
+    Port 2222
+"));
+        assert_eq!(resolve(&path, "example").unwrap().port, Some(2222));
     }
 
     #[test]

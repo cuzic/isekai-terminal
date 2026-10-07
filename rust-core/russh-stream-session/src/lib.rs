@@ -59,6 +59,29 @@ pub enum SessionError {
     Auth(russh::Error),
     #[error("agent-backed authentication failed: {0}")]
     AgentAuth(russh::AgentAuthError),
+    /// A connect step that has no bound of its own (TCP connect, opening
+    /// the jump host's direct-tcpip tunnel) didn't finish within
+    /// [`CONNECT_STEP_TIMEOUT`].
+    #[error("{stage} timed out after {timeout:?}")]
+    TimedOut { stage: &'static str, timeout: std::time::Duration },
+}
+
+/// Bound on each connect step [`connect_via_jump_or_direct`] performs that
+/// could otherwise wait forever on a silently dropping network: the TCP
+/// connect to the target/jump host and opening the jump host's
+/// direct-tcpip tunnel. (The SSH handshake itself is deliberately *not*
+/// bounded here: it includes the host-key verification callback, which may
+/// be an interactive first-use prompt waiting on a human; a stalled peer
+/// during the handshake is bounded by the caller's own `russh::client::Config`
+/// inactivity/keepalive settings instead.)
+pub const CONNECT_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn tcp_connect_bounded(addr: &str) -> Result<tokio::net::TcpStream, SessionError> {
+    match tokio::time::timeout(CONNECT_STEP_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(SessionError::Connect { addr: addr.to_string(), source: russh::Error::IO(e) }),
+        Err(_) => Err(SessionError::TimedOut { stage: "TCP connect", timeout: CONNECT_STEP_TIMEOUT }),
+    }
 }
 
 /// The result of a [`HostKeyVerifier::verify`] call. Unlike a plain `bool`,
@@ -383,14 +406,18 @@ where
 {
     let Some(jump) = jump else {
         let addr = format!("{target_host}:{target_port}");
-        let handle = client::connect(russh_config, addr.as_str(), new_handler(ConnectionLeg::Target))
+        // Same as `client::connect` (TCP connect, then `connect_stream`),
+        // but with the TCP connect bounded.
+        let socket = tcp_connect_bounded(&addr).await?;
+        let handle = client::connect_stream(russh_config, socket, new_handler(ConnectionLeg::Target))
             .await
             .map_err(|source| SessionError::Connect { addr, source })?;
         return Ok(Session { handle, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
-    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), new_handler(ConnectionLeg::Jump))
+    let jump_socket = tcp_connect_bounded(&jump_addr).await?;
+    let mut jump_handle = client::connect_stream(russh_config.clone(), jump_socket, new_handler(ConnectionLeg::Jump))
         .await
         .map_err(|source| SessionError::Connect { addr: jump_addr.clone(), source })?;
 
@@ -399,10 +426,13 @@ where
         return Err(SessionError::JumpAuthFailed { username: jump.username.clone(), addr: jump_addr });
     }
 
-    let channel = jump_handle
-        .channel_open_direct_tcpip(target_host, target_port as u32, "127.0.0.1", 0)
-        .await
-        .map_err(|source| SessionError::JumpTunnel { host: target_host.to_string(), port: target_port, source })?;
+    let channel = tokio::time::timeout(
+        CONNECT_STEP_TIMEOUT,
+        jump_handle.channel_open_direct_tcpip(target_host, target_port as u32, "127.0.0.1", 0),
+    )
+    .await
+    .map_err(|_| SessionError::TimedOut { stage: "jump host direct-tcpip open", timeout: CONNECT_STEP_TIMEOUT })?
+    .map_err(|source| SessionError::JumpTunnel { host: target_host.to_string(), port: target_port, source })?;
     let stream = channel.into_stream();
 
     let handle = client::connect_stream(russh_config, stream, new_handler(ConnectionLeg::Target))
