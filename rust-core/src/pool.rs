@@ -543,7 +543,7 @@ mod tests {
             _ => panic!("expected Waiter"),
         };
         publish_success(&pool, &"k", 7u32);
-        let value = wait_for_establish(rx).await.expect("waiter should see success");
+        let value = wait_for_establish(rx, ESTABLISH_TIMEOUT).await.expect("waiter should see success");
         assert_eq!(*value, 7);
     }
 
@@ -556,7 +556,7 @@ mod tests {
             _ => panic!("expected Waiter"),
         };
         publish_failure(&pool, &"k", "boom".to_string());
-        let err = wait_for_establish(rx).await.expect_err("waiter should see failure");
+        let err = wait_for_establish(rx, ESTABLISH_TIMEOUT).await.expect_err("waiter should see failure");
         assert_eq!(err, "boom");
         let map = pool.lock();
         let entry = map.get(&"k").expect("failed entry should remain as tombstone");
@@ -580,8 +580,8 @@ mod tests {
 
         publish_success(&pool, &"k", 99u32);
 
-        let v1 = wait_for_establish(rx1).await.expect("waiter 1 should see success");
-        let v2 = wait_for_establish(rx2).await.expect("waiter 2 should see success");
+        let v1 = wait_for_establish(rx1, ESTABLISH_TIMEOUT).await.expect("waiter 1 should see success");
+        let v2 = wait_for_establish(rx2, ESTABLISH_TIMEOUT).await.expect("waiter 2 should see success");
         assert_eq!(*v1, 99);
         assert_eq!(*v2, 99);
         assert!(Arc::ptr_eq(&v1, &v2), "all waiters should share the exact same Arc instance");
@@ -602,8 +602,8 @@ mod tests {
 
         publish_failure(&pool, &"k", "dial failed".to_string());
 
-        let e1 = wait_for_establish(rx1).await.expect_err("waiter 1 should see failure");
-        let e2 = wait_for_establish(rx2).await.expect_err("waiter 2 should see failure");
+        let e1 = wait_for_establish(rx1, ESTABLISH_TIMEOUT).await.expect_err("waiter 1 should see failure");
+        let e2 = wait_for_establish(rx2, ESTABLISH_TIMEOUT).await.expect_err("waiter 2 should see failure");
         assert_eq!(e1, "dial failed");
         assert_eq!(e2, "dial failed");
     }
@@ -705,7 +705,7 @@ mod tests {
         };
 
         publish_failure(&RELEASE_TEST_POOL, &key, "boom".to_string());
-        assert_eq!(wait_for_establish(rx).await.expect_err("waiter should see failure"), "boom");
+        assert_eq!(wait_for_establish(rx, ESTABLISH_TIMEOUT).await.expect_err("waiter should see failure"), "boom");
         release_virtual(key, Duration::from_millis(30));
         release_virtual(key, Duration::from_millis(30));
 
