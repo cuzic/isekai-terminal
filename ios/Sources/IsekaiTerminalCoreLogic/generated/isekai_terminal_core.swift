@@ -9757,7 +9757,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 42589) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 39423) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 19256) {
         return InitializationResult.apiChecksumMismatch
     }
 
