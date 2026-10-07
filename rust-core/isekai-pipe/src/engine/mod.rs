@@ -1736,14 +1736,21 @@ async fn relay_buffered(
                         return RelayOutcome::TcpDied;
                     }
                     Ok(n) => {
-                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
-                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
-                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
-                        }
+                        // replayバッファへappendしてから送信する(review 2026-09-29, PIPE-03)。
+                        // 以前は送信→appendの順で、送信が途中で失敗・キャンセルされると
+                        // 読み取った`n`バイト(一部はpeerに届いていることもある)がreplayに
+                        // 載らないまま失われ、RESUMEが`OffsetGone`になるか、再開後の
+                        // ストリームからバイトが欠落してSSHのMAC検証で即切断していた。
+                        // 読み取り量は`remaining_capacity()`で頭打ちなのでappendは失敗しない
+                        // (失敗した場合も、replayに無いバイトを送るよりは接続を畳む)。
                         if !session.lock().await.output_buffer.append(&s2c_buf[..n]) {
                             log::warn!(
                                 "relay to {target}: output buffer had no room after bounded read; treating as data stream failure"
                             );
+                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        }
+                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
+                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
                             return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
                         }
                     }
