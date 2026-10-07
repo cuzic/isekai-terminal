@@ -1644,15 +1644,20 @@ async fn pump_c2h(
             let _ = quic_write.shutdown().await;
             return Ok(());
         }
-        quic_write
-            .write_all(&buf[..n])
-            .await
-            .context("writing to remote stream failed")
-            .map_err(PumpFailure::Remote)?;
+        // Append to the replay buffer *before* sending (review 2026-09-29,
+        // PIPE-03). The old send-then-append order lost bytes whenever the
+        // send failed or — the common case — `run_resume_loop`'s outer
+        // `select!` cancelled this whole pump on a network change while
+        // `write_all` was blocked on flow control (i.e. exactly when the link
+        // drops): whatever had partially gone out was never buffered, so the
+        // helper's committed offset could run past this buffer's end and
+        // the replay failed the resume. Buffered first, every byte read from
+        // stdin is replayable no matter where the send stops.
+        //
         // `read_len`が`remaining_capacity()`で頭打ちにしてあり、`advance_start`は
         // 空きを増やすことしかしないため、ここが`false`になることは無い。それでも
         // 握り潰さないのは、もし起きた場合の被害が「replayバッファに載らないまま
-        // QUICへ送出済みのバイトができる」=`end_offset()`由来の
+        // QUICへ送出されるバイトができる」=`end_offset()`由来の
         // `client_sent_offset`がhelper側とずれる、というresume不能状態だから
         // (`.claude/rules/always-connects.md`)。接続ごと畳んでしまえば
         // `run_resume_loop`が再接続からやり直せるので、そちらの方が安全側に倒れる
@@ -1663,6 +1668,11 @@ async fn pump_c2h(
                  dropping this connection rather than desyncing client_sent_offset"
             )));
         }
+        quic_write
+            .write_all(&buf[..n])
+            .await
+            .context("writing to remote stream failed")
+            .map_err(PumpFailure::Remote)?;
     }
 }
 
@@ -2283,6 +2293,52 @@ mod tests {
             assert!(
                 matches!(result, Err(PumpFailure::Local(_))),
                 "a stdin read failure must be classified Local, not Remote: {result:?}"
+            );
+        }
+
+        /// Endless stdin of zero bytes that counts how much it has handed out.
+        struct CountingZeroReader(Arc<std::sync::atomic::AtomicU64>);
+        impl tokio::io::AsyncRead for CountingZeroReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let n = buf.remaining();
+                buf.put_slice(&vec![0u8; n]);
+                self.0.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// Regression (review 2026-09-29, PIPE-03): every byte `pump_c2h`
+        /// reads from stdin must be in the replay buffer even when the QUIC
+        /// send of it fails. The fixture listener drops any stream whose
+        /// first bytes aren't a `CONTROL_HELLO` (→ STOP_SENDING), so the
+        /// pump's writes start failing; with the old send-then-append order
+        /// the chunk whose send failed was never buffered, leaving the
+        /// replay buffer's end short of what was actually read — exactly the
+        /// gap that made a later resume fail.
+        #[tokio::test]
+        async fn pump_c2h_buffers_every_read_byte_even_when_the_send_fails() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let stream = conn.open_bi().await.unwrap();
+            let (_recv, mut send) = stream.split();
+
+            let read_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut stdin = CountingZeroReader(read_total.clone());
+            let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(256 * 1024 * 1024)));
+            let counters = Arc::new(AppAckCounters::new());
+
+            let result = tokio::time::timeout(Duration::from_secs(20), pump_c2h(&mut stdin, &mut send, replay.clone(), counters))
+                .await
+                .expect("the peer's STOP_SENDING should make the pump's writes fail");
+            assert!(matches!(result, Err(PumpFailure::Remote(_))), "{result:?}");
+            assert_eq!(
+                replay.lock().unwrap().end_offset(),
+                read_total.load(std::sync::atomic::Ordering::SeqCst),
+                "every byte read from stdin must have been buffered for replay"
             );
         }
 
