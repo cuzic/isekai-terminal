@@ -59,9 +59,6 @@ pub(crate) enum TransportCommand {
         bind_addr: String,
         bind_port: u16,
     },
-    /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
-    #[allow(dead_code)] // UNWIRED: 送信側(SshSession/ActiveSession::remove_forward)はe8ed36ee(2026-08-09)で削除済み。ハンドラ側の残骸
-    RemoveForward { id: String },
     /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには一切触れず、同じ
     /// 認証済み`client::Handle`上に新しい"exec"チャネルを1本開いて短命なコマンドを
     /// 実行する(tmux管理コマンドなど、リモートで1回だけ走らせて結果を回収したい
@@ -1142,15 +1139,6 @@ async fn run_ssh_channel_loop_after_first_open(
                                     }).await.ok();
                                 }
                             }
-                        }
-                    }
-                    Some(TransportCommand::RemoveForward { id }) => {
-                        info!("forward[{}]: remove requested", id);
-                        if let Some(old) = active_forwards.remove(&id) {
-                            teardown_forward(old, session.clone(), remote_forwards.clone());
-                            event_tx.send(TransportEvent::ForwardStateChanged {
-                                id, state: ForwardState::Stopped,
-                            }).await.ok();
                         }
                     }
                     Some(TransportCommand::RunExec { command, reply }) => {
