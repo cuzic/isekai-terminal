@@ -71,6 +71,10 @@ object KeystoreKek {
 
     private fun loadKey(): SecretKey {
         val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-        return (keyStore.getEntry(KEY_ALIAS, null) as KeyStore.SecretKeyEntry).secretKey
+        // AND-H3/L3: エントリ欠落(アプリデータ移行・Keystoreリセット等)時に意味の薄い
+        // TypeCastException(`null as SecretKeyEntry`)ではなく原因の分かる例外にする。
+        val entry = keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+            ?: throw IllegalStateException("Keystoreに暗号鍵($KEY_ALIAS)が見つかりません(端末移行・データ消去後は鍵の再インポートが必要です)")
+        return entry.secretKey
     }
 }

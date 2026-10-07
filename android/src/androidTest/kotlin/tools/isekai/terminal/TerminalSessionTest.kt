@@ -90,7 +90,7 @@ class TerminalSessionTest {
 
     @Test
     fun initialState_logEmpty() {
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 接続 ──────────────────────────────────────────────────────
@@ -230,8 +230,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateData("hello ".toByteArray())
         fakeOrchestrator.simulateData("world".toByteArray())
 
-        withTimeout(3000) { session.log.first { it.contains("world") } }
-        assertEquals("hello world", session.log.value)
+        assertEquals("hello world", session.logSnapshot())
     }
 
     @Test
@@ -240,10 +239,10 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
         fakeOrchestrator.simulateData("hello".toByteArray())
-        withTimeout(3000) { session.log.first { it.isNotEmpty() } }
+        assertEquals("hello", session.logSnapshot())
 
         session.clearLog()
-        assertEquals("", session.log.value)
+        assertEquals("", session.logSnapshot())
     }
 
     // ── 送信 ──────────────────────────────────────────────────────
