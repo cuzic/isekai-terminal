@@ -18,7 +18,7 @@ use std::time::Duration;
 use isekai_transport::resume::TRANSPORT_STEP_TIMEOUT;
 
 use super::super::{parse_args_from, HELLO_TIMEOUT, PREEMPT_WAIT_TIMEOUT};
-use super::{PENDING_ACTIVATION_TIMEOUT, TARGET_CONNECT_TIMEOUT};
+use super::{HELLO_OUTCOME_TIMEOUT, PENDING_ACTIVATION_TIMEOUT, TARGET_CONNECT_TIMEOUT};
 use crate::resume_fsm::{resume_window_for, UNKNOWN_SESSION_MIN_ELAPSED_FLOOR};
 
 /// `isekai-pipe serve`を引数なしで起動したときの既定値(`--idle-timeout`, `--resume-window`)。
@@ -146,5 +146,17 @@ fn server_default_park_expiry_outlives_detection_plus_client_retry_budget() {
     assert_ne!(
         server_park_expiry, server_idle,
         "--resume-window and --idle-timeout are deliberately separate values (engine/mod.rs sweep comment, Phase 8-4b)"
+    );
+}
+
+/// `hello()`の待機上限(`HELLO_OUTCOME_TIMEOUT`、PIPE-06のbackstop)は、正当な待機のうち最長の
+/// target接続(`TARGET_CONNECT_TIMEOUT`)より長い。短いと、遅いtargetへの正常な接続中に
+/// ATTACHを`Target`で拒否してしまう。
+#[test]
+fn hello_outcome_backstop_outlives_the_target_connect_timeout() {
+    assert!(
+        HELLO_OUTCOME_TIMEOUT > TARGET_CONNECT_TIMEOUT,
+        "HELLO_OUTCOME_TIMEOUT ({HELLO_OUTCOME_TIMEOUT:?}) must exceed TARGET_CONNECT_TIMEOUT ({TARGET_CONNECT_TIMEOUT:?}): \
+         it is only a backstop and must never cut a legitimate slow target connect short"
     );
 }

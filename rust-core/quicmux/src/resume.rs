@@ -107,6 +107,16 @@ impl ResumeRejectReason {
     }
 }
 
+/// Upper bound on a RESUME request's `token` and `auth_blob` lengths, on both
+/// the encode and decode side. The wire format's u16 length prefix would
+/// allow 64 KiB each, and [`decode_resume_request`] runs *before* the caller
+/// can authenticate anything (it needs the decoded `auth_blob` to do so), so
+/// trusting the prefix let any peer that completed a QUIC handshake make the
+/// server allocate up to 128 KiB per stream (review 2026-09-29, PIPE-13).
+/// Real tokens/proofs are tens of bytes (isekai: a 16-byte session id and a
+/// 32-byte HMAC); 1 KiB leaves ample headroom for any other caller.
+pub const MAX_RESUME_FIELD_LEN: usize = 1024;
+
 /// A resume attempt, as decoded off the wire by [`decode_resume_request`].
 /// Every field is caller-interpreted — this crate only carries the bytes.
 pub struct ResumeRequest {
@@ -137,11 +147,15 @@ pub struct ResumeRequest {
 }
 
 fn encode_resume_request(req: &ResumeRequestToSend<'_>) -> Result<Vec<u8>, MuxError> {
-    if req.token.len() > u16::MAX as usize {
-        return Err(MuxError::ProtocolViolation("resume token too large to encode (max 65535 bytes)".to_string()));
+    if req.token.len() > MAX_RESUME_FIELD_LEN {
+        return Err(MuxError::ProtocolViolation(format!(
+            "resume token too large to encode (max {MAX_RESUME_FIELD_LEN} bytes)"
+        )));
     }
-    if req.auth_blob.len() > u16::MAX as usize {
-        return Err(MuxError::ProtocolViolation("resume auth_blob too large to encode (max 65535 bytes)".to_string()));
+    if req.auth_blob.len() > MAX_RESUME_FIELD_LEN {
+        return Err(MuxError::ProtocolViolation(format!(
+            "resume auth_blob too large to encode (max {MAX_RESUME_FIELD_LEN} bytes)"
+        )));
     }
     let mut buf = Vec::with_capacity(1 + 2 + req.token.len() + 2 + req.auth_blob.len() + 8 + 8);
     buf.push(FRAME_RESUME);
@@ -197,12 +211,12 @@ async fn read_exact(recv: &mut AnyByteStreamReadHalf, buf: &mut [u8]) -> Result<
 pub async fn decode_resume_request(recv: &mut AnyByteStreamReadHalf, conn_exporter: [u8; 32]) -> Result<ResumeRequest, MuxError> {
     let mut token_len = [0u8; 2];
     read_exact(recv, &mut token_len).await?;
-    let mut token = vec![0u8; u16::from_be_bytes(token_len) as usize];
+    let mut token = vec![0u8; bounded_field_len(token_len, "token")?];
     read_exact(recv, &mut token).await?;
 
     let mut auth_len = [0u8; 2];
     read_exact(recv, &mut auth_len).await?;
-    let mut auth_blob = vec![0u8; u16::from_be_bytes(auth_len) as usize];
+    let mut auth_blob = vec![0u8; bounded_field_len(auth_len, "auth_blob")?];
     read_exact(recv, &mut auth_blob).await?;
 
     let mut sent = [0u8; 8];
@@ -217,6 +231,18 @@ pub async fn decode_resume_request(recv: &mut AnyByteStreamReadHalf, conn_export
         client_sent_offset: u64::from_be_bytes(sent),
         client_delivered_offset: u64::from_be_bytes(delivered),
     })
+}
+
+/// Validates a RESUME field's length prefix against [`MAX_RESUME_FIELD_LEN`]
+/// before anything is allocated for it.
+fn bounded_field_len(prefix: [u8; 2], field: &str) -> Result<usize, MuxError> {
+    let len = u16::from_be_bytes(prefix) as usize;
+    if len > MAX_RESUME_FIELD_LEN {
+        return Err(MuxError::ProtocolViolation(format!(
+            "resume {field} length {len} exceeds the maximum of {MAX_RESUME_FIELD_LEN} bytes"
+        )));
+    }
+    Ok(len)
 }
 
 /// The client side of a resume exchange: dials nothing itself (the caller
@@ -450,37 +476,27 @@ impl ReplayBuffer {
     /// drained and `start_offset` stops at the old `end_offset()`. It
     /// deliberately does *not* jump `start_offset` ahead to
     /// `confirmed_offset`, even though that would look like the tidier
-    /// postcondition, because that is unsound in the presence of the
-    /// send-then-append ordering every caller here uses:
-    ///
-    /// 1. The caller writes `n` bytes to the peer.
-    /// 2. The caller appends those same `n` bytes to this buffer.
-    ///
-    /// Between (1) and (2) the peer can legitimately receive, process, and
-    /// ack those bytes, so an ack naming an offset past the current
-    /// `end_offset()` is a *normal race*, not a protocol violation —
-    /// `isekai-pipe serve` hits exactly this window, since its ack reader
-    /// runs in a task spawned separately from its relay loop and the two
-    /// contend for the same session lock. Jumping `start_offset` to
-    /// `confirmed_offset` there would mislabel the bytes that step (2) is
-    /// about to append: they belong at the *old* `end_offset()`, so the
-    /// buffer would then hand a resuming peer already-delivered bytes under
-    /// a higher offset, silently duplicating data and desyncing both sides'
-    /// offset accounting. Clamping keeps step (2)'s bytes correctly
-    /// labelled.
+    /// postcondition. Callers must **append before sending** (review
+    /// 2026-09-29, PIPE-03 — `isekai-pipe`'s server relay and client pump
+    /// both used to send first, so a send that failed or was cancelled
+    /// part-way lost bytes that were never buffered), and with that ordering
+    /// an ack can never legitimately exceed `end_offset()`. If one ever does
+    /// (a buggy or hostile peer), jumping `start_offset` to it would mislabel
+    /// every byte appended afterwards — they belong at the *old*
+    /// `end_offset()` — handing a resuming peer bytes under the wrong offsets
+    /// and silently desyncing both sides' accounting. Clamping keeps later
+    /// appends correctly labelled.
     ///
     /// (`isekai-pipe`'s client-side copy of this buffer used to jump ahead
-    /// instead. It was safe only by accident of its own structure — there,
-    /// append and `advance_start` run sequentially in one task with append
-    /// first, so the window never opens — and it was never reachable anyway,
-    /// because `replay_and_advance` rejects an out-of-range offset via
-    /// `replay_from` before calling this. Consolidating on the clamping
-    /// behavior loses nothing and removes the trap.)
+    /// instead; consolidating on the clamping behavior lost nothing and
+    /// removed the trap.)
     pub fn advance_start(&mut self, confirmed_offset: u64) {
-        while self.start_offset < confirmed_offset && !self.data.is_empty() {
-            self.data.pop_front();
-            self.start_offset += 1;
-        }
+        // One `drain` rather than a `pop_front` per byte (PIPE-15): a single
+        // APP_ACK can confirm megabytes, and the server calls this while
+        // holding the session lock its relay loop also needs.
+        let discard = confirmed_offset.saturating_sub(self.start_offset).min(self.data.len() as u64) as usize;
+        self.data.drain(..discard);
+        self.start_offset += discard as u64;
     }
 
     /// Bytes from `from` (inclusive) to `end_offset()`. `None` if `from` is
@@ -620,6 +636,37 @@ mod tests {
         let token = vec![0u8; u16::MAX as usize + 1];
         let req = ResumeRequestToSend { token: &token, auth_blob: b"", client_sent_offset: 0, client_delivered_offset: 0 };
         assert!(matches!(encode_resume_request(&req), Err(MuxError::ProtocolViolation(_))));
+    }
+
+    /// PIPE-13: the decode side must refuse an oversized length prefix
+    /// *before* allocating for it (it runs pre-authentication).
+    #[test]
+    fn decode_length_prefix_is_bounded_before_allocation() {
+        assert_eq!(bounded_field_len((MAX_RESUME_FIELD_LEN as u16).to_be_bytes(), "token").unwrap(), MAX_RESUME_FIELD_LEN);
+        assert!(matches!(
+            bounded_field_len(((MAX_RESUME_FIELD_LEN + 1) as u16).to_be_bytes(), "token"),
+            Err(MuxError::ProtocolViolation(_))
+        ));
+        assert!(matches!(bounded_field_len(u16::MAX.to_be_bytes(), "auth_blob"), Err(MuxError::ProtocolViolation(_))));
+    }
+
+    #[test]
+    fn encode_resume_request_rejects_a_token_over_the_decode_limit() {
+        let token = vec![0u8; MAX_RESUME_FIELD_LEN + 1];
+        let req = ResumeRequestToSend { token: &token, auth_blob: b"", client_sent_offset: 0, client_delivered_offset: 0 };
+        assert!(matches!(encode_resume_request(&req), Err(MuxError::ProtocolViolation(_))));
+    }
+
+    /// PIPE-15: the bulk `drain` keeps `advance_start`'s exact semantics.
+    #[test]
+    fn advance_start_discards_exactly_up_to_the_confirmed_offset() {
+        let mut buf = ReplayBuffer::new(1 << 20);
+        assert!(buf.append(&vec![7u8; 500_000]));
+        buf.advance_start(300_000);
+        assert_eq!(buf.start_offset(), 300_000);
+        assert_eq!(buf.len(), 200_000);
+        assert_eq!(buf.end_offset(), 500_000);
+        assert_eq!(buf.replay_from(300_000).unwrap().len(), 200_000);
     }
 }
 

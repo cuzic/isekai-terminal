@@ -169,39 +169,21 @@ impl InstallScript {
     }
 }
 
-/// Builds the remote install/launch script and the stdin payload it reads,
-/// for either backend.
+/// The `isekai-pipe serve` argv tail (shell text, interpolated verbatim after
+/// `<remote_binary_path> serve` in the remote script) plus any extra secret
+/// bytes (`relay_jwt` only) that must travel over stdin right after the
+/// `BootstrapRequestV2` JSON.
 ///
-/// The base64-encoded `binary` always travels over stdin regardless of
-/// whether the script ends up using it, so the remote script's read position
-/// stays aligned across every branch — see the script's own `head -c
-/// {encoded_len}` calls, every one of which consumes exactly that many bytes
-/// whether it decodes them or discards them.
-///
-/// Async because `fresh_bootstrap_request_v2` probes the configured STUN
-/// servers for this client's own reflexive candidates before the request can
-/// be serialized.
-pub(crate) async fn build_install_script(
+/// Split out of [`build_install_script`] (sync, no STUN probing) so the exact
+/// argv `isekai-bootstrap` generates can be round-tripped through the real
+/// `isekai-pipe serve` argument parser in that crate's tests (review
+/// 2026-09-29 PIPE-01: `parse_serve` rejected the `--bind-port-range`/
+/// `--relay-transport` this function emits — a permanent always-connects
+/// failure). Exposed as [`crate::serve_launch_args`].
+pub(crate) fn serve_launch_args(
     launch: &LaunchSpec,
-    remote_binary_path: &str,
     stun_servers: &[SocketAddr],
-    binary: &[u8],
-) -> Result<InstallScript, BootstrapError> {
-    let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
-
-    // `#20a`/`#20b`: every bootstrap operation carries a
-    // `BootstrapRequestV2` over this same stdin, alongside
-    // whatever launch-specific secret (`relay_jwt`) already travels that
-    // way. `client_candidates` is now real: one entry per `stun_servers`
-    // entry that actually answered (`collect_client_stun_candidates`).
-    // `session_id`/`bootstrap_attempt_id` are freshly random per call —
-    // see `isekai_protocol::bootstrap_request`'s module docs for why
-    // these are their own identifiers, unrelated to any later ATTACH v2
-    // fencing identity the eventual QUIC connection will use.
-    let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
-    let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
-    let request_len = request_bytes.len();
-
+) -> Result<(String, Vec<u8>), BootstrapError> {
     // `#20b`: pass the first configured STUN server through to the
     // remote `isekai-pipe serve` too (`LaunchSpec::Direct` only —
     // `isekai-pipe serve` itself rejects `--stun-server`/`--relay`
@@ -215,15 +197,19 @@ pub(crate) async fn build_install_script(
     // scoped multi-STUN collection to the client side only); the
     // remaining configured servers still contribute to
     // `client_candidates` regardless.
+    // Shell-quoted (review 2026-09-29, SSH-41): an IPv6 `SocketAddr`
+    // renders as `[2001:db8::1]:3478`, and `[...]` is a glob bracket
+    // expression to `sh` — unquoted, a matching file in the remote cwd
+    // would silently replace the argument.
     let stun_server_arg = match stun_servers.first() {
-        Some(addr) => format!(" --stun-server {addr}"),
+        Some(addr) => format!(" --stun-server {}", shell_single_quote(&addr.to_string())),
         None => String::new(),
     };
 
     // Per-variant: the `isekai-pipe serve` argv tail, and any extra
     // secret bytes (`relay_jwt` only) that must travel over this same
     // stdin immediately after the `BootstrapRequestV2` JSON.
-    let (launch_args, jwt_bytes): (String, Vec<u8>) = match launch {
+    Ok(match launch {
         LaunchSpec::Relay(relay) => {
             // Security review #57: validate `relay_sni`/`relay_jwt` against a
             // strict allow-list charset *before* interpolating either into a
@@ -274,7 +260,43 @@ pub(crate) async fn build_install_script(
             );
             (args, Vec::new())
         }
-    };
+    })
+}
+
+/// Builds the remote install/launch script and the stdin payload it reads,
+/// for either backend.
+///
+/// The base64-encoded `binary` always travels over stdin regardless of
+/// whether the script ends up using it, so the remote script's read position
+/// stays aligned across every branch — see the script's own `head -c
+/// {encoded_len}` calls, every one of which consumes exactly that many bytes
+/// whether it decodes them or discards them.
+///
+/// Async because `fresh_bootstrap_request_v2` probes the configured STUN
+/// servers for this client's own reflexive candidates before the request can
+/// be serialized.
+pub(crate) async fn build_install_script(
+    launch: &LaunchSpec,
+    remote_binary_path: &str,
+    stun_servers: &[SocketAddr],
+    binary: &[u8],
+) -> Result<InstallScript, BootstrapError> {
+    let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
+
+    // `#20a`/`#20b`: every bootstrap operation carries a
+    // `BootstrapRequestV2` over this same stdin, alongside
+    // whatever launch-specific secret (`relay_jwt`) already travels that
+    // way. `client_candidates` is now real: one entry per `stun_servers`
+    // entry that actually answered (`collect_client_stun_candidates`).
+    // `session_id`/`bootstrap_attempt_id` are freshly random per call —
+    // see `isekai_protocol::bootstrap_request`'s module docs for why
+    // these are their own identifiers, unrelated to any later ATTACH v2
+    // fencing identity the eventual QUIC connection will use.
+    let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
+    let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
+    let request_len = request_bytes.len();
+
+    let (launch_args, jwt_bytes) = serve_launch_args(launch, stun_servers)?;
 
     // Security review #68: use the same per-invocation `mktemp -d` +
     // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
@@ -395,12 +417,17 @@ sha256_of() {{
     echo "isekai-pipe bootstrap: no sha256sum/shasum on remote, binary reuse detection permanently disabled (always re-uploading+relaunching)" >&2
   fi
 }}
-tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT
+sha_matches_or_unknown() {{
+  got_sha=$(sha256_of "$1")
+  [ -z "$got_sha" ] || [ "$got_sha" = "{expected_sha256}" ]
+}}
+tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir; rm -f {remote_binary_path}.tmp.$$ {pid_path}.$$' EXIT || exit 1
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
     existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
+    existing_launched_sha=$(sed -n '1p' {state_path} | cut -d' ' -f3)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
       # `/proc/<pid>/exe` doesn't exist on macOS remotes (no /proc at all) —
       # skip this extra identity check there and trust `kill -0` + fingerprint
@@ -435,7 +462,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
       # interfere with. The stale one self-exits via `--max-idle-lifetime`.
       if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
         existing_sha=$(sha256_of {remote_binary_path})
-        if [ "$existing_sha" = "{expected_sha256}" ]; then
+        if [ "$existing_sha" = "{expected_sha256}" ] && [ "$existing_launched_sha" = "{expected_sha256}" ]; then
           reuse_envelope=$(sed -n '2p' {state_path})
         fi
       fi
@@ -452,7 +479,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
-      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
+      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp.$$ && chmod 0700 {remote_binary_path}.tmp.$$ && sha_matches_or_unknown {remote_binary_path}.tmp.$$ && mv {remote_binary_path}.tmp.$$ {remote_binary_path} || {{ rm -f {remote_binary_path}.tmp.$$ 2>/dev/null; upload_ok=0; }}
     else
       head -c {encoded_len} > /dev/null
     fi
@@ -472,9 +499,11 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
         envelope=$(cat $tmpdir/handshake)
         new_pid=$(cat {pid_path}.$$ 2>/dev/null)
         mv {pid_path}.$$ {pid_path} 2>/dev/null
-        ( printf '%s %s\n' "$new_pid" "{fingerprint}"; printf '%s\n' "$envelope" ) > {state_path}.tmp.$$ && mv {state_path}.tmp.$$ {state_path}
+        ( printf '%s %s %s\n' "$new_pid" "{fingerprint}" "{expected_sha256}"; printf '%s\n' "$envelope" ) > {state_path}.tmp.$$ && mv {state_path}.tmp.$$ {state_path}
         printf '%s\n' "$envelope"
       else
+        orphan_pid=$(cat {pid_path}.$$ 2>/dev/null)
+        if [ -n "$orphan_pid" ]; then kill "$orphan_pid" 2>/dev/null; fi
         rm -f {pid_path}.$$ 2>/dev/null
       fi
     fi

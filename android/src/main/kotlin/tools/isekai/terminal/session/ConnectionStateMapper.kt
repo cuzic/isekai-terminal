@@ -85,8 +85,10 @@ object ConnectionStateMapper {
         is UiMsg.ConnectionStateChanged -> apply(current, msg.state)
         is UiMsg.ConnectFailed ->
             current.copy(isConnecting = false, statusMsg = "エラー: ${msg.message ?: "不明なエラー"}")
+        // AND-M8a: 再接続ループ中([isReconnecting])の切断で「切断済み」かつReconnecting
+        // という不整合な表示にならないよう、`isReconnecting`も落とす。
         UiMsg.LocalDisconnectRequested ->
-            current.copy(connected = false, isConnecting = false, statusMsg = "切断済み")
+            current.copy(connected = false, isConnecting = false, isReconnecting = false, statusMsg = "切断済み")
         is UiMsg.ScreenUpdated -> current.copy(screenUpdate = msg.update, scrollbackLen = msg.scrollbackLen)
         is UiMsg.HostKeyTrustedNew -> current.copy(lastFingerprint = msg.fingerprint)
         is UiMsg.HostKeyChanged -> current.copy(hostKeyChangedWarning = msg.warning)
