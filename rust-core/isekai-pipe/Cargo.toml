@@ -63,6 +63,10 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1.89"
+# `main.rs`のテストで、bootstrapが実際に生成する`serve`引数
+# (`isekai_bootstrap::serve_launch_args`)を実`parse_serve`+engineパーサーに
+# 通すラウンドトリップ検証のため(review 2026-09-29 PIPE-01)。
+isekai-bootstrap = { path = "../isekai-bootstrap" }
 # `sleep_with_live_status`のタイミングを`tokio::time::pause()`/`advance()`で
 # 実時間を待たずに決定的にテストするため(`[dependencies]`の`tokio`とは
 # feature unificationで1つのtokioクレートにまとまる)。
