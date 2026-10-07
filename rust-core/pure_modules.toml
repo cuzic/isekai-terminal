@@ -20,6 +20,12 @@ package = "isekai-pipe"
 file = "isekai-pipe/src/engine/serve_fsm.rs"
 module = "engine::serve_fsm"
 
+# Step 5: isekai-pipe connectのresume判断(ResumePlanner、BUSY_OTHER_SESSIONの再試行期限)。
+[[module]]
+package = "isekai-pipe"
+file = "isekai-pipe/src/resume_fsm.rs"
+module = "resume_fsm"
+
 [[module]]
 package = "isekai-terminal-core"
 file = "src/rebind_manager.rs"
@@ -101,6 +107,10 @@ allow = [
     "isekai_pipe_core::ConnectOutcomeClass",
     # Step 6+7: `BackoffPolicy::next_delay(attempt, seed)`はseed付きStdRngの純粋関数
     "isekai_transport::backoff::BackoffPolicy",
+    # Step 5(resume_fsm.rs): 純粋な値・関数の項目単位許可
+    "isekai_transport::BackoffPolicy",                      # 純粋なbackoff計算(RNGはseedで注入、Step 6)
+    "isekai_transport::resume::TRANSPORT_STEP_TIMEOUT",     # 定数(CROSS_FAMILY_MIN_PROBE_BUDGETの導出元)
+    "isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS",          # 定数(既定のresume window)
 ]
 # allowより優先して拒否する(時計/タスク実行を持つサブモジュール)
 deny = [
@@ -157,6 +167,17 @@ effect = "RecoveryEffect"
 file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
 effect = "ReconnectEffect"
+
+# Step 5: ResumePlanner(resume_fsm.rs)のResumeCmdを解釈するshell。
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "resume_with_backoff_until_deadline"
+effect = "ResumeCmd"
+
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "interpret_tick_cmds"
+effect = "ResumeCmd"
 
 # Step 4: pool.rsのアイドルタイマーinterpreter(ロック内: Remove実行 / ロック外: ArmIdleTimerのspawn)。
 [[interpreter]]

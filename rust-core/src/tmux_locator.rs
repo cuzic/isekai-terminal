@@ -114,6 +114,7 @@ impl TmuxTag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TmuxTargetKind {
     Window,
+    #[allow(dead_code)] // UNWIRED: 本番で構築されない(テストのみ)。ee34304a(backfill削除、2026-08-09)の根本原因・ADR_UNWIRED_CALLBACK_DETECTION.md §1.4
     Pane,
 }
 
@@ -123,6 +124,7 @@ pub(crate) enum TmuxTargetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TmuxSessionScope {
     /// group化されていない、ただ1つのtmuxセッション。
+    #[allow(dead_code)] // UNWIRED: 本番で構築されない(テストのみ)。ADR_UNWIRED_CALLBACK_DETECTION.md §1.3(4)
     Standalone { session_name: String },
     /// tmux session groupのメンバー。`group`はグループ内の全メンバーが共有する
     /// ウィンドウ/ペイン集合の識別(グループ名)、`session_name`はこの
