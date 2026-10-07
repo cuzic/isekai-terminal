@@ -316,6 +316,26 @@ impl SessionCore {
         }
     }
 
+    /// trzszのプロトコルデータ(アップロードchunk等)用: 捨ててはいけないコマンドを送る。
+    ///
+    /// RC-06(2026-09-29 コードレビュー): 以前は`send_session_cmd`(`try_send`)で送っており、
+    /// Kotlinがペーシング無しに64KiBずつ押し込むとキュー(容量64)が溢れた分のchunkを
+    /// 黙って捨てていた(ファイル欠落)。tokio runtime外のスレッド(Kotlinの
+    /// `Dispatchers.IO`等)からの呼び出しでは`blocking_send`でキューが空くまで呼び出し元を
+    /// 待たせてバックプレッシャーを掛ける。runtime内(テスト等)から呼ばれた場合は
+    /// blockingできないので`try_send`にフォールバックし、失敗をログに残す。
+    /// 送信端はロックの外でcloneしてから待つ(待機中に`disconnect()`を塞がない)。
+    fn send_session_cmd_reliable(&self, cmd: SessionCmd) {
+        let Some(tx) = self.session_tx.lock().clone() else { return };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            if let Err(e) = tx.try_send(cmd) {
+                log::error!("session: reliable session command dropped inside runtime context: {e}");
+            }
+        } else if tx.blocking_send(cmd).is_err() {
+            log::warn!("session: event loop ended before a reliable session command could be delivered");
+        }
+    }
+
     /// transport コマンド送信端を複製して返す。connect() 直後に
     /// 初期ポートフォワード(config.forwards)を投入するために使う。
     pub(crate) fn command_sender(&self) -> Option<tokio::sync::mpsc::Sender<TransportCommand>> {
@@ -507,11 +527,11 @@ impl SessionCore {
     }
 
     pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
-        self.send_session_cmd(SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode });
+        self.send_session_cmd_reliable(SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode });
     }
 
     pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
-        self.send_session_cmd(SessionCmd::TrzszChunk { transfer_id, data, is_last });
+        self.send_session_cmd_reliable(SessionCmd::TrzszChunk { transfer_id, data, is_last });
     }
 
     pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
@@ -1050,6 +1070,12 @@ pub(crate) async fn session_event_loop(
     // `select!`より先に消費し、元の到着順序を保つ。
     let mut pending_event: Option<TransportEvent> = None;
 
+    // RC-06: transportへ送り切れていない`WriteStdin`の行列(`PendingStdin`参照)。
+    let mut pending_stdin = PendingStdin::default();
+    // RC-13: `session_cmd_rx`がNoneを返した(送信端が全てdropされた)後もそのアームを
+    // 有効にしたままだと、`recv()`が常に即座にNoneを返し`select!`がbusy-spinする。
+    let mut session_cmd_closed = false;
+
     'outer: loop {
         let result: Option<ProcessResult> = if let Some(ev) = pending_event.take() {
             match dispatch_transport_event(ev, &mut event_rx, &mut pending_event, &mut state, &callback) {
@@ -1072,13 +1098,29 @@ pub(crate) async fn session_event_loop(
                 Some(id) => Some(state.on_timeout(id)),
                 None => None,
             },
-            cmd = session_cmd_rx.recv() => match cmd {
+            cmd = session_cmd_rx.recv(), if !session_cmd_closed && pending_stdin.accepts_more_upstream() => match cmd {
                 // OSC 133(タスク#13)の「前/次のプロンプトへジャンプ」だけが実際に
                 // 使う値だが、`handle_session_cmd`の外(このループ)でしか
                 // `scrollback`ロックを取れないため、コマンド種別を問わず毎回渡す
                 // (`handle_session_cmd`のdocコメント参照)。
                 Some(c) => Some(handle_session_cmd(&mut state, c, scrollback.lock().len() as u32)),
-                None => None,
+                None => {
+                    session_cmd_closed = true;
+                    None
+                }
+            },
+            permit = transport_cmd_tx.reserve(), if !pending_stdin.is_empty() => {
+                match permit {
+                    Ok(permit) => {
+                        if let Some(bytes) = pending_stdin.pop() {
+                            permit.send(TransportCommand::WriteStdin(bytes));
+                        }
+                        pending_stdin.flush(&transport_cmd_tx);
+                    }
+                    // transportが終了済み。送り先が無いので捨てる(`flush`がclosedを検知して空にする)。
+                    Err(_) => pending_stdin.flush(&transport_cmd_tx),
+                }
+                None
             },
             fired = sync_timeout_rx.recv() => match fired {
                 Some(gen) if sync_output_timeout_is_current(gen, sync_output_armed_generation) => {
@@ -1142,7 +1184,7 @@ pub(crate) async fn session_event_loop(
                     RepaintDecision::AlreadyArmed => {}
                 }
             }
-            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
+            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &mut pending_stdin, &callback, &scrollback);
             if clipboard_pull_requested {
                 // Fetching the current Android clipboard text needs a Kotlin
                 // round trip (`on_host_key`/`on_agent_sign_request`'s same
@@ -1188,6 +1230,64 @@ fn emit_screen_update(
     throttle.note_emitted(now);
 }
 
+/// event loopからtransportへ送る`WriteStdin`(trzszのプロトコルフレーム等)の送出待ち行列。
+///
+/// RC-06(2026-09-29 コードレビュー): 以前は`transport_cmd_tx.try_send`が満杯で失敗すると
+/// フレームを捨てていた(transportは`channel.data().await`でSSHウィンドウ待ちをするため、
+/// 遅い回線ではすぐ満杯になる)。event loop自身をtransportへの送信でブロックさせると、
+/// transportが`event_tx.send().await`で詰まった瞬間に相互待ちになるため、ここへ積んで
+/// `session_event_loop`の`reserve()`アームで順番通りに流す。行列が
+/// [PENDING_STDIN_HIGH_WATER]を超えている間は`session_cmd_rx`の受信を止め、
+/// Kotlin側の`trzsz_send_chunk`(`blocking_send`)まで背圧を伝える。
+#[derive(Default)]
+pub(crate) struct PendingStdin {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+/// [PendingStdin]がこれを超えたら上流(`session_cmd_rx`)からの受信を一時停止する。
+const PENDING_STDIN_HIGH_WATER: usize = 1024 * 1024;
+
+impl PendingStdin {
+    fn push(&mut self, bytes: Vec<u8>) {
+        self.bytes += bytes.len();
+        self.queue.push_back(bytes);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn accepts_more_upstream(&self) -> bool {
+        self.bytes < PENDING_STDIN_HIGH_WATER
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        let b = self.queue.pop_front()?;
+        self.bytes -= b.len();
+        Some(b)
+    }
+
+    /// 送れるだけ(チャネルに空きがある分だけ)送る。transportが既に終了して
+    /// いれば(受信側がclose)、送り先が無いので行列を捨てる。
+    fn flush(&mut self, tx: &tokio::sync::mpsc::Sender<TransportCommand>) {
+        while !self.queue.is_empty() {
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    let b = self.pop().expect("non-empty");
+                    permit.send(TransportCommand::WriteStdin(b));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(())) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                    self.queue.clear();
+                    self.bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// ProcessResult をすべて処理する（タイマー・scrollback・副作用）。画面更新の
 /// 発行は`RepaintThrottle`により間引かれるため、ここでは扱わない
 /// (`emit_screen_update`を参照、呼び出し元の`session_event_loop`が別途呼ぶ)。
@@ -1195,6 +1295,7 @@ fn dispatch_result(
     r: ProcessResult,
     timer_rt: &mut TokioTimerRuntime,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
+    pending_stdin: &mut PendingStdin,
     callback: &Arc<dyn SessionCallback>,
     scrollback: &Arc<Mutex<VecDeque<Vec<TermCell>>>>,
 ) {
@@ -1218,10 +1319,9 @@ fn dispatch_result(
     for effect in r.side_effects {
         match effect {
             SideEffect::SendStdin(bytes) => {
-                let len = bytes.len();
-                if let Err(e) = transport_cmd_tx.try_send(TransportCommand::WriteStdin(bytes)) {
-                    log::error!("trzsz: FATAL try_send WriteStdin({} bytes) failed: {}", len, e);
-                }
+                // RC-06: 捨てずに行列へ積み、順番を保ったまま送れるだけ送る。
+                pending_stdin.push(bytes);
+                pending_stdin.flush(transport_cmd_tx);
             }
             SideEffect::TrzszRequest { transfer_id, mode, suggested_name, expected_size } => {
                 let mode_str = match mode {
@@ -2035,6 +2135,43 @@ mod tests {
         }
     }
 
+    // ── RC-06: WriteStdinの送出待ち行列 ────────────────────
+
+    #[test]
+    fn pending_stdin_never_drops_frames_when_the_transport_channel_is_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportCommand>(2);
+        let mut pending = PendingStdin::default();
+        for i in 0u8..5 {
+            pending.push(vec![i]);
+            pending.flush(&tx);
+        }
+        // チャネル容量(2)を超えた3フレームは捨てられずに行列に残る。
+        assert_eq!(pending.queue.len(), 3);
+        let mut received = Vec::new();
+        // transportが1件ずつ消費し、そのたびに行列から補充される様子を模す。
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                TransportCommand::WriteStdin(b) => received.push(b[0]),
+                _ => panic!("unexpected command"),
+            }
+            pending.flush(&tx);
+        }
+        assert_eq!(received, vec![0, 1, 2, 3, 4], "全フレームが順番通りに届くこと");
+        assert_eq!(pending.bytes, 0);
+    }
+
+    #[test]
+    fn pending_stdin_discards_when_transport_is_gone_and_applies_backpressure_above_high_water() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TransportCommand>(1);
+        let mut pending = PendingStdin::default();
+        pending.push(vec![0; PENDING_STDIN_HIGH_WATER]);
+        assert!(!pending.accepts_more_upstream());
+        drop(rx);
+        pending.flush(&tx);
+        assert!(pending.is_empty());
+        assert!(pending.accepts_more_upstream());
+    }
+
     // ── dispatch_result: scrollback上限トリミング ────────────
 
     #[test]
@@ -2057,7 +2194,7 @@ mod tests {
         };
         // dispatch_resultはscrollback/side effectsのみを扱う(画面発行は
         // emit_screen_update側の責務なのでここでは検証不要)。
-        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &mut PendingStdin::default(), &callback, &scrollback);
 
         let sb = scrollback.lock();
         assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
