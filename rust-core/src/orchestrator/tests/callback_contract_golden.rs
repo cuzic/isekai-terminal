@@ -8,7 +8,8 @@
 //! 各プラットフォームの転送実装へreplayする。
 //!
 //! - **射影**(ADR Q17): メソッド名・`ConnectionEdge`のvariant・`generation`・公開状態のタグ、と
-//!   `Connected{host}`/`Established{host}`のhost(テスト用の固定値。秘密は載せない、§3-3)。理由文字列・
+//!   `Connected{host}`/`Established{host}`のhost(テスト用の固定値。秘密は載せない、§3-3)と
+//!   `Established`の`upstream_failover`(#175)。理由文字列・
 //!   `Reconnecting`の秒数は載せない。`Reconnecting`の連続(再接続ループがtickごとに出すカウントダウンの
 //!   再公開)は1件に畳む(tick方針を変えただけでgoldenが変わらないように)。
 //! - **順序**: 全シナリオを`start_paused`のcurrent-threadランタイムで走らせるので、別task(再接続ループ・
@@ -38,6 +39,7 @@ const SCENARIOS: &[&str] = &[
     "f_reconnect_loop_success",
     "reconnect_gives_up",
     "fast_reconnect_cycles",
+    "upstream_failover_reconnects",
 ];
 
 const RECONNECTING_LINE: &str = r#"{"method": "on_connection_state_changed", "state": "Reconnecting"}"#;
@@ -77,8 +79,8 @@ fn state_line(state: &ConnectionPublicState) -> String {
 
 fn edge_line(edge: &ConnectionEdge, generation: u64) -> String {
     match edge {
-        ConnectionEdge::Established { host } => format!(
-            r#"{{"method": "on_connection_edge", "edge": "Established", "host": {}, "generation": {generation}}}"#,
+        ConnectionEdge::Established { host, upstream_failover } => format!(
+            r#"{{"method": "on_connection_edge", "edge": "Established", "host": {}, "upstream_failover": {upstream_failover}, "generation": {generation}}}"#,
             json_str(host)
         ),
         ConnectionEdge::Lost => {
@@ -299,5 +301,29 @@ async fn golden_fast_reconnect_cycles() {
         &cb,
         "fast_reconnect_cycles",
         "切断から自動再接続の成功までを3回続けた。世代ごとにLostとEstablishedが1回ずつ届く",
+    );
+}
+
+/// #175: upstream failoverを有効にしたマルチパス接続の後、自動再接続ループの成功とフォアグラウンド復帰の
+/// 再接続(どちらもKotlinの`connectPane`を通らない)が続く。全世代の`Established`が
+/// `upstream_failover: true`を運ぶ(Kotlin/Swiftはこれをエッジごとに適用するだけ)。
+#[tokio::test(start_paused = true)]
+async fn golden_upstream_failover_reconnects() {
+    let (orch, cb, adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), golden_policy());
+    let first = orch.begin_connect(multipath_attempt(HOST, true)).expect("Idle中のconnectは受理されるはず");
+    first.on_connected();
+    first.on_disconnected(Some("peer closed".to_string()));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let looped = adapters.lock().unwrap().pop().expect("試行間隔の経過後に再接続を試みるはず");
+    looped.on_connected();
+    orch.notify_did_enter_background(30_000);
+    orch.notify_background_budget_expired();
+    orch.notify_will_enter_foreground();
+    let resumed = adapters.lock().unwrap().pop().expect("フォアグラウンド復帰で再接続を試みるはず");
+    resumed.on_connected();
+    check_golden(
+        &cb,
+        "upstream_failover_reconnects",
+        "upstream failover有効のマルチパス接続が、自動再接続ループとフォアグラウンド復帰で張り直された。全世代のEstablishedがupstream_failover: trueを運ぶ",
     );
 }

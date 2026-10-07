@@ -4982,8 +4982,17 @@ public enum ConnectionEdge: Equatable, Hashable {
     /**
      * 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
      * `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
+     *
+     * `upstream_failover`(#175): この世代について、プラットフォーム側のupstream health監視
+     * (Androidの`UpstreamHealthMonitor`。WiFiは繋がっているがupstreamが死んでいる、の検知)を
+     * 登録すべきか。Rustが直前の接続設定(`last_connect_attempt`。自動再接続・フォアグラウンド復帰も
+     * 同じ設定を使う)から決める: `connect_multipath_isekai_pipe_quic`で
+     * `enable_upstream_failover = true`だった場合だけ`true`。Kotlin/Swiftはこの値をエッジごとに
+     * そのまま適用するだけで、「今のセッションでupstream failoverが有効か」のミラーフラグを持たない
+     * (以前はKotlin側のミラーフラグが`Lost`で下ろされたまま、`connectPane`を通らない自動再接続の
+     * `Established`で再登録されなかった、`rust-ssot.md`)。
      */
-    case established(host: String
+    case established(host: String, upstreamFailover: Bool
     )
     /**
      * `Established`を出した世代のセッションが`Connected`を離れた。`Established(g)`の後、
@@ -5011,7 +5020,7 @@ public struct FfiConverterTypeConnectionEdge: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .established(host: try FfiConverterString.read(from: &buf)
+        case 1: return .established(host: try FfiConverterString.read(from: &buf), upstreamFailover: try FfiConverterBool.read(from: &buf)
         )
         
         case 2: return .lost
@@ -5024,9 +5033,10 @@ public struct FfiConverterTypeConnectionEdge: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .established(host):
+        case let .established(host,upstreamFailover):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(host, into: &buf)
+            FfiConverterBool.write(upstreamFailover, into: &buf)
             
         
         case .lost:
