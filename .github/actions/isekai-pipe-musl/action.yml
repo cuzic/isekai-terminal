@@ -33,6 +33,12 @@ inputs:
     description: zig version used by cargo-zigbuild on a cache miss (part of the cache key)
     required: false
     default: "0.16.0"
+  zig-sha256:
+    description: >-
+      sha256 of zig-x86_64-linux-<zig-version>.tar.xz as published in
+      https://ziglang.org/download/index.json (update together with zig-version)
+    required: false
+    default: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
 
 outputs:
   cache-hit:
@@ -97,6 +103,8 @@ runs:
         if [ ! -x "$HOME/zig-toolchain/zig" ]; then
           curl -fL -o /tmp/zig.tar.xz \
             "https://ziglang.org/download/${{ inputs.zig-version }}/zig-x86_64-linux-${{ inputs.zig-version }}.tar.xz"
+          # 改ざん・破損したtarballを展開しない(2026-09-29レビューCI-L2)。
+          echo "${{ inputs.zig-sha256 }}  /tmp/zig.tar.xz" | sha256sum -c -
           mkdir -p "$HOME/zig-toolchain"
           tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
         fi
