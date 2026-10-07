@@ -114,7 +114,6 @@ pub(crate) trait ByteHalfRead: Send {
 
 pub(crate) trait ByteHalfWrite: Send {
     fn write_all(&mut self, buf: &[u8]) -> impl std::future::Future<Output = Result<(), String>> + Send;
-    fn shutdown(&mut self) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 impl ByteHalfRead for quicmux::AnyByteStreamReadHalf {
@@ -126,9 +125,6 @@ impl ByteHalfRead for quicmux::AnyByteStreamReadHalf {
 impl ByteHalfWrite for quicmux::AnyByteStreamWriteHalf {
     fn write_all(&mut self, buf: &[u8]) -> impl std::future::Future<Output = Result<(), String>> + Send {
         async move { quicmux::AnyByteStreamWriteHalf::write_all(self, buf).await.map_err(|e| e.to_string()) }
-    }
-    fn shutdown(&mut self) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        async move { quicmux::AnyByteStreamWriteHalf::shutdown(self).await.map_err(|e| e.to_string()) }
     }
 }
 
@@ -579,10 +575,6 @@ mod tests {
                 return Err("mock write failure".to_string());
             }
             let _ = self.tx.send(buf.to_vec());
-            Ok(())
-        }
-
-        async fn shutdown(&mut self) -> Result<(), String> {
             Ok(())
         }
     }

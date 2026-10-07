@@ -350,6 +350,14 @@ jobs:
         working-directory: rust-core
         run: cargo clippy --workspace --lib --bins -- -A clippy::all
 
+      # ADR_UNWIRED_CALLBACK_DETECTION.md Phase 3: isekai-terminal-coreの新規dead_codeを禁止する。
+      # 意図的に残す未配線項目は`#[allow(dead_code)] // UNWIRED: <参照>`で明示すること
+      # (テスト専用はcfg(test)、本当に死んだものは削除)。crate単位(-p)なので
+      # isekai-ssh(cfg(windows)依存で単一プラットフォームdeny不可)・vendor crateには効かない。
+      - name: cargo clippy (isekai-terminal-core, deny dead_code)
+        working-directory: rust-core
+        run: cargo clippy -p isekai-terminal-core --lib -- -A clippy::all -D dead_code
+
       - name: Save cargo cache (rust-core, main only)
         if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

@@ -57,6 +57,7 @@ impl IdleLedger {
         Self { refcount: 1, generation: 0 }
     }
 
+    #[cfg(test)]
     pub(crate) fn refcount(&self) -> u32 {
         self.refcount
     }
