@@ -1,0 +1,17 @@
+{
+  "scenario": "upstream_failover_reconnects",
+  "description": "upstream failover有効のマルチパス接続が、自動再接続ループとフォアグラウンド復帰で張り直された。全世代のEstablishedがupstream_failover: trueを運ぶ",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "upstream_failover": true, "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "upstream_failover": true, "generation": 2},
+    {"method": "on_foreground_resume", "did_reconnect": true},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 2},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "upstream_failover": true, "generation": 3}
+  ]
+}

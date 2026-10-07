@@ -50,10 +50,16 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         }
     }
 
+    /** #175: 直前の`connect*`の設定から決まる、Established に載せる upstream_failover(Rust の
+     *  `LastConnectAttempt::wants_upstream_failover_monitor`と同じ: マルチパスかつ
+     *  `enableUpstreamFailover`のときだけ true。自動再接続の世代も同じ設定を使う)。 */
+    private var upstreamFailover = false
+
     /** `begin_connect`: Connected 中なら旧世代の Lost を出してから新しい世代を作る。 */
-    private fun beginSession() {
+    private fun beginSession(upstreamFailover: Boolean = false) {
         closeEdge()
         generation++
+        this.upstreamFailover = upstreamFailover
     }
     val sentBytes = mutableListOf<ByteArray>()
     var lastResizeCols: UInt? = null
@@ -105,7 +111,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) {
         connectMultipathIsekaiPipeQuicCalled = true
         quic = true
-        beginSession()
+        beginSession(upstreamFailover = config.enableUpstreamFailover)
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -283,7 +289,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         if (!edgeOpen) {
             edgeOpen = true
             lastEstablished = generation
-            emitEdge(ConnectionEdge.Established(host))
+            emitEdge(ConnectionEdge.Established(host, upstreamFailover))
         }
     }
 

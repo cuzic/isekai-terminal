@@ -19,7 +19,6 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -81,7 +80,7 @@ class CallbackContractGoldenReplayTest {
 
     sealed interface GoldenEvent {
         data class State(val tag: String, val host: String?) : GoldenEvent
-        data class Edge(val established: Boolean, val host: String?, val generation: Long) : GoldenEvent
+        data class Edge(val established: Boolean, val host: String?, val upstreamFailover: Boolean, val generation: Long) : GoldenEvent
         data class ForegroundResume(val didReconnect: Boolean) : GoldenEvent
     }
 
@@ -89,6 +88,8 @@ class CallbackContractGoldenReplayTest {
         val edges get() = events.filterIsInstance<GoldenEvent.Edge>()
         val establishedHosts get() = edges.filter { it.established }.map { it.host!! }
         val lostCount get() = edges.count { !it.established }
+        /** `upstream_failover: true`を運ぶEstablishedの数(#175: Kotlinはその数だけupstream監視を登録する)。 */
+        val upstreamFailoverEstablishedCount get() = edges.count { it.established && it.upstreamFailover }
         /** goldenの末尾でエッジが開いたまま(最後のエッジがEstablished)か。 */
         val edgeOpenAtEnd get() = edges.lastOrNull()?.established == true
         val lastState get() = events.filterIsInstance<GoldenEvent.State>().last()
@@ -111,8 +112,9 @@ class CallbackContractGoldenReplayTest {
                 "on_connection_state_changed" ->
                     GoldenEvent.State(e.getString("state"), if (e.has("host")) e.getString("host") else null)
                 "on_connection_edge" -> when (val edge = e.getString("edge")) {
-                    "Established" -> GoldenEvent.Edge(true, e.getString("host"), e.getLong("generation"))
-                    "Lost" -> GoldenEvent.Edge(false, null, e.getLong("generation"))
+                    "Established" ->
+                        GoldenEvent.Edge(true, e.getString("host"), e.getBoolean("upstream_failover"), e.getLong("generation"))
+                    "Lost" -> GoldenEvent.Edge(false, null, false, e.getLong("generation"))
                     else -> throw AssertionError("$scenario: 未知のedge '$edge'")
                 }
                 "on_foreground_resume" -> GoldenEvent.ForegroundResume(e.getBoolean("did_reconnect"))
@@ -144,7 +146,7 @@ class CallbackContractGoldenReplayTest {
             when (event) {
                 is GoldenEvent.State -> callback.onConnectionStateChanged(event.toPublicState(golden.scenario))
                 is GoldenEvent.Edge -> callback.onConnectionEdge(
-                    if (event.established) ConnectionEdge.Established(event.host!!) else ConnectionEdge.Lost,
+                    if (event.established) ConnectionEdge.Established(event.host!!, event.upstreamFailover) else ConnectionEdge.Lost,
                     event.generation.toULong(),
                 )
                 is GoldenEvent.ForegroundResume -> callback.onForegroundResume(event.didReconnect)
@@ -188,6 +190,13 @@ class CallbackContractGoldenReplayTest {
             executor.physicalMultipathHandles[0].closeCount,
         )
 
+        // #175: upstream監視は、Rustが`upstream_failover: true`を載せたEstablishedごとに1回だけ登録する
+        // (プロファイルは有効でも、Kotlin側はエッジの値だけに従う。ミラーフラグを持たない)。
+        assertEquals(
+            "$scenario: upstream_failover: trueのEstablishedごとにupstream監視を1回登録",
+            golden.upstreamFailoverEstablishedCount,
+            executor.upstreamFailoverHandles.size,
+        )
         // upstream監視のhandleは二重closeせず、同時に開いているのは高々1つ。エッジが閉じて終わったら全て閉じている。
         executor.upstreamFailoverHandles.forEach {
             assertTrue("$scenario: ${it.label}が二重closeされた(${it.closeCount}回)", it.closeCount <= 1)
@@ -218,6 +227,7 @@ class CallbackContractGoldenReplayTest {
     @Test fun f_reconnect_loop_success() = replayAndAssertContract("f_reconnect_loop_success")
     @Test fun reconnect_gives_up() = replayAndAssertContract("reconnect_gives_up")
     @Test fun fast_reconnect_cycles() = replayAndAssertContract("fast_reconnect_cycles")
+    @Test fun upstream_failover_reconnects() = replayAndAssertContract("upstream_failover_reconnects")
 
     /** goldenディレクトリの全シナリオを上のテストがreplayしている(Rust側でシナリオを足したらここにも足す)。 */
     @Test
@@ -231,25 +241,26 @@ class CallbackContractGoldenReplayTest {
     }
 
     /**
-     * Step 13のreplayで見つかった挙動(リードへ報告済み、本PRでは直さない=テスト専用PRのため):
-     * [TerminalTabsViewModel]の`onConnectionLost`が`upstreamFailoverEnabledForCurrentSession`を
-     * falseに戻すため、Rustの自動再接続(同じ接続設定で新しい世代が`Established`、`connectPane`を通らない)の
-     * 後はupstreamフェイルオーバー監視が再登録されない。プロファイルで有効にしたupstreamフェイルオーバーが、
-     * 一度の再接続(自動再接続ループ・フォアグラウンド復帰)以降は黙って無効になる。
+     * #175(Step 13のreplayで発見): 以前は`onConnectionLost`がKotlin側のミラーフラグ
+     * `upstreamFailoverEnabledForCurrentSession`をfalseに戻していたため、Rustの自動再接続ループ・
+     * フォアグラウンド復帰(同じ接続設定で新しい世代が`Established`、`connectPane`を通らない)の後は
+     * upstreamフェイルオーバー監視が再登録されなかった。いまはRustが`Established`ごとに
+     * `upstream_failover`を載せ、Kotlinはそれをそのまま適用する。
      */
-    @Ignore(
-        "Step 13 golden replayで発見(リードへ報告済み): onConnectionLostがupstreamFailoverEnabledForCurrentSessionを" +
-            "falseに戻すため、自動再接続/フォアグラウンド復帰後のEstablishedでupstreamフェイルオーバー監視が再登録されない",
-    )
     @Test
     fun upstreamFailoverMonitor_isRegisteredForEveryEstablishedEdge_acrossAutomaticReconnects() = runBlocking {
-        val golden = load("fast_reconnect_cycles")
-        replay(golden)
+        val golden = load("upstream_failover_reconnects")
+        assertTrue("goldenの前提: 再接続を含む複数世代", golden.establishedHosts.size >= 3)
+        assertEquals("goldenの前提: 全世代がupstream_failoverを運ぶ", golden.establishedHosts.size, golden.upstreamFailoverEstablishedCount)
+        val id = replay(golden)
         assertEquals(
             "Establishedごとにupstream監視を登録するはず",
             golden.establishedHosts.size,
             executor.upstreamFailoverHandles.size,
         )
+        val open = executor.upstreamFailoverHandles.filter { !it.closed }
+        assertEquals("最後の世代のhandleだけが開いている", listOf(executor.upstreamFailoverHandles.last()), open)
+        assertSame(open.single(), tab(id).primaryPane.upstreamFailoverMonitorHandle)
     }
 
     companion object {
@@ -265,6 +276,7 @@ class CallbackContractGoldenReplayTest {
             "f_reconnect_loop_success",
             "reconnect_gives_up",
             "fast_reconnect_cycles",
+            "upstream_failover_reconnects",
         )
     }
 }

@@ -1428,7 +1428,16 @@ pub enum ConnectionPublicState {
 pub enum ConnectionEdge {
     /// 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
     /// `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
-    Established { host: String },
+    ///
+    /// `upstream_failover`(#175): この世代について、プラットフォーム側のupstream health監視
+    /// (Androidの`UpstreamHealthMonitor`。WiFiは繋がっているがupstreamが死んでいる、の検知)を
+    /// 登録すべきか。Rustが直前の接続設定(`last_connect_attempt`。自動再接続・フォアグラウンド復帰も
+    /// 同じ設定を使う)から決める: `connect_multipath_isekai_pipe_quic`で
+    /// `enable_upstream_failover = true`だった場合だけ`true`。Kotlin/Swiftはこの値をエッジごとに
+    /// そのまま適用するだけで、「今のセッションでupstream failoverが有効か」のミラーフラグを持たない
+    /// (以前はKotlin側のミラーフラグが`Lost`で下ろされたまま、`connectPane`を通らない自動再接続の
+    /// `Established`で再登録されなかった、`rust-ssot.md`)。
+    Established { host: String, upstream_failover: bool },
     /// `Established`を出した世代のセッションが`Connected`を離れた。`Established(g)`の後、
     /// 次の`Established(g'>g)`より前に正確に1回届く。
     Lost,
