@@ -1681,6 +1681,18 @@ enum RelayOutcome {
 
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
 /// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
+///
+/// **C→S は target への書き込みが進んだ分だけ `helper_committed_offset` を
+/// 進める**(cancel-safe な `write` を1回ずつ、review 2026-09-29 PIPE-03)。
+/// プリエンプション(下記)で書き込みの途中から抜けても、client は committed
+/// offset から再送するので重複も欠落も起きない。
+///
+/// **プリエンプション**(`SessionIo::preempt`, PIPE-05): `Notified` をループの
+/// 外で1つだけ作って保持し(`enable()` 済み)、中継ループの待機中だけでなく
+/// S→C/C→S の書き込み中にも `select!` する。以前は周回ごとに作り直して
+/// いたため、ゾンビ接続でまさに起きる「書き込みが flow control で詰まって
+/// いる」最中の `notify_waiters()` を取りこぼし、プリエンプションが効かな
+/// かった(`handle_resume_stream`側は1回だけ再送して拒否に倒れる)。
 /// control stream が最終的に確立しなかった場合でも、この関数自体は
 /// Phase 7 と同じ双方向コピーとして機能する（バッファへの tee はしているが
 /// 誰も参照しないだけで、実害はない。上限付きなので無制限には増えない）。
@@ -1703,6 +1715,16 @@ async fn relay_buffered(
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
     let output_space_available = session.lock().await.output_space_available.clone();
+    // A later RESUME for this same session_id wants this connection to yield
+    // (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2) — most
+    // likely because this connection is a zombie (looks established here but
+    // the peer never actually receives anything) and the later attempt is
+    // the real live one. Created once and enabled up front so a
+    // `notify_waiters()` is never lost, whatever this loop is awaiting at the
+    // time (review 2026-09-29, PIPE-05).
+    let preempted = preempt.notified();
+    tokio::pin!(preempted);
+    preempted.as_mut().enable();
 
     loop {
         let s2c_read_len = {
@@ -1720,11 +1742,29 @@ async fn relay_buffered(
             result = recv.read(&mut c2s_buf), if !c2s_done => {
                 match result {
                     Ok(n) if n > 0 => {
-                        if let Err(e) = tcp_write.write_all(&c2s_buf[..n]).await {
-                            log::warn!("relay to {target}: tcp write failed: {e}");
-                            return RelayOutcome::TcpDied;
+                        let mut written = 0;
+                        while written < n {
+                            tokio::select! {
+                                r = tcp_write.write(&c2s_buf[written..n]) => match r {
+                                    Ok(0) => {
+                                        log::warn!("relay to {target}: tcp write returned 0 bytes");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                    Ok(k) => {
+                                        written += k;
+                                        session.lock().await.helper_committed_offset += k as u64;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("relay to {target}: tcp write failed: {e}");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                },
+                                _ = &mut preempted => {
+                                    log::info!("relay to {target}: preempted (mid C->S write) by a later RESUME; parking for it");
+                                    return RelayOutcome::Preempted { tcp_read, tcp_write };
+                                }
+                            }
                         }
-                        session.lock().await.helper_committed_offset += n as u64;
                     }
                     Ok(_) => {
                         // client 側の half-close。S→C 方向はまだ継続する。
@@ -1743,14 +1783,10 @@ async fn relay_buffered(
             _ = tokio::time::sleep(Duration::from_millis(50)), if s2c_read_len == 0 => {
                 continue;
             }
-            // A later RESUME for this same session_id wants this connection
-            // to yield (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
-            // D-2) — most likely because this connection is a zombie (looks
-            // established here but the peer never actually receives
-            // anything) and the later attempt is the real live one. Give up
-            // the TCP connection the same way a dead data stream would, so
-            // `handle_resume_stream`'s waiting preemptor can grab it.
-            _ = preempt.notified() => {
+            // Give up the TCP connection the same way a dead data stream
+            // would, so `handle_resume_stream`'s waiting preemptor can grab
+            // it (see `preempted` above).
+            _ = &mut preempted => {
                 log::info!("relay to {target}: preempted by a later RESUME for the same session; parking for it");
                 return RelayOutcome::Preempted { tcp_read, tcp_write };
             }
@@ -1776,9 +1812,21 @@ async fn relay_buffered(
                             );
                             return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
                         }
-                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
-                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
-                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        tokio::select! {
+                            r = send.write_all(&s2c_buf[..n]) => {
+                                if let Err(e) = r {
+                                    log::info!("relay to {target}: data stream (S->C) write failed: {e}");
+                                    return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                                }
+                            }
+                            _ = &mut preempted => {
+                                // The bytes are already in the replay buffer
+                                // (append-first above), so the preemptor's
+                                // RESUME replays whatever this write did not
+                                // deliver.
+                                log::info!("relay to {target}: preempted (mid S->C write) by a later RESUME; parking for it");
+                                return RelayOutcome::Preempted { tcp_read, tcp_write };
+                            }
                         }
                     }
                     Err(e) => {
