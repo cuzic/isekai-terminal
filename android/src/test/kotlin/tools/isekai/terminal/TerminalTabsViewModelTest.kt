@@ -76,7 +76,7 @@ class TerminalTabsViewModelTest {
             { _, _, _ ->
                 val fake = FakeOrchestrator()
                 orchestrators.add(fake)
-                TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+                testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
             }
         // ViewModel内部のviewModelScope.launch(ioDispatcher)にも同じtestScheduler駆動の
         // ディスパッチャーを使わせ、テストの仮想時間と実スレッドの完了タイミングが競合して
@@ -133,7 +133,7 @@ class TerminalTabsViewModelTest {
         val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, ConnectionProfile) -> TerminalSession = { _, _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
-            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+            testTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
         return TerminalTabsViewModel(
             app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore, freshnessPolicy, batteryGuidancePolicy,
@@ -606,6 +606,30 @@ class TerminalTabsViewModelTest {
 
         assertTrue(orchestrators[0].connectIsekaiLinkRelayCalled)
         assertFalse(orchestrators[0].connectCalled)
+    }
+
+    /** docs/adr/0019-functional-core-effects.md §6 Step 8a′: 接続エッジはRustの`onConnectionEdge`から
+     *  届いた順に(無制限バッファで)処理される。`StateFlow`のconflationで`Connected→Reconnecting→
+     *  Connected`を取りこぼしえた旧実装(`prevConnected`)と違い、収集より速く遷移しても
+     *  Established/Lost/Established の3件すべてに対応する処理が走る。 */
+    @Test
+    fun connectionEdges_rapidReconnect_runsEveryEdgeWithoutConflation() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+
+        orchestrators[0].simulateConnected("host-a")
+        orchestrators[0].simulateReconnecting()
+        orchestrators[0].simulateConnected("host-a")
+
+        withTimeout(3000) { while (executor.connectedHosts.size < 2) delay(10) }
+        withTimeout(3000) { while (executor.disconnectedCount < 1) delay(10) }
+        assertEquals(listOf("host-a", "host-a"), executor.connectedHosts)
+        assertEquals(1, executor.disconnectedCount)
+        assertEquals(
+            listOf(1uL, 1uL, 2uL),
+            orchestrators[0].connectionEdges.map { it.second },
+        )
+        assertTrue(tab(id).primaryPane.session.state.value.connected)
     }
 
     @Test

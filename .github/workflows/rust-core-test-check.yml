@@ -350,6 +350,14 @@ jobs:
         working-directory: rust-core
         run: cargo clippy --workspace --lib --bins -- -A clippy::all
 
+      # docs/adr/0020-unwired-callback-detection.md Phase 3: isekai-terminal-coreの新規dead_codeを禁止する。
+      # 意図的に残す未配線項目は`#[allow(dead_code)] // UNWIRED: <参照>`で明示すること
+      # (テスト専用はcfg(test)、本当に死んだものは削除)。crate単位(-p)なので
+      # isekai-ssh(cfg(windows)依存で単一プラットフォームdeny不可)・vendor crateには効かない。
+      - name: cargo clippy (isekai-terminal-core, deny dead_code)
+        working-directory: rust-core
+        run: cargo clippy -p isekai-terminal-core --lib -- -A clippy::all -D dead_code
+
       - name: Save cargo cache (rust-core, main only)
         if: success() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -363,7 +371,9 @@ jobs:
 
   test-macos:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
+    # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-macos`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
@@ -441,7 +451,9 @@ jobs:
 
   test-windows:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
+    # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-windows`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を

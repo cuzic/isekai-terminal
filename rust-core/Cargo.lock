@@ -1948,6 +1948,7 @@ dependencies = [
  "log",
  "openssh-config",
  "osc-color",
+ "proptest",
  "rand 0.8.6",
  "rpassword",
  "russh",

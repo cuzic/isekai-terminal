@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod admission_race_tests;
 mod attach_arbiter;
 mod attach_runtime;
 mod resume;
@@ -1016,57 +1018,6 @@ async fn reject_attach(send: &mut AnyByteStreamWriteHalf, reason: AttachRejectRe
     reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
 }
 
-/// Epic N-5 admission control. `AttachArbiter` used to hold a single global
-/// fencing slot per target (Epic N-4's world): a brand-new `session_id`
-/// could be blocked by whatever *other* session_id was occupying that slot,
-/// and `hello_with_parked_preemption` (this function's predecessor) existed
-/// to preempt that occupant if it turned out to be merely parked rather
-/// than actively relaying. Now that `AttachArbiter` hands out one
-/// independent slot per `session_id` (`attach_arbiter.rs`'s module docs), a
-/// genuinely new session_id is never blocked by another session's state at
-/// all — that whole preemption dance no longer has anything to preempt.
-///
-/// What still needs bounding is the *number* of concurrent slots.
-/// The session index already enforces `--max-sessions` (Phase S-4b) via
-/// LRU-eviction of the oldest parked session, but only once a new session
-/// has already gone all the way through the ATTACH handshake and connected
-/// to `target` (the `Activated` transition, near the end of
-/// `handle_attach_stream`). Left alone, that would let unbounded concurrent
-/// target TCP connects/handshakes pile up before the cap ever bites, since
-/// `AttachArbiter` itself has no notion of "parked" vs "actively relying"
-/// (only the session index tracks that) and so cannot police its own capacity.
-/// This runs the same evict-oldest-parked-else-reject policy *before*
-/// `attach_runtime.hello()` even starts a target connect, for any
-/// `session_id` the arbiter doesn't already know about — a retransmit or
-/// reattach of a session already holding a slot always passes through
-/// untouched.
-///
-/// The check-then-act between `session_count()` and the eviction below
-/// (two concurrent new sessions may both pass, max+1) is deliberately left
-/// as-is here: fixing it is docs/adr/0019-functional-core-effects.md Step 2b.
-///
-/// Reuses `AttachRejectReason::BusyOtherSession` for the "genuinely full,
-/// nothing to evict" case rather than adding a new wire reason — every
-/// tracked session is actively relaying, so the client's existing 180s
-/// `retry_while_busy_other_session` backoff (`resume_loop.rs`) remains a
-/// sensible response ("come back once something frees up").
-async fn admit_new_session(
-    attach_runtime: &Arc<AttachRuntime>,
-    session_id: isekai_protocol::SessionId,
-) -> Result<(), AttachRejectReason> {
-    if attach_runtime.has_session(session_id).await
-        || attach_runtime.session_count().await < attach_runtime.max_sessions().await
-    {
-        return Ok(());
-    }
-    // 立ち退き(indexからの除去・parked TCPのclose・fencing slotの解放)は
-    // 集約の1回のapplyで行われる(旧: `claim_oldest_parked` + `release_slot_for`)。
-    match attach_runtime.evict_oldest_parked().await {
-        Some(_evicted_id) => Ok(()),
-        None => Err(AttachRejectReason::BusyOtherSession),
-    }
-}
-
 /// `EstablishedLease`と対になる、session index側エントリのRAIIガード。
 ///
 /// 通常の後始末(`TcpDied`での`relay_ended`、または`DataStreamDied`/`Preempted`での
@@ -1167,10 +1118,13 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
-    if let Err(reason) = admit_new_session(&attach_runtime, hello.session_id).await {
-        reject_attach(&mut send, reason).await;
-        return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
-    }
+    // `hello()`は`--max-sessions`のadmission(Epic N-5: 既知のsession_idは素通し、新規は空きが
+    // あれば確保・満杯なら最古parkedを立ち退かせて確保・それも無ければ`BusyOtherSession`)と
+    // fencing slotの確保を**集約の1回のapply**で行う(docs/adr/0019-functional-core-effects.md Step 2b)。
+    // 旧`admit_new_session`は判定とslot確保の間でロックを手放していたため、同時に来た新規
+    // session 2本が両方とも判定を通りmax+1になり得た。`BusyOtherSession`を新しいwire reasonに
+    // しないのは、全sessionがactiveに中継中なので、クライアントの既存の180秒
+    // `retry_while_busy_other_session`(`resume_loop.rs`)が妥当な応答だから(従来どおり)。
     // `lease`(この`HelloOutcome::Ready`が返すもの)自体はここでは使わない —
     // `attach_runtime.activate()`は`key`から`PendingActivation`状態を引く
     // ので不要。実際に使う`EstablishedLease`は下で`activate()`の戻り値から
@@ -1368,6 +1322,15 @@ async fn handle_resume_stream(
             hex_lower(&session_id)
         ));
     };
+    // grant直後(=indexエントリがactiveかつslotが`Established`になった瞬間)にRAIIガードを
+    // 作る(Step 2a follow-up、レビューH-1)。ここから下の`handle.lock()`・`replay_from`・
+    // `respond_resume_accepted`等でpanicしても、Dropが`RelayTerminated{GuardDropped}`を
+    // このincarnationのleaseで送り、indexエントリとslotを1遷移で解放する(以前はこの区間に
+    // ガードが無く、panicするとactiveのまま誰にもsweep/立ち退きされず恒久リークした —
+    // `.claude/rules/always-connects.md`のリーク類型)。正常な早期return(OffsetGone/
+    // RESUME_ACK書き込み失敗)はslotを`Established`のまま維持したいので、`park`完了後に
+    // `disarm()`する(`finish_or_park_session`と同じ順序)。
+    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id, lease_id);
 
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
         let session = handle.lock().await;
@@ -1380,6 +1343,7 @@ async fn handle_resume_stream(
     };
     let Some(replay_bytes) = replay_bytes else {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
+        table_guard.disarm();
         quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::OffsetGone).await;
         return Err(anyhow!(
             "requested offset {client_delivered_offset} no longer in output buffer for session {}",
@@ -1397,20 +1361,14 @@ async fn handle_resume_stream(
 
     if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
+        table_guard.disarm();
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
     }
 
-    // ここでようやくRAIIガードを作る — この行より前にある`park`+早期return
-    // 経路(UnknownToken/OffsetGone/RESUME_ACK書き込み失敗)はいずれも
-    // 「slotを`Established`のまま維持したい」正常系であり、ガードをここより
-    // 前で作ると、それらの正常な早期returnのたびにDropが誤ってslotを
-    // 解放してしまう(`EstablishedLease`/`AttachRuntime::resumed_lease`docs参照)。
+    // `EstablishedLease`は従来どおりここで作る(`AttachRuntime::resumed_lease`docs参照)。
+    // grantからここまでの区間のpanicは上の`table_guard`が覆う(Dropの`GuardDropped`は
+    // indexエントリの除去とslot解放を同じ遷移で行う)。
     let lease = attach_runtime.resumed_lease(lease_id);
-    // `ResumeGranted`によって、このsession_idのindexエントリは既に「parkされていない」
-    // 状態に戻っている。ここから`finish_or_park_session`が outcome を解決する
-    // までの間にタスクがpanicすると、`EstablishedLease`と全く同じ理由で
-    // このエントリも孤児化する(`SessionTableEntryGuard`docs参照)。
-    let table_guard = SessionTableEntryGuard::new(attach_runtime.clone(), session_id, lease_id);
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、

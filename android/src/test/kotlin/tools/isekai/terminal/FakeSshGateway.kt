@@ -25,6 +25,36 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     // 判断（切断する/無視する）を Rust 側の実装に合わせてここで再現する。
     private enum class Phase { IDLE, CONNECTING, CONNECTED }
     private var phase = Phase.IDLE
+
+    // docs/adr/0019-functional-core-effects.md §6 Step 8a′: 実 Rust 側(`reconnect_fsm.rs`)の接続エッジ
+    // (`onConnectionEdge`)を模した最小限の状態。本番の Kotlin 側はエッジを自前で検出しないため、
+    // Connected/切断を模す simulate* はここで Rust と同じ契約のエッジも発火する:
+    // 各世代について Established は高々1回、Connected を離れる遷移(切断・Reconnecting・
+    // Connected 中の connect*)で同じ世代の Lost を正確に1回。
+    var generation: ULong = 0u
+        private set
+    private var edgeOpen = false
+    private var lastEstablished: ULong? = null
+    val connectionEdges = mutableListOf<Pair<ConnectionEdge, ULong>>()
+
+    private fun emitEdge(edge: ConnectionEdge) {
+        connectionEdges.add(edge to generation)
+        callback!!.onConnectionEdge(edge, generation)
+    }
+
+    /** Connected を離れる遷移(Rust の `ReconnectState::set_phase`)。 */
+    private fun closeEdge() {
+        if (edgeOpen) {
+            edgeOpen = false
+            emitEdge(ConnectionEdge.Lost)
+        }
+    }
+
+    /** `begin_connect`: Connected 中なら旧世代の Lost を出してから新しい世代を作る。 */
+    private fun beginSession() {
+        closeEdge()
+        generation++
+    }
     val sentBytes = mutableListOf<ByteArray>()
     var lastResizeCols: UInt? = null
     var lastResizeRows: UInt? = null
@@ -39,6 +69,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     @Throws(SshException::class)
     override fun connect(config: SshConfig) {
         connectCalled = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -47,6 +78,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectQuic(config: QuicConfig) {
         connectQuicCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -55,6 +87,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig) {
         connectIsekaiPipeQuicCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -63,6 +96,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig) {
         connectIsekaiPipeQuicAutoCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -71,6 +105,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) {
         connectMultipathIsekaiPipeQuicCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -79,6 +114,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) {
         connectIsekaiStunP2pCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -87,6 +123,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) {
         connectIsekaiLinkRelayCalled = true
         quic = true
+        beginSession()
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
@@ -156,6 +193,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {
                 disconnectCalled = true
+                closeEdge()
                 phase = Phase.IDLE
                 callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected("network lost", null))
             }
@@ -235,17 +273,28 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     // ── Simulation helpers ───────────────────────────────────────────
 
+    /** Connected の公開の後に Established を出す(Rust の `on_connected` と同じ順)。切断後に
+     *  再度呼ばれた場合は、Rust の再接続ループの試行(`connect_via`)が新しい世代のセッションを
+     *  作って成功したものとして世代を進める。 */
     fun simulateConnected(host: String = "test.host"): Unit {
+        if (!edgeOpen && lastEstablished == generation) generation++
         phase = Phase.CONNECTED
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connected(host))
+        if (!edgeOpen) {
+            edgeOpen = true
+            lastEstablished = generation
+            emitEdge(ConnectionEdge.Established(host))
+        }
     }
 
     fun simulateDisconnected(reason: String? = null): Unit {
+        closeEdge()
         phase = Phase.IDLE
         callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason, null))
     }
 
     fun simulateReconnecting(elapsedSecs: UInt = 0u, timeoutSecs: UInt = 60u, reason: String? = null): Unit {
+        closeEdge()
         phase = Phase.IDLE
         callback!!.onConnectionStateChanged(ConnectionPublicState.Reconnecting(elapsedSecs, timeoutSecs, reason))
     }

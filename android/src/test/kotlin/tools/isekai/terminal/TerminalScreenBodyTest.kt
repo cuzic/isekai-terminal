@@ -30,25 +30,7 @@ import uniffi.isekai_terminal_core.ScreenUpdate
 class TerminalScreenBodyTest {
     @get:Rule val composeTestRule = createComposeRule()
 
-    private val noopActions = TerminalScreenActions(
-        onConnect = {},
-        onDisconnect = {},
-        onBack = {},
-        onSend = {},
-        onResize = { _, _ -> },
-        onScrollbackCells = { _, _ -> null },
-        onTrustUpdatedHostKey = {},
-        onDismissHostKeyWarning = {},
-        onTrustNewHostKey = {},
-        onDismissNewHostKeyPrompt = {},
-        onTrzszStartUpload = {},
-        onTrzszStartDownload = {},
-        onTrzszCancel = {},
-        onTrzszDismiss = {},
-        onGetSessionLog = { "" },
-        onSendSnippet = {},
-        onRespondAgentSignRequest = {},
-    )
+    private val noopActions = noopTerminalScreenActions()
 
     private fun setScreen(uiState: TerminalUiState, hasFocus: Boolean) {
         composeTestRule.setContent {

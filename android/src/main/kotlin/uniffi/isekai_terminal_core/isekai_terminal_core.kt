@@ -683,6 +683,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod17 : com.sun
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod18 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`didReconnect`: Byte,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod19 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`edge`: RustBuffer.ByValue,`generation`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -721,7 +724,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onNotify", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult", "onForegroundResume")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onNotify", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult", "onForegroundResume", "onConnectionEdge")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -744,6 +747,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
     @JvmField internal var `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod17? = null,
     @JvmField internal var `onForegroundResume`: UniffiCallbackInterfaceOrchestratorCallbackMethod18? = null,
+    @JvmField internal var `onConnectionEdge`: UniffiCallbackInterfaceOrchestratorCallbackMethod19? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -767,7 +771,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
         `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod17? = null,
         `onForegroundResume`: UniffiCallbackInterfaceOrchestratorCallbackMethod18? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onNotify`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,`onForegroundResume`,), Structure.ByValue
+        `onConnectionEdge`: UniffiCallbackInterfaceOrchestratorCallbackMethod19? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onNotify`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,`onForegroundResume`,`onConnectionEdge`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -791,6 +796,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onPromptOutputCopyReady` = other.`onPromptOutputCopyReady`
         `onFilePreviewResult` = other.`onFilePreviewResult`
         `onForegroundResume` = other.`onForegroundResume`
+        `onConnectionEdge` = other.`onConnectionEdge`
     }
 
 }
@@ -1002,6 +1008,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge(
     ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
@@ -1586,6 +1594,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 42589) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 39423) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -6374,6 +6385,93 @@ public object FfiConverterTypeClipboardMimeKind: FfiConverterRustBuffer<Clipboar
 
 
 /**
+ * `OrchestratorCallback::on_connection_edge`で通知する接続エッジ
+ * (docs/adr/0019-functional-core-effects.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
+ * 変化からエッジを自前で検出せず(`StateFlow`のconflationで`Connected→Reconnecting→Connected`
+ * を取りこぼしうる)、これを受け取ったら接続/切断に伴う既存の処理を呼ぶだけにする(`rust-ssot.md`)。
+ */
+sealed class ConnectionEdge {
+    
+    /**
+     * 世代`generation`のセッションが`Connected`になった(各世代について高々1回)。
+     * `host`は同じタイミングで公開した`ConnectionPublicState::Connected{host}`と同じ値。
+     */
+    data class Established(
+        val `host`: kotlin.String) : ConnectionEdge()
+        
+    {
+        
+
+        companion object
+    }
+    
+    /**
+     * `Established`を出した世代のセッションが`Connected`を離れた。`Established(g)`の後、
+     * 次の`Established(g'>g)`より前に正確に1回届く。
+     */
+    object Lost : ConnectionEdge()
+    
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeConnectionEdge : FfiConverterRustBuffer<ConnectionEdge>{
+    override fun read(buf: ByteBuffer): ConnectionEdge {
+        return when(buf.getInt()) {
+            1 -> ConnectionEdge.Established(
+                FfiConverterString.read(buf),
+                )
+            2 -> ConnectionEdge.Lost
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: ConnectionEdge) = when(value) {
+        is ConnectionEdge.Established -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`host`)
+            )
+        }
+        is ConnectionEdge.Lost -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: ConnectionEdge, buf: ByteBuffer) {
+        when(value) {
+            is ConnectionEdge.Established -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`host`, buf)
+                Unit
+            }
+            is ConnectionEdge.Lost -> {
+                buf.putInt(2)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
  * #19: 接続失敗の原因をユーザーが自己解決しやすくするための追加ヒント。
  * 判断材料(接続先アドレスの種別等)はRust側(`orchestrator.rs`)に閉じており、
  * Kotlin/Swiftは届いたヒントに応じた案内UIを出すだけでよい(`rust-ssot.md`)。
@@ -8527,6 +8625,21 @@ public interface OrchestratorCallback {
      */
     fun `onForegroundResume`(`didReconnect`: kotlin.Boolean)
     
+    /**
+     * docs/adr/0019-functional-core-effects.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
+     * 世代(`generation`=`session_generation`)付きの接続エッジ。実装は受け取ったら接続/切断に伴う
+     * 既存の処理(upstream監視の登録/解除・tmuxウィンドウensure等)を呼ぶだけにし、重複排除や
+     * エッジ判定を自前で行わない(`rust-ssot.md`)。
+     *
+     * 保証: 各`generation`について`Established`は高々1回で、その後`Established(g'>g)`より前に
+     * `Lost(generation)`が正確に1回届く(予期しない切断・network-lost・ユーザー切断・Connected中の
+     * 手動`connect_*`・フォアグラウンド復帰の再接続のいずれの経路でも)。`Established`は同じ呼び出し
+     * 箇所から`on_connection_state_changed(Connected)`の**後**に届く。`Lost`は、それを起こした遷移の
+     * 状態公開(`Disconnected`/`Connecting`)と同じ呼び出し箇所から**前**に届く(自動再接続ループの
+     * `Reconnecting`は別スレッドから公開されるので、それとの順序は保証しない)。
+     */
+    fun `onConnectionEdge`(`edge`: ConnectionEdge, `generation`: kotlin.ULong)
+    
     companion object
 }
 
@@ -8763,6 +8876,19 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onConnectionEdge`: UniffiCallbackInterfaceOrchestratorCallbackMethod19 {
+        override fun callback(`uniffiHandle`: Long,`edge`: RustBuffer.ByValue,`generation`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onConnectionEdge`(
+                    FfiConverterTypeConnectionEdge.lift(`edge`),
+                    FfiConverterULong.lift(`generation`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -8798,6 +8924,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onPromptOutputCopyReady`,
         `onFilePreviewResult`,
         `onForegroundResume`,
+        `onConnectionEdge`,
     )
 
     // Registers the foreign callback with the Rust side.

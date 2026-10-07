@@ -60,6 +60,7 @@ pub(crate) enum TransportCommand {
         bind_port: u16,
     },
     /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
+    #[allow(dead_code)] // UNWIRED: 送信側(SshSession/ActiveSession::remove_forward)はe8ed36ee(2026-08-09)で削除済み。ハンドラ側の残骸
     RemoveForward { id: String },
     /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには一切触れず、同じ
     /// 認証済み`client::Handle`上に新しい"exec"チャネルを1本開いて短命なコマンドを
@@ -2287,6 +2288,7 @@ mod pooling_e2e_tests {
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
         fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
         fn on_foreground_resume(&self, _did_reconnect: bool) {}
+        fn on_connection_edge(&self, _edge: crate::ConnectionEdge, _generation: u64) {}
     }
 
     /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで

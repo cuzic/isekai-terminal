@@ -21,9 +21,21 @@
 - サーバー側(`isekai-pipe serve`)の状態リーク(例: `AttachArbiter`のfencing slotが
   解放されないまま残る)は、クライアント側の再試行では原理的に回復できない。新しい
   session/lease/park状態を`isekai-pipe/src/engine/`に追加するときは、そのsessionが
-  どんな経路で破棄・立ち退き・タイムアウトしても、対応する`AttachRuntime::relay_ended`
-  が必ず呼ばれることを確認する(`SessionTable::sweep_expired_parked`と`insert_existing`
-  の両方が過去にこれを一度ずつ怠っていた——同じ見落としを繰り返さないこと)。
+  どんな経路で破棄・立ち退き・タイムアウトしても、fencing slotが必ず解放されることを
+  確認する。Step 2a(PR #146)以降、session indexとfencing(`AttachArbiter`)は
+  単一集約`serve_fsm::ServeAggregate`の1つの値になっており、**indexからの除去は
+  `ServeAggregate::discard`だけ**が行い、同じ遷移でarbiterへ`RelayEnded`を送って
+  slotを解放する(`ServeEffect::Discard`を返し、shell側の唯一の解釈は
+  `attach_runtime.rs::interpret_in_lock`→`discard_io`)。新しい破棄理由は、shellで
+  `relay_ended`を呼び足すのではなく、新しい`DiscardCause`(+それを起こすEvent)として
+  reducerに追加し、`serve_fsm.rs`のproptest(I-a〜I-j・Sweep完全性・到達カバレッジ)で
+  検証すること。旧`SessionTable::sweep_expired_parked`と`insert_existing`は、shell側で
+  `relay_ended`を呼ぶ方式だったため一度ずつこれを怠っていた——その反省からの構造。
+  - shell側のタスクがRAIIガードを持たない区間(panic・早期returnでDropだけが走る区間)
+    を作らないこと: slotを`Established`にした/維持した瞬間から後始末まで、
+    `EstablishedLease`か`SessionTableEntryGuard`(Dropで`RelayTerminated{GuardDropped}`)
+    のどちらかが必ず生きていること(`handle_resume_stream`はRESUME許可直後から
+    `SessionTableEntryGuard`を張る、Step 2a follow-up)。
 - 唯一の例外: 本質的に自動化できないケース。新規(未登録)ホストの初回TOFU確認、
   `isekai-ssh login`のトークン失効、既知ホストのSSHホスト鍵ローテーション/再生成後の
   pinning mismatchは対象外。ホスト鍵mismatchはMITMと正当な再デプロイを機械的に区別
@@ -68,10 +80,16 @@
 - `isekai-pipe/src/connect.rs`: `write_connect_outcome_for_wrapper`
 - `isekai-ssh/src/wrapper.rs`: `run_ssh_with_connect_failure_recovery`,
   `decide_connect_failure_recovery`, `outcome_summary`
-- `isekai-pipe/src/engine/resume.rs`: `SessionTable::sweep_expired_parked`,
-  `SessionTable::insert_existing`(どちらも`InsertOutcome`/破棄した`SessionId`一覧を
-  返し、呼び出し元[`isekai-pipe/src/engine/mod.rs`]が`AttachRuntime::relay_ended`で
-  fencing slotを解放する)
+- `isekai-pipe/src/engine/serve_fsm.rs`: `ServeAggregate::discard`(唯一の除去経路、
+  slot解放と同一遷移)、`DiscardCause`(`Expired`/`Evicted`/`TcpDied`/`GuardDropped`/
+  `Unresumable`)、`ServeEvent::Sweep`/`EvictOldestParked`/`Activated`(LRU立ち退き)
+- `isekai-pipe/src/engine/attach_runtime.rs`: `interpret_in_lock`(`ServeEffect::Discard`
+  の唯一の解釈→`discard_io`)、`sweep_expired_parked`/`evict_oldest_parked`/`park`/
+  `resume_request`(孤児は`RelayTerminated{GuardDropped}`で後続apply破棄)、
+  `EstablishedLease`(DropでRelayEndedを送るRAIIバックストップ)
+- `isekai-pipe/src/engine/mod.rs`: `SessionTableEntryGuard`(Dropで
+  `RelayTerminated{GuardDropped}`を送るRAIIバックストップ)、`handle_resume_stream`/
+  `finish_or_park_session`
 - `ISEKAI_PIPE_DESIGN.md` §8 Epic N / Epic N-2
 - `isekai-trust/src/host_key_verifier.rs`: `FileBackedHostKeyVerifier`(既知一致は
   サイレント通過、mismatchはサイレント拒否、未知のみ`confirm_new_host`を呼ぶ)

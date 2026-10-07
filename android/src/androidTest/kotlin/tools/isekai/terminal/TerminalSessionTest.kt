@@ -23,6 +23,25 @@ import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
 
 /**
+ * 本番の[TerminalSession]は注入lambdaの既定no-opを持たない(`docs/adr/0020-unwired-callback-detection.md` §3(g))ので、
+ * 注入lambdaを使わないこのテストでは明示的にno-opを渡す。
+ */
+private fun noopLambdaTerminalSession(
+    hostKeyChecker: tools.isekai.terminal.session.HostKeyChecker,
+    orchestratorFactory: (uniffi.isekai_terminal_core.OrchestratorCallback) -> uniffi.isekai_terminal_core.SessionOrchestratorInterface,
+): TerminalSession = TerminalSession(
+    hostKeyChecker,
+    orchestratorFactory = orchestratorFactory,
+    onClipboardWriteRequested = {},
+    onClipboardPullRequested = { null },
+    acquireWifiFd = { null },
+    acquireCellularFd = { null },
+    onBell = {},
+    onNotify = { _, _, _ -> },
+    onNotifyRequested = {},
+)
+
+/**
  * TerminalSession の動作テスト。
  * FakeOrchestrator / FakeHostKeyChecker を使い、Rust/Android 依存なしで動作を検証。
  */
@@ -37,7 +56,7 @@ class TerminalSessionTest {
     fun setup() {
         fakeOrchestrator = FakeOrchestrator()
         fakeHostKeyChecker = FakeHostKeyChecker()
-        session = TerminalSession(fakeHostKeyChecker, orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
+        session = noopLambdaTerminalSession(fakeHostKeyChecker, orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
     }
 
     @After
@@ -265,7 +284,7 @@ class TerminalSessionTest {
             )
         )
         val fakeOrc2 = FakeOrchestrator()
-        val s = TerminalSession(changedChecker, orchestratorFactory = { cb -> fakeOrc2.also { it.callback = cb } })
+        val s = noopLambdaTerminalSession(changedChecker, orchestratorFactory = { cb -> fakeOrc2.also { it.callback = cb } })
         s.connect(testConfig())
         val result = fakeOrc2.simulateHostKey(fingerprint = "new-fp")
         assertFalse(result)
@@ -696,7 +715,7 @@ class TerminalSessionTest {
 
         // 再接続（新しいセッションインスタンスで）
         val newOrchestrator = FakeOrchestrator()
-        val s = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> newOrchestrator.also { it.callback = cb } })
+        val s = noopLambdaTerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> newOrchestrator.also { it.callback = cb } })
         s.connect(testConfig())
         newOrchestrator.simulateConnected()
         withTimeout(3000) { s.state.first { it.connected } }

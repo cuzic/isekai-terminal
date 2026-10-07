@@ -1196,7 +1196,21 @@ rev6で、Step 5は昇格(3aの後)、Step 7はStep 6へ統合、3b/3cのうち`
 
 | Step | 内容 | 再評価の判断材料 |
 |---|---|---|
-| 3b/3c(残り) | 再接続ループのtick会計(`elapsed`/`tick_count`による`due`の計算)・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと、`pending_wake`を含めた3aのproptestの後に、tick会計まわりの未検証インターリーブや不具合が実際に残っているか |
+| 3b/3c(残り) | 再接続ループのtick会計(`elapsed`/`tick_count`による`due`の計算)・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと、`pending_wake`を含めた3aのproptestの後に、tick会計まわりの未検証インターリーブや不具合が実際に残っているか。**(実施済み、下の注記)** |
+
+**Step 3b/3cの実施記録(リード判断で着手)**: tick会計・`due`・`woke_early`分岐・タイムアウトのギブアップ・`cancel_reconnect`・
+ループ起動失敗(3aレビューm2)を`ReconnectState::apply`へ移した(`LoopStarted`/`ReconnectTick{epoch, policy}`/`ReconnectWake{epoch, policy}`/
+`CancelReconnect`/`LoopStartAborted`、ループのタイマーは§2.2-1の`ArmLoopTimer{epoch, after}`)。挙動は旧ループと同じで(旧ループを書き写した
+参照モデルとのproptestで固定)、ADRが割り当てた変更は2点だけ: (1)ギブアップで`reconnect_epoch`を進める(3aレビューm5)。(2)状態公開と接続エッジを
+applyと同じ臨界区間で配信待ちの列に積み、1スレッドずつ順に配信する(Step 8a′レビューL-1。§2.4-4の「汎用の連番publisherは導入しない」の
+例外として、orchestratorの`on_connection_state_changed`/`on_connection_edge`だけに限定。逆転`Lost(g)`→`Established(g)`はエッジが
+自己修正しないため実害ありと判断)。8a′レビューの残り: L-2(`phase`をreducerの外から書けない型にした)、L-3(orchestratorの破棄で`Lost`を
+出さないことを`reconnect_fsm.rs`に明記。破棄はphase遷移ではなく、Kotlinは購読を止めてから自分でハンドルを閉じる)、
+**L-4は追跡中のfollow-up(挙動は変えていない)**: フォアグラウンド復帰の再接続(`connect_via`)で`Lost`→`Established(g+1)`が出るようになった結果、
+Kotlinの`onConnectionLost`がupstream failover監視を閉じて`upstreamFailoverEnabledForCurrentSession`を下ろし、再登録は`connectPane`だけが行うため、
+`enableUpstreamFailover`のマルチパスプロファイルでは復帰後に監視が再登録されない(自動再接続ループ経路では以前から同じ)。
+`physicalMultipathHandle`の非同期closeと`connect_via`がcloneした`wifi_fd`/`cellular_fd`の再利用の競合も同じ経路の既存問題。
+「同じ手動接続の再接続をまたいでfailoverフラグを保つ」「自動再接続時のfd所有権」を別Issueで決める(実験的・既定OFF機能)。
 | 8b | `TerminalSession.kt`のUI状態のreducer化(§6 Step 8b) | UI状態(`_state.update`22箇所)由来の不具合が観測されたか。行う場合は8a′ → 8bの依存と、13の後に行う推奨順序に従う |
 
 ---

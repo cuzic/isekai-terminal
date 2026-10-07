@@ -42,8 +42,6 @@ pub enum BootstrapError {
     UnsupportedArch(String),
     #[error("failed to upload isekai-helper binary: {0}")]
     Upload(String),
-    #[error("failed to launch isekai-helper: {0}")]
-    Launch(String),
     #[error("handshake not received within timeout")]
     HandshakeTimeout,
     #[error("failed to parse handshake JSON: {0}")]

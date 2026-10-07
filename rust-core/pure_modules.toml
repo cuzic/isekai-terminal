@@ -20,6 +20,12 @@ package = "isekai-pipe"
 file = "isekai-pipe/src/engine/serve_fsm.rs"
 module = "engine::serve_fsm"
 
+# Step 5: isekai-pipe connectのresume判断(ResumePlanner、BUSY_OTHER_SESSIONの再試行期限)。
+[[module]]
+package = "isekai-pipe"
+file = "isekai-pipe/src/resume_fsm.rs"
+module = "resume_fsm"
+
 [[module]]
 package = "isekai-terminal-core"
 file = "src/rebind_manager.rs"
@@ -29,6 +35,12 @@ module = "rebind_manager"
 package = "isekai-terminal-core"
 file = "src/trzsz.rs"
 module = "trzsz"
+
+# Step 4: pool.rsのrefcount/アイドル削除タイマー判断(token付きArmIdleTimer/IdleExpired)。
+[[module]]
+package = "isekai-terminal-core"
+file = "src/pool_idle_fsm.rs"
+module = "pool_idle_fsm"
 
 [[module]]
 package = "isekai-terminal-core"
@@ -44,6 +56,18 @@ module = "background_reliability_policy"
 package = "isekai-transport"
 file = "isekai-transport/src/path_health_fsm.rs"
 module = "path_health_fsm"
+
+# Step 6+7: isekai-sshの接続失敗回復ループ(Unix wrapper.rs / Windows native::connect共通)の
+# 純粋reducerと、その会計(RedeployGate/RecoveryBudget/backoff定数)。
+[[module]]
+package = "isekai-ssh"
+file = "isekai-ssh/src/connect_recovery_fsm.rs"
+module = "connect_recovery_fsm"
+
+[[module]]
+package = "isekai-ssh"
+file = "isekai-ssh/src/reconnect_backoff.rs"
+module = "reconnect_backoff"
 
 # ADR §6 Step 3a: orchestratorの自動再接続判断(`ReconnectState::apply`)。
 [[module]]
@@ -79,6 +103,14 @@ allow = [
     "std::rc::Rc",
     # 項目単位の外部許可(ADR §6 Step 0 / Q10): 統計値の値型
     "noq::PathStats",
+    # Step 6+7: 値型(serde enum)。isekai_pipe_core自体はファイルI/Oを含むので項目単位で許可
+    "isekai_pipe_core::ConnectOutcomeClass",
+    # Step 6+7: `BackoffPolicy::next_delay(attempt, seed)`はseed付きStdRngの純粋関数
+    "isekai_transport::backoff::BackoffPolicy",
+    # Step 5(resume_fsm.rs): 純粋な値・関数の項目単位許可
+    "isekai_transport::BackoffPolicy",                      # 純粋なbackoff計算(RNGはseedで注入、Step 6)
+    "isekai_transport::resume::TRANSPORT_STEP_TIMEOUT",     # 定数(CROSS_FAMILY_MIN_PROBE_BUDGETの導出元)
+    "isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS",          # 定数(既定のresume window)
 ]
 # allowより優先して拒否する(時計/タスク実行を持つサブモジュール)
 deny = [
@@ -124,8 +156,42 @@ file = "isekai-pipe/src/engine/attach_runtime.rs"
 fn = "interpret_in_lock"
 effect = "ServeEffect"
 
+# Step 6+7: isekai-ssh接続失敗回復のshell(Unix/Windows native共通)。
+[[interpreter]]
+file = "isekai-ssh/src/connect_recovery_driver.rs"
+fn = "drive_connect_recovery"
+effect = "RecoveryEffect"
+
 # ADR §6 Step 3a: orchestratorの再接続Effect interpreter。
 [[interpreter]]
 file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
 effect = "ReconnectEffect"
+
+# Step 3b/3c(PR #167レビューL-1): 状態公開・接続エッジをapplyと同じ臨界区間で配信待ちの列に積むin-lock interpreter。
+[[interpreter]]
+file = "src/orchestrator.rs"
+fn = "stage_publications"
+effect = "ReconnectEffect"
+
+# Step 5: ResumePlanner(resume_fsm.rs)のResumeCmdを解釈するshell。
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "resume_with_backoff_until_deadline"
+effect = "ResumeCmd"
+
+[[interpreter]]
+file = "isekai-pipe/src/resume_loop.rs"
+fn = "interpret_tick_cmds"
+effect = "ResumeCmd"
+
+# Step 4: pool.rsのアイドルタイマーinterpreter(ロック内: Remove実行 / ロック外: ArmIdleTimerのspawn)。
+[[interpreter]]
+file = "src/pool.rs"
+fn = "apply_idle_in_lock"
+effect = "IdleEffect"
+
+[[interpreter]]
+file = "src/pool.rs"
+fn = "run_pool_effects"
+effect = "PoolEffect"

@@ -1,9 +1,6 @@
 package tools.isekai.terminal.session
 
 import tools.isekai.terminal.AiPanelUiState
-import tools.isekai.terminal.HostKeyChangedWarning
-import tools.isekai.terminal.PromptJumpResult
-import tools.isekai.terminal.PromptOutputCopyResult
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import tools.isekai.terminal.util.RemoteLogger
@@ -14,12 +11,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -32,6 +31,9 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.withTimeoutOrNull
 
+/** [TerminalSession.connectionEdges]の1件(Rustの`on_connection_edge`の引数をそのまま運ぶ)。 */
+data class ConnectionEdgeEvent(val edge: ConnectionEdge, val generation: ULong)
+
 /**
  * SSH セッションのドメインオブジェクト。
  *
@@ -43,46 +45,47 @@ class TerminalSession(
     orchestratorFactory: (OrchestratorCallback) -> SessionOrchestratorInterface = { createSessionOrchestrator(it) },
     /**
      * リモートが OSC 52 でクリップボード書き込みを要求したときに呼ばれる
-     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定は no-op — 実際に Android の
+     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定値は持たない(渡し忘れで機能が黙って消えるのを防ぐ、
+     * `docs/adr/0020-unwired-callback-detection.md` §3(g))。実際に Android の
      * `ClipboardManager` へ書くかどうか(opt-in設定のチェック含む)は呼び出し元の責務とし、
      * `Context` を持たないこのクラス自体には持ち込まない([RealHostKeyChecker]を
      * `TerminalTabsViewModel`側から注入するのと同じ構成)。
      */
-    private val onClipboardWriteRequested: (ClipboardPayload) -> Unit = {},
+    private val onClipboardWriteRequested: (ClipboardPayload) -> Unit,
     /**
      * リモートが OSC 52 query、またはtmux迂回チャンネルの`ClipboardPullRequest`で
      * クリップボードの読み出しを要求したときに呼ばれる。Rust側の`onHostKey`/
      * `onAgentSignRequest`と同じ同期ブロッキング呼び出し(Rust側の`spawn_blocking`
-     * スレッドから呼ばれる)。既定はno-op(常に`null`=応答なし)。opt-in設定が無効、
+     * スレッドから呼ばれる)。応答しない場合は`null`を返す。opt-in設定が無効、
      * またはクリップボードが空/取得不可なら`null`を返すこと(呼び出し元はその場合
      * デバイス側から一切応答を送らない)。
      */
-    private val onClipboardPullRequested: () -> ClipboardPayload? = { null },
+    private val onClipboardPullRequested: () -> ClipboardPayload?,
     /**
      * #10/#22: RebindManager(Rust側)がWiFi-bound fdを要求した。判断は一切せず、
      * 取得できたfdを返すだけ(`rust-ssot.md`準拠)。Rust側の`spawn_blocking`スレッドから
-     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。既定はno-op
-     * (常に`null` — マルチパス以外のセッションでは呼ばれない)。
+     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。取得できなければ
+     * `null`を返す(マルチパス以外のセッションでは呼ばれない)。
      */
-    private val acquireWifiFd: () -> PlatformFd? = { null },
+    private val acquireWifiFd: () -> PlatformFd?,
     /** 同、セルラー-bound fd版。 */
-    private val acquireCellularFd: () -> PlatformFd? = { null },
+    private val acquireCellularFd: () -> PlatformFd?,
     /**
      * #25: 端末ベル(BEL, 0x07)受信時に呼ばれる(可視/触覚フィードバック用)。呼び出し元は
      * [ioScope] のコルーチン上から呼ばれる(メインスレッド保証は無い)。判断ロジック
      * (取りこぼし無く1回だけ発火させる `bell_generation` の単調増加チェック)はこのクラス
      * 内で完結させ、ここでは実際にバイブレーション等を鳴らすだけの副作用注入とする
      * (`onClipboardWriteRequested` と同じ構成 — `Context` を持たないこのクラス自体には
-     * 持ち込まない)。既定は no-op。
+     * 持ち込まない)。
      */
-    private val onBell: () -> Unit = {},
+    private val onBell: () -> Unit,
     /**
      * `AI_INTEGRATION_DESIGN.md` §6.1: ctlソケット経由でリモートから届いたAI/汎用の
      * 注目通知(`CtlMessage::Notify`、kindが`Waiting`/`Done`/`Info`)を受信した時に呼ばれる。
      * 判断ロジック(取りこぼし無く1回だけ発火させる`notifyGeneration`の単調増加チェック)は
      * このクラス内([maybeFireNotify]参照)で完結させ、ここではタブバッジ更新・システム
      * 通知等の副作用注入のみを行う(`onBell`と同じ構成)。呼び出し元は[ioScope]の
-     * コルーチン上(メインスレッド保証なし)。既定はno-op。
+     * コルーチン上(メインスレッド保証なし)。
      *
      * [onNotifyRequested](tmux hook由来、kindが`Bell`/`Activity`/`Silence`/`JobDone`)とは
      * 独立した別経路(統合の経緯は`isekai_protocol::ctl::NotifyKind`のRust側docコメント
@@ -90,7 +93,7 @@ class TerminalSession(
      * `OrchestratorCallback.onNotify`経由(`orchestrator.rs`の重複排除・フォアグラウンド
      * 抑制を経由済み)。
      */
-    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit = { _, _, _ -> },
+    private val onNotify: (kind: NotifyKind, title: String, body: String) -> Unit,
     /**
      * タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火。
      * 「今この瞬間ユーザーへ見せるべきか」の抑制判断(アプリがフォアグラウンドかつ
@@ -98,9 +101,9 @@ class TerminalSession(
      * (`OrchestratorAdapter::on_notify`)が既に済ませてから呼ばれるため、ここでは
      * 実際にAndroid通知を出すかどうか(プロファイル単位opt-in・通知権限)の判断だけを
      * 行う副作用注入とする(`onClipboardWriteRequested`/`onBell`と同じ構成、
-     * `Context`を持たないこのクラス自体には持ち込まない)。既定は no-op。
+     * `Context`を持たないこのクラス自体には持ち込まない)。
      */
-    private val onNotifyRequested: (NotifyKind) -> Unit = {},
+    private val onNotifyRequested: (NotifyKind) -> Unit,
 ) : AutoCloseable {
 
     companion object {
@@ -118,6 +121,12 @@ class TerminalSession(
     private val _state = MutableStateFlow(TerminalUiState())
     val state: StateFlow<TerminalUiState> = _state.asStateFlow()
 
+    /** Step 8b: [_state]を書き換える唯一の経路。遷移そのものは純粋関数
+     *  [ConnectionStateMapper.reduce]が持ち、ここは原子的に適用するだけ(UI表示状態のみ)。 */
+    private fun dispatch(msg: UiMsg) {
+        _state.update { ConnectionStateMapper.reduce(it, msg) }
+    }
+
     private val _log = MutableStateFlow("")
     val log: StateFlow<String> = _log.asStateFlow()
 
@@ -126,6 +135,17 @@ class TerminalSession(
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
+
+    /**
+     * docs/adr/0019-functional-core-effects.md §6 Step 8a′: Rustが判断した接続エッジ
+     * (`OrchestratorCallback.onConnectionEdge`)を、届いた順にそのまま渡すだけの経路。
+     * [state]は`StateFlow`でconflateされるため、そこから「未接続→接続」を検出すると
+     * `Connected→Reconnecting→Connected`を取りこぼしうる。こちらは無制限バッファの
+     * [Channel]なので1件も落とさない(購読開始前に届いたエッジも保持する)。購読者は
+     * `TerminalTabsViewModel`の1つだけ(重複排除・エッジ判定はしない、`rust-ssot.md`)。
+     */
+    private val connectionEdgeChannel = Channel<ConnectionEdgeEvent>(Channel.UNLIMITED)
+    val connectionEdges: Flow<ConnectionEdgeEvent> = connectionEdgeChannel.receiveAsFlow()
 
     private val transferAccepted = AtomicBoolean(false)
 
@@ -184,23 +204,23 @@ class TerminalSession(
         val prev = lastAppliedPanelGeneration.get()
         if (update.panelGeneration > prev.toULong() && update.panelKind != uniffi.isekai_terminal_core.PanelKind.NONE) {
             lastAppliedPanelGeneration.set(update.panelGeneration.toLong())
-            _state.update {
-                it.copy(
-                    aiPanel = AiPanelUiState(
+            dispatch(
+                UiMsg.AiPanelPresented(
+                    AiPanelUiState(
                         kind = update.panelKind,
                         title = update.panelTitle,
                         markdown = update.panelMarkdown,
                         fields = update.panelFields,
                     ),
-                )
-            }
+                ),
+            )
         }
     }
 
     /** ユーザーがパネルを閉じた(送信せずに閉じた、または送信後の後始末)。
      *  [lastAppliedPanelGeneration]はリセットしない(§上のdocコメント参照)。 */
     fun dismissAiPanel() {
-        _state.update { it.copy(aiPanel = null) }
+        dispatch(UiMsg.AiPanelDismissed)
     }
 
     /**
@@ -248,7 +268,7 @@ class TerminalSession(
                     )
                 ConnectionPublicState.Connecting -> {}
             }
-            _state.update { ConnectionStateMapper.apply(it, state) }
+            dispatch(UiMsg.ConnectionStateChanged(state))
         }
 
         override fun onScreenUpdate(update: ScreenUpdate) {
@@ -263,18 +283,18 @@ class TerminalSession(
                     is HostKeyDecision.Trust -> {
                         if (decision.isNew) {
                             RemoteLogger.i("IsekaiTerminalSSH", "TOFU: trusted $host")
-                            _state.update { it.copy(lastFingerprint = fingerprint) }
+                            dispatch(UiMsg.HostKeyTrustedNew(fingerprint))
                         }
                         true
                     }
                     is HostKeyDecision.Changed -> {
                         RemoteLogger.w("IsekaiTerminalSSH", "⚠ HOST KEY CHANGED: $host")
-                        _state.update { it.copy(hostKeyChangedWarning = decision.warning) }
+                        dispatch(UiMsg.HostKeyChanged(decision.warning))
                         false
                     }
                     is HostKeyDecision.Unconfirmed -> {
                         RemoteLogger.i("IsekaiTerminalSSH", "first connection: awaiting user confirmation for $host")
-                        _state.update { it.copy(newHostKeyPrompt = decision.prompt) }
+                        dispatch(UiMsg.NewHostKeyPromptShown(decision.prompt))
                         false
                     }
                     is HostKeyDecision.Reject -> {
@@ -295,7 +315,7 @@ class TerminalSession(
             // 二重起動防止フラグをリセットする(UI表示状態ではない副作用のため
             // TrzszStateMapper の対象外)。
             if (state !is TrzszPublicState.InProgress) transferAccepted.set(false)
-            _state.update { it.copy(trzszState = TrzszStateMapper.toUiState(state)) }
+            dispatch(UiMsg.TrzszStateChanged(state))
         }
 
         override fun onDownloadComplete(fileName: String?, data: ByteArray) {
@@ -332,7 +352,7 @@ class TerminalSession(
         override fun onRequestCellularFd(): PlatformFd? = acquireCellularFd()
 
         override fun onRebindStateChanged(state: RebindPublicState) {
-            _state.update { it.copy(rebindState = state) }
+            dispatch(UiMsg.RebindStateChanged(state))
         }
 
         // タスク#57: tmux hook発火。抑制判断はRust側(OrchestratorAdapter::on_notify)
@@ -350,11 +370,11 @@ class TerminalSession(
         // (`hostKeyChangedWarning`等の「一度きりのプロンプト」系フィールドと異なり、
         // こちらは`null`自体が有効な結果でありうるため単純な値比較では区別できない)。
         override fun onPromptJump(target: PromptJumpTarget?) {
-            _state.update { it.copy(promptJumpResult = PromptJumpResult(target, it.promptJumpResult.seq + 1)) }
+            dispatch(UiMsg.PromptJumpResolved(target))
         }
 
         override fun onPromptOutputCopyReady(text: String?) {
-            _state.update { it.copy(promptOutputCopyResult = PromptOutputCopyResult(text, it.promptOutputCopyResult.seq + 1)) }
+            dispatch(UiMsg.PromptOutputCopyReady(text))
         }
 
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
@@ -364,7 +384,7 @@ class TerminalSession(
             RemoteLogger.i("IsekaiTerminalSSH", "agent sign request: $keyFingerprint")
             val deferred = CompletableDeferred<Boolean>()
             pendingAgentSignRequest.set(deferred)
-            _state.update { it.copy(agentSignRequestFingerprint = keyFingerprint) }
+            dispatch(UiMsg.AgentSignRequested(keyFingerprint))
             return try {
                 runBlocking {
                     try {
@@ -376,7 +396,7 @@ class TerminalSession(
                 }
             } finally {
                 pendingAgentSignRequest.set(null)
-                _state.update { it.copy(agentSignRequestFingerprint = null) }
+                dispatch(UiMsg.AgentSignRequestCleared)
             }
         }
 
@@ -393,6 +413,12 @@ class TerminalSession(
         override fun onForegroundResume(didReconnect: Boolean) {
             RemoteLogger.i("IsekaiTerminalSSH", "onForegroundResume: didReconnect=$didReconnect")
         }
+
+        // Step 8a′: 判断はRust側(`reconnect_fsm.rs`)で済んでいるので、ここは転送するだけ。
+        override fun onConnectionEdge(edge: ConnectionEdge, generation: ULong) {
+            RemoteLogger.i("IsekaiTerminalSSH", "connection edge: $edge generation=$generation")
+            connectionEdgeChannel.trySend(ConnectionEdgeEvent(edge, generation))
+        }
     }
 
     private val orchestrator: SessionOrchestratorInterface = orchestratorFactory(callback)
@@ -401,7 +427,7 @@ class TerminalSession(
         ioScope.launch {
             for (update in screenUpdateChannel) {
                 if (_state.value.connected) {
-                    _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
+                    dispatch(UiMsg.ScreenUpdated(update, orchestrator.scrollbackLen().toInt()))
                     maybeFireBell(update)
                     maybeFireNotify(update)
                     maybeApplyPanel(update)
@@ -433,7 +459,7 @@ class TerminalSession(
         // `AI_INTEGRATION_DESIGN.md` §6.2: 新しい論理セッションでは前回接続の
         // パネル世代・表示中パネルを引き継がない([lastFiredBellGeneration]と同じ理由)。
         lastAppliedPanelGeneration.set(0)
-        _state.update { it.copy(aiPanel = null) }
+        dispatch(UiMsg.AiPanelDismissed)
         // CONFLATEDチャネルに旧セッションの`ScreenUpdate`(高い`bellGeneration`)が
         // まだ未消費のまま残っている稀なケース(旧`onScreenUpdate`が切断直後の一瞬
         // `_state.value.connected`の古い読み取りで滑り込んだ場合)に備え、ここで
@@ -445,7 +471,7 @@ class TerminalSession(
         try {
             connect()
         } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+            dispatch(UiMsg.ConnectFailed(e.message))
         }
     }
 
@@ -477,7 +503,7 @@ class TerminalSession(
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
 
     fun disconnect() {
-        _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
+        dispatch(UiMsg.LocalDisconnectRequested)
         orchestrator.disconnect()
     }
 
@@ -583,14 +609,14 @@ class TerminalSession(
 
     fun trustUpdatedHostKey() {
         val w = _state.value.hostKeyChangedWarning ?: return
-        _state.update { it.copy(hostKeyChangedWarning = null) }
+        dispatch(UiMsg.HostKeyChangedWarningCleared)
         ioScope.launch {
             hostKeyChecker.trustUpdated(w.host, w.port, w.newFingerprint)
         }
     }
 
     fun dismissHostKeyWarning() {
-        _state.update { it.copy(hostKeyChangedWarning = null) }
+        dispatch(UiMsg.HostKeyChangedWarningCleared)
         disconnect()
     }
 
@@ -599,14 +625,14 @@ class TerminalSession(
      *  (`TerminalScreenBody`の「再接続」ボタン、`canReconnect`が true の間表示される)。 */
     fun trustNewHostKey() {
         val p = _state.value.newHostKeyPrompt ?: return
-        _state.update { it.copy(newHostKeyPrompt = null) }
+        dispatch(UiMsg.NewHostKeyPromptCleared)
         ioScope.launch {
             hostKeyChecker.trustUpdated(p.host, p.port, p.fingerprint)
         }
     }
 
     fun dismissNewHostKeyPrompt() {
-        _state.update { it.copy(newHostKeyPrompt = null) }
+        dispatch(UiMsg.NewHostKeyPromptCleared)
         disconnect()
     }
 
@@ -615,7 +641,7 @@ class TerminalSession(
     /** ユーザーが署名確認ダイアログで承認/拒否を選んだ時に呼ぶ。応答が無ければ拒否扱い。 */
     fun respondAgentSignRequest(approved: Boolean) {
         val deferred = pendingAgentSignRequest.getAndSet(null) ?: return
-        _state.update { it.copy(agentSignRequestFingerprint = null) }
+        dispatch(UiMsg.AgentSignRequestCleared)
         deferred.complete(approved)
     }
 
@@ -640,7 +666,7 @@ class TerminalSession(
     fun trzszCancel() {
         if (_state.value.trzszState == null) return
         transferAccepted.set(false)
-        _state.update { it.copy(trzszState = null) }
+        dispatch(UiMsg.TrzszCancelled)
         orchestrator.trzszCancel()
     }
 

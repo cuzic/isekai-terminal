@@ -151,6 +151,7 @@ impl RebindManager {
     }
 
     /// 現在の公開状態(UI向け)。
+    #[cfg(test)]
     pub fn public_state(&self) -> RebindPublicState {
         match self.phase {
             Phase::OnWifi => RebindPublicState::OnWifi,
