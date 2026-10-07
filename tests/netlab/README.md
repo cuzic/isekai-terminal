@@ -14,7 +14,7 @@ namespace(`topology.sh`)上で動かし、実カーネル・実QUIC・実時間�
 
 | スクリプト | 故障 | 検証 |
 |---|---|---|
-| `silent_blackhole_then_resume.sh` | 両nsでUDPをiptables DROP(サイレント)を25秒 | 同一sshセッションが完走、sha256一致、serveが2本以上のQUIC接続を受理(=resume) |
+| `silent_blackhole_then_resume.sh` | 両nsでUDPをiptables DROP(サイレント)を25秒 | 同一sshセッションが完走、sha256一致、故障注入後にserveが新たなQUIC接続を受理(=実際にresume) |
 | `link_down_then_resume.sh` | client側vethをdown→20秒後up(完全切断、エラーが即見える経路) | 同上 |
 | `zombie_relay_preempt.sh` | 旧QUIC接続の4タプルだけ両方向DROP(serve側は `--idle-timeout 60` でzombie化) | 新ソケットのRESUMEがzombieをpreemptして受理され完走(857f6ae6 D-2型) |
 | `direct_survives_loss_and_delay.sh` | tc netem loss 3% + delay 80ms±20ms | ベースライン(バイト列が壊れない) |

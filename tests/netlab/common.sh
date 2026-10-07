@@ -193,15 +193,20 @@ netlab_paced_feeder() {
 }
 
 # pacedシナリオの共通実行部。$1=ペース回数、$2=故障注入関数名(バックグラウンドで
-# 実行される。ssh開始の5秒後に呼ばれる)。完走・sha256一致・QUIC接続が2本以上
-# (=実際にresumeした)ことを検証する。$3=最低QUIC接続数(既定2)。
+# 実行される。ssh開始の5秒後に呼ばれる)。完走・sha256一致・故障注入の「後」に
+# serveがQUIC接続を新たに受けた(=実際にresumeした)ことを検証する。
+# (起動直後にclientが「OS network change」で1本張り直すことがあるため、
+# 接続数の絶対値ではなく注入時点からの増分で見る。)
 netlab_run_paced_scenario() {
-    local n="$1" inject="$2" min_conns="${3:-2}"
+    local n="$1" inject="$2"
     head -c $((n * 4096)) /dev/urandom > "$WORKDIR/payload.bin"
     local local_sum
     local_sum="$(sha256sum "$WORKDIR/payload.bin" | awk '{print $1}')"
 
-    ( sleep 5; echo "== [$(date +%T)] inject: $inject =="; "$inject" ) &
+    ( sleep 5
+      grep -c 'QUIC connection established' "$WORKDIR/serve.stderr" > "$WORKDIR/conns_before" || true
+      echo "== [$(date +%T)] inject: $inject =="
+      "$inject" ) &
     local inject_pid=$!
 
     local t0 status
@@ -219,11 +224,12 @@ netlab_run_paced_scenario() {
     remote_sum="$(awk '{print $1}' "$WORKDIR/remote_sum.txt")"
     [ "$local_sum" = "$remote_sum" ] || { echo "checksum mismatch: local=$local_sum remote=$remote_sum" >&2; exit 1; }
 
-    local conns
+    local conns before
     conns="$(grep -c 'QUIC connection established' "$WORKDIR/serve.stderr" || true)"
-    echo "== serve saw $conns QUIC connection(s) (need >= $min_conns) =="
-    if [ "$conns" -lt "$min_conns" ]; then
-        echo "session survived without a resume; the fault was not effective" >&2
+    before="$(cat "$WORKDIR/conns_before" 2>/dev/null || echo 0)"
+    echo "== serve QUIC connections: $before at injection, $conns at end =="
+    if [ "$conns" -le "$before" ]; then
+        echo "session survived without a resume after the fault; the fault was not effective" >&2
         exit 1
     fi
     echo "OK: ${n}x4096B round-tripped intact across the fault (sha256=$local_sum, conns=$conns)"

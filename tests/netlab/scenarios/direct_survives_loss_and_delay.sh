@@ -21,13 +21,16 @@ source "$NETLAB_SCENARIO_DIR/../common.sh"
 NETLAB_LOSS="${NETLAB_LOSS:-3%}"
 NETLAB_DELAY="${NETLAB_DELAY:-80ms 20ms}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-2097152}"
+export NETLAB_SSH_TIMEOUT="${NETLAB_SSH_TIMEOUT:-120}"
 
 echo "== workdir: $WORKDIR =="
 echo "== loss=$NETLAB_LOSS delay=$NETLAB_DELAY payload=${PAYLOAD_BYTES}B =="
 
 netlab_up
 netlab_apply_netem "$NETLAB_LOSS" "$NETLAB_DELAY"
-netlab_stack_up --once
+# `--once`は付けない: clientは起動直後に「OS network change」で張り直すことがあり、
+# --onceだとserveが2本目を拒否してセッションが死ぬ(実CIで確認)。serveはcleanupで止める。
+netlab_stack_up
 
 head -c "$PAYLOAD_BYTES" /dev/urandom > "$WORKDIR/payload.bin"
 LOCAL_SUM="$(sha256sum "$WORKDIR/payload.bin" | awk '{print $1}')"
@@ -36,11 +39,6 @@ set +e
 netlab_ssh sha256sum < "$WORKDIR/payload.bin" > "$WORKDIR/remote_sum.txt" 2> "$WORKDIR/ssh.log"
 SSH_STATUS=$?
 set -e
-
-if [ "$SSH_STATUS" -eq 0 ]; then
-    wait "$SERVE_PID" 2>/dev/null || true
-    SERVE_PID=""
-fi
 
 if [ "$SSH_STATUS" -ne 0 ]; then
     echo "ssh exited $SSH_STATUS" >&2
