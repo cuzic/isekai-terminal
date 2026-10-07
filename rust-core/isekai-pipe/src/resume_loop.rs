@@ -922,7 +922,23 @@ async fn dial_and_replay(
     let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
     match reconnect_and_resume(factory, target, state.session_id, client_sent_offset, client_delivered_offset).await {
         Ok(mut resumed) => {
-            if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+            let committed = resumed.helper_committed_offset.get();
+            // The helper claims to have committed an offset this client can no
+            // longer replay from: bytes were lost and the two sides' offsets can
+            // never be reconciled again — deterministic for this session, so the
+            // reducer gives up at once instead of retrying for the whole resume
+            // window (review 2026-09-29, PIPE-10). A replay *write* failure below
+            // stays an ordinary, retried `ReplayFailed`.
+            if committed_offset_out_of_replay_range(&state.replay.lock().unwrap(), committed) {
+                return Err((
+                    AttemptFailure::Unrecoverable,
+                    format!(
+                        "the helper's committed offset {committed} is outside this client's replay buffer \
+                         (bytes were lost; the two sides' offsets can no longer be reconciled)"
+                    ),
+                ));
+            }
+            if !replay_and_advance(&state.replay, committed, &mut resumed.data_stream).await {
                 // resume自体は成功したがreplayが不整合 —実質「この試行は
                 // 失敗した」ので、通常の失敗と同じTTY/非TTY分岐・
                 // last_resume_error更新を行う(codexレビューで指摘: この
@@ -936,7 +952,16 @@ async fn dial_and_replay(
             })
         }
         Err(e) => {
-            let kind = if is_unknown_session_rejection(&e) { AttemptFailure::UnknownSession } else { AttemptFailure::Other };
+            let kind = if is_unknown_session_rejection(&e) {
+                AttemptFailure::UnknownSession
+            } else if is_offset_gone_rejection(&e) {
+                // The server can no longer replay from the offset this client
+                // last received — every later RESUME of this session gets the
+                // same answer (PIPE-10).
+                AttemptFailure::Unrecoverable
+            } else {
+                AttemptFailure::Other
+            };
             Err((kind, format!("{e:#}")))
         }
     }
@@ -957,16 +982,35 @@ async fn dial_and_replay(
 /// per a Codex review finding) — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
 /// consecutive occurrences are treated as such by the reducer
 /// (`resume_fsm::update_unknown_session_streak`).
-/// `Auth`/`OffsetGone` and any non-rejection `TransportError` (network/mux
-/// failures) are left to the existing deadline-bound retry loop unchanged —
-/// those are rejections of a *specific attempt*, not proof the session
-/// itself is gone, so this function deliberately doesn't guess at their
-/// retriability.
+/// `Auth` and any non-rejection `TransportError` (network/mux failures) are
+/// left to the existing deadline-bound retry loop unchanged — those are
+/// rejections of a *specific attempt*, not proof the session itself is gone,
+/// so this function deliberately doesn't guess at their retriability.
+/// `OffsetGone` is different — deterministic for this session — and is
+/// classified separately (`is_offset_gone_rejection`, PIPE-10).
 fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
     matches!(
         e,
         isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
     )
+}
+
+/// `OffsetGone` — unlike `UnknownSession` (see above), deterministic for this
+/// session: the server's S→C replay buffer no longer reaches back to the
+/// offset this client last delivered, and nothing a retry does can change
+/// that (PIPE-10, `AttemptFailure::Unrecoverable`).
+fn is_offset_gone_rejection(e: &isekai_transport::TransportError) -> bool {
+    matches!(
+        e,
+        isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::OffsetGone)
+    )
+}
+
+/// Whether the helper's claimed `committed_offset` lies outside what this
+/// client's C→S replay buffer can reproduce — exactly
+/// `ReplayBuffer::replay_from`'s `None` cases (PIPE-10).
+fn committed_offset_out_of_replay_range(replay: &C2hReplayBuffer, committed_offset: u64) -> bool {
+    committed_offset < replay.start_offset() || committed_offset > replay.end_offset()
 }
 
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
@@ -1176,7 +1220,9 @@ async fn resume_with_backoff_until_deadline(
                     // ログでは個々の失敗を追えることの方が重要なため。
                     let line = match kind {
                         AttemptFailure::ReplayFailed => format!("isekai-pipe connect: resume attempt {attempt} {msg}"),
-                        AttemptFailure::UnknownSession | AttemptFailure::Other => {
+                        // `Unrecoverable` ends the episode with a give-up instead
+                        // (no `ReportAttemptFailure`); listed for exhaustiveness.
+                        AttemptFailure::UnknownSession | AttemptFailure::Other | AttemptFailure::Unrecoverable => {
                             format!("isekai-pipe connect: resume attempt {attempt} failed: {msg}")
                         }
                     };
@@ -1273,6 +1319,30 @@ async fn resume_with_backoff_until_deadline(
                             "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
                              retrying would never succeed."
                         )
+                    }
+                    GiveUpReason::SessionUnrecoverable => {
+                        // The attempt that ended the episode is not reported via
+                        // `ReportAttemptFailure`; its message is still pending.
+                        let what = last_failure
+                            .take()
+                            .map(|(_, msg)| msg)
+                            .unwrap_or_else(|| "the session can no longer be resumed".to_string());
+                        give_up(
+                            state.is_tty,
+                            warm_standby_task,
+                            &format!(
+                                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - {what}; \
+                                 retrying this session would never succeed. Ending this connect attempt; \
+                                 ssh will treat this as a lost connection.",
+                            ),
+                        );
+                        if notify {
+                            notify_os(
+                                "isekai-pipe connect",
+                                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): {what}."),
+                            );
+                        }
+                        anyhow::anyhow!("resume of session_id={session_id} for '{profile}' can never succeed: {what}")
                     }
                 };
                 if let Some(reason) = continuity_lost {
@@ -1973,6 +2043,30 @@ mod tests {
         .await;
         assert!(result.is_ok(), "a BUSY_OTHER_SESSION failure must be retried until it succeeds");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn offset_gone_is_classified_separately_from_unknown_session() {
+        use isekai_transport::{ResumeRejectReason, TransportError};
+        assert!(is_offset_gone_rejection(&TransportError::ResumeRejected(ResumeRejectReason::OffsetGone)));
+        assert!(!is_offset_gone_rejection(&TransportError::ResumeRejected(ResumeRejectReason::UnknownSession)));
+        assert!(!is_unknown_session_rejection(&TransportError::ResumeRejected(ResumeRejectReason::OffsetGone)));
+    }
+
+    /// PIPE-10: the replay-range check matches `ReplayBuffer::replay_from`'s
+    /// `None` cases exactly.
+    #[test]
+    fn committed_offset_out_of_replay_range_matches_replay_from() {
+        let mut replay = C2hReplayBuffer::new(1024);
+        assert!(replay.append(b"0123456789"));
+        replay.advance_start(4);
+        for committed in 0..=12u64 {
+            assert_eq!(
+                committed_offset_out_of_replay_range(&replay, committed),
+                replay.replay_from(committed).is_none(),
+                "committed={committed}"
+            );
+        }
     }
 
     #[test]

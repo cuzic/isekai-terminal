@@ -47,6 +47,11 @@ pub struct Session {
     pub helper_committed_offset: u64,
     /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
     pub output_space_available: Arc<Notify>,
+    // 「この接続の control stream が確立しなかった」(PIPE-09)はここ(session単位、RESUMEを
+    // またいで同じ`Session`が引き継がれる)には置かない: 接続(incarnation)ごとの
+    // `engine/mod.rs::AppAckUnavailable`。session単位にすると、前の接続で立った値が
+    // RESUME後の接続に残り、新しい接続自身のcontrol streamが上がる前にunresumableに
+    // されてしまう(PR #208レビューF-3)。
 }
 
 impl Session {
