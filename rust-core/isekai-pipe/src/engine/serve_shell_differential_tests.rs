@@ -174,8 +174,9 @@ enum Op {
     /// `finish_or_park_session(TcpDied)` for the relay holding `s`.
     TcpDied { s: u8 },
     /// The relay task holding `s` dies: `EstablishedLease` and
-    /// `SessionTableEntryGuard` both drop armed (two fire-and-forget backstops).
-    Panic { s: u8 },
+    /// `SessionTableEntryGuard` both drop armed (two fire-and-forget backstops,
+    /// in either order: whichever lands first discards, the other is a no-op).
+    Panic { s: u8, guard_first: bool },
     /// `handle_resume_stream`'s decision loop for `s`.
     Resume { s: u8, relay_yields: bool, offset_gone: bool },
     /// `AttachRuntime::cancel` (the current pending key, or an arbitrary one).
@@ -201,7 +202,7 @@ fn op_strategy(allow_bypass: bool) -> impl Strategy<Value = Op> {
             .prop_map(|(s, grace, wrong_token)| Op::Activate { s, grace, wrong_token }),
         4 => s().prop_map(|s| Op::DataStreamDied { s }),
         1 => s().prop_map(|s| Op::TcpDied { s }),
-        1 => s().prop_map(|s| Op::Panic { s }),
+        1 => (s(), any::<bool>()).prop_map(|(s, guard_first)| Op::Panic { s, guard_first }),
         4 => (s(), any::<bool>(), proptest::bool::weighted(0.2))
             .prop_map(|(s, relay_yields, offset_gone)| Op::Resume { s, relay_yields, offset_gone }),
         1 => (s(), 0u8..3, 0u8..2, any::<bool>()).prop_map(|(s, g, at, current)| Op::Cancel { s, g, at, current }),
@@ -488,7 +489,7 @@ impl Harness {
             Op::Activate { s, grace, wrong_token } => self.activate(s, grace, wrong_token).await,
             Op::DataStreamDied { s } => self.park_relay(s, false).await.map(|_| ()),
             Op::TcpDied { s } => self.tcp_died(s).await,
-            Op::Panic { s } => self.panic(s).await,
+            Op::Panic { s, guard_first } => self.panic(s, guard_first).await,
             Op::Resume { s, relay_yields, offset_gone } => self.resume(s, relay_yields, offset_gone).await,
             Op::Cancel { s, g, at, current } => {
                 let k = match (current, self.pending[usize::from(s)]) {
@@ -627,13 +628,19 @@ impl Harness {
         Ok(())
     }
 
-    async fn panic(&mut self, s: u8) -> Result<(), TestCaseError> {
+    async fn panic(&mut self, s: u8, guard_first: bool) -> Result<(), TestCaseError> {
         let Some(relay) = self.relays[usize::from(s)].take() else { return Ok(()) };
         let lease_id = relay.lease.id();
-        // Both RAII backstops fire (spawned in this order on the
-        // current-thread runtime: `RelayEnded`, then `RelayTerminated`).
-        drop(relay.lease);
-        drop(relay.guard);
+        // Both RAII backstops fire. The current-thread scheduler polls spawned
+        // tasks FIFO (and each backstop's apply is one uncontended critical
+        // section), so the drop order is the apply order.
+        if guard_first {
+            drop(relay.guard);
+            drop(relay.lease);
+        } else {
+            drop(relay.lease);
+            drop(relay.guard);
+        }
         drop(relay.tcp);
         for _ in 0..1000 {
             if !self.rt.index_contains(&id(s)).await {
@@ -646,12 +653,12 @@ impl Harness {
             tokio::task::yield_now().await;
         }
         let mut step = Step::default();
-        self.model.apply(ServeEvent::RelayEnded { lease: lease_id }, dummy_token(), &mut step);
-        self.model.apply(
-            ServeEvent::RelayTerminated { id: id(s), lease: lease_id, reason: TerminateReason::GuardDropped },
-            dummy_token(),
-            &mut step,
-        );
+        let ended = ServeEvent::RelayEnded { lease: lease_id };
+        let terminated =
+            ServeEvent::RelayTerminated { id: id(s), lease: lease_id, reason: TerminateReason::GuardDropped };
+        let (first, second) = if guard_first { (terminated, ended) } else { (ended, terminated) };
+        self.model.apply(first, dummy_token(), &mut step);
+        self.model.apply(second, dummy_token(), &mut step);
         self.model.bump("panic");
         Ok(())
     }
