@@ -1,0 +1,13 @@
+{
+  "scenario": "e_foreground_resume_reconnect",
+  "description": "(e) バックグラウンド猶予切れの後にフォアグラウンド復帰し再接続した。Connected公開を挟まずLostが届く",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_foreground_resume", "did_reconnect": true},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 2}
+  ]
+}

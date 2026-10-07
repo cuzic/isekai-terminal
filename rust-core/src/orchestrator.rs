@@ -1974,6 +1974,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: callback契約goldenの生成・一致検査
+    // (`src/orchestrator/tests/callback_contract_golden.rs`)。
+    mod callback_contract_golden;
+
     #[test]
     fn disconnect_kind_classifies_graceful_remote_exit_by_prefix() {
         let reason = Some("remote process exited (status 0)".to_string());
