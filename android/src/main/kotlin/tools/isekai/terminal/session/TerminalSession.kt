@@ -843,6 +843,9 @@ class TerminalSession(
             // 自動再接続ループが回っていればRust側で止める(動いていなければRust側で無音、
             // 判断はRustの`CancelReconnect`)。止めないとdestroy後もループが新しい
             // セッションを張り直しうる。
+            // TODO(#207): #207マージ後はRustの`disconnect()`が`UserDisconnect`で進行中の
+            // 再接続ループも止めるため、この`cancelReconnect()`はno-opになる。その時点で
+            // Rust側のteardown入口(disconnect/destroy)に統合し、この呼び出しを削除する。
             orchestrator.cancelReconnect()
             orchestrator.disconnect()
         } catch (e: Exception) {

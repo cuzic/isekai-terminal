@@ -95,7 +95,9 @@ class TerminalInputView @JvmOverloads constructor(
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (currentConnection?.sendKeyEvent(event) == true) return true
+        // AND-M7(d): `sendKeyEvent`(未処理時に`super.sendKeyEvent`でこのViewへ再注入する)
+        // ではなく、処理だけを行う`handleKeyDown`を呼ぶ(再注入ループ防止)。
+        if (currentConnection?.handleKeyDown(event) == true) return true
         return super.onKeyDown(keyCode, event)
     }
 }
