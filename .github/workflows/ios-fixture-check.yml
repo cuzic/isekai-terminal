@@ -4,17 +4,16 @@ name: iOS SSH fixture check
 # macOS上で起動・SSH接続・停止できることを検証する(PLAN.md「Phase Y」節 Phase 1A-3参照)。
 # Phase 1A-8以降の実SSH縦切りテストがこのfixtureに依存するため、macOSランナー上での
 # 動作を単体で先に確認しておく。
+#
+# macOSランナーのジョブは夜間(schedule)+手動dispatchのみ(2026-10-07、ユーザー決定)。
+# PR/pushでは走らない。失敗時は`macos-nightly`ラベルのissueへ自動報告する。
+# 経緯・調査手順・ロールバック(pull_requestトリガーを戻す)は
+# .claude/rules/main-branch-protection.md「macOSジョブは夜間のみ」節を参照。
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "rust-core/scripts/ios-fixture/**"
-      - ".github/workflows/ios-fixture-check.yml"
-  pull_request:
-    paths:
-      - "rust-core/scripts/ios-fixture/**"
-      - ".github/workflows/ios-fixture-check.yml"
+  schedule:
+    # 毎日 18:47 UTC(= 03:47 JST)。L2 netlab(18:17)と他のmacOS夜間とずらす。
+    - cron: "47 18 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -58,3 +57,20 @@ jobs:
             exit 1
           fi
           echo "confirmed: sshd fixture no longer reachable"
+
+  # スケジュール実行が赤のとき、`macos-nightly`ラベルのissueを重複なく作成/追記する。
+  report-failure:
+    name: report failure to tracking issue
+    needs: [fixture-smoke-test]
+    if: ${{ always() && github.event_name == 'schedule' && needs.fixture-smoke-test.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/report-macos-nightly-failure

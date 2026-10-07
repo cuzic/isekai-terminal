@@ -73,6 +73,45 @@ contextは二度と緑にならず恒久pendingでmainへのマージが詰ま�
   (Phase 6でも`ios-app-build`/`ios-ssh-vertical-slice`は除外予定)。
 - `fdroid-build-check.yml`: `assembleRelease`のビルド確認、60〜100分と重すぎる。
 
+## macOSジョブは夜間のみ(2026-10-07、ユーザー決定)
+
+`runs-on: macos-*`のジョブは**PR/pushでは一切走らず**、夜間`schedule`と手動
+`workflow_dispatch`のみで走る。macOSランナーの待ち行列でPRのマージが45分以上待たされ、
+しかもiOS系ジョブは30分timeout/インフラ起因でほぼ毎回赤だったため。どれもrequiredでは
+ないので、required 5本(+`rust-core-purity-check`)のPR時の挙動は変わらない。
+
+| ワークフロー | macOSジョブ | 夜間(UTC) |
+|---|---|---|
+| `ios-fixture-check.yml` | `fixture-smoke-test` | 18:47 |
+| `ios-app-build-check.yml` | `build` | 19:17 |
+| `ios-rust-core-check.yml` | `build-and-test`(Swift binding drift-check含む) | 19:47 |
+| `ios-ssh-vertical-slice-check.yml` | `vertical-slice` | 20:17 |
+| `rust-core-test-check.yml` | `test-macos`(`rust-core-test-macos`) | 20:47 |
+
+(L2 netlab夜間`rust-core-netlab-check.yml`の18:17とずらしてある。)
+
+- `rust-core-test-check.yml`は`pull_request`/`push`を維持したまま`schedule`を足しており、
+  `test`/`purity-check`/`test-windows`/`isekai-ssh-dead-code-report`は
+  `github.event_name != 'schedule'`でskip、`test-macos`は`schedule`/`workflow_dispatch`
+  のときだけ走る(`changes`はscheduleでも走り、PR以外は無条件`relevant=true`)。
+- PR時に失うもの: macOS固有のisekai-ssh/isekai-pipeのテスト失敗と、iOS
+  (Swiftバインディングのdrift含む)の検出が最大1日遅れる。Linux上のiOSロジック検査
+  `ios-logic-linux-check.yml`は引き続きPRで走る。macOSで確かめたいPRは、leadが
+  `gh workflow run <workflow> --ref <branch>`で個別にdispatchする。
+- **赤い夜間runの調査**: スケジュール実行が失敗すると、各ワークフローの
+  `report-failure`(rust-core-test-checkでは`report-macos-failure`)ジョブが
+  `.github/actions/report-macos-nightly-failure`経由で`macos-nightly`ラベルの
+  issueをワークフローごとに1件(タイトル`macOS夜間ジョブの失敗: <workflow名>`)作成し、
+  以後の失敗はそこへrun URL・commit・失敗jobをコメントで追記する。調査は
+  (1) issueのjobリンクからログを開き、timeout/ランナー取得失敗/Xcode・Simulator起因の
+  インフラ要因か、コード起因かを切り分ける、(2) コード起因なら前回の緑の夜間から
+  当該commitまでの`git log`を見て原因PRを絞る、(3) 修正PRのブランチで該当
+  ワークフローをdispatchして緑を確認し、issueをcloseする。closeしないと以後の失敗も
+  そのissueに積まれ続ける(closeすれば次の失敗で新規issueになる)。
+- **ロールバック**: 各ワークフローの`on:`に`pull_request:`(必要なら元の`paths:`も)を
+  戻し、`rust-core-test-check.yml`の`test-macos`の`if:`を
+  `needs.changes.outputs.relevant == 'true' && github.event_name != 'push'`に戻す。
+
 ## `strict: false`にした理由
 
 `strict: true`(「マージ前にブランチが最新であること」を要求)は、並列worktree/

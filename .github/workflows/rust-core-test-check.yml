@@ -22,6 +22,11 @@ name: rust-core test check
 # (Android/iOS binding生成ツール、CLI/shared crateのテスト対象外)は除外し、
 # それ以外のCLI/shared crateのみをmacOSでも検証する。iOS側の別ビルド確認は
 # ios-rust-core-check.yml等が既にカバーしている。
+# 2026-10-07(ユーザー決定)から、test-macosはPR/pushでは走らず、夜間(schedule)と
+# 手動dispatchのみで走る(macOSランナーの待ち行列でPRのマージが45分以上待たされたため)。
+# scheduleでは他のjob(test/purity-check/test-windows等)は走らない。夜間の失敗は
+# `macos-nightly`ラベルのissueへ自動報告する(report-macos-failureジョブ)。経緯・調査手順・
+# ロールバックは.claude/rules/main-branch-protection.md「macOSジョブは夜間のみ」節を参照。
 #
 # test-windows: 詳細は各ジョブのコメント参照。
 
@@ -46,6 +51,10 @@ on:
   # 同一だったものをそのまま維持している。
   pull_request:
   workflow_dispatch:
+  # test-macos専用の夜間実行(他のjobはscheduleでは`if:`でskipする)。
+  schedule:
+    # 毎日 20:47 UTC(= 05:47 JST)。L2 netlab(18:17)とiOS系macOS夜間(18:47〜20:17)とずらす。
+    - cron: "47 20 * * *"
 
 concurrency:
   group: rust-core-test-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
@@ -90,7 +99,8 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'schedule'
     # branch protectionのrequired status checkのcontextとして使われている、
     # 変更時は同時にprotection設定も更新すること。
     name: rust-core-test-linux
@@ -313,7 +323,8 @@ jobs:
   # 追加する際は、このname:と`checks[].context`を同時に更新すること)。
   purity-check:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'schedule'
     name: rust-core-purity-check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -394,9 +405,10 @@ jobs:
 
   test-macos:
     needs: changes
-    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
-    # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
-    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
+    # 夜間(schedule)と手動dispatchのみ。PR/pushでは走らない(2026-10-07、ユーザー決定:
+    # macOSランナーの待ち行列でPRのマージが45分以上待たされたため。それ以前の2026-10-06には
+    # まずmain pushでのスキップを入れていた)。ファイル冒頭のコメント参照。
+    if: needs.changes.outputs.relevant == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-macos`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
@@ -474,9 +486,10 @@ jobs:
 
   test-windows:
     needs: changes
-    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
+    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、WindowsはPRで済ませる。
     # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
-    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
+    # scheduleはtest-macos専用(ファイル冒頭のコメント参照)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push' && github.event_name != 'schedule'
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-windows`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
@@ -664,7 +677,7 @@ jobs:
   # (branch protectionに追加しないこと)。両プラットフォームで未使用=本当に死んでいる候補。
   isekai-ssh-dead-code-report:
     needs: [changes, purity-check, test-windows]
-    if: always() && needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
+    if: always() && needs.changes.outputs.relevant == 'true' && github.event_name != 'push' && github.event_name != 'schedule'
     name: isekai-ssh-dead-code-report
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -689,3 +702,22 @@ jobs:
         run: |
           python3 rust-core/scripts/dead_code_intersection.py report dead-code/linux.json dead-code/windows.json \
             | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # 夜間(schedule)のtest-macosが赤のとき、`macos-nightly`ラベルのissueを重複なく作成/追記する
+  # (rust-core-netlab-check.ymlのreport-failureと同じパターン、本体は
+  # .github/actions/report-macos-nightly-failure)。
+  report-macos-failure:
+    name: report macOS nightly failure to tracking issue
+    needs: [test-macos]
+    if: ${{ always() && github.event_name == 'schedule' && needs.test-macos.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/report-macos-nightly-failure

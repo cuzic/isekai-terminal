@@ -191,6 +191,8 @@ Planned ─dispatch→ Dispatched ─base確認OK→ Implementing ─PR作成→
 - **「関連プラットフォームcheck」**(U1): PRが`rust-core/isekai-ssh/`・`rust-core/isekai-pipe/`・`rust-core/quicmux/`
   (およびそれらが依存するcrate。初期は`isekai-transport`・`isekai-pipe-core`・`isekai-protocol`も含める、Q6)に
   触れるなら`rust-core-test-macos`と`rust-core-test-windows`。docs-only・CI-onlyのPRは待たない(U1)。
+  (2026-10-07追記、ユーザー決定: macOSジョブはPR/pushから外して夜間+dispatchのみにしたため、PR時に待つのは
+  `rust-core-test-windows`だけ。`.claude/rules/main-branch-protection.md`「macOSジョブは夜間のみ」節参照。)
 - **「終了状態」** = `COMPLETED`(conclusionは`SUCCESS`/`FAILURE`/`CANCELLED`/`TIMED_OUT`等)。`QUEUED`/`IN_PROGRESS`は未終了。
   `FAILURE`はG2に従い判断し、`CANCELLED`/`TIMED_OUT`は再実行してから判断する(再実行しても終わらなければ`AwaitingUser`)。
 - **`MainGreen`**(M2): run単位のconclusionではなく、**required context(job `name:`)単位**で判定する
