@@ -122,6 +122,19 @@ pub struct ConnectOutcome {
     #[serde(flatten)]
     pub class: ConnectOutcomeClass,
     pub detail: String,
+    /// Whether the SSH byte bridge had already gone live (`isekai-pipe
+    /// connect` reached its data pump, so `ssh(1)` may have exchanged bytes
+    /// and a remote command may already have run) before this failure.
+    /// Independent of `class`: the relay route deliberately keeps recording
+    /// resume-window exhaustion as `Unreachable` (a full re-deploy is still
+    /// the right recovery), so `class` alone cannot tell a pre-handshake
+    /// failure from a mid-session one — and `isekai-ssh host -- cmd` must
+    /// never re-run a non-idempotent remote command after the latter
+    /// (review 2026-09-29, PIPE-18, requested by the isekai-ssh review's A2).
+    /// `#[serde(default)]`: an outcome written by an older `isekai-pipe`
+    /// reads as `false`, i.e. "not known to be established".
+    #[serde(default)]
+    pub session_established: bool,
 }
 
 /// Same atomic tmp-file + rename write `write_connection_intent` uses
@@ -150,6 +163,7 @@ mod tests {
             profile: "production".to_string(),
             class: ConnectOutcomeClass::StaleTrust,
             detail: "cert pin mismatch".to_string(),
+            session_established: false,
         }
     }
 
@@ -217,6 +231,7 @@ mod tests {
                 profile: "production".to_string(),
                 class: ConnectOutcomeClass::Unknown,
                 detail: "a variant introduced by a newer isekai-pipe build".to_string(),
+                session_established: false,
             })
         );
     }
@@ -245,6 +260,29 @@ mod tests {
 
         let claimed = claim_connect_outcome(dir.path(), &outcome.intent_id).unwrap();
         assert_eq!(claimed, Some(outcome));
+    }
+
+    /// PIPE-18: the new flag round-trips, and an outcome file written by an
+    /// older `isekai-pipe` (no `session_established` key) reads as `false`.
+    #[test]
+    fn session_established_round_trips_and_defaults_to_false_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = sample_outcome();
+        outcome.intent_id = "est123".to_string();
+        outcome.class = ConnectOutcomeClass::Unreachable;
+        outcome.session_established = true;
+        write_connect_outcome(dir.path(), &outcome).unwrap();
+        assert_eq!(claim_connect_outcome(dir.path(), &outcome.intent_id).unwrap(), Some(outcome));
+
+        let legacy = r#"{
+            "schema_version": 1,
+            "intent_id": "abc123",
+            "profile": "production",
+            "class": "unreachable",
+            "detail": "written by an older isekai-pipe"
+        }"#;
+        let parsed: ConnectOutcome = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.session_established);
     }
 
     #[test]

@@ -79,6 +79,11 @@ const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on writing `RESUME_ACK` plus its replay bytes (review
+/// 2026-09-29, PIPE-12) — mirrors the client side's own replay-write bound
+/// in `resume_loop.rs`, which bounds the symmetric C→S replay write.
+const RESUME_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long `handle_resume_stream` waits, after asking an in-flight relay to
 /// yield (`SessionIo::preempt`), for it to actually park the connection
 /// (`SessionIo::reparked`) before re-sending the request once (ADR Q9; a
@@ -502,7 +507,16 @@ pub(crate) fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<
 /// ディレクトリは`trap ... EXIT`でも最終的に回収されるが、露出時間を最小化する)。
 fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) -> Result<String> {
     match (relay_jwt, relay_jwt_file) {
-        (Some(jwt), None) => Ok(jwt),
+        (Some(jwt), None) => {
+            // Still accepted for backward compatibility, but the token sits in
+            // argv for the whole process lifetime (`ps`, `/proc/<pid>/cmdline`)
+            // — make that visible (review 2026-09-29, PIPE-16).
+            log::warn!(
+                "--relay-jwt exposes the relay token to other local users via the process argv; \
+                 use --relay-jwt-file instead (isekai-bootstrap already does)"
+            );
+            Ok(jwt)
+        }
         (None, Some(path)) => {
             let mut content = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read --relay-jwt-file {path}"))?;
@@ -511,9 +525,16 @@ fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) 
             if let Err(e) = std::fs::remove_file(&path) {
                 log::warn!("failed to remove --relay-jwt-file {path} after reading: {e}");
             }
-            let trimmed = content.trim_end_matches(['\n', '\r']).to_string();
-            zeroize_string(&mut content);
-            Ok(trimmed)
+            // Trim in place rather than copying into a second `String`
+            // (PIPE-16): the old `.to_string()` copy was never zeroized, so
+            // the "zeroize the buffer we read" step only scrubbed a copy of a
+            // secret that still lived on elsewhere. Scrub the trailing bytes
+            // being cut off, then shorten — the one remaining buffer is the
+            // value handed to the caller.
+            let keep = content.trim_end_matches(['\n', '\r']).len();
+            let mut tail = content.split_off(keep);
+            zeroize_string(&mut tail);
+            Ok(content)
         }
         (None, None) | (Some(_), Some(_)) => {
             unreachable!("relay_jwt/relay_jwt_file exclusivity already validated in parse_args")
@@ -1279,6 +1300,35 @@ async fn handle_attach_stream(
     Ok(())
 }
 
+/// `RESUME_ACK` + replay, bounded by `limit` (PIPE-12). On a write error or
+/// expiry the stream is **reset**, not just dropped: dropping a send stream
+/// that was neither finished nor reset finishes it implicitly, so a client
+/// whose replay was cut short by the timeout could read a clean FIN right
+/// after the truncated bytes, treat it as an orderly remote close and end
+/// the ssh session — while this server has just parked the TCP connection
+/// for a resume (review of #206, F3). A reset is an abrupt error on the
+/// client side, which its resume loop retries.
+async fn write_resume_ack_bounded(
+    send: &mut AnyByteStreamWriteHalf,
+    helper_committed_offset: u64,
+    helper_sent_offset: u64,
+    replay_bytes: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    let result = tokio::time::timeout(
+        limit,
+        quicmux::respond_resume_accepted(send, helper_committed_offset, helper_sent_offset, replay_bytes),
+    )
+    .await;
+    let error = match result {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(e)) => anyhow!("failed to write RESUME_ACK: {e}"),
+        Err(_elapsed) => anyhow!("timed out writing RESUME_ACK + replay after {limit:?}"),
+    };
+    send.reset(0);
+    Err(error)
+}
+
 /// Phase 8-3 / quicmux-server-resume Stage B: `quicmux::resume`のRESUMEフレーム
 /// (frame typeバイトは呼び出し元`handle_connection`が既に読み取り済み)を
 /// 検証し、既存セッションに park された TCP 接続を取り戻して中継を再開する。
@@ -1307,7 +1357,14 @@ async fn handle_resume_stream(
         .export_keying_material(EXPORTER_LABEL, b"")
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let request = quicmux::decode_resume_request(&mut recv, exporter).await.context("failed to decode RESUME frame")?;
+    // `handle_connection`'s `HELLO_TIMEOUT` only covers reading the frame
+    // type byte; bound the (unauthenticated) RESUME body too, so a peer
+    // trickling it cannot hold this task open indefinitely (review
+    // 2026-09-29, PIPE-13 — the length caps live in `quicmux::resume`).
+    let request = tokio::time::timeout(HELLO_TIMEOUT, quicmux::decode_resume_request(&mut recv, exporter))
+        .await
+        .context("RESUME frame not received within timeout")?
+        .context("failed to decode RESUME frame")?;
 
     let session_id: [u8; 16] = request.token.as_slice().try_into().map_err(|_| {
         anyhow!("resume token has unexpected length {} (expected 16)", request.token.len())
@@ -1399,10 +1456,23 @@ async fn handle_resume_stream(
         replay_bytes.len()
     );
 
-    if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
+    // Bounded (review 2026-09-29, PIPE-12): up to `--resume-buffer-size`
+    // bytes of replay go out here, and a peer that stops reading used to hold
+    // this task — with the TCP connection neither parked nor relaying, so
+    // every later RESUME of this session was preempt-rejected — until the
+    // QUIC idle timeout. On expiry, park exactly like the write-error branch.
+    if let Err(e) = write_resume_ack_bounded(
+        &mut send,
+        helper_committed_offset,
+        helper_sent_offset,
+        &replay_bytes,
+        RESUME_ACK_WRITE_TIMEOUT,
+    )
+    .await
+    {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
         table_guard.disarm();
-        return Err(anyhow!("failed to write RESUME_ACK: {e}"));
+        return Err(e);
     }
 
     // `EstablishedLease`は従来どおりここで作る(`AttachRuntime::resumed_lease`docs参照)。
@@ -1690,6 +1760,18 @@ enum RelayOutcome {
 
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
 /// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
+///
+/// **C→S は target への書き込みが進んだ分だけ `helper_committed_offset` を
+/// 進める**(cancel-safe な `write` を1回ずつ、review 2026-09-29 PIPE-03)。
+/// プリエンプション(下記)で書き込みの途中から抜けても、client は committed
+/// offset から再送するので重複も欠落も起きない。
+///
+/// **プリエンプション**(`SessionIo::preempt`, PIPE-05): `Notified` をループの
+/// 外で1つだけ作って保持し(`enable()` 済み)、中継ループの待機中だけでなく
+/// S→C/C→S の書き込み中にも `select!` する。以前は周回ごとに作り直して
+/// いたため、ゾンビ接続でまさに起きる「書き込みが flow control で詰まって
+/// いる」最中の `notify_waiters()` を取りこぼし、プリエンプションが効かな
+/// かった(`handle_resume_stream`側は1回だけ再送して拒否に倒れる)。
 /// control stream が最終的に確立しなかった場合でも、この関数自体は
 /// Phase 7 と同じ双方向コピーとして機能する（バッファへの tee はしているが
 /// 誰も参照しないだけで、実害はない。上限付きなので無制限には増えない）。
@@ -1712,6 +1794,16 @@ async fn relay_buffered(
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
     let output_space_available = session.lock().await.output_space_available.clone();
+    // A later RESUME for this same session_id wants this connection to yield
+    // (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2) — most
+    // likely because this connection is a zombie (looks established here but
+    // the peer never actually receives anything) and the later attempt is
+    // the real live one. Created once and enabled up front so a
+    // `notify_waiters()` is never lost, whatever this loop is awaiting at the
+    // time (review 2026-09-29, PIPE-05).
+    let preempted = preempt.notified();
+    tokio::pin!(preempted);
+    preempted.as_mut().enable();
 
     loop {
         let s2c_read_len = {
@@ -1729,11 +1821,29 @@ async fn relay_buffered(
             result = recv.read(&mut c2s_buf), if !c2s_done => {
                 match result {
                     Ok(n) if n > 0 => {
-                        if let Err(e) = tcp_write.write_all(&c2s_buf[..n]).await {
-                            log::warn!("relay to {target}: tcp write failed: {e}");
-                            return RelayOutcome::TcpDied;
+                        let mut written = 0;
+                        while written < n {
+                            tokio::select! {
+                                r = tcp_write.write(&c2s_buf[written..n]) => match r {
+                                    Ok(0) => {
+                                        log::warn!("relay to {target}: tcp write returned 0 bytes");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                    Ok(k) => {
+                                        written += k;
+                                        session.lock().await.helper_committed_offset += k as u64;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("relay to {target}: tcp write failed: {e}");
+                                        return RelayOutcome::TcpDied;
+                                    }
+                                },
+                                _ = &mut preempted => {
+                                    log::info!("relay to {target}: preempted (mid C->S write) by a later RESUME; parking for it");
+                                    return RelayOutcome::Preempted { tcp_read, tcp_write };
+                                }
+                            }
                         }
-                        session.lock().await.helper_committed_offset += n as u64;
                     }
                     Ok(_) => {
                         // client 側の half-close。S→C 方向はまだ継続する。
@@ -1752,14 +1862,10 @@ async fn relay_buffered(
             _ = tokio::time::sleep(Duration::from_millis(50)), if s2c_read_len == 0 => {
                 continue;
             }
-            // A later RESUME for this same session_id wants this connection
-            // to yield (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md
-            // D-2) — most likely because this connection is a zombie (looks
-            // established here but the peer never actually receives
-            // anything) and the later attempt is the real live one. Give up
-            // the TCP connection the same way a dead data stream would, so
-            // `handle_resume_stream`'s waiting preemptor can grab it.
-            _ = preempt.notified() => {
+            // Give up the TCP connection the same way a dead data stream
+            // would, so `handle_resume_stream`'s waiting preemptor can grab
+            // it (see `preempted` above).
+            _ = &mut preempted => {
                 log::info!("relay to {target}: preempted by a later RESUME for the same session; parking for it");
                 return RelayOutcome::Preempted { tcp_read, tcp_write };
             }
@@ -1772,15 +1878,34 @@ async fn relay_buffered(
                         return RelayOutcome::TcpDied;
                     }
                     Ok(n) => {
-                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
-                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
-                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
-                        }
+                        // replayバッファへappendしてから送信する(review 2026-09-29, PIPE-03)。
+                        // 以前は送信→appendの順で、送信が途中で失敗・キャンセルされると
+                        // 読み取った`n`バイト(一部はpeerに届いていることもある)がreplayに
+                        // 載らないまま失われ、RESUMEが`OffsetGone`になるか、再開後の
+                        // ストリームからバイトが欠落してSSHのMAC検証で即切断していた。
+                        // 読み取り量は`remaining_capacity()`で頭打ちなのでappendは失敗しない
+                        // (失敗した場合も、replayに無いバイトを送るよりは接続を畳む)。
                         if !session.lock().await.output_buffer.append(&s2c_buf[..n]) {
                             log::warn!(
                                 "relay to {target}: output buffer had no room after bounded read; treating as data stream failure"
                             );
                             return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        }
+                        tokio::select! {
+                            r = send.write_all(&s2c_buf[..n]) => {
+                                if let Err(e) = r {
+                                    log::info!("relay to {target}: data stream (S->C) write failed: {e}");
+                                    return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                                }
+                            }
+                            _ = &mut preempted => {
+                                // The bytes are already in the replay buffer
+                                // (append-first above), so the preemptor's
+                                // RESUME replays whatever this write did not
+                                // deliver.
+                                log::info!("relay to {target}: preempted (mid S->C write) by a later RESUME; parking for it");
+                                return RelayOutcome::Preempted { tcp_read, tcp_write };
+                            }
                         }
                     }
                     Err(e) => {
@@ -1999,6 +2124,82 @@ mod bind_port_range_tests {
         let socket =
             bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port.saturating_add(31)))).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), held_port);
+    }
+}
+
+#[cfg(test)]
+mod relay_jwt_file_tests {
+    use super::*;
+
+    /// PIPE-16: the file's trailing newline is trimmed in place (no second,
+    /// never-zeroized copy) and the file is removed after reading.
+    #[test]
+    fn relay_jwt_file_is_trimmed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay_jwt");
+        std::fs::write(&path, "header.payload.sig\r\n").unwrap();
+        let jwt = resolve_relay_jwt(None, Some(path.to_str().unwrap().to_string())).unwrap();
+        assert_eq!(jwt, "header.payload.sig");
+        assert!(!path.exists(), "the token file must be unlinked after reading");
+    }
+}
+
+#[cfg(test)]
+mod resume_ack_write_tests {
+    use super::*;
+    use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// PIPE-12 / review of #206 F3: when the bounded `RESUME_ACK` + replay
+    /// write gives up on a peer that is not reading, the client must observe
+    /// an abrupt reset — never a clean end-of-stream after a truncated
+    /// replay, which its data pump would take for an orderly remote close.
+    #[tokio::test]
+    async fn timed_out_resume_ack_resets_the_stream_instead_of_finishing_it() {
+        let (mut config, cert_sha256_hex) = quicmux::test_support::self_signed_server_config("isekai-pipe.local");
+        config.alpn = ALPN.to_vec();
+        config.exporter_label = EXPORTER_LABEL.to_vec();
+        config.max_concurrent_bidi_streams = 4;
+        let listener = AnyMuxListener::bind_noq(config, quicmux::BindSpec::any_ipv4()).await.unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        let factory = isekai_transport::system_quic_factory();
+        let endpoint = factory.create_endpoint(isekai_transport::BindSpec::any_ipv4()).await.unwrap();
+        // The server side must accept concurrently, or the handshake never completes.
+        let (client, server) = tokio::join!(
+            endpoint.connect(quicmux::RemoteSpec { addr, server_name: "isekai-pipe.local".to_string(), cert_sha256_hex }),
+            async { listener.accept().await.expect("incoming connection").accept().await },
+        );
+        let (client, server) = (client.unwrap(), server.unwrap());
+
+        let (mut client_recv, mut client_send) = client.open_bi().await.unwrap().split();
+        // A stream only becomes visible to `accept_bi` once it carries data.
+        client_send.write_all(&[0u8]).await.unwrap();
+        let (_server_recv, mut server_send) = server.accept_bi().await.unwrap().split();
+
+        // Far more than any stream flow-control window: the client reads
+        // nothing yet, so the write stalls and the bound expires.
+        let replay = vec![0x5Au8; 64 * 1024 * 1024];
+        let result = write_resume_ack_bounded(&mut server_send, 0, 0, &replay, Duration::from_millis(300)).await;
+        assert!(result.is_err(), "the stalled write must hit the bound");
+        drop(server_send);
+
+        // Now drain from the client side: it must end in an error (reset),
+        // not `Ok(0)`. `server`/`client` stay alive throughout.
+        let mut buf = vec![0u8; 64 * 1024];
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match client_recv.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("the client must observe how the stream ended");
+        assert!(outcome.is_err(), "a truncated replay must end with a reset, not a clean FIN");
+        drop((server, client));
     }
 }
 

@@ -2418,6 +2418,7 @@ mod tests {
             profile: "prod".to_string(),
             class,
             detail: "test detail".to_string(),
+            session_established: false,
         }
     }
 
