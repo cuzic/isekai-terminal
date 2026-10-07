@@ -1316,6 +1316,19 @@ fn should_give_up_without_resuming(outcome: &Result<(), PumpFailure>, c2h_alread
 /// avoid re-running a remote command after a mid-session failure that the
 /// outcome `class` alone (e.g. the relay route's `Unreachable`) cannot
 /// distinguish from a pre-handshake one.
+///
+/// Semantics: `true` means the bridge was **armed**, not that any byte
+/// flowed — it is set on entry to `run_resume_loop`, before the first stdin
+/// read. That errs on the safe side for "never re-run a non-idempotent
+/// remote command", but a consumer (the #130 re-split's D-1) will then also
+/// skip automatic re-exec when the very first post-handshake read fails with
+/// zero bytes exchanged; that cost to always-connects auto-recovery is
+/// deliberate and must be weighed there.
+///
+/// Scope caveat for tests: being process-global and never reset, any
+/// in-process test that enters `run_resume_loop` leaves it `true` for every
+/// later test in the same test binary — a test must not assert
+/// `session_established == false` after such a test could have run.
 static SSH_BRIDGE_WENT_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn ssh_bridge_went_live() -> bool {
@@ -1734,12 +1747,11 @@ async fn pump_h2c(
 /// clamp側へ一本化した — 詳しい理由は
 /// [`quicmux::ReplayBuffer::advance_start`]のdocs参照。
 ///
-/// ここでjump-aheadが問題にならなかったのは、このファイル固有の構造の
-/// おかげでしかない: `pump_c2h`は単一タスク内で「appendしてから次の周回で
-/// advance_start」の順に実行するため、`engine/mod.rs`側にある
-/// 「peerへ送出済みだがappend前」の窓がそもそも開かない。加えて
-/// `replay_and_advance`が`replay_from`で範囲外offsetを先に弾くため、
-/// この分岐は到達不能だった。
+/// 現在は`pump_c2h`も`engine/mod.rs`の`relay_buffered`(S→C)も「replayへappend
+/// してから送信」の順(review 2026-09-29, PIPE-03)なので、「peerへ送出済みだが
+/// append前」の窓はどちら側にも無く、正当なackが`end_offset()`を超えることは無い。
+/// 超えるackが来た場合の扱い(clamp)は上記docs参照。加えて`replay_and_advance`が
+/// `replay_from`で範囲外offsetを先に弾く。
 type C2hReplayBuffer = quicmux::ReplayBuffer;
 
 #[cfg(test)]
