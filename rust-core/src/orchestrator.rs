@@ -161,13 +161,6 @@ impl ActiveSession {
             Self::IsekaiLinkRelay(s) => s.run_exec(command).await,
         }
     }
-    /// タスク#58: tmux scrollback backfillのバッチ注入。全トランスポート共通
-    /// (`SessionCore::inject_scrollback_history`)なので`dispatch_all!`でよい。
-    // この1箇所のallowで下流(SessionCore::inject_scrollback_history・plain_text_to_scrollback_row)も生きていると扱われる。
-    #[allow(dead_code)] // UNWIRED: 呼び出し元はee34304a(2026-08-09)でbackfillごと削除済み。元実装はf356766b(task #58)。ADR_UNWIRED_CALLBACK_DETECTION.md §1.4
-    fn inject_scrollback_history(&self, lines: Vec<String>) {
-        dispatch_all!(self, inject_scrollback_history, lines)
-    }
 }
 
 // ── Shared internal state ─────────────────────────────────
