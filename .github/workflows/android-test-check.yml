@@ -110,7 +110,7 @@ jobs:
       # configuration cacheは、runner間で持ち越すには暗号化キー(secret)が必要なので
       # 使わない。
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: ./gradlew :android:testDebugUnitTest
         # `--build-cache`: kspDebugKotlin/compileDebugKotlin等のコンパイル系タスクを

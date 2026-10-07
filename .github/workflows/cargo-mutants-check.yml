@@ -76,15 +76,18 @@ jobs:
           fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # SHA固定時はref名(`@stable`)からtoolchainを推定できないため、明示的に渡す。
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
+        with:
+          toolchain: stable
 
       - name: Add musl targets
         run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
       - name: Install zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: latest
+          version: 0.16.0
 
       - name: Cache Cargo (github-hosted only)
         if: inputs.runner_type != 'self-hosted-gcp-spot'
@@ -99,9 +102,9 @@ jobs:
             cargo-mutants-${{ runner.os }}-
 
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild@0.23.4
 
       # cargo-mutantsの事前ビルド済みgnuバイナリはglibc 2.39を要求し、self-hosted VM
       # (Debian 12、glibc 2.36)では動かない。ソースからインストールする(32コアで約26秒)。

@@ -252,7 +252,7 @@ jobs:
           exit $missing
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@bb0282cdd6e41599bc8dfa5fc712ebe9e27cfd8c # nextest
 
       - name: Install openssh-server (opt-in real-sshd E2E tests need /usr/sbin/sshd)
         run: |
