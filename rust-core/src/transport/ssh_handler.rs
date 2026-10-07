@@ -1351,10 +1351,22 @@ mod proxy_jump_e2e_tests {
 
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
             // check_server_key はホスト鍵の信頼確認を待つので、テストでは常に許可する。
+            // RC-07: 踏み台の鍵は`JumpHostKey`(踏み台自身のhost:port付き)、接続先の鍵は
+            // `HostKey`として届くことも合わせて記録・検証する。
+            let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen_in_task = Arc::clone(&seen);
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
-                    if let TransportEvent::HostKey(_, reply) = event {
-                        let _ = reply.send(true);
+                    match event {
+                        TransportEvent::HostKey(_, reply) => {
+                            seen_in_task.lock().unwrap().push("target".to_string());
+                            let _ = reply.send(true);
+                        }
+                        TransportEvent::JumpHostKey { host, port, reply, .. } => {
+                            seen_in_task.lock().unwrap().push(format!("jump {host}:{port}"));
+                            let _ = reply.send(true);
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -1383,6 +1395,15 @@ mod proxy_jump_e2e_tests {
                 .channel_open_session()
                 .await
                 .expect("opening a channel on the target through the jump tunnel should succeed");
+
+            // RC-07: 踏み台の鍵は踏み台自身の`host:port`で、接続先の鍵は通常の`HostKey`で
+            // (=呼び出し側でtargetの識別子により)確認されること。
+            let jump_identity = format!("jump {}:{}", jump_addr.ip(), jump_addr.port());
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                &[jump_identity, "target".to_string()],
+                "RC-07: the jump host's key must be checked under its own host:port, separately from the target's"
+            );
         });
     }
 }
