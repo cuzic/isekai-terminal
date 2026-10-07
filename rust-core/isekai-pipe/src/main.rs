@@ -5,6 +5,7 @@ mod connect;
 mod inspect;
 mod parent_watchdog;
 mod probe;
+mod resume_fsm;
 mod resume_loop;
 mod tty;
 

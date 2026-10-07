@@ -8,33 +8,41 @@
 
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::time::Instant;
+use std::time::Duration;
+
+use isekai_protocol::Millis;
 
 use anyhow::{Context, Result};
 use isekai_transport::{
     compute_proof, connect_stun_p2p_with_fallback, connect_via_relay_resumable, connect_via_relay_resumable_with_fallback,
     open_control_stream, reconnect_and_resume, spawn_app_ack_tasks, system_quic_factory, AnyByteStream,
     AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxFactory, AnyMuxRebinder, AppAckCounters,
-    AppAckTasks, BackoffPolicy, BindSpec, C2hSentOffset, H2cClientDeliveredOffset, RelayTarget,
+    AppAckTasks, BindSpec, C2hSentOffset, H2cClientDeliveredOffset, RelayTarget,
     ResumableRelaySession, SequentialRelayCandidate, SequentialStunCandidate, StunP2pConnection,
     StunP2pTarget,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::connect::{attach_stale_trust_signal, relay_endpoint_factory};
+use crate::resume_fsm::{
+    AttemptFailure, BusyOtherSessionRetry, BusyRetryDecision, ContinuityLost, DialPath, GiveUpReason, ResumeCmd,
+    ResumeEvent, ResumePlanner, ResumePlannerConfig, SwitchTrigger, UNKNOWN_SESSION_CONFIRM_THRESHOLD,
+};
+pub(crate) use crate::resume_fsm::BUSY_OTHER_SESSION_RETRY_WINDOW;
+#[cfg(test)]
+use crate::resume_fsm::{
+    clamp_resume_window, cross_family_probe_fits, effective_resume_window, resume_window_for,
+    should_switch_to_cross_family, update_unknown_session_streak, CROSS_FAMILY_MIN_PROBE_BUDGET,
+    RECONNECT_NOTIFY_GRACE, STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS, UNKNOWN_SESSION_MIN_ELAPSED_FLOOR,
+};
 use crate::RelayTransportKind;
+#[cfg(test)]
 use crate::DEFAULT_RESUME_WINDOW;
 
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
-/// `jitter: 0.25`(±25%、ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4): スリープ
-/// 復帰やネットワーク瞬断は「複数タブが同時に同じイベントを見る」典型例
-/// であり、ジッター無しの純粋な指数バックオフでは全タブが同一グリッド上で
-/// 同期再試行し、サーバー側のresume競合(D-2)を確実に踏みにいく。
-const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
-    initial: Duration::from_millis(500),
-    max: Duration::from_secs(10),
-    jitter: 0.25,
-};
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Bounds `replay_and_advance`'s post-resume replay write — same rationale
 /// and magnitude as `isekai_transport::resume`'s `TRANSPORT_STEP_TIMEOUT`
@@ -67,135 +75,25 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// only keeps bare-redial resume attempts alive briefly before returning
 /// control to the wrapper's full STUN re-establishment loop.
 const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
-/// How many consecutive failed bare-redial attempts against the *original*
-/// STUN peer address, within one disconnect episode, before switching to the
-/// cross-family relay fallback (if one exists) — independent of, and usually
-/// reached much sooner than, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` (that streak
-/// only increments on a specific `UnknownSession` *rejection*; this counter
-/// increments on *any* attempt failure, since a STUN bare redial against a
-/// peer address the client can no longer reach typically fails as a mux/QUIC
-/// dial error, never even reaching a point where the server could reject it).
-/// At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, 4s, 8s, capped at 10s) the
-/// cumulative *wait between* attempts is roughly 15s — **but that is not
-/// when the switch actually fires** (opus review round 5 on this ADR's
-/// implementation): each attempt's own `reconnect_and_resume` can itself
-/// cost up to two separate `TRANSPORT_STEP_TIMEOUT`s (its `connect` step
-/// and its `request_resume` step are timed independently, ~15s each — see
-/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`'s own docs), so the
-/// count alone can take up to ~90s (15s/attempt) or ~165s (30s/attempt) of
-/// wall-clock time to reach this many failures — the second figure already
-/// exceeds `STUN_RESUME_GIVE_UP_WINDOW` (120s), meaning the count-based
-/// trigger could silently *never* fire before the deadline it's supposed to
-/// preempt. `should_switch_to_cross_family` (near `cross_family_switch_
-/// budget`) closes this by also switching once the *remaining* time before
-/// the deadline stops being enough for even one cross-family probe,
-/// independent of this attempt count — see that function's own docs.
-///
-/// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
-/// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
-/// single sequential loop with no second concurrent reconnect driver, so
-/// there's nothing to latch against yet; build one only if real-world
-/// measurement shows otherwise. The server's own PREEMPT_WAIT_TIMEOUT
-/// (engine/mod.rs, 2s) adds at most 2s of latency to whichever attempt races
-/// it, comfortably inside this switch's own bounded windows above.
-const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
-/// How long, measured from the *moment of the switch itself* (not from
-/// `disconnected_at` — see the R1 note below), `resume_with_backoff_until_
-/// deadline` keeps retrying the cross-family relay target *before that
-/// target has ever succeeded* in this disconnect episode.
-///
-/// This is deliberately **not** the same as the relay-grace-based deadline
-/// (`None`/multi-day) that `run_resume_loop` installs for later episodes
-/// once the switch has actually succeeded once (ADR_STUN_REESTABLISH_CONTINUITY.md
-/// §3.2 task 7's "成功した後" wording, and its own separate task 4 bullet
-/// requiring a *bounded* first attempt) — the two are easy to conflate
-/// because both are implemented as `ResumeDeadlinePolicy::max_resume_window`
-/// (opus review round on this ADR's implementation, finding C1: an earlier
-/// cut of this code installed the multi-day deadline immediately upon
-/// switching, before the cross-family target had ever answered, which — if
-/// `cached_relay_addr` turned out to be unreachable from the client's new
-/// network, exactly the unverified assumption §3.3 calls out — made
-/// `isekai-pipe connect` hang for up to `DEFAULT_RESUME_GRACE_SECS` instead
-/// of ever returning control to `isekai-ssh`'s wrapper-level
-/// `lightweight_retries`/`redeploy_gate` escalation that `always-connects.md`
-/// depends on).
-///
-/// **R1** (opus review round 2 on this ADR's implementation): the switch
-/// call site adds this to *elapsed time since `disconnected_at`* rather than
-/// anchoring the whole window to `disconnected_at` directly, because the
-/// switch itself can already be tens of seconds into the episode by the
-/// time it fires — `switch_attempts_before_cross_family` real attempts
-/// against the *original* STUN target, each up to two separate
-/// `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`s (15s each, for its
-/// `connect` and `request_resume` steps — see `STUN_TO_CROSS_FAMILY_SWITCH_
-/// ATTEMPTS`'s own docs for the full corrected cost model, opus review
-/// round 5), not just the `RESUME_BACKOFF` waits between them. Anchoring this constant to
-/// `disconnected_at` instead left as little as zero of it for the
-/// cross-family target on a slow-to-fail STUN peer, defeating task 4's
-/// "short *bounded retry*" (up to ~`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
-/// attempts) requirement — see the call site's own `.max(
-/// UNKNOWN_SESSION_MIN_ELAPSED_FLOOR)`, which keeps task 4's *other* half
-/// (never give up before 30s since `disconnected_at`) true even when the
-/// switch happens quickly. That `.max()` is a no-op against *this*
-/// constant's current value (45s > 30s, so the sum term always wins) —
-/// kept anyway as a guard against a future tuning of `CROSS_FAMILY_SWITCH_
-/// DEADLINE` below 30s silently reopening the gap it exists to close
-/// (confirmed intentional, opus review round 3 on this ADR's
-/// implementation).
-///
-/// This is a budget on the cross-family target *alone*, from the moment of
-/// the switch — not a promise that the whole episode (STUN attempts plus
-/// this) stays under `STUN_RESUME_GIVE_UP_WINDOW` (120s) end to end
-/// (`/code-review` finding on this ADR's implementation, correcting an
-/// earlier version of this doc that claimed exactly that). In the realistic
-/// worst case (all `switch_attempts_before_cross_family` STUN attempts each
-/// burning up to *two* separate `TRANSPORT_STEP_TIMEOUT`s before failing —
-/// their `connect` and `request_resume` steps are timed independently, not
-/// jointly — see `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own docs, updated
-/// after opus review round 5 caught this same undercount here), the
-/// count-based switch can be up to ~90s (one `TRANSPORT_STEP_TIMEOUT`/attempt)
-/// or ~165s (two/attempt) into the episode by the time it *would* fire —
-/// the second figure already past `STUN_RESUME_GIVE_UP_WINDOW`. This
-/// constant alone doesn't reach that trigger in time; the deadline-aware
-/// half of `should_switch_to_cross_family` (near `cross_family_switch_
-/// budget`, below) is what actually keeps the switch from silently never
-/// firing in that band — see its own docs. Either way, `isekai-ssh`'s
-/// wrapper-level `lightweight_retries`/`redeploy_gate` escalation still
-/// takes over once this function finally returns `Err` — always-connects.md
-/// is about *eventual* automatic recovery, not a hard latency SLA.
-const CROSS_FAMILY_SWITCH_DEADLINE: Duration = Duration::from_secs(45);
-/// The smallest remaining slice of the current deadline in which switching
-/// to the cross-family relay target can still buy anything: one
-/// `RESUME_BACKOFF` first delay (500ms, +25% jitter, rounded up to a whole
-/// second here) plus one `isekai_transport::resume::TRANSPORT_STEP_TIMEOUT`-
-/// bounded QUIC connect step. Derived from that constant directly (not
-/// hand-mirrored as a second literal) — `/code-review` finding on this
-/// ADR's implementation: a hand-mirrored copy is exactly the kind of
-/// cross-crate drift this ADR's own review rounds already caught once for
-/// this same 15s-vs-30s distinction (opus review round 5).
-///
-/// Deliberately *not* the ~30s worst case of a whole `reconnect_and_resume`
-/// (its `connect` and `request_resume` steps are each bounded by
-/// `TRANSPORT_STEP_TIMEOUT` *separately*, not jointly): demanding 31s of
-/// headroom would suppress the switch across exactly the moderate
-/// `#@isekai resume-grace` band where it matters most, and the case this
-/// ADR exists for (a `cached_relay_addr` the client's new network cannot
-/// reach at all) is decided in the *connect* step alone — a probe that only
-/// gets this far still yields a real relay-reachability verdict (opus
-/// review round 5 on this ADR's implementation).
-const CROSS_FAMILY_MIN_PROBE_BUDGET: Duration = Duration::from_secs(isekai_transport::resume::TRANSPORT_STEP_TIMEOUT.as_secs() + 1);
-/// How long a disconnect stays silent before [`print_reconnect_status`]
-/// actually prints anything. Matches trzsz-ssh's own
-/// `kDefaultUdpReconnectTimeout` (`tssh/udp.go`) — `tssh` polls liveness
-/// every ~1s but only calls its `notifyConnectionLost()` once elapsed time
-/// since the last active moment exceeds this same 15s, so a blip shorter
-/// than that produces no visible output at all on that client. Before this
-/// existed, `run_resume_loop` printed a status line the instant a disconnect
-/// was *detected* (see the call site's history) — every brief Wi-Fi/cellular
-/// handoff surfaced a "connection lost" message that a same-length outage
-/// on `tssh` never showed, even though both sides were transparently
-/// recovering within their (much longer) resume windows the whole time.
-const RECONNECT_NOTIFY_GRACE: Duration = Duration::from_secs(15);
+
+/// このshellの時計(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.2)。`resume_fsm`のreducerへ渡す
+/// `now: Millis`は、すべて[`ShellClock::stamp`]でだけ刻む(Step 5で、本番コードに13箇所
+/// 散っていた`Instant::now()`をここへ集約した)。`tokio::time::Instant`を使うので、
+/// `start_paused`のテストでは仮想時刻に追従する(`std::time::Instant`と混在させない)。
+/// エポックはこの値を作った瞬間で、異なる`ShellClock`の`Millis`同士は比較しない。
+struct ShellClock {
+    epoch: tokio::time::Instant,
+}
+
+impl ShellClock {
+    fn new() -> Self {
+        Self { epoch: tokio::time::Instant::now() }
+    }
+
+    fn stamp(&self) -> Millis {
+        Millis(u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+}
 
 /// Marks an `anyhow::Error` as having occurred *after* the STUN P2P
 /// handshake already succeeded — i.e. after the route has entered its
@@ -367,26 +265,6 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
     }
 }
 
-/// Deliberately **not** derived from `resume_window_for`/`resume-grace`
-/// (unlike a same-process resume loop's own deadline) — even though a
-/// `BUSY_OTHER_SESSION` reject on the very first connect most often means
-/// *this same client's* previous session is still parked on the remote
-/// helper (see `TransportError::is_busy_other_session`'s docs), waiting for
-/// that park to clear on its own is no longer a sound thing to size against
-/// `resume-grace`, now that the value is days long by default
-/// (`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`'s docs). A fixed, short
-/// window here is defense-in-depth for `isekai-pipe serve` deployments that
-/// predate `ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption fix
-/// (`engine/mod.rs::hello_with_parked_preemption`) — helper reuse
-/// deliberately doesn't force those to redeploy (`reuse.rs`'s fingerprint
-/// exclusion), so they can keep running the old, un-preempting behavior for
-/// up to `--max-idle-lifetime` (30 days) after this fix ships. Against a
-/// server that *does* have the fix, a legitimate retry here succeeds almost
-/// immediately (the preemption is atomic, no real waiting involved), so
-/// this window is never the limiting factor in the common case; against one
-/// that doesn't, it turns what would otherwise be a silent multi-day hang
-/// into a fast, visible failure instead.
-pub(crate) const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 
 /// Retries `attempt` while — and only while — it fails with
 /// `BUSY_OTHER_SESSION`, for up to `window` (production call sites always
@@ -410,19 +288,19 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = Instant::now() + window;
-    let mut attempt_no: u32 = 0;
+    // 期限・待機時間の判断は`resume_fsm::BusyOtherSessionRetry`(Step 5)。ここは時刻の刻印・
+    // 乱数・待機・ログだけを行う。
+    let clock = ShellClock::new();
+    let mut retry = BusyOtherSessionRetry::start(clock.stamp(), window);
     loop {
         let err = match attempt().await {
             Ok(ok) => return Ok(ok),
             Err(err) => err,
         };
-        let now = Instant::now();
-        if !err.signals_busy_other_session() || now >= deadline {
-            return Err(err);
-        }
-        let delay = RESUME_BACKOFF.next_delay(attempt_no, rand::random()).min(deadline - now);
-        attempt_no = attempt_no.saturating_add(1);
+        let delay = match retry.on_failure(clock.stamp(), err.signals_busy_other_session(), rand::random()) {
+            BusyRetryDecision::GiveUp => return Err(err),
+            BusyRetryDecision::RetryAfter { after } => after,
+        };
         eprintln!(
             "isekai-pipe connect: remote helper reports BUSY_OTHER_SESSION (likely this client's own prior \
              session still parked from an earlier disconnect); retrying in {delay:?}"
@@ -786,45 +664,6 @@ async fn reestablish_control_stream(
     Ok(spawn_app_ack_tasks(control.stream, counters.clone()))
 }
 
-/// The server clamps our request to its own configured max (or applies its
-/// own default when we requested `0`) and echoes back what it actually
-/// granted — that, not our own request, is the real deadline: the server
-/// will have already discarded the parked session past this point
-/// regardless of how long we keep retrying (`ISEKAI_PIPE_DESIGN.md`).
-///
-/// `0` itself is treated as "no real value was ever learned" rather than a
-/// literal zero-second window: `isekai-transport::resume::finish_via_resume`
-/// (the `MustResume` ambiguous-attach convergence path) has no ATTACH_HELLO
-/// exchange to learn the server's actual grant from, and — even after that
-/// function's own fix to fall back to the caller's originally *requested*
-/// grace period instead of hardcoding `0` — a caller that itself requested
-/// `0` (isekai-ssh/isekai-pipe connect's own "let the server pick its
-/// default" convention) still produces `0` here. Without this fallback, any
-/// session that ever passed through that convergence path would give up on
-/// its very first subsequent disconnect instead of resuming at all (codex
-/// review, quicmux-server-resume).
-fn resume_window_for(effective_resume_grace_secs: u32) -> Duration {
-    match effective_resume_grace_secs {
-        0 => DEFAULT_RESUME_WINDOW,
-        secs => Duration::from_secs(secs.into()),
-    }
-}
-
-fn clamp_resume_window(resume_window: Duration, max_resume_window: Option<Duration>) -> Duration {
-    max_resume_window.map(|max| resume_window.min(max)).unwrap_or(resume_window)
-}
-
-/// `run_resume_loop`'s own resume-window computation, factored out so it has
-/// exactly one call site in production code and one in its test (round 3
-/// code review, significant finding on the first cut of this test): a test
-/// that merely *re-derived* `clamp_resume_window(resume_window_for(...), ...)`
-/// inline, rather than calling the same function `run_resume_loop` calls,
-/// couldn't actually catch a regression that dropped the clamp from
-/// `run_resume_loop` itself — it would keep passing because it never
-/// exercises that call site at all.
-fn effective_resume_window(effective_resume_grace_secs: u32, max_resume_window: Option<Duration>) -> Duration {
-    clamp_resume_window(resume_window_for(effective_resume_grace_secs), max_resume_window)
-}
 
 // ── tssh風のライブ再接続表示(`run_resume_loop`専用) ──────────────
 //
@@ -862,23 +701,22 @@ fn format_reconnect_status(is_tty: bool, elapsed_secs: u64, total_secs: u64) -> 
     }
 }
 
-/// Whether [`print_reconnect_status`] should actually print anything yet —
-/// split out as a pure function (same reason [`format_reconnect_status`] is:
-/// `print_reconnect_status` itself does direct stderr I/O, which a unit test
-/// can't easily observe) so the `RECONNECT_NOTIFY_GRACE` boundary is
-/// testable without needing to actually sleep or fake stderr.
+/// The `RECONNECT_NOTIFY_GRACE` boundary itself now lives in
+/// `resume_fsm::reconnect_notify_due` (the reducer only returns
+/// `ResumeCmd::ShowReconnecting`/`announce` once it's past); this adapter
+/// keeps the original `Instant`-based unit tests below pointed at that same
+/// decision.
+#[cfg(test)]
 fn reconnect_notify_due(disconnected_at: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(disconnected_at) >= RECONNECT_NOTIFY_GRACE
+    let elapsed_ms = u64::try_from(now.saturating_duration_since(disconnected_at).as_millis()).unwrap_or(u64::MAX);
+    crate::resume_fsm::reconnect_notify_due(Millis(0), Millis(elapsed_ms))
 }
 
-fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window: Duration) {
-    let now = Instant::now();
-    if !reconnect_notify_due(disconnected_at, now) {
-        // Still within tssh's own silent grace period — a blip this short
-        // is expected to self-heal, so don't alarm the user over it.
-        return;
-    }
-    let elapsed_secs = now.saturating_duration_since(disconnected_at).as_secs();
+/// Renders `ResumeCmd::ShowReconnecting` — the reducer already decided the
+/// grace period is over (tssh's own silent grace period: a blip shorter than
+/// that is expected to self-heal, so nothing is shown for it).
+fn print_reconnect_status(is_tty: bool, elapsed: Duration, resume_window: Duration) {
+    let elapsed_secs = elapsed.as_secs();
     let msg = format_reconnect_status(is_tty, elapsed_secs, resume_window.as_secs());
     if is_tty {
         eprint!("{msg}");
@@ -888,8 +726,9 @@ fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window:
     }
 }
 
-/// `disconnected_at` lets this skip printing anything when the matching
-/// disconnect was itself never announced — still within
+/// Called only for `ResumeCmd::Resumed { announce: true, .. }` — the reducer
+/// sets `announce` to `false` when the matching disconnect was itself never
+/// announced — still within
 /// `RECONNECT_NOTIFY_GRACE` of `disconnected_at` (`/code-review` on
 /// `isekai-ssh` PR #115, round 2: without this, a blip that self-healed via
 /// `promote_warm_standby_once` or the first `reconnect_and_resume` attempt
@@ -897,10 +736,7 @@ fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window:
 /// "reconnected." with no matching "connection lost" ever shown — exactly
 /// the kind of surprising, unattributable message this tssh-style grace
 /// period exists to avoid).
-fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId, disconnected_at: Instant) {
-    if !reconnect_notify_due(disconnected_at, Instant::now()) {
-        return;
-    }
+fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId) {
     if is_tty {
         eprintln!("\r\x1b[0;32misekai-pipe connect: reconnected.\x1b[0m\x1b[K");
     } else {
@@ -1008,43 +844,36 @@ struct ResumeLoopState {
     /// メッセージに"Last error: ..."として付け足す。再接続成功のたびに
     /// `None`へリセットされる。
     last_resume_error: Option<String>,
-    /// `UnknownSession`が何回連続で返ってきたか。サーバ側`RESUME`ハンドラ
-    /// (`isekai-pipe serve`側`engine/mod.rs::handle_resume`相当)は、
-    /// 「session_idがテーブルに無い」(本当に消滅)だけでなく「テーブルには
-    /// あるがまだparkされていない」(直前のdata streamのresetをまだ処理し
-    /// 終えていない一時的な状態、`parked_tcp == None`)や「fencing slotが
-    /// 一致しない」場合も同じ`UnknownToken`/`UnknownSession`を返す
-    /// (ワイヤに複数の意味を1値へ潰しているため区別できない)。1回だけで
-    /// 即terminal扱いすると、この一時的なraceを本当に消滅したものと誤認して
-    /// 本来resumeできたはずのセッションを早まって諦めてしまう
-    /// (Codexレビューで指摘、実際に`engine/mod.rs`の該当箇所を確認して
-    /// 再現条件を特定した)。`resume_with_backoff_until_deadline`はこの
-    /// カウンタが`UNKNOWN_SESSION_CONFIRM_THRESHOLD`に達したときだけ
-    /// give upする——「毎回同じ確定的signalが返り続けている」ことでしか
-    /// 本物の消滅とは区別できないため。
-    consecutive_unknown_session: u32,
+    // `consecutive_unknown_session`(UnknownSessionの連続回数)はStep 5で
+    // `resume_fsm::ResumePlanner`の状態へ移った(判断に使う値なのでreducerが持つ)。
+}
+
+/// A successfully resumed connection, before the shell has re-established its
+/// control stream — produced by either `DialPath::WarmStandby`
+/// (`promote_warm_standby_once`) or `DialPath::Primary`/`CrossFamily`
+/// (`reconnect_and_resume` + replay), and consumed by the interpreter's
+/// `ResumeCmd::Resumed` arm.
+struct ResumedConnection {
+    connection: AnyMuxConnection,
+    data_stream: AnyByteStream,
+    network_rebinder: Option<AnyMuxRebinder>,
 }
 
 /// Fast path: promote the already-warm standby connection instead of
 /// waiting through `resume_with_backoff_until_deadline`'s backoff loop — the
 /// entire point of keeping one warm (`warm_standby.rs`'s module docs).
-/// Returns `Some(stream)` only once promotion, replay, and (best-effort)
-/// control-stream re-establishment have all been attempted; a missing
-/// standby, an in-flight promotion, a transport failure, or a replay
-/// mismatch all return `None`, and every `None` here falls straight through
-/// to the caller's ordinary `reconnect_and_resume` retry loop unchanged —
-/// this is a latency optimization, not a correctness dependency. On
-/// success, clears `state.network_rebinder`: the promoted connection was
-/// dialed directly by `WarmStandby`, not via the endpoint this generation's
-/// rebinder came from, so there is no rebinder to carry over — the next
-/// disconnect just falls back to a full resume, same as any other
-/// rebinder-less generation.
-async fn promote_warm_standby_once(
-    warm_standby: &isekai_transport::WarmStandby,
-    target: &RelayTarget,
-    state: &mut ResumeLoopState,
-    disconnected_at: Instant,
-) -> Option<AnyByteStream> {
+/// Returns `Some(..)` only once promotion and replay have both succeeded
+/// (the reconnect notice and control-stream re-establishment then happen in
+/// the interpreter's `ResumeCmd::Resumed` arm, in the same order as before
+/// Step 5); a missing standby, an in-flight promotion, a transport failure,
+/// or a replay mismatch all return `None`, which the reducer turns into the
+/// ordinary `reconnect_and_resume` retry loop unchanged — this is a latency
+/// optimization, not a correctness dependency. On success, the returned
+/// `network_rebinder` is `None`: the promoted connection was dialed directly
+/// by `WarmStandby`, not via the endpoint this generation's rebinder came
+/// from, so there is no rebinder to carry over — the next disconnect just
+/// falls back to a full resume, same as any other rebinder-less generation.
+async fn promote_warm_standby_once(warm_standby: &isekai_transport::WarmStandby, state: &mut ResumeLoopState) -> Option<ResumedConnection> {
     let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
     let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
     let mut promoted = match warm_standby.promote(client_sent_offset, client_delivered_offset).await {
@@ -1070,67 +899,43 @@ async fn promote_warm_standby_once(
         return None;
     }
     log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={}", state.session_id);
-    print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
-    match reestablish_control_stream(&promoted.connection, &target.session_secret, &state.counters).await {
-        Ok(new_tasks) => state.app_ack_tasks = new_tasks,
-        Err(e) => eprintln!(
-            "isekai-pipe connect: control stream re-establishment after promote failed ({e:#}), \
-             continuing without resume support until the next reattach"
-        ),
-    }
-    drop(promoted.connection);
-    state.network_rebinder = None;
-    Some(promoted.data_stream)
+    Some(ResumedConnection { connection: promoted.connection, data_stream: promoted.data_stream, network_rebinder: None })
 }
 
-/// The ordinary `reconnect_and_resume` retry loop, run until either a resume
-/// attempt succeeds or `deadline` passes. Returns `Ok(stream)` on success
-/// (having also re-established the control stream and updated
-/// `state.network_rebinder`); returns `Err` once `deadline` has passed,
-/// having printed a final give-up message and aborted `warm_standby_task`
-/// (Epic R PR1, B6: no longer closes `stdout` itself — see `give_up`'s own
-/// docs for why) — the caller propagates this `Err` (e.g. via `?`) so it
-/// eventually reaches
-/// `connect_command`'s `Err` arm and `write_connect_outcome_for_wrapper`
-/// classifies it as `ConnectOutcomeClass::Unreachable`, letting `isekai-ssh`'s
-/// wrapper auto-retry (`.claude/rules/always-connects.md`) instead of the
-/// give-up silently looking like a clean exit to everything downstream of
-/// this function.
-///
-/// Each backoff wait races against `network_monitor.next_change()`: unlike
-/// `spawn_reconnect_signal` (which only watches while a connection is
-/// actually up, to detect the *first* disconnect early), this is watched
-/// while already disconnected and retrying, so a fresh OS network-change
-/// event (e.g. the new interface/route finishing DHCP after the earlier
-/// disconnect) cuts the remaining backoff short and retries immediately
-/// instead of blindly waiting out `RESUME_BACKOFF`. `network_monitor` is a
-/// fresh instance the caller creates per disconnect episode (mirroring
-/// `spawn_reconnect_signal`'s own one-per-generation rule) — passed in
-/// rather than constructed here so tests can inject a controllable mock.
-/// How many *consecutive* `UnknownSession` rejections
-/// `resume_with_backoff_until_deadline` requires before treating the
-/// session as genuinely, permanently gone — see `is_unknown_session_rejection`'s
-/// docs for why a single occurrence isn't proof enough.
-const UNKNOWN_SESSION_CONFIRM_THRESHOLD: u32 = 3;
-
-/// Minimum time since disconnect that must have elapsed before
-/// `UNKNOWN_SESSION_CONFIRM_THRESHOLD` consecutive rejections are trusted as
-/// proof of permanent loss, required *in addition to* the streak count
-/// above. At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, ...) 3 consecutive
-/// attempts land around t≈3.5s — comfortably inside `isekai-pipe serve
-/// --idle-timeout`'s default (15s) worst case for the "not-yet-parked"
-/// race `is_unknown_session_rejection` describes: a "break-before-make"
-/// roam (Wi-Fi drop, AP switch, airplane mode) means the client's
-/// `quic_write.reset(0)` on the *old* path never reaches the server, so the
-/// server can only notice the old connection died via its own QUIC idle
-/// timeout, not the explicit reset — the fast path this streak was tuned
-/// around. Without this floor, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` alone
-/// would misfire and kill exactly the roaming reconnects this project's
-/// resumable transport exists to survive (`CLAUDE.md`'s differentiator:
-/// "QUIC接続耐性(ローミング...)"). 30s is double the idle-timeout default,
-/// leaving margin without meaningfully eating into the (now days-long)
-/// deadline a truly-dead session would otherwise be retried against.
-const UNKNOWN_SESSION_MIN_ELAPSED_FLOOR: Duration = Duration::from_secs(30);
+/// One `reconnect_and_resume` attempt against `target`, plus the replay of
+/// unacknowledged C2H bytes onto the resumed stream. Classifies a failure
+/// for the reducer (`AttemptFailure`) and returns the human-readable message
+/// separately — the reducer decides *whether* it gets reported
+/// (`ResumeCmd::ReportAttemptFailure` is not issued for the attempt that
+/// ends the episode with a `SessionGone` give-up, same as before Step 5).
+async fn dial_and_replay(
+    factory: &AnyMuxFactory,
+    target: &RelayTarget,
+    state: &ResumeLoopState,
+) -> Result<ResumedConnection, (AttemptFailure, String)> {
+    let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
+    let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
+    match reconnect_and_resume(factory, target, state.session_id, client_sent_offset, client_delivered_offset).await {
+        Ok(mut resumed) => {
+            if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+                // resume自体は成功したがreplayが不整合 —実質「この試行は
+                // 失敗した」ので、通常の失敗と同じTTY/非TTY分岐・
+                // last_resume_error更新を行う(codexレビューで指摘: この
+                // 経路だけ元々何も表示せずlast_resume_errorも更新していなかった)。
+                return Err((AttemptFailure::ReplayFailed, "resume succeeded but replay failed".to_string()));
+            }
+            Ok(ResumedConnection {
+                connection: resumed.connection,
+                data_stream: resumed.data_stream,
+                network_rebinder: resumed.network_rebinder,
+            })
+        }
+        Err(e) => {
+            let kind = if is_unknown_session_rejection(&e) { AttemptFailure::UnknownSession } else { AttemptFailure::Other };
+            Err((kind, format!("{e:#}")))
+        }
+    }
+}
 
 /// `UnknownSession` is the wire reason for three different server-side
 /// situations that `isekai-pipe serve`'s `RESUME` handler
@@ -1145,7 +950,8 @@ const UNKNOWN_SESSION_MIN_ELAPSED_FLOOR: Duration = Duration::from_secs(30);
 /// apart, a *single* `UnknownSession` is not reliable proof of permanent
 /// loss (confirmed by reading `engine/mod.rs`'s `RESUME` handler directly,
 /// per a Codex review finding) — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
-/// consecutive occurrences are treated as such by the caller.
+/// consecutive occurrences are treated as such by the reducer
+/// (`resume_fsm::update_unknown_session_streak`).
 /// `Auth`/`OffsetGone` and any non-rejection `TransportError` (network/mux
 /// failures) are left to the existing deadline-bound retry loop unchanged —
 /// those are rejections of a *specific attempt*, not proof the session
@@ -1156,25 +962,6 @@ fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
         e,
         isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
     )
-}
-
-/// Pure decision core of the `UnknownSession` streak-tracking described on
-/// `ResumeLoopState::consecutive_unknown_session`'s docs, factored out so it
-/// can be unit-tested without a real `AnyMuxFactory`/network dial (unlike
-/// `resume_with_backoff_until_deadline` itself). Given the streak length
-/// going into this attempt, whether this attempt's error was an
-/// `UnknownSession` rejection, and how long it's been since the disconnect
-/// that started this episode, returns the streak length coming out of it
-/// and whether the caller should give up now — both the streak count *and*
-/// `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` must be satisfied (see that
-/// constant's docs for why the streak alone isn't enough).
-fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool, elapsed_since_disconnect: Duration) -> (u32, bool) {
-    if !is_unknown_session {
-        return (0, false);
-    }
-    let streak = previous_streak.saturating_add(1);
-    let should_give_up = streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD && elapsed_since_disconnect >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR;
-    (streak, should_give_up)
 }
 
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
@@ -1215,335 +1002,214 @@ fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>
     }
 }
 
-/// The time-related values that decide how long [`resume_with_backoff_until_deadline`]
-/// keeps retrying and whether it may give up early. `max_resume_window` is
-/// the STUN-only client-side clamp already applied by `run_resume_loop`;
-/// when present (`Some`), this helper also suppresses desktop give-up
-/// notifications so repeated lightweight STUN retries do not spam the user.
-/// Kept as `Option<Duration>`, not `Duration`, since `None`-ness itself is
-/// the branch condition.
-struct ResumeDeadlinePolicy {
-    resume_window: Duration,
-    disconnected_at: Instant,
-    deadline: Instant,
-    max_resume_window: Option<Duration>,
-}
-
 /// Records `"continuity-lost"` (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)
-/// the moment [`resume_with_backoff_until_deadline`] gives up while on the
-/// cross-family relay target — whether that's *this* call's own bounded
-/// probe (`switched_this_call.is_some()`) or a later episode that already
-/// proved the target reachable (`already_cross_family`) — distinguishing
-/// *why* it gave up (`reason`: `"relay-unreachable"` for the deadline
-/// give-up, `"session-gone"` for the confirmed `UnknownSession` streak
-/// give-up) so §3.3's unverified "cached_relay_addr reachable from the new
-/// network" assumption can be checked against real data. No-op (not even the
-/// log line) unless one of the two flags is set — callers don't need to gate
-/// the call themselves.
-///
-/// Factored out (`/code-review` finding on this ADR's implementation) so the
-/// two give-up sites that need this can't drift from each other on the
-/// guard condition or the telemetry call's fixed argument shape, the way
-/// this ADR's own switch-window logic already drifted twice across review
-/// rounds (C1, R1).
-fn record_continuity_lost_if_applicable(already_cross_family: bool, switched_this_call: bool, session_id: isekai_transport::SessionId, reason: &str) {
-    if !already_cross_family && !switched_this_call {
-        return;
-    }
-    log::info!("isekai-pipe connect: continuity-lost reason: {reason}");
+/// for a give-up while on the cross-family relay target. *Whether* to record
+/// (this episode's own bounded probe, or a later episode that already proved
+/// the target reachable) and *why* (`relay-unreachable` for the deadline
+/// give-up, `session-gone` for the confirmed `UnknownSession` streak) are
+/// decided by the reducer (`ResumeCmd::GiveUp::continuity_lost`, Step 5) so
+/// the two give-up sites can't drift from each other on the guard condition.
+fn record_continuity_lost(session_id: isekai_transport::SessionId, reason: ContinuityLost) {
+    log::info!("isekai-pipe connect: continuity-lost reason: {}", reason.as_str());
     isekai_transport::telemetry::log_rendezvous_outcome(Some(session_id), None, "continuity-lost", 0, Duration::ZERO);
 }
 
-/// Whether a switch made *now* would still get at least one real probe in
-/// before the current `deadline` — see [`CROSS_FAMILY_MIN_PROBE_BUDGET`].
-///
-/// Switching without this is worse than not switching: the very next thing
-/// `resume_with_backoff_until_deadline` does is its loop-top deadline
-/// give-up, which then records `continuity-lost` / `"relay-unreachable"`
-/// for an episode that never sent a single packet to the relay — the same
-/// ADR §6 denominator inflation N1 (opus review round 4) closed at the
-/// *other* give-up site (the `UnknownSession`-streak one), reached here
-/// through the residual gap round 4's own N2 recorded as harmless (opus
-/// review round 5 on this ADR's implementation).
-fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bool {
-    remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
+/// The concrete targets the reducer's opaque `DialPath` refers to, for one
+/// `run_resume_loop` call. Kept in the shell so no session secret ever enters
+/// a reducer Event/Cmd (ADR_FUNCTIONAL_CORE_EFFECTS.md §3-3).
+struct ResumeTargets<'a> {
+    primary: &'a RelayTarget,
+    cross_family: Option<&'a RelayTarget>,
 }
 
-/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
-/// §3.2 task 1's second disjunct), made deadline-aware.
-///
-/// The count alone can silently *never* fire whenever the episode's
-/// deadline is shorter than what reaching `switch_attempts_before_cross_
-/// family` failures actually takes — see `STUN_TO_CROSS_FAMILY_SWITCH_
-/// ATTEMPTS`'s own docs (opus review round 5 on this ADR's implementation).
-/// That is the same "silently degrades back into waiting out the whole
-/// window" failure ADR §3.2 task 1 forbids, arrived at from the other side:
-/// so this also switches once what remains of the window stops being any
-/// bigger than the cross-family probe itself would want — at that point
-/// another bare redial against the *original* target can only consume the
-/// remaining window, while the fallback can still change the outcome.
-///
-/// Deliberately *lowers* the deadline's meaning here, never raises it — the
-/// client must never retry past the server's own grant, which is also what
-/// discards the parked session (`resume_window_for`'s own docs,
-/// `engine/mod.rs`'s `max_parked`/`effective_resume_grace`) — so this
-/// cannot be satisfied by widening `remaining_before_deadline` itself, only
-/// by switching sooner within it.
-fn should_switch_to_cross_family(stun_failures: u32, switch_attempts_before_cross_family: u32, remaining_before_deadline: Duration) -> bool {
-    cross_family_probe_fits(remaining_before_deadline)
-        && (stun_failures >= switch_attempts_before_cross_family || remaining_before_deadline <= CROSS_FAMILY_SWITCH_DEADLINE)
+impl ResumeTargets<'_> {
+    fn for_path(&self, path: DialPath) -> &RelayTarget {
+        match path {
+            DialPath::WarmStandby | DialPath::Primary => self.primary,
+            // The reducer only issues `CrossFamily` after a switch, which it only
+            // makes when `has_cross_family_target` was set from `cross_family.is_some()`.
+            DialPath::CrossFamily => {
+                debug_assert!(self.cross_family.is_some(), "the planner switched to a cross-family target that does not exist");
+                self.cross_family.unwrap_or(self.primary)
+            }
+        }
+    }
 }
 
-/// The four [`ResumeDeadlinePolicy`]-shaped values that change the moment
-/// [`resume_with_backoff_until_deadline`] switches to the cross-family relay
-/// target — computed once here (`/code-review` finding on this ADR's
-/// implementation: the two call sites that trigger a switch used to
-/// recompute all four inline, identically apart from the trigger's own log
-/// message) so they can't drift from each other. See `CROSS_FAMILY_SWITCH_
-/// DEADLINE`'s own doc for why the budget is anchored to *now*, not to
-/// `disconnected_at`.
-struct CrossFamilySwitchBudget {
-    max_resume_window: Option<Duration>,
-    resume_window: Duration,
-    deadline: Instant,
+/// Interprets `ResumeCmd::ShowReconnecting` from a TTY live-status tick
+/// (`ResumeEvent::Tick`) — the only command a `Tick` can produce. Every other
+/// variant is listed explicitly (ADR §3-8/Step 7a) and only logged, since the
+/// reducer never returns it for a `Tick`.
+#[deny(clippy::wildcard_enum_match_arm)]
+fn interpret_tick_cmds(cmds: Vec<ResumeCmd>) {
+    for cmd in cmds {
+        match cmd {
+            ResumeCmd::ShowReconnecting { elapsed, resume_window } => print_reconnect_status(true, elapsed, resume_window),
+            ResumeCmd::Backoff { .. }
+            | ResumeCmd::Dial { .. }
+            | ResumeCmd::SwitchedToCrossFamily { .. }
+            | ResumeCmd::ReportAttemptFailure { .. }
+            | ResumeCmd::Resumed { .. }
+            | ResumeCmd::GiveUp { .. } => log::warn!("isekai-pipe connect: unexpected resume command from a status tick: {cmd:?}"),
+        }
+    }
 }
 
-fn cross_family_switch_budget(disconnected_at: Instant, effective_resume_grace_secs: u32) -> CrossFamilySwitchBudget {
-    let elapsed_since_disconnect = Instant::now().saturating_duration_since(disconnected_at);
-    let max_resume_window = Some((elapsed_since_disconnect + CROSS_FAMILY_SWITCH_DEADLINE).max(UNKNOWN_SESSION_MIN_ELAPSED_FLOOR));
-    let resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
-    CrossFamilySwitchBudget { max_resume_window, resume_window, deadline: disconnected_at + resume_window }
-}
-
-/// The full switch side-effect, applied at either of [`resume_with_backoff_
-/// until_deadline`]'s two trigger sites (the `NetworkChanged` wait outcome,
-/// and the failure-count/deadline-imminent check in the `Err` arm): point
-/// `current_target` at `fallback_target`, install its
-/// [`cross_family_switch_budget`], mark `switched_this_call`, and reset
-/// `attempt` so the new target's first backoff delay doesn't inherit a
-/// stale, possibly near-`RESUME_BACKOFF`-max count from the target it's
-/// replacing.
+/// The ordinary resume retry loop for one disconnect episode — the shell
+/// (interpreter) half of `resume_fsm::ResumePlanner` (ADR_FUNCTIONAL_CORE_EFFECTS.md
+/// §6 Step 5). Every decision (deadline, backoff length, when to give up,
+/// when to switch to the cross-family relay target, whether to announce) is
+/// the reducer's; this function only executes `ResumeCmd`s — waits, dials,
+/// prints, telemetry — and feeds the results back as `ResumeEvent`s stamped
+/// with `clock.stamp()`, until the reducer returns `Resumed` or `GiveUp`.
 ///
-/// Factored out (`/code-review` finding on this ADR's implementation,
-/// reported independently by three review passes) because this exact block
-/// — previously duplicated verbatim at both call sites apart from their log
-/// message — is precisely the kind of switch-mechanics detail that has
-/// already drifted out of sync across this ADR's own review rounds (C1,
-/// R1, N1, N2, round 5's deadline-aware trigger): one shared function means
-/// a future change to what "switching" does can't update one site and miss
-/// the other.
+/// Returns `Ok((stream, via))` on success (having also re-established the
+/// control stream and updated `state.network_rebinder`); returns `Err` on
+/// `GiveUp`, having printed a final give-up message and aborted
+/// `warm_standby_task` (Epic R PR1, B6: no longer closes `stdout` itself —
+/// see `give_up`'s own docs for why) — the caller propagates this `Err`
+/// (e.g. via `?`) so it eventually reaches `connect_command`'s `Err` arm and
+/// `write_connect_outcome_for_wrapper` classifies it as
+/// `ConnectOutcomeClass::Unreachable`, letting `isekai-ssh`'s wrapper
+/// auto-retry (`.claude/rules/always-connects.md`) instead of the give-up
+/// silently looking like a clean exit to everything downstream of this
+/// function (03224b11).
 ///
-/// Deliberately does **not** reset `state.consecutive_unknown_session`
-/// (`/code-review` finding on this ADR's implementation raised this as a
-/// possible bug — confirmed not one): that streak is ADR_STUN_REESTABLISH_
-/// CONTINUITY.md §3.2 task 4's explicit design, carried session-wide rather
-/// than per-target, because an `UnknownSession` rejection is the *server*
-/// asserting it doesn't know this `session_id` — a claim about the session,
-/// not about which network path was used to ask. A rejection observed via
-/// the abandoned STUN target and one observed via the fresh cross-family
-/// target are two independent confirmations of the *same* claim, not stale
-/// evidence about a different target (opus review round 1's "OK-2" already
-/// reached this conclusion for the pre-switch code; it still holds here).
-fn apply_cross_family_switch<'a>(
-    fallback_target: &'a RelayTarget,
-    disconnected_at: Instant,
-    effective_resume_grace_secs: u32,
-    current_target: &mut &'a RelayTarget,
-    max_resume_window: &mut Option<Duration>,
-    resume_window: &mut Duration,
-    deadline: &mut Instant,
-    switched_this_call: &mut Option<RelayTarget>,
-    attempt: &mut u32,
-) {
-    *current_target = fallback_target;
-    let budget = cross_family_switch_budget(disconnected_at, effective_resume_grace_secs);
-    *max_resume_window = budget.max_resume_window;
-    *resume_window = budget.resume_window;
-    *deadline = budget.deadline;
-    *switched_this_call = Some(fallback_target.clone());
-    *attempt = 0;
-}
-
+/// Each backoff wait races against `network_monitor.next_change()`: unlike
+/// `spawn_reconnect_signal` (which only watches while a connection is
+/// actually up, to detect the *first* disconnect early), this is watched
+/// while already disconnected and retrying, so a fresh OS network-change
+/// event (e.g. the new interface/route finishing DHCP after the earlier
+/// disconnect) cuts the remaining backoff short and retries immediately
+/// instead of blindly waiting out `RESUME_BACKOFF`. The monitor is created
+/// by `new_network_monitor` lazily, at this episode's first backoff wait
+/// (i.e. after any warm-standby promotion attempt, as before Step 5), once
+/// per episode (mirroring `spawn_reconnect_signal`'s own one-per-generation
+/// rule) — a constructor rather than a constructed monitor so tests can
+/// inject a controllable mock.
+#[deny(clippy::wildcard_enum_match_arm)]
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
-    target: &RelayTarget,
-    cross_family_target: Option<&RelayTarget>,
-    episode_started_by_network_change: bool,
-    already_cross_family: bool,
-    effective_resume_grace_secs: u32,
+    targets: &ResumeTargets<'_>,
+    warm_standby: Option<&isekai_transport::WarmStandby>,
     profile: &str,
-    policy: ResumeDeadlinePolicy,
+    planner: &mut ResumePlanner,
+    clock: &ShellClock,
+    initial_cmds: Vec<ResumeCmd>,
     state: &mut ResumeLoopState,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
-    network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) -> Result<(AnyByteStream, Option<RelayTarget>)> {
-    let ResumeDeadlinePolicy { mut resume_window, disconnected_at, mut deadline, mut max_resume_window } = policy;
-    let mut current_target: &RelayTarget = target;
-    let mut switched_this_call: Option<RelayTarget> = None;
-    let mut stun_failures: u32 = 0;
-    // Deliberately no "switch before the first attempt" branch here even
-    // when `episode_started_by_network_change` is true (opus review round on
-    // this ADR's implementation, finding M3): the OS's network-change
-    // monitor also fires for changes that never affect this client's actual
-    // reachability (VPN/tailscale interface flapping, suspend/resume,
-    // secondary-NIC DHCP renewal, ...), and switching away from a perfectly
-    // healthy STUN P2P session on every such event would be a silent,
-    // one-way (see `switched_this_call`'s doc below) downgrade for the rest
-    // of the connection's life. `switch_attempts_before_cross_family` below
-    // gives a network-change-started episode exactly one real attempt
-    // against `current_target` (RESUME_BACKOFF's own first delay, ~500ms)
-    // before switching — still nowhere near the 120s ADR §3.2 task 1 says
-    // not to wait out, but no longer zero attempts either.
-    let switch_attempts_before_cross_family = if episode_started_by_network_change { 1 } else { STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS };
-    let mut attempt: u32 = 0;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            let exceeded_by = now.saturating_duration_since(deadline);
-            let last_error_suffix = state
-                .last_resume_error
-                .as_deref()
-                .map(|e| format!(" Last error: {e}."))
-                .unwrap_or_default();
-            let session_id = state.session_id;
-            give_up(
-                state.is_tty,
-                warm_standby_task,
-                &format!(
-                    "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                     the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
-                     Ending this connect attempt; ssh will treat this as a lost connection.",
-                ),
-            );
-            if max_resume_window.is_none() {
-                notify_os(
-                    "isekai-pipe connect",
-                    &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
-                );
+    new_network_monitor: &mut (dyn FnMut() -> Box<dyn isekai_netmon::NetworkChangeMonitor> + Send),
+) -> Result<(AnyByteStream, DialPath)> {
+    let mut pending: VecDeque<ResumeCmd> = initial_cmds.into();
+    let mut network_monitor: Option<Box<dyn isekai_netmon::NetworkChangeMonitor>> = None;
+    let mut resumed: Option<ResumedConnection> = None;
+    // The message for the most recent failed `Dial`, reported (or not) by the
+    // reducer's `ReportAttemptFailure` right after it.
+    let mut last_failure: Option<(AttemptFailure, String)> = None;
+    while let Some(cmd) = pending.pop_front() {
+        let event = match cmd {
+            ResumeCmd::ShowReconnecting { elapsed, resume_window } => {
+                print_reconnect_status(state.is_tty, elapsed, resume_window);
+                None
             }
-            // The deadline give-up while on the cross-family relay target
-            // means every attempt against it kept failing with a
-            // network/mux error long enough to exhaust the window — never
-            // an `UnknownSession` rejection, or the streak give-up below
-            // would have fired first.
-            record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "relay-unreachable");
-            return Err(anyhow::anyhow!(
-                "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
-                 for '{profile}'.{last_error_suffix}"
-            ));
-        }
-
-        let delay = RESUME_BACKOFF.next_delay(attempt, rand::random()).min(deadline - now);
-        attempt = attempt.saturating_add(1);
-        let backoff_wait_outcome = wait_backoff_or_network_change(
-            delay,
-            state.is_tty,
-            || print_reconnect_status(true, disconnected_at, resume_window),
-            network_monitor,
-        )
-        .await;
-        // Only the `NetworkChanged`-interrupted-a-wait trigger lives here —
-        // the "enough consecutive failures" trigger is checked later, in
-        // the `Err` arm below (after its own give-up check — see that
-        // block's comment for why), *before* this function waits out
-        // another backoff delay for an attempt it's about to abandon
-        // anyway (`/code-review` finding on this ADR's implementation:
-        // originally checking the failure-count trigger only here, at the
-        // top of the *next* iteration, meant the actual switch always
-        // waited through one extra backoff delay beyond
-        // `STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS`'s own "roughly 15s" doc —
-        // e.g. its full 10s-capped 6th wait, landing at ~25.5s instead).
-        // `stun_failures >= 1` still guards this: a network-change signal
-        // arriving before the very first attempt against `current_target`
-        // is the M3/R2 zero-attempt-switch hole this ADR's implementation
-        // already closed once and must not reopen here.
-        //
-        // `cross_family_probe_fits` is checked directly (not via
-        // `should_switch_to_cross_family`) — that function's OR branch can
-        // be true even at `stun_failures == 0`, which would reopen the
-        // exact M3/R2 hole the line above just closed (opus review round 5
-        // on this ADR's implementation, explicit warning against reusing it
-        // here). Without this guard, a network-change signal arriving with
-        // little of the deadline left would switch to a target it then
-        // never actually probes — the loop's very next deadline check gives
-        // up immediately and wrongly records `continuity-lost /
-        // "relay-unreachable"` (round 4's N2, "harmless" at the time,
-        // turned out to have this real cost after all).
-        if switched_this_call.is_none()
-            && backoff_wait_outcome == BackoffWaitOutcome::NetworkChanged
-            && stun_failures >= 1
-            && cross_family_probe_fits(deadline.saturating_duration_since(Instant::now()))
-        {
-            if let Some(fallback_target) = cross_family_target {
-                log::info!(
-                    "isekai-pipe connect: switching to cross-family relay fallback \
-                     (OS reported another network change while backing off)"
-                );
-                apply_cross_family_switch(
-                    fallback_target,
-                    disconnected_at,
-                    effective_resume_grace_secs,
-                    &mut current_target,
-                    &mut max_resume_window,
-                    &mut resume_window,
-                    &mut deadline,
-                    &mut switched_this_call,
-                    &mut attempt,
-                );
+            ResumeCmd::Backoff { token, after } => {
+                let monitor = network_monitor.get_or_insert_with(|| new_network_monitor());
+                let outcome = wait_backoff_or_network_change(
+                    after,
+                    state.is_tty,
+                    || interpret_tick_cmds(planner.apply(ResumeEvent::Tick { now: clock.stamp() })),
+                    &mut **monitor,
+                )
+                .await;
+                Some(ResumeEvent::BackoffElapsed {
+                    token,
+                    now: clock.stamp(),
+                    network_changed: outcome == BackoffWaitOutcome::NetworkChanged,
+                })
             }
-        }
-
-        let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
-        let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
-        match reconnect_and_resume(
-            factory,
-            current_target,
-            state.session_id,
-            client_sent_offset,
-            client_delivered_offset,
-        )
-        .await
-        {
-            Ok(mut resumed) => {
-                // A successful RESUME_ACK is proof the session was known and
-                // parked — whatever streak of `UnknownSession` preceded it
-                // (if any) was the transient not-yet-parked race, not
-                // genuine loss.
-                state.consecutive_unknown_session = 0;
-                if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
-                    // resume自体は成功したがreplayが不整合 —実質「この試行は
-                    // 失敗した」ので、既存のErr(e)アームと同じTTY/非TTY分岐・
-                    // last_resume_error更新を行う(codexレビューで指摘: この
-                    // continue経路だけ元々何も表示せずlast_resume_errorも
-                    // 更新していなかった)。
-                    let msg = "resume succeeded but replay failed".to_string();
-                    if state.is_tty {
-                        log::debug!("isekai-pipe connect: resume attempt {attempt} {msg}");
-                    } else {
-                        eprintln!("isekai-pipe connect: resume attempt {attempt} {msg}");
+            ResumeCmd::Dial { token, path } => {
+                let result = match path {
+                    DialPath::WarmStandby => match warm_standby {
+                        Some(ws) => promote_warm_standby_once(ws, state).await.ok_or(AttemptFailure::Other),
+                        None => Err(AttemptFailure::Other),
+                    },
+                    DialPath::Primary | DialPath::CrossFamily => {
+                        dial_and_replay(factory, targets.for_path(path), state).await.map_err(|(kind, msg)| {
+                            last_failure = Some((kind, msg));
+                            kind
+                        })
                     }
-                    state.last_resume_error = Some(msg);
-                    continue;
+                };
+                match result {
+                    Ok(connection) => {
+                        resumed = Some(connection);
+                        Some(ResumeEvent::AttemptOk { token, now: clock.stamp() })
+                    }
+                    Err(kind) => Some(ResumeEvent::AttemptFailed { token, now: clock.stamp(), kind, jitter_seed: rand::random() }),
                 }
-                print_reconnect_success(state.is_tty, state.session_id, disconnected_at);
-                match reestablish_control_stream(&resumed.connection, &current_target.session_secret, &state.counters).await {
-                    Ok(new_tasks) => state.app_ack_tasks = new_tasks,
-                    Err(e) => eprintln!(
-                        "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
-                         continuing without resume support until the next reattach"
+            }
+            ResumeCmd::SwitchedToCrossFamily { trigger } => {
+                match trigger {
+                    SwitchTrigger::NetworkChangeWhileBackingOff => log::info!(
+                        "isekai-pipe connect: switching to cross-family relay fallback \
+                         (OS reported another network change while backing off)"
+                    ),
+                    SwitchTrigger::FailuresOrDeadline => log::info!(
+                        "isekai-pipe connect: switching to cross-family relay fallback \
+                         (the original STUN peer failed enough consecutive bare-redial attempts, \
+                         or too little of the resume window remains to keep retrying it)"
                     ),
                 }
-                drop(resumed.connection);
-                state.network_rebinder = resumed.network_rebinder;
-                if switched_this_call.is_some() {
+                None
+            }
+            ResumeCmd::ReportAttemptFailure { attempt } => {
+                if let Some((kind, msg)) = last_failure.take() {
+                    // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると
+                    // UXを壊すため、個々の失敗はdebugログへ格下げする(既定の
+                    // `info`フィルタでは表示されない、`RUST_LOG=debug`で見られる)。
+                    // 非TTY(ログファイル等)では引き続きeprintln!のまま残す —
+                    // ログでは個々の失敗を追えることの方が重要なため。
+                    let line = match kind {
+                        AttemptFailure::ReplayFailed => format!("isekai-pipe connect: resume attempt {attempt} {msg}"),
+                        AttemptFailure::UnknownSession | AttemptFailure::Other => {
+                            format!("isekai-pipe connect: resume attempt {attempt} failed: {msg}")
+                        }
+                    };
+                    if state.is_tty {
+                        log::debug!("{line}");
+                    } else {
+                        eprintln!("{line}");
+                    }
+                    state.last_resume_error = Some(msg);
+                }
+                None
+            }
+            ResumeCmd::Resumed { via, announce, cross_family_switched } => {
+                let Some(connection) = resumed.take() else {
+                    return Err(anyhow::anyhow!("internal: resume planner reported success without a resumed connection"));
+                };
+                if announce {
+                    print_reconnect_success(state.is_tty, state.session_id);
+                }
+                match reestablish_control_stream(&connection.connection, &targets.for_path(via).session_secret, &state.counters).await {
+                    Ok(new_tasks) => state.app_ack_tasks = new_tasks,
+                    Err(e) => eprintln!(
+                        "isekai-pipe connect: control stream re-establishment after {} failed ({e:#}), \
+                         continuing without resume support until the next reattach",
+                        match via {
+                            DialPath::WarmStandby => "promote",
+                            DialPath::Primary | DialPath::CrossFamily => "resume",
+                        }
+                    ),
+                }
+                drop(connection.connection);
+                state.network_rebinder = connection.network_rebinder;
+                if cross_family_switched {
                     // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: only
                     // logged the one time the switch actually happens in
-                    // this call — deliberately *not* gated on
-                    // `already_cross_family` too, since that would repeat
-                    // this event on every later successful resume against
-                    // the now-permanent relay target for the rest of the
-                    // session, which isn't what this event is meant to mark
-                    // (the transition, not every subsequent resume).
+                    // this episode — not on every later successful resume
+                    // against the now-permanent relay target (the reducer
+                    // only sets this for the episode that switched).
                     isekai_transport::telemetry::log_rendezvous_outcome(
                         Some(state.session_id),
                         Some(state.session_id),
@@ -1552,114 +1218,69 @@ async fn resume_with_backoff_until_deadline(
                         Duration::ZERO,
                     );
                 }
-                return Ok((resumed.data_stream, switched_this_call));
+                return Ok((connection.data_stream, via));
             }
-            Err(e) => {
-                if switched_this_call.is_none() {
-                    stun_failures = stun_failures.saturating_add(1);
-                }
-                // See `is_unknown_session_rejection`'s docs: a single
-                // occurrence isn't reliable proof the session is gone for
-                // good (it's also what a transient not-yet-parked race on
-                // the server looks like), so only give up once it's been
-                // confirmed `UNKNOWN_SESSION_CONFIRM_THRESHOLD` times in a
-                // row *and* `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` has passed
-                // (see that constant's docs — the streak alone misfires
-                // during break-before-make roaming). Any other outcome
-                // (success, or a *different* error) resets the streak
-                // elsewhere in this loop.
-                let (streak, should_give_up) = update_unknown_session_streak(
-                    state.consecutive_unknown_session,
-                    is_unknown_session_rejection(&e),
-                    Instant::now().saturating_duration_since(disconnected_at),
-                );
-                state.consecutive_unknown_session = streak;
-                if should_give_up {
-                    let session_id = state.session_id;
-                    give_up(
-                        state.is_tty,
-                        warm_standby_task,
-                        &format!(
-                            "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                             the server no longer knows this session ({UNKNOWN_SESSION_CONFIRM_THRESHOLD} \
-                             consecutive UnknownSession rejections; reclaimed, or the server itself \
-                             restarted), retrying would never succeed. Ending this connect attempt; \
-                             ssh will treat this as a lost connection.",
-                        ),
-                    );
-                    if max_resume_window.is_none() {
-                        notify_os(
-                            "isekai-pipe connect",
-                            &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+            ResumeCmd::GiveUp { reason, resume_window, notify_os: notify, continuity_lost } => {
+                let session_id = state.session_id;
+                let err = match reason {
+                    GiveUpReason::DeadlineExceeded { exceeded_by } => {
+                        let last_error_suffix =
+                            state.last_resume_error.as_deref().map(|e| format!(" Last error: {e}.")).unwrap_or_default();
+                        give_up(
+                            state.is_tty,
+                            warm_standby_task,
+                            &format!(
+                                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                                 the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
+                                 Ending this connect attempt; ssh will treat this as a lost connection.",
+                            ),
                         );
+                        if notify {
+                            notify_os(
+                                "isekai-pipe connect",
+                                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
+                            );
+                        }
+                        anyhow::anyhow!(
+                            "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
+                             for '{profile}'.{last_error_suffix}"
+                        )
                     }
-                    // The server has confirmed (via the UnknownSession
-                    // streak) that this session_id is genuinely gone —
-                    // distinct from the deadline give-up above, which means
-                    // the cross-family target was simply unreachable.
-                    record_continuity_lost_if_applicable(already_cross_family, switched_this_call.is_some(), session_id, "session-gone");
-                    return Err(anyhow::anyhow!(
-                        "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
-                         retrying would never succeed."
-                    ));
-                }
-                // Checked only once this attempt's failure didn't already
-                // end the episode above — not right after the
-                // `stun_failures` increment (opus review round 4 on this
-                // ADR's implementation, finding N1): checking it earlier
-                // meant an episode that happened to hit the switch
-                // threshold on the *same* attempt that also confirmed the
-                // `UnknownSession` streak recorded `continuity-lost /
-                // session-gone` as if it had tried the cross-family target,
-                // when it had in fact just decided to switch and given up
-                // on the *old* one in the same breath — inflating ADR §6's
-                // "cross-family actually attempted" denominator with
-                // episodes that never attempted it at all.
-                //
-                // `should_switch_to_cross_family` (not a bare `stun_failures
-                // >= switch_attempts_before_cross_family` count check): see
-                // its own docs — the plain count can take longer to reach
-                // than the deadline gives it, in which case this also
-                // switches once the remaining window stops leaving room for
-                // even one cross-family probe (opus review round 5 on this
-                // ADR's implementation).
-                if switched_this_call.is_none()
-                    && should_switch_to_cross_family(stun_failures, switch_attempts_before_cross_family, deadline.saturating_duration_since(Instant::now()))
-                {
-                    if let Some(fallback_target) = cross_family_target {
-                        log::info!(
-                            "isekai-pipe connect: switching to cross-family relay fallback \
-                             (the original STUN peer failed enough consecutive bare-redial attempts, \
-                             or too little of the resume window remains to keep retrying it)"
+                    GiveUpReason::SessionGone => {
+                        give_up(
+                            state.is_tty,
+                            warm_standby_task,
+                            &format!(
+                                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                                 the server no longer knows this session ({UNKNOWN_SESSION_CONFIRM_THRESHOLD} \
+                                 consecutive UnknownSession rejections; reclaimed, or the server itself \
+                                 restarted), retrying would never succeed. Ending this connect attempt; \
+                                 ssh will treat this as a lost connection.",
+                            ),
                         );
-                        apply_cross_family_switch(
-                            fallback_target,
-                            disconnected_at,
-                            effective_resume_grace_secs,
-                            &mut current_target,
-                            &mut max_resume_window,
-                            &mut resume_window,
-                            &mut deadline,
-                            &mut switched_this_call,
-                            &mut attempt,
-                        );
+                        if notify {
+                            notify_os(
+                                "isekai-pipe connect",
+                                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+                            );
+                        }
+                        anyhow::anyhow!(
+                            "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
+                             retrying would never succeed."
+                        )
                     }
+                };
+                if let Some(reason) = continuity_lost {
+                    record_continuity_lost(session_id, reason);
                 }
-                let msg = format!("{e:#}");
-                // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると
-                // UXを壊すため、個々の失敗はdebugログへ格下げする(既定の
-                // `info`フィルタでは表示されない、`RUST_LOG=debug`で見られる)。
-                // 非TTY(ログファイル等)では引き続きeprintln!のまま残す —
-                // ログでは個々の失敗を追えることの方が重要なため。
-                if state.is_tty {
-                    log::debug!("isekai-pipe connect: resume attempt {attempt} failed: {msg}");
-                } else {
-                    eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {msg}");
-                }
-                state.last_resume_error = Some(msg);
+                return Err(err);
             }
+        };
+        if let Some(event) = event {
+            pending.extend(planner.apply(event));
         }
     }
+    Err(anyhow::anyhow!("internal: resume planner stopped issuing commands before resuming or giving up"))
 }
 
 /// The EOF-latch decision (Task 2.9 / issue #111): whether `run_resume_loop`
@@ -1708,14 +1329,20 @@ pub(crate) async fn run_resume_loop(
     let effective_resume_grace_secs = established.effective_resume_grace_secs;
     drop(established.connection);
 
-    let mut current_target: RelayTarget = target.clone();
-    let mut cross_family_target = cross_family_target;
-    let mut max_resume_window = max_resume_window;
-    let mut resume_window = effective_resume_window(effective_resume_grace_secs, max_resume_window);
-    // Persists across disconnect episodes once the STUN→relay switch
-    // happens in any one of them; this cannot be derived from
-    // `cross_family_target.is_none()` alone.
-    let mut switched_to_cross_family = false;
+    // Which target `DialPath::Primary`/`CrossFamily` mean. The reducer
+    // decides when to switch and remembers, across disconnect episodes, that
+    // the switch succeeded once (`ResumePlanner::on_cross_family`); the shell
+    // only follows `ResumeCmd::Resumed { via, .. }` to know which target the
+    // *current* connection runs on (for `spawn_reconnect_signal`'s rebind).
+    let targets = ResumeTargets { primary: target, cross_family: cross_family_target.as_ref() };
+    let mut current_path = DialPath::Primary;
+    let clock = ShellClock::new();
+    let mut planner = ResumePlanner::new(ResumePlannerConfig {
+        effective_resume_grace_secs,
+        max_resume_window,
+        has_cross_family_target: cross_family_target.is_some(),
+        has_warm_standby: tethering_interface.is_some(),
+    });
 
     let counters = Arc::new(AppAckCounters::new());
     let mut state = ResumeLoopState {
@@ -1728,13 +1355,11 @@ pub(crate) async fn run_resume_loop(
         // `format_reconnect_status`周辺のモジュールドキュメント参照)。
         is_tty: std::io::stderr().is_terminal(),
         last_resume_error: None,
-        consecutive_unknown_session: 0,
     };
 
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut data_stream = established.data_stream;
-    let mut disconnected_since: Option<Instant> = None;
 
     // `--tethering-interface`: keeps a second connection warm on a specific
     // physical interface and promotes it (no fresh dial, no backoff wait) as
@@ -1754,12 +1379,8 @@ pub(crate) async fn run_resume_loop(
     // `--tethering-interface` is ever wired up for the STUN paths, this
     // needs revisiting (opus review round on this ADR's implementation,
     // finding m6, confirmed no live bug for exactly this reason).
-    // Reuses `current_target`'s own clone of `target` (`/code-review`
-    // finding on this ADR's implementation) rather than cloning `target` a
-    // second time — the two are still equal here, before the first loop
-    // iteration has had any chance to switch `current_target` away from it.
     let warm_standby = tethering_interface
-        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), current_target.clone(), session_id, iface)));
+        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), target.clone(), session_id, iface)));
     let warm_standby_task = warm_standby.clone().map(|ws| {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(WARM_STANDBY_PROBE_INTERVAL);
@@ -1811,8 +1432,8 @@ pub(crate) async fn run_resume_loop(
             isekai_netmon::system_monitor(),
             state.network_rebinder.take(),
             experimental_network_rebind,
-            current_target.helper_addr,
-            current_target.local_bind_port_range,
+            targets.for_path(current_path).helper_addr,
+            targets.for_path(current_path).local_bind_port_range,
         );
 
         let (mut quic_read, mut quic_write) = data_stream.split();
@@ -1898,59 +1519,39 @@ pub(crate) async fn run_resume_loop(
         quic_write.reset(0);
 
         // The resume window's clock starts here, at disconnect detection —
-        // before the fast-path promote attempt below, not after it, so a
-        // slow-to-fail promote still counts against the deadline the same as
-        // a slow-to-fail `reconnect_and_resume` attempt would.
-        let disconnected_at = *disconnected_since.get_or_insert_with(Instant::now);
-        let deadline = disconnected_at + resume_window;
-        // tssh風のライブ再接続表示: ここで呼んでおくのは、`disconnected_at`が
-        // (このループの前回の周回等で)既に`RECONNECT_NOTIFY_GRACE`より過去の
-        // 場合に、最初のバックオフtickを待たずに即座に表示させるため。
-        // `disconnected_at`がまさに今の瞬間なら`print_reconnect_status`内部の
-        // 猶予チェックで何も表示されない(tsshと同じく、短い瞬断は無音)。
-        print_reconnect_status(state.is_tty, disconnected_at, resume_window);
-
-        let promoted_stream = match &warm_standby {
-            Some(ws) => promote_warm_standby_once(ws, &current_target, &mut state, disconnected_at).await,
-            None => None,
-        };
-
-        let new_stream = match promoted_stream {
-            Some(stream) => stream,
-            None => {
-                // Fresh per disconnect episode, same one-registration-per-
-                // generation rule as `spawn_reconnect_signal`'s own monitor
-                // — this one just watches for a *later* network change
-                // while already backing off, not the first one that got us
-                // here.
-                let mut backoff_network_monitor = isekai_netmon::system_monitor();
-                let (stream, switched) = resume_with_backoff_until_deadline(
-                    factory,
-                    &current_target,
-                    cross_family_target.as_ref(),
-                    episode_started_by_network_change,
-                    switched_to_cross_family,
-                    effective_resume_grace_secs,
-                    profile,
-                    ResumeDeadlinePolicy { resume_window, disconnected_at, deadline, max_resume_window },
-                    &mut state,
-                    &warm_standby_task,
-                    &mut *backoff_network_monitor,
-                )
-                .await?;
-                if let Some(new_target) = switched {
-                    current_target = new_target;
-                    cross_family_target = None;
-                    switched_to_cross_family = true;
-                    max_resume_window = None;
-                    resume_window = effective_resume_window(effective_resume_grace_secs, None);
-                }
-                stream
-            }
-        };
+        // before the fast-path promote attempt (the reducer's first
+        // `Dial { path: WarmStandby }` when a standby exists), not after it,
+        // so a slow-to-fail promote still counts against the deadline the
+        // same as a slow-to-fail `reconnect_and_resume` attempt would.
+        let initial_cmds = planner.apply(ResumeEvent::Disconnected {
+            now: clock.stamp(),
+            by_network_change: episode_started_by_network_change,
+            jitter_seed: rand::random(),
+        });
+        // Fresh per disconnect episode (created lazily at the first backoff
+        // wait), same one-registration-per-generation rule as
+        // `spawn_reconnect_signal`'s own monitor — this one just watches for a
+        // *later* network change while already backing off, not the first one
+        // that got us here.
+        let (new_stream, via) = resume_with_backoff_until_deadline(
+            factory,
+            &targets,
+            warm_standby.as_deref(),
+            profile,
+            &mut planner,
+            &clock,
+            initial_cmds,
+            &mut state,
+            &warm_standby_task,
+            &mut isekai_netmon::system_monitor,
+        )
+        .await?;
+        match via {
+            DialPath::CrossFamily => current_path = DialPath::CrossFamily,
+            DialPath::Primary | DialPath::WarmStandby => {}
+        }
 
         data_stream = new_stream;
-        disconnected_since = None;
         state.last_resume_error = None;
     }
 }
@@ -2740,6 +2341,53 @@ mod tests {
             assert_eq!(replay.lock().unwrap().end_offset(), 11);
         }
 
+        /// Drives the real `resume_with_backoff_until_deadline` interpreter
+        /// through one episode that disconnected at `Millis(0)` and whose
+        /// first loop-top check happens `first_check_after` later, via the
+        /// reducer's test-only `begin_episode_for_test`. The resume window
+        /// itself is **not** injected (Step 5, PR #164 review M1): the
+        /// planner computes it from `effective_resume_grace_secs`/
+        /// `max_resume_window` exactly as in production, so if that
+        /// computation loses a clamp the episode is not yet expired at
+        /// `first_check_after`, the interpreter keeps retrying instead of
+        /// giving up, and the `timeout` below fails the test.
+        async fn run_expired_episode_for_test(
+            factory: &AnyMuxFactory,
+            target: &RelayTarget,
+            effective_resume_grace_secs: u32,
+            max_resume_window: Option<Duration>,
+            first_check_after: Duration,
+            state: &mut ResumeLoopState,
+        ) -> Result<(AnyByteStream, DialPath)> {
+            let clock = ShellClock::new();
+            let mut planner = ResumePlanner::new(ResumePlannerConfig {
+                effective_resume_grace_secs,
+                max_resume_window,
+                has_cross_family_target: false,
+                has_warm_standby: false,
+            });
+            let first_check_at = Millis(u64::try_from(first_check_after.as_millis()).unwrap());
+            let initial_cmds = planner.begin_episode_for_test(Millis(0), first_check_at, 0);
+            let targets = ResumeTargets { primary: target, cross_family: None };
+            let no_warm_standby_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut make_monitor = || -> Box<dyn isekai_netmon::NetworkChangeMonitor> { Box::new(isekai_netmon::NoopNetworkChangeMonitor) };
+            let episode = resume_with_backoff_until_deadline(
+                factory,
+                &targets,
+                None,
+                "test-profile",
+                &mut planner,
+                &clock,
+                initial_cmds,
+                state,
+                &no_warm_standby_task,
+                &mut make_monitor,
+            );
+            tokio::time::timeout(Duration::from_secs(60), episode)
+                .await
+                .expect("the episode did not give up at its first check: the planner's own resume window is longer than expected")
+        }
+
         #[tokio::test]
         async fn resume_with_backoff_until_deadline_returns_err_once_the_resume_window_is_exceeded() {
             // Regression test for the bug reported 2026-07-16: this give-up
@@ -2771,30 +2419,9 @@ mod tests {
                 network_rebinder: None,
                 is_tty: false,
                 last_resume_error: Some("connection refused".to_string()),
-                consecutive_unknown_session: 0,
             };
-            let now = Instant::now();
-            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
-
-            let result = resume_with_backoff_until_deadline(
-                &factory,
-                &target,
-                None,
-                false,
-                false,
-                0,
-                "test-profile",
-                ResumeDeadlinePolicy {
-                    resume_window: Duration::from_secs(0),
-                    disconnected_at: now,
-                    deadline: now, // deadline already reached: must give up on the first check
-                    max_resume_window: None,
-                },
-                &mut state,
-                &None,
-                &mut monitor,
-            )
-            .await;
+            // First check exactly at the (grace 0 → default) window: the deadline is already reached, so it must give up on the first check.
+            let result = run_expired_episode_for_test(&factory, &target, 0, None, DEFAULT_RESUME_WINDOW, &mut state).await;
 
             assert!(result.is_err(), "must return Err once the resume window is exceeded, not a silent Ok/None");
             state.app_ack_tasks.abort();
@@ -2802,17 +2429,18 @@ mod tests {
 
         /// Round 3 code review, significant finding (revised after a second
         /// round caught that the first cut of this test re-derived the
-        /// composition inline instead of calling `effective_resume_window`
-        /// — the same function `run_resume_loop` calls — which meant it
-        /// couldn't actually catch a regression that dropped the clamp from
-        /// `run_resume_loop` itself). The three `clamp_resume_window` unit
-        /// tests only cover that helper in isolation; this test additionally
-        /// pins `effective_resume_window` (the exact call `run_resume_loop`
-        /// makes) by driving the *real* `resume_with_backoff_until_deadline`
-        /// (same proven fixture as the test above) with its result, for a
+        /// composition inline instead of exercising the window computation
+        /// `run_resume_loop` actually uses, which meant it couldn't catch a
+        /// regression that dropped the clamp). Since Step 5 that computation
+        /// lives in `ResumePlanner` (built from the same
+        /// `effective_resume_grace_secs`/`max_resume_window` inputs
+        /// `run_resume_loop` passes): this test drives the *real*
+        /// `resume_with_backoff_until_deadline` interpreter with a planner
+        /// that computes its own window — nothing is injected — for a
         /// STUN-shaped scenario (a large server-granted grace, clamped down
-        /// by a short `max_resume_window`) — and asserts the give-up error
-        /// reports the *clamped* window, not the unclamped one.
+        /// by a short `max_resume_window`), checks it gives up at exactly
+        /// `STUN_RESUME_GIVE_UP_WINDOW` after the disconnect, and asserts the
+        /// give-up error reports the *clamped* window, not the unclamped one.
         #[tokio::test]
         async fn effective_resume_window_clamp_reaches_the_real_give_up_message_for_stun() {
             let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
@@ -2836,40 +2464,28 @@ mod tests {
                 network_rebinder: None,
                 is_tty: false,
                 last_resume_error: Some("connection refused".to_string()),
-                consecutive_unknown_session: 0,
             };
-            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
-
             // A server that granted a multi-hour resume grace, exactly as a
             // real relay/STUN peer with a generous `--resume-window` would.
             let server_granted_grace_secs: u32 = 6 * 60 * 60;
             let max_resume_window = Some(STUN_RESUME_GIVE_UP_WINDOW);
-            // The exact function `run_resume_loop` calls — not a
-            // re-derivation of its composition — so this test actually
-            // fails if a future change drops the clamp from that call site.
+            // Sanity check of the helper composition; the test below does not
+            // feed this value to the planner (the planner computes its own).
             let resume_window = effective_resume_window(server_granted_grace_secs, max_resume_window);
             assert_eq!(resume_window, STUN_RESUME_GIVE_UP_WINDOW, "sanity check on the composition itself before using it below");
 
-            // `now` for both `disconnected_at` and `deadline`, exactly like
-            // the sibling test above — the give-up branch triggers on
-            // `now >= deadline`, and the message formats the `resume_window`
-            // *parameter* directly, not an elapsed delta, so there's no need
-            // to subtract from `Instant::now()` (which would panic on a host
-            // with under 121s of monotonic uptime).
-            let now = Instant::now();
-
-            let result = resume_with_backoff_until_deadline(
+            // First loop-top check exactly 120s (the pre-Step-5
+            // `STUN_RESUME_GIVE_UP_WINDOW`) after the disconnect: with the
+            // clamp in place the planner's own deadline is reached and it
+            // gives up immediately; without it (a 6h window) it would keep
+            // retrying and `run_expired_episode_for_test`'s timeout fails.
+            let result = run_expired_episode_for_test(
                 &factory,
                 &target,
-                None,
-                false,
-                false,
                 server_granted_grace_secs,
-                "test-profile",
-                ResumeDeadlinePolicy { resume_window, disconnected_at: now, deadline: now, max_resume_window },
+                max_resume_window,
+                STUN_RESUME_GIVE_UP_WINDOW,
                 &mut state,
-                &None,
-                &mut monitor,
             )
             .await;
 
