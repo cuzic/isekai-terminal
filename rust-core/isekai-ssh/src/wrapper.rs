@@ -910,6 +910,25 @@ pub(crate) fn resolve_claimed_outcome(
     }
 }
 
+/// Whether `apply_ctl_socket_forward` must add `-t` itself. Only ever under
+/// `RequestTty::Auto` (an explicit `-t`/`-tt`/`-T` is the caller's call):
+///
+/// - `--isekai-tty`: always — `isekai-pipe tty attach` needs a PTY.
+/// - ctl-socket (review 2026-09-29, SSH-20): it turns what the user typed
+///   as a plain interactive `isekai-ssh host` into `ssh host '<login shell
+///   command>'`, and `ssh(1)` never allocates a PTY for a remote command
+///   without `-t` — so enabling ctl-socket silently gave the user a
+///   PTY-less shell (no prompt, no line editing, no job control). Added only
+///   when local stdin is a terminal, which is exactly when `ssh(1)` itself
+///   would have allocated one for the command-less session the user
+///   actually asked for (this is `ssh(1)`-parity, not the
+///   `TofuConfirmation`-style "may we prompt" decision
+///   `.claude/rules/always-connects.md` forbids inferring from a tty).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn needs_forced_tty(tty_exec: bool, ctl_forward: bool, request_tty: RequestTty, stdin_is_terminal: bool) -> bool {
+    request_tty == RequestTty::Auto && (tty_exec || (ctl_forward && stdin_is_terminal))
+}
+
 /// Writes `intent`, execs `ssh` with the `isekai-pipe connect` `ProxyCommand`
 /// injected, and waits for it to exit. All three of `ssh`'s stdio streams
 /// are inherited (interactive TTY passthrough) — `.status()` (not
@@ -955,25 +974,6 @@ pub(crate) fn resolve_claimed_outcome(
 /// task `spawn_ctl_listener` started (see `CtlForward::listener_task`'s
 /// docs for why that matters now that `run_ssh_once` can run many times per
 /// invocation).
-/// Whether `apply_ctl_socket_forward` must add `-t` itself. Only ever under
-/// `RequestTty::Auto` (an explicit `-t`/`-tt`/`-T` is the caller's call):
-///
-/// - `--isekai-tty`: always — `isekai-pipe tty attach` needs a PTY.
-/// - ctl-socket (review 2026-09-29, SSH-20): it turns what the user typed
-///   as a plain interactive `isekai-ssh host` into `ssh host '<login shell
-///   command>'`, and `ssh(1)` never allocates a PTY for a remote command
-///   without `-t` — so enabling ctl-socket silently gave the user a
-///   PTY-less shell (no prompt, no line editing, no job control). Added only
-///   when local stdin is a terminal, which is exactly when `ssh(1)` itself
-///   would have allocated one for the command-less session the user
-///   actually asked for (this is `ssh(1)`-parity, not the
-///   `TofuConfirmation`-style "may we prompt" decision
-///   `.claude/rules/always-connects.md` forbids inferring from a tty).
-#[cfg_attr(not(unix), allow(dead_code))]
-fn needs_forced_tty(tty_exec: bool, ctl_forward: bool, request_tty: RequestTty, stdin_is_terminal: bool) -> bool {
-    request_tty == RequestTty::Auto && (tty_exec || (ctl_forward && stdin_is_terminal))
-}
-
 #[cfg(unix)]
 async fn apply_ctl_socket_forward(
     command: &mut Command,
