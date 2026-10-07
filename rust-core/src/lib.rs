@@ -1568,6 +1568,13 @@ pub trait OrchestratorCallback: Send + Sync {
 pub(crate) trait SessionCallback: Send + Sync {
     fn on_data(&self, data: Vec<u8>);
     fn on_host_key(&self, fingerprint: String) -> bool;
+    /// RC-07: ProxyJumpの踏み台ホストのホスト鍵確認。`host`/`port`は踏み台自身の識別子
+    /// (接続先targetのものではない)。既定は安全側で拒否する——本番の実装は
+    /// `OrchestratorAdapter`(踏み台の`host:port`でOrchestratorCallback::on_host_keyへ委譲)。
+    fn on_jump_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
+        let _ = (host, port, fingerprint);
+        false
+    }
     fn on_connected(&self);
     fn on_disconnected(&self, reason: Option<String>);
     fn on_screen_update(&self, update: ScreenUpdate);
