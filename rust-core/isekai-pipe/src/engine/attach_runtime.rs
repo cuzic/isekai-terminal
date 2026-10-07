@@ -559,13 +559,20 @@ impl AttachRuntime {
         }
     }
 
-    /// Spawns the target `TcpStream::connect`, then — synchronously, before
-    /// this function returns — records `Connecting { task }` in `leases` so
-    /// a `CancelLease` effect processed immediately afterward always finds
-    /// an entry to abort.
+    /// Spawns the target `TcpStream::connect` and records `Connecting { task }`
+    /// in `leases` **while still holding the `leases` lock across the spawn**,
+    /// so a `CancelLease` effect processed immediately afterward always finds
+    /// an entry to abort, and the spawned task — which itself needs that lock
+    /// to store `PendingTarget` — can never run first (review 2026-09-29,
+    /// PIPE-04). Previously the entry was inserted *after* `tokio::spawn`
+    /// returned, so a fast connect could store `PendingTarget { tcp }` first
+    /// and then have it overwritten by `Connecting`: `activate()` then found no
+    /// target and the attach failed. A failed/timed-out connect also used to
+    /// leave its stale `Connecting` entry behind; it is now removed first.
     async fn start_connect(self: &Arc<Self>, lease: LeaseId) {
         let this = self.clone();
         let target_addr = self.target;
+        let mut leases = self.leases.lock().await;
         let task = tokio::spawn(async move {
             match tokio::time::timeout(TARGET_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await {
                 Ok(Ok(tcp)) => {
@@ -573,23 +580,45 @@ impl AttachRuntime {
                     let mut token_bytes = [0u8; ATTACH_TOKEN_LEN];
                     rand::rngs::OsRng.fill_bytes(&mut token_bytes);
                     let attach_token = AttachToken::new(token_bytes);
-                    this.leases.lock().await.insert(lease, LeaseResource::PendingTarget { tcp, timer: None });
+                    {
+                        let mut leases = this.leases.lock().await;
+                        // Only a lease still `Connecting` may advance: if the
+                        // entry is gone, `cancel_lease` already took it (and
+                        // is aborting/awaiting this very task), so the fresh
+                        // TCP connection must simply be dropped here.
+                        if !matches!(leases.get(&lease), Some(LeaseResource::Connecting { .. })) {
+                            return;
+                        }
+                        leases.insert(lease, LeaseResource::PendingTarget { tcp, timer: None });
+                    }
                     this.apply_and_execute(ServeEvent::TargetConnected { lease, target: target_id, attach_token })
                         .await;
                 }
                 Ok(Err(e)) => {
                     log::info!("attach_runtime: target connect failed for lease {lease:?}: {e}");
+                    this.forget_connecting(lease).await;
                     this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
                 }
                 Err(_elapsed) => {
                     log::info!(
                         "attach_runtime: target connect timed out after {TARGET_CONNECT_TIMEOUT:?} for lease {lease:?}"
                     );
+                    this.forget_connecting(lease).await;
                     this.apply_and_execute(ServeEvent::TargetConnectFailed { lease }).await;
                 }
             }
         });
-        self.leases.lock().await.insert(lease, LeaseResource::Connecting { task });
+        leases.insert(lease, LeaseResource::Connecting { task });
+    }
+
+    /// Drops a finished connect's `Connecting` entry (PIPE-04) — only if it is
+    /// still `Connecting`, so an entry some other path already replaced or
+    /// removed is left alone.
+    async fn forget_connecting(self: &Arc<Self>, lease: LeaseId) {
+        let mut leases = self.leases.lock().await;
+        if matches!(leases.get(&lease), Some(LeaseResource::Connecting { .. })) {
+            leases.remove(&lease);
+        }
     }
 
     async fn cancel_lease(self: &Arc<Self>, lease: LeaseId) {
@@ -788,6 +817,12 @@ impl AttachRuntime {
         rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
     }
 
+    /// How many per-lease resources (`Connecting`/`PendingTarget`) the shell
+    /// still holds (PIPE-04 regression).
+    pub(crate) async fn lease_resource_count_for_test(&self) -> usize {
+        self.leases.lock().await.len()
+    }
+
     pub(crate) async fn index_contains(&self, id: &SessionKey) -> bool {
         self.core.lock().await.agg.index_entry(id).is_some()
     }
@@ -836,3 +871,63 @@ pub(crate) struct ShellSnapshot {
 // このファイルとengine/mod.rsのprivate定数が`pub(crate)`化なしで見えるよう、子モジュールにしてある。
 #[cfg(test)]
 mod timing_relations;
+
+#[cfg(test)]
+mod start_connect_tests {
+    use super::*;
+    use isekai_protocol::attach::{AttemptId, ConnectionGeneration, ATTEMPT_ID_LEN};
+
+    fn key(session: u8) -> AttachKey {
+        AttachKey {
+            session_id: isekai_protocol::SessionId::from_bytes([session; 16]),
+            generation: ConnectionGeneration::new(1),
+            attempt_id: AttemptId::from_bytes([1u8; ATTEMPT_ID_LEN]),
+        }
+    }
+
+    /// A target address nothing listens on (bound, then closed).
+    async fn closed_target() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    /// PIPE-04 regression: a failed target connect used to leave its stale
+    /// `Connecting { task }` entry in `leases` forever.
+    #[tokio::test]
+    async fn failed_target_connect_rejects_and_leaves_no_lease_bookkeeping() {
+        let runtime = AttachRuntime::new(closed_target().await, 16);
+        let outcome = runtime.hello(key(1)).await;
+        assert!(matches!(outcome, HelloOutcome::Reject(_)), "connect to a closed port must reject the attach");
+        assert_eq!(runtime.lease_resource_count_for_test().await, 0, "no Connecting entry may be left behind");
+        assert!(runtime.is_vacant().await, "the fencing slot must be released");
+    }
+
+    /// PIPE-04 regression: a fast connect must always reach `PendingTarget`
+    /// (the old insert-after-spawn order could overwrite it with
+    /// `Connecting`, so `activate()` found no target). Repeated because the
+    /// old bug was a scheduling race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_target_connect_is_always_activatable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let runtime = AttachRuntime::new(target, 64);
+        for i in 0..32u8 {
+            let k = key(i);
+            let attach_token = match runtime.hello(k).await {
+                HelloOutcome::Ready { attach_token } => attach_token,
+                HelloOutcome::Reject(reason) => panic!("hello {i} rejected: {reason:?}"),
+            };
+            let handle = Arc::new(Mutex::new(Session::new(1024)));
+            let activation = runtime.activate(k, attach_token, Some(3600), handle).await;
+            assert!(activation.is_some(), "attempt {i}: activate must find the connected target");
+        }
+    }
+}
