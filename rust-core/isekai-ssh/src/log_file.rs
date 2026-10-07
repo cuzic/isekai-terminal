@@ -138,8 +138,12 @@ impl Sink {
         // looser umask) kept whatever permissions it had (review 2026-09-29,
         // SSH-43). Re-tighten it on every open — best-effort, since a log we
         // can write to but not chmod (not our file) shouldn't block logging.
+        // Only a *regular file* is re-tightened: `--isekai-log-file` may point
+        // at a device node (`/dev/null`, `/dev/stderr` → the user's pty), and
+        // under root a successful fchmod(0600) would make `/dev/null`
+        // unwritable for every other user until reboot.
         #[cfg(unix)]
-        {
+        if file.metadata().is_ok_and(|m| should_retighten(&m)) {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
@@ -346,9 +350,34 @@ pub async fn redirect_child_stderr(mut child_stderr: tokio::process::ChildStderr
     }
 }
 
+/// Whether [`Sink::open`] may re-tighten the opened log to 0600: only for a
+/// regular file, never a device node / FIFO / socket the user pointed
+/// `--isekai-log-file` at.
+#[cfg(unix)]
+fn should_retighten(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_file()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Review of PR #201 (M1): `--isekai-log-file /dev/null` (e.g. under
+    /// `sudo`) must not be chmod'ed — only regular files are re-tightened.
+    #[test]
+    fn retighten_applies_to_regular_files_but_never_to_device_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isekai-ssh.log");
+        std::fs::write(&path, b"").unwrap();
+        assert!(should_retighten(&std::fs::metadata(&path).unwrap()));
+        assert!(!should_retighten(&std::fs::metadata("/dev/null").unwrap()));
+        assert!(!should_retighten(&std::fs::metadata(dir.path()).unwrap()));
+        // Opening /dev/null as the log sink still works and leaves it alone.
+        use std::os::unix::fs::PermissionsExt as _;
+        let before = std::fs::metadata("/dev/null").unwrap().permissions().mode();
+        Sink::new().open(std::path::Path::new("/dev/null"), None).unwrap();
+        assert_eq!(std::fs::metadata("/dev/null").unwrap().permissions().mode(), before);
+    }
 
     /// SSH-43 regression: opening a pre-existing, looser-permissioned log
     /// re-tightens it to 0600 (the create-time `mode` alone never did).

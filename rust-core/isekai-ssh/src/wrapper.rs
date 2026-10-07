@@ -508,26 +508,6 @@ pub(crate) fn init_logging(plan: &WrapperPlan) -> Result<()> {
     Ok(())
 }
 
-/// Resolves `resolution` into a [`ConnectionIntent`], auto-bootstrapping a
-/// brand-new (never-registered) destination inline when [`should_bootstrap`]
-/// allows it — `tofu` decides whether *that* bootstrap's own trust
-/// confirmation is interactive ([`TofuConfirmation::AlwaysPrompt`], both
-/// entrypoints' first-contact case) or silent
-/// ([`TofuConfirmation::Silent`], only used by the native path's detached
-/// mux-holder entrypoint, which has no console to confirm on — see
-/// `native::connect::prepare_with_tofu`'s doc comment).
-///
-/// Shared by the Unix entrypoint ([`run`]) and the Windows-native entrypoint
-/// (`native::connect::prepare_with_tofu`), which used to hand-roll nearly
-/// identical copies of this match — the *only* platform-specific piece
-/// (which [`isekai_bootstrap::BootstrapBackend`] actually performs the
-/// deploy) is already internal to [`bootstrap_and_register`], so nothing
-/// here needs to branch on platform. Unifies the two copies' previously
-/// divergent "auto-bootstrap is disabled" message onto the native path's
-/// more actionable wording (pointing at the exact `isekai-ssh init` command
-/// to run) for both — a small, deliberate UX improvement riding along with
-/// this dedup, not a functional change (this arm is reached only when the
-/// user has explicitly opted out of auto-bootstrap).
 /// Whether a persisted profile exists for `resolution`'s profile key, as far
 /// as [`build_intent_or_bootstrap`]'s choice of trust-confirmation mode is
 /// concerned (review 2026-09-29, SSH-08).
@@ -569,6 +549,26 @@ fn tofu_for_unusable_profile(state: ProfileFileState, requested: TofuConfirmatio
     }
 }
 
+/// Resolves `resolution` into a [`ConnectionIntent`], auto-bootstrapping a
+/// brand-new (never-registered) destination inline when [`should_bootstrap`]
+/// allows it — `tofu` decides whether *that* bootstrap's own trust
+/// confirmation is interactive ([`TofuConfirmation::AlwaysPrompt`], both
+/// entrypoints' first-contact case) or silent
+/// ([`TofuConfirmation::Silent`], only used by the native path's detached
+/// mux-holder entrypoint, which has no console to confirm on — see
+/// `native::connect::prepare_with_tofu`'s doc comment).
+///
+/// Shared by the Unix entrypoint ([`run`]) and the Windows-native entrypoint
+/// (`native::connect::prepare_with_tofu`), which used to hand-roll nearly
+/// identical copies of this match — the *only* platform-specific piece
+/// (which [`isekai_bootstrap::BootstrapBackend`] actually performs the
+/// deploy) is already internal to [`bootstrap_and_register`], so nothing
+/// here needs to branch on platform. Unifies the two copies' previously
+/// divergent "auto-bootstrap is disabled" message onto the native path's
+/// more actionable wording (pointing at the exact `isekai-ssh init` command
+/// to run) for both — a small, deliberate UX improvement riding along with
+/// this dedup, not a functional change (this arm is reached only when the
+/// user has explicitly opted out of auto-bootstrap).
 pub(crate) async fn build_intent_or_bootstrap(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
@@ -1356,6 +1356,14 @@ async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
 /// A DNS failure is classified [`BootstrapFailure::JumpHostUnreachable`]
 /// (retryable): it is a transient-connectivity-shaped failure, not a
 /// trust/config one.
+///
+/// An IPv4 result is preferred over getaddrinfo's (RFC 6724, usually
+/// AAAA-first on a dual-stack client) first entry: `isekai-pipe serve` binds
+/// `0.0.0.0` by default and bootstrap never passes `--bind`, so the
+/// direct-launch helper only listens on IPv4. Caching a v6 address would make
+/// every connect `Unreachable` and every silent re-bootstrap re-resolve the
+/// same AAAA — a permanent loop (review of PR #201, M2). The first address is
+/// still used when the name has no A record at all.
 async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr> {
     // A `bootstrap-candidate target=[v6]:22` directive keeps its brackets
     // through `rsplit_once(':')`; `ssh -G`'s own `hostname` never has them.
@@ -1364,7 +1372,7 @@ async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr>
         return Ok(SocketAddr::new(ip, port));
     }
     match tokio::time::timeout(STUN_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((bare, port))).await {
-        Ok(Ok(mut addrs)) => addrs.next().ok_or_else(|| {
+        Ok(Ok(addrs)) => prefer_ipv4(addrs).ok_or_else(|| {
             anyhow!("isekai-ssh: DNS lookup for the bootstrap host {bare:?} returned no addresses")
                 .context(BootstrapFailure::JumpHostUnreachable)
         }),
@@ -1376,6 +1384,19 @@ async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr>
         )
         .context(BootstrapFailure::JumpHostUnreachable)),
     }
+}
+
+/// The first IPv4 address in `addrs`, else the first address at all (see
+/// [`resolve_direct_helper_addr`]).
+fn prefer_ipv4(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first = None;
+    for addr in addrs {
+        if addr.is_ipv4() {
+            return Some(addr);
+        }
+        first.get_or_insert(addr);
+    }
+    first
 }
 
 /// Picks the bootstrap candidate to deploy through: highest `priority`, and
@@ -1539,6 +1560,15 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             );
         }
     }
+    // Direct launch: resolve the bootstrap host *before* deploying (review of
+    // PR #201, M2) — a DNS failure then fails fast as a retryable
+    // `JumpHostUnreachable` instead of orphaning a freshly started helper on
+    // every recovery attempt. Only the IP is needed here; the port comes from
+    // the helper's handshake below.
+    let direct_helper_ip = match &resolution.isekai.bootstrap_relay {
+        Some(_) => None,
+        None => Some(resolve_direct_helper_addr(host, 0).await?.ip()),
+    };
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -1568,7 +1598,10 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             let direct_port = handshake
                 .direct_by_bootstrap_host_port()
                 .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
-            resolve_direct_helper_addr(host, direct_port).await?.to_string()
+            match direct_helper_ip {
+                Some(ip) => SocketAddr::new(ip, direct_port).to_string(),
+                None => resolve_direct_helper_addr(host, direct_port).await?.to_string(),
+            }
         }
     };
 
@@ -2597,6 +2630,21 @@ mod tests {
         assert_eq!(resolve_direct_helper_addr("192.0.2.7", 4433).await.unwrap().to_string(), "192.0.2.7:4433");
     }
 
+    /// Review of PR #201 (M2): a dual-stack name that getaddrinfo returns
+    /// AAAA-first must still cache the IPv4 address, because the
+    /// direct-launch helper only listens on `0.0.0.0`. A v6-only name keeps
+    /// its (only) address.
+    #[test]
+    fn prefer_ipv4_picks_the_a_record_even_when_aaaa_comes_first() {
+        let v6: SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:4433".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.7:4433".parse().unwrap();
+        assert_eq!(prefer_ipv4([v6, v6b, v4]), Some(v4));
+        assert_eq!(prefer_ipv4([v4, v6]), Some(v4));
+        assert_eq!(prefer_ipv4([v6, v6b]), Some(v6));
+        assert_eq!(prefer_ipv4(std::iter::empty()), None);
+    }
+
     /// SSH-01 regression: a DNS-named `HostName` is resolved at bootstrap
     /// time rather than cached verbatim (which `isekai-pipe connect` could
     /// never parse, failing every single connect forever).
@@ -3178,12 +3226,6 @@ mod tests {
         );
     }
 
-    /// A path/profile with no space or shell metacharacter is emitted bare
-    /// (no quoting at all) — safe on a POSIX shell either way, and sidesteps
-    /// ever needing to guess Win32-OpenSSH's own `ProxyCommand`
-    /// argument-splitting convention on Windows (see `proxy_command`'s
-    /// module docs for why quoting there is a real, version-dependent
-    /// minefield this avoids rather than picks a side on).
     /// SSH-44 regression: `%` is doubled (ssh's own `ProxyCommand` token
     /// expansion runs before the shell), a leading `~` is never left bare,
     /// and on Unix a backslash in the path is quoted rather than left for
@@ -3200,6 +3242,12 @@ mod tests {
         assert_eq!(quote_proxy_command_path(Path::new(r"/opt/odd\name/isekai-pipe"), false), shell_quote(r"/opt/odd\name/isekai-pipe"));
     }
 
+    /// A path/profile with no space or shell metacharacter is emitted bare
+    /// (no quoting at all) — safe on a POSIX shell either way, and sidesteps
+    /// ever needing to guess Win32-OpenSSH's own `ProxyCommand`
+    /// argument-splitting convention on Windows (see `proxy_command`'s
+    /// module docs for why quoting there is a real, version-dependent
+    /// minefield this avoids rather than picks a side on).
     #[test]
     fn proxy_command_emits_safe_path_and_profile_bare() {
         assert_eq!(
