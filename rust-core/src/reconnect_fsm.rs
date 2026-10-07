@@ -486,6 +486,8 @@ impl ReconnectState {
                 self.stop_loop();
                 if was_active {
                     let mut effects = Vec::new();
+                    // ユーザーが再接続を中止した: 復帰時の自動再接続も望まれていない。
+                    self.background_state = BackgroundState::Foreground;
                     self.abort_loop_attempt(&mut effects);
                     effects.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
                     effects
@@ -498,6 +500,8 @@ impl ReconnectState {
                     self.stop_loop();
                     self.user_initiated_disconnect = false;
                     let mut effects = vec![ReconnectEffect::InvalidatePathObserver];
+                    // ユーザーが切断した: 復帰時の自動再接続も望まれていない。
+                    self.background_state = BackgroundState::Foreground;
                     self.abort_loop_attempt(&mut effects);
                     effects.push(ReconnectEffect::PublishDisconnected { issue_hint: None });
                     effects
@@ -574,9 +578,13 @@ impl ReconnectState {
     /// `Idle`へ戻し(試行中は`Connecting`)、ループが追跡していたバックグラウンド遷移状態も手放す
     /// (自動ループが始まらなかった切断と同じ扱い)。試行のセッション自体の無効化・切断はshellが
     /// [`ReconnectEffect::AbortInFlightAttempt`]で行う。
+    ///
+    /// `background_state`はここでは触らない(PR #207レビューF2): タイムアウトによるギブアップでは
+    /// `Suspended`/`Quiescing`を保ち、次のフォアグラウンド復帰時の自動再接続・
+    /// `on_foreground_resume`を失わせない。ユーザー操作(中止・切断)の側だけが明示的に
+    /// `Foreground`へ戻す。
     fn abort_loop_attempt(&mut self, effects: &mut Vec<ReconnectEffect>) {
         self.set_phase(ConnPhase::Idle, effects);
-        self.background_state = BackgroundState::Foreground;
         effects.push(ReconnectEffect::AbortInFlightAttempt);
     }
 
@@ -1714,6 +1722,37 @@ mod tests {
                     return Ok(());
                 }
             }
+        }
+
+        /// PR #207レビューF2: タイムアウトによるギブアップは`background_state`を保つ
+        /// (`Suspended`なら次のフォアグラウンド復帰で自動再接続、`Quiescing`なら
+        /// `on_foreground_resume`を出す、という復帰時の挙動を失わせない)。一方、ユーザーの
+        /// 中止(`CancelReconnect`)・切断(`UserDisconnect`)は`Foreground`へ戻す。
+        #[test]
+        fn give_up_keeps_background_state_but_user_abort_resets_it(
+            bg in prop_oneof![Just(BackgroundState::Foreground), Just(BackgroundState::Quiescing), Just(BackgroundState::Suspended)],
+            user_abort in prop_oneof![Just(None), Just(Some(ReconnectEvent::CancelReconnect)), Just(Some(ReconnectEvent::UserDisconnect))],
+        ) {
+            let policy = ReconnectPolicy { tick: Duration::from_millis(10), retry_interval: Duration::from_millis(10), timeout: Duration::ZERO };
+            let mut s = ReconnectState::for_test(ConnPhase::Connected, Some(AttemptRef(0)));
+            let epoch = start_loop_from_connected(&mut s);
+            prop_assert!(arms_timer(&s.apply(ReconnectEvent::LoopStarted { epoch, policy })), "LoopStartedで最初のタイマーが設定されなかった");
+            s.background_state = bg;
+            match user_abort {
+                None => {
+                    let effects = s.apply(ReconnectEvent::ReconnectTick { epoch, policy });
+                    prop_assert!(
+                        effects.contains(&ReconnectEffect::PublishReconnectTimedOut { timeout_secs: policy.timeout_secs() }),
+                        "timeout=0の最初のtickでギブアップしなかった: {:?}", effects
+                    );
+                    prop_assert_eq!(s.background_state, bg, "ギブアップがbackground_stateを書き換えた");
+                }
+                Some(ev) => {
+                    s.apply(ev);
+                    prop_assert_eq!(s.background_state, BackgroundState::Foreground, "ユーザー操作の中断がForegroundへ戻さなかった");
+                }
+            }
+            prop_assert_eq!(s.phase(), ConnPhase::Idle, "中断後のphaseがIdleでない");
         }
 
         /// ギブアップの判断(Step 3b/3c): 満了したtickの`after`の和が`timeout`に達した最初のtick
