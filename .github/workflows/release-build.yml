@@ -104,9 +104,9 @@ jobs:
 
       - name: Install zig (mlugg/setup-zig)
         if: matrix.platform.toolchain == 'zig'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: latest
+          version: 0.16.0
 
       # cargo-zigbuildのインストールより前に置く。以前は逆順だったため、
       # ~/.cargo/binがキャッシュ対象でも常に再インストールになっていた
@@ -128,7 +128,7 @@ jobs:
         if: matrix.platform.toolchain == 'zig'
         run: |
           if ! command -v cargo-zigbuild >/dev/null; then
-            cargo install cargo-zigbuild
+            cargo install cargo-zigbuild --locked --version 0.23.4
           fi
 
       - name: Build (cargo build)
@@ -193,6 +193,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      # `releases/latest`は全ホストへのサイレント再bootstrap(`helper_download.rs`)の
+      # 配布元なので、mainに入っていない任意のコミット(PRブランチ・ローカルの実験
+      # コミット等)に打ったタグからは公開しない(2026-09-29レビューCI-L3)。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require the tagged commit to be on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF ($GITHUB_SHA) is not an ancestor of origin/main; refusing to publish a release from a commit that is not on main." >&2
+            exit 1
+          fi
+          echo "$GITHUB_SHA is on origin/main."
+
       - name: Download all built binaries
         uses: actions/download-artifact@v4
         with:
@@ -200,7 +217,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           fail_on_unmatched_files: true

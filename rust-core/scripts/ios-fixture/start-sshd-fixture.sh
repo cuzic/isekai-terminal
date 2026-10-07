@@ -19,6 +19,10 @@ SSHD_BIN="${SSHD_BIN:-$(command -v sshd)}"
 [[ -x "$SSHD_BIN" ]] || { echo "error: sshd binary not found" >&2; exit 1; }
 
 mkdir -p "$FIXTURE_DIR"
+# 以降はcd後の相対パスとsshd_config/fixture.json内の絶対パス(sshdはdaemon化時に
+# chdir /する)の両方で使うため、ここで絶対パスに正規化する。相対パスのまま
+# cdすると`${FIXTURE_DIR}/...`が二重になったり、sshdが誤った場所を参照したりする。
+FIXTURE_DIR="$(cd "$FIXTURE_DIR" && pwd)"
 cd "$FIXTURE_DIR"
 
 rm -f ssh_host_ed25519_key ssh_host_ed25519_key.pub user_ed25519_key user_ed25519_key.pub \

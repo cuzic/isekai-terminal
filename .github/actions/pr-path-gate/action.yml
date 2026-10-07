@@ -35,6 +35,13 @@ name: PR path gate
 # 追加取得する(呼び出し元が`fetch-depth: 0`等の深いcheckoutをしていなくても
 # 正しく動く)。
 #
+# このaction内の`exit 1`経路(入力不正)や、checkout失敗・ランナー障害で呼び出し元の
+# gate job(`changes`)自体が失敗した場合、後続のrequired jobを
+# `needs.changes.outputs.relevant == 'true'`だけで条件付けていると、そのjobは`skipped`
+# (=branch protection上は緑)になり、テストが黙って素通りする。呼び出し側のrequired jobは
+# 必ず`${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.relevant == 'true') }}`
+# の形で条件付け、gate失敗時もfail-open(テストを実行)にすること(2026-09-29レビューCI-H1)。
+#
 # `pull_request`イベント専用(`push`トリガーでは元々paths:フィルタを維持しており、
 # そちらはpush先ブランチのcheck-run自体を作らないだけで恒久pending問題を起こさない
 # ため、このゲートを挟む必要がない)。

@@ -68,6 +68,26 @@ use crate::native::bootstrap_backend::NativeBootstrapBackend;
 /// magnitude under that.
 const DEFAULT_FRESHNESS_TTL_SECS: u64 = 5 * 60;
 
+/// Connect timeout for every release-download HTTP request.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whole-request ceiling for every release-download HTTP request — generous
+/// enough for a tens-of-MB `isekai-pipe` asset over a slow link, but finite.
+const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// The `ureq` agent every request in this module uses. ureq 3's defaults
+/// have **no** timeout at all (review 2026-09-29, SSH-18): a stalled GitHub
+/// connection hung the whole (possibly silent, background) re-bootstrap
+/// forever, so it never reached the retry/backoff logic
+/// `.claude/rules/always-connects.md` relies on.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+        .timeout_global(Some(HTTP_GLOBAL_TIMEOUT))
+        .build()
+        .into()
+}
+
 fn freshness_ttl() -> Duration {
     std::env::var("ISEKAI_SSH_HELPER_CACHE_TTL_SECS")
         .ok()
@@ -244,7 +264,56 @@ pub fn default_helper_cache_dir() -> std::io::Result<PathBuf> {
     if let Some(home) = isekai_fs_guard::resolve_home_dir() {
         return Ok(home.join(".cache").join("isekai-ssh").join("helpers"));
     }
-    Ok(std::env::temp_dir().join("isekai-ssh-helpers"))
+    // Per-user name (review 2026-09-29, SSH-39): `/tmp` is shared, and a
+    // fixed `isekai-ssh-helpers` directory another local user created first
+    // would let them plant the binary this user then uploads and runs on
+    // their own remote hosts. `cache_is_trustworthy` additionally refuses a
+    // cache whose file/directory isn't this user's.
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        Ok(std::env::temp_dir().join(format!("isekai-ssh-helpers-{uid}")))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(std::env::temp_dir().join("isekai-ssh-helpers"))
+    }
+}
+
+/// Sidecar recording the sha256 of the bytes *this tool itself* wrote to
+/// `cache_file` — re-checked on every cache hit so a cached binary that was
+/// modified afterwards (another local user, disk corruption, a partial
+/// write) is never uploaded to a remote host and executed there (SSH-39).
+fn local_sha256_path(cache_file: &Path) -> PathBuf {
+    let mut name = cache_file.as_os_str().to_os_string();
+    name.push(".local-sha256");
+    PathBuf::from(name)
+}
+
+/// Whether an existing cache entry may be used as-is: its bytes still match
+/// the digest recorded when it was written, and (on Unix) both the file and
+/// its directory belong to the current user and aren't group/world-writable.
+/// A cache failing this is treated exactly like no cache at all (re-download).
+fn cache_is_trustworthy(cache_file: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(cache_file) else { return false };
+    let Ok(recorded) = std::fs::read_to_string(local_sha256_path(cache_file)) else { return false };
+    if recorded.trim() != hex_sha256(&bytes) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let owned_and_private = |path: &Path| {
+            std::fs::symlink_metadata(path).map(|m| m.uid() == uid && m.mode() & 0o022 == 0).unwrap_or(false)
+        };
+        if !owned_and_private(cache_file) || !cache_file.parent().is_some_and(owned_and_private) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Downloads `{asset_name}.sha256` (a plain hex digest, matching
@@ -292,7 +361,9 @@ fn verify_sha256_sidecar_if_present(agent: &ureq::Agent, sidecar_url: &str, byte
 pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSource, arch: &str, base_url: &str, api_base_url: &str) -> Result<PathBuf> {
     let asset_name = asset_name_for_arch(arch)?;
     let path = cache_path(cache_dir, source, &asset_name);
-    let cache_existed = path.exists();
+    // An entry that fails `cache_is_trustworthy` is treated as absent: it is
+    // re-downloaded, and never used as the network-failure fallback below.
+    let cache_existed = path.exists() && cache_is_trustworthy(&path);
     if cache_existed && (source.tag.is_some() || !is_stale(&path)) {
         log::debug!("isekai-ssh: using cached isekai-pipe binary at {}", path.display());
         return Ok(path);
@@ -399,7 +470,7 @@ fn revalidate_and_cache(
         return download_and_cache(cache_dir, source, asset_name, base_url);
     }
 
-    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let agent = http_agent();
     if cache_existed {
         let latest_tag = fetch_latest_tag(&agent, api_base_url, &source.repo)?;
         let tag_path = cached_tag_path(&path);
@@ -413,7 +484,7 @@ fn revalidate_and_cache(
         }
         log::info!("isekai-ssh: latest release changed to {latest_tag:?}; re-downloading isekai-pipe binary");
         let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
-        write_cached_tag(&tag_path, &latest_tag)?;
+        record_tag_if_unchanged(&agent, api_base_url, &source.repo, Some(&latest_tag), &tag_path);
         return Ok(downloaded);
     }
 
@@ -422,14 +493,39 @@ fn revalidate_and_cache(
     // *next* check can take the cheap path above — a failure here doesn't
     // fail the overall download, it just means the next check re-downloads
     // once more before catching up.
+    let tag_before = fetch_latest_tag(&agent, api_base_url, &source.repo)
+        .map_err(|e| log::debug!("isekai-ssh: could not look up the latest release tag before downloading ({e:#})"))
+        .ok();
     let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
-    match fetch_latest_tag(&agent, api_base_url, &source.repo) {
-        Ok(latest_tag) => {
-            let _ = write_cached_tag(&cached_tag_path(&path), &latest_tag);
-        }
-        Err(e) => log::debug!("isekai-ssh: downloaded isekai-pipe binary, but could not also record its release tag ({e:#})"),
-    }
+    record_tag_if_unchanged(&agent, api_base_url, &source.repo, tag_before.as_deref(), &cached_tag_path(&path));
     Ok(downloaded)
+}
+
+/// Records `tag_before` as the cached binary's release tag only if "latest"
+/// still resolves to that same tag *after* the download (review 2026-09-29,
+/// SSH-40). The download itself goes through GitHub's `/releases/latest/
+/// download/` redirect, which is resolved independently of the tag lookup:
+/// a release cut in between used to pair the *new* tag with the *old*
+/// binary, and since the cheap freshness check then saw a matching tag, the
+/// stale binary was kept — and silently re-deployed everywhere — until the
+/// next release. Not recording anything just means the next check
+/// re-downloads once more, the safe direction.
+fn record_tag_if_unchanged(agent: &ureq::Agent, api_base_url: &str, repo: &str, tag_before: Option<&str>, tag_path: &Path) {
+    let Some(tag_before) = tag_before else {
+        return;
+    };
+    match fetch_latest_tag(agent, api_base_url, repo) {
+        Ok(tag_after) if tag_after == tag_before => {
+            if let Err(e) = write_cached_tag(tag_path, tag_before) {
+                log::debug!("isekai-ssh: could not record the downloaded binary's release tag ({e:#})");
+            }
+        }
+        Ok(tag_after) => log::info!(
+            "isekai-ssh: latest release moved from {tag_before:?} to {tag_after:?} during the download; \
+             not recording a tag so the next check re-downloads"
+        ),
+        Err(e) => log::debug!("isekai-ssh: downloaded isekai-pipe binary, but could not confirm its release tag ({e:#})"),
+    }
 }
 
 fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str, base_url: &str) -> Result<PathBuf> {
@@ -437,7 +533,7 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
     let path = cache_path(cache_dir, source, asset_name);
     let previously_cached = std::fs::read(&path).ok();
 
-    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let agent = http_agent();
     let mut response = agent
         .get(&url)
         .call()
@@ -453,6 +549,11 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
 
     let parent = path.parent().expect("cache_path always has a parent directory");
     std::fs::create_dir_all(parent).with_context(|| format!("isekai-ssh: failed to create helper cache directory {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
 
     if previously_cached.as_deref() == Some(bytes.as_slice()) {
         log::debug!("isekai-ssh: cached isekai-pipe binary at {} is already up to date", path.display());
@@ -472,6 +573,8 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
         log::info!("isekai-ssh: {verb} isekai-pipe binary ({} bytes) at {}", bytes.len(), path.display());
     }
 
+    std::fs::write(local_sha256_path(&path), hex_sha256(&bytes))
+        .with_context(|| format!("isekai-ssh: failed to record the cached binary's digest next to {}", path.display()))?;
     write_last_checked(&last_checked_path(&path), SystemTime::now())?;
     Ok(path)
 }
@@ -583,6 +686,36 @@ mod tests {
         ("/repos/cuzic/isekai-terminal/releases/latest".to_string(), format!(r#"{{"tag_name":"{tag}"}}"#).into_bytes())
     }
 
+    /// SSH-40 regression: if "latest" moved on while the binary was being
+    /// downloaded, the (possibly old) binary must not be recorded under the
+    /// new tag — otherwise the cheap freshness check would keep the stale
+    /// binary until the *next* release.
+    #[tokio::test]
+    async fn record_tag_if_unchanged_skips_a_tag_that_moved_during_the_download() {
+        let mut routes = std::collections::HashMap::new();
+        let (tag_route, tag_body) = latest_tag_route("isekai-pipe-v2.0.0");
+        routes.insert(tag_route, tag_body);
+        let addr = spawn_mock_release_server(routes);
+        let api = format!("http://{addr}");
+        let dir = tempfile::tempdir().unwrap();
+        let tag_path = dir.path().join("asset.release-tag");
+        let repo = ReleaseSource::DEFAULT_REPO.to_string();
+
+        let (tag_path_for_task, api_for_task, repo_for_task) = (tag_path.clone(), api.clone(), repo.clone());
+        tokio::task::spawn_blocking(move || {
+            record_tag_if_unchanged(&http_agent(), &api_for_task, &repo_for_task, Some("isekai-pipe-v1.0.0"), &tag_path_for_task)
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_cached_tag(&tag_path), None, "a tag that changed mid-download must not be recorded");
+
+        let tag_path_for_task = tag_path.clone();
+        tokio::task::spawn_blocking(move || record_tag_if_unchanged(&http_agent(), &api, &repo, Some("isekai-pipe-v2.0.0"), &tag_path_for_task))
+            .await
+            .unwrap();
+        assert_eq!(read_cached_tag(&tag_path).as_deref(), Some("isekai-pipe-v2.0.0"));
+    }
+
     #[tokio::test]
     async fn ensure_helper_binary_cached_downloads_verifies_and_caches() {
         let binary_bytes = b"pretend-isekai-pipe-binary-bytes".to_vec();
@@ -623,8 +756,23 @@ mod tests {
         let path = cache_path(cache_dir, source, &asset_name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
+        std::fs::write(local_sha256_path(&path), hex_sha256(bytes)).unwrap();
         write_last_checked(&last_checked_path(&path), SystemTime::now() - age).unwrap();
         path
+    }
+
+    /// SSH-39 regression: a cached binary modified after this tool wrote it
+    /// is not trusted (re-downloaded rather than uploaded and executed).
+    #[test]
+    fn a_tampered_cache_entry_is_not_trustworthy() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, b"genuine-bytes", Duration::from_secs(0));
+        assert!(cache_is_trustworthy(&path));
+        std::fs::write(&path, b"planted-bytes").unwrap();
+        assert!(!cache_is_trustworthy(&path), "bytes that no longer match the recorded digest must not be used");
+        std::fs::remove_file(local_sha256_path(&path)).unwrap();
+        assert!(!cache_is_trustworthy(&path), "an entry without a recorded digest must not be used either");
     }
 
     #[tokio::test]
@@ -696,6 +844,8 @@ mod tests {
         let path = cache_path(cache_dir.path(), &source, &asset_name_for_arch("x86_64").unwrap());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &old_bytes).unwrap();
+        // As `download_and_cache` itself records it (SSH-39).
+        std::fs::write(local_sha256_path(&path), hex_sha256(&old_bytes)).unwrap();
 
         let unreachable = "http://127.0.0.1:1";
         let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable, unreachable).await.unwrap();

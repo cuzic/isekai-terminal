@@ -26,8 +26,32 @@ object RelayCredentialVault {
         return Base64.encodeToString(enc, Base64.NO_WRAP)
     }
 
-    fun decrypt(storedValue: String): String {
-        val enc = Base64.decode(storedValue, Base64.NO_WRAP)
-        return String(KeystoreKek.decrypt(enc), Charsets.UTF_8)
+    /**
+     * [storedValue]を平文JWTへ戻す。
+     *
+     * AND-H3: 暗号化導入(`400df8c1`)以前に平文のまま保存されたJWTが残っている場合、
+     * 以前はBase64デコードの`IllegalArgumentException`が接続コルーチンから未捕捉のまま
+     * 抜けてアプリごとクラッシュしていた(平文→暗号化のデータ移行は存在しない)。
+     * 暗号文は`Base64.NO_WRAP`で保存しており、その字種に`.`は含まれない一方、JWTは
+     * 必ず`.`区切りの3セグメントになるため、`.`を含む値は平文レガシー値としてそのまま
+     * 返す(次に編集画面で保存した時点で暗号化される)。それ以外の復号失敗
+     * (Keystoreエントリ欠落・改竄等)は原因の分かる[IllegalStateException]にする。
+     */
+    fun decrypt(storedValue: String): String = decryptWith(storedValue) { KeystoreKek.decrypt(it) }
+
+    /** [decrypt]の本体。AndroidKeyStoreを使わずにテストできるよう復号関数を注入可能にしている。 */
+    internal fun decryptWith(storedValue: String, decryptBytes: (ByteArray) -> ByteArray): String {
+        if (isLegacyPlaintext(storedValue)) return storedValue
+        return try {
+            val enc = Base64.decode(storedValue, Base64.NO_WRAP)
+            String(decryptBytes(enc), Charsets.UTF_8)
+        } catch (e: Exception) {
+            throw IllegalStateException("relay JWTを復号できませんでした(${e.javaClass.simpleName})。プロファイルを編集してJWTを再入力してください", e)
+        }
     }
+
+    /** 編集画面の初期表示用。復号できない値は空欄に落とす(クラッシュさせない)。 */
+    fun decryptOrEmpty(storedValue: String): String = runCatching { decrypt(storedValue) }.getOrDefault("")
+
+    internal fun isLegacyPlaintext(storedValue: String): Boolean = storedValue.contains('.')
 }
