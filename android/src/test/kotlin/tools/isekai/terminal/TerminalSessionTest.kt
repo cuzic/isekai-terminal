@@ -446,7 +446,7 @@ class TerminalSessionTest {
             }
         }
         val orch = FakeOrchestrator()
-        val s = TerminalSession(checker, orchestratorFactory = { cb -> orch.also { it.callback = cb } })
+        val s = testTerminalSession(checker, orchestratorFactory = { cb -> orch.also { it.callback = cb } })
         s.connect(testConfig())
         assertFalse(orch.simulateHostKey(fingerprint = "SHA256:new"))
         withTimeout(3000) { s.state.first { it.newHostKeyPrompt != null } }
