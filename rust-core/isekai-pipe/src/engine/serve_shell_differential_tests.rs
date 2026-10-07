@@ -970,6 +970,23 @@ fn differential_cases_reach_the_interesting_shell_paths() {
             *hits.entry(k).or_default() += v;
         }
     }
+    // Hand-written seed for the one path too deep for the random generator to
+    // hit reliably (the first CI run of the 64 deterministic cases reached
+    // every other required path but not this one): an over-capacity
+    // (unresumable) session whose data stream dies → `Discard{Unresumable}`,
+    // which must free its slot and close its target TCP (ADR I-g).
+    let seed = vec![
+        Op::Hello { s: 0, g: 0, at: 0 },
+        Op::Activate { s: 0, grace: Grace::Long, wrong_token: false },
+        Op::HelloBypass { s: 1, g: 0 },
+        Op::Activate { s: 1, grace: Grace::Long, wrong_token: false },
+        Op::DataStreamDied { s: 1 },
+        Op::Hello { s: 1, g: 1, at: 0 },
+    ];
+    let coverage = run_case(1, seed).unwrap_or_else(|e| panic!("unresumable seed case failed: {e}"));
+    for (k, v) in coverage {
+        *hits.entry(k).or_default() += v;
+    }
     let required = [
         "activated",
         "hello rejected BusyOtherSession",
