@@ -74,14 +74,73 @@ pub enum FsGuardError {
 /// group is still allowed. Windows: rejects any DACL grant of write-ish
 /// rights to a principal other than the current user (see `windows_acl.rs`,
 /// stricter than the Unix policy by design). A no-op on any other platform.
+///
+/// Unix also requires the (symlink-resolved) path to be owned by the
+/// current user or root: a file/directory owned by another account is
+/// writable by that account whatever its mode bits say (the same rule
+/// `ssh(1)` applies to `~/.ssh` — "Bad owner or permissions"). Symlinks are
+/// followed on purpose (a dotfiles-managed `~/.config` is common); the
+/// checks apply to what they point at.
 #[cfg(unix)]
 pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = fs::metadata(path).map_err(FsGuardError::Stat)?;
     let mode = metadata.permissions().mode();
     if mode & 0o002 != 0 {
         return Err(FsGuardError::WorldWritable { mode: mode & 0o777 });
     }
+    // SAFETY: geteuid never fails and has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let owner = metadata.uid();
+    if owner != euid && owner != 0 {
+        // Reported through the existing variant (a new one would break
+        // downstream exhaustive matches): the "principal" with write access
+        // is the foreign owner.
+        return Err(FsGuardError::InsecureAcl { principal: format!("uid {owner} (owner)"), rights: format!("{:o}", mode & 0o777) });
+    }
+    Ok(())
+}
+
+/// Tightens an existing secret file we own to `0600` if it is readable by
+/// group/others (e.g. copied in by hand, or created before this crate
+/// enforced the mode) — self-healing rather than refusing to read it, which
+/// would break connecting for no gain once the file is fixed anyway.
+///
+/// Best-effort (PR #202 review F2): only a file owned by the current euid is
+/// tightened, and a failed chmod is a `warn!`, never an error. A root-owned
+/// file (allowed by [`check_not_world_writable`]) or one on a read-only fs
+/// (e.g. a nix-store/home-manager symlink target) can't be chmod-ed, and
+/// refusing to read it would make e.g. `known_ssh_hosts.toml` unreadable and
+/// reject every connection — an always-connects violation for a file that
+/// is still safe to read (it already passed the writability checks).
+#[cfg(unix)]
+fn tighten_secret_file_mode(path: &Path) -> Result<(), FsGuardError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::metadata(path).map_err(FsGuardError::Stat)?;
+    if !needs_tightening(metadata.is_file(), metadata.permissions().mode(), metadata.uid(), current_euid()) {
+        return Ok(());
+    }
+    if let Err(e) = set_private_file_permissions(path) {
+        log::warn!("could not tighten {} to 0600 (reading it anyway): {e:?}", path.display());
+    }
+    Ok(())
+}
+
+/// Whether [`tighten_secret_file_mode`] should chmod a file: a regular file
+/// we own (`owner == euid`) that is readable by group/others.
+#[cfg(unix)]
+fn needs_tightening(is_file: bool, mode: u32, owner: u32, euid: u32) -> bool {
+    is_file && owner == euid && mode & 0o077 != 0
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: geteuid never fails and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn tighten_secret_file_mode(_path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }
 
@@ -275,6 +334,7 @@ pub fn read_checked(path: &Path) -> Result<Option<String>, FsGuardErrorAt> {
         return Ok(None);
     }
     check_not_world_writable(path).map_err(|e| FsGuardErrorAt::at(path, e))?;
+    tighten_secret_file_mode(path).map_err(|e| FsGuardErrorAt::at(path, e))?;
     let content =
         fs::read_to_string(path).map_err(|source| FsGuardErrorAt::Read { path: path.to_path_buf(), source })?;
     Ok(Some(content))
@@ -295,8 +355,12 @@ pub fn write_private_atomically(path: &Path, contents: &[u8]) -> Result<(), FsGu
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|source| FsGuardErrorAt::Write { path: path.to_path_buf(), source })?;
     set_private_file_permissions(tmp.path()).map_err(|e| FsGuardErrorAt::at(tmp.path(), e))?;
+    // `sync_all` before the rename: otherwise a crash/power loss right after
+    // `persist` can leave the new name pointing at an empty or partially
+    // written file (the rename reaches disk before the data does).
     tmp.write_all(contents)
         .and_then(|_| tmp.flush())
+        .and_then(|_| tmp.as_file().sync_all())
         .map_err(|source| FsGuardErrorAt::Write { path: path.to_path_buf(), source })?;
 
     tmp.persist(path).map_err(|e| FsGuardErrorAt::Write { path: path.to_path_buf(), source: e.error })?;
@@ -473,5 +537,49 @@ mod tests {
         write_private_atomically(&path, b"first").unwrap();
         write_private_atomically(&path, b"second").unwrap();
         assert_eq!(read_checked(&path).unwrap(), Some("second".to_string()));
+    }
+
+    /// A secret file readable by group/others (e.g. copied in by hand) is
+    /// tightened to 0600 on read instead of being left exposed.
+    #[cfg(unix)]
+    #[test]
+    fn read_checked_tightens_a_group_or_world_readable_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("token.json");
+        fs::write(&path, b"secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(read_checked(&path).unwrap(), Some("secret".to_string()));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    /// PR #202 review F2: only a regular file owned by the current euid is
+    /// chmod-ed. A root-owned 0644 file (allowed by the owner check) is read
+    /// as-is instead of failing on EPERM; the chmod-failure path itself is a
+    /// `warn!` (can't be provoked without root or a read-only fs here).
+    #[cfg(unix)]
+    #[test]
+    fn needs_tightening_only_for_our_own_group_or_world_readable_regular_files() {
+        const ME: u32 = 1000;
+        assert!(needs_tightening(true, 0o644, ME, ME));
+        assert!(needs_tightening(true, 0o640, ME, ME));
+        assert!(!needs_tightening(true, 0o600, ME, ME), "already private");
+        assert!(!needs_tightening(true, 0o644, 0, ME), "root-owned: chmod would fail with EPERM");
+        assert!(!needs_tightening(true, 0o644, 4242, ME), "foreign owner");
+        assert!(!needs_tightening(false, 0o755, ME, ME), "not a regular file");
+    }
+
+    /// Our own files pass the owner check (the foreign-owner branch can't be
+    /// exercised without root, but this pins that the new check doesn't
+    /// reject the normal case).
+    #[cfg(unix)]
+    #[test]
+    fn a_file_owned_by_the_current_user_passes_the_owner_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, b"x").unwrap();
+        check_not_world_writable(&path).unwrap();
     }
 }

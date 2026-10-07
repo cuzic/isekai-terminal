@@ -235,6 +235,14 @@ pub(crate) fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> 
             if entry.grfAccessMode != GRANT_ACCESS {
                 continue;
             }
+            // An inherit-only ACE (e.g. the `CREATOR OWNER` template ACE
+            // Windows puts on user-profile directories) grants nothing on
+            // *this* object — it only seeds children's ACLs. Treating it as a
+            // live grant made `check_not_world_writable` fail closed on
+            // perfectly private directories.
+            if entry.grfInheritance.0 & windows::Win32::Security::INHERIT_ONLY_ACE.0 != 0 {
+                continue;
+            }
             if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
                 // `ptstrName` isn't a `PSID` for any other trustee form
                 // (e.g. `TRUSTEE_IS_NAME`) — casting it to one anyway and
