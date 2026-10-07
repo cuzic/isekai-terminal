@@ -1,39 +1,32 @@
-name: rust-core netlab check (PoC)
+name: rust-core netlab nightly (L2)
 
-# 実バイナリ(isekai-pipe serve/connect + 実sshd + 実ssh)を、tc netemで
-# パケットロス/遅延を注入した2つのnetwork namespace間で動かし、1本の
-# SSHセッションが壊れずに完走することを検証する(PLAN.md:1322「物理2
-# ネットワークでの実機検証は未実施」のギャップに対する、CI上での代替第一段)。
-# シナリオ本体は tests/netlab/scenarios/direct_survives_loss_and_delay.sh。
+# L2夜間: 実バイナリ(isekai-pipe serve/connect + 実sshd + 実ssh)を、veth直結の2つの
+# network namespace上で動かし、実カーネル・実QUIC・実時間で故障を注入する
+# (ADR_CONNECTION_RESILIENCE_SIMULATION.md の L2 / ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §5-4、Q-L1-14)。
 #
-# まだPoC段階のため workflow_dispatch のみで手動起動する。安定したら
-# push/pull_request トリガーへ昇格させる。
+# - トリガーは schedule(夜間)と workflow_dispatch のみ。pull_request/push は意図的に無い:
+#   PRを遅くしない・止めない。required check にも含めない(実時間依存でflakeやすい)。
+# - スケジュール実行が失敗したら、`l2-nightly` ラベルのトラッキングissueを自動で
+#   新規作成または追記する(report-failure ジョブ)。調査手順は tests/netlab/README.md。
+# - シナリオ本体は tests/netlab/scenarios/*.sh、共通部は tests/netlab/common.sh。
 
 on:
+  schedule:
+    # 毎日 18:17 UTC(= 03:17 JST)。毎正時を避けてGitHubのcron混雑を回避する。
+    - cron: "17 18 * * *"
   workflow_dispatch:
-    inputs:
-      loss:
-        description: "tc netem packet loss (例: 3%)"
-        required: false
-        default: "3%"
-      delay:
-        description: "tc netem delay+jitter (例: 80ms 20ms)"
-        required: false
-        default: "80ms 20ms"
-      payload_bytes:
-        description: "往復させるペイロードサイズ(バイト)"
-        required: false
-        default: "2097152"
 
+# 夜間実行同士(および手動dispatch)を重ねない。実行中のものは止めず、後続を待たせる。
 concurrency:
-  group: rust-core-netlab-${{ github.ref }}
-  cancel-in-progress: true
+  group: rust-core-netlab-nightly
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  direct-survives-loss-and-delay:
+  build:
+    name: build isekai-pipe
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -52,30 +45,117 @@ jobs:
           restore-keys: |
             netlab-cargo-${{ runner.os }}-
 
-      - name: Show toolchain versions
-        run: |
-          rustc --version
-          cargo --version
-
-      - name: Install openssh-server + jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server jq
-
       - name: Build isekai-pipe
         working-directory: rust-core
         run: cargo build -p isekai-pipe --bin isekai-pipe
 
-      - name: Run direct_survives_loss_and_delay scenario
-        env:
-          NETLAB_LOSS: ${{ inputs.loss }}
-          NETLAB_DELAY: ${{ inputs.delay }}
-          PAYLOAD_BYTES: ${{ inputs.payload_bytes }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isekai-pipe-netlab
+          path: rust-core/target/debug/isekai-pipe
+          retention-days: 3
+          if-no-files-found: error
+
+  scenario:
+    name: scenario ${{ matrix.scenario }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - silent_blackhole_then_resume
+          - link_down_then_resume
+          - zombie_relay_preempt
+          # ベースライン(旧PoC): ロス3%・遅延80msでもバイト列が壊れない
+          - direct_survives_loss_and_delay
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: isekai-pipe-netlab
+          path: ${{ runner.temp }}/bin
+
+      - name: Install openssh-server + jq + iptables
         run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server jq iptables
+
+      - name: Run ${{ matrix.scenario }}
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/isekai-pipe"
           sudo -E env \
-            ISEKAI_PIPE_BIN="$PWD/rust-core/target/debug/isekai-pipe" \
-            NETLAB_LOSS="$NETLAB_LOSS" \
-            NETLAB_DELAY="$NETLAB_DELAY" \
-            PAYLOAD_BYTES="$PAYLOAD_BYTES" \
+            ISEKAI_PIPE_BIN="$RUNNER_TEMP/bin/isekai-pipe" \
             PATH="$PATH" \
-            bash tests/netlab/scenarios/direct_survives_loss_and_delay.sh
+            bash "tests/netlab/scenarios/${{ matrix.scenario }}.sh"
+
+  # スケジュール実行が赤のとき、`l2-nightly`ラベルのissueを重複なく作成/追記する。
+  report-failure:
+    name: report failure to tracking issue
+    needs: [build, scenario]
+    if: ${{ always() && github.event_name == 'schedule' && (needs.build.result == 'failure' || needs.scenario.result == 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'l2-nightly';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // 失敗したjob(=シナリオ)を列挙する。
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId, per_page: 100,
+            });
+            const failed = jobs
+              .filter(j => j.conclusion === 'failure')
+              .map(j => `- [${j.name}](${j.html_url})`);
+            const failedList = failed.length ? failed.join('\n') : '- (失敗jobを特定できず。run全体を確認)';
+
+            const body = [
+              `L2夜間netlabが失敗しました。`,
+              ``,
+              `- run: ${runUrl}`,
+              `- commit: ${context.sha}`,
+              ``,
+              `失敗したjob:`,
+              failedList,
+              ``,
+              `調査手順: tests/netlab/README.md の「赤い夜間runの調査」を参照。`,
+            ].join('\n');
+
+            // ラベルが無ければ作る(既にあれば422を無視)。
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: label, color: 'b60205',
+                description: 'L2 nightly netlab failure tracking',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              labels: label, state: 'open', per_page: 1,
+            });
+            if (open.data.length > 0) {
+              const issue = open.data[0];
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issue.number, body,
+              });
+              core.info(`commented on #${issue.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: 'L2夜間netlabの失敗', labels: [label], body,
+              });
+              core.info(`created #${created.data.number}`);
+            }
