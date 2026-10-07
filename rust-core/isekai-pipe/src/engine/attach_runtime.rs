@@ -61,6 +61,16 @@ const PENDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// over the network to `target`.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Upper bound on how long [`AttachRuntime::hello`] waits for its
+/// `AttachReadyV2`/reject outcome (review 2026-09-29, PIPE-06). Every
+/// arbiter transition that displaces a waiting key now resolves it
+/// explicitly (`SendReject`), so this is only a backstop against a future
+/// path that forgets to: without it such a caller (its connection task, its
+/// `AnyMuxConnection` clone, and its `waiters` entry) leaked forever, and
+/// `serve --once` hung. Longer than `TARGET_CONNECT_TIMEOUT` — the longest
+/// legitimate wait (a slow target connect) — plus margin.
+const HELLO_OUTCOME_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The target TCP connection of a session whose data stream is gone, kept
 /// for a possible `RESUME`.
 pub type ParkedTcp = (OwnedReadHalf, OwnedWriteHalf);
@@ -70,6 +80,7 @@ pub type ParkedTcp = (OwnedReadHalf, OwnedWriteHalf);
 /// `negotiated_resume_grace_secs` depends on `requested_resume_grace_secs`
 /// (an ATTACH-unrelated policy value the connection task already knows),
 /// which this runtime has no reason to also track.
+#[derive(Clone, Copy)]
 pub enum HelloOutcome {
     Ready { attach_token: AttachToken },
     Reject(AttachRejectReason),
@@ -241,7 +252,11 @@ impl Drop for EstablishedLease {
 pub struct AttachRuntime {
     core: Mutex<ServeCore>,
     leases: Mutex<HashMap<LeaseId, LeaseResource>>,
-    waiters: Mutex<HashMap<AttachKey, oneshot::Sender<HelloOutcome>>>,
+    /// Every `hello()` caller still waiting on a key. A list, not a single
+    /// slot: a retransmitted `ATTACH_HELLO` for the same key (a second
+    /// connection racing the first) must not silently drop the first
+    /// caller's sender (PIPE-06) — every one of them gets the outcome.
+    waiters: Mutex<HashMap<AttachKey, Vec<oneshot::Sender<HelloOutcome>>>>,
     next_target_id: AtomicU64,
     target: SocketAddr,
     /// Epoch of this shell's `Millis` (ADR §2.2). `tokio::time::Instant`, so
@@ -383,11 +398,32 @@ impl AttachRuntime {
     /// unlike the former `engine/mod.rs::admit_new_session`, which checked
     /// `session_count()` under the lock, dropped it, then called this — two
     /// concurrent new sessions can no longer both pass the check (max+1).
+    ///
+    /// The wait is bounded by `HELLO_OUTCOME_TIMEOUT` (PIPE-06); on expiry
+    /// the now-dead sender is pruned from `waiters`.
     pub async fn hello(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().await.insert(key, tx);
+        self.waiters.lock().await.entry(key).or_default().push(tx);
         self.apply_and_execute(ServeEvent::AdmitRequested { key }).await;
-        rx.await.unwrap_or(HelloOutcome::Reject(AttachRejectReason::Unsupported))
+        self.wait_hello_outcome(key, rx).await
+    }
+
+    async fn wait_hello_outcome(self: &Arc<Self>, key: AttachKey, rx: oneshot::Receiver<HelloOutcome>) -> HelloOutcome {
+        match tokio::time::timeout(HELLO_OUTCOME_TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => HelloOutcome::Reject(AttachRejectReason::Unsupported),
+            Err(_elapsed) => {
+                log::warn!("attach_runtime: no ATTACH outcome for {key:?} within {HELLO_OUTCOME_TIMEOUT:?}; giving up");
+                let mut waiters = self.waiters.lock().await;
+                if let Some(senders) = waiters.get_mut(&key) {
+                    senders.retain(|tx| !tx.is_closed());
+                    if senders.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+                HelloOutcome::Reject(AttachRejectReason::Target)
+            }
+        }
     }
 
     /// Applies `AttachActivate`; on success (the activation matched the
@@ -565,7 +601,8 @@ impl AttachRuntime {
     }
 
     async fn resolve_waiter(self: &Arc<Self>, key: AttachKey, outcome: HelloOutcome) {
-        if let Some(tx) = self.waiters.lock().await.remove(&key) {
+        let senders = self.waiters.lock().await.remove(&key).unwrap_or_default();
+        for tx in senders {
             let _ = tx.send(outcome);
         }
     }
@@ -848,7 +885,7 @@ impl AttachRuntime {
     /// pre-Step-2b admission race could create (→ an unresumable entry).
     pub(crate) async fn hello_bypassing_admission(self: &Arc<Self>, key: AttachKey) -> HelloOutcome {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().await.insert(key, tx);
+        self.waiters.lock().await.entry(key).or_default().push(tx);
         let attach = {
             let mut core = self.core.lock().await;
             let ServeCore { agg, io } = &mut *core;
@@ -1040,6 +1077,39 @@ mod start_connect_tests {
         assert!(matches!(outcome, HelloOutcome::Reject(_)), "connect to a closed port must reject the attach");
         assert_eq!(runtime.lease_resource_count_for_test().await, 0, "no Connecting entry may be left behind");
         assert!(runtime.is_vacant().await, "the fencing slot must be released");
+    }
+
+    /// PIPE-06 regression: a retransmitted `ATTACH_HELLO` for the same key
+    /// (two connections racing) used to replace the first caller's sender,
+    /// so that caller got `Unsupported`. Both now get the same outcome.
+    #[tokio::test]
+    async fn retransmitted_hello_for_the_same_key_resolves_every_waiter() {
+        // On the current-thread test runtime the spawned connect task cannot
+        // run before `join!` has polled both hellos, so both are registered
+        // (the second as a same-attempt retransmit while `Connecting`)
+        // before `TargetConnected` resolves the key.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let runtime = AttachRuntime::new(target, 16);
+        let k = key(9);
+        let (a, b) = tokio::join!(runtime.hello(k), runtime.hello(k));
+        match (a, b) {
+            (HelloOutcome::Ready { attach_token: ta }, HelloOutcome::Ready { attach_token: tb }) => {
+                assert!(ta == tb, "both waiters of one key must get the same attach token");
+            }
+            (HelloOutcome::Reject(ra), HelloOutcome::Reject(rb)) => {
+                panic!("both hellos rejected: {ra:?} / {rb:?}");
+            }
+            (HelloOutcome::Ready { .. }, HelloOutcome::Reject(r)) | (HelloOutcome::Reject(r), HelloOutcome::Ready { .. }) => {
+                panic!("one waiter of a retransmitted key was dropped with {r:?}");
+            }
+        }
     }
 
     /// PIPE-04 regression: a fast connect must always reach `PendingTarget`
