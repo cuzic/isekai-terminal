@@ -7706,12 +7706,13 @@ mod tests {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(left, b"\x1b[66;1;1M");
+        // RC-45: urxvt(1015)のCbはX10と同じく+32する(水平ホイールはボタン66/67 → 98/99)。
+        assert_eq!(left, b"\x1b[98;1;1M");
         let right = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelRight), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(right, b"\x1b[67;1;1M");
+        assert_eq!(right, b"\x1b[99;1;1M");
     }
 
     // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
