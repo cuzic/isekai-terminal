@@ -2711,6 +2711,37 @@ mod tests {
         assert_eq!(ops.rebootstrap_calls, 1, "a pre-handshake failure never started the remote command, so it is safe to retry");
     }
 
+    /// SSH-02 (driver level): the claimed outcome's `session_established`
+    /// reaches the reducer. An `Unreachable` failure *after* the SSH bridge
+    /// went live (the Relay route's resume-window exhaustion) must not
+    /// re-run a remote command; the same class without it (a pre-connect
+    /// failure) is still redeployed and retried.
+    #[tokio::test]
+    async fn recovery_does_not_rerun_a_remote_command_once_the_session_was_established() {
+        tokio::time::pause();
+        let mut established = fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable);
+        established.session_established = true;
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string())].into_iter().collect(),
+            outcome: Some(established),
+            has_remote_command: true,
+            ..Default::default()
+        };
+        let err = drive_connect_recovery(&mut ops, fake_intent()).await.expect_err("must give up");
+        assert!(format!("{err:#}").contains("connection lost"), "{err:#}");
+        assert_eq!(ops.attempt_calls, 1, "the remote command must not be re-run");
+        assert_eq!(ops.rebootstrap_calls, 0);
+
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("connection lost".to_string()), Ok(0)].into_iter().collect(),
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            has_remote_command: true,
+            ..Default::default()
+        };
+        assert_eq!(drive_connect_recovery(&mut ops, fake_intent()).await.unwrap(), 0);
+        assert_eq!(ops.rebootstrap_calls, 1, "a pre-connect failure is still redeployed and retried");
+    }
+
     /// Once the lightweight-retry cap is exceeded, the loop falls back to a
     /// full re-deploy exactly like a `StaleTrust`/`Unreachable` signal would.
     #[tokio::test]

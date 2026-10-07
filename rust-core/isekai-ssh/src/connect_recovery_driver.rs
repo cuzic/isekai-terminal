@@ -128,6 +128,7 @@ pub(crate) async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, i
                             class: last_outcome.as_ref().map(|o| o.class.clone()),
                             should_bootstrap: ops.should_bootstrap(),
                             has_remote_command: ops.has_remote_command(),
+                            session_established: last_outcome.as_ref().is_some_and(|o| o.session_established),
                             seed: rand::random(),
                         };
                         queue.extend(fsm.apply(event));
