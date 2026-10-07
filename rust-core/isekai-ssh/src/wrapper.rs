@@ -1386,6 +1386,33 @@ async fn resolve_direct_helper_addr(host: &str, port: u16) -> Result<SocketAddr>
     }
 }
 
+/// The `helper_addr` a direct launch caches, given the local resolution of the
+/// bootstrap host (`resolved`, from [`resolve_direct_helper_addr`]).
+///
+/// A local DNS failure is fatal only when the helper reported no STUN-observed
+/// address. A `HostName` reached through ProxyJump/`ProxyCommand` (an internal
+/// `*.lan` name, `cloudflared`/`tailscale nc`) often doesn't resolve on this
+/// machine, yet with `#@isekai stun` such a host connects STUN-primary:
+/// `select_transport` puts `StunP2p` first and the direct address only feeds
+/// the cross-family fallback, which `isekai-pipe connect`
+/// (`build_cross_family_target`) deliberately ignores when it can't parse it.
+/// Failing the bootstrap there would turn a host that works into a permanent
+/// retry loop (re-review of PR #201, B1, `.claude/rules/always-connects.md`), so
+/// the raw `host:port` is cached as before. Without STUN the route can't work
+/// at all, so the retryable `JumpHostUnreachable` is returned.
+fn direct_helper_addr_for(resolved: Result<std::net::IpAddr>, host: &str, port: u16, stun_observed: bool) -> Result<String> {
+    match resolved {
+        Ok(ip) => Ok(SocketAddr::new(ip, port).to_string()),
+        Err(e) if stun_observed => {
+            log_line_verbose!(
+                "isekai-ssh: {host:?} does not resolve locally ({e:#}); caching it unresolved, STUN P2P stays the primary route"
+            );
+            Ok(format!("{host}:{port}"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The first IPv4 address in `addrs`, else the first address at all (see
 /// [`resolve_direct_helper_addr`]).
 fn prefer_ipv4(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
@@ -1560,14 +1587,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             );
         }
     }
-    // Direct launch: resolve the bootstrap host *before* deploying (review of
-    // PR #201, M2) — a DNS failure then fails fast as a retryable
-    // `JumpHostUnreachable` instead of orphaning a freshly started helper on
-    // every recovery attempt. Only the IP is needed here; the port comes from
-    // the helper's handshake below.
+    // Direct launch: resolve the bootstrap host's IP locally. Best-effort, not
+    // `?`: a `HostName` reached only through ProxyJump/`ProxyCommand` may not
+    // resolve here at all, yet such a host still connects STUN-primary — see
+    // `direct_helper_addr_for`. Only the IP is needed; the port comes from the
+    // helper's handshake below.
     let direct_helper_ip = match &resolution.isekai.bootstrap_relay {
         Some(_) => None,
-        None => Some(resolve_direct_helper_addr(host, 0).await?.ip()),
+        None => Some(resolve_direct_helper_addr(host, 0).await.map(|addr| addr.ip())),
     };
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
@@ -1598,10 +1625,8 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             let direct_port = handshake
                 .direct_by_bootstrap_host_port()
                 .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
-            match direct_helper_ip {
-                Some(ip) => SocketAddr::new(ip, direct_port).to_string(),
-                None => resolve_direct_helper_addr(host, direct_port).await?.to_string(),
-            }
+            let resolved = direct_helper_ip.expect("direct_helper_ip is resolved for every direct launch");
+            direct_helper_addr_for(resolved, host, direct_port, handshake.stun_observed_addr().is_some())?
         }
     };
 
@@ -2643,6 +2668,38 @@ mod tests {
         assert_eq!(prefer_ipv4([v4, v6]), Some(v4));
         assert_eq!(prefer_ipv4([v6, v6b]), Some(v6));
         assert_eq!(prefer_ipv4(std::iter::empty()), None);
+    }
+
+    /// Wiring for `prefer_ipv4`: whatever order the resolver returns
+    /// `localhost` in (`::1` first on many dual-stack hosts), the cached
+    /// address is IPv4 whenever the name has an A record at all.
+    #[tokio::test]
+    async fn resolve_direct_helper_addr_returns_ipv4_when_the_name_has_an_a_record() {
+        let all: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", 4433)).await.unwrap().collect();
+        let picked = resolve_direct_helper_addr("localhost", 4433).await.unwrap();
+        if all.iter().any(SocketAddr::is_ipv4) {
+            assert!(picked.is_ipv4(), "picked {picked} from {all:?}");
+        }
+    }
+
+    /// Re-review of PR #201 (B1): a `HostName` that only resolves on the far
+    /// side of a ProxyJump/`ProxyCommand` must not fail the bootstrap when the
+    /// helper reported a STUN-observed address (STUN P2P is the primary route
+    /// there, as on main). Without STUN evidence it stays a retryable
+    /// `JumpHostUnreachable`.
+    #[tokio::test]
+    async fn direct_helper_addr_for_a_host_resolvable_only_via_proxyjump() {
+        let host = "isekai-ssh-test-host.invalid";
+        let with_stun = direct_helper_addr_for(resolve_direct_helper_addr(host, 0).await.map(|a| a.ip()), host, 4433, true);
+        assert_eq!(with_stun.unwrap(), "isekai-ssh-test-host.invalid:4433");
+
+        let err = direct_helper_addr_for(resolve_direct_helper_addr(host, 0).await.map(|a| a.ip()), host, 4433, false).unwrap_err();
+        let failure = err.downcast_ref::<BootstrapFailure>().expect("classified");
+        assert!(matches!(failure, BootstrapFailure::JumpHostUnreachable), "{failure:?}");
+        assert!(failure.may_retry());
+
+        let ip: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(direct_helper_addr_for(Ok(ip), host, 4433, true).unwrap(), "192.0.2.7:4433");
     }
 
     /// SSH-01 regression: a DNS-named `HostName` is resolved at bootstrap

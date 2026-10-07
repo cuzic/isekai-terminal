@@ -379,6 +379,24 @@ mod tests {
         assert_eq!(std::fs::metadata("/dev/null").unwrap().permissions().mode(), before);
     }
 
+    /// Wiring for M1 that doesn't need root: a user-owned FIFO (fchmod on it
+    /// *succeeds* as a normal user, unlike `/dev/null`) opened as the log sink
+    /// keeps its 0644 — the pre-fix code re-tightened it to 0600.
+    #[test]
+    fn open_leaves_a_non_regular_log_target_alone() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("log.fifo");
+        let c_path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str())).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "{}", std::io::Error::last_os_error());
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A non-blocking reader first, so the sink's write-open doesn't block.
+        let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap();
+        Sink::new().open(&fifo, None).unwrap();
+        assert_eq!(std::fs::metadata(&fifo).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
     /// SSH-43 regression: opening a pre-existing, looser-permissioned log
     /// re-tightens it to 0600 (the create-time `mode` alone never did).
     #[test]
