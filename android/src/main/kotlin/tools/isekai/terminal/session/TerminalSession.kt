@@ -46,7 +46,7 @@ class TerminalSession(
     /**
      * リモートが OSC 52 でクリップボード書き込みを要求したときに呼ばれる
      * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定値は持たない(渡し忘れで機能が黙って消えるのを防ぐ、
-     * `ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g))。実際に Android の
+     * `docs/adr/0020-unwired-callback-detection.md` §3(g))。実際に Android の
      * `ClipboardManager` へ書くかどうか(opt-in設定のチェック含む)は呼び出し元の責務とし、
      * `Context` を持たないこのクラス自体には持ち込まない([RealHostKeyChecker]を
      * `TerminalTabsViewModel`側から注入するのと同じ構成)。
@@ -137,7 +137,7 @@ class TerminalSession(
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
 
     /**
-     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustが判断した接続エッジ
+     * docs/adr/0019-functional-core-effects.md §6 Step 8a′: Rustが判断した接続エッジ
      * (`OrchestratorCallback.onConnectionEdge`)を、届いた順にそのまま渡すだけの経路。
      * [state]は`StateFlow`でconflateされるため、そこから「未接続→接続」を検出すると
      * `Connected→Reconnecting→Connected`を取りこぼしうる。こちらは無制限バッファの
@@ -409,7 +409,7 @@ class TerminalSession(
 
         // D-6(Y-R): 前面復帰時のRustの判断(再接続を開始したか/猶予内で接続が
         // 生きていたか)。Q10: Y-RではAndroid側はログのみに留める(UX活用は
-        // 別follow-up、ADR_IOS_PARITY_IMPLEMENTATION.md §5.1-4/D-6-5参照)。
+        // 別follow-up、docs/adr/0001-ios-parity-implementation.md §5.1-4/D-6-5参照)。
         override fun onForegroundResume(didReconnect: Boolean) {
             RemoteLogger.i("IsekaiTerminalSSH", "onForegroundResume: didReconnect=$didReconnect")
         }

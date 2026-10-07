@@ -42,7 +42,7 @@ import uniffi.isekai_terminal_core.RebindPublicState
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
- * `ADR_UNWIRED_CALLBACK_DETECTION.md` Phase 1(§3(a′)-6、rev2 R2-1)の配線契約テスト(Compose側)。
+ * `docs/adr/0020-unwired-callback-detection.md` Phase 1(§3(a′)-6、rev2 R2-1)の配線契約テスト(Compose側)。
  *
  * [WiringContract]で`UiAction`に分類した`SessionOrchestrator`の全メソッドを、本物の
  * [TerminalHostScreen]+[TerminalTabsViewModel]+[TerminalSession]を描画し、意味木から

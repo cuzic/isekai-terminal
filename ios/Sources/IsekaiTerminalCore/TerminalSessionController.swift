@@ -814,7 +814,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         }
     }
 
-    // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が世代付きで
+    // docs/adr/0019-functional-core-effects.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が世代付きで
     // 判断して届ける。ここは届いたエッジに対応する既存の処理を呼ぶだけで、`onConnectionStateChanged`
     // から自前でエッジを検出したり重複排除したりしない(以前の`tmuxPrevConnected`ミラー状態は撤去、
     // `.claude/rules/rust-ssot.md`)。
@@ -1115,7 +1115,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
 
     // D-6(Y-R): 前面復帰時にRustが下した「再接続を開始したか/猶予内で接続が
     // 生きていたか」の判断。Y-Rではログのみ(バナー表示等の実UIはY-P3で実装、
-    // `ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照)。didReconnect=trueは
+    // `docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照)。didReconnect=trueは
     // 「開始した」であって「成功した」ではない(N2b)——結果は既存の
     // onConnectionStateChangedが伝える。
     public func onForegroundResume(didReconnect: Bool) {

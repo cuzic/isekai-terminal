@@ -2,7 +2,7 @@ import Foundation
 
 /// 定型コマンド一覧画面の「テンプレートから追加」で選べる、アプリ同梱の雛形。
 /// DB行ではなく静的データ。選んだ内容は通常の`Snippet`としてそのまま編集・保存できる
-/// (Android版`data/SnippetTemplates.kt`の1:1移植、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.3)。
+/// (Android版`data/SnippetTemplates.kt`の1:1移植、`docs/adr/0001-ios-parity-implementation.md` §3.3)。
 /// テンプレート定義自体はUI初期データであり接続/セッションの状態でも意思決定でもないため、
 /// Rust共通層には置かない(D-1の「UI表示に閉じた状態」に該当、UniFFI regenサイクルを
 /// 増やすだけで対称性の実利が無いという判断)。

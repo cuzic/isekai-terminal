@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """isekai-ssh の dead_code 警告の Linux ∩ Windows 積集合レポート(report-only)。
 
-ADR_UNWIRED_CALLBACK_DETECTION.md §3(b) / U4: isekai-ssh は `native/` が cfg(windows) でしか
+docs/adr/0020-unwired-callback-detection.md §3(b) / U4: isekai-ssh は `native/` が cfg(windows) でしか
 使われないため、単一プラットフォームでは dead_code を deny できない。Linux と Windows の
 両ビルドで未使用と報告された項目(=本当に死んでいる候補)だけを報告する。失敗させない。
 

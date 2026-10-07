@@ -6,7 +6,7 @@ import org.junit.Test
 import java.io.File
 
 /**
- * `ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g)(Phase 2)の再発防止ガード(字句検査)。
+ * `docs/adr/0020-unwired-callback-detection.md` §3(g)(Phase 2)の再発防止ガード(字句検査)。
  *
  * 1. **既定no-op lambdaの禁止**: 登録した宣言([noDefaultLambdas])の関数型パラメータ/プロパティに
  *    `= { ... }`の既定値を書かせない。ce214ef5(`onNotify`の既定no-opに吸われ、渡し忘れがコンパイルを

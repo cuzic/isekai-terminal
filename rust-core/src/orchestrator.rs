@@ -166,7 +166,7 @@ impl ActiveSession {
 // ── Shared internal state ─────────────────────────────────
 
 // `ConnPhase`/`BackgroundState`/`DisconnectKind`/`NETWORK_LOST_REASON`は
-// `crate::reconnect_fsm`へ移した(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 3a)。
+// `crate::reconnect_fsm`へ移した(docs/adr/0019-functional-core-effects.md §6 Step 3a)。
 
 /// 直前に成功した(あるいは試みた)`connect_*`の種類とConfigを保持し、予期しない
 /// 切断時に同じ接続を自動的に張り直せるようにする(tssh のUDPモード reconnect相当)。
@@ -299,7 +299,7 @@ struct OrchestratorState {
     /// 再接続に関する集約(`phase`・`reconnect_epoch`・`reconnect_loop_active`・
     /// `retry_attempt_in_flight`・`pending_wake`・`user_initiated_disconnect`・
     /// `background_state`・`last_attempt`)。判断は[`ReconnectState::apply`]が行う
-    /// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 3a)。別ストアではなくこの構造体の
+    /// (docs/adr/0019-functional-core-effects.md §6 Step 3a)。別ストアではなくこの構造体の
     /// フィールドなので、所有者は`OrchestratorState`1つのまま(ADR §4.3)。
     /// Step 3aで`apply`経由に移行していない書き手は従来どおりフィールドを直接書く。
     reconnect: ReconnectState,
@@ -446,13 +446,13 @@ pub(crate) struct OrchestratorShared {
     reconnect_wake: tokio::sync::Notify,
     /// このオーケストレータが自分のバックグラウンドtask(自動再接続ループ
     /// [`spawn_reconnect_loop`]と、TCP網断debounceの遅延発火)をspawnする先の
-    /// tokioランタイム(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2.5)。
+    /// tokioランタイム(docs/adr/0019-functional-core-effects.md §6 Step 2.5)。
     ///
     /// 本番(`create_session_orchestrator`)は常にグローバル[`RUNTIME`]のHandleで、
     /// 以前の`RUNTIME.spawn`と挙動は同一。テストは`#[tokio::test(start_paused = true)]`の
     /// current_threadランタイムのHandleを**明示的に**渡し、ループのtick/debounceを
     /// 仮想時間で決定論的に進める。`Handle::try_current()`による暗黙のフォールバックは
-    /// 採らない(ADR_CONNECTION_RESILIENCE_SIMULATION.md §5): 呼び出し元のランタイムに
+    /// 採らない(docs/adr/0018-connection-resilience-simulation.md §5): 呼び出し元のランタイムに
     /// 黙って乗り換えると、本番でUniFFIスレッドからの呼び出しとtokio task内からの
     /// 呼び出しでspawn先が変わってしまうため。
     rt: tokio::runtime::Handle,
@@ -751,7 +751,7 @@ fn apply_network_lost(shared: &Arc<OrchestratorShared>) {
 /// ループ自身のtickに任せる。
 ///
 /// 判断は[`ReconnectState::apply`]`(`[`ReconnectEvent::AttemptDisconnected`]`)`が行い
-/// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 3a)、この関数はshellとして
+/// (docs/adr/0019-functional-core-effects.md §6 Step 3a)、この関数はshellとして
 /// 「ロック下でapply+in-lock解決 → ロック解放後にEffectを解釈」だけを行う(§2.4-2,3)。
 /// `generation`はアダプタ経由ならそのアダプタの世代、`None`なら現行の`session_generation`
 /// (`apply_network_lost`経路)。
@@ -2028,7 +2028,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: callback契約goldenの生成・一致検査
+    // docs/adr/0019-functional-core-effects.md §6 Step 13: callback契約goldenの生成・一致検査
     // (`src/orchestrator/tests/callback_contract_golden.rs`)。
     mod callback_contract_golden;
 

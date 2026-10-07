@@ -3,7 +3,7 @@ import IsekaiTerminalCoreLogic
 
 /// Y-P1(#2): `AI_INTEGRATION_DESIGN.md` §6にあるリモートAPC経由の構造化パネル
 /// (`presentDocument`/`presentForm`)を表示するシート。Android版`AiPanelDialog.kt`の
-/// `AiPanelSheet`と対称(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.2)。
+/// `AiPanelSheet`と対称(`docs/adr/0001-ios-parity-implementation.md` §3.2)。
 ///
 /// **信頼境界**: `panel`の内容(title/markdown/fields)はリモートの任意プロセスが
 /// 偽造できるPTY上のin-bandデータであり、このシートはそれを**表示専用テキストとして

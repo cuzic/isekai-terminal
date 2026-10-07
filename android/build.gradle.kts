@@ -72,7 +72,7 @@ android {
             all {
                 // Roborazzi のCompose UIスクリーンショットにハードウェアレンダリングを使う
                 it.systemProperties["robolectric.pixelCopyRenderMode"] = "hardware"
-                // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: Rustが生成するcallback契約golden
+                // docs/adr/0019-functional-core-effects.md §6 Step 13: Rustが生成するcallback契約golden
                 // (`CallbackContractGoldenReplayTest`がreplayする)。Swift側と同じファイルを直接読む
                 // (コピーを持たない)。テストの入力として宣言し、golden変更時に結果のキャッシュを再利用させない。
                 val callbackContractGoldenDir = rootProject.file("rust-core/tests/golden/callback_contract")

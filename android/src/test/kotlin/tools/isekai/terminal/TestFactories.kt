@@ -13,7 +13,7 @@ import uniffi.isekai_terminal_core.PlatformFd
 import uniffi.isekai_terminal_core.SessionOrchestratorInterface
 
 /*
- * `ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g)(Phase 2): 本番の[TerminalSession]・[TerminalScreenActions]は
+ * `docs/adr/0020-unwired-callback-detection.md` §3(g)(Phase 2): 本番の[TerminalSession]・[TerminalScreenActions]は
  * 関数型パラメータの既定no-opを持たない(渡し忘れがコンパイルエラーになる)。既定no-opで足りるテストは
  * ここのファクトリ経由で生成する。既定値を持ってよいのはテスト側だけ。
  */

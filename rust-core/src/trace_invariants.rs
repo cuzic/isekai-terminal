@@ -1,4 +1,4 @@
-//! テスト専用: Effect/callback列の不変条件検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 11)。
+//! テスト専用: Effect/callback列の不変条件検査(docs/adr/0019-functional-core-effects.md §6 Step 11)。
 //!
 //! テストが自分で起こしたcallback(`on_connection_state_changed`/`on_connection_edge`)や
 //! reducerのEffectを、**テスト内メモリ上の列**([`TraceEvent`])として記録し、純粋な検査関数

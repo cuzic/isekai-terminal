@@ -821,7 +821,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
 }
 
 /// Builds the pre-validated cross-family relay target for STUN P2P's
-/// resume-preserving fallback (`ADR_STUN_REESTABLISH_CONTINUITY.md` §3.2 task 2).
+/// resume-preserving fallback (`docs/adr/0006-stun-reestablish-continuity.md` §3.2 task 2).
 ///
 /// Deliberately never fails the caller: an invalid/missing
 /// `cross_family_fallback` on the profile just disables cross-family resume

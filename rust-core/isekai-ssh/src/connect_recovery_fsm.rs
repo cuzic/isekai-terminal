@@ -1,7 +1,7 @@
 //! The one "always-connects" connect-failure recovery reducer shared by
 //! `isekai-ssh`'s Unix (`wrapper.rs::run_ssh_with_connect_failure_recovery`)
 //! and Windows-native (`native::connect::run_native_connect_with_recovery`)
-//! paths (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 6+7).
+//! paths (docs/adr/0019-functional-core-effects.md §6 Step 6+7).
 //!
 //! Before Step 6+7 each path had its own copy of the loop body (attempt →
 //! claim outcome → decide → maybe redeploy → backoff → retry), and real bugs
@@ -26,7 +26,7 @@
 //!   policy of `reconnect_backoff`. `native::mux::mod`'s separate reconnect
 //!   loop (and its deliberately different 60s `RECONNECT_STABLE_THRESHOLD`,
 //!   ADR D4) is *not* part of this reducer.
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;

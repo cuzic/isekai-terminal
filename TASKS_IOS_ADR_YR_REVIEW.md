@@ -1,7 +1,7 @@
 # レビュー: `TASKS_IOS_ADR_YR.md`（Y-R 実装タスクリスト）
 
 - **レビュー対象**: `TASKS_IOS_ADR_YR.md`（Y-R フェーズのみの実装タスクリスト）
-- **照合先**: `ADR_IOS_PARITY_IMPLEMENTATION.md`（Accepted, round-3）D-6 / §3.9.3c / §3.10.2-② /
+- **照合先**: `docs/adr/0001-ios-parity-implementation.md`（Accepted, round-3）D-6 / §3.9.3c / §3.10.2-② /
   §3.10.4 / §4.1 / §4.2-5 / §4.4、`.claude/rules/uniffi-binding-regeneration.md`、
   `.claude/rules/main-branch-protection.md`、および現ソースツリーの実読
 - **方針**: タスクファイルの主張する行番号・引用は一切信用せず、全て該当ファイルを開いて確認した。

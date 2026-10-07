@@ -1,4 +1,4 @@
-# 純粋モジュールの登録簿(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+# 純粋モジュールの登録簿(docs/adr/0019-functional-core-effects.md §2.3)。
 #
 # 検査は2層:
 #   1. clippy disallowed_methods/types(clippy.toml + 各モジュール先頭の #![deny(..)])

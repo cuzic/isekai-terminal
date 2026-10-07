@@ -1,5 +1,5 @@
 //! The one shell (interpreter) for `connect_recovery_fsm::ConnectRecoveryFsm`
-//! (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 6+7), shared by the Unix
+//! (docs/adr/0019-functional-core-effects.md §6 Step 6+7), shared by the Unix
 //! (`wrapper.rs::run_ssh_with_connect_failure_recovery`) and Windows-native
 //! (`native::connect::run_native_connect_with_recovery`) recovery loops,
 //! which used to be two hand-maintained copies of the same loop body.

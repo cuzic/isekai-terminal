@@ -49,7 +49,7 @@
 | `android-uniffi-drift` | `android-uniffi-drift-check.yml`の`drift-check` | UniFFI Kotlinバインディングのdrift検知 | 〜4分(pr-path-gate経由で無関係PRは20〜30秒) |
 | `lockfile-drift` | `lockfile-drift-check.yml`の`check` | `cargo metadata --locked`によるCargo.lock整合性検証 | 数秒〜十数秒 |
 | `room-migration` | `room-migration-check.yml`の`check` | Room migration番号の整合性検証 | 数秒〜数十秒 |
-| `rust-core-purity-check` | `rust-core-test-check.yml`の`purity-check` | 純粋モジュール(`rust-core/pure_modules.toml`登録)のclippy `disallowed_*`+importホワイトリスト+interpreter網羅性検査(`ADR_FUNCTIONAL_CORE_EFFECTS.md` Step 0/7a)。無関係なPRはpr-path-gate経由で`skipping`として報告されブロックしない | 〜10分 |
+| `rust-core-purity-check` | `rust-core-test-check.yml`の`purity-check` | 純粋モジュール(`rust-core/pure_modules.toml`登録)のclippy `disallowed_*`+importホワイトリスト+interpreter網羅性検査(`docs/adr/0019-functional-core-effects.md` Step 0/7a)。無関係なPRはpr-path-gate経由で`skipping`として報告されブロックしない | 〜10分 |
 
 5つ(+purity-check)とも元は各ワークフローのjob id(`test`/`drift-check`/`check`等)がGitHub上の
 check-run context名になっていたが、`android-test-check.yml`と`rust-core-test-check.yml`

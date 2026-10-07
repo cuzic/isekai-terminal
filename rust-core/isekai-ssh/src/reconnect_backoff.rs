@@ -12,13 +12,13 @@
 //! `native::connect` on Windows' single-process fallback) for why a
 //! simpler, console-independent wait is the right fit for both.
 //!
-//! Pure since ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7: the accounting here
+//! Pure since docs/adr/0019-functional-core-effects.md Step 6+7: the accounting here
 //! ([`RedeployGate`], [`RecoveryBudget`]) never reads a clock or an RNG
 //! itself. Time arrives as `now: Millis` stamped by the shell
 //! (`connect_recovery_driver.rs`), and jitter as an explicit `seed: u64`.
 //! The one reducer that drives both is `connect_recovery_fsm.rs`, shared by
 //! the Unix (`wrapper.rs`) and Windows-native (`native::connect`) paths.
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
@@ -36,7 +36,7 @@ pub(crate) const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 /// Same exponential-backoff-with-jitter shape as
 /// `native::mux::mod::ReconnectBackoff` and
 /// `isekai-pipe::resume_loop::RESUME_BACKOFF` — all three are now the one
-/// `isekai_transport::backoff::BackoffPolicy` (ADR_FUNCTIONAL_CORE_EFFECTS.md
+/// `isekai_transport::backoff::BackoffPolicy` (docs/adr/0019-functional-core-effects.md
 /// Step 6); jitter specifically avoids every open tab's reconnect loop
 /// retrying (and re-dialing) on the exact same schedule after a shared event
 /// like a sleep/resume or roaming network change. Draw it with the pure
@@ -107,7 +107,7 @@ pub(crate) const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(200)
 /// closed, `RebootstrapAndRetry` falls through to a plain lightweight
 /// reconnect with the existing intent instead — most reconnects after a
 /// real, transient network blip need nothing more than that, matching both
-/// `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`'s own observation ("re-deploying
+/// `docs/adr/0002-midsession-disconnect-recovery.md`'s own observation ("re-deploying
 /// the helper is often unnecessary — the server-side helper is usually
 /// still alive") and tssh/tsshd's actual design (confirmed by reading
 /// `tssh/udp.go` and `tsshd/server.go`: `tsshd` stays resident across

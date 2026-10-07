@@ -5,7 +5,7 @@
 # 並行作業間での版数の奪い合いを防ぐための「予約」側スクリプト。予約した番号どおりに
 # 実装・マージされたか(および予約エントリの削除し忘れ)の「検証」側は
 # scripts/check-grdb-migrations.sh(CI: .github/workflows/grdb-migration-check.yml)が担当する。
-# Android版`scripts/reserve-room-migration.sh`の1:1移植(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(b))。
+# Android版`scripts/reserve-room-migration.sh`の1:1移植(`docs/adr/0001-ios-parity-implementation.md` §3.11(b))。
 #
 # 背景・使い方の詳細は ios/migration_registry.toml のコメントを参照。
 #

@@ -1,4 +1,4 @@
-//! ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: Android/iOSのcallback契約golden(Rust側)。
+//! docs/adr/0019-functional-core-effects.md §6 Step 13: Android/iOSのcallback契約golden(Rust側)。
 //!
 //! orchestratorのシナリオ(Step 8a′の退出経路(a)〜(f)・再接続ループのギブアップ・高速な再接続の連続)を
 //! 本番と同じshell経路で走らせ、`OrchestratorCallback`へ届いた列を射影したものを
@@ -169,7 +169,7 @@ fn check_golden(cb: &RecordingCallback, scenario: &str, description: &str) {
              --- expected ({}) ---\n{expected}\n\
              --- actual ({}{}) ---\n{rendered}\n\
              callback列の変更が意図どおりなら、actualの内容を確認して{scenario}.jsonとしてコミットする\n\
-             (Kotlin/Swiftのreplayテストも同じファイルを読む。ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13 / §7)。",
+             (Kotlin/Swiftのreplayテストも同じファイルを読む。docs/adr/0019-functional-core-effects.md §6 Step 13 / §7)。",
             path.display(),
             actual_path.display(),
             if wrote { "" } else { "、書き込み失敗" },

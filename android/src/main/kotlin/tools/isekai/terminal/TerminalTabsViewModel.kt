@@ -823,7 +823,7 @@ class TerminalTabsViewModel(
     }
 
     /**
-     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が
+     * docs/adr/0019-functional-core-effects.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が
      * 世代付きで判断して`TerminalSession.connectionEdges`へ届ける。ここは届いたエッジに
      * 対応する既存の処理を呼ぶだけで、`uiState`からエッジを検出したり重複排除したりしない
      * (以前の`prevConnected`ミラー状態は`StateFlow`のconflationで`Connected→Reconnecting→

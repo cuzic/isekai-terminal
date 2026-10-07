@@ -32,7 +32,7 @@
 //! この案内は予防策(「案内すれば頻度が減るかもしれない」)に過ぎず、実際の復旧保証は
 //! タスク#14の黙示的自動再アタッチが既に担っている——このモジュールが無くても
 //! `.claude/rules/always-connects.md`の原則は満たされたままである、という位置づけ。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

@@ -1,5 +1,5 @@
 //! `SessionOrchestrator`の自動再接続に関する判断を、時計・ロック・spawn・コールバックから
-//! 切り離した純粋reducer(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.1 / §6 Step 3a)。
+//! 切り離した純粋reducer(docs/adr/0019-functional-core-effects.md §2.1 / §6 Step 3a)。
 //!
 //! ## 集約(`ReconnectState`)
 //!
@@ -91,7 +91,7 @@
 //! - 範囲外(PR #167レビューL-3): orchestratorの破棄(Kotlinの`close()`/drop)はphase遷移ではないので
 //!   `Lost`を出さない。Kotlinの`closePaneSession`は`disconnect()`の後に購読を止め、接続に紐づく
 //!   ハンドルを自分で閉じるので、破棄後の`Lost`を必要としない。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

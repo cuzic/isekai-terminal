@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # L2シナリオ1: サイレントblackhole → 復旧後にresumeして同一SSHセッションが完走する。
-# ADR_CONNECTION_RESILIENCE_SIMULATION.md L2 / ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §5-4。
+# docs/adr/0018-connection-resilience-simulation.md L2 / docs/adr/0021-deterministic-network-simulation-l1.md §5-4。
 #
 # 両netnsでUDPをiptables DROP(エラー応答なし=サイレント)し、QUIC idle timeout(15s)を
 # 超える25秒維持してから解除する。その間もsshのstdinにはデータが流れ続ける。

@@ -1,5 +1,5 @@
 //! 接続プール(`pool.rs`)の1エントリぶんの参照カウントとアイドル削除タイマーの判断
-//! (ADR_FUNCTIONAL_CORE_EFFECTS.md §2.2-1 / §6 Step 4)。
+//! (docs/adr/0019-functional-core-effects.md §2.2-1 / §6 Step 4)。
 //!
 //! `pool.rs`は`parking_lot::Mutex`・`tokio::sync::watch`・`RUNTIME`へのspawnを持つshellで、
 //! ここはそのうち「いつ削除タイマーをarmし、満了したタイマーで実際に削除してよいか」の判断だけを
@@ -16,7 +16,7 @@
 //! 新エントリの現行`generation`と偶然一致して満了すると、新エントリをgrace前に削除しうる
 //! (ABA)。削除はrefcount==0のときだけなので、影響は「アイドルなプール接続が早めに閉じられ、
 //! 次のタブが新規接続する」に留まる。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

@@ -639,7 +639,7 @@ class TerminalTabsViewModelTest {
         assertFalse(orchestrators[0].connectCalled)
     }
 
-    /** ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 接続エッジはRustの`onConnectionEdge`から
+    /** docs/adr/0019-functional-core-effects.md §6 Step 8a′: 接続エッジはRustの`onConnectionEdge`から
      *  届いた順に(無制限バッファで)処理される。`StateFlow`のconflationで`Connected→Reconnecting→
      *  Connected`を取りこぼしえた旧実装(`prevConnected`)と違い、収集より速く遷移しても
      *  Established/Lost/Established の3件すべてに対応する処理が走る。 */

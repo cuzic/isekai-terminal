@@ -95,7 +95,7 @@ import uniffi.isekai_terminal_core.*
  * すべての操作は最終的に [tools.isekai.terminal.session.TerminalSession] への薄い委譲。
  *
  * 関数型プロパティには既定値を持たせない(既定のno-opに吸われて渡し忘れがコンパイルを通る
- * 配線漏れを防ぐ、`ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g)。`WiringLintTest`が再発を検査する)。
+ * 配線漏れを防ぐ、`docs/adr/0020-unwired-callback-detection.md` §3(g)。`WiringLintTest`が再発を検査する)。
  */
 data class TerminalScreenActions(
     val onConnect: () -> Unit,

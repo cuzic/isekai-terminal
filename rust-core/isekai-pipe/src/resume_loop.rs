@@ -42,7 +42,7 @@ use crate::RelayTransportKind;
 #[cfg(test)]
 use crate::DEFAULT_RESUME_WINDOW;
 
-// client側の時間定数の関係テスト(ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.5(a))。
+// client側の時間定数の関係テスト(docs/adr/0021-deterministic-network-simulation-l1.md §4.5(a))。
 // このファイルのprivate定数が見えるよう子モジュールにしてある。
 #[cfg(test)]
 mod timing_relations;
@@ -81,7 +81,7 @@ const WARM_STANDBY_SUSPEND_JUMP_FACTOR: u32 = 3;
 /// control to the wrapper's full STUN re-establishment loop.
 const STUN_RESUME_GIVE_UP_WINDOW: Duration = Duration::from_secs(120);
 
-/// このshellの時計(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.2)。`resume_fsm`のreducerへ渡す
+/// このshellの時計(docs/adr/0019-functional-core-effects.md §2.2)。`resume_fsm`のreducerへ渡す
 /// `now: Millis`は、すべて[`ShellClock::stamp`]でだけ刻む(Step 5で、本番コードに13箇所
 /// 散っていた`Instant::now()`をここへ集約した)。`tokio::time::Instant`を使うので、
 /// `start_paused`のテストでは仮想時刻に追従する(`std::time::Instant`と混在させない)。
@@ -155,7 +155,7 @@ impl std::error::Error for MidSessionDisconnectSignal {}
 /// (`anyhow!("network change detected, reconnecting")`) with the same
 /// typed-marker + `downcast_ref` pattern already used by
 /// `MidSessionDisconnectSignal`/`StaleTrustSignal`, so callers can check for
-/// it without string-matching (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 2:
+/// it without string-matching (docs/adr/0006-stun-reestablish-continuity.md §3.2 task 2:
 /// this is what lets the cross-family switch trigger react to "this episode
 /// started from a network change" without inventing a second channel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,7 +790,7 @@ async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
 }
 
 /// Which branch [`wait_backoff_or_network_change`] returned through — lets
-/// callers (the cross-family switch trigger, ADR_STUN_REESTABLISH_CONTINUITY.md
+/// callers (the cross-family switch trigger, docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 1/2) react to "this wait ended because of a fresh network
 /// change" without string-matching a log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,7 +1007,7 @@ fn give_up(is_tty: bool, warm_standby_task: &Option<tokio::task::JoinHandle<()>>
     }
 }
 
-/// Records `"continuity-lost"` (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)
+/// Records `"continuity-lost"` (docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5)
 /// for a give-up while on the cross-family relay target. *Whether* to record
 /// (this episode's own bounded probe, or a later episode that already proved
 /// the target reachable) and *why* (`relay-unreachable` for the deadline
@@ -1021,7 +1021,7 @@ fn record_continuity_lost(session_id: isekai_transport::SessionId, reason: Conti
 
 /// The concrete targets the reducer's opaque `DialPath` refers to, for one
 /// `run_resume_loop` call. Kept in the shell so no session secret ever enters
-/// a reducer Event/Cmd (ADR_FUNCTIONAL_CORE_EFFECTS.md §3-3).
+/// a reducer Event/Cmd (docs/adr/0019-functional-core-effects.md §3-3).
 struct ResumeTargets<'a> {
     primary: &'a RelayTarget,
     cross_family: Option<&'a RelayTarget>,
@@ -1061,7 +1061,7 @@ fn interpret_tick_cmds(cmds: Vec<ResumeCmd>) {
 }
 
 /// The ordinary resume retry loop for one disconnect episode — the shell
-/// (interpreter) half of `resume_fsm::ResumePlanner` (ADR_FUNCTIONAL_CORE_EFFECTS.md
+/// (interpreter) half of `resume_fsm::ResumePlanner` (docs/adr/0019-functional-core-effects.md
 /// §6 Step 5). Every decision (deadline, backoff length, when to give up,
 /// when to switch to the cross-family relay target, whether to announce) is
 /// the reducer's; this function only executes `ResumeCmd`s — waits, dials,
@@ -1210,7 +1210,7 @@ async fn resume_with_backoff_until_deadline(
                 drop(connection.connection);
                 state.network_rebinder = connection.network_rebinder;
                 if cross_family_switched {
-                    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5: only
+                    // docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5: only
                     // logged the one time the switch actually happens in
                     // this episode — not on every later successful resume
                     // against the now-permanent relay target (the reducer
@@ -1373,7 +1373,7 @@ pub(crate) async fn run_resume_loop(
     // no-op in that case, matching this codebase's "opportunistic,
     // default-off" convention for experimental features.
     //
-    // ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 7's last bullet asks this
+    // docs/adr/0006-stun-reestablish-continuity.md §3.2 task 7's last bullet asks this
     // to be an explicit decision rather than left implicit: this function
     // (and `experimental_network_rebind` above) are received once, as plain
     // arguments, and are *not* re-derived after a cross-family switch. This

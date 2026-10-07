@@ -37,7 +37,7 @@ enum EntryState<T> {
 pub(crate) struct PoolEntry<T> {
     state: EntryState<T>,
     /// 参照カウントとアイドルタイマーの世代(stale-guard token)。判断は純粋reducer
-    /// [`IdleLedger`](`pool_idle_fsm.rs`、ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 4)にあり、
+    /// [`IdleLedger`](`pool_idle_fsm.rs`、docs/adr/0019-functional-core-effects.md §6 Step 4)にあり、
     /// `release`の0到達で`ArmIdleTimer{generation}`を返す。新規アタッチ(`try_attach_with`)や
     /// 再度の0到達で世代が進むので、古いタイマーの`IdleExpired`は世代不一致で何もしない
     /// (`AbortHandle`を持ち回らずに古いタイマーを無効化する)。
@@ -193,11 +193,11 @@ where
 }
 
 /// [`release`]の、アイドルタイマーのspawn先ランタイムを明示的に受け取る版
-/// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2.5)。本番の呼び出し元は全て[`release`]
+/// (docs/adr/0019-functional-core-effects.md §6 Step 2.5)。本番の呼び出し元は全て[`release`]
 /// (=グローバル`RUNTIME`)経由で、これを直接呼ぶのは`#[tokio::test(start_paused = true)]`
 /// から`Handle::current()`を渡してidle graceを仮想時間で進めるテストだけ。
 /// `Handle::try_current()`による暗黙のフォールバックは採らない
-/// (ADR_CONNECTION_RESILIENCE_SIMULATION.md §5)。
+/// (docs/adr/0018-connection-resilience-simulation.md §5)。
 ///
 /// Step 4: 判断は[`release_step`](ロック内でreducerへ`Released`を渡す)、タイマーは
 /// [`run_pool_effects`](`ArmIdleTimer`をspawnし、満了で[`idle_expired_step`]を呼ぶ)に分かれた。
@@ -699,7 +699,7 @@ mod tests {
     // 差し替え(Ready→Connecting)を跨いだ状態の食い違い(#120と同種の「エラー後に状態が
     // 残る」バグ)を、操作の組み合わせから探す。
     //
-    // 削除タイマーの満了(Step 4、ADR_FUNCTIONAL_CORE_EFFECTS.md §6 / L0-3・L0-4): `release`の
+    // 削除タイマーの満了(Step 4、docs/adr/0019-functional-core-effects.md §6 / L0-3・L0-4): `release`の
     // 判断部分[`release_step`]が返す`PoolEffect::ArmIdleTimer{key, generation}`を実時間タイマーに
     // せずモデル側で保持し、`FireLatest`/`FireArmed`/`FireArbitrary`操作で任意の順序・任意の
     // (現行/古い/armされていない)世代の[`idle_expired_step`]を発火させる。これで

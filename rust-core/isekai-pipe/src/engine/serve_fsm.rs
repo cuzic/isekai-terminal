@@ -1,4 +1,4 @@
-//! `isekai-pipe serve`の単一集約 [`ServeAggregate`](ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2a)。
+//! `isekai-pipe serve`の単一集約 [`ServeAggregate`](docs/adr/0019-functional-core-effects.md §6 Step 2a)。
 //!
 //! fencing([`AttachArbiter`])とresume用のsession index([`IndexEntry`]の`BTreeMap`)を
 //! **1つの値**にまとめた純粋reducer。shell(`attach_runtime.rs`の`AttachRuntime`)はこれと
@@ -26,7 +26,7 @@
 //!
 //! 不変条件(§4.1 I-a〜I-j、およびStep 2bのI-k「slot数は`max_sessions`を超えない」)は
 //! このモジュールのproptestで検証する。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;

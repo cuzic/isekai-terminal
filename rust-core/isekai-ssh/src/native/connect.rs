@@ -51,7 +51,7 @@ use super::mux::ctl_forward;
 use super::mux::handoff::HandoffCredentials;
 use super::mux::naming;
 
-// ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7: the recovery loop body is the
+// docs/adr/0019-functional-core-effects.md Step 6+7: the recovery loop body is the
 // shared `connect_recovery_driver`/`connect_recovery_fsm` pair, also used by
 // `wrapper.rs::run_ssh_with_connect_failure_recovery`.
 #[cfg(test)]
@@ -292,7 +292,7 @@ pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHoo
 /// stated exception in `always-connects.md` (a genuinely new host key needs a
 /// human), not a violation of the "always-connects" principle.
 ///
-/// Since ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7 both the connect-failure
+/// Since docs/adr/0019-functional-core-effects.md Step 6+7 both the connect-failure
 /// *decision* and the whole loop body are single-sourced with the Unix path:
 /// the pure reducer `crate::connect_recovery_fsm` decides, and the shared
 /// shell [`drive_connect_recovery`] runs it over the [`ConnectRecoveryOps`]
@@ -327,7 +327,7 @@ async fn run_native_connect_with_recovery(
 }
 
 /// Classifies a native re-deploy result exactly as `drive_connect_recovery`'s
-/// own two copies of the loop did before ADR_FUNCTIONAL_CORE_EFFECTS.md
+/// own two copies of the loop did before docs/adr/0019-functional-core-effects.md
 /// Step 6+7 moved the loop into the shared
 /// `connect_recovery_driver`: a failure whose chain carries a retryable
 /// `BootstrapFailure` falls through to a plain lightweight reconnect wait;

@@ -1,4 +1,4 @@
-//! テスト専用: `isekai-pipe serve`のEffect列の不変条件検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 11)。
+//! テスト専用: `isekai-pipe serve`のEffect列の不変条件検査(docs/adr/0019-functional-core-effects.md §6 Step 11)。
 //!
 //! [`ServeAggregate::apply`]の1回ごとに、入力Eventと出力Effectを**秘密を含まない形**
 //! ([`ServeStep`]: variant名とleaseの番号、apply前に判定した「現行か」のフラグだけ)へ写して列にし、

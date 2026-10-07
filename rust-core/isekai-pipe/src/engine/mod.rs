@@ -777,7 +777,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
 
     // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）と
     // fencing(`AttachArbiter`)は、Step 2a以降1つの集約(`serve_fsm::ServeAggregate`)・
-    // 1つのロックにまとまっている(ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2a)。
+    // 1つのロックにまとまっている(docs/adr/0019-functional-core-effects.md §6 Step 2a)。
     // Phase S-4b: 同時保持数を `--max-sessions` で上限を設ける（DoS/リソース枯渇対策）。
     let attach_runtime = AttachRuntime::new(args.target, args.max_sessions);
     let last_activity = Arc::new(Mutex::new(Instant::now()));
@@ -1124,7 +1124,7 @@ async fn handle_attach_stream(
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
     // `hello()`は`--max-sessions`のadmission(Epic N-5: 既知のsession_idは素通し、新規は空きが
     // あれば確保・満杯なら最古parkedを立ち退かせて確保・それも無ければ`BusyOtherSession`)と
-    // fencing slotの確保を**集約の1回のapply**で行う(ADR_FUNCTIONAL_CORE_EFFECTS.md Step 2b)。
+    // fencing slotの確保を**集約の1回のapply**で行う(docs/adr/0019-functional-core-effects.md Step 2b)。
     // 旧`admit_new_session`は判定とslot確保の間でロックを手放していたため、同時に来た新規
     // session 2本が両方とも判定を通りmax+1になり得た。`BusyOtherSession`を新しいwire reasonに
     // しないのは、全sessionがactiveに中継中なので、クライアントの既存の180秒

@@ -13,7 +13,7 @@ import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TrzszPublicState
 
 /**
- * Step 8b(`ADR_FUNCTIONAL_CORE_EFFECTS.md`): [TerminalSession]が[TerminalUiState]へ反映する
+ * Step 8b(`docs/adr/0019-functional-core-effects.md`): [TerminalSession]が[TerminalUiState]へ反映する
  * 更新の語彙。以前は`_state.update { it.copy(...) }`が22箇所に散らばっていたものを、
  * 1メッセージ=1つの表示上の出来事として列挙し、[ConnectionStateMapper.reduce]だけが
  * [TerminalUiState]を組み立てるようにする。

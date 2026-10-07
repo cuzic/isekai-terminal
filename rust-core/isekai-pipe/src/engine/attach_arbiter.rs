@@ -30,7 +30,7 @@
 //! entry for a `session_id` is this module's "vacant" (there used to be an
 //! explicit `AttachState::Vacant` for the single-slot design; a per-session
 //! table just omits the key instead).
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(effects, vec![AttachEffect::SendReady { key: k, attach_token: tok }]);
     }
 
-    // ---- proptest invariants (ADR_FUNCTIONAL_CORE_EFFECTS.md Step 1) ----
+    // ---- proptest invariants (docs/adr/0019-functional-core-effects.md Step 1) ----
     //
     // These live inside this module because `LeaseId`'s field is private:
     // leases are recovered from issued `ConnectTarget` effects and referred

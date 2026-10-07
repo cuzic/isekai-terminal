@@ -91,7 +91,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// Y-P1(#7): `autoTrustNewHostKeys`をONにすると、未知ホストが確認プロンプト無しで
-    /// 即座に信頼される(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.4)。
+    /// 即座に信頼される(`docs/adr/0001-ios-parity-implementation.md` §3.4)。
     func testAutoTrustNewHostKeysAcceptsUnknownHostWithoutPrompt() throws {
         let (controller, trustStore) = try makeController()
         UserDefaults.standard.set(true, forKey: AppSettingsKeys.autoTrustNewHostKeys)
@@ -118,7 +118,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     }
 
     /// Y-P1(#5): `onPromptJump`受信で`uiState.promptJumpResult`が更新され、`seq`が
-    /// 単調増加すること(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.1)。
+    /// 単調増加すること(`docs/adr/0001-ios-parity-implementation.md` §3.1)。
     func testOnPromptJumpUpdatesUiStateAndIncrementsSeq() async throws {
         let (controller, _) = try makeController()
         XCTAssertEqual(controller.uiState.promptJumpResult.seq, 0)
@@ -155,7 +155,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(controller.uiState.promptOutputCopyResult.text, "hello world")
     }
 
-    /// Y-P1(#2): `submitAiPanelForm`はパネルを閉じる(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.2)。
+    /// Y-P1(#2): `submitAiPanelForm`はパネルを閉じる(`docs/adr/0001-ios-parity-implementation.md` §3.2)。
     /// 実際に送信されるバイト列の内容(組み立てロジック自体)は`AiPanelFormSubmissionTests`
     /// (Logic層、全境界ケース)で検証済み。ここでは未接続の`orchestrator`(`init`で常に
     /// 非nil、`.claude/rules/always-connects.md`と同じ「セッション未確立時は安全にno-op」

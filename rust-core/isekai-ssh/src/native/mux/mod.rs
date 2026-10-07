@@ -126,7 +126,7 @@ const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
 /// `isekai-pipe::resume_loop::RESUME_BACKOFF`, and the very same type:
 /// `isekai-ssh` already links `isekai-transport` via `isekai-pipe-core`, so
 /// the old local copy of the pure math (and its "doesn't link against"
-/// rationale) is gone (ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6). Draw the
+/// rationale) is gone (docs/adr/0019-functional-core-effects.md Step 6). Draw the
 /// jitter with `next_delay(attempt, seed)`.
 use isekai_transport::backoff::BackoffPolicy as ReconnectBackoff;
 const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.25 };
@@ -493,7 +493,7 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     // over this holder sink, so installing it anyway would only create a
     // permanently-empty `-ssh.log` companion file and log a "writing holder
     // diagnostics to <path>" line that is not actually where anything ends
-    // up (`ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md` §C4).
+    // up (`docs/adr/0009-isekai-ssh-exit-diagnostics.md` §C4).
     if !crate::log_file::is_enabled() {
         if let Some(channel_name) = &early_channel_name {
             match naming::ssh_holder_log_file(channel_name).and_then(|path| crate::log_file::init_holder_log(&path).map(|()| path)) {

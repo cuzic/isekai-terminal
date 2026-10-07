@@ -26,7 +26,7 @@ import uniffi.isekai_terminal_core.TrzszPublicState
 import kotlin.random.Random
 
 /**
- * Step 8b(`ADR_FUNCTIONAL_CORE_EFFECTS.md`): [ConnectionStateMapper.reduce]の検証。
+ * Step 8b(`docs/adr/0019-functional-core-effects.md`): [ConnectionStateMapper.reduce]の検証。
  *
  * - 表テスト: 各[UiMsg]が[TerminalUiState]のどのフィールドを変え、どれを変えないか。
  * - 性質テスト: 任意のメッセージ列を[ConnectionStateMapper.reduceAll]で畳み込んだ結果が、

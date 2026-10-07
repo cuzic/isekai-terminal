@@ -10,7 +10,7 @@
 //! 元に、連続成功/連続無応答のヒステリシスをどう遷移させるかという、旧実装では
 //! `spawn_health_monitor`の`loop`本体に埋め込まれていて未テストだった部分を
 //! ここに切り出し、`noq::Connection`無しでunit testできるようにしてある。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 // 時計・RNG・ロック・I/O型の直接使用を`clippy.toml`の`disallowed-*`で禁止する。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 

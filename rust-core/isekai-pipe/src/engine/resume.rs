@@ -35,7 +35,7 @@ pub type OutputBuffer = ReplayBuffer;
 
 /// resume 可能な 1 セッション分の、中継ホットパスが触るデータ(出力バッファ等)。
 ///
-/// ADR_FUNCTIONAL_CORE_EFFECTS.md Step 2a 以降、park状態(`parked_tcp`/`parked_since`)・
+/// docs/adr/0019-functional-core-effects.md Step 2a 以降、park状態(`parked_tcp`/`parked_since`)・
 /// 交渉済みgrace・`preempt`/`reparked`の`Notify`はここには無い: park/unpark/破棄の判断は
 /// 純粋reducer(`serve_fsm::ServeAggregate`)が、ソケットと`Notify`はそれと同じロックの
 /// 下にある`attach_runtime::SessionIo`が持つ。このstructは`SessionIo`から

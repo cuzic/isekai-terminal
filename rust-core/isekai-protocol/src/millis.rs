@@ -1,4 +1,4 @@
-//! `Millis`: reducerへ時刻を渡すための値型(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.2、Q1)。
+//! `Millis`: reducerへ時刻を渡すための値型(docs/adr/0019-functional-core-effects.md §2.2、Q1)。
 //!
 //! shell が持つエポック(プロセス/shell起動時の `tokio::time::Instant`)からの経過ミリ秒。
 //! **wire(プロトコルフレーム)に載せないこと。異なるshell/プロセスの値同士を比較しないこと**

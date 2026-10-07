@@ -26,7 +26,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     private enum class Phase { IDLE, CONNECTING, CONNECTED }
     private var phase = Phase.IDLE
 
-    // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 実 Rust 側(`reconnect_fsm.rs`)の接続エッジ
+    // docs/adr/0019-functional-core-effects.md §6 Step 8a′: 実 Rust 側(`reconnect_fsm.rs`)の接続エッジ
     // (`onConnectionEdge`)を模した最小限の状態。本番の Kotlin 側はエッジを自前で検出しないため、
     // Connected/切断を模す simulate* はここで Rust と同じ契約のエッジも発火する:
     // 各世代について Established は高々1回、Connected を離れる遷移(切断・Reconnecting・

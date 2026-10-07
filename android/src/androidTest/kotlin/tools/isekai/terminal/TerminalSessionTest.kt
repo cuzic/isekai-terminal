@@ -23,7 +23,7 @@ import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
 
 /**
- * 本番の[TerminalSession]は注入lambdaの既定no-opを持たない(`ADR_UNWIRED_CALLBACK_DETECTION.md` §3(g))ので、
+ * 本番の[TerminalSession]は注入lambdaの既定no-opを持たない(`docs/adr/0020-unwired-callback-detection.md` §3(g))ので、
  * 注入lambdaを使わないこのテストでは明示的にno-opを渡す。
  */
 private fun noopLambdaTerminalSession(

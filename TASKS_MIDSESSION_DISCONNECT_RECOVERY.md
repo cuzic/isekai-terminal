@@ -1,6 +1,6 @@
-# Tasks: `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`実装タスク一覧
+# Tasks: `docs/adr/0002-midsession-disconnect-recovery.md`実装タスク一覧
 
-- **入力**: `ADR_MIDSESSION_DISCONNECT_RECOVERY.md`（Accepted、round 4）
+- **入力**: `docs/adr/0002-midsession-disconnect-recovery.md`（Accepted、round 4）
 - **前提ルール**: `.claude/rules/prefer-gh-actions-over-local-cargo.md`
   （ローカル`cargo build`/`test`禁止、GitHub Actions経由で検証）、
   `.claude/rules/main-branch-protection.md`（各PRはrequired 5本green
@@ -763,7 +763,7 @@ server-side park共有／`probe.rs:370`の`AnyMuxConnection`保持位置）は
 
 ## 横断: テスト戦略・Rollout
 
-`ADR_MIDSESSION_DISCONNECT_RECOVERY.md` §5・§6を参照。要点:
+`docs/adr/0002-midsession-disconnect-recovery.md` §5・§6を参照。要点:
 
 - 全PR共通でローカル`cargo build`/`test`は使わない
   （`.claude/rules/prefer-gh-actions-over-local-cargo.md`。

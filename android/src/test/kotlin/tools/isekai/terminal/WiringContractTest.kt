@@ -44,7 +44,7 @@ import uniffi.isekai_terminal_core.TransportPreference
 import java.lang.reflect.Modifier
 
 /**
- * `ADR_UNWIRED_CALLBACK_DETECTION.md` Phase 1(§3(a′))の配線契約テスト(JVM/Robolectric側)。
+ * `docs/adr/0020-unwired-callback-detection.md` Phase 1(§3(a′))の配線契約テスト(JVM/Robolectric側)。
  *
  * 1. **網羅**: 生成UniFFIバインディングの全interfaceメソッド・全トップレベル関数を反射で列挙し、
  *    [WiringContract]の分類表と過不足なく一致することをassertする。全数はUniFFIのchecksumシンボル

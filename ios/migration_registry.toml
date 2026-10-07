@@ -4,7 +4,7 @@
 # [worktree/エージェント]が同時に新しいマイグレーションを追加すると、同じ版数を
 # 奪い合い、後から手動で再採番するfixupコミットが必要になる)がiOS版のGRDBでも
 # 起こり得るため、実証済みのRoom側の予約台帳パターンをそのまま移植したもの
-# (`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(b) / D-4)。
+# (`docs/adr/0001-ios-parity-implementation.md` §3.11(b) / D-4)。
 #
 # ルール:
 # 1. 新しい GRDB migration を書き始める前に、

@@ -1,4 +1,4 @@
-//! Step 10-1 differential test (`ADR_FUNCTIONAL_CORE_EFFECTS.md` §6 Step 10):
+//! Step 10-1 differential test (`docs/adr/0019-functional-core-effects.md` §6 Step 10):
 //! the **real** `isekai-pipe serve` shell (`AttachRuntime` + `engine/mod.rs`'s
 //! `finish_or_park_session` / `SessionTableEntryGuard`, with real target TCP
 //! connections to a local listener) against the **pure** reference model

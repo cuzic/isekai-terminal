@@ -65,5 +65,5 @@ signature = "2"
 # Windows named-pipe connections into the `Stream` `russh_keys::agent::server
 # ::serve` requires, without hand-rolling a `Stream` impl.
 tokio-stream = "0.1"
-# connect_recovery_fsm.rsのproptest不変条件(ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7、§3-7)。
+# connect_recovery_fsm.rsのproptest不変条件(docs/adr/0019-functional-core-effects.md Step 6+7、§3-7)。
 proptest = { version = "1", default-features = false, features = ["std"] }

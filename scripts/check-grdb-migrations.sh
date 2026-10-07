@@ -2,7 +2,7 @@
 # GRDB migration(ProfileDatabase)の版数整合性をチェックする。CI(grdb-migration-check.yml)と
 # ローカルの両方から実行できる。版数を事前に確保する「予約」側は
 # scripts/reserve-grdb-migration.sh が担当し、こちらはその結果の「検証」側にあたる。
-# Android版`scripts/check-room-migrations.sh`の1:1移植(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(b))。
+# Android版`scripts/check-room-migrations.sh`の1:1移植(`docs/adr/0001-ios-parity-implementation.md` §3.11(b))。
 # 背景・運用手順の詳細は ios/migration_registry.toml のコメントを参照。
 #
 # 検証内容:

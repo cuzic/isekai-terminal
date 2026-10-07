@@ -2,8 +2,8 @@
 
 実バイナリ(`isekai-pipe serve`/`connect` + 実sshd + 実ssh)を、veth直結の2つのnetwork
 namespace(`topology.sh`)上で動かし、実カーネル・実QUIC・実時間で故障を注入する。
-位置づけは `ADR_CONNECTION_RESILIENCE_SIMULATION.md` の L2 と
-`ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md` §5-4(Q-L1-14)。
+位置づけは `docs/adr/0018-connection-resilience-simulation.md` の L2 と
+`docs/adr/0021-deterministic-network-simulation-l1.md` §5-4(Q-L1-14)。
 
 - ワークフロー: `.github/workflows/rust-core-netlab-check.yml`
   (`schedule` 毎日 18:17 UTC + `workflow_dispatch`。PR/pushでは動かず、required checkでもない)。

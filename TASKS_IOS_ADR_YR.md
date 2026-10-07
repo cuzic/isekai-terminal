@@ -1,6 +1,6 @@
 # Y-R 実装タスクリスト: Rust API チェックポイント（UniFFI 破壊的変更バッチ）
 
-**スコープ**: `ADR_IOS_PARITY_IMPLEMENTATION.md` D-6 / §4.1 の Y-R フェーズのみ。
+**スコープ**: `docs/adr/0001-ios-parity-implementation.md` D-6 / §4.1 の Y-R フェーズのみ。
 `OrchestratorCallback` に `on_foreground_resume(did_reconnect: bool)` を追加し、新規
 `rust-core/src/tmux_window_claim.rs` に `try_claim_tmux_window` /
 `release_tmux_window_claim` を追加し、UniFFI バインディングを1回だけ再生成し、
@@ -50,7 +50,7 @@ UI・ロジック実装（`BackgroundBehaviorView`、`TabRestoreStore`、`Notify
   /// 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
   /// (`orchestrator.rs::notify_will_enter_foreground`から発火)。
   /// `did_reconnect`は「再接続を開始した」であって「成功した」ではない
-  /// (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+  /// (round-3 N2b、`docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照。再接続は
   /// `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
   /// 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
   /// 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し
@@ -412,7 +412,7 @@ Boolean)` は確定済み。**実装者2はAと並行して着手してよい**�
   ```swift
   // D-6(Y-R): 前面復帰時にRustが下した「再接続を開始したか/猶予内で接続が
   // 生きていたか」の判断。Y-Rではログのみ(バナー表示等の実UIはY-P3で実装、
-  // `ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照)。didReconnect=trueは
+  // `docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照)。didReconnect=trueは
   // 「開始した」であって「成功した」ではない(N2b)——結果は既存の
   // onConnectionStateChangedが伝える。
   public func onForegroundResume(didReconnect: Bool) {
@@ -481,7 +481,7 @@ Boolean)` は確定済み。**実装者2はAと並行して着手してよい**�
   ```kotlin
   // D-6(Y-R): 前面復帰時のRustの判断(再接続を開始したか/猶予内で接続が
   // 生きていたか)。Q10: Y-RではAndroid側はログのみに留める(UX活用は
-  // 別follow-up、ADR_IOS_PARITY_IMPLEMENTATION.md §5.1-4/D-6-5参照)。
+  // 別follow-up、docs/adr/0001-ios-parity-implementation.md §5.1-4/D-6-5参照)。
   override fun onForegroundResume(didReconnect: Boolean) {
       RemoteLogger.i("IsekaiTerminalSSH", "onForegroundResume: didReconnect=$didReconnect")
   }

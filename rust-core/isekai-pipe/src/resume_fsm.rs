@@ -1,5 +1,5 @@
 //! `isekai-pipe connect`のresume判断の純粋reducer [`ResumePlanner`]
-//! (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 5)。
+//! (docs/adr/0019-functional-core-effects.md §6 Step 5)。
 //!
 //! 切断を検知してから「どの経路へいつ再接続を試みるか」「いつ諦めるか」を決める判断を、
 //! shell(`resume_loop.rs`の`run_resume_loop`/`resume_with_backoff_until_deadline`)から
@@ -20,13 +20,13 @@
 //! - Event/Cmdは秘密情報(session secret・接続先の証明書等)を一切持たない(§3-3)。接続先は
 //!   [`DialPath`]という不透明な選択肢で指し、実体の`RelayTarget`はshellが持つ。
 //!
-//! 後続のL1合成proptest(ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.6)が`ServeAggregate`
+//! 後続のL1合成proptest(docs/adr/0021-deterministic-network-simulation-l1.md §4.6)が`ServeAggregate`
 //! (server)とこのreducer(client)を同じ`Millis`時計で結ぶことを想定し、client側の期限
 //! (`GiveUp`の`resume_window`、`Backoff`の`after`)をすべてCmdの値として観測できるようにしてある。
 //!
 //! 範囲外(shellに残したもの): EOF-latch(`should_give_up_without_resuming`、`PumpFailure`に
 //! `anyhow::Error`が乗るため)、stdio、表示・通知・telemetryの実I/O(判断はここ、実行はshell)。
-// 純粋モジュール(`pure_modules.toml`登録、ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3)。
+// 純粋モジュール(`pure_modules.toml`登録、docs/adr/0019-functional-core-effects.md §2.3)。
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
@@ -79,7 +79,7 @@ pub(crate) const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
 /// the deadline stops being enough for even one cross-family probe,
 /// independent of this attempt count — see that function's own docs.
 ///
-/// Deliberately no preempt/ping-pong latch here (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// Deliberately no preempt/ping-pong latch here (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 8) — round 2 review concluded cross-family resume runs as a
 /// single sequential loop with no second concurrent reconnect driver, so
 /// there's nothing to latch against yet; build one only if real-world
@@ -94,7 +94,7 @@ pub(crate) const STUN_TO_CROSS_FAMILY_SWITCH_ATTEMPTS: u32 = 5;
 ///
 /// This is deliberately **not** the same as the relay-grace-based deadline
 /// (`None`/multi-day) that `run_resume_loop` installs for later episodes
-/// once the switch has actually succeeded once (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// once the switch has actually succeeded once (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 7's "成功した後" wording, and its own separate task 4 bullet
 /// requiring a *bounded* first attempt) — the two are easy to conflate
 /// because both are implemented as `ResumeDeadlinePolicy::max_resume_window`
@@ -305,7 +305,7 @@ pub(crate) fn cross_family_probe_fits(remaining_before_deadline: Duration) -> bo
     remaining_before_deadline >= CROSS_FAMILY_MIN_PROBE_BUDGET
 }
 
-/// The failure-count switch trigger (ADR_STUN_REESTABLISH_CONTINUITY.md
+/// The failure-count switch trigger (docs/adr/0006-stun-reestablish-continuity.md
 /// §3.2 task 1's second disjunct), made deadline-aware.
 ///
 /// The count alone can silently *never* fire whenever the episode's
@@ -410,7 +410,7 @@ pub(crate) enum DialPath {
     WarmStandby,
     /// 最初に確立した接続先(relayならそのrelay、STUNなら元のpeer)へのbare redial。
     Primary,
-    /// STUN P2Pのcross-family relay fallback(ADR_STUN_REESTABLISH_CONTINUITY.md)。
+    /// STUN P2Pのcross-family relay fallback(docs/adr/0006-stun-reestablish-continuity.md)。
     CrossFamily,
 }
 
@@ -458,7 +458,7 @@ pub(crate) enum GiveUpReason {
     SessionGone,
 }
 
-/// `continuity-lost` telemetryの理由(ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 5)。
+/// `continuity-lost` telemetryの理由(docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContinuityLost {
     RelayUnreachable,
@@ -624,7 +624,7 @@ impl ResumePlanner {
                         self.consecutive_unknown_session = 0;
                         if ep.switched_this_call {
                             // 切り替え先が一度成功したら、以後のepisodeはそこへ、relayの
-                            // grace(clampなし)でresumeする(ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 7)。
+                            // grace(clampなし)でresumeする(docs/adr/0006-stun-reestablish-continuity.md §3.2 task 7)。
                             self.on_cross_family = true;
                             self.max_resume_window = None;
                             self.resume_window = effective_resume_window(self.effective_resume_grace_secs, None);

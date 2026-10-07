@@ -1,5 +1,5 @@
 //! client側の時間定数の**関係**を固定するテスト
-//! (ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §4.5(a)・§5-1、「定数関係テスト」)。
+//! (docs/adr/0021-deterministic-network-simulation-l1.md §4.5(a)・§5-1、「定数関係テスト」)。
 //!
 //! このファイルは値そのものではなく、定数同士の関係だけをassertする。関係はすべて、定数のdoc
 //! コメントかADRに書かれた意図から導いたもの(ADR §12 R3: 意図として書かれている関係だけを守る)。
@@ -95,7 +95,7 @@ fn cross_family_switch_deadline_leaves_room_for_at_least_one_probe() {
         CROSS_FAMILY_SWITCH_DEADLINE >= CROSS_FAMILY_MIN_PROBE_BUDGET,
         "CROSS_FAMILY_SWITCH_DEADLINE ({CROSS_FAMILY_SWITCH_DEADLINE:?}) must be >= CROSS_FAMILY_MIN_PROBE_BUDGET \
          ({CROSS_FAMILY_MIN_PROBE_BUDGET:?}): the bounded post-switch window must fit at least one cross-family probe \
-         (ADR_STUN_REESTABLISH_CONTINUITY.md §3.2 task 4's 'short bounded retry')"
+         (docs/adr/0006-stun-reestablish-continuity.md §3.2 task 4's 'short bounded retry')"
     );
 }
 

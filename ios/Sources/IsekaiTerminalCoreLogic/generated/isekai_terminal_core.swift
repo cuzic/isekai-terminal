@@ -4972,7 +4972,7 @@ public func FfiConverterTypeClipboardMimeKind_lower(_ value: ClipboardMimeKind) 
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * `OrchestratorCallback::on_connection_edge`で通知する接続エッジ
- * (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
+ * (docs/adr/0019-functional-core-effects.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
  * 変化からエッジを自前で検出せず(`StateFlow`のconflationで`Connected→Reconnecting→Connected`
  * を取りこぼしうる)、これを受け取ったら接続/切断に伴う既存の処理を呼ぶだけにする(`rust-ssot.md`)。
  */
@@ -7687,7 +7687,7 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      * 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
      * (`orchestrator.rs::notify_will_enter_foreground`から発火)。
      * `did_reconnect`は「再接続を開始した」であって「成功した」ではない
-     * (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+     * (round-3 N2b、`docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照。再接続は
      * `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
      * 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
      * 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し
@@ -7698,7 +7698,7 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
     func onForegroundResume(didReconnect: Bool) 
     
     /**
-     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
+     * docs/adr/0019-functional-core-effects.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
      * 世代(`generation`=`session_generation`)付きの接続エッジ。実装は受け取ったら接続/切断に伴う
      * 既存の処理(upstream監視の登録/解除・tmuxウィンドウensure等)を呼ぶだけにし、重複排除や
      * エッジ判定を自前で行わない(`rust-ssot.md`)。
@@ -9764,10 +9764,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 797) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 33882) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_foreground_resume() != 42589) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 39423) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_edge() != 19256) {
         return InitializationResult.apiChecksumMismatch
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse(Bash) hook rev3: エージェントからのGitHub書き込み系操作を許可リスト方式で制限する。
 
-ADR_PARALLEL_AGENT_DELIVERY.md B1/NM1/NM2 対策。gh/git pushは「許可した形だけ通す」。
+docs/adr/0022-parallel-agent-delivery.md B1/NM1/NM2 対策。gh/git pushは「許可した形だけ通す」。
 rev3: shlexで字句解析(引用符内/ヒアドキュメント本文の文字列は命令として扱わない)、env/timeout/絶対パス/
 command等の前置ラッパーを剥がす、`--method=PUT`形式、リリースタグ(isekai-*-v*)のpushを拒否。
 対象判定: stdinの agent_id/agent_type、または cwd が .claude/worktrees/ 配下。それ以外(リード)は対象外。

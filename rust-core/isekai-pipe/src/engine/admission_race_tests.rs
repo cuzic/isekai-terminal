@@ -1,5 +1,5 @@
 //! Shell-level test for the `--max-sessions` admission race
-//! (`ADR_FUNCTIONAL_CORE_EFFECTS.md` §6 Step 2b).
+//! (`docs/adr/0019-functional-core-effects.md` §6 Step 2b).
 //!
 //! # The race (before Step 2b)
 //!

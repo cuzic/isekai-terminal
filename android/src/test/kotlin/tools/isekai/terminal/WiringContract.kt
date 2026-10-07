@@ -9,7 +9,7 @@ import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 
 /**
- * `ADR_UNWIRED_CALLBACK_DETECTION.md` §3(a′)(Phase 1): 生成UniFFIバインディングの全入口・
+ * `docs/adr/0020-unwired-callback-detection.md` §3(a′)(Phase 1): 生成UniFFIバインディングの全入口・
  * 全callbackを「Androidで実際にどう配線されているか」で分類した表。
  *
  * 新しいUniFFIメソッド/関数/callbackを足したPRは、Kotlinバインディング再生成
@@ -59,7 +59,7 @@ sealed interface Wiring {
 }
 
 object WiringContract {
-    private const val ADR = "ADR_UNWIRED_CALLBACK_DETECTION.md"
+    private const val ADR = "docs/adr/0020-unwired-callback-detection.md"
     private const val HOST_PANE = "tools.isekai.terminal.TerminalHostScreenKt#TerminalPaneScreen"
     private const val COORDINATOR = "tools.isekai.terminal.ConnectionCoordinator#connectPane"
     private const val VM = "tools.isekai.terminal.TerminalTabsViewModel"
@@ -121,7 +121,7 @@ object WiringContract {
         "onData" to Wiring.UiState,
         "onDownloadComplete" to Wiring.UiState,
         "onFilePreviewResult" to Wiring.UiState,
-        // 8ced2131(PR #104)本文: Y-RではAndroidはログのみ。UX活用は別follow-up(ADR_IOS_PARITY_IMPLEMENTATION.md Q10)。
+        // 8ced2131(PR #104)本文: Y-RではAndroidはログのみ。UX活用は別follow-up(docs/adr/0001-ios-parity-implementation.md Q10)。
         "onForegroundResume" to Wiring.LogOnly("8ced2131"),
         // e8ed36ee: add_local_forward/remove_forwardをAndroidから削除済み。状態通知はログのみ。
         "onForwardStateChanged" to Wiring.LogOnly("e8ed36ee"),

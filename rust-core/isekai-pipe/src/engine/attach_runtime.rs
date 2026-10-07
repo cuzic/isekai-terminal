@@ -1,5 +1,5 @@
 //! Real (I/O-performing) effect executor around [`ServeAggregate`]
-//! (`#18-3`, ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 2a), replacing
+//! (`#18-3`, docs/adr/0019-functional-core-effects.md §6 Step 2a), replacing
 //! `engine/mod.rs`'s single `active: Arc<AtomicBool>` compare-exchange and —
 //! since Step 2a — the separate `SessionTable` lock. One [`AttachRuntime`] is
 //! created per `isekai-pipe serve` process and shared across every accepted
@@ -363,7 +363,7 @@ impl AttachRuntime {
     /// eventual `AttachReadyV2`/reject outcome.
     ///
     /// Admission (`--max-sessions`, Epic N-5) happens in that **same apply**
-    /// (ADR_FUNCTIONAL_CORE_EFFECTS.md Step 2b): a session_id that already
+    /// (docs/adr/0019-functional-core-effects.md Step 2b): a session_id that already
     /// holds a slot (retransmit/reattach/supersede) passes straight through;
     /// a brand-new one claims a slot if fewer than `max_sessions` are held,
     /// else evicts the oldest parked session first, else is rejected with
@@ -403,7 +403,7 @@ impl AttachRuntime {
             .await;
         let mut started = None;
         // Effect interpreter: every `AttachEffect` variant is listed explicitly
-        // (ADR_FUNCTIONAL_CORE_EFFECTS.md §3-8, Step 7a) so adding a new effect
+        // (docs/adr/0019-functional-core-effects.md §3-8, Step 7a) so adding a new effect
         // forces a decision here instead of being silently dropped. (The
         // in-lock `ServeEffect`s — `RegisterIo`, an eviction's `Discard` — were
         // already interpreted by `interpret_in_lock`.)

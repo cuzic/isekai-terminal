@@ -289,7 +289,7 @@ jobs:
             rust-core/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-      # proptestの反例保存(ADR_FUNCTIONAL_CORE_EFFECTS.md §7 m-5): CI専用運用では
+      # proptestの反例保存(docs/adr/0019-functional-core-effects.md §7 m-5): CI専用運用では
       # ローカルでproptest-regressions/が生成されないため、失敗時にartifactとして回収し、
       # `cc`行をソースツリーへ手でコミットする。
       # Step 13のcallback契約golden(`rust-core/tests/golden/callback_contract/`)の不一致時に
@@ -305,7 +305,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # 純粋モジュールの純粋性検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3 / §6 Step 0)。
+  # 純粋モジュールの純粋性検査(docs/adr/0019-functional-core-effects.md §2.3 / §6 Step 0)。
   # 層1: clippy disallowed_methods/types(rust-core/clippy.toml、各純粋モジュール先頭の#![deny])。
   # `-A clippy::all`でも、ソース内のdenyが優先されるため純粋モジュールだけが検査される。
   # 層2: import allowlist(rust-core/scripts/check_pure_modules.py、rust-core/pure_modules.toml)。
@@ -354,7 +354,7 @@ jobs:
         working-directory: rust-core
         run: cargo clippy --workspace --lib --bins -- -A clippy::all
 
-      # ADR_UNWIRED_CALLBACK_DETECTION.md Phase 3: isekai-terminal-coreの新規dead_codeを禁止する。
+      # docs/adr/0020-unwired-callback-detection.md Phase 3: isekai-terminal-coreの新規dead_codeを禁止する。
       # 意図的に残す未配線項目は`#[allow(dead_code)] // UNWIRED: <参照>`で明示すること
       # (テスト専用はcfg(test)、本当に死んだものは削除)。crate単位(-p)なので
       # isekai-ssh(cfg(windows)依存で単一プラットフォームdeny不可)・vendor crateには効かない。
@@ -362,7 +362,7 @@ jobs:
         working-directory: rust-core
         run: cargo clippy -p isekai-terminal-core --lib -- -A clippy::all -D dead_code
 
-      # ADR_UNWIRED_CALLBACK_DETECTION.md §3(b)/U4(report-only): isekai-sshのdead_code警告を
+      # docs/adr/0020-unwired-callback-detection.md §3(b)/U4(report-only): isekai-sshのdead_code警告を
       # 収集する。上のworkspace clippyと同一コマンド+json出力なので全crateがfreshで、cargoが
       # キャッシュ済み診断を再生するだけ(再コンパイルしない)。失敗させない。
       - name: Collect isekai-ssh dead_code warnings (Linux, report-only)
@@ -539,7 +539,7 @@ jobs:
         working-directory: rust-core
         run: cargo build --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
-      # ADR_UNWIRED_CALLBACK_DETECTION.md §3(b)/U4(report-only): 直前のbuildと同一コマンド+
+      # docs/adr/0020-unwired-callback-detection.md §3(b)/U4(report-only): 直前のbuildと同一コマンド+
       # json出力なのでfresh、キャッシュ済み診断の再生のみ(再コンパイルしない)。失敗させない。
       # (cfg(windows)のnative/はここで初めて使われる)
       - name: Collect isekai-ssh dead_code warnings (Windows, report-only)
@@ -659,7 +659,7 @@ jobs:
             rust-core/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # ADR_UNWIRED_CALLBACK_DETECTION.md §3(b)/U4: isekai-sshのdead_code警告のLinux∩Windows積集合を
+  # docs/adr/0020-unwired-callback-detection.md §3(b)/U4: isekai-sshのdead_code警告のLinux∩Windows積集合を
   # job summaryに出す。**report-only**: 何があっても失敗させず、required status checkにもしない
   # (branch protectionに追加しないこと)。両プラットフォームで未使用=本当に死んでいる候補。
   isekai-ssh-dead-code-report:

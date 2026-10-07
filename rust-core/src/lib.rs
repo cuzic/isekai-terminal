@@ -11,7 +11,7 @@ pub(crate) mod ai_panel;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
-// Step 4(ADR_FUNCTIONAL_CORE_EFFECTS.md): pool.rsのrefcount/アイドルタイマー判断の純粋reducer。
+// Step 4(docs/adr/0019-functional-core-effects.md): pool.rsのrefcount/アイドルタイマー判断の純粋reducer。
 pub(crate) mod pool_idle_fsm;
 pub(crate) mod socks;
 pub(crate) mod session_state;
@@ -1421,7 +1421,7 @@ pub enum ConnectionPublicState {
 }
 
 /// `OrchestratorCallback::on_connection_edge`で通知する接続エッジ
-/// (ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
+/// (docs/adr/0019-functional-core-effects.md §6 Step 8a′)。Kotlin/Swiftは`ConnectionPublicState`の
 /// 変化からエッジを自前で検出せず(`StateFlow`のconflationで`Connected→Reconnecting→Connected`
 /// を取りこぼしうる)、これを受け取ったら接続/切断に伴う既存の処理を呼ぶだけにする(`rust-ssot.md`)。
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -1536,7 +1536,7 @@ pub trait OrchestratorCallback: Send + Sync {
     /// 接続が生きていたか」の判断を、Swift/Kotlinが観測できるようにする
     /// (`orchestrator.rs::notify_will_enter_foreground`から発火)。
     /// `did_reconnect`は「再接続を開始した」であって「成功した」ではない
-    /// (round-3 N2b、`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.9.3c参照。再接続は
+    /// (round-3 N2b、`docs/adr/0001-ios-parity-implementation.md` §3.9.3c参照。再接続は
     /// `notify_will_enter_foreground`内で同期的に失敗しうる)。`background_state`が
     /// 既に`Foreground`だったタブでは発火しない(N2a、未接続/既切断タブへの
     /// 誤ったバナー表示を防ぐ)。呼び出し順序: `reconnect_attempt`の呼び出し
@@ -1544,7 +1544,7 @@ pub trait OrchestratorCallback: Send + Sync {
     /// **前**に発火する(round-3 レビュー S1)——順序を逆にすると「Disconnected
     /// 直後に『再接続しています』」という矛盾した一過性表示になる。
     fn on_foreground_resume(&self, did_reconnect: bool);
-    /// ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
+    /// docs/adr/0019-functional-core-effects.md §6 Step 8a′: Rustのreducer(`reconnect_fsm.rs`)が判断した
     /// 世代(`generation`=`session_generation`)付きの接続エッジ。実装は受け取ったら接続/切断に伴う
     /// 既存の処理(upstream監視の登録/解除・tmuxウィンドウensure等)を呼ぶだけにし、重複排除や
     /// エッジ判定を自前で行わない(`rust-ssot.md`)。

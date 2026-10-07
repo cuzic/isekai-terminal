@@ -2,7 +2,7 @@ name: rust-core netlab nightly (L2)
 
 # L2夜間: 実バイナリ(isekai-pipe serve/connect + 実sshd + 実ssh)を、veth直結の2つの
 # network namespace上で動かし、実カーネル・実QUIC・実時間で故障を注入する
-# (ADR_CONNECTION_RESILIENCE_SIMULATION.md の L2 / ADR_DETERMINISTIC_NETWORK_SIMULATION_L1.md §5-4、Q-L1-14)。
+# (docs/adr/0018-connection-resilience-simulation.md の L2 / docs/adr/0021-deterministic-network-simulation-l1.md §5-4、Q-L1-14)。
 #
 # - トリガーは schedule(夜間)と workflow_dispatch のみ。pull_request/push は意図的に無い:
 #   PRを遅くしない・止めない。required check にも含めない(実時間依存でflakeやすい)。

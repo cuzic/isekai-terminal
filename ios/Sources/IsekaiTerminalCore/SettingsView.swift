@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Y-P0(a): `ProfileListView.swift`にインラインされていた4つのオプトイン設定トグル
 /// (画面の保護/リモートクリップボード書込・送信許可/tmux迂回control-plane)を、
-/// 独立した設定画面へ抽出したもの(`ADR_IOS_PARITY_IMPLEMENTATION.md` §3.11(a))。
+/// 独立した設定画面へ抽出したもの(`docs/adr/0001-ios-parity-implementation.md` §3.11(a))。
 ///
 /// トグル表現は移設前のMenu Button(ラベルにON/OFFを埋め込む)と同じ形をあえて踏襲する。
 /// ネイティブ`Toggle`/`Switch`へ書き換えたところ、`XCUIElement.value`(Switch)の

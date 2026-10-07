@@ -303,7 +303,7 @@ mod tests {
     /// future change to that format (e.g. appending a protocol-version
     /// suffix) fails this test loudly instead of `channel_digest` silently
     /// isolating the wrong substring for both holder log names
-    /// (ADR_ISEKAI_SSH_EXIT_DIAGNOSTICS.md §R8).
+    /// (docs/adr/0009-isekai-ssh-exit-diagnostics.md §R8).
     #[test]
     fn channel_digest_isolates_the_hex_digest_of_a_real_channel_name() {
         let (resolution, host_config) = resolve("digest-safety-test-host");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""純粋モジュールのimport allowlist検査(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3 層2)。
+"""純粋モジュールのimport allowlist検査(docs/adr/0019-functional-core-effects.md §2.3 層2)。
 
 rust-core/pure_modules.toml に登録された各モジュールが、
   * 未登録(=不純かもしれない)crate内モジュールの項目を `use`/インラインパスで参照していない
@@ -402,7 +402,7 @@ if __name__ == "__main__":
         sys.exit(0)
     problems = run(os.path.join(ROOT, "pure_modules.toml"))
     if problems:
-        print("純粋性検査に失敗しました(ADR_FUNCTIONAL_CORE_EFFECTS.md §2.3):", file=sys.stderr)
+        print("純粋性検査に失敗しました(docs/adr/0019-functional-core-effects.md §2.3):", file=sys.stderr)
         for p in problems:
             print(f"::error::{p}")
         sys.exit(1)

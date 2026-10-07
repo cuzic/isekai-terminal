@@ -663,7 +663,7 @@ async fn run_ssh_with_connect_failure_recovery(
     // check is what keeps `\r`/ANSI bytes out of the log file specifically.
     let is_tty = std::io::stderr().is_terminal() && !crate::log_file::is_enabled();
     let mut ops = UnixSshRecoveryOps { plan, resolution, runtime_dir, is_tty };
-    // ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7: the loop body (decide →
+    // docs/adr/0019-functional-core-effects.md Step 6+7: the loop body (decide →
     // maybe redeploy via `RedeployGate` → backoff → retry with a freshly
     // rebuilt intent) is the one shared reducer/driver the Windows-native
     // path also uses; only the platform I/O below is Unix-specific.
@@ -825,7 +825,7 @@ pub(crate) fn log_rebootstrap_and_retry_decision(class: &isekai_pipe_core::Conne
 
 /// The recovery decision (`decide_connect_failure_recovery` and its
 /// `ConnectFailureRecoveryAction`) lives in the pure reducer module since
-/// ADR_FUNCTIONAL_CORE_EFFECTS.md Step 6+7, where both the Unix and the
+/// docs/adr/0019-functional-core-effects.md Step 6+7, where both the Unix and the
 /// Windows-native recovery loops reach it through the one shared reducer.
 /// Re-exported here (for tests only — production code reaches it through
 /// the reducer) so Step 12's exhaustive table keeps using the same names
@@ -873,7 +873,7 @@ pub(crate) fn resolve_claimed_outcome(
 /// are inherited (interactive TTY passthrough) — `.status()` (not
 /// `.output()`) only waits on the direct child (`ssh(1)` itself), *not* the
 /// whole process tree: confirmed 2026-09-02 by direct experiment (Task 2.9 /
-/// issue #111, `ADR_MIDSESSION_DISCONNECT_RECOVERY.md` Round 6) that when
+/// issue #111, `docs/adr/0002-midsession-disconnect-recovery.md` Round 6) that when
 /// `ssh(1)` is killed by an external signal (`SIGTERM`/`SIGKILL`, as opposed
 /// to exiting on its own, e.g. via `ConnectTimeout`) it does **not** reap its
 /// `ProxyCommand` grandchild — the grandchild is simply reparented to init

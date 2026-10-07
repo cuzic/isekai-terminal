@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import IsekaiTerminalCoreLogic
 
-/// ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: Rustが生成したcallback契約golden
+/// docs/adr/0019-functional-core-effects.md §6 Step 13: Rustが生成したcallback契約golden
 /// (`rust-core/tests/golden/callback_contract/<scenario>.json`、生成・一致検査は
 /// `rust-core/src/orchestrator/tests/callback_contract_golden.rs`)を、iOS側の転送層
 /// (`ConnectionEdgeRouter`。`TerminalSessionController.onConnectionEdge`が使う)へreplayし、

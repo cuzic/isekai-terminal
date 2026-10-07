@@ -33,7 +33,7 @@ import uniffi.isekai_terminal_core.ConnectionPublicState
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
- * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 13: Rustが生成したcallback契約golden
+ * docs/adr/0019-functional-core-effects.md §6 Step 13: Rustが生成したcallback契約golden
  * (`rust-core/tests/golden/callback_contract/<scenario>.json`、生成・一致検査は
  * `rust-core/src/orchestrator/tests/callback_contract_golden.rs`)を、本物の転送経路
  * ([TerminalSession]の`OrchestratorCallback`実装 → `connectionEdges` → [TerminalTabsViewModel]の

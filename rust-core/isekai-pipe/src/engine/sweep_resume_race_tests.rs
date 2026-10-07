@@ -1,5 +1,5 @@
 //! L0 tests for the sweep × RESUME race
-//! (`ADR_FUNCTIONAL_CORE_EFFECTS.md` §4.1 / §6 Step 1.5 → Step 2a, round 1
+//! (`docs/adr/0019-functional-core-effects.md` §4.1 / §6 Step 1.5 → Step 2a, round 1
 //! B-2, round 2 m-R2-9).
 //!
 //! **History**: Step 1.5 landed these as *characterization* tests asserting
