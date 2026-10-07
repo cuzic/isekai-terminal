@@ -875,6 +875,9 @@ mod tests {
 
             check_transition(&agg, max_sessions, check_capacity, event, before_count, &before, &after, &before_index, &effects)?;
         }
+        if let Err(violation) = super::super::trace_invariants::check_serve_trace(&trace) {
+            prop_assert!(false, "Step 11 serve trace invariant violated: {} / trace: {:?}", violation, trace);
+        }
         Ok(())
     }
 
@@ -1067,9 +1070,6 @@ mod tests {
                 prop_assert!(!agg.index.values().any(is_expired), "an expired parked entry survived the sweep");
             }
             ServeEvent::Activated { .. } => {}
-        }
-        if let Err(violation) = super::super::trace_invariants::check_serve_trace(&trace) {
-            prop_assert!(false, "Step 11 serve trace invariant violated: {} / trace: {:?}", violation, trace);
         }
         Ok(())
     }
