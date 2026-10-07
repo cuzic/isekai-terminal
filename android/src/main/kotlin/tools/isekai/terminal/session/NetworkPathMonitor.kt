@@ -32,13 +32,27 @@ class NetworkPathMonitor(private val connectivityManager: ConnectivityManager) {
         PathId.TAILSCALE to PathState.UNKNOWN,
     )
 
+    /**
+     * AND-M3a: [PathId]ごとに「今そのPathIdの条件を満たすネットワーク」の集合。
+     * `registerNetworkCallback`は条件に合う**全ネットワーク**を個別に報告するため、
+     * 以前のように`onLost(network)`1回でPathId全体を[PathState.FAILED]にすると、
+     * Wi-Fiとセルラーが両方いる状態でWi-Fiだけ失ったときにDIRECTがFAILEDに張り付き
+     * (セルラーは既にavailable済みなので再度`onAvailable`は来ない)、誤った「経路なし」を
+     * Rustへ送っていた。集合が空になった時だけFAILEDにする。
+     */
+    private val networks = mutableMapOf<PathId, MutableSet<Network>>(
+        PathId.DIRECT to mutableSetOf(),
+        PathId.TAILSCALE to mutableSetOf(),
+    )
+    private val lock = Any()
+
     private val callbacks = mutableMapOf<PathId, ConnectivityManager.NetworkCallback>()
     private var onAggregateChanged: (Boolean) -> Unit = {}
 
-    fun currentState(id: PathId): PathState = states.getValue(id)
+    fun currentState(id: PathId): PathState = synchronized(lock) { states.getValue(id) }
 
     /** True if at least one path (direct or Tailscale) currently has a reachable network. */
-    fun isAnyPathAvailable(): Boolean = states.values.any { it == PathState.VALIDATED }
+    fun isAnyPathAvailable(): Boolean = synchronized(lock) { states.values.any { it == PathState.VALIDATED } }
 
     /**
      * Starts monitoring. [onAggregateChanged] fires with [isAnyPathAvailable] every time any
@@ -69,6 +83,7 @@ class NetworkPathMonitor(private val connectivityManager: ConnectivityManager) {
             connectivityManager.unregisterNetworkCallback(callback)
         }
         callbacks.clear()
+        synchronized(lock) { networks.values.forEach { it.clear() } }
         onAggregateChanged = {}
     }
 
@@ -76,16 +91,24 @@ class NetworkPathMonitor(private val connectivityManager: ConnectivityManager) {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 DebugReconnectLog.record("network_callback path=$id callback=onAvailable network=$network")
-                states[id] = PathState.VALIDATED
-                DebugReconnectLog.record("network_aggregate anyPathAvailable=${isAnyPathAvailable()}")
-                onAggregateChanged(isAnyPathAvailable())
+                val any = synchronized(lock) {
+                    networks.getValue(id).add(network)
+                    states[id] = PathState.VALIDATED
+                    isAnyPathAvailable()
+                }
+                DebugReconnectLog.record("network_aggregate anyPathAvailable=$any")
+                onAggregateChanged(any)
             }
 
             override fun onLost(network: Network) {
                 DebugReconnectLog.record("network_callback path=$id callback=onLost network=$network")
-                states[id] = PathState.FAILED
-                DebugReconnectLog.record("network_aggregate anyPathAvailable=${isAnyPathAvailable()}")
-                onAggregateChanged(isAnyPathAvailable())
+                val any = synchronized(lock) {
+                    val remaining = networks.getValue(id).apply { remove(network) }
+                    states[id] = if (remaining.isEmpty()) PathState.FAILED else PathState.VALIDATED
+                    isAnyPathAvailable()
+                }
+                DebugReconnectLog.record("network_aggregate anyPathAvailable=$any")
+                onAggregateChanged(any)
             }
         }
         connectivityManager.registerNetworkCallback(request, callback)

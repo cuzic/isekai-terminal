@@ -55,6 +55,23 @@ class TerminalSessionServiceTest {
         )
     }
 
+    /** AND-M2: 最後のタブが閉じられた(totalCount=0)ら、stopSelfだけでなくフォアグラウンドを
+     *  解除して常駐通知を消す(bound中はstopSelfだけでは破棄されず通知が残り続けていた)。 */
+    @Test
+    fun updateSessionsSummary_zeroTotal_stopsForegroundRemovingNotification() {
+        val controller = Robolectric.buildService(TerminalSessionService::class.java).create()
+        val service = controller.get()
+        val intent = Intent(service, TerminalSessionService::class.java)
+            .putExtra(TerminalSessionService.EXTRA_SESSION_LABEL, "cuzic@example.com")
+        service.onStartCommand(intent, 0, 1)
+
+        service.updateSessionsSummary(0, 0)
+
+        assertTrue(shadowOf(service).isForegroundStopped)
+        assertTrue(shadowOf(service).notificationShouldRemoved)
+        assertTrue(shadowOf(service).isStoppedBySelf)
+    }
+
     /**
      * `foregroundServiceType`をdataSync/mediaProcessing/shortService等の
      * タイムアウト対象型へうっかり戻すことを機械的に防ぐ回帰テスト
@@ -78,6 +95,23 @@ class TerminalSessionServiceTest {
     }
 
     // ── 項目2: 正常終了マーカー ──────────────────────────────
+
+    /**
+     * #204レビューM1: 最後のタブを閉じてサービスが破棄(=マーカーclean)された後、同一プロセス内で
+     * 新しいタブのためにサービスが再生成されたら、マーカーは"dirty"へ戻っていなければならない。
+     * 戻らないと、その後のOEM killが次回起動時に正常終了と誤判定される。
+     */
+    @Test
+    fun recreateAfterCleanDestroy_inSameProcess_resetsMarkerToDirty() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        // アプリ起動時の消費(TerminalTabsViewModel初期化)を模す。
+        TerminalSessionService.consumeCleanShutdownMarker(context)
+
+        Robolectric.buildService(TerminalSessionService::class.java).create().destroy()
+        Robolectric.buildService(TerminalSessionService::class.java).create()
+
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
 
     @Test
     fun consumeCleanShutdownMarker_withoutPriorMark_returnsFalse() {

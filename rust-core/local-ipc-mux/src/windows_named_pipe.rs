@@ -33,6 +33,7 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle, RawHandle};
 
 use async_trait::async_trait;
 use tokio::net::windows::named_pipe::{
@@ -42,21 +43,24 @@ use tokio::net::windows::named_pipe::{
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSidToStringSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL,
+    EqualSid, GetTokenInformation, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL,
     NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::pipe_classify::{
-    classify_connect_error, is_already_claimed, should_retry_connect, ConnectDisposition,
-    CONNECT_MAX_RETRIES, CONNECT_RETRY_BACKOFF,
+    classify_connect_error, is_already_claimed, is_transient_accept_error, should_retry_connect,
+    ConnectDisposition, CONNECT_MAX_RETRIES, CONNECT_RETRY_BACKOFF,
 };
 use crate::{ClaimError, ConnectError, ExclusiveChannel};
 
@@ -199,10 +203,26 @@ impl ExclusiveChannel for WindowsNamedPipeChannel {
         // to create the following instance, it left `pending` as `None` and
         // deferred that error to here — so create the instance now, surfacing
         // any failure as a normal `Err` rather than panicking.
-        let server = take_or_create_pending(&mut self.pending, || {
+        let mut server = take_or_create_pending(&mut self.pending, || {
             Self::create_server_instance(&self.name, false)
         })?;
-        server.connect().await?;
+        // A client that opens the pipe and closes it again before `connect`
+        // completes (`ERROR_NO_DATA`/`ERROR_BROKEN_PIPE`) is that client's
+        // problem, not a failure of the channel: discard this instance and
+        // wait on a fresh one instead of returning `Err` (which the owner's
+        // accept loop treats as fatal, taking every other client down with it).
+        let mut transient_failures = 0u32;
+        loop {
+            match server.connect().await {
+                Ok(()) => break,
+                Err(e) if is_transient_accept_error(e.raw_os_error()) && transient_failures < MAX_TRANSIENT_ACCEPT_FAILURES => {
+                    transient_failures += 1;
+                    drop(server);
+                    server = Self::create_server_instance(&self.name, false)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // Re-arm the next accepting instance immediately, so a client that
         // connects right after this one is served rather than seeing the pipe
         // as momentarily gone. Creating it must NEVER cost us the client we
@@ -219,7 +239,17 @@ impl ExclusiveChannel for WindowsNamedPipeChannel {
         let mut retries_done = 0usize;
         loop {
             match ClientOptions::new().open(name) {
-                Ok(client) => return Ok(PipeConnection::Client(client)),
+                Ok(client) => {
+                    // Pipe names live in a machine-wide namespace: another
+                    // local user could have created an instance of this name
+                    // first. Only talk to a server run by our own user —
+                    // otherwise keystrokes (passwords), output and the mux
+                    // token would go to them.
+                    if let Err(source) = verify_named_pipe_server_is_current_user(client.as_raw_handle()) {
+                        return Err(ConnectError::Io { name: name.to_string(), source });
+                    }
+                    return Ok(PipeConnection::Client(client));
+                }
                 Err(source) => {
                     let disposition = classify_connect_error(source.raw_os_error(), source.kind());
                     match disposition {
@@ -339,9 +369,77 @@ fn win32_io_error(code: u32) -> io::Error {
 /// `PSID` inside it (via [`sid_in_token_buf`]) is valid only while this buffer
 /// lives. Mirrors `isekai-fs-guard::windows_acl::current_user_token_buf`.
 fn current_user_token_buf() -> io::Result<Vec<u8>> {
+    // SAFETY: GetCurrentProcess just returns the constant pseudo-handle.
+    process_user_token_buf(unsafe { GetCurrentProcess() })
+}
+
+struct ProcessGuard(HANDLE);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: the handle was returned by OpenProcess and is owned here.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Maximum number of consecutive transient `connect` failures one `accept`
+/// absorbs before giving up (guards against a pathological tight loop).
+const MAX_TRANSIENT_ACCEPT_FAILURES: u32 = 64;
+
+/// The current user's SID in string form (`S-1-5-21-...`), e.g. for
+/// building a per-user pipe name so two users on one machine can never
+/// collide on (or squat) each other's name.
+pub fn current_user_sid_string() -> io::Result<String> {
+    let token_buf = current_user_token_buf()?;
+    let sid = sid_in_token_buf(&token_buf);
+    // SAFETY: `sid` points into `token_buf`, alive for this whole block;
+    // `ConvertSidToStringSidW` LocalAlloc's the returned string, which is
+    // freed exactly once below after being copied out.
+    unsafe {
+        let mut out = PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut out).map_err(|e| win32_io_error(e.code().0 as u32))?;
+        let _free = LocalAllocGuard(out.0 as *mut c_void);
+        out.to_string().map_err(|e| io::Error::other(format!("SID string is not valid UTF-16: {e}")))
+    }
+}
+
+/// Verifies that the process serving the named pipe `pipe` (a connected
+/// client handle) runs as the same user as this process. Fails with
+/// [`io::ErrorKind::PermissionDenied`] otherwise — including when the
+/// server's process/token can't even be opened, which is itself a strong
+/// sign it belongs to someone else.
+pub fn verify_named_pipe_server_is_current_user(pipe: RawHandle) -> io::Result<()> {
+    let ours = current_user_token_buf()?;
+    // SAFETY: `pipe` is a live pipe handle owned by the caller for the
+    // duration of this call; every handle opened here is closed by a guard;
+    // both SIDs point into buffers alive until the comparison is done.
+    unsafe {
+        let mut pid = 0u32;
+        GetNamedPipeServerProcessId(HANDLE(pipe as *mut c_void), &mut pid)
+            .map_err(|e| win32_io_error(e.code().0 as u32))?;
+        let deny = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, WIN_FALSE, pid)
+            .map_err(|e| deny(format!("cannot open named pipe server process {pid}: {e}")))?;
+        let _process_guard = ProcessGuard(process);
+        let theirs = process_user_token_buf(process)
+            .map_err(|e| deny(format!("cannot read the user of named pipe server process {pid}: {e}")))?;
+        if EqualSid(sid_in_token_buf(&ours), sid_in_token_buf(&theirs)).is_err() {
+            return Err(deny(format!("named pipe server process {pid} belongs to a different user; refusing to connect")));
+        }
+    }
+    Ok(())
+}
+
+/// Returns the raw `TOKEN_USER` buffer for `process`'s token (an invalid or
+/// insufficiently privileged handle just yields an `Err`).
+fn process_user_token_buf(process: HANDLE) -> io::Result<Vec<u8>> {
     unsafe {
         let mut token = HANDLE(std::ptr::null_mut());
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)
             .map_err(|e| win32_io_error(e.code().0 as u32))?;
         let _guard = TokenGuard(token);
 

@@ -83,8 +83,24 @@ impl JumpSpec {
     /// [`HostSpec::ssh_destination`] builds, with `-J`'s inline `:port`
     /// suffix appended (a target host passes its port out of band as `-p`
     /// instead, which is the whole difference between the two renderings).
+    ///
+    /// An IPv6 literal host is re-bracketed (`alice@[2001:db8::1]:2222`):
+    /// `split_user_host_port` strips the brackets, and ssh(1)'s `-J` parser
+    /// (`parse_user_host_port`/`hpdelim2`) splits an unbracketed host at the
+    /// first `:`, so `alice@2001:db8::1:2222` would be rejected and the
+    /// bootstrap would fail (review 2026-10-07 of PR #202, F1). The bracketed
+    /// form is also accepted without a port.
     pub(crate) fn to_arg(&self) -> String {
-        let dest = self.0.ssh_destination();
+        let host = &self.0.host;
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let dest = match &self.0.user {
+            Some(user) => format!("{user}@{host}"),
+            None => host,
+        };
         match self.0.port {
             Some(port) => format!("{dest}:{port}"),
             None => dest,
@@ -243,5 +259,22 @@ mod tests {
         let rendered = format!("{spec:?} {:?}", LaunchSpec::Relay(spec.clone()));
         assert!(!rendered.contains("super-secret"), "{rendered}");
         assert!(rendered.contains("relay.example.com") && rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// PR #202 review F1: an IPv6 jump host (brackets already stripped by
+    /// `split_user_host_port`) is re-bracketed so ssh(1)'s `-J` parser does
+    /// not split it at the first `:`.
+    #[test]
+    fn jump_spec_to_arg_brackets_ipv6_hosts() {
+        let v6 = JumpSpec::new("2001:db8::1").with_user("alice").with_port(2222);
+        assert_eq!(v6.to_arg(), "alice@[2001:db8::1]:2222");
+        assert_eq!(JumpSpec::new("2001:db8::1").to_arg(), "[2001:db8::1]");
+        assert_eq!(JumpSpec::new("[2001:db8::1]").with_port(22).to_arg(), "[2001:db8::1]:22");
+    }
+
+    #[test]
+    fn jump_spec_to_arg_keeps_names_and_ipv4_unbracketed() {
+        assert_eq!(JumpSpec::new("bastion.example").with_user("bob").with_port(2200).to_arg(), "bob@bastion.example:2200");
+        assert_eq!(JumpSpec::new("192.0.2.1").to_arg(), "192.0.2.1");
     }
 }

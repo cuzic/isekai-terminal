@@ -206,9 +206,15 @@ fn classify_session_error(err: &russh_stream_session::SessionError) -> Option<Bo
         S::Connect { source, .. } | S::JumpHandshake { source, .. } if matches!(source, russh::Error::UnknownKey) => {
             Some(BootstrapFailure::HostKeyRejected)
         }
-        S::Connect { .. } | S::JumpTunnel { .. } | S::JumpHandshake { .. } | S::Handshake(_) | S::Channel(_) => {
-            Some(BootstrapFailure::JumpHostUnreachable)
-        }
+        // `TimedOut` (TCP connect / jump direct-tcpip open exceeding
+        // `CONNECT_STEP_TIMEOUT`) is connectivity-shaped like `Connect`/
+        // `JumpTunnel`: auto-retryable, never a trust decision.
+        S::Connect { .. }
+        | S::JumpTunnel { .. }
+        | S::JumpHandshake { .. }
+        | S::Handshake(_)
+        | S::Channel(_)
+        | S::TimedOut { .. } => Some(BootstrapFailure::JumpHostUnreachable),
         // `EncryptedPrivateKey` lands in the same bucket as `InvalidPrivateKey`:
         // this bootstrap-time classifier has no passphrase-prompting of its own
         // (that's `isekai-ssh::native::connect`'s job, for the target-host
@@ -352,6 +358,16 @@ mod tests {
         let jump_unreachable =
             SessionError::JumpHandshake { host: "example.com".to_string(), port: 22, source: russh::Error::Disconnect };
         assert!(matches!(classify_session_error(&jump_unreachable), Some(BootstrapFailure::JumpHostUnreachable)));
+    }
+
+    #[test]
+    fn connect_step_timeout_is_classified_as_retryable_unreachable() {
+        use russh_stream_session::SessionError;
+
+        let timed_out = SessionError::TimedOut { stage: "TCP connect", timeout: std::time::Duration::from_secs(30) };
+        let classified = classify_session_error(&timed_out);
+        assert!(matches!(classified, Some(BootstrapFailure::JumpHostUnreachable)));
+        assert!(classified.expect("classified above").may_retry());
     }
 
     #[test]
