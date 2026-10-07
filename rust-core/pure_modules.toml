@@ -146,6 +146,12 @@ file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
 effect = "ReconnectEffect"
 
+# Step 3b/3c(PR #167レビューL-1): 状態公開・接続エッジをapplyと同じ臨界区間で配信待ちの列に積むin-lock interpreter。
+[[interpreter]]
+file = "src/orchestrator.rs"
+fn = "stage_publications"
+effect = "ReconnectEffect"
+
 # Step 5: ResumePlanner(resume_fsm.rs)のResumeCmdを解釈するshell。
 [[interpreter]]
 file = "isekai-pipe/src/resume_loop.rs"

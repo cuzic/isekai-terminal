@@ -19,6 +19,7 @@ use crate::reconnect_fsm::{
     AttemptRef, AttemptSource, BackgroundState, ConnPhase, DisconnectKind, ReconnectEffect, ReconnectEvent,
     ReconnectState, NETWORK_LOST_REASON,
 };
+use std::collections::VecDeque;
 
 // ── Active session ────────────────────────────────────────
 
@@ -245,28 +246,10 @@ fn is_private_or_link_local(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// 自動再接続ループのタイミング定数。`net_health_policy::NetPathPolicy`と同じ理由
-/// (テストで短い値に差し替えられるようにする)で構造体化する。既定値はMVPとして
-/// ハードコード(設定UIは作らない): tssh の `aliveTimeout` 相当が60秒。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ReconnectPolicy {
-    /// UIへライブ通知する間隔。
-    pub(crate) tick: Duration,
-    /// 実際に`connect_via`を試みる間隔(tickの整数倍)。
-    pub(crate) retry_interval: Duration,
-    /// これを超えて再接続できなければギブアップする。
-    pub(crate) timeout: Duration,
-}
-
-impl Default for ReconnectPolicy {
-    fn default() -> Self {
-        Self {
-            tick: Duration::from_secs(1),
-            retry_interval: Duration::from_secs(3),
-            timeout: Duration::from_secs(60),
-        }
-    }
-}
+/// 自動再接続ループのタイミング定数(`net_health_policy::NetPathPolicy`と同じ理由で
+/// テストで短い値に差し替えられるよう構造体化。既定値はMVPとしてハードコード、tssh の
+/// `aliveTimeout` 相当が60秒)。定義はtick会計を持つreducer側(ADR §6 Step 3b/3c)。
+pub(crate) use crate::reconnect_fsm::ReconnectPolicy;
 
 /// trzsz ダウンロードの累積バッファに設ける上限(#60)。trzsz プロトコルの
 /// `SIZE`(申告値)はサーバー側の自己申告に過ぎず強制されないため、悪意ある/
@@ -283,6 +266,10 @@ struct OrchestratorState {
     /// フィールドなので、所有者は`OrchestratorState`1つのまま(ADR §4.3)。
     /// Step 3aで`apply`経由に移行していない書き手は従来どおりフィールドを直接書く。
     reconnect: ReconnectState,
+    /// `reconnect`のapplyが出した状態公開・接続エッジの、配信待ちの列(PR #167レビューL-1)。
+    /// applyと**同じ臨界区間で**積むので、列の順序はreducerが遷移を適用した順序そのもの。
+    /// 配信は[`flush_publications`]が1スレッドずつ行う([`PublicationQueue`]参照)。
+    publications: PublicationQueue,
     /// Active transfer ID set by on_trzsz_request; used to route trzsz commands without exposing ID to Kotlin
     current_transfer_id: Option<String>,
     /// "upload" / "download" set on on_trzsz_request; used to detect download accumulation
@@ -458,7 +445,8 @@ impl OrchestratorAdapter {
             let mut s = shared.state.lock();
             s.session_generation += 1;
             let generation = s.session_generation;
-            let effects = s.reconnect.apply(ReconnectEvent::SessionCreated { new_generation: generation });
+            let effects =
+                apply_reconnect(&mut s, ReconnectEvent::SessionCreated { new_generation: generation }, &EffectContext::default());
             (generation, effects)
         };
         execute_reconnect_effects(&shared, effects, EffectContext::default());
@@ -525,20 +513,22 @@ impl SessionCallback for OrchestratorAdapter {
 
     fn on_connected(&self) {
         if !self.is_current() { return; }
-        let (effects, ctx, retry_log) = {
+        let (effects, retry_log) = {
             let mut s = self.shared.state.lock();
             let retry_log = s.reconnect.reconnect_loop_active;
-            let effects = s.reconnect.apply(ReconnectEvent::AttemptConnected { generation: self.generation });
-            let ctx = EffectContext {
-                connected_host: s.current_target().map(|(host, _, _)| host).unwrap_or_default(),
-                ..EffectContext::default()
-            };
-            (effects, ctx, retry_log)
+            // `Connected{host}`/`Established{host}`のhostは、`apply_reconnect`がapplyと同じ臨界区間で
+            // `current_target()`から解決する。
+            let effects = apply_reconnect(
+                &mut s,
+                ReconnectEvent::AttemptConnected { generation: self.generation },
+                &EffectContext::default(),
+            );
+            (effects, retry_log)
         };
         if retry_log {
             crate::debug_reconnect::record("retry_attempt_in_flight off result=connected");
         }
-        execute_reconnect_effects(&self.shared, effects, ctx);
+        execute_reconnect_effects(&self.shared, effects, EffectContext::default());
     }
 
     fn on_disconnected(&self, reason: Option<String>) {
@@ -730,7 +720,8 @@ fn apply_network_lost(shared: &Arc<OrchestratorShared>) {
 /// (`apply_network_lost`経路)。
 fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option<String>, generation: Option<u64>) {
     let kind = DisconnectKind::classify(&reason);
-    let (effects, resolved_attempt) = {
+    let mut ctx = EffectContext { reason, ..EffectContext::default() };
+    let (effects, retry_log) = {
         let mut s = shared.state.lock();
         let generation = generation.unwrap_or(s.session_generation);
         // #19のLocal Networkヒント判定材料。秘密を含む`last_connect_attempt`はreducerへ渡さず、
@@ -739,18 +730,19 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         let effects = s.reconnect.apply(ReconnectEvent::AttemptDisconnected { generation, kind, targets_local_network });
         // in-lock解決(§2.4-2): ループ起動の`AttemptRef`が指す実体を、applyと同じ臨界区間で
         // 取り出す(ロック解放後に引き直すと、間に入った手動接続の新しいConfigを掴みうる)。
-        let resolved_attempt = resolve_start_loop_attempt(&s, &effects);
-        (effects, resolved_attempt)
+        ctx.resolved_attempt = resolve_start_loop_attempt(&s, &effects);
+        // 旧`Action::Suppress`/`Action::StartLoop`(=Disconnectedを公開しない分岐)のときだけ記録する。
+        // NOTE: この`matches!`と`resolve_start_loop_attempt`の`matches!`は登録interpreter
+        // (`stage_publications`/`execute_reconnect_effects`)の外で、ログ判定とin-lock解決のために
+        // Effectを覗くだけで、消費(捨てる)はしない。Effectの解釈はすべてinterpreterの明示armで行う(ADR §3-8)。
+        let retry_log = !effects.iter().any(|e| matches!(e, ReconnectEffect::PublishDisconnected { .. }));
+        stage_publications(&mut s, &effects, &ctx);
+        (effects, retry_log)
     };
-    // 旧`Action::Suppress`/`Action::StartLoop`(=Disconnectedを公開しない分岐)のときだけ記録する。
-    // NOTE: この`matches!`と`resolve_start_loop_attempt`の`matches!`は登録interpreter
-    // (`execute_reconnect_effects`)の外で、ログ判定とin-lock解決のためにEffectを覗くだけで、
-    // 消費(捨てる)はしない。Effectの解釈はすべてinterpreterの明示armで行う(ADR §3-8)。
-    let retry_log = !effects.iter().any(|e| matches!(e, ReconnectEffect::PublishDisconnected { .. }));
     if retry_log {
         crate::debug_reconnect::record(format!(
             "retry_attempt_in_flight off result=disconnected reason={}",
-            reason.as_deref().unwrap_or("none")
+            ctx.reason.as_deref().unwrap_or("none")
         ));
     }
 
@@ -767,11 +759,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
     // `apply_network_lost`自身がこの関数を呼ぶ経路では、debounceクロージャの
     // `is_current(epoch)`判定は既にこの呼び出しより前に完了しているため、
     // ここでの無効化は次回以降の保留debounceにのみ作用し自己無効化にはならない。
-    execute_reconnect_effects(
-        shared,
-        effects,
-        EffectContext { reason, resolved_attempt, ..EffectContext::default() },
-    );
+    execute_reconnect_effects(shared, effects, ctx);
 }
 
 /// [`ReconnectEffect::StartReconnectLoop`]が指す[`AttemptRef`]の実体を、applyと同じ
@@ -788,28 +776,169 @@ fn resolve_start_loop_attempt(
     Some((s.reconnect.last_attempt?, s.last_connect_attempt.clone()?))
 }
 
-/// [`execute_reconnect_effects`]がEffectを解釈するのに要る、shell側の材料。
+/// [`stage_publications`]/[`execute_reconnect_effects`]がEffectを解釈するのに要る、shell側の材料。
 /// どれもreducerに載せない(秘密を含むConfig・公開文字列等)。
 #[derive(Default)]
 struct EffectContext<'a> {
-    /// `AttemptDisconnected`の切断理由(`Disconnected`公開・ループ起動に使う)。
+    /// 公開する`Disconnected`/`Reconnecting`の理由文字列(切断理由・ループが起動時に受け取った理由・
+    /// 中止/同期失敗の理由)。ループ起動にも使う。
     reason: Option<String>,
     /// `StartReconnectLoop`の`AttemptRef`をin-lockで解決したもの。
     resolved_attempt: Option<(AttemptRef, LastConnectAttempt)>,
-    /// `PublishConnected`/`EdgeEstablished`で公開するホスト名(in-lockで`current_target`から解決)。
-    connected_host: String,
-    /// `StartAttempt`で試行する接続設定(再接続ループが起動時に受け取ったclone)。
+    /// 再接続ループの接続設定(ループが起動時に受け取ったclone)。`StartAttempt`で試行し、
+    /// `PublishReconnectTimedOut`のLocal Networkヒントの判定に使う。ループの外では`None`。
     loop_attempt: Option<&'a LastConnectAttempt>,
 }
 
-/// [`ReconnectEffect`]のinterpreter(ADR §2.4 / §3-8)。**ロック解放後に**、`apply`が返した
-/// 順に解釈する。Effectは`match`の明示armでのみ消費し、黙って捨てない(Step 7a)。
+/// コールバックで公開する1件(状態公開か接続エッジ)。
+enum Publication {
+    State(ConnectionPublicState),
+    Edge(crate::ConnectionEdge, u64),
+}
+
+/// 状態公開・接続エッジの配信待ちの列(PR #167レビューL-1、ADR §2.4-4)。
+///
+/// 以前は、各スレッドがapplyの後ロックを外してから自分でコールバックを呼んでいたので、別スレッドの
+/// applyがその隙間に割り込むと配信順がapply順と逆転しえた(例: セッションtaskの`on_connected`が
+/// `Connected`/`Established(g)`を公開する直前に、別スレッドのnetwork-lost debounceが`Lost(g)`を先に
+/// 公開する。エッジはレベルでなくエッジなので、逆転したまま次のエッジまで自己修正されない)。
+///
+/// いまは**applyと同じ臨界区間で**この列に積み([`apply_reconnect`]/[`stage_publications`]、§2.4-2の
+/// in-lock effect)、配信は[`flush_publications`]が**同時に1スレッドだけ**、ロックを持たずに先頭から順に行う
+/// (`draining`)。よって`on_connection_state_changed`/`on_connection_edge`の配信順は、それらを生んだ
+/// reducerの遷移の適用順と常に一致する(スレッドをまたいでも)。配信中のコールバックが同期的に別の公開を
+/// 起こしても、それは列に積まれて同じ配信者が後で配る(非再入の`parking_lot::Mutex`でデッドロックしない)。
+#[derive(Default)]
+struct PublicationQueue {
+    queue: VecDeque<Publication>,
+    /// あるスレッドが[`flush_publications`]で配信中か。
+    draining: bool,
+}
+
+/// `s.reconnect`にEventを1つ適用し、その出力のうち状態公開・接続エッジを**同じ臨界区間で**
+/// 配信待ちの列に積む(§2.4-2のin-lock effect)。返したEffect列はロック解放後に
+/// [`execute_reconnect_effects`]で解釈する。`ReconnectState::apply`を本番コードで呼ぶのは
+/// これと`handle_unexpected_disconnect`/`begin_connect`(applyと積む間にin-lockの処理を挟む)だけ。
+fn apply_reconnect(s: &mut OrchestratorState, ev: ReconnectEvent, ctx: &EffectContext<'_>) -> Vec<ReconnectEffect> {
+    let effects = s.reconnect.apply(ev);
+    stage_publications(s, &effects, ctx);
+    effects
+}
+
+/// [`ReconnectEffect`]のin-lock interpreter(ADR §2.4-2 / §3-8): 状態公開・接続エッジを、applyと
+/// 同じ臨界区間で配信待ちの列に積む。Effect列は消費しない(公開系のEffectは
+/// [`execute_reconnect_effects`]で「ここまでに積んだ分を配信する」点として残る)。
+/// `Connected{host}`/`Established{host}`のhostはここで`current_target()`から解決する。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn stage_publications(s: &mut OrchestratorState, effects: &[ReconnectEffect], ctx: &EffectContext<'_>) {
+    for effect in effects {
+        let publication = match effect {
+            ReconnectEffect::PublishDisconnected { issue_hint } => {
+                Publication::State(ConnectionPublicState::Disconnected { reason: ctx.reason.clone(), issue_hint: *issue_hint })
+            }
+            ReconnectEffect::PublishConnected => Publication::State(ConnectionPublicState::Connected {
+                host: s.current_target().map(|(host, _, _)| host).unwrap_or_default(),
+            }),
+            ReconnectEffect::PublishConnecting => Publication::State(ConnectionPublicState::Connecting),
+            ReconnectEffect::PublishReconnecting { elapsed_secs, timeout_secs } => {
+                Publication::State(ConnectionPublicState::Reconnecting {
+                    elapsed_secs: *elapsed_secs,
+                    timeout_secs: *timeout_secs,
+                    reason: ctx.reason.clone(),
+                })
+            }
+            ReconnectEffect::PublishReconnectTimedOut { timeout_secs } => {
+                log::warn!("orchestrator: reconnect loop gave up after {timeout_secs}s");
+                Publication::State(ConnectionPublicState::Disconnected {
+                    reason: Some(format!(
+                        "reconnect timed out after {timeout_secs}s (last: {})",
+                        ctx.reason.clone().unwrap_or_else(|| "unknown".to_string())
+                    )),
+                    issue_hint: classify_disconnect_issue_hint(ctx.loop_attempt),
+                })
+            }
+            ReconnectEffect::EdgeEstablished { generation } => Publication::Edge(
+                crate::ConnectionEdge::Established {
+                    host: s.current_target().map(|(host, _, _)| host).unwrap_or_default(),
+                },
+                *generation,
+            ),
+            ReconnectEffect::EdgeLost { generation } => Publication::Edge(crate::ConnectionEdge::Lost, *generation),
+            ReconnectEffect::InvalidatePathObserver
+            | ReconnectEffect::WakeReconnectLoop
+            | ReconnectEffect::StartReconnectLoop { .. }
+            | ReconnectEffect::ManualConnectRejected
+            | ReconnectEffect::StartAttempt { .. }
+            | ReconnectEffect::PendingWakeRecorded { .. }
+            | ReconnectEffect::ArmLoopTimer { .. }
+            | ReconnectEffect::LoopWokeEarly { .. }
+            | ReconnectEffect::LoopTicked { .. } => continue,
+        };
+        s.publications.queue.push_back(publication);
+    }
+}
+
+/// 配信待ちの列([`PublicationQueue`])を、ロックを持たずに先頭から順に配信する。既に別のスレッドが
+/// 配信中なら何もしない(そのスレッドが今積まれた分まで配る)。コールバックがpanicしても`draining`は
+/// 戻すので、以後の公開が止まったままにはならない。
+fn flush_publications(shared: &OrchestratorShared) {
+    {
+        let mut s = shared.state.lock();
+        if s.publications.draining || s.publications.queue.is_empty() {
+            return;
+        }
+        s.publications.draining = true;
+    }
+    struct Draining<'a> {
+        shared: &'a OrchestratorShared,
+        armed: bool,
+    }
+    impl Drop for Draining<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.shared.state.lock().publications.draining = false;
+            }
+        }
+    }
+    let mut guard = Draining { shared, armed: true };
+    loop {
+        let next = {
+            let mut s = shared.state.lock();
+            match s.publications.queue.pop_front() {
+                Some(publication) => publication,
+                None => {
+                    // 「列が空」の確認と`draining`を下ろすのを同じ臨界区間で行う(間に積まれた分を取り残さない)。
+                    s.publications.draining = false;
+                    guard.armed = false;
+                    return;
+                }
+            }
+        };
+        match next {
+            Publication::State(state) => shared.callback.on_connection_state_changed(state),
+            Publication::Edge(edge, generation) => {
+                let label = match edge {
+                    crate::ConnectionEdge::Established { .. } => "established",
+                    crate::ConnectionEdge::Lost => "lost",
+                };
+                crate::debug_reconnect::record(format!("connection_edge {label} generation={generation}"));
+                shared.callback.on_connection_edge(edge, generation);
+            }
+        }
+    }
+}
+
+/// [`ReconnectEffect`]のout-of-lock interpreter(ADR §2.4 / §3-8)。**ロック解放後に**、`apply`が返した
+/// 順に解釈する。Effectは`match`の明示armでのみ消費し、黙って捨てない(Step 7a)。状態公開・接続エッジは
+/// [`stage_publications`]が既に列に積んでいるので、その位置で[`flush_publications`]する。
+/// 戻り値は再接続ループの次のタイマー(`ArmLoopTimer`の`after`)。`None`ならループtaskは終了する。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn execute_reconnect_effects(
     shared: &Arc<OrchestratorShared>,
     effects: Vec<ReconnectEffect>,
     mut ctx: EffectContext<'_>,
-) {
+) -> Option<Duration> {
+    let mut loop_timer = None;
     for effect in effects {
         match effect {
             ReconnectEffect::InvalidatePathObserver => {
@@ -826,49 +955,22 @@ fn execute_reconnect_effects(
                 } else {
                     // `set_last_connect_attempt`の不変条件が破れない限り到達しない。到達した
                     // 場合もループフラグを立てたまま放置せず(always-connects.md)、ループ無しの
-                    // 切断として扱う。状態は`ReconnectState::apply`の「直前の接続設定が無い」分岐
-                    // (`last_attempt == None`)と同じ形に揃える: ループ非動作・`background_state`は
-                    // Foreground(`pending_wake`はその遷移で既に下りている)。
-                    // NOTE: reducer外からの直接書き込み(Step 3aで未移行の他の書き手と同じ扱い)。
+                    // 切断として扱う(判断は`ReconnectEvent::LoopStartAborted`のapply、Step 3aレビューm2)。
                     debug_assert!(false, "StartReconnectLoop: AttemptRef {attempt:?} could not be resolved");
                     log::error!("orchestrator: reconnect attempt {attempt:?} could not be resolved; not starting the loop");
-                    {
-                        let mut s = shared.state.lock();
-                        if s.reconnect.reconnect_epoch == epoch {
-                            s.reconnect.reconnect_loop_active = false;
-                            s.reconnect.background_state = BackgroundState::Foreground;
-                        }
-                    }
-                    shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
-                        reason: ctx.reason.clone(),
-                        issue_hint: None,
-                    });
+                    let abort_ctx = EffectContext { reason: ctx.reason.clone(), ..EffectContext::default() };
+                    let effects = apply_reconnect(&mut shared.state.lock(), ReconnectEvent::LoopStartAborted { epoch }, &abort_ctx);
+                    execute_reconnect_effects(shared, effects, abort_ctx);
                 }
             }
-            ReconnectEffect::PublishDisconnected { issue_hint } => {
-                shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
-                    reason: ctx.reason.clone(),
-                    issue_hint,
-                });
-            }
-            ReconnectEffect::PublishConnected => {
-                shared.callback.on_connection_state_changed(ConnectionPublicState::Connected {
-                    host: ctx.connected_host.clone(),
-                });
-            }
-            ReconnectEffect::PublishConnecting => {
-                shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-            }
-            ReconnectEffect::EdgeEstablished { generation } => {
-                crate::debug_reconnect::record(format!("connection_edge established generation={generation}"));
-                shared.callback.on_connection_edge(
-                    crate::ConnectionEdge::Established { host: ctx.connected_host.clone() },
-                    generation,
-                );
-            }
-            ReconnectEffect::EdgeLost { generation } => {
-                crate::debug_reconnect::record(format!("connection_edge lost generation={generation}"));
-                shared.callback.on_connection_edge(crate::ConnectionEdge::Lost, generation);
+            ReconnectEffect::PublishDisconnected { .. }
+            | ReconnectEffect::PublishConnected
+            | ReconnectEffect::PublishConnecting
+            | ReconnectEffect::PublishReconnecting { .. }
+            | ReconnectEffect::PublishReconnectTimedOut { .. }
+            | ReconnectEffect::EdgeEstablished { .. }
+            | ReconnectEffect::EdgeLost { .. } => {
+                flush_publications(shared);
             }
             ReconnectEffect::ManualConnectRejected => {
                 // `begin_connect`はこのEffectを見たら解釈せずに`Err`を返すので、ここへは来ない。
@@ -883,15 +985,44 @@ fn execute_reconnect_effects(
                     // `loop_attempt`を渡す)。
                     debug_assert!(false, "StartAttempt without a loop attempt");
                     log::error!("orchestrator: StartAttempt outside the reconnect loop; releasing the in-flight guard");
-                    let effects = shared.state.lock().reconnect.apply(ReconnectEvent::AttemptFailedSync { epoch });
+                    let effects = apply_reconnect(
+                        &mut shared.state.lock(),
+                        ReconnectEvent::AttemptFailedSync { epoch },
+                        &EffectContext::default(),
+                    );
                     execute_reconnect_effects(shared, effects, EffectContext::default());
                 }
             }
             ReconnectEffect::PendingWakeRecorded { epoch } => {
                 crate::debug_reconnect::record(format!("pending_wake set epoch={epoch}"));
             }
+            ReconnectEffect::ArmLoopTimer { epoch, after, elapsed_secs } => {
+                // `ArmLoopTimer`は再接続ループのEvent(`LoopStarted`/wake/tick)からしか出ない。
+                debug_assert!(ctx.loop_attempt.is_some(), "ArmLoopTimer outside the reconnect loop");
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!(
+                        "spawn_reconnect_loop tick_wait epoch={epoch} elapsed_secs={elapsed_secs}"
+                    ));
+                }
+                loop_timer = Some(after);
+            }
+            ReconnectEffect::LoopWokeEarly { epoch } => {
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!("loop_woke_early epoch={epoch}"));
+                }
+            }
+            ReconnectEffect::LoopTicked { epoch, tick_count, elapsed_secs } => {
+                if crate::debug_reconnect::is_enabled() {
+                    crate::debug_reconnect::record(format!(
+                        "spawn_reconnect_loop tick epoch={epoch} tick_count={tick_count} elapsed_secs={elapsed_secs}"
+                    ));
+                }
+            }
         }
     }
+    // 公開系のEffectを伴わないapply(例: 別スレッドが積んだ分の配信者が終わった直後)でも取り残さない。
+    flush_publications(shared);
+    loop_timer
 }
 
 /// 再接続ループの1回の試行(`reconnect_attempt`、既定は`connect_via`)を実行する。
@@ -925,7 +1056,7 @@ fn run_reconnect_attempt(
             let (matched, effects) = {
                 let mut s = shared.state.lock();
                 let matched = s.reconnect.reconnect_epoch == epoch;
-                (matched, s.reconnect.apply(ReconnectEvent::AttemptFailedSync { epoch }))
+                (matched, apply_reconnect(&mut s, ReconnectEvent::AttemptFailedSync { epoch }, &EffectContext::default()))
             };
             if matched {
                 crate::debug_reconnect::record(format!(
@@ -963,7 +1094,8 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
 /// (既存の挙動、ADR m-R4-4)。テストのフェイク`reconnect_attempt`も、実接続をせずに本番と同じ
 /// 遷移を踏むためにこれを呼ぶ。
 fn begin_reconnect_session(shared: &Arc<OrchestratorShared>) -> OrchestratorAdapter {
-    let effects = shared.state.lock().reconnect.apply(ReconnectEvent::ReconnectSessionStarting);
+    let effects =
+        apply_reconnect(&mut shared.state.lock(), ReconnectEvent::ReconnectSessionStarting, &EffectContext::default());
     execute_reconnect_effects(shared, effects, EffectContext::default());
     OrchestratorAdapter::new(shared.clone())
 }
@@ -1033,17 +1165,16 @@ fn build_and_store_session(
     Ok(())
 }
 
-/// `spawn_reconnect_loop`の1 tick分の待機。`tick`を素通しで待つのと、
-/// `wake`(`OrchestratorShared::reconnect_wake`)がネットワーク復帰通知で
+/// `spawn_reconnect_loop`の1回分のタイマー待ち。`after`(reducerが`ArmLoopTimer`で指定した長さ)を
+/// 素通しで待つのと、`wake`(`OrchestratorShared::reconnect_wake`)がネットワーク復帰通知で
 /// 起こされるのをレースさせる — 戻り値は「`wake`側で早期に起きたか」。
-/// 早期に起きた場合、呼び出し側は`elapsed`/`tick_count`の通常の会計には
-/// 一切触れずに「今すぐ1回試す」ボーナス試行だけ行い、次のループでまた
-/// 通常のtick待機に戻る(isekai-pipe側`resume_loop::wait_backoff_or_network_change`
-/// と同じ「バックオフ待機とOS通知をレースさせる」発想を、こちらは
-/// elapsed/timeoutの会計を一切歪めない形で移植したもの)。
-async fn sleep_tick_or_network_restored(tick: Duration, wake: &tokio::sync::Notify) -> bool {
+/// 早期に起きた場合、reducer(`ReconnectEvent::ReconnectWake`)は`elapsed`/`tick_count`の通常の会計には
+/// 一切触れずに「今すぐ1回試す」ボーナス試行だけ行い、次のタイマーを満額で設定し直す
+/// (isekai-pipe側`resume_loop::wait_backoff_or_network_change`と同じ「バックオフ待機とOS通知を
+/// レースさせる」発想を、elapsed/timeoutの会計を一切歪めない形で移植したもの)。
+async fn sleep_tick_or_network_restored(after: Duration, wake: &tokio::sync::Notify) -> bool {
     tokio::select! {
-        _ = tokio::time::sleep(tick) => false,
+        _ = tokio::time::sleep(after) => false,
         _ = wake.notified() => true,
     }
 }
@@ -1058,6 +1189,12 @@ async fn sleep_tick_or_network_restored(tick: Duration, wake: &tokio::sync::Noti
 /// `ConnPhase::Idle`分岐がネットワーク復帰時に鳴らす)で早期に起こされた場合は
 /// `retry_interval`のcadenceを待たず、その場で1回だけボーナス試行する
 /// (`sleep_tick_or_network_restored`参照)。
+///
+/// ADR §6 Step 3b/3c: このtaskは§2.2-1のタイマーの**shellだけ**を担う。tick会計(`elapsed`/`tick_count`)・
+/// `due`の計算・`woke_early`分岐・タイムアウトによるギブアップ・epochによる自己終了の判断はすべて
+/// `ReconnectState::apply`([`ReconnectEvent::LoopStarted`]/[`ReconnectEvent::ReconnectTick`]/
+/// [`ReconnectEvent::ReconnectWake`])が行い、taskは返ってきた`ArmLoopTimer`の`after`だけ待って次の
+/// Eventを戻す。`ArmLoopTimer`が返らなければ(別の何かに主導権が移った・ギブアップした)静かに終了する。
 fn spawn_reconnect_loop(
     shared: Arc<OrchestratorShared>,
     attempt: LastConnectAttempt,
@@ -1066,120 +1203,41 @@ fn spawn_reconnect_loop(
 ) {
     let rt = shared.rt.clone();
     rt.spawn(async move {
-        let mut policy = shared.state.lock().reconnect_policy;
-        let mut timeout_secs = policy.timeout.as_secs() as u32;
-        // tickの整数倍でretry_intervalを表す(「何tickごとに1回試みるか」)。
-        // 経過時間を`.as_secs()`で秒に丸めてから割り算すると、テスト用の
-        // サブ秒ポリシー(tick=10msなど)で常に0になり判定が壊れるため、
-        // tick単位のカウンタで比較する。
-        let mut ticks_per_retry: u128;
-        let mut elapsed = Duration::ZERO;
-        let mut tick_count: u128 = 0;
-
-        if shared.state.lock().reconnect.reconnect_epoch != epoch {
-            // spawnされてから最初のtickに至るまでの間に、既に別の何か(即座の
-            // 手動再接続・cancel_reconnect等)に主導権が移っていた場合、初回の
-            // Reconnecting通知すら出さずに静かに終了する。
-            return;
-        }
-        shared.callback.on_connection_state_changed(ConnectionPublicState::Reconnecting {
-            elapsed_secs: 0,
-            timeout_secs,
-            reason: reason.clone(),
+        // spawnされてから走り始めるまでの間に、既に別の何か(即座の手動再接続・cancel_reconnect等)に
+        // 主導権が移っていた場合、reducerは初回のReconnecting通知すら返さず、taskはここで終了する。
+        let mut next = run_reconnect_loop_step(&shared, &attempt, &reason, |policy| ReconnectEvent::LoopStarted {
+            epoch,
+            policy,
         });
-
-        loop {
-            // #新規: debug_set_reconnect_policyによる実行中セッションへの反映を
-            // 次のtickから即座に効かせるため、tickごとに読み直す(固定値のまま
-            // だと`SessionOrchestrator::apply_reconnect_policy_override`相当の
-            // 即時反映がこのループには届かなかった)。
-            policy = shared.state.lock().reconnect_policy;
-            timeout_secs = policy.timeout.as_secs() as u32;
-            ticks_per_retry = (policy.retry_interval.as_nanos() / policy.tick.as_nanos().max(1)).max(1);
-
-            if crate::debug_reconnect::is_enabled() {
-                crate::debug_reconnect::record(format!(
-                    "spawn_reconnect_loop tick_wait epoch={} elapsed_secs={}",
-                    epoch,
-                    elapsed.as_secs()
-                ));
-            }
-            let woke_early = sleep_tick_or_network_restored(policy.tick, &shared.reconnect_wake).await;
-
-            if shared.state.lock().reconnect.reconnect_epoch != epoch {
-                // 別の何か(新しい手動接続・cancel_reconnect・再接続成功)に
-                // 主導権が移った。静かに終了する。
-                return;
-            }
-
-            if woke_early {
-                if crate::debug_reconnect::is_enabled() {
-                    crate::debug_reconnect::record(format!("loop_woke_early epoch={epoch}"));
+        while let Some(after) = next {
+            let woke_early = sleep_tick_or_network_restored(after, &shared.reconnect_wake).await;
+            next = run_reconnect_loop_step(&shared, &attempt, &reason, |policy| {
+                if woke_early {
+                    ReconnectEvent::ReconnectWake { epoch, policy }
+                } else {
+                    ReconnectEvent::ReconnectTick { epoch, policy }
                 }
-                // ネットワーク復帰通知による早期起床: 通常のelapsed/tick_countの
-                // 会計には触れず、`retry_attempt_in_flight`が空いていれば
-                // 「今すぐ1回試す」ボーナス試行だけ行って、次のループでまた
-                // 通常のtick待機に戻る。試行中なら`pending_wake`として保持する
-                // (判断は`ReconnectState::apply`、ADR §6 Step 3a rev6)。
-                let effects = shared.state.lock().reconnect.apply(ReconnectEvent::ReconnectWake { epoch });
-                execute_reconnect_effects(
-                    &shared,
-                    effects,
-                    EffectContext { loop_attempt: Some(&attempt), ..EffectContext::default() },
-                );
-                continue;
-            }
-
-            elapsed = elapsed.saturating_add(policy.tick);
-            tick_count += 1;
-            if crate::debug_reconnect::is_enabled() {
-                crate::debug_reconnect::record(format!(
-                    "spawn_reconnect_loop tick epoch={} tick_count={} elapsed_secs={}",
-                    epoch,
-                    tick_count,
-                    elapsed.as_secs()
-                ));
-            }
-
-            if elapsed >= policy.timeout {
-                // NOTE: ギブアップはtick会計の結果なのでStep 3aでは未移行(3b/3cの再評価対象)。
-                // 現状どおり`reconnect_epoch`を進めない: 既に送出済みの試行の遅延結果(同epochの
-                // `AttemptFailedSync`等)はこのepochのまま届きうる。挙動は変えていない。
-                let mut s = shared.state.lock();
-                if s.reconnect.reconnect_epoch == epoch {
-                    s.reconnect.reconnect_loop_active = false;
-                    s.reconnect.retry_attempt_in_flight = false;
-                    s.reconnect.pending_wake = false;
-                }
-                drop(s);
-                log::warn!("orchestrator: reconnect loop gave up after {timeout_secs}s");
-                shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
-                    reason: Some(format!(
-                        "reconnect timed out after {timeout_secs}s (last: {})",
-                        reason.clone().unwrap_or_else(|| "unknown".to_string())
-                    )),
-                    issue_hint: classify_disconnect_issue_hint(Some(&attempt)),
-                });
-                return;
-            }
-
-            shared.callback.on_connection_state_changed(ConnectionPublicState::Reconnecting {
-                elapsed_secs: elapsed.as_secs() as u32,
-                timeout_secs,
-                reason: reason.clone(),
             });
-
-            // tick会計(`due`の計算)はshellに残す(3b/3cの範囲として再評価、ADR §6 Step 3a)。
-            // 試行するかどうか(`retry_attempt_in_flight`・`pending_wake`)の判断はreducer。
-            let due = tick_count % ticks_per_retry == 0;
-            let effects = shared.state.lock().reconnect.apply(ReconnectEvent::ReconnectTick { epoch, due });
-            execute_reconnect_effects(
-                &shared,
-                effects,
-                EffectContext { loop_attempt: Some(&attempt), ..EffectContext::default() },
-            );
         }
     });
+}
+
+/// 再接続ループの1ステップ: ロックを取り、その臨界区間で読んだ現在のポリシー(`debug_set_reconnect_policy`の
+/// 即時反映のため毎回読み直す)を載せたEventをapplyし(ADR §2.2の`apply_with`形。クロージャはEventを
+/// 組み立てるだけ)、ロック解放後に解釈する。戻り値は次のタイマー(`None`ならループ終了)。
+fn run_reconnect_loop_step(
+    shared: &Arc<OrchestratorShared>,
+    attempt: &LastConnectAttempt,
+    reason: &Option<String>,
+    make_event: impl FnOnce(ReconnectPolicy) -> ReconnectEvent,
+) -> Option<Duration> {
+    let ctx = EffectContext { reason: reason.clone(), loop_attempt: Some(attempt), ..EffectContext::default() };
+    let effects = {
+        let mut s = shared.state.lock();
+        let policy = s.reconnect_policy;
+        apply_reconnect(&mut s, make_event(policy), &ctx)
+    };
+    execute_reconnect_effects(shared, effects, ctx)
 }
 
 // ── SessionOrchestrator ───────────────────────────────────
@@ -1196,6 +1254,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
     let shared = Arc::new(OrchestratorShared {
         state: Mutex::new(OrchestratorState {
             reconnect: ReconnectState::default(),
+            publications: PublicationQueue::default(),
             current_transfer_id: None,
             trzsz_mode: None,
             download_buf: Vec::new(),
@@ -1243,6 +1302,8 @@ impl SessionOrchestrator {
             let mut s = self.shared.state.lock();
             let attempt_ref = AttemptRef::next_after(s.reconnect.last_attempt);
             let effects = s.reconnect.apply(ReconnectEvent::ManualConnectStarted { attempt: attempt_ref });
+            // NOTE: 拒否された場合のEffect列は`ManualConnectRejected`だけ(公開するものは無い)なので、
+            // 覗いて`Err`を返しても何も捨てない(登録interpreterの外でのpeek、ADR §3-8)。
             if effects.contains(&ReconnectEffect::ManualConnectRejected) {
                 return Err(SshError::ConnectionFailed);
             }
@@ -1250,6 +1311,7 @@ impl SessionOrchestrator {
             // `last_connect_attempt`が担う。reducer側の参照(`last_attempt`)と同じ臨界区間で
             // 書く(ロックを一度解放した後に書くと、その間だけ両者が食い違って見え得る)。
             s.last_connect_attempt = Some(attempt);
+            stage_publications(&mut s, &effects, &EffectContext::default());
             effects
         };
         execute_reconnect_effects(&self.shared, effects, EffectContext::default());
@@ -1337,23 +1399,11 @@ impl SessionOrchestrator {
     /// 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
     /// 「中止」操作を出す想定)。
     pub fn cancel_reconnect(&self) {
-        let was_active = {
-            let mut s = self.shared.state.lock();
-            let was_active = s.reconnect.reconnect_loop_active;
-            s.reconnect.reconnect_epoch += 1;
-            s.reconnect.reconnect_loop_active = false;
-            s.reconnect.retry_attempt_in_flight = false;
-            s.reconnect.pending_wake = false;
-            was_active
-        };
-        if was_active {
-            self.shared.callback.on_connection_state_changed(
-                ConnectionPublicState::Disconnected {
-                    reason: Some("reconnect cancelled by user".to_string()),
-                    issue_hint: None,
-                }
-            );
-        }
+        // 判断(epochを進めてループを止め、動作中だった場合だけ`Disconnected`)は
+        // `ReconnectEvent::CancelReconnect`のapply(ADR §6 Step 3b/3c)。
+        let ctx = EffectContext { reason: Some("reconnect cancelled by user".to_string()), ..EffectContext::default() };
+        let effects = apply_reconnect(&mut self.shared.state.lock(), ReconnectEvent::CancelReconnect, &ctx);
+        execute_reconnect_effects(&self.shared, effects, ctx);
     }
 
     // ── #20: バックグラウンド/フォアグラウンド遷移 ─────────────
@@ -1472,15 +1522,13 @@ impl SessionOrchestrator {
                 Ok(()) => {}
                 Err(e) => {
                     log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
-                    let effects = self.shared.state.lock().reconnect.apply(ReconnectEvent::ForegroundReconnectFailedSync);
-                    execute_reconnect_effects(
-                        &self.shared,
-                        effects,
-                        EffectContext {
-                            reason: Some(format!("foreground resume reconnect failed: {e}")),
-                            ..EffectContext::default()
-                        },
-                    );
+                    let ctx = EffectContext {
+                        reason: Some(format!("foreground resume reconnect failed: {e}")),
+                        ..EffectContext::default()
+                    };
+                    let effects =
+                        apply_reconnect(&mut self.shared.state.lock(), ReconnectEvent::ForegroundReconnectFailedSync, &ctx);
+                    execute_reconnect_effects(&self.shared, effects, ctx);
                 }
             }
         }
@@ -1652,7 +1700,7 @@ impl SessionOrchestrator {
     pub fn notify_network_path_changed(&self, is_satisfied: bool) {
         let (phase, is_quic) = {
             let s = self.shared.state.lock();
-            (s.reconnect.phase, s.is_quic())
+            (s.reconnect.phase(), s.is_quic())
         };
         match phase {
             ConnPhase::Idle => {
@@ -1995,12 +2043,21 @@ mod tests {
         prompt_output_copies: StdMutex<Vec<Option<String>>>,
         /// Step 8a′: `on_connection_edge`へ渡された`(edge, generation)`。
         edges: StdMutex<Vec<(crate::ConnectionEdge, u64)>>,
+        /// PR #167レビューL-1のテスト用: `on_connection_state_changed`の配信中に呼ぶフック
+        /// (配信と別の遷移が割り込む状況を、同じスレッドからの再入で決定論的に作る)。
+        on_state_hook: StdMutex<Option<Box<dyn Fn(&ConnectionPublicState) + Send>>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
         fn on_connection_state_changed(&self, state: ConnectionPublicState) {
             self.event_order.lock().unwrap().push("connection_state_changed");
-            self.connection_states.lock().unwrap().push(state);
+            self.connection_states.lock().unwrap().push(state.clone());
+            // フックの実行中はMutexを持たない(フックが再入して公開を起こしてもデッドロックしない)。
+            let hook = self.on_state_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&state);
+                *self.on_state_hook.lock().unwrap() = Some(hook);
+            }
         }
         fn on_screen_update(&self, _update: ScreenUpdate) {}
         fn on_host_key(&self, host: String, port: u16, fingerprint: String) -> bool {
@@ -2114,12 +2171,10 @@ mod tests {
         let callback = Arc::new(RecordingCallback::default());
         let shared = Arc::new(OrchestratorShared {
             state: Mutex::new(OrchestratorState {
-                reconnect: ReconnectState {
-                    phase,
-                    // `last_connect_attempt`と常に対で設定する(`set_last_connect_attempt`のdoc)。
-                    last_attempt: is_quic.then(|| AttemptRef::next_after(None)),
-                    ..ReconnectState::default()
-                },
+                // `last_connect_attempt`と常に対で設定する(`set_last_connect_attempt`のdoc)。
+                // `phase`はreducerの外から書けない(PR #167レビューL-2)のでテスト用コンストラクタで作る。
+                reconnect: ReconnectState::for_test(phase, is_quic.then(|| AttemptRef::next_after(None))),
+                publications: PublicationQueue::default(),
                 current_transfer_id: None,
                 trzsz_mode: None,
                 download_buf: Vec::new(),
@@ -2172,12 +2227,9 @@ mod tests {
     /// この関数の範囲外——呼び出し側が`OrchestratorShared`構築時に個別に指定する。
     fn reconnect_test_state(policy: ReconnectPolicy) -> OrchestratorState {
         OrchestratorState {
-            reconnect: ReconnectState {
-                phase: ConnPhase::Connected,
-                // `last_connect_attempt`と常に対で設定する(`set_last_connect_attempt`のdoc)。
-                last_attempt: Some(AttemptRef::next_after(None)),
-                ..ReconnectState::default()
-            },
+            // `last_connect_attempt`と常に対で設定する(`set_last_connect_attempt`のdoc)。
+            reconnect: ReconnectState::for_test(ConnPhase::Connected, Some(AttemptRef::next_after(None))),
+            publications: PublicationQueue::default(),
             current_transfer_id: None,
             trzsz_mode: None,
             download_buf: Vec::new(),
@@ -3330,6 +3382,47 @@ mod tests {
         (SessionOrchestrator { shared }, callback, adapters)
     }
 
+    /// PR #167レビューL-1: `on_connection_state_changed`/`on_connection_edge`の配信順は、reducerが遷移を
+    /// 適用した順序と一致する。`Connected`を配信している最中(=`Established(g)`を配信する前)に別の遷移
+    /// (network-lost)が`Lost(g)`を出しても、`Lost(g)`は`Established(g)`の後に届く。別スレッドの割り込み
+    /// (セッションtaskの`on_connected`とnetwork-lost debounceの競合)を、配信中のコールバックからの再入で
+    /// 決定論的に再現している。以前の実装(各スレッドがロック解放後に自分で配信)では、再入した側の
+    /// `Lost(g)`が先に配信され`[Lost(g), Established(g)]`になっていた。
+    #[tokio::test(start_paused = true)]
+    async fn edges_are_delivered_in_reducer_order_even_if_a_transition_interleaves_with_delivery() {
+        let (orch, cb, _adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), fast_test_policy());
+        let adapter = orch.begin_connect(ssh_attempt("example.com")).expect("Idle中のconnectは受理されるはず");
+        let generation = adapter.generation;
+        let weak = Arc::downgrade(&orch.shared);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        *cb.on_state_hook.lock().unwrap() = Some(Box::new(move |state: &ConnectionPublicState| {
+            if matches!(state, ConnectionPublicState::Connected { .. })
+                && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(shared) = weak.upgrade() {
+                    apply_network_lost(&shared);
+                }
+            }
+        }));
+
+        adapter.on_connected();
+
+        assert_eq!(
+            edges_of(&cb),
+            vec![
+                (crate::ConnectionEdge::Established { host: "example.com".to_string() }, generation),
+                (crate::ConnectionEdge::Lost, generation),
+            ],
+            "Lost(g)がEstablished(g)より先に配信された"
+        );
+        let states = cb.connection_states.lock().unwrap().clone();
+        assert!(
+            matches!(states.as_slice(), [ConnectionPublicState::Connecting, ConnectionPublicState::Connected { .. }]),
+            "状態公開の順序: {states:?}"
+        );
+        assert!(orch.shared.state.lock().reconnect.reconnect_loop_active, "network-lostで再接続ループが起動しているはず");
+    }
+
     /// `begin_connect`→`on_connected`で新しい世代のedgeを開く(本番の手動接続と同じ経路)。
     fn connect_and_establish(orch: &SessionOrchestrator, host: &str) -> OrchestratorAdapter {
         let adapter = orch.begin_connect(ssh_attempt(host)).expect("Idle/Connected中のconnectは受理されるはず");
@@ -3633,7 +3726,7 @@ mod tests {
         orch.notify_did_enter_background(30_000);
         orch.notify_background_budget_expired();
 
-        orch.shared.state.lock().reconnect.phase = ConnPhase::Connecting;
+        orch.shared.state.lock().reconnect.force_phase_for_test(ConnPhase::Connecting);
 
         orch.notify_will_enter_foreground();
         assert_eq!(
@@ -3648,7 +3741,7 @@ mod tests {
         orch.notify_did_enter_background(30_000);
         orch.notify_background_budget_expired();
 
-        orch.shared.state.lock().reconnect.phase = ConnPhase::Connecting;
+        orch.shared.state.lock().reconnect.force_phase_for_test(ConnPhase::Connecting);
 
         orch.notify_will_enter_foreground();
         assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3684,7 +3777,7 @@ mod tests {
         let (orch, cb, _attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
         orch.notify_did_enter_background(30_000);
 
-        orch.shared.state.lock().reconnect.phase = ConnPhase::Idle;
+        orch.shared.state.lock().reconnect.force_phase_for_test(ConnPhase::Idle);
 
         orch.notify_will_enter_foreground();
 
