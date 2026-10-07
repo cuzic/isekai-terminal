@@ -133,6 +133,20 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// パス引数を、リモートCLIにオプションとして解釈されない形にする。
+///
+/// RC-36(2026-09-29 コードレビュー): `-`で始まるパス(例えば`--offset`や`-h`という
+/// 名前のファイル)はクォートしても`isekai-pipe ctl file`のオプションとして解釈されて
+/// いた。リモートCLIの`--`対応に依存しないよう、同じファイルを指す`./`付きの相対パスに
+/// 書き換える(`-`始まりのパスは必ず相対パスなので意味は変わらない)。
+fn path_arg(path: &str) -> String {
+    if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    }
+}
+
 /// `TransportCommand::FilePreviewExec`のexecチャネルへそのまま渡すコマンド文字列を
 /// 組み立てる(`isekai-pipe ctl file <subcommand> <quoted args...>`)。
 pub(crate) fn build_command_line(kind: &FilePreviewRequestKind) -> String {
@@ -140,11 +154,11 @@ pub(crate) fn build_command_line(kind: &FilePreviewRequestKind) -> String {
     match kind {
         FilePreviewRequestKind::Ls { path } => {
             args.push("ls".to_string());
-            args.push(path.clone());
+            args.push(path_arg(path));
         }
         FilePreviewRequestKind::Cat { path, offset, length } => {
             args.push("cat".to_string());
-            args.push(path.clone());
+            args.push(path_arg(path));
             args.push("--offset".to_string());
             args.push(offset.to_string());
             if let Some(length) = length {
@@ -154,7 +168,7 @@ pub(crate) fn build_command_line(kind: &FilePreviewRequestKind) -> String {
         }
         FilePreviewRequestKind::Info { path } => {
             args.push("info".to_string());
-            args.push(path.clone());
+            args.push(path_arg(path));
         }
     }
     args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
@@ -236,6 +250,13 @@ mod tests {
     use super::*;
 
     // ── shell_quote / build_command_line ──
+
+    #[test]
+    fn build_command_line_does_not_let_a_dash_path_become_an_option() {
+        // RC-36
+        let kind = FilePreviewRequestKind::Info { path: "--offset".to_string() };
+        assert_eq!(build_command_line(&kind), "isekai-pipe ctl file info ./--offset");
+    }
 
     #[test]
     fn build_command_line_for_ls_quotes_simple_path_unquoted() {

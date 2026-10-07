@@ -90,6 +90,9 @@ pub(super) fn teardown_forward(
     }
 }
 
+/// RC-35: SOCKSネゴシエーション全体の上限時間。
+const SOCKS_NEGOTIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `bind_addr:bind_port` で待受し、accept ごとに `channel_open_direct_tcpip` で
 /// リモート `remote_host:remote_port` への SSH チャネルを開き、TCP ソケットと
 /// 双方向にバイトを中継する。待受確立/失敗を `ForwardStateChanged` で通知する。
@@ -117,6 +120,11 @@ pub(super) async fn run_local_forward(
         id: id.clone(), state: ForwardState::Listening,
     }).await.ok();
 
+    // RC-35(2026-09-29 コードレビュー): 受理済み接続の中継タスクを`JoinSet`で待受タスク
+    // 自身が所有する。以前は個別に`tokio::spawn`して切り離していたため、フォワード削除・
+    // タブ切断で待受タスクだけをabortしても(プール共有で接続が生きている限り)既存の
+    // 転送が流れ続けた。待受タスクがabortされると`JoinSet`のdropで中継も全て止まる。
+    let mut relays = tokio::task::JoinSet::new();
     loop {
         let (tcp_stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -125,11 +133,12 @@ pub(super) async fn run_local_forward(
                 break;
             }
         };
+        while relays.try_join_next().is_some() {}
         debug!("forward[{}]: accepted from {}", id, peer_addr);
         let handle = handle.clone();
         let remote_host = remote_host.clone();
         let fwd_id = id.clone();
-        tokio::spawn(async move {
+        relays.spawn(async move {
             let originator_ip = peer_addr.ip().to_string();
             let originator_port = peer_addr.port() as u32;
             let channel = match with_shared_handle_timeout(&handle, RUN_EXEC_TIMEOUT, |handle| {
@@ -194,6 +203,8 @@ pub(super) async fn run_dynamic_forward(
         id: id.clone(), state: ForwardState::Listening,
     }).await.ok();
 
+    // RC-35: `run_local_forward`と同じく中継タスクを待受タスクが所有する。
+    let mut relays = tokio::task::JoinSet::new();
     loop {
         let (tcp_stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -202,15 +213,22 @@ pub(super) async fn run_dynamic_forward(
                 break;
             }
         };
+        while relays.try_join_next().is_some() {}
         debug!("forward[{}]: accepted (SOCKS) from {}", id, peer_addr);
         let handle = handle.clone();
         let fwd_id = id.clone();
-        tokio::spawn(async move {
+        relays.spawn(async move {
             let mut tcp_stream = tcp_stream;
-            let (target_host, target_port) = match crate::socks::negotiate(&mut tcp_stream).await {
-                Ok(v) => v,
-                Err(e) => {
+            // RC-35: SOCKSハンドシェイクが終わらないクライアントでタスクを占有させない。
+            let negotiated = tokio::time::timeout(SOCKS_NEGOTIATION_TIMEOUT, crate::socks::negotiate(&mut tcp_stream)).await;
+            let (target_host, target_port) = match negotiated {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
                     warn!("forward[{}]: SOCKS negotiation from {} failed: {}", fwd_id, peer_addr, e);
+                    return;
+                }
+                Err(_) => {
+                    warn!("forward[{}]: SOCKS negotiation from {} timed out", fwd_id, peer_addr);
                     return;
                 }
             };
@@ -710,6 +728,78 @@ mod local_forward_e2e_tests {
                 .await.expect("read from SOCKS relay timed out")
                 .expect("read from SOCKS relay failed");
             assert_eq!(&buf[..n], b"hello-dynamic-forward");
+
+            orchestrator.disconnect();
+        });
+    }
+    #[test]
+    fn dynamic_forward_drops_a_client_that_never_finishes_socks_negotiation() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let echo_addr = spawn_echo_server().await;
+            let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
+
+            let probe = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bind_port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
+            let orchestrator = create_session_orchestrator(callback);
+
+            let config = SshConfig {
+                host: ssh_addr.ip().to_string(),
+                port: ssh_addr.port(),
+                username: "tester".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+                cols: 80,
+                rows: 24,
+                forwards: vec![PortForward {
+                    forward_type: ForwardType::Dynamic,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port,
+                    remote_host: String::new(),
+                    remote_port: 0,
+                }],
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            };
+
+            orchestrator.connect(config).expect("connect() should not fail synchronously");
+
+            let mut listening = false;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Listening))) => { listening = true; break; }
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Failed { reason }))) => {
+                        panic!("dynamic forward reported Failed before Listening: {}", reason);
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(listening, "dynamic forward did not report Listening within timeout");
+
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(5),
+                TokioTcpStream::connect(("127.0.0.1", bind_port)),
+            ).await.expect("connect to SOCKS port timed out")
+             .expect("connect to SOCKS port failed");
+
+            // RC-35: 挨拶の1バイト目だけ送って止まるクライアント。以前はネゴシエーションに
+            // 上限が無く、このタスクが永久にacceptした接続を握り続けた。上限(10秒)の後に
+            // サーバー側から閉じられ、こちらのreadはEOF(または接続リセット)で終わる。
+            client.write_all(&[0x05]).await.unwrap();
+            let mut buf = [0u8; 16];
+            let read = tokio::time::timeout(
+                SOCKS_NEGOTIATION_TIMEOUT + Duration::from_secs(10),
+                client.read(&mut buf),
+            ).await.expect("a stalled SOCKS client must be dropped once SOCKS_NEGOTIATION_TIMEOUT elapses");
+            match read {
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("unexpected {n} bytes for an incomplete SOCKS greeting"),
+            }
 
             orchestrator.disconnect();
         });

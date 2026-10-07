@@ -383,7 +383,7 @@ impl client::Handler for RusshEventHandler {
         };
         let socket_path = socket_path.to_string();
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+            use tokio::io::{AsyncWriteExt as _, BufReader};
 
             let (read_half, mut write_half) = tokio::io::split(channel.into_stream());
             let mut reader = BufReader::new(read_half);
@@ -395,20 +395,26 @@ impl client::Handler for RusshEventHandler {
             // decode_ctl_messageに渡り「expected value at line 1 column 1」で
             // 常に失敗する(実機検証、2026-07-28: isekai-terminal-core側だけ
             // この検証が抜けていた)。
-            let mut secret_line = String::new();
-            if let Err(e) = reader.read_line(&mut secret_line).await {
-                warn!("ctl-socket[{socket_path}]: failed to read ctl connection preamble: {e}");
-                return;
-            }
+            // RC-23(2026-09-29 コードレビュー): 以前は認証(preamble照合)前から長さ無制限・
+            // タイムアウト無しで`read_line`しており、同じリモートユーザーの任意プロセスが
+            // 改行の来ない巨大な行や放置接続で端末のメモリ/タスクを消費できた。
+            // preambleはsocketパス程度の長さしかないので小さな上限、本文はプロトコル上の
+            // 1行上限で打ち切り、どちらも読み取りにタイムアウトを設ける。
+            let secret_line = match read_ctl_line(&mut reader, CTL_PREAMBLE_MAX_LEN).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("ctl-socket[{socket_path}]: failed to read ctl connection preamble: {e}");
+                    return;
+                }
+            };
             if secret_line.trim_end_matches('\n') != socket_path {
                 warn!("ctl-socket[{socket_path}]: ctl connection preamble did not match this tab's expected secret");
                 return;
             }
 
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
-                Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
+            match read_ctl_line(&mut reader, isekai_protocol::MAX_CTL_MESSAGE_LINE_LEN).await {
+                Ok(line) if line.is_empty() => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
+                Ok(line) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
                     Ok(
                         msg @ (isekai_protocol::CtlMessage::ClipboardPullRequest {}
                         | isekai_protocol::CtlMessage::GetVarRequest { .. }),
@@ -451,6 +457,61 @@ impl client::Handler for RusshEventHandler {
             }
         });
         Ok(())
+    }
+}
+
+/// RC-23: ctl接続の先頭行(secret preamble=このタブのsocketパス)の長さ上限。
+const CTL_PREAMBLE_MAX_LEN: usize = 4096;
+/// RC-23: ctl接続の1行の読み取りタイムアウト。
+const CTL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// RC-23: `setvar`で1つのストアに保持する変数の件数上限。
+const MAX_CTL_VARS_PER_STORE: usize = 256;
+
+/// ctl接続から1行(改行込み)を、`limit`バイトと[CTL_READ_TIMEOUT]を上限に読む。
+/// EOFなら空文字列を返す。上限を超えた行・タイムアウトはエラー。
+async fn read_ctl_line<R>(reader: &mut R, limit: usize) -> std::io::Result<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+    let mut line = String::new();
+    // `Take`を一時値のまま`read_line`すると、返るfutureがその一時値を借用したまま
+    // 文末でdropされE0716になる。束縛して`timeout`のawaitが終わるまで生かす。
+    let mut limited = (&mut *reader).take(limit as u64 + 1);
+    let read = limited.read_line(&mut line);
+    let n = tokio::time::timeout(CTL_READ_TIMEOUT, read)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "ctl line read timed out"))??;
+    if n > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ctl line exceeds {limit} bytes")));
+    }
+    Ok(line)
+}
+
+#[cfg(test)]
+mod read_ctl_line_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_a_line_within_the_limit_and_rejects_oversized_lines() {
+        let mut ok = tokio::io::BufReader::new(&b"hello\nrest"[..]);
+        assert_eq!(read_ctl_line(&mut ok, 16).await.unwrap(), "hello\n");
+
+        let long = vec![b'x'; 100];
+        let mut too_long = tokio::io::BufReader::new(&long[..]);
+        let err = read_ctl_line(&mut too_long, 16).await.expect_err("RC-23: oversized line must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut eof = tokio::io::BufReader::new(&b""[..]);
+        assert_eq!(read_ctl_line(&mut eof, 16).await.unwrap(), "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn times_out_on_an_idle_connection() {
+        let (_keep_open, idle) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(idle);
+        let err = read_ctl_line(&mut reader, 16).await.expect_err("RC-23: idle connection must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
 
@@ -1003,7 +1064,13 @@ async fn run_ssh_channel_loop_after_first_open(
                     while let Some(CtlInbound { msg, reply }) = ctl_rx.recv().await {
                         match (msg, reply) {
                             (isekai_protocol::CtlMessage::SetVar { scope, key, value }, _) => {
-                                ctl_var_store(scope, &tab_vars).set(key, value);
+                                // RC-23: 変数の件数に上限を設ける(既存キーの上書きは常に許可)。
+                                let store = ctl_var_store(scope, &tab_vars);
+                                if store.get(&key).is_none() && store.len() >= MAX_CTL_VARS_PER_STORE {
+                                    warn!("ctl-socket: setvar ignored, store already holds {} variables", MAX_CTL_VARS_PER_STORE);
+                                } else {
+                                    store.set(key, value);
+                                }
                             }
                             (isekai_protocol::CtlMessage::GetVarRequest { scope, key }, Some(reply)) => {
                                 let value = ctl_var_store(scope, &tab_vars).get(&key);
