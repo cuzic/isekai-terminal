@@ -23,10 +23,16 @@ extension TerminalSessionController {
     /// 実アップロード(`trzszStartUpload`)とテストの両方から同じ関数を使うことで、
     /// チャンク境界(特に0バイトファイル・ちょうどchunkSize境界)のロジックを実ファイル
     /// I/Oなしで検証できる。
-    static func trzszSendChunked(readNext: () -> Data, send: (Data, Bool) -> Void) {
-        var chunk = readNext()
+    ///
+    /// `readNext`は読み出しエラーをthrowしてよく、その場合は(isLast=trueのチャンクを
+    /// 送らずに)そのままエラーを呼び出し元へ返す。実アップロードでは
+    /// `FileHandle.read(upToCount:)`(throws)を使う: `readData(ofLength:)`はI/Oエラー時に
+    /// Objective-C例外を投げ、Swiftでは捕捉できずクラッシュするため(iCloudから退避済みの
+    /// ファイル等、2026-09-29レビューIOS-I8)。
+    static func trzszSendChunked(readNext: () throws -> Data, send: (Data, Bool) -> Void) rethrows {
+        var chunk = try readNext()
         while true {
-            let next = readNext()
+            let next = try readNext()
             let isLast = next.isEmpty
             send(chunk, isLast)
             if isLast { break }

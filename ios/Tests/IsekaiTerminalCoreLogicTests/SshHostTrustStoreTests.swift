@@ -92,4 +92,87 @@ final class SshHostTrustStoreTests: XCTestCase {
         let second = try SshHostTrustStore(storeURL: storeURL)
         XCTAssertEqual(second.verify(identifier: id, keyType: "ssh-ed25519", fingerprint: "11:22"), .trustedMatch)
     }
+
+    // MARK: - 2026-09-29レビュー IOS-I2/I3
+
+    /// 同じidentifierが重複したファイルでも初期化がtrapせず、後勝ちで読める
+    /// (以前は`Dictionary(uniqueKeysWithValues:)`が実行時trapし、起動のたびにクラッシュした)。
+    func testDuplicateIdentifiersInFileLoadLastWins() throws {
+        let json = """
+        [
+          {"identifier": "sshHost|dup.example.com:22", "keyType": "ssh", "fingerprint": "SHA256:old", "firstTrustedAt": 0},
+          {"identifier": "sshHost|dup.example.com:22", "keyType": "ssh", "fingerprint": "SHA256:new", "firstTrustedAt": 1}
+        ]
+        """
+        try Data(json.utf8).write(to: storeURL)
+
+        let store = try SshHostTrustStore(storeURL: storeURL)
+
+        XCTAssertEqual(store.allRecords.count, 1)
+        XCTAssertEqual(
+            store.verify(identifier: "sshHost|dup.example.com:22", keyType: "ssh", fingerprint: "SHA256:new"),
+            .trustedMatch
+        )
+    }
+
+    /// 壊れたJSONでも`openRecoveringCorruption`は空のストアで開き、壊れたファイルを退避する。
+    func testOpenRecoveringCorruptionQuarantinesBrokenFileAndStartsEmpty() throws {
+        try Data("{not json".utf8).write(to: storeURL)
+        XCTAssertThrowsError(try SshHostTrustStore(storeURL: storeURL))
+
+        let (store, recovered) = SshHostTrustStore.openRecoveringCorruption(storeURL: storeURL)
+
+        let quarantined = try XCTUnwrap(try XCTUnwrap(recovered).quarantinedURL)
+        defer { try? FileManager.default.removeItem(at: quarantined) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantined.path))
+        XCTAssertEqual(try Data(contentsOf: quarantined), Data("{not json".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeURL.path))
+        XCTAssertTrue(store.allRecords.isEmpty)
+
+        // 開き直したストアはそのまま使え、同じパスへ正常に永続化できる。
+        let id = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "after.example.com", port: 22)
+        try store.trust(identifier: id, keyType: "ssh", fingerprint: "SHA256:aaaa")
+        XCTAssertEqual(
+            try SshHostTrustStore(storeURL: storeURL).verify(identifier: id, keyType: "ssh", fingerprint: "SHA256:aaaa"),
+            .trustedMatch
+        )
+    }
+
+    func testOpenRecoveringCorruptionReportsNothingForHealthyOrMissingFile() throws {
+        let (_, recoveredMissing) = SshHostTrustStore.openRecoveringCorruption(storeURL: storeURL)
+        XCTAssertNil(recoveredMissing)
+    }
+
+    /// 永続化に失敗した`trust`はメモリ上の状態も変えない(ファイルとの食い違いを作らない)。
+    func testTrustDoesNotMutateMemoryWhenSaveFails() throws {
+        let unwritable = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .appendingPathComponent("missing-dir", isDirectory: true)
+            .appendingPathComponent("trust.json")
+        let store = try SshHostTrustStore(storeURL: unwritable)
+        let id = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "nosave.example.com", port: 22)
+
+        XCTAssertThrowsError(try store.trust(identifier: id, keyType: "ssh", fingerprint: "SHA256:aaaa"))
+
+        XCTAssertEqual(store.verify(identifier: id, keyType: "ssh", fingerprint: "SHA256:aaaa"), .unknownHost)
+        XCTAssertNil(store.record(for: id))
+    }
+
+    /// 複数スレッド(Rustのコールバックスレッド群+main相当)からの同時verify/trustで
+    /// クラッシュせず、全ての書き込みが反映される。
+    func testConcurrentVerifyAndTrustAreSafe() throws {
+        let store = try SshHostTrustStore(storeURL: storeURL)
+        let iterations = 200
+
+        DispatchQueue.concurrentPerform(iterations: iterations) { i in
+            let id = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "host\(i).example.com", port: 22)
+            _ = store.verify(identifier: id, keyType: "ssh", fingerprint: "SHA256:\(i)")
+            try? store.trust(identifier: id, keyType: "ssh", fingerprint: "SHA256:\(i)")
+            _ = store.allRecords
+        }
+
+        XCTAssertEqual(store.allRecords.count, iterations)
+        let reloaded = try SshHostTrustStore(storeURL: storeURL)
+        XCTAssertEqual(reloaded.allRecords.count, iterations)
+    }
 }
