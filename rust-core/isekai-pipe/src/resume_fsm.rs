@@ -424,6 +424,14 @@ pub(crate) enum AttemptFailure {
     /// RESUME自体は成功したがreplayが不整合で、この接続は捨てた。サーバがsessionを
     /// 知っていた証拠なのでUnknownSessionの連続は途切れる。
     ReplayFailed,
+    /// このsessionでは再試行しても決して成功しない決定的な失敗(review 2026-09-29, PIPE-10):
+    /// サーバの`OffsetGone`(clientが最後に受け取ったoffsetからはもうreplayできない)、または
+    /// RESUMEが返したhelperのcommitted offsetがこのclientのC→S replayバッファの範囲外
+    /// (バイトが失われ、両側のoffsetをもう突き合わせられない)。以前は`Other`/`ReplayFailed`
+    /// として通常のbackoffに落ち、resume window(既定10日)が尽きるまで再試行し続け、その間
+    /// `ConnectOutcome`も書かれず`isekai-ssh`の自動回復が働かなかった
+    /// (`.claude/rules/always-connects.md`)。replayの*書き込み*失敗(一時的)は引き続き`ReplayFailed`。
+    Unrecoverable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +464,8 @@ pub(crate) enum GiveUpReason {
     DeadlineExceeded { exceeded_by: Duration },
     /// UnknownSessionが閾値回連続、かつ切断から`UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`経過。
     SessionGone,
+    /// `AttemptFailure::Unrecoverable`(OffsetGone / replay範囲外)が1回でも返った(PIPE-10)。
+    SessionUnrecoverable,
 }
 
 /// `continuity-lost` telemetryの理由(docs/adr/0006-stun-reestablish-continuity.md §3.2 task 5)。
@@ -641,9 +651,27 @@ impl ResumePlanner {
                     return cmds;
                 }
                 match (path, kind) {
-                    (DialPath::WarmStandby, AttemptFailure::UnknownSession | AttemptFailure::Other | AttemptFailure::ReplayFailed) => {
+                    (
+                        DialPath::WarmStandby,
+                        AttemptFailure::UnknownSession | AttemptFailure::Other | AttemptFailure::ReplayFailed | AttemptFailure::Unrecoverable,
+                    ) => {
                         // 昇格の不成立は通常のbackoffループへそのまま落ちる(遅延の最適化で
                         // あって正しさの依存ではない)。失敗の表示はshellが昇格時に済ませている。
+                        // shellは昇格の失敗を`Unrecoverable`に分類しない(通常のresumeで判定する)。
+                    }
+                    (DialPath::Primary | DialPath::CrossFamily, AttemptFailure::Unrecoverable) => {
+                        // 決定的な失敗: 同じsessionへの再試行は同じ結果を再現するだけなので、
+                        // 期限を待たずに即座に諦める(PIPE-10)。shellのGiveUpが`Err`を返し、
+                        // `write_connect_outcome_for_wrapper`経由で`isekai-ssh`の自動回復が働く。
+                        let continuity_lost = self.continuity_lost_if_applicable(&ep, ContinuityLost::SessionGone);
+                        cmds.push(ResumeCmd::GiveUp {
+                            reason: GiveUpReason::SessionUnrecoverable,
+                            resume_window: ep.resume_window,
+                            notify_os: ep.max_resume_window.is_none(),
+                            continuity_lost,
+                        });
+                        self.phase = Phase::GaveUp;
+                        return cmds;
                     }
                     (DialPath::Primary | DialPath::CrossFamily, AttemptFailure::ReplayFailed) => {
                         self.consecutive_unknown_session = 0;
@@ -972,6 +1000,30 @@ mod tests {
         assert_eq!(give_up(&fail_at(&mut p, &[500, 1_500, 29_999], AttemptFailure::UnknownSession)), None);
     }
 
+    /// PIPE-10: `OffsetGone`/replay範囲外(`Unrecoverable`)は1回目でその場で諦める(10日のwindowを
+    /// 待たない)。それ以前の一時的な失敗が何回あっても同じで、`ReportAttemptFailure`は出さない。
+    #[test]
+    fn unrecoverable_failure_gives_up_immediately() {
+        let mut p = ResumePlanner::new(relay_config());
+        let cmds = fail_at(&mut p, &[500], AttemptFailure::Unrecoverable);
+        assert_eq!(
+            give_up_cmd(&cmds),
+            Some(ResumeCmd::GiveUp {
+                reason: GiveUpReason::SessionUnrecoverable,
+                resume_window: Duration::from_secs(u64::from(GRACE_LONG)),
+                notify_os: true,
+                continuity_lost: None,
+            })
+        );
+        assert!(!cmds.iter().any(|c| matches!(c, ResumeCmd::ReportAttemptFailure { .. })), "{cmds:?}");
+        assert_eq!(p.phase, Phase::GaveUp);
+
+        let mut p = ResumePlanner::new(relay_config());
+        let cmds = fail_at(&mut p, &[500, 1_500], AttemptFailure::Other);
+        assert_eq!(give_up(&cmds), None);
+        assert_eq!(give_up(&keep_failing(&mut p, cmds, &[3_500], AttemptFailure::Unrecoverable)), Some(GiveUpReason::SessionUnrecoverable));
+    }
+
     /// 03224b11: 期限超過は`GiveUp`(shellが`Err`にする)であって、黙って接続済みへ戻らない。
     #[test]
     fn deadline_exceeded_gives_up_instead_of_silently_returning_to_connected() {
@@ -1017,7 +1069,7 @@ mod tests {
         prop_oneof![
             3 => (-20_000i64..200_000).prop_map(Step::Advance),
             1 => any::<bool>().prop_map(|by_network_change| Step::Disconnect { by_network_change }),
-            6 => (0u8..4, any::<bool>()).prop_map(|(outcome, network_changed)| Step::Respond { outcome, network_changed }),
+            6 => (prop_oneof![9 => 0u8..4, 1 => Just(4u8)], any::<bool>()).prop_map(|(outcome, network_changed)| Step::Respond { outcome, network_changed }),
             1 => (1u64..4, 0u8..4).prop_map(|(token_delta, outcome)| Step::Stale { token_delta, outcome }),
             1 => Just(Step::Tick),
         ]
@@ -1043,7 +1095,8 @@ mod tests {
             0 => ResumeEvent::AttemptOk { token, now },
             1 => ResumeEvent::AttemptFailed { token, now, kind: AttemptFailure::UnknownSession, jitter_seed: seed },
             2 => ResumeEvent::AttemptFailed { token, now, kind: AttemptFailure::Other, jitter_seed: seed },
-            _ => ResumeEvent::AttemptFailed { token, now, kind: AttemptFailure::ReplayFailed, jitter_seed: seed },
+            3 => ResumeEvent::AttemptFailed { token, now, kind: AttemptFailure::ReplayFailed, jitter_seed: seed },
+            _ => ResumeEvent::AttemptFailed { token, now, kind: AttemptFailure::Unrecoverable, jitter_seed: seed },
         }
     }
 
@@ -1135,13 +1188,15 @@ mod tests {
                     }
                 }
                 let mut unknown_failure_now = false;
+                let mut unrecoverable_now = false;
                 if let (ResumeEvent::AttemptFailed { kind, .. }, Some(Awaiting::Dial(_, path))) = (ev, ep_before.map(|e| e.awaiting)) {
                     if path != DialPath::WarmStandby {
                         match kind {
                             AttemptFailure::UnknownSession => { model.unknown_streak += 1; unknown_failure_now = true; }
                             AttemptFailure::Other | AttemptFailure::ReplayFailed => model.unknown_streak = 0,
+                            AttemptFailure::Unrecoverable => unrecoverable_now = true,
                         }
-                        if kind != AttemptFailure::ReplayFailed && !model.switched {
+                        if matches!(kind, AttemptFailure::UnknownSession | AttemptFailure::Other) && !model.switched {
                             model.stun_failures += 1;
                         }
                     }
@@ -1167,6 +1222,11 @@ mod tests {
                                     prop_assert!(unknown_failure_now, "SessionGone give-up on an attempt that was not an UnknownSession rejection");
                                     prop_assert!(model.unknown_streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD, "gave up at streak {}", model.unknown_streak);
                                     prop_assert!(elapsed >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR, "gave up only {elapsed:?} after disconnect");
+                                }
+                                GiveUpReason::SessionUnrecoverable => {
+                                    // (G3) 決定的失敗のgive-upは、今回のPrimary/CrossFamilyへの試行が
+                                    //      `Unrecoverable`だったときだけ(PIPE-10)。
+                                    prop_assert!(unrecoverable_now, "SessionUnrecoverable give-up on an attempt that was not Unrecoverable");
                                 }
                                 GiveUpReason::DeadlineExceeded { exceeded_by } => {
                                     // (G2) 期限のgive-upは now >= disconnected_at + resume_window のときだけ
@@ -1236,6 +1296,10 @@ mod tests {
                     }
                 }
 
+                // (G3') liveness: Primary/CrossFamilyへの`Unrecoverable`では必ずその場で諦める(PIPE-10)。
+                if unrecoverable_now {
+                    prop_assert!(gave_up, "an Unrecoverable attempt must give up immediately");
+                }
                 // (G1') liveness: 3条件が揃った失敗では必ず諦める(諦めすぎ・諦めなさすぎの両方向)。
                 if unknown_failure_now && model.unknown_streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD && elapsed >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR {
                     prop_assert!(gave_up, "streak {} / {elapsed:?} must give up", model.unknown_streak);
