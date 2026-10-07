@@ -59,11 +59,21 @@ pub(crate) enum OrchestratorTestEvent {
 }
 
 pub(crate) struct ForwardingOrchestratorCallback {
-    pub(crate) tx: UnboundedSender<OrchestratorTestEvent>,
+    tx: UnboundedSender<OrchestratorTestEvent>,
+    /// Step 11: e2eテストの状態公開・接続エッジの列を記録し、不変条件を記録のたびと`Drop`で
+    /// 検査する(`trace_invariants`)。チャネルへは転送しない(既存テストのmatchへ波及させない)。
+    trace: crate::trace_invariants::TraceRecorder,
+}
+
+impl ForwardingOrchestratorCallback {
+    pub(crate) fn new(tx: UnboundedSender<OrchestratorTestEvent>) -> Self {
+        Self { tx, trace: crate::trace_invariants::TraceRecorder::default() }
+    }
 }
 
 impl OrchestratorCallback for ForwardingOrchestratorCallback {
     fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+        self.trace.record_state(&state);
         let _ = self.tx.send(OrchestratorTestEvent::Connection(state));
     }
     fn on_screen_update(&self, _update: crate::ScreenUpdate) {}
@@ -90,7 +100,9 @@ impl OrchestratorCallback for ForwardingOrchestratorCallback {
         let _ = self.tx.send(OrchestratorTestEvent::FilePreview(request_id, outcome));
     }
     fn on_foreground_resume(&self, _did_reconnect: bool) {}
-    // Step 8a′の接続エッジ契約は`orchestrator.rs`のテスト(`RecordingCallback`)で検証する。
-    // ここで転送すると、`OrchestratorTestEvent`を網羅的にmatchする既存テストへ波及するため転送しない。
-    fn on_connection_edge(&self, _edge: crate::ConnectionEdge, _generation: u64) {}
+    // Step 8a′の接続エッジは、ここで転送すると`OrchestratorTestEvent`を網羅的にmatchする既存テストへ
+    // 波及するため転送しない。代わりにStep 11の記録器で列の不変条件を検査する。
+    fn on_connection_edge(&self, edge: crate::ConnectionEdge, generation: u64) {
+        self.trace.record_edge(&edge, generation);
+    }
 }

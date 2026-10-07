@@ -396,6 +396,25 @@ impl AttachArbiter {
     }
 }
 
+// テスト専用の読み取りクエリ(ADR §6 Step 11の列記録、`engine::trace_invariants`)。本番の挙動は変えない。
+#[cfg(test)]
+impl LeaseId {
+    /// leaseの生の値(列に`LeaseId`を載せず、比較可能な番号だけを記録するため)。
+    pub(crate) fn raw_for_trace(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(test)]
+impl AttachArbiter {
+    /// `lease`が現在`PendingActivation`のleaseか(=その`PendingExpired`が現行tokenか)。
+    pub(crate) fn is_pending_activation_lease(&self, lease: LeaseId) -> bool {
+        self.sessions
+            .values()
+            .any(|state| matches!(state, AttachState::PendingActivation { lease: l, .. } if *l == lease))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
