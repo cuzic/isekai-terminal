@@ -1264,6 +1264,35 @@ async fn handle_attach_stream(
     Ok(())
 }
 
+/// `RESUME_ACK` + replay, bounded by `limit` (PIPE-12). On a write error or
+/// expiry the stream is **reset**, not just dropped: dropping a send stream
+/// that was neither finished nor reset finishes it implicitly, so a client
+/// whose replay was cut short by the timeout could read a clean FIN right
+/// after the truncated bytes, treat it as an orderly remote close and end
+/// the ssh session — while this server has just parked the TCP connection
+/// for a resume (review of #206, F3). A reset is an abrupt error on the
+/// client side, which its resume loop retries.
+async fn write_resume_ack_bounded(
+    send: &mut AnyByteStreamWriteHalf,
+    helper_committed_offset: u64,
+    helper_sent_offset: u64,
+    replay_bytes: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    let result = tokio::time::timeout(
+        limit,
+        quicmux::respond_resume_accepted(send, helper_committed_offset, helper_sent_offset, replay_bytes),
+    )
+    .await;
+    let error = match result {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(e)) => anyhow!("failed to write RESUME_ACK: {e}"),
+        Err(_elapsed) => anyhow!("timed out writing RESUME_ACK + replay after {limit:?}"),
+    };
+    send.reset(0);
+    Err(error)
+}
+
 /// Phase 8-3 / quicmux-server-resume Stage B: `quicmux::resume`のRESUMEフレーム
 /// (frame typeバイトは呼び出し元`handle_connection`が既に読み取り済み)を
 /// 検証し、既存セッションに park された TCP 接続を取り戻して中継を再開する。
@@ -1396,17 +1425,15 @@ async fn handle_resume_stream(
     // this task — with the TCP connection neither parked nor relaying, so
     // every later RESUME of this session was preempt-rejected — until the
     // QUIC idle timeout. On expiry, park exactly like the write-error branch.
-    let ack_result = tokio::time::timeout(
+    if let Err(e) = write_resume_ack_bounded(
+        &mut send,
+        helper_committed_offset,
+        helper_sent_offset,
+        &replay_bytes,
         RESUME_ACK_WRITE_TIMEOUT,
-        quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes),
     )
-    .await;
-    let ack_error = match ack_result {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(anyhow!("failed to write RESUME_ACK: {e}")),
-        Err(_elapsed) => Some(anyhow!("timed out writing RESUME_ACK + replay after {RESUME_ACK_WRITE_TIMEOUT:?}")),
-    };
-    if let Some(e) = ack_error {
+    .await
+    {
         attach_runtime.park(session_id, lease_id, (tcp_read, tcp_write)).await;
         table_guard.disarm();
         return Err(e);
@@ -2078,5 +2105,64 @@ mod relay_jwt_file_tests {
         let jwt = resolve_relay_jwt(None, Some(path.to_str().unwrap().to_string())).unwrap();
         assert_eq!(jwt, "header.payload.sig");
         assert!(!path.exists(), "the token file must be unlinked after reading");
+    }
+}
+
+#[cfg(test)]
+mod resume_ack_write_tests {
+    use super::*;
+    use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// PIPE-12 / review of #206 F3: when the bounded `RESUME_ACK` + replay
+    /// write gives up on a peer that is not reading, the client must observe
+    /// an abrupt reset — never a clean end-of-stream after a truncated
+    /// replay, which its data pump would take for an orderly remote close.
+    #[tokio::test]
+    async fn timed_out_resume_ack_resets_the_stream_instead_of_finishing_it() {
+        let (mut config, cert_sha256_hex) = quicmux::test_support::self_signed_server_config("isekai-pipe.local");
+        config.alpn = ALPN.to_vec();
+        config.exporter_label = EXPORTER_LABEL.to_vec();
+        config.max_concurrent_bidi_streams = 4;
+        let listener = AnyMuxListener::bind_noq(config, quicmux::BindSpec::any_ipv4()).await.unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        let factory = isekai_transport::system_quic_factory();
+        let endpoint = factory.create_endpoint(isekai_transport::BindSpec::any_ipv4()).await.unwrap();
+        // The server side must accept concurrently, or the handshake never completes.
+        let (client, server) = tokio::join!(
+            endpoint.connect(quicmux::RemoteSpec { addr, server_name: "isekai-pipe.local".to_string(), cert_sha256_hex }),
+            async { listener.accept().await.expect("incoming connection").accept().await },
+        );
+        let (client, server) = (client.unwrap(), server.unwrap());
+
+        let (mut client_recv, mut client_send) = client.open_bi().await.unwrap().split();
+        // A stream only becomes visible to `accept_bi` once it carries data.
+        client_send.write_all(&[0u8]).await.unwrap();
+        let (_server_recv, mut server_send) = server.accept_bi().await.unwrap().split();
+
+        // Far more than any stream flow-control window: the client reads
+        // nothing yet, so the write stalls and the bound expires.
+        let replay = vec![0x5Au8; 64 * 1024 * 1024];
+        let result = write_resume_ack_bounded(&mut server_send, 0, 0, &replay, Duration::from_millis(300)).await;
+        assert!(result.is_err(), "the stalled write must hit the bound");
+        drop(server_send);
+
+        // Now drain from the client side: it must end in an error (reset),
+        // not `Ok(0)`. `server`/`client` stay alive throughout.
+        let mut buf = vec![0u8; 64 * 1024];
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match client_recv.read(&mut buf).await {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .expect("the client must observe how the stream ended");
+        assert!(outcome.is_err(), "a truncated replay must end with a reset, not a clean FIN");
+        drop((server, client));
     }
 }
