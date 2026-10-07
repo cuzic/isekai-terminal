@@ -1,9 +1,6 @@
 package tools.isekai.terminal.session
 
 import tools.isekai.terminal.AiPanelUiState
-import tools.isekai.terminal.HostKeyChangedWarning
-import tools.isekai.terminal.PromptJumpResult
-import tools.isekai.terminal.PromptOutputCopyResult
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import tools.isekai.terminal.util.RemoteLogger
@@ -124,6 +121,12 @@ class TerminalSession(
     private val _state = MutableStateFlow(TerminalUiState())
     val state: StateFlow<TerminalUiState> = _state.asStateFlow()
 
+    /** Step 8b: [_state]を書き換える唯一の経路。遷移そのものは純粋関数
+     *  [ConnectionStateMapper.reduce]が持ち、ここは原子的に適用するだけ(UI表示状態のみ)。 */
+    private fun dispatch(msg: UiMsg) {
+        _state.update { ConnectionStateMapper.reduce(it, msg) }
+    }
+
     private val _log = MutableStateFlow("")
     val log: StateFlow<String> = _log.asStateFlow()
 
@@ -201,23 +204,23 @@ class TerminalSession(
         val prev = lastAppliedPanelGeneration.get()
         if (update.panelGeneration > prev.toULong() && update.panelKind != uniffi.isekai_terminal_core.PanelKind.NONE) {
             lastAppliedPanelGeneration.set(update.panelGeneration.toLong())
-            _state.update {
-                it.copy(
-                    aiPanel = AiPanelUiState(
+            dispatch(
+                UiMsg.AiPanelPresented(
+                    AiPanelUiState(
                         kind = update.panelKind,
                         title = update.panelTitle,
                         markdown = update.panelMarkdown,
                         fields = update.panelFields,
                     ),
-                )
-            }
+                ),
+            )
         }
     }
 
     /** ユーザーがパネルを閉じた(送信せずに閉じた、または送信後の後始末)。
      *  [lastAppliedPanelGeneration]はリセットしない(§上のdocコメント参照)。 */
     fun dismissAiPanel() {
-        _state.update { it.copy(aiPanel = null) }
+        dispatch(UiMsg.AiPanelDismissed)
     }
 
     /**
@@ -265,7 +268,7 @@ class TerminalSession(
                     )
                 ConnectionPublicState.Connecting -> {}
             }
-            _state.update { ConnectionStateMapper.apply(it, state) }
+            dispatch(UiMsg.ConnectionStateChanged(state))
         }
 
         override fun onScreenUpdate(update: ScreenUpdate) {
@@ -280,18 +283,18 @@ class TerminalSession(
                     is HostKeyDecision.Trust -> {
                         if (decision.isNew) {
                             RemoteLogger.i("IsekaiTerminalSSH", "TOFU: trusted $host")
-                            _state.update { it.copy(lastFingerprint = fingerprint) }
+                            dispatch(UiMsg.HostKeyTrustedNew(fingerprint))
                         }
                         true
                     }
                     is HostKeyDecision.Changed -> {
                         RemoteLogger.w("IsekaiTerminalSSH", "⚠ HOST KEY CHANGED: $host")
-                        _state.update { it.copy(hostKeyChangedWarning = decision.warning) }
+                        dispatch(UiMsg.HostKeyChanged(decision.warning))
                         false
                     }
                     is HostKeyDecision.Unconfirmed -> {
                         RemoteLogger.i("IsekaiTerminalSSH", "first connection: awaiting user confirmation for $host")
-                        _state.update { it.copy(newHostKeyPrompt = decision.prompt) }
+                        dispatch(UiMsg.NewHostKeyPromptShown(decision.prompt))
                         false
                     }
                     is HostKeyDecision.Reject -> {
@@ -312,7 +315,7 @@ class TerminalSession(
             // 二重起動防止フラグをリセットする(UI表示状態ではない副作用のため
             // TrzszStateMapper の対象外)。
             if (state !is TrzszPublicState.InProgress) transferAccepted.set(false)
-            _state.update { it.copy(trzszState = TrzszStateMapper.toUiState(state)) }
+            dispatch(UiMsg.TrzszStateChanged(state))
         }
 
         override fun onDownloadComplete(fileName: String?, data: ByteArray) {
@@ -349,7 +352,7 @@ class TerminalSession(
         override fun onRequestCellularFd(): PlatformFd? = acquireCellularFd()
 
         override fun onRebindStateChanged(state: RebindPublicState) {
-            _state.update { it.copy(rebindState = state) }
+            dispatch(UiMsg.RebindStateChanged(state))
         }
 
         // タスク#57: tmux hook発火。抑制判断はRust側(OrchestratorAdapter::on_notify)
@@ -367,11 +370,11 @@ class TerminalSession(
         // (`hostKeyChangedWarning`等の「一度きりのプロンプト」系フィールドと異なり、
         // こちらは`null`自体が有効な結果でありうるため単純な値比較では区別できない)。
         override fun onPromptJump(target: PromptJumpTarget?) {
-            _state.update { it.copy(promptJumpResult = PromptJumpResult(target, it.promptJumpResult.seq + 1)) }
+            dispatch(UiMsg.PromptJumpResolved(target))
         }
 
         override fun onPromptOutputCopyReady(text: String?) {
-            _state.update { it.copy(promptOutputCopyResult = PromptOutputCopyResult(text, it.promptOutputCopyResult.seq + 1)) }
+            dispatch(UiMsg.PromptOutputCopyReady(text))
         }
 
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
@@ -381,7 +384,7 @@ class TerminalSession(
             RemoteLogger.i("IsekaiTerminalSSH", "agent sign request: $keyFingerprint")
             val deferred = CompletableDeferred<Boolean>()
             pendingAgentSignRequest.set(deferred)
-            _state.update { it.copy(agentSignRequestFingerprint = keyFingerprint) }
+            dispatch(UiMsg.AgentSignRequested(keyFingerprint))
             return try {
                 runBlocking {
                     try {
@@ -393,7 +396,7 @@ class TerminalSession(
                 }
             } finally {
                 pendingAgentSignRequest.set(null)
-                _state.update { it.copy(agentSignRequestFingerprint = null) }
+                dispatch(UiMsg.AgentSignRequestCleared)
             }
         }
 
@@ -424,7 +427,7 @@ class TerminalSession(
         ioScope.launch {
             for (update in screenUpdateChannel) {
                 if (_state.value.connected) {
-                    _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
+                    dispatch(UiMsg.ScreenUpdated(update, orchestrator.scrollbackLen().toInt()))
                     maybeFireBell(update)
                     maybeFireNotify(update)
                     maybeApplyPanel(update)
@@ -456,7 +459,7 @@ class TerminalSession(
         // `AI_INTEGRATION_DESIGN.md` §6.2: 新しい論理セッションでは前回接続の
         // パネル世代・表示中パネルを引き継がない([lastFiredBellGeneration]と同じ理由)。
         lastAppliedPanelGeneration.set(0)
-        _state.update { it.copy(aiPanel = null) }
+        dispatch(UiMsg.AiPanelDismissed)
         // CONFLATEDチャネルに旧セッションの`ScreenUpdate`(高い`bellGeneration`)が
         // まだ未消費のまま残っている稀なケース(旧`onScreenUpdate`が切断直後の一瞬
         // `_state.value.connected`の古い読み取りで滑り込んだ場合)に備え、ここで
@@ -468,7 +471,7 @@ class TerminalSession(
         try {
             connect()
         } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+            dispatch(UiMsg.ConnectFailed(e.message))
         }
     }
 
@@ -500,7 +503,7 @@ class TerminalSession(
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
 
     fun disconnect() {
-        _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
+        dispatch(UiMsg.LocalDisconnectRequested)
         orchestrator.disconnect()
     }
 
@@ -606,14 +609,14 @@ class TerminalSession(
 
     fun trustUpdatedHostKey() {
         val w = _state.value.hostKeyChangedWarning ?: return
-        _state.update { it.copy(hostKeyChangedWarning = null) }
+        dispatch(UiMsg.HostKeyChangedWarningCleared)
         ioScope.launch {
             hostKeyChecker.trustUpdated(w.host, w.port, w.newFingerprint)
         }
     }
 
     fun dismissHostKeyWarning() {
-        _state.update { it.copy(hostKeyChangedWarning = null) }
+        dispatch(UiMsg.HostKeyChangedWarningCleared)
         disconnect()
     }
 
@@ -622,14 +625,14 @@ class TerminalSession(
      *  (`TerminalScreenBody`の「再接続」ボタン、`canReconnect`が true の間表示される)。 */
     fun trustNewHostKey() {
         val p = _state.value.newHostKeyPrompt ?: return
-        _state.update { it.copy(newHostKeyPrompt = null) }
+        dispatch(UiMsg.NewHostKeyPromptCleared)
         ioScope.launch {
             hostKeyChecker.trustUpdated(p.host, p.port, p.fingerprint)
         }
     }
 
     fun dismissNewHostKeyPrompt() {
-        _state.update { it.copy(newHostKeyPrompt = null) }
+        dispatch(UiMsg.NewHostKeyPromptCleared)
         disconnect()
     }
 
@@ -638,7 +641,7 @@ class TerminalSession(
     /** ユーザーが署名確認ダイアログで承認/拒否を選んだ時に呼ぶ。応答が無ければ拒否扱い。 */
     fun respondAgentSignRequest(approved: Boolean) {
         val deferred = pendingAgentSignRequest.getAndSet(null) ?: return
-        _state.update { it.copy(agentSignRequestFingerprint = null) }
+        dispatch(UiMsg.AgentSignRequestCleared)
         deferred.complete(approved)
     }
 
@@ -663,7 +666,7 @@ class TerminalSession(
     fun trzszCancel() {
         if (_state.value.trzszState == null) return
         transferAccepted.set(false)
-        _state.update { it.copy(trzszState = null) }
+        dispatch(UiMsg.TrzszCancelled)
         orchestrator.trzszCancel()
     }
 
