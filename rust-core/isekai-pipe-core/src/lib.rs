@@ -425,8 +425,12 @@ pub(crate) fn claim_json<T: DeserializeOwned>(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(IntentError::Io(e)),
     }
-    let bytes = fs::read(&dst)?;
-    let value: T = serde_json::from_slice(&bytes)?;
+    let bytes = fs::read(&dst);
+    // The claimed copy has served its purpose (the rename above is what makes
+    // the claim exclusive); nothing reads it afterwards, and leaving it behind
+    // accumulated one file per connect attempt forever (isekai-ssh review D8).
+    let _ = fs::remove_file(&dst);
+    let value: T = serde_json::from_slice(&bytes?)?;
     Ok(Some(value))
 }
 
@@ -434,7 +438,21 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // `default_runtime_dir` falls back to a predictable
+        // `/tmp/isekai-<uid>` when neither `ISEKAI_PIPE_RUNTIME_DIR` nor
+        // `XDG_RUNTIME_DIR` is set, which another local user could pre-create
+        // (or plant as a symlink). Refuse anything that isn't a real
+        // directory owned by us before trusting it with intents/outcomes
+        // (isekai-ssh review D8) — rather than relying on `set_permissions`
+        // below merely happening to fail on someone else's directory.
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.file_type().is_dir() || meta.uid() != current_uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a directory owned by the current user; refusing to use it", path.display()),
+            ));
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -556,5 +574,32 @@ mod tests {
             IntentError::Missing
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// isekai-ssh review D8: a runtime dir planted as a symlink must be
+    /// refused rather than trusted.
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_refuses_a_symlinked_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("isekai-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = create_private_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        create_private_dir(&real).expect("a real directory we own is fine");
+    }
+
+    /// isekai-ssh review D8: claiming consumes the file entirely — no
+    /// per-attempt leftovers accumulate in the claimed directory.
+    #[test]
+    fn claim_json_leaves_no_claimed_copy_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_json_atomically(dir.path(), "things", "abc", &serde_json::json!({"k": 1})).unwrap();
+        let value: Option<serde_json::Value> = claim_json(dir.path(), "things", "things-claimed", "abc").unwrap();
+        assert_eq!(value, Some(serde_json::json!({"k": 1})));
+        let leftovers = fs::read_dir(dir.path().join("things-claimed")).unwrap().count();
+        assert_eq!(leftovers, 0);
     }
 }

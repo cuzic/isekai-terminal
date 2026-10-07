@@ -51,8 +51,9 @@ pub struct IndexEntry {
     pub parked_since: Option<Millis>,
     /// ATTACHのACKで約束した実効resume-grace。sweepはグローバルな`max_parked`との短い方を使う。
     pub negotiated_grace_secs: Option<u32>,
-    /// 容量超過で登録された(旧`InsertOutcome::Rejected`)。RESUME不可・LRU対象外・
-    /// table側の容量計数に含めない。parkは`Discard{Unresumable}`になる(I-g)。
+    /// 容量超過で登録された(旧`InsertOutcome::Rejected`)、または中継中にresumeの前提
+    /// (control streamの`APP_ACK`)が失われてS→C replayを捨てた(`ResumeUnavailable`、PIPE-09)。
+    /// RESUME不可・LRU対象外・table側の容量計数に含めない。parkは`Discard{Unresumable}`になる(I-g)。
     pub unresumable: bool,
 }
 
@@ -102,6 +103,13 @@ pub enum ServeEvent {
     // ---- 事実(既存incarnationのleaseを運ぶ) ----
     Parked { id: SessionKey, lease: LeaseId, now: Millis },
     RelayTerminated { id: SessionKey, lease: LeaseId, reason: TerminateReason },
+    /// 中継中(active)のincarnationが、もうresumeできなくなった(review 2026-09-29, PIPE-09):
+    /// control streamが確立しなかった/途切れたため`APP_ACK`が来ず、S→C replayバッファが満杯に
+    /// なったので、shellはS→Cを止めないためにreplayへのteeをやめた。以後このincarnationへの
+    /// RESUMEは決して正しく再開できない(replayに穴がある)ので`unresumable`にする: 後の`Parked`は
+    /// `Discard{Unresumable}`(slot解放・TCP close、I-g)、`ResumeRequested`は拒否。
+    /// 非現行lease・parked・既にunresumableなら何もしない(Effectも無い)。
+    ResumeUnavailable { id: SessionKey, lease: LeaseId },
     Sweep { now: Millis, max_parked: Duration },
     // ---- 要求(1回のapplyで解決する) ----
     ResumeRequested { id: SessionKey },
@@ -177,6 +185,7 @@ impl ServeAggregate {
             ServeEvent::RelayEnded { lease } => self.on_relay_ended(lease),
             ServeEvent::Parked { id, lease, now } => self.on_parked(id, lease, now),
             ServeEvent::RelayTerminated { id, lease, reason } => self.on_relay_terminated(id, lease, reason),
+            ServeEvent::ResumeUnavailable { id, lease } => self.on_resume_unavailable(id, lease),
             ServeEvent::Sweep { now, max_parked } => self.on_sweep(now, max_parked),
             ServeEvent::ResumeRequested { id } => self.on_resume_requested(id),
         }
@@ -265,6 +274,18 @@ impl ServeAggregate {
         }
         entry.parked_since = Some(now);
         vec![ServeEffect::StoreParked { id, lease }]
+    }
+
+    fn on_resume_unavailable(&mut self, id: SessionKey, lease: LeaseId) -> Vec<ServeEffect> {
+        if let Some(entry) = self.index.get_mut(&id) {
+            // parkedのエントリには触れない(I-g: unresumableはparkedに到達しない)。shellは中継中に
+            // しか送らないので、parkedに当たるのは中継終了と競合した場合だけで、そのparkは
+            // 通常どおりRESUME/sweepに任せる。
+            if entry.lease == lease && entry.parked_since.is_none() {
+                entry.unresumable = true;
+            }
+        }
+        vec![]
     }
 
     fn on_relay_terminated(&mut self, id: SessionKey, lease: LeaseId, reason: TerminateReason) -> Vec<ServeEffect> {
@@ -632,6 +653,35 @@ mod tests {
         );
     }
 
+    /// PIPE-09: 中継中にresumeの前提を失ったincarnationは、以後のparkで破棄されslotも解放される
+    /// (以前はreplayが満杯になった時点でS→Cが永久に止まり、仮にparkされてもreplayに穴があった)。
+    #[test]
+    fn resume_unavailable_makes_the_later_park_a_discard() {
+        let mut agg = ServeAggregate::new(4);
+        let (lease, _) = establish(&mut agg, 1, None);
+        // 非現行leaseは何もしない。
+        assert_eq!(agg.apply(ServeEvent::ResumeUnavailable { id: id(1), lease: fabricated_lease() }), vec![]);
+        assert!(!agg.index[&id(1)].unresumable);
+        assert_eq!(agg.apply(ServeEvent::ResumeUnavailable { id: id(1), lease }), vec![]);
+        assert!(agg.index[&id(1)].unresumable);
+        assert_eq!(agg.apply(ServeEvent::ResumeRequested { id: id(1) }), vec![ServeEffect::ResumeRejected { id: id(1) }]);
+        let effects = agg.apply(ServeEvent::Parked { id: id(1), lease, now: Millis(10) });
+        assert_eq!(effects[0], ServeEffect::Discard { id: id(1), lease, cause: DiscardCause::Unresumable });
+        assert!(agg.index_entry(&id(1)).is_none());
+        assert_eq!(agg.arbiter.session_count(), 0, "the fencing slot is released in the same transition");
+    }
+
+    /// PIPE-09: parkedのエントリには触れない(I-g: unresumableはparkedに到達しない)。
+    #[test]
+    fn resume_unavailable_leaves_a_parked_entry_alone() {
+        let mut agg = ServeAggregate::new(4);
+        let (lease, _) = establish(&mut agg, 1, None);
+        agg.apply(ServeEvent::Parked { id: id(1), lease, now: Millis(10) });
+        assert_eq!(agg.apply(ServeEvent::ResumeUnavailable { id: id(1), lease }), vec![]);
+        assert!(!agg.index[&id(1)].unresumable);
+        assert_eq!(agg.apply(ServeEvent::ResumeRequested { id: id(1) }), vec![ServeEffect::ResumeGranted { id: id(1), lease }]);
+    }
+
     #[test]
     fn parking_an_unresumable_entry_discards_it_and_frees_the_slot() {
         // Step 2aの意図した挙動変更その2(I-g、旧: 孤児park→恒久的なslotリーク)。
@@ -676,6 +726,7 @@ mod tests {
         RelayEnded { l: usize },
         Parked { s: u8, l: usize, now: u64 },
         RelayTerminated { s: u8, l: usize, dropped: bool },
+        ResumeUnavailable { s: u8, l: usize },
         Sweep { now: u64, max_parked_ms: u64 },
         Resume { s: u8 },
     }
@@ -704,6 +755,7 @@ mod tests {
             2 => l().prop_map(|l| Op::RelayEnded { l }),
             4 => (s(), l(), now()).prop_map(|(s, l, now)| Op::Parked { s, l, now }),
             2 => (s(), l(), any::<bool>()).prop_map(|(s, l, dropped)| Op::RelayTerminated { s, l, dropped }),
+            1 => (s(), l()).prop_map(|(s, l)| Op::ResumeUnavailable { s, l }),
             3 => (now(), 0u64..60_000).prop_map(|(now, max_parked_ms)| Op::Sweep { now, max_parked_ms }),
             3 => s().prop_map(|s| Op::Resume { s }),
         ]
@@ -799,6 +851,13 @@ mod tests {
                 };
                 let reason = if dropped { TerminateReason::GuardDropped } else { TerminateReason::TcpDied };
                 ServeEvent::RelayTerminated { id: id(s), lease, reason }
+            }
+            Op::ResumeUnavailable { s, l } => {
+                let lease = match agg.index.get(&id(s)) {
+                    Some(e) if l % 2 == 0 => e.lease,
+                    _ => lease_at(issued, fabricated, l),
+                };
+                ServeEvent::ResumeUnavailable { id: id(s), lease }
             }
             Op::Sweep { now, max_parked_ms } => {
                 ServeEvent::Sweep { now: Millis(now), max_parked: Duration::from_millis(max_parked_ms) }
@@ -1070,6 +1129,19 @@ mod tests {
                 prop_assert!(!agg.index.values().any(is_expired), "an expired parked entry survived the sweep");
             }
             ServeEvent::Activated { .. } => {}
+            // PIPE-09: Effectは無く、arbiterも触らない。現行leaseのactiveなエントリだけが
+            // `unresumable`になり、それ以外の何も変わらない。
+            ServeEvent::ResumeUnavailable { id: uid, lease } => {
+                prop_assert!(effects.is_empty(), "ResumeUnavailable produced effects: {:?}", effects);
+                prop_assert_eq!(&before.0, &after.0, "ResumeUnavailable changed an arbiter state");
+                let mut expected = before_index.clone();
+                if let Some(e) = expected.get_mut(&uid) {
+                    if e.lease == lease && e.parked_since.is_none() {
+                        e.unresumable = true;
+                    }
+                }
+                prop_assert_eq!(&agg.index, &expected, "ResumeUnavailable did more than mark the active incarnation");
+            }
         }
         Ok(())
     }

@@ -12,13 +12,23 @@
 #
 # Usage:
 #   ./scripts/device_verify.sh [--device SERIAL] [--host HOST] [--port PORT] [--user USER]
-#                               [--skip-install] [--keep]
+#                               [--apk PATH | --install-local] [--keep]
 #
 #   --device SERIAL   adb -s に渡すデバイスシリアル(省略時: 接続中デバイスが1台ならそれを使う)
-#   --host/--port/--user  接続先SSHサーバー(デフォルト: 100.100.45.36:22, 実行ユーザー名)
-#   --skip-install    ./gradlew installDebug をスキップ(既にインストール済みの場合)
+#   --host/--port/--user  接続先SSHサーバー(デフォルト: $ISEKAI_E2E_SSH_HOST(未設定なら
+#                     100.100.45.36):$ISEKAI_E2E_SSH_PORT(未設定なら22), 実行ユーザー名)。
+#                     テスト用公開鍵は常に「このスクリプトを実行しているマシン」の
+#                     ~/.ssh/authorized_keys に追記/削除するため、--host はこのマシン自身
+#                     (を指すアドレス)でなければならない。
+#   --apk PATH        ビルド済みAPK(例: android-ci-deployスキルでGitHub Actionsから取得した
+#                     もの)を adb install -r してから開始する。
+#   --install-local   ローカルで ./gradlew installDebug を実行してから開始する(ローカルビルドは
+#                     prefer-gh-actions-over-local-cargo 方針で原則禁止のため、明示指定時のみ)。
+#                     --apk / --install-local のどちらも無い場合は、インストール済みのアプリを使う。
+#   --skip-install    互換のため受け付ける(現在は既定動作。何もしない)。
 #   --keep            最後の後片付け(生成鍵・プロファイル・authorized_keys削除)をスキップ
-#                      (失敗時の実機状態をそのまま確認したい場合)
+#                      (失敗時の実機状態をそのまま確認したい場合)。--keep 無しの場合、途中で
+#                      失敗してもEXIT trapでauthorized_keysに追記したテスト鍵は必ず削除する。
 
 set -euo pipefail
 
@@ -27,10 +37,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UI_HELPER="$SCRIPT_DIR/lib/adb_ui.py"
 
 DEVICE=""
-SSH_HOST="100.100.45.36"
-SSH_PORT="22"
+SSH_HOST="${ISEKAI_E2E_SSH_HOST:-100.100.45.36}"
+SSH_PORT="${ISEKAI_E2E_SSH_PORT:-22}"
 SSH_USER="$(whoami)"
-SKIP_INSTALL=0
+APK_PATH=""
+INSTALL_LOCAL=0
 KEEP=0
 
 while [ $# -gt 0 ]; do
@@ -39,7 +50,9 @@ while [ $# -gt 0 ]; do
         --host) SSH_HOST="$2"; shift 2 ;;
         --port) SSH_PORT="$2"; shift 2 ;;
         --user) SSH_USER="$2"; shift 2 ;;
-        --skip-install) SKIP_INSTALL=1; shift ;;
+        --apk) APK_PATH="$2"; shift 2 ;;
+        --install-local) INSTALL_LOCAL=1; shift ;;
+        --skip-install) shift ;;
         --keep) KEEP=1; shift ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -74,6 +87,31 @@ ORIG_USER_ROTATION=""
 ORIG_SCREEN_TIMEOUT=""
 PASS_COUNT=0
 FAIL_STEP=""
+MARKER="isekai-terminal-e2e-test-${TS}"
+AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
+AUTHKEY_ADDED=0
+
+# テスト用に追記した公開鍵(末尾コメント=$MARKER)の行だけを authorized_keys から取り除く。
+# 失敗経路でも鍵が恒久的にログイン可能なまま残らないよう、EXIT trap(cleanup)からも呼ぶ。
+# `grep -v` は残りが0行だと終了コード1を返すので、2以上(本当のエラー)だけを失敗扱いにする。
+# 一時ファイルは同じディレクトリに作り mv で置き換える(途中で中断しても元ファイルが
+# 中途半端に切り詰められない)。
+remove_test_authorized_key() {
+    [ "$AUTHKEY_ADDED" -eq 1 ] || return 0
+    [ -f "$AUTHORIZED_KEYS" ] || { AUTHKEY_ADDED=0; return 0; }
+    local tmp rc=0
+    tmp="$(mktemp "${AUTHORIZED_KEYS}.isekai_e2e_XXXXXX")"
+    grep -vF -- "$MARKER" "$AUTHORIZED_KEYS" > "$tmp" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        rm -f "$tmp"
+        echo "  WARNING: authorized_keys から marker=${MARKER} の行を削除できませんでした(手動で削除してください)" >&2
+        return 1
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$AUTHORIZED_KEYS"
+    AUTHKEY_ADDED=0
+    echo "  authorized_keys から marker=${MARKER} の行を削除しました"
+}
 
 cleanup() {
     local rc=$?
@@ -89,6 +127,11 @@ cleanup() {
     fi
     if [ -n "$ORIG_SCREEN_TIMEOUT" ]; then
         adbd shell settings put system screen_off_timeout "$ORIG_SCREEN_TIMEOUT" 2>/dev/null || true
+    fi
+    if [ "$KEEP" -eq 0 ]; then
+        remove_test_authorized_key || true
+    elif [ "$AUTHKEY_ADDED" -eq 1 ]; then
+        echo "  (--keep: authorized_keys のテスト鍵 marker=${MARKER} は残しています)"
     fi
     echo ""
     echo "=== full log: $LOGFILE ==="
@@ -138,11 +181,14 @@ assert_absent_since() {
 
 echo ""
 echo "--- 0. 事前準備 ---"
-if [ "$SKIP_INSTALL" -eq 0 ]; then
-    echo "installDebug..."
+if [ -n "$APK_PATH" ]; then
+    echo "adb install -r $APK_PATH ..."
+    adbd install -r "$APK_PATH"
+elif [ "$INSTALL_LOCAL" -eq 1 ]; then
+    echo "installDebug (--install-local)..."
     (cd "$REPO_ROOT" && ./gradlew installDebug -q)
 else
-    echo "(--skip-install: ビルド/インストールをスキップ)"
+    echo "(インストール済みのアプリを使用。ビルドは android-ci-deploy スキル等で GitHub Actions 上で行い、--apk で渡せる)"
 fi
 
 ORIG_ACCEL_ROTATION="$(adbd shell settings get system accelerometer_rotation | tr -d '\r')"
@@ -193,11 +239,12 @@ assert_since "$since" "generated key saved id=[0-9]+ '${KEY_LABEL}'" "鍵をDB�
 
 PUBKEY="$(ui get-prefix --prefix "ssh-ed25519 ")"
 echo "  pubkey: $PUBKEY"
-MARKER="isekai-terminal-e2e-test-${TS}"
-mkdir -p ~/.ssh
-echo "${PUBKEY} ${MARKER}" >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-echo "  appended to ~/.ssh/authorized_keys (marker=${MARKER})"
+mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
+# 追記より先にフラグを立てる(追記直後に中断されてもEXIT trapが削除を試みる)。
+AUTHKEY_ADDED=1
+echo "${PUBKEY} ${MARKER}" >> "$AUTHORIZED_KEYS"
+chmod 600 "$AUTHORIZED_KEYS"
+echo "  appended to $AUTHORIZED_KEYS (marker=${MARKER})"
 
 ui tap --resource-id dismissGeneratedKeyButton
 since=$(checkpoint)
@@ -334,10 +381,7 @@ ui tap-near --anchor "$KEY_LABEL" --resource-id keyDeleteButton
 ui tap --resource-id deleteConfirmButton
 assert_since "$since" "deleting key id=[0-9]+ '${KEY_LABEL}'" "鍵削除"
 
-grep -v "$MARKER" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.isekai_e2e_tmp
-mv ~/.ssh/authorized_keys.isekai_e2e_tmp ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-echo "  authorized_keys から marker=${MARKER} の行を削除しました"
+remove_test_authorized_key
 
 echo ""
 echo "=== 全ステップ完了 ==="

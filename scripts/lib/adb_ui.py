@@ -28,6 +28,27 @@ def adb(device, *args, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
 
+def input_text_shell_arg(value):
+    """`adb shell "input text <ここ>"` に渡す引数を組み立てる。
+
+    `adb shell` の文字列は端末側の `sh -c` で解釈されるため、以前のように一部の記号だけを
+    バックスラッシュでエスケープする方式では `* ? ~ # ! { [` 等の取りこぼしがあった
+    (`#` 以降はコメントとして捨てられ、`*` はグロブ展開される)。ここでは値全体を
+    単一引用符で囲み、単一引用符自体だけを `'\\''` で閉じ直す(POSIX sh の定石)ことで、
+    どんな記号も端末側シェルに解釈させずに `input` コマンドへそのまま届ける。
+
+    `input text` 自身は空白を受け付けず `%s` を空白として扱うため、空白は `%s` に変換する。
+    その裏返しで、値に元から含まれる `%s` は空白に化けてしまい正しく送れない。改行も
+    `input text` では送れない。これらは黙って別の文字列を送るより明示的に失敗させる。
+    """
+    if "\n" in value or "\r" in value:
+        raise SystemExit(f"input text: 改行は送れません(KEYCODE_ENTER を別途送ってください): {value!r}")
+    if "%s" in value:
+        raise SystemExit(f"input text: '%s' は空白に化けるため送れません: {value!r}")
+    encoded = value.replace(" ", "%s")
+    return "'" + encoded.replace("'", "'\\''") + "'"
+
+
 def dump_nodes(device):
     """端末上で uiautomator dump し、フラットな node 属性 dict のリスト(文書順)を返す。"""
     adb(device, "shell", "uiautomator", "dump", "/sdcard/isekai_e2e_dump.xml")
@@ -189,11 +210,7 @@ def cmd_type(args):
     del_keys = ["input", "keyevent"] + ["67"] * 128  # KEYCODE_DEL x128 (十分に長いフィールドをカバー)
     adb(args.device, "shell", *del_keys)
     time.sleep(0.2)
-    # adb shell input text は空白を %s に、他のシェル特殊文字はエスケープする必要がある。
-    escaped = args.value.replace("\\", "\\\\").replace(" ", "%s")
-    for ch in ("&", "(", ")", "<", ">", "|", ";", "'", '"', "`", "$"):
-        escaped = escaped.replace(ch, f"\\{ch}")
-    adb(args.device, "shell", f"input text {escaped}")
+    adb(args.device, "shell", f"input text {input_text_shell_arg(args.value)}")
     # Compose 側の state 反映(IME commitText → recompose)が非同期のため、
     # 直後に別ノードをタップすると古い state のまま判定されることがある(実機で確認済み)。
     time.sleep(0.6)
@@ -217,11 +234,8 @@ def cmd_type_terminal(args):
     for i, word in enumerate(words):
         if i > 0:
             adb(args.device, "shell", "input", "keyevent", "62")  # KEYCODE_SPACE
-        escaped = word.replace("\\", "\\\\")
-        for ch in ("&", "(", ")", "<", ">", "|", ";", "'", '"', "`", "$"):
-            escaped = escaped.replace(ch, f"\\{ch}")
-        if escaped:
-            adb(args.device, "shell", f"input text {escaped}")
+        if word:
+            adb(args.device, "shell", f"input text {input_text_shell_arg(word)}")
         time.sleep(0.1)
     print(f"sent to terminal: {args.value!r}")
 

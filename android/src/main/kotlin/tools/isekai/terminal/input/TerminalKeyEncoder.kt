@@ -351,8 +351,14 @@ object TerminalKeyEncoder {
         val normalized = text.replace("\r\n", "\r").replace("\n", "\r")
         val codePoints = normalized.codePointCount(0, normalized.length)
         return if (codePoints > 1 && bracketedPasteMode) {
+            // RC-12(2026-09-29 コードレビュー): 本文に`ESC[201~`が含まれていると
+            // bracketed pasteがそこで終わり、残りがシェルにコマンドとして実行されて
+            // しまう(クリップボード経由のコマンド注入)。Rust側
+            // `terminal_commit_text_bytes`と同じく、括る前にESCとC1制御文字
+            // (U+0080..U+009F、8bit CSI等)を取り除く。
+            val sanitized = normalized.filter { it != '\u001B' && it !in '\u0080'..'\u009F' }
             byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E) +  // ESC[200~
-            normalized.toByteArray(Charsets.UTF_8) +
+            sanitized.toByteArray(Charsets.UTF_8) +
             byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E)    // ESC[201~
         } else {
             normalized.toByteArray(Charsets.UTF_8)

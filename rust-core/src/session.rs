@@ -817,6 +817,14 @@ fn dispatch_transport_event(
             });
             EventOutcome::Continue(None)
         }
+        TransportEvent::JumpHostKey { host, port, fingerprint, reply } => {
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                let accepted = cb.on_jump_host_key(host, port, fingerprint);
+                let _ = reply.send(accepted);
+            });
+            EventOutcome::Continue(None)
+        }
         TransportEvent::AgentSignRequest { key_fingerprint, reply } => {
             let cb = Arc::clone(callback);
             tokio::task::spawn_blocking(move || {
