@@ -15,16 +15,16 @@
 
 | 項目 | 状態 | 移植先 / 理由 |
 |---|---|---|
-| PIPE-01 | 移植 | #192(別エージェント) |
+| PIPE-01 | 移植 | #192(別エージェント。`isekai-pipe/src/main.rs`・`engine/mod.rs`・`tests/serve_e2e.rs`が本PRと近接するため、後からマージする側でテキスト衝突の解消が要る可能性あり) |
 | PIPE-02 | C 見送り | #146: 容量超過sessionはunresumableとしてindex登録され、`Parked`は`Discard{Unresumable}`になる(ADR 0019 I-c/I-g) |
 | PIPE-03 | 移植 | 本PR(server: `relay_buffered`、client: `pump_c2h`を append→送信 に) |
 | PIPE-04 | 移植 | 本PR(`start_connect`の登録順) |
 | PIPE-05 | 移植 | 本PR(preempt `Notified`の保持) |
-| PIPE-06 | 移植 | 本PR(arbiterの`SendReject`、`hello()`のタイムアウトと同一key複数waiter) |
+| PIPE-06 | 移植 | 姉妹PR `fix/resplit-isekai-pipe-fsm`(本PRの上に積む。arbiterの`SendReject`、`hello()`のタイムアウトと同一key複数waiter) |
 | PIPE-07 | C 見送り | #146: discardは常に`(id, lease)`照合(`discard_io`/`RelayTerminated`) |
 | PIPE-08 | C 見送り | #146: `ResumeRequested`がparked確認・slot確認・引き渡しを1回のapplyで行い、slot無しrepark分岐は消滅 |
-| PIPE-09 | 移植 | 本PR(`ServeEvent::ResumeUnavailable`でunresumable化、replayのteeを停止) |
-| PIPE-10 | 移植 | 本PR(`resume_fsm`で OffsetGone / replay範囲外 を即GiveUp) |
+| PIPE-09 | 移植 | 姉妹PR `fix/resplit-isekai-pipe-fsm`(`ServeEvent::ResumeUnavailable`でunresumable化、replayのteeを停止) |
+| PIPE-10 | 移植 | 姉妹PR `fix/resplit-isekai-pipe-fsm`(`resume_fsm`で OffsetGone / replay範囲外 を即GiveUp) |
 | PIPE-11 | C 見送り | #160: `AdmitRequested`が判定とslot確保を1回のapplyで行う |
 | PIPE-12 | 移植 | 本PR(RESUME_ACK書き込みにタイムアウト) |
 | PIPE-13 | 移植 | 本PR(長さ上限 00875cbb + decodeを`HELLO_TIMEOUT`で包む) |
