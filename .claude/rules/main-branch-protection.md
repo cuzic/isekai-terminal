@@ -86,7 +86,7 @@ checksが緑であればマージ可)を選んだ。
 ## Phase 5: `enforce_admins`昇格の手順(まだ実施していない)
 
 1週間、以下を観測してから昇格する:
-- ドキュメントのみのPRで5本すべて緑が付くか(pr-path-gate経由の恒久pending対策が
+- ドキュメントのみのPRで6本すべて緑が付くか(pr-path-gate経由の恒久pending対策が
   機能しているか)。
 - `gh pr merge --auto`が実際に動作するか(Phase 3の`allow_auto_merge`設定と
   組み合わせて)。
@@ -96,7 +96,7 @@ checksが緑であればマージ可)を選んだ。
 観測後、問題なければ:
 
 ```bash
-# mainの最新コミットでrequired 5本が全て緑であることを確認してから
+# mainの最新コミットでrequired 6本が全て緑であることを確認してから
 gh api -X POST repos/cuzic/isekai-terminal/branches/main/protection/enforce_admins
 ```
 
