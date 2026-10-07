@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -79,6 +80,40 @@ def find_upwards(start: Path, filename: str, ceiling: Path) -> Path | None:
             return candidate
         if d == ceiling or d == d.parent:
             return None
+        d = d.parent
+
+
+_WORKSPACE_TABLE_RE = re.compile(r"^\s*\[workspace(\]|\.)")
+
+
+def has_workspace_table(manifest: Path) -> bool:
+    """True if this Cargo.toml declares a `[workspace]` (or `[workspace.*]`) table."""
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(_WORKSPACE_TABLE_RE.match(line) for line in text.splitlines())
+
+
+def find_workspace_manifest(crate_manifest: Path, ceiling: Path) -> Path:
+    """The manifest of the workspace the crate is actually built in.
+
+    Walks upward starting at the crate's *own* directory and returns the first
+    Cargo.toml that has a `[workspace]` table. Starting at the crate itself
+    matters for crates that are their own independent workspace root (e.g.
+    `rust-core/noq-multipath-spike`, which is deliberately not a member of
+    `rust-core/Cargo.toml`): picking the first Cargo.toml *above* the crate
+    would build `-p noq-multipath-spike` against rust-core's workspace and fail
+    with "package ID specification did not match" on every edit. Falls back to
+    the crate's own manifest when no workspace manifest is found.
+    """
+    d = crate_manifest.parent
+    while True:
+        candidate = d / "Cargo.toml"
+        if candidate.is_file() and has_workspace_table(candidate):
+            return candidate
+        if d == ceiling or d == d.parent:
+            return crate_manifest
         d = d.parent
 
 
@@ -180,13 +215,13 @@ def main() -> int:
     if crate_name is None:
         return 0
 
-    # Search for a workspace manifest *above* the crate directory. Falls
-    # back to the crate's own manifest when none is found — this is
-    # correct as-is for the root `isekai-terminal-core` crate, whose
-    # Cargo.toml already *is* rust-core's workspace manifest.
-    workspace_manifest = find_upwards(
-        crate_manifest.parent.parent, "Cargo.toml", repo_root(edited_file)
-    ) or crate_manifest
+    # The workspace manifest is the nearest Cargo.toml (starting at the
+    # crate's own directory) that actually has a `[workspace]` table — see
+    # find_workspace_manifest(). This is rust-core/Cargo.toml for every
+    # member crate (including the root `isekai-terminal-core`, whose own
+    # manifest *is* the workspace manifest), and the crate's own manifest for
+    # independent workspace roots like noq-multipath-spike.
+    workspace_manifest = find_workspace_manifest(crate_manifest, repo_root(edited_file))
 
     try:
         proc = run_cargo_build(workspace_manifest, crate_name)
@@ -194,6 +229,7 @@ def main() -> int:
         return 0
 
     diagnostics = extract_diagnostics(proc.stdout)
+    cache_file = cache_file_for(workspace_manifest.parent, crate_name)
 
     if not diagnostics:
         if proc.returncode != 0 and proc.stderr.strip():
@@ -203,9 +239,13 @@ def main() -> int:
             label = worktree_label(edited_file)
             print(f"[{label}] cargo build -p {crate_name} failed to run:\n{proc.stderr.strip()[:3000]}")
             return 2
+        if proc.returncode == 0:
+            # A clean build: record the empty set so that a warning which
+            # disappeared and later comes back is reported as new again
+            # (previously the cache kept the stale key set forever).
+            save_current_keys(cache_file, set())
         return 0
 
-    cache_file = cache_file_for(workspace_manifest.parent, crate_name)
     previous_keys = load_previous_keys(cache_file)
     current_keys = set(diagnostics.keys())
     save_current_keys(cache_file, current_keys)

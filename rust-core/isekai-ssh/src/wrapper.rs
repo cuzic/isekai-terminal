@@ -2450,6 +2450,7 @@ mod tests {
             profile: "prod".to_string(),
             class: isekai_pipe_core::ConnectOutcomeClass::Unreachable,
             detail: "idle timeout".to_string(),
+            session_established: false,
         };
         assert_eq!(resolve_claimed_outcome(Ok(Some(outcome.clone()))), Some(outcome));
     }

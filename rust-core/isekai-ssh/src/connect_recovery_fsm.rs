@@ -112,6 +112,10 @@ pub(crate) fn decide_connect_failure_recovery(outcome_class: Option<&ConnectOutc
 ///   a future mid-session class — treat it like one.
 /// - `StaleTrust`/`Unreachable`: pre-handshake failures — no SSH bytes ever
 ///   flowed, so the remote command never started and retrying is safe.
+///   Not quite always true by class alone (the Relay route also records a
+///   post-handshake resume-window exhaustion as `Unreachable`) — the reducer
+///   therefore asks [`remote_command_forbids_retry_after`], which adds the
+///   outcome's `session_established` bit on top of this class table.
 ///
 /// Formerly two inline conditions duplicated in each loop (`wrapper.rs:727`/
 /// `:789`, `native/connect.rs:454`/`:503`); this is exactly equivalent: the
@@ -123,6 +127,26 @@ pub(crate) fn remote_command_forbids_retry(class: &ConnectOutcomeClass, has_remo
         ConnectOutcomeClass::MidSessionDisconnect | ConnectOutcomeClass::Unknown => has_remote_command,
         ConnectOutcomeClass::StaleTrust | ConnectOutcomeClass::Unreachable => false,
     }
+}
+
+/// [`remote_command_forbids_retry`] plus the outcome's own
+/// `session_established` bit (`isekai_pipe_core::ConnectOutcome`, PIPE-18):
+/// the class alone cannot tell a pre-handshake failure from a mid-session one
+/// on every route — the Relay route deliberately records resume-window
+/// exhaustion *after* the session was live as `Unreachable` (a full re-deploy
+/// is still the right recovery for an interactive session there). So a
+/// remote command is also refused an automatic re-run whenever the failed
+/// attempt's SSH byte bridge had already gone live, whatever the class
+/// (review 2026-09-29, SSH-02).
+///
+/// Deliberately *only* then: a failure where `session_established` is
+/// `false` (no SSH bytes ever flowed, so the remote command never started)
+/// stays retryable and redeployable exactly as before, which is what
+/// `.claude/rules/always-connects.md` requires. An outcome written by an
+/// older `isekai-pipe` (no such field) reads as `false` (`serde(default)`),
+/// i.e. exactly the previous behaviour.
+pub(crate) fn remote_command_forbids_retry_after(class: &ConnectOutcomeClass, has_remote_command: bool, session_established: bool) -> bool {
+    remote_command_forbids_retry(class, has_remote_command) || (has_remote_command && session_established)
 }
 
 /// Generation token of the one effect the shell currently owes an answer
@@ -161,6 +185,9 @@ pub(crate) enum RecoveryEvent {
         class: Option<ConnectOutcomeClass>,
         should_bootstrap: bool,
         has_remote_command: bool,
+        /// The claimed `ConnectOutcome`'s `session_established` (`false`
+        /// when there is no outcome) — see [`remote_command_forbids_retry_after`].
+        session_established: bool,
         seed: u64,
     },
     RedeployFinished { token: Token, now: Millis, seed: u64, result: RedeployResult },
@@ -255,8 +282,8 @@ impl ConnectRecoveryFsm {
         match (self.awaiting, event) {
             (
                 Awaiting::Attempt(current),
-                RecoveryEvent::AttemptFailed { token, started, now, class, should_bootstrap, has_remote_command, seed },
-            ) if token == current => self.on_attempt_failed(started, now, class, should_bootstrap, has_remote_command, seed),
+                RecoveryEvent::AttemptFailed { token, started, now, class, should_bootstrap, has_remote_command, session_established, seed },
+            ) if token == current => self.on_attempt_failed(started, now, class, should_bootstrap, has_remote_command, session_established, seed),
             (Awaiting::Redeploy(current, origin), RecoveryEvent::RedeployFinished { token, now, seed, result }) if token == current => {
                 self.on_redeploy_finished(origin, now, seed, result)
             }
@@ -315,6 +342,7 @@ impl ConnectRecoveryFsm {
         class: Option<ConnectOutcomeClass>,
         should_bootstrap: bool,
         has_remote_command: bool,
+        session_established: bool,
         seed: u64,
     ) -> Vec<RecoveryEffect> {
         // Any failure this long after the previous attempt started counts as
@@ -331,7 +359,7 @@ impl ConnectRecoveryFsm {
                 self.finish(vec![RecoveryEffect::Log(RecoveryLog::AutoBootstrapDisabled)], RecoveryEffect::GiveUp)
             }
             (ConnectFailureRecoveryAction::RebootstrapAndRetry, Some(class)) => {
-                if remote_command_forbids_retry(&class, has_remote_command) {
+                if remote_command_forbids_retry_after(&class, has_remote_command, session_established) {
                     return self.finish(vec![RecoveryEffect::Log(RecoveryLog::RemoteCommandNotRetried)], RecoveryEffect::GiveUp);
                 }
                 // `StaleTrust`/`Unreachable`/`Unknown` have no lightweight
@@ -344,7 +372,7 @@ impl ConnectRecoveryFsm {
                 self.backoff(now, seed)
             }
             (ConnectFailureRecoveryAction::RetryConnectLightweight, Some(class)) => {
-                if remote_command_forbids_retry(&class, has_remote_command) {
+                if remote_command_forbids_retry_after(&class, has_remote_command, session_established) {
                     return self.finish(vec![RecoveryEffect::Log(RecoveryLog::RemoteCommandNotRetried)], RecoveryEffect::GiveUp);
                 }
                 self.budget.lightweight_retries += 1;
@@ -425,6 +453,7 @@ mod tests {
             class,
             should_bootstrap,
             has_remote_command: remote,
+            session_established: false,
             seed: 0,
         }
     }
@@ -467,6 +496,69 @@ mod tests {
         let t = token_of(&fsm.start()[0]);
         let effects = fsm.apply(failed(t, 0, Some(C::Unreachable), true, true));
         assert!(matches!(effects.last(), Some(RecoveryEffect::Redeploy { .. })), "pre-handshake classes are safe to retry: {effects:?}");
+    }
+
+    fn failed_established(token: Token, class: ConnectOutcomeClass, remote: bool, session_established: bool) -> RecoveryEvent {
+        RecoveryEvent::AttemptFailed {
+            token,
+            started: Millis(0),
+            now: Millis(0),
+            class: Some(class),
+            should_bootstrap: true,
+            has_remote_command: remote,
+            session_established,
+            seed: 0,
+        }
+    }
+
+    /// SSH-02: `session_established` widens the guard to every class for a
+    /// remote command, and only for a remote command; with
+    /// `session_established == false` it is exactly
+    /// [`remote_command_forbids_retry`].
+    #[test]
+    fn remote_command_guard_with_session_established_table() {
+        for class in all_classes() {
+            for remote in [false, true] {
+                assert_eq!(
+                    remote_command_forbids_retry_after(&class, remote, false),
+                    remote_command_forbids_retry(&class, remote),
+                    "{class:?}, remote {remote}: a pre-connect failure must keep the old guard"
+                );
+                assert_eq!(remote_command_forbids_retry_after(&class, remote, true), remote, "{class:?}, remote {remote}");
+            }
+        }
+    }
+
+    /// (1) A pre-connect failure (no SSH bytes ever flowed) with a remote
+    /// command is still redeployed and retried (always-connects).
+    #[test]
+    fn a_pre_connect_failure_with_a_remote_command_is_still_redeployed() {
+        for class in [C::StaleTrust, C::Unreachable] {
+            let mut fsm = ConnectRecoveryFsm::new();
+            let t = token_of(&fsm.start()[0]);
+            let effects = fsm.apply(failed_established(t, class.clone(), true, false));
+            assert_eq!(effects[0], RecoveryEffect::Log(RecoveryLog::RebootstrapDecision), "{class:?}: {effects:?}");
+            assert!(matches!(effects.last(), Some(RecoveryEffect::Redeploy { .. })), "{class:?}: {effects:?}");
+        }
+    }
+
+    /// (2) Once the session had been established, a remote command is never
+    /// re-run automatically, whatever the class (the Relay route writes
+    /// `Unreachable` for a post-handshake resume-window exhaustion) — same
+    /// give-up as the `Unknown` + remote command guard.
+    #[test]
+    fn an_established_session_with_a_remote_command_is_not_rerun() {
+        for class in all_classes() {
+            let mut fsm = ConnectRecoveryFsm::new();
+            let t = token_of(&fsm.start()[0]);
+            let effects = fsm.apply(failed_established(t, class.clone(), true, true));
+            assert_eq!(effects, vec![RecoveryEffect::Log(RecoveryLog::RemoteCommandNotRetried), RecoveryEffect::GiveUp], "{class:?}");
+        }
+        // Without a remote command an established session still recovers.
+        let mut fsm = ConnectRecoveryFsm::new();
+        let t = token_of(&fsm.start()[0]);
+        let effects = fsm.apply(failed_established(t, C::Unreachable, false, true));
+        assert!(matches!(effects.last(), Some(RecoveryEffect::Redeploy { .. })), "{effects:?}");
     }
 
     #[test]
@@ -552,6 +644,7 @@ mod tests {
             class: Some(C::Unreachable),
             should_bootstrap: true,
             has_remote_command: false,
+            session_established: false,
             seed: 0,
         });
         assert_eq!(effects[0], RecoveryEffect::Log(RecoveryLog::RebootstrapDecision), "gate must be fresh again: {effects:?}");
@@ -629,6 +722,7 @@ mod tests {
                 class: class.clone(),
                 should_bootstrap: s.should_bootstrap,
                 has_remote_command: s.remote,
+                session_established: false,
                 seed: s.seed,
             },
             1 => RecoveryEvent::RedeployFinished {

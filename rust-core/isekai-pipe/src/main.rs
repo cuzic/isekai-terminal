@@ -185,21 +185,15 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                     return Err(ExitCode::from(EX_USAGE));
                 }
             }
-            "--once" => helper_args.push(arg),
-            "--bind"
-            | "--idle-timeout"
-            | "--resume-window"
-            | "--resume-buffer-size"
-            | "--max-idle-lifetime"
-            | "--max-sessions"
-            | "--stun-server"
-            | "--punch-peer"
-            | "--relay"
-            | "--relay-sni"
-            | "--relay-jwt"
-            | "--relay-jwt-file"
-            | "--bootstrap-request-file"
-            | "--log-level" => {
+            // The forwarded-option lists live in the engine itself (the one
+            // place that actually parses them) — this used to be a separate,
+            // hand-maintained allow-list here that silently fell behind the
+            // engine (`--bind-port-range`/`--relay-transport` were rejected
+            // as "unsupported option" although the engine implemented both
+            // and `isekai-bootstrap` generates them), making every bootstrap
+            // that used either flag fail permanently.
+            flag if engine::SERVE_FORWARDED_FLAG_OPTIONS.contains(&flag) => helper_args.push(arg),
+            opt if engine::SERVE_FORWARDED_VALUE_OPTIONS.contains(&opt) => {
                 let value = connect::next_arg("serve", &mut iter, &arg).map_err(connect::usage_err)?;
                 helper_args.push(arg);
                 helper_args.push(value);
@@ -285,6 +279,136 @@ mod tests {
             ServiceSpec::ssh_target("127.0.0.1:2222").unwrap()
         );
         assert!(launch.helper_args.is_empty());
+    }
+
+    /// Runs `argv` through the exact two stages the real `serve` subcommand
+    /// does (`parse_serve`, then the engine's own parser on the forwarded
+    /// args + the `--service-name`/`--target` `serve_command` appends) —
+    /// i.e. "would a real `isekai-pipe serve` accept this command line".
+    fn serve_and_engine_accept(argv: &str) {
+        let launch = parse_serve(argv.split_whitespace().map(str::to_string))
+            .unwrap_or_else(|_| panic!("parse_serve rejected {argv:?}"))
+            .expect("not a --help invocation");
+        let mut helper_args = launch.helper_args;
+        helper_args.push("--service-name".to_string());
+        helper_args.push(launch.service.name().as_str().to_string());
+        helper_args.push("--target".to_string());
+        helper_args.push(launch.service.target().to_string());
+        if let Err(e) = engine::parse_args_from(helper_args) {
+            panic!("engine rejected the args parse_serve forwarded for {argv:?}: {e:#}");
+        }
+    }
+
+    /// Regression (review 2026-09-29, PIPE-01): same shape as
+    /// `isekai-bootstrap::install_script`'s `LaunchSpec::Direct` launch args
+    /// with both `#@isekai stun` and `#@isekai remote-bind-port-range` set.
+    /// `parse_serve` used to reject `--bind-port-range` outright, so every
+    /// such bootstrap (and every silent re-deploy after it) failed.
+    #[test]
+    fn serve_accepts_bootstrap_direct_launch_args_with_port_range_and_stun() {
+        serve_and_engine_accept(
+            "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file /tmp/x/bootstrap-request.json \
+             --stun-server 198.51.100.1:3478 --bind-port-range 40000-40100 --max-idle-lifetime 600 \
+             --resume-window 864000 --log-level info",
+        );
+    }
+
+    /// Regression (PIPE-01): `LaunchSpec::Relay` with `relay_transport =
+    /// Qmux` — `parse_serve` used to reject `--relay-transport`.
+    #[test]
+    fn serve_accepts_bootstrap_relay_launch_args_with_qmux_transport() {
+        serve_and_engine_accept(
+            "--target 127.0.0.1:22 --relay 203.0.113.1:4433 --relay-sni relay.test \
+             --relay-jwt-file /tmp/x/relay_jwt --bootstrap-request-file /tmp/x/bootstrap-request.json \
+             --relay-transport qmux --max-idle-lifetime 600 --resume-window 864000 --log-level info",
+        );
+    }
+
+    /// Splits the shell text `isekai_bootstrap::serve_launch_args` returns
+    /// into argv the way the remote `/bin/sh` would for the narrow forms that
+    /// generator emits: whitespace-separated words, `$tmpdir` expanded, and
+    /// `shell_single_quote`-wrapped values (`relay_sni`, already restricted
+    /// to a quote-free charset) unwrapped. Panics on anything else so a
+    /// future generator change that needs a real shell parser can't be
+    /// silently mis-split here.
+    fn shell_split_generated(args: &str) -> Vec<String> {
+        args.split_whitespace()
+            .map(|word| {
+                let word = word.replace("$tmpdir", "/tmp/isekai-test");
+                let word = match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
+                    Some(inner) => inner.to_string(),
+                    None => word,
+                };
+                assert!(
+                    !word.contains(['$', '\'', '"', '\\', '`']),
+                    "generated serve arg {word:?} needs real shell parsing; extend shell_split_generated"
+                );
+                word
+            })
+            .collect()
+    }
+
+    /// Regression (PIPE-01) as a real round trip: every argv the *actual*
+    /// bootstrap generator (`isekai_bootstrap::serve_launch_args`, the same
+    /// function `build_install_script` interpolates after `<bin> serve`)
+    /// produces — across every `LaunchSpec` shape it can emit flags for — must
+    /// be accepted by the real `parse_serve` and then the engine parser.
+    /// The hand-written argv tests above only mirror the generator's current
+    /// shape; this one fails as soon as the generator learns a flag `serve`
+    /// doesn't forward (`.claude/rules/always-connects.md`: such a mismatch
+    /// fails every silent re-deploy too).
+    #[test]
+    fn serve_accepts_every_argv_the_real_bootstrap_generator_emits() {
+        use isekai_bootstrap::{LaunchSpec, RelayLaunchSpec, RelayTransportKind};
+
+        let stun: std::net::SocketAddr = "198.51.100.1:3478".parse().unwrap();
+        let mut cases: Vec<(LaunchSpec, Vec<std::net::SocketAddr>)> = Vec::new();
+        for remote_bind_port_range in [None, Some((40000, 40100))] {
+            for stun_servers in [vec![], vec![stun]] {
+                cases.push((
+                    LaunchSpec::Direct {
+                        idle_lifetime_secs: 600,
+                        remote_log_level: "info".to_string(),
+                        remote_bind_port_range,
+                        resume_window_secs: 864000,
+                    },
+                    stun_servers,
+                ));
+            }
+        }
+        for relay_transport in [RelayTransportKind::Udp, RelayTransportKind::Qmux] {
+            cases.push((
+                LaunchSpec::Relay(RelayLaunchSpec {
+                    relay_addr: "203.0.113.1:4433".parse().unwrap(),
+                    relay_sni: "relay.test".to_string(),
+                    relay_jwt: "aaa.bbb.ccc".to_string(),
+                    relay_transport,
+                    idle_lifetime_secs: 600,
+                    remote_log_level: "debug".to_string(),
+                    resume_window_secs: 864000,
+                }),
+                vec![],
+            ));
+        }
+
+        let mut saw_port_range = false;
+        let mut saw_relay_transport = false;
+        for (launch, stun_servers) in &cases {
+            let generated = isekai_bootstrap::serve_launch_args(launch, stun_servers)
+                .unwrap_or_else(|e| panic!("generator rejected {launch:?}: {e}"));
+            saw_port_range |= generated.contains("--bind-port-range");
+            saw_relay_transport |= generated.contains("--relay-transport");
+            serve_and_engine_accept(&shell_split_generated(&generated).join(" "));
+        }
+        // Guard against the generator dropping the very flags PIPE-01 was
+        // about, which would make this test vacuous.
+        assert!(saw_port_range, "no case generated --bind-port-range");
+        assert!(saw_relay_transport, "no case generated --relay-transport");
+    }
+
+    #[test]
+    fn serve_still_rejects_genuinely_unknown_options() {
+        assert!(parse_serve(["--target", "127.0.0.1:22", "--no-such-flag"].into_iter().map(str::to_string)).is_err());
     }
 
     #[test]

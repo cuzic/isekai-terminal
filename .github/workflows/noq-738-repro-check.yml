@@ -66,14 +66,22 @@ jobs:
       - name: Apply [patch.crates-io] for noq_git_rev (if given)
         if: ${{ github.event.inputs.noq_git_rev != '' }}
         working-directory: rust-core/noq-multipath-spike
+        # 入力は`run:`へ直接展開せず`env:`経由で受け取り、git revとして妥当な
+        # 形式(16進のcommit SHA)かを検証してからCargo.tomlへ書き込む。
+        env:
+          NOQ_GIT_REV: ${{ github.event.inputs.noq_git_rev }}
         run: |
           set -euo pipefail
+          if ! [[ "$NOQ_GIT_REV" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            echo "::error::noq_git_rev must be a hex commit SHA (7-40 chars), got: $NOQ_GIT_REV" >&2
+            exit 1
+          fi
           cat >> Cargo.toml <<EOF
 
           [patch.crates-io]
-          noq = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
-          noq-proto = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
-          noq-udp = { git = "https://github.com/n0-computer/noq", rev = "${{ github.event.inputs.noq_git_rev }}" }
+          noq = { git = "https://github.com/n0-computer/noq", rev = "$NOQ_GIT_REV" }
+          noq-proto = { git = "https://github.com/n0-computer/noq", rev = "$NOQ_GIT_REV" }
+          noq-udp = { git = "https://github.com/n0-computer/noq", rev = "$NOQ_GIT_REV" }
           EOF
           echo "--- patched Cargo.toml tail ---"
           tail -10 Cargo.toml

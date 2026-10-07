@@ -24,6 +24,8 @@ class TerminalSessionService : Service() {
 
     private val binder = SessionBinder()
     private var sessionLabel: String = "接続なし"
+    /** 現在[sessionLabel]の通知が表示中か(stopForeground後は再postが必要)。 */
+    private var isNotificationPosted = false
 
     fun notifyConnected(host: String) {
         updateNotification("接続中: $host")
@@ -81,7 +83,11 @@ class TerminalSessionService : Service() {
     }
 
     fun updateNotification(label: String) {
+        // AND-H4: 同じ内容の再postは無駄なBinder IPCで、通知のエンキューレート制限
+        // (約5回/秒)に当たると本当に必要な更新まで捨てられうるため抑止する。
+        if (label == sessionLabel && isNotificationPosted) return
         sessionLabel = label
+        isNotificationPosted = true
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(label))
     }
@@ -100,6 +106,8 @@ class TerminalSessionService : Service() {
     // ── 通知 ──────────────────────────────────────────────
 
     private fun startForegroundWithNotification(label: String) {
+        sessionLabel = label
+        isNotificationPosted = true
         val notification = buildNotification(label)
         // Android 14+: foregroundServiceType は Manifest で宣言（specialUse）
         startForeground(NOTIFICATION_ID, notification)

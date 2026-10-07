@@ -1,5 +1,6 @@
 package tools.isekai.terminal
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -68,64 +69,81 @@ internal class ConnectionCoordinator(
                 (if (profile.usesJumpHost) " via jump ${profile.jumpUsername}@${profile.jumpHost}:${profile.jumpPort}" else ""),
         )
         scope.launch(ioDispatcher) {
-            val auth = resolveAuth(pane, profile, password) ?: return@launch
-            // 踏み台(jump host)は、SSHブートストラップを伴う全トランスポートで共通に使える
-            // (TSSHD_QUICのみ旧Phase 5B経路でrust-core側が未対応、Phase 10--1c参照)。
-            val jumpAuth = if (profile.usesJumpHost) {
-                resolveJumpAuth(pane, profile, jumpPassword) ?: return@launch
-            } else {
-                null
-            }
-            // 実際の`connect_*`種別によらず、呼び出し先はいずれも接続前に
-            // isekai-pipe serveのAndroidサービスが起動していることを要求するため、
-            // dispatch前に一度だけ呼んでおく(旧実装は`connectX`という薄いラッパーを
-            // 7つ経由してそれぞれの中でensureServiceRunning()を呼んでいた)。
-            executor.ensureServiceRunning()
-            when (profile.transportPreference) {
-                TransportPreference.PLAIN_SSH -> pane.session.connect(profile.toSshConfig(auth, jumpAuth))
-                TransportPreference.TSSHD_QUIC -> pane.session.connectQuic(profile.toQuicConfig(auth))
-                TransportPreference.ISEKAI_PIPE_QUIC ->
-                    pane.session.connectIsekaiPipeQuic(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
-                TransportPreference.AUTO ->
-                    pane.session.connectIsekaiPipeQuicAuto(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
-                TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH -> {
-                    // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
-                    // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
-                    // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
-                    val physicalFds = if (profile.enablePhysicalMultipath) {
-                        val acquisition = executor.acquirePhysicalMultipathFds()
-                        pane.physicalMultipathHandle = acquisition.handle
-                        acquisition.fds
-                    } else {
-                        PhysicalMultipathFds()
-                    }
-                    pane.session.connectMultipathIsekaiPipeQuic(
-                        profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth),
-                    )
+            // AND-H3: このコルーチンは`viewModelScope`(CoroutineExceptionHandler無し)上で動く
+            // ため、ここから例外が抜けるとアプリ全体がクラッシュする。relay JWTの復号失敗
+            // (Keystoreエントリ欠落・平文レガシー値)や、UniFFIの`InternalException`(Rust panic
+            // 由来)等をすべてこのペインの接続前エラーとして表示に落とす。
+            var auth: SshAuth? = null
+            var jumpAuth: SshAuth? = null
+            try {
+                auth = resolveAuth(pane, profile, password) ?: return@launch
+                // 踏み台(jump host)は、SSHブートストラップを伴う全トランスポートで共通に使える
+                // (TSSHD_QUICのみ旧Phase 5B経路でrust-core側が未対応、Phase 10--1c参照)。
+                if (profile.usesJumpHost) {
+                    jumpAuth = resolveJumpAuth(pane, profile, jumpPassword) ?: return@launch
                 }
-                TransportPreference.ISEKAI_STUN_P2P_QUIC ->
-                    pane.session.connectIsekaiStunP2p(profile.toIsekaiStunP2pConfig(auth, jumpAuth))
-                TransportPreference.ISEKAI_LINK_RELAY_QUIC -> {
-                    // relayJwt は Room に RelayCredentialVault で暗号化して保存してあるため、
-                    // 実際の接続直前に復号する(toIsekaiLinkRelayConfig 自体は暗号化を意識しない
-                    // 純粋なマッピング関数のまま保つ)。
-                    val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
-                    pane.session.connectIsekaiLinkRelay(decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
-                }
+                dispatchConnect(pane, profile, auth, jumpAuth)
+                // Phase 12 P2-1: このタブが解決したテーマ(Global default → Profile default)を
+                // 接続直後に反映する。connect_* はRust側で同期的にActiveSessionを差し込むため、
+                // このタイミングで呼べば確実にセッションへ届く。分割ペインも含め、タブ内の
+                // 全ペインに同じテーマを適用する(ペイン単位の配色分岐はスコープ外)。
+                pushTheme(pane, currentTheme)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                RemoteLogger.e("IsekaiTerminalSSH", "connectPane[$tabId/${pane.paneId}] failed: ${e.message}", e)
+                pane.preConnectError.value = "接続エラー: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                // タスク#65: 復号済み秘密鍵PEMのベストエフォートなメモリ消去。
+                // connect_* はUniFFI越しのFFI呼び出しで、呼び出し内でByteArrayの内容を
+                // 同期的にRust側へコピーしてから戻るため、ここで元のByteArrayをゼロ埋めしても
+                // Rust側の認証には影響しない。ただしJVM上に他の参照(GCされるまでのコピー等)が
+                // 残っていないことまでは保証できないベストエフォートの対策。AND-H3: 例外経路でも
+                // 必ず消去するため`finally`で行う。
+                wipeIfPublicKey(auth)
+                wipeIfPublicKey(jumpAuth)
             }
-            // タスク#65: 復号済み秘密鍵PEMのベストエフォートなメモリ消去。
-            // connect_* はUniFFI越しのFFI呼び出しで、呼び出し内でByteArrayの内容を
-            // 同期的にRust側へコピーしてから戻る(直上のコメント参照)ため、
-            // ここで元のByteArrayをゼロ埋めしてもRust側の認証には影響しない。
-            // ただしJVM上に他の参照(GCされるまでのコピー等)が残っていないことまでは
-            // 保証できないベストエフォートの対策。
-            wipeIfPublicKey(auth)
-            wipeIfPublicKey(jumpAuth)
-            // Phase 12 P2-1: このタブが解決したテーマ(Global default → Profile default)を
-            // 接続直後に反映する。connect_* はRust側で同期的にActiveSessionを差し込むため、
-            // このタイミングで呼べば確実にセッションへ届く。分割ペインも含め、タブ内の
-            // 全ペインに同じテーマを適用する(ペイン単位の配色分岐はスコープ外)。
-            pushTheme(pane, currentTheme)
+        }
+    }
+
+    /** トランスポート別の`connect_*`呼び出しへの分岐。 */
+    private suspend fun dispatchConnect(pane: PaneState, profile: ConnectionProfile, auth: SshAuth, jumpAuth: SshAuth?) {
+        // 実際の`connect_*`種別によらず、呼び出し先はいずれも接続前に
+        // isekai-pipe serveのAndroidサービスが起動していることを要求するため、
+        // dispatch前に一度だけ呼んでおく(旧実装は`connectX`という薄いラッパーを
+        // 7つ経由してそれぞれの中でensureServiceRunning()を呼んでいた)。
+        executor.ensureServiceRunning()
+        when (profile.transportPreference) {
+            TransportPreference.PLAIN_SSH -> pane.session.connect(profile.toSshConfig(auth, jumpAuth))
+            TransportPreference.TSSHD_QUIC -> pane.session.connectQuic(profile.toQuicConfig(auth))
+            TransportPreference.ISEKAI_PIPE_QUIC ->
+                pane.session.connectIsekaiPipeQuic(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+            TransportPreference.AUTO ->
+                pane.session.connectIsekaiPipeQuicAuto(profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+            TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH -> {
+                // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
+                // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
+                // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
+                val physicalFds = if (profile.enablePhysicalMultipath) {
+                    val acquisition = executor.acquirePhysicalMultipathFds()
+                    pane.physicalMultipathHandle = acquisition.handle
+                    acquisition.fds
+                } else {
+                    PhysicalMultipathFds()
+                }
+                pane.session.connectMultipathIsekaiPipeQuic(
+                    profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth),
+                )
+            }
+            TransportPreference.ISEKAI_STUN_P2P_QUIC ->
+                pane.session.connectIsekaiStunP2p(profile.toIsekaiStunP2pConfig(auth, jumpAuth))
+            TransportPreference.ISEKAI_LINK_RELAY_QUIC -> {
+                // relayJwt は Room に RelayCredentialVault で暗号化して保存してあるため、
+                // 実際の接続直前に復号する(toIsekaiLinkRelayConfig 自体は暗号化を意識しない
+                // 純粋なマッピング関数のまま保つ)。
+                val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
+                pane.session.connectIsekaiLinkRelay(decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
+            }
         }
     }
 
