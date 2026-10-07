@@ -60,6 +60,13 @@ class TerminalSessionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // #204レビューM1: 最後のタブを閉じると同一プロセス内でもサービスが本当に破棄され、
+        // `onDestroy`が正常終了マーカーを書く。再生成時にここで"dirty"へ戻さないと、
+        // その後の同一プロセス内でのOEM killが次回起動時に「正常終了」と誤判定され
+        // 予期しないkillの検出(バッテリーガイダンス)を取りこぼす。前回プロセスの痕跡を
+        // 起動時の`consumeCleanShutdownMarker`より先に消さないよう、消費済みのときだけ書く
+        // ([markServiceRunning]参照)。
+        markServiceRunning(this)
         createNotificationChannel()
     }
 
@@ -188,6 +195,24 @@ class TerminalSessionService : Service() {
                 .commit()
         }
 
+        /** このプロセスで[consumeCleanShutdownMarker]が既に呼ばれたか。 */
+        @Volatile
+        private var markerConsumedInThisProcess = false
+
+        /**
+         * サービス稼働中("dirty")を同期的に記録する。[onCreate]から呼ぶ(#204レビューM1)。
+         * 起動時の消費([consumeCleanShutdownMarker]、ViewModelのIOコルーチン)より前に
+         * サービスが作られた場合は何もしない——その場合は前回プロセスの"clean"痕跡がまだ
+         * 判定前であり、消費時にどのみちfalseへ戻る。
+         */
+        fun markServiceRunning(context: Context) {
+            if (!markerConsumedInThisProcess) return
+            context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_KEY_CLEAN_SHUTDOWN, false)
+                .commit()
+        }
+
         /**
          * アプリ起動時に1回だけ呼ぶ。マーカーが存在すれば「前回プロセスは正常終了
          * だった」ことを意味するので`true`を返しつつ、直後にマーカーを消費(false相当
@@ -199,6 +224,7 @@ class TerminalSessionService : Service() {
             val prefs = context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
             val wasClean = prefs.getBoolean(PREF_KEY_CLEAN_SHUTDOWN, false)
             prefs.edit().putBoolean(PREF_KEY_CLEAN_SHUTDOWN, false).commit()
+            markerConsumedInThisProcess = true
             return wasClean
         }
     }

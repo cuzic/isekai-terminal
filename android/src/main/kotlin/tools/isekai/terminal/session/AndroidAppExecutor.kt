@@ -85,7 +85,19 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         // AND-M2: 最後のタブが閉じられたらbindも解除する。BIND_AUTO_CREATEでbindした
         // ままだと、サービス側で`stopSelf()`してもbound serviceとして生き残り破棄されない。
         // 次に[ensureServiceRunning]が呼ばれれば改めてbindし直す。
-        if (totalCount <= 0) release()
+        if (totalCount <= 0) {
+            // #204レビューL1: bindがまだ`onServiceConnected`に届く前に最後のタブが閉じられると
+            // 上の`updateSessionsSummary`は空振りし、`startService`済みのサービスが
+            // 前面+通知のまま残る。その場合は明示的に止める。
+            if (terminalService == null) {
+                try {
+                    app.stopService(Intent(app, TerminalSessionService::class.java))
+                } catch (e: Exception) {
+                    RemoteLogger.w("IsekaiTerminalVM", "stopService failed (ignored)", e)
+                }
+            }
+            release()
+        }
     }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {

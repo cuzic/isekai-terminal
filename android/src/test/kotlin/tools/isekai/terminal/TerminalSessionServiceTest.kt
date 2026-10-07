@@ -96,6 +96,23 @@ class TerminalSessionServiceTest {
 
     // ── 項目2: 正常終了マーカー ──────────────────────────────
 
+    /**
+     * #204レビューM1: 最後のタブを閉じてサービスが破棄(=マーカーclean)された後、同一プロセス内で
+     * 新しいタブのためにサービスが再生成されたら、マーカーは"dirty"へ戻っていなければならない。
+     * 戻らないと、その後のOEM killが次回起動時に正常終了と誤判定される。
+     */
+    @Test
+    fun recreateAfterCleanDestroy_inSameProcess_resetsMarkerToDirty() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        // アプリ起動時の消費(TerminalTabsViewModel初期化)を模す。
+        TerminalSessionService.consumeCleanShutdownMarker(context)
+
+        Robolectric.buildService(TerminalSessionService::class.java).create().destroy()
+        Robolectric.buildService(TerminalSessionService::class.java).create()
+
+        assertTrue(!TerminalSessionService.consumeCleanShutdownMarker(context))
+    }
+
     @Test
     fun consumeCleanShutdownMarker_withoutPriorMark_returnsFalse() {
         val context = org.robolectric.RuntimeEnvironment.getApplication()
