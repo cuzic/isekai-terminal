@@ -96,7 +96,7 @@ object WiringContract {
         "scrollbackLen" to Wiring.Query("tools.isekai.terminal.session.TerminalSession#<init>"),
         "searchScrollback" to Wiring.UiAction(),
         "send" to Wiring.Command("$VM#sendSnippetToPane"),
-        "setAiPanelEnabled" to Wiring.Command("$VM#observeConnectionTransitions", observedInLifecycle = true),
+        "setAiPanelEnabled" to Wiring.Command("$VM#onConnectionEstablished", observedInLifecycle = true),
         "setSessionTheme" to Wiring.Command("$VM#pushThemeToSession"),
         "trzszAcceptDownload" to Wiring.UiAction(),
         "trzszAcceptUpload" to Wiring.UiAction(
@@ -109,11 +109,14 @@ object WiringContract {
         "trzszSendChunk" to Wiring.Command("$VM#trzszStartUploadForPane"),
     )
 
-    /** `OrchestratorCallback`(Rust → platform)の19メソッド。 */
+    /** `OrchestratorCallback`(Rust → platform)の20メソッド。 */
     val orchestratorCallback: Map<String, Wiring> = mapOf(
         "onAgentSignRequest" to Wiring.UiState,
         "onClipboardPullRequest" to Wiring.InjectedLambda("onClipboardPullRequested"),
         "onClipboardWrite" to Wiring.InjectedLambda("onClipboardWriteRequested"),
+        // Step 8a′(#167): 世代付き接続エッジ。TerminalSessionがconnectionEdges(Flow)へそのまま流し、
+        // TerminalTabsViewModel.observeConnectionEdgesがonConnectionEstablished/onConnectionLostへ振り分ける。
+        "onConnectionEdge" to Wiring.UiState,
         "onConnectionStateChanged" to Wiring.UiState,
         "onData" to Wiring.UiState,
         "onDownloadComplete" to Wiring.UiState,
