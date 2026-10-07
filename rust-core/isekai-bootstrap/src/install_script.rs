@@ -169,39 +169,21 @@ impl InstallScript {
     }
 }
 
-/// Builds the remote install/launch script and the stdin payload it reads,
-/// for either backend.
+/// The `isekai-pipe serve` argv tail (shell text, interpolated verbatim after
+/// `<remote_binary_path> serve` in the remote script) plus any extra secret
+/// bytes (`relay_jwt` only) that must travel over stdin right after the
+/// `BootstrapRequestV2` JSON.
 ///
-/// The base64-encoded `binary` always travels over stdin regardless of
-/// whether the script ends up using it, so the remote script's read position
-/// stays aligned across every branch — see the script's own `head -c
-/// {encoded_len}` calls, every one of which consumes exactly that many bytes
-/// whether it decodes them or discards them.
-///
-/// Async because `fresh_bootstrap_request_v2` probes the configured STUN
-/// servers for this client's own reflexive candidates before the request can
-/// be serialized.
-pub(crate) async fn build_install_script(
+/// Split out of [`build_install_script`] (sync, no STUN probing) so the exact
+/// argv `isekai-bootstrap` generates can be round-tripped through the real
+/// `isekai-pipe serve` argument parser in that crate's tests (review
+/// 2026-09-29 PIPE-01: `parse_serve` rejected the `--bind-port-range`/
+/// `--relay-transport` this function emits — a permanent always-connects
+/// failure). Exposed as [`crate::serve_launch_args`].
+pub(crate) fn serve_launch_args(
     launch: &LaunchSpec,
-    remote_binary_path: &str,
     stun_servers: &[SocketAddr],
-    binary: &[u8],
-) -> Result<InstallScript, BootstrapError> {
-    let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
-
-    // `#20a`/`#20b`: every bootstrap operation carries a
-    // `BootstrapRequestV2` over this same stdin, alongside
-    // whatever launch-specific secret (`relay_jwt`) already travels that
-    // way. `client_candidates` is now real: one entry per `stun_servers`
-    // entry that actually answered (`collect_client_stun_candidates`).
-    // `session_id`/`bootstrap_attempt_id` are freshly random per call —
-    // see `isekai_protocol::bootstrap_request`'s module docs for why
-    // these are their own identifiers, unrelated to any later ATTACH v2
-    // fencing identity the eventual QUIC connection will use.
-    let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
-    let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
-    let request_len = request_bytes.len();
-
+) -> Result<(String, Vec<u8>), BootstrapError> {
     // `#20b`: pass the first configured STUN server through to the
     // remote `isekai-pipe serve` too (`LaunchSpec::Direct` only —
     // `isekai-pipe serve` itself rejects `--stun-server`/`--relay`
@@ -223,7 +205,7 @@ pub(crate) async fn build_install_script(
     // Per-variant: the `isekai-pipe serve` argv tail, and any extra
     // secret bytes (`relay_jwt` only) that must travel over this same
     // stdin immediately after the `BootstrapRequestV2` JSON.
-    let (launch_args, jwt_bytes): (String, Vec<u8>) = match launch {
+    Ok(match launch {
         LaunchSpec::Relay(relay) => {
             // Security review #57: validate `relay_sni`/`relay_jwt` against a
             // strict allow-list charset *before* interpolating either into a
@@ -274,7 +256,43 @@ pub(crate) async fn build_install_script(
             );
             (args, Vec::new())
         }
-    };
+    })
+}
+
+/// Builds the remote install/launch script and the stdin payload it reads,
+/// for either backend.
+///
+/// The base64-encoded `binary` always travels over stdin regardless of
+/// whether the script ends up using it, so the remote script's read position
+/// stays aligned across every branch — see the script's own `head -c
+/// {encoded_len}` calls, every one of which consumes exactly that many bytes
+/// whether it decodes them or discards them.
+///
+/// Async because `fresh_bootstrap_request_v2` probes the configured STUN
+/// servers for this client's own reflexive candidates before the request can
+/// be serialized.
+pub(crate) async fn build_install_script(
+    launch: &LaunchSpec,
+    remote_binary_path: &str,
+    stun_servers: &[SocketAddr],
+    binary: &[u8],
+) -> Result<InstallScript, BootstrapError> {
+    let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
+
+    // `#20a`/`#20b`: every bootstrap operation carries a
+    // `BootstrapRequestV2` over this same stdin, alongside
+    // whatever launch-specific secret (`relay_jwt`) already travels that
+    // way. `client_candidates` is now real: one entry per `stun_servers`
+    // entry that actually answered (`collect_client_stun_candidates`).
+    // `session_id`/`bootstrap_attempt_id` are freshly random per call —
+    // see `isekai_protocol::bootstrap_request`'s module docs for why
+    // these are their own identifiers, unrelated to any later ATTACH v2
+    // fencing identity the eventual QUIC connection will use.
+    let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
+    let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
+    let request_len = request_bytes.len();
+
+    let (launch_args, jwt_bytes) = serve_launch_args(launch, stun_servers)?;
 
     // Security review #68: use the same per-invocation `mktemp -d` +
     // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`

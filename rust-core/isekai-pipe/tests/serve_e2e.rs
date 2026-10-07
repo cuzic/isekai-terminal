@@ -1511,12 +1511,6 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
     assert!(matches!(response, AttachResponse::Ready { .. }), "expected AttachReadyV2, got {response:?}");
 }
 
-/// `#20a-4`: when launched with `--bootstrap-request-file` (the real
-/// `isekai-bootstrap::openssh` call shape, `#20a-2`), `isekai-pipe serve`
-/// must wrap its handshake in a `BootstrapReportV2` envelope echoing back
-/// the request's `session_id`/`bootstrap_attempt_id`, rather than emitting
-/// the bare `HandshakeJson` line every other test in this file expects
-/// (`spawn_helper` deliberately never passes this flag).
 /// Regression (review 2026-09-29, PIPE-01): `isekai-pipe serve`'s own
 /// argument front-end (`main.rs::parse_serve`) used to reject
 /// `--bind-port-range` as "unsupported option" even though the engine
@@ -1535,6 +1529,12 @@ async fn serve_accepts_bind_port_range_and_binds_inside_it() {
     assert!((47000..=47999).contains(&port), "bound port {port} outside --bind-port-range");
 }
 
+/// `#20a-4`: when launched with `--bootstrap-request-file` (the real
+/// `isekai-bootstrap::openssh` call shape, `#20a-2`), `isekai-pipe serve`
+/// must wrap its handshake in a `BootstrapReportV2` envelope echoing back
+/// the request's `session_id`/`bootstrap_attempt_id`, rather than emitting
+/// the bare `HandshakeJson` line every other test in this file expects
+/// (`spawn_helper` deliberately never passes this flag).
 #[tokio::test]
 async fn bootstrap_request_file_wraps_handshake_in_a_bootstrap_report_v2() {
     let echo_addr = spawn_echo_server().await;

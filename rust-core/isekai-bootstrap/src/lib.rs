@@ -38,3 +38,21 @@ pub use openssh::OpenSshBackend;
 pub use reuse::launch_fingerprint;
 pub use russh_backend::RusshBackend;
 pub use types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
+
+/// The exact `isekai-pipe serve` argv tail (as shell text — `$tmpdir`
+/// references and single-quoted values unexpanded) that every bootstrap
+/// backend launches the uploaded helper with for `launch`.
+///
+/// Not part of the bootstrap API proper: exposed only so `isekai-pipe`'s own
+/// tests can feed the *real* generated argv through its real `serve` parser
+/// (review 2026-09-29 PIPE-01 — `parse_serve` had silently drifted behind
+/// this generator and rejected `--bind-port-range`/`--relay-transport`,
+/// failing every bootstrap and silent re-deploy that used them;
+/// `.claude/rules/always-connects.md`).
+#[doc(hidden)]
+pub fn serve_launch_args(
+    launch: &LaunchSpec,
+    stun_servers: &[std::net::SocketAddr],
+) -> Result<String, BootstrapError> {
+    install_script::serve_launch_args(launch, stun_servers).map(|(args, _jwt)| args)
+}
