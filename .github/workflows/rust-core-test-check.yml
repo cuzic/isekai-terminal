@@ -363,7 +363,9 @@ jobs:
 
   test-macos:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
+    # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-macos`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を
@@ -441,7 +443,9 @@ jobs:
 
   test-windows:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    # mainへのpushではLinuxだけ(必須テスト+purity)で合成状態を検証し、macOS/WindowsはPRで済ませる。
+    # push毎にmacOS/Windowsまで走らせるとランナー待ちでPRのmacOS完了が40分以上遅れたため(2026-10-06、ユーザー決定)。
+    if: needs.changes.outputs.relevant == 'true' && github.event_name != 'push'
     # まだrequired status checkではないが、将来Phase 6でrequired化する際に
     # job idそのまま(`test-windows`)がcontext名になっていると、`test`job(id
     # `test`→context名`rust-core-test-linux`)のときと同じ「job idの衝突」を

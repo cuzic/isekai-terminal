@@ -207,10 +207,6 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// `TmuxTabLocatorStore`へ適合済み)を再利用する — Android版が`ClientIdentity`と
     /// `TmuxTabLocator`を別ストレージ(SharedPreferences/Room)に分けているのと同じ構造。
     private let clientIdentityStore: ClientIdentityStore
-    /// タスク#3: `onConnectionStateChanged`が「未接続→接続」のエッジでだけ
-    /// `maybeEnsureTmuxTabWindow()`を呼ぶための直近状態の記憶(Android版
-    /// `TerminalTabsViewModel.observeConnectionTransitions`の`prevConnected`と対称)。
-    private var tmuxPrevConnected = false
 
     public init(
         profile: ConnectionProfile,
@@ -802,9 +798,6 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // MARK: - OrchestratorCallback
 
     public func onConnectionStateChanged(state: ConnectionPublicState) {
-        let isConnected: Bool
-        if case .connected = state { isConnected = true } else { isConnected = false }
-
         switch state {
         case .connecting:
             Task { @MainActor in self.uiState.state = .connecting }
@@ -819,15 +812,23 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
                 self.uiState.state = .reconnecting(elapsedSecs: elapsedSecs, timeoutSecs: timeoutSecs, reason: reason)
             }
         }
+    }
 
-        // タスク#3(Android版タスク#60`observeConnectionTransitions`と対称): 「未接続→
-        // 接続」のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
-        // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
-        // primary paneだけに絞っているスコープ制限は自動的に満たされる。
-        if isConnected && !tmuxPrevConnected {
+    // ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が世代付きで
+    // 判断して届ける。ここは届いたエッジに対応する既存の処理を呼ぶだけで、`onConnectionStateChanged`
+    // から自前でエッジを検出したり重複排除したりしない(以前の`tmuxPrevConnected`ミラー状態は撤去、
+    // `.claude/rules/rust-ssot.md`)。
+    public func onConnectionEdge(edge: ConnectionEdge, generation: UInt64) {
+        switch edge {
+        case .established:
+            // タスク#3(Android版タスク#60`TerminalTabsViewModel.observeConnectionEdges`と対称):
+            // 接続確立のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
+            // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
+            // primary paneだけに絞っているスコープ制限は自動的に満たされる。
             maybeEnsureTmuxTabWindow()
+        case .lost:
+            break
         }
-        tmuxPrevConnected = isConnected
     }
 
     // MARK: - tmux session group / ウィンドウ紐付け(タスク#3、Android版タスク#60)

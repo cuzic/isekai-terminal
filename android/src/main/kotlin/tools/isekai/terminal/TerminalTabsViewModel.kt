@@ -46,6 +46,7 @@ import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.BackgroundKillFacts
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
+import uniffi.isekai_terminal_core.ConnectionEdge
 import uniffi.isekai_terminal_core.PlatformFd
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 import uniffi.isekai_terminal_core.decideBatteryGuidance
@@ -795,7 +796,7 @@ class TerminalTabsViewModel(
 
     /**
      * ペイン固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
-     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)。
+     * 接続エッジ(Rustの`on_connection_edge`。Established での自動実行コマンド送信・Lost での後始末)。
      * 非アクティブでも動き続ける。upstream フェイルオーバーの `NoViablePath` 検知は
      * `RebindManager`(Rust側)が既に同じイベントで反応するため、Kotlin側で
      * 二重に監視しない(`observeFailover`は撤去済み、`rust-ssot.md`参照)。
@@ -806,7 +807,7 @@ class TerminalTabsViewModel(
         watchJobs[pane.paneId] = viewModelScope.launch {
             launch { observeSummary(pane) }
             launch { observeDownloads(pane) }
-            launch { observeConnectionTransitions(tab, pane) }
+            launch { observeConnectionEdges(tab, pane) }
         }
     }
 
@@ -822,49 +823,61 @@ class TerminalTabsViewModel(
         }
     }
 
-    private suspend fun observeConnectionTransitions(tab: TabState, pane: PaneState) {
-        var prevConnected = false
-        pane.uiState.collect { state ->
-            val connected = state.connected
-            if (connected && !prevConnected) {
-                executor.notifyConnected(state.currentHost ?: "")
-                if (pane.upstreamFailoverEnabledForCurrentSession) {
-                    pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
-                }
-                maybeSendPostConnectCommands(pane)
-                // `AI_INTEGRATION_DESIGN.md` §3: このpaneのAIパネルopt-inを、接続の
-                // たびに(再接続を含め)Rust側へ送り直す(`SessionCore.set_panel_enabled`
-                // のdocコメント参照: 値を保持しないため毎回の送信が必須)。split pane
-                // それぞれが独立した`Terminal`を持つため、tmux通知(primary paneのみ)
-                // と異なり全paneに対して行う。
-                tab.profile?.let { pane.session.setAiPanelEnabled(it.enableAiPanel) }
-                // タスク#60: tmux session group ensure/attach + ウィンドウのcreate-or-select。
-                // primary paneのみが対象(split paneはtmux非対応のMVP判断、
-                // `rust-core/src/tmux_session.rs`のモジュールdoc参照)。
-                if (pane.paneId == tab.primaryPane.paneId) {
-                    maybeEnsureTmuxTabWindow(tab, pane)
-                }
-                // タスク#14: 「直近まで生きていたセッション」の記録を、Connectedへ
-                // 遷移するたびに新しい保存時刻で更新する。タブを開いた瞬間の時刻だけを
-                // 使うと、長時間接続し続けたセッションが(一度もネットワーク瞬断による
-                // 再接続を経験しないまま)猶予期間を過ぎて「古い」と誤判定されうるため
-                // (`reattach_persistence.rs`の`AUTO_REATTACH_GRACE_SECS`参照)。
-                tab.profile?.let { persistReattachRecord(tab.tabId, it) }
-            } else if (!connected && prevConnected) {
-                executor.notifyDisconnected()
-                pane.physicalMultipathHandle?.close()
-                pane.physicalMultipathHandle = null
-                pane.upstreamFailoverMonitorHandle?.close()
-                pane.upstreamFailoverMonitorHandle = null
-                pane.upstreamFailoverEnabledForCurrentSession = false
-                // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
-                // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
-                // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
-                if (pane.paneId == tab.primaryPane.paneId) {
-                    tab.tmuxWindowLabel.value = null
-                }
+    /**
+     * ADR_FUNCTIONAL_CORE_EFFECTS.md §6 Step 8a′: 接続エッジはRust(`reconnect_fsm.rs`)が
+     * 世代付きで判断して`TerminalSession.connectionEdges`へ届ける。ここは届いたエッジに
+     * 対応する既存の処理を呼ぶだけで、`uiState`からエッジを検出したり重複排除したりしない
+     * (以前の`prevConnected`ミラー状態は`StateFlow`のconflationで`Connected→Reconnecting→
+     * Connected`を取りこぼしえた、`rust-ssot.md`)。Rustは各世代について`Established`の後に
+     * 次の`Established`より前に必ず1回`Lost`を出す(手動再接続・フォアグラウンド復帰も含む)。
+     */
+    private suspend fun observeConnectionEdges(tab: TabState, pane: PaneState) {
+        pane.session.connectionEdges.collect { event ->
+            when (val edge = event.edge) {
+                is ConnectionEdge.Established -> onConnectionEstablished(tab, pane, edge.host)
+                is ConnectionEdge.Lost -> onConnectionLost(tab, pane)
             }
-            prevConnected = connected
+        }
+    }
+
+    private fun onConnectionEstablished(tab: TabState, pane: PaneState, host: String) {
+        executor.notifyConnected(host)
+        if (pane.upstreamFailoverEnabledForCurrentSession) {
+            pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
+        }
+        maybeSendPostConnectCommands(pane)
+        // `AI_INTEGRATION_DESIGN.md` §3: このpaneのAIパネルopt-inを、接続の
+        // たびに(再接続を含め)Rust側へ送り直す(`SessionCore.set_panel_enabled`
+        // のdocコメント参照: 値を保持しないため毎回の送信が必須)。split pane
+        // それぞれが独立した`Terminal`を持つため、tmux通知(primary paneのみ)
+        // と異なり全paneに対して行う。
+        tab.profile?.let { pane.session.setAiPanelEnabled(it.enableAiPanel) }
+        // タスク#60: tmux session group ensure/attach + ウィンドウのcreate-or-select。
+        // primary paneのみが対象(split paneはtmux非対応のMVP判断、
+        // `rust-core/src/tmux_session.rs`のモジュールdoc参照)。
+        if (pane.paneId == tab.primaryPane.paneId) {
+            maybeEnsureTmuxTabWindow(tab, pane)
+        }
+        // タスク#14: 「直近まで生きていたセッション」の記録を、Connectedへ
+        // 遷移するたびに新しい保存時刻で更新する。タブを開いた瞬間の時刻だけを
+        // 使うと、長時間接続し続けたセッションが(一度もネットワーク瞬断による
+        // 再接続を経験しないまま)猶予期間を過ぎて「古い」と誤判定されうるため
+        // (`reattach_persistence.rs`の`AUTO_REATTACH_GRACE_SECS`参照)。
+        tab.profile?.let { persistReattachRecord(tab.tabId, it) }
+    }
+
+    private fun onConnectionLost(tab: TabState, pane: PaneState) {
+        executor.notifyDisconnected()
+        pane.physicalMultipathHandle?.close()
+        pane.physicalMultipathHandle = null
+        pane.upstreamFailoverMonitorHandle?.close()
+        pane.upstreamFailoverMonitorHandle = null
+        pane.upstreamFailoverEnabledForCurrentSession = false
+        // タスク#60: 切断中は古い`tmux:N`ラベルを表示し続けない(再接続後の
+        // maybeEnsureTmuxTabWindowが新しいラベルで上書きするまでの間、
+        // 実際にはもう繋がっていないウィンドウ番号が残るのを防ぐ)。
+        if (pane.paneId == tab.primaryPane.paneId) {
+            tab.tmuxWindowLabel.value = null
         }
     }
 
@@ -1001,7 +1014,7 @@ class TerminalTabsViewModel(
     // ── 接続後自動実行コマンド ────────────────────────────────────
     // 発火(arm)は[ConnectionCoordinator.connectPane]側に移した(新しい接続試行のたびに
     // 呼ぶ必要があり、connect_*呼び出しと不可分なため)。ここに残る送信(fire)は
-    // Connected遷移を監視する[observeConnectionTransitions]から呼ばれる別の関心事。
+    // 接続エッジ(Established)を受け取る[observeConnectionEdges]から呼ばれる別の関心事。
 
     /** Connected 立ち上がりで1回だけ呼ばれる。CAS でセッション単位の二重発火を防ぐ。
      *  常にこの[pane]自身のsessionへ直接送る(フォーカス中のペインへルーティングする[send]は
