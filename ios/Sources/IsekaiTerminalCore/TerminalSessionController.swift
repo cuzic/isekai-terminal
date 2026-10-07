@@ -818,17 +818,20 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // 判断して届ける。ここは届いたエッジに対応する既存の処理を呼ぶだけで、`onConnectionStateChanged`
     // から自前でエッジを検出したり重複排除したりしない(以前の`tmuxPrevConnected`ミラー状態は撤去、
     // `.claude/rules/rust-ssot.md`)。
+    // 振り分けはLogic層の`ConnectionEdgeRouter`(Step 13のgolden replayがLinuxでも検証する転送層)。
     public func onConnectionEdge(edge: ConnectionEdge, generation: UInt64) {
-        switch edge {
-        case .established:
-            // タスク#3(Android版タスク#60`TerminalTabsViewModel.observeConnectionEdges`と対称):
-            // 接続確立のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
-            // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
-            // primary paneだけに絞っているスコープ制限は自動的に満たされる。
-            maybeEnsureTmuxTabWindow()
-        case .lost:
-            break
-        }
+        ConnectionEdgeRouter.route(
+            edge: edge,
+            generation: generation,
+            onEstablished: { _, _ in
+                // タスク#3(Android版タスク#60`TerminalTabsViewModel.observeConnectionEdges`と対称):
+                // 接続確立のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
+                // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
+                // primary paneだけに絞っているスコープ制限は自動的に満たされる。
+                self.maybeEnsureTmuxTabWindow()
+            },
+            onLost: { _ in }
+        )
     }
 
     // MARK: - tmux session group / ウィンドウ紐付け(タスク#3、Android版タスク#60)
