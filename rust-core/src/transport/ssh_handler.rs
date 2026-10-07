@@ -430,7 +430,10 @@ where
 {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
     let mut line = String::new();
-    let read = (&mut *reader).take(limit as u64 + 1).read_line(&mut line);
+    // `Take`を一時値のまま`read_line`すると、返るfutureがその一時値を借用したまま
+    // 文末でdropされE0716になる。束縛して`timeout`のawaitが終わるまで生かす。
+    let mut limited = (&mut *reader).take(limit as u64 + 1);
+    let read = limited.read_line(&mut line);
     let n = tokio::time::timeout(CTL_READ_TIMEOUT, read)
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "ctl line read timed out"))??;
