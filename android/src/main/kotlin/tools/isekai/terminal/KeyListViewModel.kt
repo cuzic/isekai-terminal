@@ -61,6 +61,8 @@ class KeyListViewModel(app: Application) : DeletableListViewModel<KeyEntry>(app)
                     )
                     RemoteLogger.i("IsekaiTerminalKey", "generated key saved id=$id '$label'")
                 }
+                // AND-L4: 暗号化保存後は平文PEMをゼロ化する(ベストエフォート)。
+                pemBytes.fill(0)
                 _generatedPubKey.value = pubKey
                 onSuccess()
                 loadKeys()

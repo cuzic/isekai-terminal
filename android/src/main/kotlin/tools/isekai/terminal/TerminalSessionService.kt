@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import tools.isekai.terminal.util.RemoteLogger
 
 /**
  * ターミナルセッションを保持する Foreground Service。
@@ -42,6 +43,12 @@ class TerminalSessionService : Service() {
      */
     fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         if (totalCount <= 0) {
+            // AND-M2: `stopSelf()`だけでは、Activity/ViewModel側がbind(BIND_AUTO_CREATE)
+            // している間サービスは破棄されず、フォアグラウンド状態と最後のラベルの常駐通知が
+            // プロセス終了まで残り続けていた。先にフォアグラウンドを解除して通知を消す
+            // (bind解除は[tools.isekai.terminal.session.AndroidAppExecutor]側が行う)。
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            isNotificationPosted = false
             stopSelf()
             return
         }
@@ -53,6 +60,13 @@ class TerminalSessionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // #204レビューM1: 最後のタブを閉じると同一プロセス内でもサービスが本当に破棄され、
+        // `onDestroy`が正常終了マーカーを書く。再生成時にここで"dirty"へ戻さないと、
+        // その後の同一プロセス内でのOEM killが次回起動時に「正常終了」と誤判定され
+        // 予期しないkillの検出(バッテリーガイダンス)を取りこぼす。前回プロセスの痕跡を
+        // 起動時の`consumeCleanShutdownMarker`より先に消さないよう、消費済みのときだけ書く
+        // ([markServiceRunning]参照)。
+        markServiceRunning(this)
         createNotificationChannel()
     }
 
@@ -78,7 +92,18 @@ class TerminalSessionService : Service() {
             return START_NOT_STICKY
         }
         val label = intent.getStringExtra(EXTRA_SESSION_LABEL) ?: "SSH セッション"
-        startForegroundWithNotification(label)
+        try {
+            startForegroundWithNotification(label)
+        } catch (e: IllegalStateException) {
+            // AND-L7: Android 12+でバックグラウンドから起動された場合の
+            // `ForegroundServiceStartNotAllowedException`(IllegalStateExceptionのサブクラス)等。
+            // 未捕捉だとアプリごとクラッシュするため、前面化を諦めて自分を停止する
+            // (セッション自体はプロセスが生きている限り継続する)。
+            RemoteLogger.w("IsekaiTerminalService", "startForeground failed, stopping service", e)
+            isNotificationPosted = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
@@ -170,6 +195,24 @@ class TerminalSessionService : Service() {
                 .commit()
         }
 
+        /** このプロセスで[consumeCleanShutdownMarker]が既に呼ばれたか。 */
+        @Volatile
+        private var markerConsumedInThisProcess = false
+
+        /**
+         * サービス稼働中("dirty")を同期的に記録する。[onCreate]から呼ぶ(#204レビューM1)。
+         * 起動時の消費([consumeCleanShutdownMarker]、ViewModelのIOコルーチン)より前に
+         * サービスが作られた場合は何もしない——その場合は前回プロセスの"clean"痕跡がまだ
+         * 判定前であり、消費時にどのみちfalseへ戻る。
+         */
+        fun markServiceRunning(context: Context) {
+            if (!markerConsumedInThisProcess) return
+            context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_KEY_CLEAN_SHUTDOWN, false)
+                .commit()
+        }
+
         /**
          * アプリ起動時に1回だけ呼ぶ。マーカーが存在すれば「前回プロセスは正常終了
          * だった」ことを意味するので`true`を返しつつ、直後にマーカーを消費(false相当
@@ -181,6 +224,7 @@ class TerminalSessionService : Service() {
             val prefs = context.getSharedPreferences(LIFECYCLE_PREFS_NAME, Context.MODE_PRIVATE)
             val wasClean = prefs.getBoolean(PREF_KEY_CLEAN_SHUTDOWN, false)
             prefs.edit().putBoolean(PREF_KEY_CLEAN_SHUTDOWN, false).commit()
+            markerConsumedInThisProcess = true
             return wasClean
         }
     }

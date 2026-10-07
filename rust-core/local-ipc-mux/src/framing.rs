@@ -42,6 +42,13 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> io
 /// can't force an unbounded allocation (the actual security property). A
 /// clean EOF at the frame boundary surfaces as
 /// [`io::ErrorKind::UnexpectedEof`] via `read_exact`.
+///
+/// **Not cancel-safe**: if this future is dropped mid-frame (e.g. it lost a
+/// `tokio::select!` race), the bytes already consumed are lost and the
+/// stream is left positioned inside a frame, so every later read is
+/// misframed. Callers that race reads against something else must keep one
+/// `read_frame` future alive across iterations (or read in a dedicated
+/// task) rather than re-creating it each time.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max_len: usize) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
@@ -60,7 +67,9 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max_len: usize) -> io::
 /// Owner-side relay loop: repeatedly [`accept`](ExclusiveChannel::accept)s the
 /// next client connection and spawns a task running `handler` on it, so many
 /// clients are served concurrently over the owner's lifetime. Returns only
-/// when `accept` itself fails (a genuine failure of the underlying channel);
+/// when `accept` itself fails (a genuine failure of the underlying channel —
+/// implementations absorb one client's own misbehavior, e.g. connecting and
+/// closing immediately, rather than surfacing it here);
 /// per-connection errors are the handler's concern, not this loop's.
 ///
 /// `handler` is cloned per connection and must produce a `Send` future, so it

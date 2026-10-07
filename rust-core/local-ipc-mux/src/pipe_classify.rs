@@ -26,6 +26,22 @@ pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
 /// yet created the next one.
 pub(crate) const ERROR_PIPE_BUSY: i32 = 231;
 
+/// Win32 error code: the pipe's other end was closed (a client that
+/// connected and immediately went away).
+pub(crate) const ERROR_BROKEN_PIPE: i32 = 109;
+
+/// Win32 error code from `ConnectNamedPipe`: a client connected *and closed*
+/// its end before the server's connect completed.
+pub(crate) const ERROR_NO_DATA: i32 = 232;
+
+/// Whether a server-side `connect` (accept) failure is caused by one
+/// misbehaving/short-lived client rather than the channel itself — the
+/// owner should discard that instance and keep accepting, not stop serving
+/// every other client.
+pub(crate) fn is_transient_accept_error(raw_os_error: Option<i32>) -> bool {
+    matches!(raw_os_error, Some(ERROR_NO_DATA) | Some(ERROR_BROKEN_PIPE))
+}
+
 /// How many times `connect` retries after an `ERROR_PIPE_BUSY` before giving
 /// up. Five attempts at [`CONNECT_RETRY_BACKOFF`] apart covers the sub-second
 /// window in which an owner is momentarily between accepting instances,
@@ -142,6 +158,15 @@ mod tests {
             classify_connect_error(None, io::ErrorKind::ConnectionRefused),
             ConnectDisposition::Fatal,
         );
+    }
+
+    #[test]
+    fn a_client_that_vanished_mid_accept_is_transient_everything_else_is_not() {
+        assert!(is_transient_accept_error(Some(ERROR_NO_DATA)));
+        assert!(is_transient_accept_error(Some(ERROR_BROKEN_PIPE)));
+        assert!(!is_transient_accept_error(Some(5)));
+        assert!(!is_transient_accept_error(Some(ERROR_PIPE_BUSY)));
+        assert!(!is_transient_accept_error(None));
     }
 
     #[test]

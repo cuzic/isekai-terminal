@@ -164,11 +164,17 @@ class PhysicalPathProvider(context: Context) {
             ?.filterIsInstance<Inet4Address>()
             ?.firstOrNull()
             ?: error("no IPv4 link address on network (IPv6-only network, unsupported yet)")
-        val socket = DatagramSocket(null)
-        network.bindSocket(socket)
-        socket.bind(InetSocketAddress(ipv4, 0))
-        val fd = ParcelFileDescriptor.fromDatagramSocket(socket).detachFd()
-        return fd to ipv4.hostAddress!!
+        // AND-M4: `ParcelFileDescriptor.fromDatagramSocket`は元fdの**dup**を返す仕様なので、
+        // detach済みのdup(所有権はRust側へ移る)とは別に、元の`socket`も必ず閉じる。
+        // 以前は成功時も`bindSocket`/`bind`失敗時(Tailscale稼働中のEPERMは想定内)も閉じて
+        // おらず、`RebindManager`のProbeCadence(約10秒周期)でGC/CloseGuard回収までfdが
+        // 溜まっていた。
+        return DatagramSocket(null).use { socket ->
+            network.bindSocket(socket)
+            socket.bind(InetSocketAddress(ipv4, 0))
+            val fd = ParcelFileDescriptor.fromDatagramSocket(socket).detachFd()
+            fd to ipv4.hostAddress!!
+        }
     }
 
     /** 保持していたネットワークリクエストをすべて解除する。接続終了時に必ず呼ぶこと。 */

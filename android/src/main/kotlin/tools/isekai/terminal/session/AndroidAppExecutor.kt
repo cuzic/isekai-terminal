@@ -55,7 +55,14 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     }
 
     override fun ensureServiceRunning() {
-        app.startService(Intent(app, TerminalSessionService::class.java))
+        try {
+            app.startService(Intent(app, TerminalSessionService::class.java))
+        } catch (e: IllegalStateException) {
+            // AND-L7: バックグラウンドからの`startService`はAndroid O+で
+            // IllegalStateException(バックグラウンド起動制限)になりうる。接続自体は
+            // 続行できるため、ログだけ残して握り潰す(bindは下で試みる)。
+            RemoteLogger.w("IsekaiTerminalVM", "startService failed (background start restricted?)", e)
+        }
         if (!isServiceBound) {
             isServiceBound = app.bindService(
                 Intent(app, TerminalSessionService::class.java),
@@ -75,6 +82,22 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
 
     override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
         terminalService?.updateSessionsSummary(connectedCount, totalCount)
+        // AND-M2: 最後のタブが閉じられたらbindも解除する。BIND_AUTO_CREATEでbindした
+        // ままだと、サービス側で`stopSelf()`してもbound serviceとして生き残り破棄されない。
+        // 次に[ensureServiceRunning]が呼ばれれば改めてbindし直す。
+        if (totalCount <= 0) {
+            // #204レビューL1: bindがまだ`onServiceConnected`に届く前に最後のタブが閉じられると
+            // 上の`updateSessionsSummary`は空振りし、`startService`済みのサービスが
+            // 前面+通知のまま残る。その場合は明示的に止める。
+            if (terminalService == null) {
+                try {
+                    app.stopService(Intent(app, TerminalSessionService::class.java))
+                } catch (e: Exception) {
+                    RemoteLogger.w("IsekaiTerminalVM", "stopService failed (ignored)", e)
+                }
+            }
+            release()
+        }
     }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
@@ -180,6 +203,9 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
             try { app.unbindService(serviceConnection) } catch (_: Exception) {}
             isServiceBound = false
         }
+        // 自発的なunbindでは`onServiceDisconnected`が呼ばれないため、ここで参照を捨てる
+        // (再bindされるまでの通知更新は無視される)。
+        terminalService = null
     }
 
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {

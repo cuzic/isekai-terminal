@@ -9,6 +9,7 @@ import androidx.core.content.FileProvider
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import java.io.ByteArrayOutputStream
+import tools.isekai.terminal.util.BitmapSampling
 import java.io.File
 
 /**
@@ -36,6 +37,10 @@ object RemoteClipboardImagePolicy {
      * 展開後サイズが巨大な画像(decompression bomb)を弾いてからデコードする。
      */
     private const val MAX_IMAGE_PIXELS = 40_000_000L
+
+    /** 実際にデコードする画素数の上限(ARGB_8888で約16MB)。これを超える画像は
+     *  `inSampleSize`で縮小してからデコードする(AND-L1)。 */
+    private const val MAX_DECODE_PIXELS = 4_000_000L
 
     private val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
 
@@ -87,10 +92,20 @@ object RemoteClipboardImagePolicy {
         resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) } ?: return null
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         if (bounds.outWidth.toLong() * bounds.outHeight.toLong() > MAX_IMAGE_PIXELS) return null
-        val bitmap = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } ?: return null
-        val encoded = ByteArrayOutputStream().use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-            out.toByteArray()
+        // AND-L1: 上限いっぱい(4000万画素、ARGBで約160MB)をフル解像度でデコードすると
+        // OOMが現実的なため、[MAX_DECODE_PIXELS]以下へ縮小してデコードする(どのみち
+        // ワイヤー上限[MAX_IMAGE_BYTES]のPNGに収まる必要がある)。
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = BitmapSampling.inSampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_DECODE_PIXELS)
+        }
+        val bitmap = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOptions) } ?: return null
+        val encoded = try {
+            ByteArrayOutputStream().use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                out.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
         }
         if (encoded.size > MAX_IMAGE_BYTES) return null
         return ClipboardPayload(ClipboardMimeKind.IMAGE_PNG, encoded)
