@@ -46,11 +46,15 @@ use crate::telemetry::CandidateIdentity;
 use crate::RelayTarget;
 
 /// Default stagger before the relay candidate joins the race, if the direct
-/// candidate hasn't already finished (succeeded or failed) by then. `250ms`
-/// mirrors RFC 8305 Happy Eyeballs v2's own default connection-attempt delay
-/// — a reasonable starting point, not a value validated against this
-/// project's own telemetry yet (`#13a`/`#13b`'s job).
-pub const DEFAULT_RELAY_DELAY: Duration = Duration::from_millis(250);
+/// candidate hasn't already finished (succeeded or failed) by then.
+///
+/// `750ms`, not RFC 8305's 250ms: the direct (STUN P2P) candidate spends at
+/// least `PUNCH_PROBE_COUNT * PUNCH_PROBE_INTERVAL` (~750ms, `stun_p2p.rs`)
+/// punching before its QUIC handshake even starts, so a 250ms stagger let
+/// the relay join (and usually win) before the direct path ever had a
+/// chance. Matches `isekai-pipe-core::DEFAULT_RELAY_DELAY_MS`, the value the
+/// production wrapper already uses.
+pub const DEFAULT_RELAY_DELAY: Duration = Duration::from_millis(750);
 
 /// Both candidates `race_direct_and_relay` needs. See module docs for the
 /// "same underlying helper" precondition this type cannot itself enforce.

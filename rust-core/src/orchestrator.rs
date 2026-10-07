@@ -458,6 +458,25 @@ pub(crate) struct OrchestratorShared {
     rt: tokio::runtime::Handle,
 }
 
+impl Drop for OrchestratorShared {
+    /// RC-34: タブ(orchestrator)が完全に破棄されたら、プロセス全体の
+    /// `TMUX_LOCATOR_REGISTRY`からこのタブのエントリを取り除く。レジストリのロックが
+    /// たまたま他で握られていても破棄処理自体を止めないよう`try_lock`し、取れなければ
+    /// 非同期に後始末する。
+    fn drop(&mut self) {
+        let registry = &crate::tmux_locator::TMUX_LOCATOR_REGISTRY;
+        match registry.try_lock() {
+            Some(mut reg) => reg.unregister(&self.app_pane_id),
+            None => {
+                let app_pane_id = self.app_pane_id.clone();
+                RUNTIME.spawn(async move {
+                    crate::tmux_locator::TMUX_LOCATOR_REGISTRY.lock().unregister(&app_pane_id);
+                });
+            }
+        }
+    }
+}
+
 // ── OrchestratorAdapter ───────────────────────────────────
 // Translates old SessionCallback events → structured OrchestratorCallback
 
@@ -556,9 +575,12 @@ impl SessionCallback for OrchestratorAdapter {
     }
 
     fn on_connected(&self) {
-        if !self.is_current() { return; }
         let (effects, retry_log) = {
             let mut s = self.shared.state.lock();
+            // RC-17: 世代チェックと状態更新を同じ臨界区間で行う(`is_current()`で一度ロックを外してから
+            // 取り直すと、その隙間に始まった新しい試行・中断(`AbortInFlightAttempt`)を古い世代の
+            // `on_connected`が`Connected`で上書きできた)。
+            if s.session_generation != self.generation { return; }
             let retry_log = s.reconnect.reconnect_loop_active;
             // `Connected{host}`/`Established{host}`のhostは、`apply_reconnect`がapplyと同じ臨界区間で
             // `current_target()`から解決する。
@@ -576,7 +598,7 @@ impl SessionCallback for OrchestratorAdapter {
     }
 
     fn on_disconnected(&self, reason: Option<String>) {
-        if !self.is_current() { return; }
+        // RC-17: 世代チェックは`handle_unexpected_disconnect`の中で、状態更新と同じ臨界区間で行う。
         handle_unexpected_disconnect(&self.shared, reason, Some(self.generation));
     }
 
@@ -609,6 +631,10 @@ impl SessionCallback for OrchestratorAdapter {
         if !self.is_current() { return; }
         let exceeded = {
             let mut s = self.shared.state.lock();
+            // RC-20: 現在の転送以外(キャンセル済み・切断で片付け済み等)のchunkは積まない。
+            if s.current_transfer_id.as_deref() != Some(transfer_id.as_str()) {
+                return;
+            }
             let would_be_len = s.download_buf.len().saturating_add(data.len());
             if would_be_len > MAX_DOWNLOAD_BUF_BYTES {
                 log::warn!(
@@ -646,6 +672,11 @@ impl SessionCallback for OrchestratorAdapter {
         if !self.is_current() { return; }
         let (data, is_download, success, message) = {
             let mut s = self.shared.state.lock();
+            // RC-20: 別の転送が既に始まっている場合、古い転送の完了通知でその状態を消してはいけない。
+            // `None`(`trzsz_cancel`が先に取り出した等)は従来どおり受け付けてUIへ`Done`を届ける。
+            if s.current_transfer_id.as_deref().is_some_and(|current| current != transfer_id) {
+                return;
+            }
             s.current_transfer_id = None;
             let size_limit_hit = s.size_limit_exceeded_for.take().as_deref() == Some(transfer_id.as_str());
             let data = std::mem::take(&mut s.download_buf);
@@ -741,13 +772,81 @@ impl SessionCallback for OrchestratorAdapter {
 /// 対象外になっていた)と同じ見落としを繰り返さないよう、`OrchestratorAdapter::
 /// on_disconnected`と同じ`handle_unexpected_disconnect`を経由させる —
 /// 個別に「phase=Idle + Disconnected通知」を書かない。
+///
+/// 本番の呼び出し元(`notify_network_path_changed`)は判断時点のスナップショットを渡す
+/// [`apply_network_lost_if_unchanged`]を使う(RC-28)。こちらは「今の状態のまま実行する」テスト用の入口。
+#[cfg(test)]
 fn apply_network_lost(shared: &Arc<OrchestratorShared>) {
-    if let Some(s) = shared.session.lock().as_ref() {
+    let expected = {
+        let s = shared.state.lock();
+        (s.reconnect.phase(), s.session_generation)
+    };
+    apply_network_lost_if_unchanged(shared, expected);
+}
+
+/// `apply_network_lost`(テスト用)の、判断時点のスナップショット`expected`(`phase`・`session_generation`)を
+/// 受け取る版。RC-28: `notify_network_path_changed`は判断に使ったphaseを読んでからロックを外すので、
+/// その隙間に`on_connected`(QUICなら切断してはいけない)や新しい`begin_connect`が割り込むと、無関係な
+/// 新しい状態のセッションを切断しうる。実行直前にロック内で「判断時点の状態のままか」を確かめ、
+/// 違えば何もしない。切断の遷移自体も`expected`の世代で行う(`handle_unexpected_disconnect`がロック内で
+/// 再確認する。アダプタを経由しない切断も、ADR round 3 R3-1の同じ遷移を通す)。
+fn apply_network_lost_if_unchanged(shared: &Arc<OrchestratorShared>, expected: (ConnPhase, u64)) {
+    let (expected_phase, expected_generation) = expected;
+    {
+        let s = shared.state.lock();
+        if s.reconnect.phase() != expected_phase || s.session_generation != expected_generation {
+            log::info!("orchestrator: network-lost decision is stale (state changed meanwhile), ignoring");
+            return;
+        }
+    }
+    disconnect_current_session(shared);
+    handle_unexpected_disconnect(shared, Some(NETWORK_LOST_REASON.to_string()), Some(expected_generation));
+}
+
+/// `shared.session`が保持する現在のセッションを切断する(`session`のロックは切断呼び出しの前に外す)。
+fn disconnect_current_session(shared: &Arc<OrchestratorShared>) {
+    let session = shared.session.lock().clone();
+    if let Some(s) = session {
         s.disconnect();
     }
-    // アダプタを経由しないので、現行の`session_generation`を付けて同じ遷移を通す
-    // (ADR round 3 R3-1、`generation: None`=現行)。
-    handle_unexpected_disconnect(shared, Some(NETWORK_LOST_REASON.to_string()), None);
+}
+
+/// RC-19: 解決待ちのファイルプレビュー要求をすべてエラーで解決する。切断・別セッションへの差し替えで、
+/// 要求を出したセッションの結果はもう届かない(届いても世代不一致で捨てられる)ため、Kotlin側を永遠に
+/// 待たせないようここで明示的に応答する。
+fn fail_pending_file_previews(shared: &Arc<OrchestratorShared>, message: &str) {
+    let pending: Vec<String> = shared.state.lock().pending_file_previews.drain().map(|(id, _)| id).collect();
+    for request_id in pending {
+        shared.callback.on_file_preview_result(request_id, FilePreviewOutcome::Error { message: message.to_string() });
+    }
+}
+
+/// RC-20: 進行中のtrzsz転送の状態(最大`MAX_DOWNLOAD_BUF_BYTES`の`download_buf`・`current_transfer_id`等)を
+/// 捨て、転送中だったならUIへ失敗の`Done`を通知する。転送元のセッションが失われた以上、その転送の
+/// `on_trzsz_finished`はもう届かない(届いても世代不一致で捨てられる)。
+fn abort_trzsz_transfer_state(shared: &Arc<OrchestratorShared>, message: &str) {
+    let aborted = {
+        let mut s = shared.state.lock();
+        let aborted = s.current_transfer_id.take();
+        s.trzsz_mode = None;
+        s.download_buf = Vec::new();
+        s.size_limit_exceeded_for = None;
+        aborted
+    };
+    if let Some(transfer_id) = aborted {
+        shared.callback.on_trzsz_state_changed(TrzszPublicState::Done {
+            transfer_id,
+            success: false,
+            message: Some(message.to_string()),
+        });
+    }
+}
+
+/// セッションが失われた・差し替えられたときに、そのセッションに紐づいていた保留中の要求・転送状態を
+/// 片付ける(RC-19/RC-20)。
+fn cleanup_after_session_lost(shared: &Arc<OrchestratorShared>) {
+    fail_pending_file_previews(shared, "connection lost before the file preview completed");
+    abort_trzsz_transfer_state(shared, "接続が切断されたため転送を中断しました");
 }
 
 /// 予期しない切断(`OrchestratorAdapter::on_disconnected`・`apply_network_lost`の
@@ -767,7 +866,13 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
     let mut ctx = EffectContext { reason, ..EffectContext::default() };
     let (effects, retry_log) = {
         let mut s = shared.state.lock();
-        let generation = generation.unwrap_or(s.session_generation);
+        // RC-17: アダプタ経由(`Some`)なら、世代チェックを状態更新と同じ臨界区間で行う(古い世代の遅延した
+        // 切断通知が、その間に始まった新しい接続試行のphaseを`Idle`へ巻き戻さないようにする)。
+        let generation = match generation {
+            Some(g) if g != s.session_generation => return,
+            Some(g) => g,
+            None => s.session_generation,
+        };
         // #19のLocal Networkヒント判定材料。秘密を含む`last_connect_attempt`はreducerへ渡さず、
         // shellが事前計算した真偽値だけを載せる(ADR §3-3)。
         let targets_local_network = classify_disconnect_issue_hint(s.last_connect_attempt.as_ref()).is_some();
@@ -803,6 +908,10 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
     // `apply_network_lost`自身がこの関数を呼ぶ経路では、debounceクロージャの
     // `is_current(epoch)`判定は既にこの呼び出しより前に完了しているため、
     // ここでの無効化は次回以降の保留debounceにのみ作用し自己無効化にはならない。
+    //
+    // RC-19/RC-20: 切断したセッションに紐づいていた保留中の要求・転送状態を、`Disconnected`の公開より前に
+    // 片付ける。
+    cleanup_after_session_lost(shared);
     execute_reconnect_effects(shared, effects, ctx);
 }
 
@@ -923,7 +1032,16 @@ fn stage_publications(s: &mut OrchestratorState, effects: &[ReconnectEffect], ct
             | ReconnectEffect::PendingWakeRecorded { .. }
             | ReconnectEffect::ArmLoopTimer { .. }
             | ReconnectEffect::LoopWokeEarly { .. }
-            | ReconnectEffect::LoopTicked { .. } => continue,
+            | ReconnectEffect::LoopTicked { .. }
+            | ReconnectEffect::DisconnectSession => continue,
+            // RC-03/RC-04: 中断する試行のセッションの遅延コールバックを、applyと同じ臨界区間で無効化する
+            // (ロック解放後に進めると、その隙間に届いた試行の`on_connected`が`Connected`へ戻しうる)。
+            // `session_generation`はreducerの集約に含めない(reconnect_fsm.rsのモジュールdoc)ので、
+            // このin-lock interpreterが進める。切断・片付けは[`execute_reconnect_effects`]が行う。
+            ReconnectEffect::AbortInFlightAttempt => {
+                s.session_generation += 1;
+                continue;
+            }
         };
         s.publications.queue.push_back(publication);
     }
@@ -1068,6 +1186,15 @@ fn execute_reconnect_effects(
                         "spawn_reconnect_loop tick epoch={epoch} tick_count={tick_count} elapsed_secs={elapsed_secs}"
                     ));
                 }
+            }
+            ReconnectEffect::AbortInFlightAttempt => {
+                // 世代は[`stage_publications`]がapplyと同じ臨界区間で既に進めている(遅延コールバックは無視される)。
+                crate::debug_reconnect::record("abort_in_flight_attempt");
+                disconnect_current_session(shared);
+                cleanup_after_session_lost(shared);
+            }
+            ReconnectEffect::DisconnectSession => {
+                disconnect_current_session(shared);
             }
         }
     }
@@ -1215,7 +1342,16 @@ fn build_and_store_session(
             ActiveSession::IsekaiLinkRelay(session)
         }
     };
-    *shared.session.lock() = Some(session);
+    // RC-13: 以前は直前のセッションを`disconnect()`せずにdropしていたため、`Connected`中の手動接続・
+    // フォアグラウンド復帰の再接続で差し替えられた生きた旧接続が(世代不一致でcallbackはすべて無視された
+    // まま)フォワード・tmux attachごと残り続けた。旧セッションの遅延callbackは`OrchestratorAdapter::new`の
+    // 世代更新で既に無効化済みなので、ここで切断しても状態を巻き戻さない。
+    let previous = shared.session.lock().replace(session);
+    if let Some(previous) = previous {
+        previous.disconnect();
+        // 旧セッション宛ての保留中の要求・転送はもう解決されない(RC-19/RC-20)。
+        cleanup_after_session_lost(shared);
+    }
     Ok(())
 }
 
@@ -1379,7 +1515,26 @@ impl SessionOrchestrator {
     /// なる(生成手順そのものは自動再接続経路[`connect_via`]と共有する)。
     fn start_manual_connect(&self, attempt: LastConnectAttempt) -> Result<(), SshError> {
         let adapter = self.begin_connect(attempt.clone())?;
-        build_and_store_session(&self.shared, attempt, adapter)
+        let generation = adapter.generation;
+        let result = build_and_store_session(&self.shared, attempt, adapter);
+        if result.is_err() {
+            self.reset_phase_after_sync_connect_error(generation);
+        }
+        result
+    }
+
+    /// RC-29: transportの`connect()`が同期的に`Err`を返した場合、phaseが`Connecting`のまま固着して以後の
+    /// 手動接続を`begin_connect`の二重start防止が永久に拒否しないよう、この試行がまだ現行の世代なら
+    /// [`ReconnectEvent::ManualConnectFailedSync`]で`Idle`へ戻す(公開はしない: 呼び出し元は`Err`を受け取る)。
+    fn reset_phase_after_sync_connect_error(&self, generation: u64) {
+        let effects = {
+            let mut s = self.shared.state.lock();
+            if s.session_generation != generation {
+                return;
+            }
+            apply_reconnect(&mut s, ReconnectEvent::ManualConnectFailedSync, &EffectContext::default())
+        };
+        execute_reconnect_effects(&self.shared, effects, EffectContext::default());
     }
 
     /// Android実機スパイク用: `debug_set_reconnect_policy`/`debug_clear_reconnect_policy`
@@ -1441,12 +1596,15 @@ impl SessionOrchestrator {
     }
 
     pub fn disconnect(&self) {
-        // 「これから来る`on_disconnected`はユーザー操作起因」の印を先に立てておく
-        // (実際の切断はこの後`s.disconnect()`が非同期にコールバックを発火させる)。
-        self.shared.state.lock().reconnect.user_initiated_disconnect = true;
-        if let Some(s) = self.shared.session.lock().as_ref() {
-            s.disconnect();
-        }
+        // 判断は`ReconnectEvent::UserDisconnect`のapply(RC-03)。ループ非動作中は「これから来る
+        // `on_disconnected`はユーザー操作起因」の印を立ててから現在のセッションを切断する(`DisconnectSession`)。
+        // 自動再接続ループの動作中は、以前は印を立てて現在の(試行の)セッションを切るだけでループ自体は
+        // 止まらず、timeoutまで再接続を試み続け、成功すると閉じたタブへ`Connected`を通知していた
+        // (Kotlinは`close()`で`disconnect()`しか呼ばない)。いまはループを止め、進行中の試行を中断して
+        // (`AbortInFlightAttempt`)、Rust側から`Disconnected`を公開する(`rust-ssot.md`)。
+        let ctx = EffectContext { reason: Some("disconnected by user".to_string()), ..EffectContext::default() };
+        let effects = apply_reconnect(&mut self.shared.state.lock(), ReconnectEvent::UserDisconnect, &ctx);
+        execute_reconnect_effects(&self.shared, effects, ctx);
     }
 
     /// 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
@@ -1704,7 +1862,8 @@ impl SessionOrchestrator {
     pub fn trzsz_accept_upload(&self, file_name: String, file_size: u64, mode: u32) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
-            if let Some(s) = self.shared.session.lock().as_ref() {
+            let session = self.shared.session.lock().clone();
+            if let Some(s) = session {
                 s.trzsz_accept_upload(tid, file_name, file_size, mode);
             }
         }
@@ -1713,7 +1872,11 @@ impl SessionOrchestrator {
     pub fn trzsz_send_chunk(&self, data: Vec<u8>, is_last: bool) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
-            if let Some(s) = self.shared.session.lock().as_ref() {
+            // RC-06: `trzsz_send_chunk`はキューが空くまで呼び出し元(Kotlinの
+            // IOスレッド)を待たせる。`session`ロックを握ったまま待つと他の
+            // orchestrator操作(send/disconnect等)まで塞ぐので、cloneしてから呼ぶ。
+            let session = self.shared.session.lock().clone();
+            if let Some(s) = session {
                 s.trzsz_send_chunk(tid, data, is_last);
             }
         }
@@ -1752,9 +1915,9 @@ impl SessionOrchestrator {
     /// [`crate::net_health_policy`]のdebounceの対象になる — OS通知の瞬断で
     /// 即切断されていた実バグの唯一の発生源だったため。
     pub fn notify_network_path_changed(&self, is_satisfied: bool) {
-        let (phase, is_quic) = {
+        let (phase, is_quic, generation) = {
             let s = self.shared.state.lock();
-            (s.reconnect.phase(), s.is_quic())
+            (s.reconnect.phase(), s.is_quic(), s.session_generation)
         };
         match phase {
             ConnPhase::Idle => {
@@ -1773,7 +1936,7 @@ impl SessionOrchestrator {
             ConnPhase::Connecting => {
                 if !is_satisfied {
                     log::warn!("orchestrator: network lost during handshake — aborting");
-                    apply_network_lost(&self.shared);
+                    apply_network_lost_if_unchanged(&self.shared, (ConnPhase::Connecting, generation));
                 }
             }
             ConnPhase::Connected if is_quic => {
@@ -1797,7 +1960,7 @@ impl SessionOrchestrator {
                                 log::warn!(
                                     "orchestrator: network still lost after debounce — disconnecting TCP session"
                                 );
-                                apply_network_lost(&shared);
+                                apply_network_lost_if_unchanged(&shared, (ConnPhase::Connected, generation));
                             }
                         });
                     }
@@ -1972,17 +2135,18 @@ impl SessionOrchestrator {
         // 引き継いで登録した上で、ロケータが分かった今すぐ改めてtmuxへ
         // 書き込み直す(bの場合は直接pushで既に成功済みのはずだが、再送は
         // 無害なのでどちらの由来でも同じ経路で扱う)。
+        // RC-31(2026-09-29 コードレビュー): 取り出し→登録→フック設定を1回のロック区間で
+        // 行う。以前は3回別々にロックしており、取り出しと登録の間に割り込んだ
+        // `push_ctl_socket_to_tmux`が書いた新しいパスを、取り出し済みの古い値で
+        // 上書きし得た。
         let recovered_ctl_socket_path = {
             let mut reg = registry.lock();
-            reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
-                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string))
+            let recovered = reg.take_pending_ctl_socket_path(&self.shared.app_pane_id)
+                .or_else(|| reg.ctl_socket_path_for(&self.shared.app_pane_id).map(str::to_string));
+            reg.register(self.shared.app_pane_id.clone(), outcome.locator.clone(), recovered.clone());
+            reg.set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
+            recovered
         };
-        registry.lock().register(
-            self.shared.app_pane_id.clone(),
-            outcome.locator.clone(),
-            recovered_ctl_socket_path.clone(),
-        );
-        registry.lock().set_notify_hooks_enabled(&self.shared.app_pane_id, enable_notifications);
         // tmux hook通知(タスク#57: bell/activity/silence/pane-died)の
         // `install_notify_hooks`(`ssh_handler.rs`側でも同じくctl-socket forward
         // 確立直後にspawnされ、ロケータ未登録なら黙ってno-opになる)も、ロケータが
@@ -2752,6 +2916,7 @@ mod tests {
     #[test]
     fn on_trzsz_download_chunk_accumulates_bytes_across_calls() {
         let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2], false);
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![3, 4], true);
         assert_eq!(shared.state.lock().download_buf, vec![1, 2, 3, 4]);
@@ -2780,6 +2945,7 @@ mod tests {
     #[test]
     fn on_trzsz_download_chunk_stays_under_cap_does_not_mark_size_limit() {
         let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2, 3], false);
         let s = shared.state.lock();
         assert_eq!(s.download_buf, vec![1, 2, 3]);
@@ -2830,6 +2996,7 @@ mod tests {
     fn on_trzsz_finished_download_success_emits_download_complete_with_accumulated_bytes() {
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
         shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
         adapter.on_trzsz_finished("t1".to_string(), true, None);
         let downloads = cb.downloads.lock().unwrap();
@@ -2844,6 +3011,7 @@ mod tests {
     fn on_trzsz_finished_failure_does_not_emit_download_complete() {
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
         shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
         adapter.on_trzsz_finished("t1".to_string(), false, Some("connection lost".to_string()));
         assert!(cb.downloads.lock().unwrap().is_empty());
@@ -3467,6 +3635,190 @@ mod tests {
             rt,
         });
         (SessionOrchestrator { shared }, callback, adapters)
+    }
+
+    // ── 2026-09-29 コードレビュー RC-03/RC-04/RC-17/RC-19/RC-20/RC-28/RC-29(PR #131再分割) ──
+
+    /// tick 10ms・試行間隔20ms。`timeout`だけテストごとに変える。
+    fn in_flight_test_policy(timeout: Duration) -> ReconnectPolicy {
+        ReconnectPolicy { tick: Duration::from_millis(10), retry_interval: Duration::from_millis(20), timeout }
+    }
+
+    /// 接続→予期しない切断で自動再接続ループを起動し、最初の試行(本番と同じ`begin_reconnect_session`経路)が
+    /// 結果を返さないまま進行中(phase `Connecting`)の状態を作る。戻り値の3つ目は試行のアダプタ。
+    async fn loop_with_in_flight_attempt(
+        timeout: Duration,
+    ) -> (SessionOrchestrator, Arc<RecordingCallback>, OrchestratorAdapter, Arc<StdMutex<Vec<OrchestratorAdapter>>>) {
+        let (orch, cb, adapters) = edge_test_orchestrator(tokio::runtime::Handle::current(), in_flight_test_policy(timeout));
+        let first = connect_and_establish(&orch, "example.com");
+        first.on_disconnected(Some("peer closed".to_string()));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let attempt = adapters.lock().unwrap().pop().expect("試行間隔の経過後に再接続を試みるはず");
+        {
+            let s = orch.shared.state.lock();
+            assert!(s.reconnect.reconnect_loop_active && s.reconnect.retry_attempt_in_flight);
+            assert!(s.reconnect.phase == ConnPhase::Connecting);
+        }
+        (orch, cb, attempt, adapters)
+    }
+
+    fn disconnected_count(cb: &RecordingCallback) -> usize {
+        cb.connection_states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, ConnectionPublicState::Disconnected { .. }))
+            .count()
+    }
+
+    fn last_state_is_disconnected(cb: &RecordingCallback) -> bool {
+        matches!(cb.connection_states.lock().unwrap().last(), Some(ConnectionPublicState::Disconnected { .. }))
+    }
+
+    /// RC-03: 自動再接続ループの動作中に`disconnect()`(タブclose)されたら、Rustがループを止めて
+    /// `Disconnected`を公開する。進行中だった試行が後から成功しても、閉じたタブを`Connected`へ戻さない。
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_during_reconnect_loop_stops_the_loop_and_ignores_a_late_attempt_success() {
+        let (orch, cb, attempt, adapters) = loop_with_in_flight_attempt(Duration::from_secs(60)).await;
+
+        orch.disconnect();
+        {
+            let s = orch.shared.state.lock();
+            assert!(!s.reconnect.reconnect_loop_active, "disconnect()はループを止めるはず(RC-03)");
+            assert!(s.reconnect.phase == ConnPhase::Idle);
+        }
+        assert!(last_state_is_disconnected(&cb));
+
+        attempt.on_connected();
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Idle, "disconnect()後の試行の成功は無視されるはず");
+        assert!(last_state_is_disconnected(&cb), "disconnect()後に状態が戻った: {:?}", cb.connection_states.lock().unwrap());
+
+        // ループはもう試行しない(旧実装はtimeoutまで再接続を試み続けた)。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(adapters.lock().unwrap().is_empty(), "disconnect()後にループが新しい試行を始めた");
+        assert!(last_state_is_disconnected(&cb));
+        assert_eq!(disconnected_count(&cb), 1);
+    }
+
+    /// RC-03: ループ非動作中の`disconnect()`は従来どおり、ユーザー操作起因の印を立ててセッションを切るだけで、
+    /// 状態の公開はそのセッションの切断通知(`on_disconnected`)で起きる。
+    #[test]
+    fn disconnect_while_connected_marks_the_following_disconnect_as_user_initiated() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, true);
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+        orch.disconnect();
+        assert!(orch.shared.state.lock().reconnect.user_initiated_disconnect);
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        adapter.on_disconnected(Some("closed by user".to_string()));
+        assert!(!orch.shared.state.lock().reconnect.reconnect_loop_active, "ユーザー切断では自動再接続しない");
+        assert_eq!(disconnected_count(&cb), 1);
+    }
+
+    /// RC-04: `cancel_reconnect()`は進行中だった試行も無効化する。後から試行が成功・失敗しても、
+    /// `Disconnected`の後に`Connected`へ戻ったり、`Disconnected`が二重に届いたりしない。
+    #[tokio::test(start_paused = true)]
+    async fn cancel_reconnect_invalidates_the_in_flight_attempt() {
+        let (orch, cb, attempt, _adapters) = loop_with_in_flight_attempt(Duration::from_secs(60)).await;
+
+        orch.cancel_reconnect();
+        attempt.on_connected();
+        attempt.on_disconnected(Some("attempt failed".to_string()));
+
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Idle);
+        assert_eq!(disconnected_count(&cb), 1, "cancel後の試行の結果は無視されるはず(RC-04): {:?}", cb.connection_states.lock().unwrap());
+        assert!(last_state_is_disconnected(&cb));
+    }
+
+    /// RC-04: タイムアウトでのギブアップも進行中の試行を無効化する。
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_timeout_invalidates_the_in_flight_attempt() {
+        let (orch, cb, attempt, _adapters) = loop_with_in_flight_attempt(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!orch.shared.state.lock().reconnect.reconnect_loop_active, "タイムアウトでループは止まっているはず");
+
+        attempt.on_connected();
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Idle, "ギブアップ後の試行の成功は無視されるはず(RC-04)");
+        assert!(matches!(
+            cb.connection_states.lock().unwrap().last(),
+            Some(ConnectionPublicState::Disconnected { reason: Some(r), .. }) if r.contains("timed out")
+        ));
+    }
+
+    /// RC-17: 古い世代の遅延した切断通知は、その間に始まった新しい接続試行のphaseを巻き戻さない。
+    #[test]
+    fn stale_disconnect_does_not_rewind_a_newer_connect_attempt() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        let old = OrchestratorAdapter::new(orch.shared.clone());
+        let _new = orch.begin_connect(ssh_attempt("other.example.com")).expect("begin_connect");
+        old.on_disconnected(Some("old session died".to_string()));
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Connecting, "古い世代の切断でphaseを巻き戻さない(RC-17)");
+    }
+
+    /// RC-19/RC-20: 切断で、保留中のファイルプレビュー要求はエラーで解決され、進行中のtrzsz転送は
+    /// 失敗の`Done`で終わる(Kotlinを永遠に待たせない・最大2GiBのバッファを持ち続けない)。
+    #[test]
+    fn disconnect_resolves_pending_file_previews_and_aborts_trzsz_transfer() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.pending_file_previews.insert("req-1".to_string(), FilePreviewRequestKind::Ls { path: "/tmp".to_string() });
+            s.current_transfer_id = Some("t1".to_string());
+            s.trzsz_mode = Some("download".to_string());
+            s.download_buf = vec![1, 2, 3];
+        }
+
+        adapter.on_disconnected(Some("peer closed".to_string()));
+
+        assert!(shared.state.lock().pending_file_previews.is_empty(), "RC-19");
+        assert!(matches!(cb.file_preview_outcomes.lock().unwrap().as_slice(), [FilePreviewOutcome::Error { .. }]));
+        {
+            let s = shared.state.lock();
+            assert!(s.current_transfer_id.is_none(), "RC-20");
+            assert!(s.download_buf.is_empty(), "RC-20");
+        }
+        assert!(matches!(cb.trzsz_states.lock().unwrap().last(), Some(TrzszPublicState::Done { success: false, .. })));
+    }
+
+    /// RC-20: 現在の転送以外のchunk・完了通知は、現在の転送の状態に触れない。
+    #[test]
+    fn download_chunk_for_a_different_transfer_is_ignored() {
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t2".to_string());
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2, 3], false);
+        assert!(shared.state.lock().download_buf.is_empty());
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+        assert_eq!(shared.state.lock().current_transfer_id.as_deref(), Some("t2"), "古い転送の完了で現在の転送を消さない");
+    }
+
+    /// RC-28: network-lostの判断の後、実行前に状態が変わっていたら(ここでは接続が成立した)何もしない。
+    #[test]
+    fn stale_network_lost_decision_is_ignored() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        let stale_generation = orch.shared.state.lock().session_generation;
+        orch.shared.state.lock().reconnect.force_phase_for_test(ConnPhase::Connected);
+        apply_network_lost_if_unchanged(&orch.shared, (ConnPhase::Connecting, stale_generation));
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Connected);
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+    }
+
+    /// RC-29: 手動接続の同期失敗はphaseを`Idle`へ戻すので、次の手動接続が拒否され続けない。
+    #[test]
+    fn sync_connect_error_resets_phase_to_idle() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        let adapter = orch.begin_connect(ssh_attempt("example.com")).expect("begin_connect");
+        orch.reset_phase_after_sync_connect_error(adapter.generation);
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Idle, "RC-29");
+        assert!(orch.begin_connect(ssh_attempt("example.com")).is_ok(), "Connectingに固着していないこと");
+    }
+
+    /// RC-29: 既に次の試行が始まっている(世代が進んだ)なら、古い試行の同期失敗でphaseを戻さない。
+    #[test]
+    fn stale_sync_connect_error_does_not_reset_a_newer_attempt() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        let old = orch.begin_connect(ssh_attempt("example.com")).expect("begin_connect");
+        let _newer = OrchestratorAdapter::new(orch.shared.clone());
+        orch.reset_phase_after_sync_connect_error(old.generation);
+        assert!(orch.shared.state.lock().reconnect.phase == ConnPhase::Connecting);
     }
 
     /// PR #167レビューL-1: `on_connection_state_changed`/`on_connection_edge`の配信順は、reducerが遷移を

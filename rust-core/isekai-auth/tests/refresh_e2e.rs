@@ -172,3 +172,50 @@ fn file_token_provider_auto_refreshes_an_expired_token_via_the_mock_token_endpoi
     let jwt_again = provider.get_relay_jwt().unwrap();
     assert_eq!(jwt_again, "refreshed-access-token");
 }
+
+/// Several processes/tabs noticing the same expired token at once must
+/// result in exactly *one* refresh-token grant: an IdP with refresh-token
+/// reuse detection would otherwise revoke the whole token family (the second
+/// request reuses a refresh token the first one already rotated away).
+#[test]
+fn concurrent_auto_refreshes_post_the_refresh_token_only_once() {
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = posts.clone();
+    let base_url = spawn_mock_oauth_server(move |_path, _body| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Slow enough that, without the lock, the other threads would also
+        // have read the expired token and posted by the time this returns.
+        thread::sleep(std::time::Duration::from_millis(300));
+        (200, r#"{"access_token":"refreshed-once","refresh_token":"rotated","expires_in":3600}"#.to_string())
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("token.json");
+    let expired = TokenSet {
+        access_token: "stale".to_string(),
+        refresh_token: Some("old-refresh-token".to_string()),
+        expires_at: Some(0),
+        token_endpoint: Some(format!("{base_url}/token")),
+        client_id: None,
+    };
+    isekai_auth::save_token_set(&path, &expired).unwrap();
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let path = path.clone();
+            thread::spawn(move || FileTokenProvider::new(path).get_relay_jwt().unwrap())
+        })
+        .collect();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), "refreshed-once");
+    }
+    assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one refresh grant may be sent");
+}
+
+/// A plain-http token endpoint on a non-loopback host is refused before any
+/// request is made (the refresh token would otherwise go out in clear text).
+#[test]
+fn a_non_loopback_http_token_endpoint_is_refused() {
+    let err = refresh_access_token("http://auth.example.invalid/token", None, "rt").unwrap_err();
+    assert!(err.to_string().contains("https"), "unexpected error: {err}");
+}

@@ -146,7 +146,9 @@ pub async fn connect_multipath_with_socket(
     let primary_label: PathLabel = PRIMARY_PATH_LABEL.into();
     tracker.register_path(noq::PathId::ZERO, primary_label.clone());
     tracker.set(primary_label.clone(), path_health::PathState::Validated);
-    path_health::spawn_health_monitor(conn.clone(), noq::PathId::ZERO, primary_label, tracker.clone(), event_tx.clone());
+    if tracker.claim_monitor(noq::PathId::ZERO) {
+        path_health::spawn_health_monitor(conn.clone(), noq::PathId::ZERO, primary_label, tracker.clone(), event_tx.clone());
+    }
 
     spawn_path_event_listener(conn.clone(), tracker.clone(), event_tx.clone());
 
@@ -189,7 +191,9 @@ fn spawn_path_event_listener(
             match ev {
                 Ok(noq::PathEvent::Established { id, .. }) => {
                     if let Some(label) = set_path_state(&tracker, id, path_health::PathState::Validated) {
-                        path_health::spawn_health_monitor(conn.clone(), id, label, tracker.clone(), event_tx.clone());
+                        if tracker.claim_monitor(id) {
+                            path_health::spawn_health_monitor(conn.clone(), id, label, tracker.clone(), event_tx.clone());
+                        }
                     }
                 }
                 Ok(noq::PathEvent::Abandoned { id, reason, .. }) => {
@@ -229,7 +233,12 @@ async fn open_path_with_retry(
                 info!("isekai-transport::multipath: path {label:?} established: id={:?}", path.id());
                 tracker.register_path(path.id(), label.clone());
                 tracker.set(label.clone(), path_health::PathState::Validated);
-                path_health::spawn_health_monitor(conn.clone(), path.id(), label, tracker.clone(), event_tx.clone());
+                // The `PathEvent::Established` listener may already have
+                // seen this path (and spawned its monitor) — only one of the
+                // two may.
+                if tracker.claim_monitor(path.id()) {
+                    path_health::spawn_health_monitor(conn.clone(), path.id(), label, tracker.clone(), event_tx.clone());
+                }
                 return;
             }
             Ok(Err(e)) => warn!("isekai-transport::multipath: path {label:?} open_path failed (attempt {attempt}): {e}"),
