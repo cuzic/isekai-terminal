@@ -1281,13 +1281,30 @@ async fn handle_attach_stream(
                     log::info!("control stream established, session_id={}", hex_lower(&session_id_bytes));
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
-                Ok(Err(e)) => log::info!("no resume support for this connection ({e:#})"),
-                Err(_) => log::info!("control stream not opened within timeout, continuing without resume support"),
+                Ok(Err(e)) => {
+                    log::info!("no resume support for this connection ({e:#})");
+                    handle.lock().await.app_ack_unavailable = true;
+                }
+                Err(_) => {
+                    log::info!("control stream not opened within timeout, continuing without resume support");
+                    handle.lock().await.app_ack_unavailable = true;
+                }
             }
         })
     };
 
-    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), preempt, target).await;
+    let outcome = relay_buffered(
+        &mut send,
+        &mut recv,
+        tcp_read,
+        tcp_write,
+        handle.clone(),
+        preempt,
+        target,
+        &attach_runtime,
+        (session_id_bytes, lease.id()),
+    )
+    .await;
     control_task.abort();
 
     // `handle_resume_stream`の末尾と全く同じ後始末 — 以前はここに同じ
@@ -1494,8 +1511,14 @@ async fn handle_resume_stream(
                     log::info!("resume: control stream re-established for session_id={}", hex_lower(&session_id));
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
-                Ok(Err(e)) => log::info!("resume: control stream re-establish failed ({e:#})"),
-                Err(_) => log::info!("resume: control stream not re-opened within timeout"),
+                Ok(Err(e)) => {
+                    log::info!("resume: control stream re-establish failed ({e:#})");
+                    handle.lock().await.app_ack_unavailable = true;
+                }
+                Err(_) => {
+                    log::info!("resume: control stream not re-opened within timeout");
+                    handle.lock().await.app_ack_unavailable = true;
+                }
             }
         })
     };
@@ -1508,6 +1531,8 @@ async fn handle_resume_stream(
         handle.clone(),
         preempt,
         target,
+        &attach_runtime,
+        (session_id, lease.id()),
     )
     .await;
     control_task.abort();
@@ -1690,6 +1715,8 @@ fn spawn_app_ack_tasks(
     {
         let session = session.clone();
         tokio::spawn(async move {
+            // A (re-)established control stream brings APP_ACK back (PIPE-09).
+            session.lock().await.app_ack_unavailable = false;
             loop {
                 let mut frame = [0u8; 9];
                 match read_exact(&mut crecv, &mut frame).await {
@@ -1761,6 +1788,14 @@ enum RelayOutcome {
 /// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
 /// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
 ///
+/// **control stream が無い(`APP_ACK`が来ない)セッション**(review 2026-09-29, PIPE-09):
+/// replay を進める者がいないので、output buffer が満杯になった時点で S→C は
+/// `output_space_available` を待ったまま永久に止まっていた(以前のdocstringは「teeは誰も
+/// 参照しないだけで実害は無い」としていたが誤り)。`Session::app_ack_unavailable` が
+/// 立った状態で満杯になったら replay への tee をやめ、**最初の tee されないバイトを
+/// 送る前に** `AttachRuntime::resume_unavailable` でこの incarnation を unresumable に
+/// してもらう(穴のある replay で RESUME させない。後の park は `Discard{Unresumable}`)。
+///
 /// **C→S は target への書き込みが進んだ分だけ `helper_committed_offset` を
 /// 進める**(cancel-safe な `write` を1回ずつ、review 2026-09-29 PIPE-03)。
 /// プリエンプション(下記)で書き込みの途中から抜けても、client は committed
@@ -1781,6 +1816,7 @@ enum RelayOutcome {
 /// 待ったまま（sshd がしばらく何も出力しない等）永久にブロックし得る
 /// バグがあったため、単一の `tokio::select!` ループに書き直した。
 /// いずれかの方向が「これ以上続けられない」と判断した時点で即座に終了する。
+#[allow(clippy::too_many_arguments)]
 async fn relay_buffered(
     send: &mut AnyByteStreamWriteHalf,
     recv: &mut AnyByteStreamReadHalf,
@@ -1789,10 +1825,14 @@ async fn relay_buffered(
     session: Arc<Mutex<Session>>,
     preempt: Arc<Notify>,
     target: SocketAddr,
+    attach_runtime: &Arc<AttachRuntime>,
+    incarnation: (resume::SessionId, attach_arbiter::LeaseId),
 ) -> RelayOutcome {
     let mut c2s_buf = vec![0u8; 16 * 1024];
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
+    // replayへのteeをやめた(PIPE-09)。一度立てたら戻さない(replayには既に穴がある)。
+    let mut replay_disabled = false;
     let output_space_available = session.lock().await.output_space_available.clone();
     // A later RESUME for this same session_id wants this connection to yield
     // (`SessionIo::preempt`, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-2) — most
@@ -1806,13 +1846,28 @@ async fn relay_buffered(
     preempted.as_mut().enable();
 
     loop {
-        let s2c_read_len = {
+        let (s2c_read_len, give_up_replay) = {
             let session = session.lock().await;
-            session
-                .output_buffer
-                .remaining_capacity()
-                .min(s2c_buf.len())
+            if replay_disabled {
+                (s2c_buf.len(), false)
+            } else if session.app_ack_unavailable && session.output_buffer.is_full() {
+                (s2c_buf.len(), true)
+            } else {
+                (session.output_buffer.remaining_capacity().min(s2c_buf.len()), false)
+            }
         };
+        if give_up_replay {
+            // Session lockを放してから集約へ伝える(2つのロックはネストしない、resume.rs docs)。
+            // この中継タスク自身が以後のparkを出す唯一の者なので、ここで適用し終えてから
+            // teeしないバイトを送れば、穴のあるreplayでRESUMEされることは無い。
+            log::info!(
+                "relay to {target}: replay buffer full and no control stream to acknowledge it; \
+                 continuing without resume support for this session"
+            );
+            let (id, lease) = incarnation;
+            attach_runtime.resume_unavailable(id, lease).await;
+            replay_disabled = true;
+        }
         tokio::select! {
             // `AnyByteStreamReadHalf::read`は`tokio::io::AsyncRead`と同じ規約
             // (`Ok(0)` = EOF)であり、旧`noq::RecvStream::read`の`Ok(None)` = EOF
@@ -1876,6 +1931,21 @@ async fn relay_buffered(
                         log::info!("relay to {target}: tcp closed cleanly");
                         let _ = send.shutdown().await;
                         return RelayOutcome::TcpDied;
+                    }
+                    Ok(n) if replay_disabled => {
+                        // replayはもう使わない(PIPE-09): teeせずにそのまま送る。
+                        tokio::select! {
+                            r = send.write_all(&s2c_buf[..n]) => {
+                                if let Err(e) = r {
+                                    log::info!("relay to {target}: data stream (S->C) write failed: {e}");
+                                    return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                                }
+                            }
+                            _ = &mut preempted => {
+                                log::info!("relay to {target}: preempted (mid S->C write) by a later RESUME; parking for it");
+                                return RelayOutcome::Preempted { tcp_read, tcp_write };
+                            }
+                        }
                     }
                     Ok(n) => {
                         // replayバッファへappendしてから送信する(review 2026-09-29, PIPE-03)。

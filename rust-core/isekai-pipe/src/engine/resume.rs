@@ -47,6 +47,12 @@ pub struct Session {
     pub helper_committed_offset: u64,
     /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
     pub output_space_available: Arc<Notify>,
+    /// この接続の control stream が確立しなかった(またはその`APP_ACK`受信が途切れた)ので、
+    /// output buffer を進める`APP_ACK`が今は来ない(review 2026-09-29, PIPE-09)。relay loop は
+    /// これが立った状態で output buffer が満杯になると、S→Cを止めないためにreplayへのteeを
+    /// やめ、`ServeEvent::ResumeUnavailable`でincarnationをunresumableにしてもらう。
+    /// control stream が(RESUME後などに)確立し直せば下ろす。
+    pub app_ack_unavailable: bool,
 }
 
 impl Session {
@@ -55,6 +61,7 @@ impl Session {
             output_buffer: OutputBuffer::new(output_buffer_capacity),
             helper_committed_offset: 0,
             output_space_available: Arc::new(Notify::new()),
+            app_ack_unavailable: false,
         }
     }
 }

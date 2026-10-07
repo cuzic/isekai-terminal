@@ -528,6 +528,15 @@ impl AttachRuntime {
         self.apply_and_execute(ServeEvent::RelayTerminated { id, lease, reason }).await;
     }
 
+    /// Fact: the relay of incarnation `lease` of `id` stopped teeing S→C into
+    /// its replay buffer because no `APP_ACK` will ever trim it (no control
+    /// stream), so it can no longer be resumed correctly (review 2026-09-29,
+    /// PIPE-09). The reducer marks the incarnation unresumable: its later park
+    /// becomes `Discard{Unresumable}` (slot released, TCP closed).
+    pub async fn resume_unavailable(self: &Arc<Self>, id: SessionKey, lease: LeaseId) {
+        self.apply_and_execute(ServeEvent::ResumeUnavailable { id, lease }).await;
+    }
+
     /// Fact: incarnation `lease` of `id` lost its data stream (or yielded to
     /// a preemption) and `tcp` is still alive. The reducer either accepts the
     /// park (the socket is stored and `reparked` is signalled), discards the
