@@ -282,6 +282,49 @@ class TerminalInputConnectionTest {
         assertEquals(false, view.ctrlArmed)
     }
 
+    // --- AND-M7 ---
+
+    /** (a) 送信済みテキストを内部Editableに溜め続けない。 */
+    @Test
+    fun commitAndFinish_leaveInternalEditableEmpty() {
+        connection.commitText("hello", 1)
+        assertEquals(0, connection.editable!!.length)
+        connection.setComposingText("abc", 1)
+        connection.finishComposingText()
+        assertEquals(0, connection.editable!!.length)
+    }
+
+    /** (b) Ctrlトグル経路でcomposing中にcommitされても、composing spanが残らず、
+     *  後続のfinishComposingTextで古い文字を再送しない。 */
+    @Test
+    fun ctrlArmedCommitDuringComposing_doesNotLeaveComposingSpan() {
+        connection.setComposingText("a", 1)
+        view.ctrlArmed = true
+        connection.commitText("a", 1)
+        assertArrayEquals(byteArrayOf(0x01), sentBytes.last())
+        val sentBefore = sentBytes.size
+
+        connection.finishComposingText()
+
+        assertEquals("古いcomposing文字を再送しない", sentBefore, sentBytes.size)
+        assertEquals(0, connection.editable!!.length)
+    }
+
+    /** (c) IME側の異常に大きなbeforeLengthでDELを無制限に送らない。 */
+    @Test
+    fun deleteSurroundingText_hugeBeforeLength_isCapped() {
+        connection.deleteSurroundingText(1_000_000, 0)
+        assertEquals(256, sentBytes.size)
+    }
+
+    /** (d) 物理キーボード経由(onKeyDown)の未処理キーは、Viewへ再注入せずfalseを返す。 */
+    @Test
+    fun handleKeyDown_unhandledModifierKey_returnsFalseWithoutSending() {
+        val handled = connection.handleKeyDown(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT))
+        assertEquals(false, handled)
+        assertTrue(sentBytes.isEmpty())
+    }
+
     @Test
     fun commitText_ctrlNotArmed_plainCharSentRaw() {
         connection.commitText("a", 1)

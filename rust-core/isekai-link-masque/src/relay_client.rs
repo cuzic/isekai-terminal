@@ -97,10 +97,30 @@ pub enum RelayClientError {
 /// (`tests/relay_e2e.rs`) can apply the same settings to their mock relay's
 /// server config, since the size ceiling is enforced by whichever side is
 /// *receiving* a given direction's datagrams.
+/// How often the uplink connection to the relay sends a keep-alive when
+/// nothing else is flowing. Comfortably below any sane idle timeout.
+pub const UPLINK_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on the CONNECT-UDP-bind handshake (response + compression-context
+/// registration). A relay that accepts the QUIC/TLS connection but then never
+/// answers must not hang `isekai-pipe serve --relay` forever.
+pub const RELAY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Capacity of the queue between the relay's datagram reader and
+/// [`RelayUdpSocket::poll_recv`]. The relay's public address accepts UDP from
+/// anyone, so this must be bounded: once full, further datagrams are dropped —
+/// exactly what a real UDP socket's receive buffer does.
+const RECV_QUEUE_CAPACITY: usize = 1024;
+
 pub fn uplink_transport_config() -> noq::TransportConfig {
     let mut transport = noq::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(64 * 1024));
     transport.initial_mtu(1500);
+    // The inner (isekai-terminal↔isekai-pipe) traffic can go quiet for long
+    // stretches — right after bootstrap, or while a session is parked — and
+    // without keep-alives the relay-side connection would hit its idle
+    // timeout and take the proxy-public-address registration with it.
+    transport.keep_alive_interval(Some(UPLINK_KEEP_ALIVE_INTERVAL));
     transport
 }
 
@@ -267,9 +287,9 @@ where
         .await
         .map_err(|e| RelayClientError::H3Handshake(e.to_string()))?;
 
-    let uri: http::Uri = format!("https://{relay_sni}{BOUND_UDP_PATH}")
+    let uri: http::Uri = format!("https://{}{BOUND_UDP_PATH}", uri_authority(relay_sni))
         .parse()
-        .expect("relay_sni is a valid authority and BOUND_UDP_PATH is a valid path");
+        .map_err(|e| RelayClientError::ConnectRequest(format!("invalid relay_sni {relay_sni:?}: {e}")))?;
     let req = http::Request::builder()
         .method(Method::CONNECT)
         .uri(uri)
@@ -278,16 +298,16 @@ where
         .header("authorization", format!("Bearer {jwt}"))
         .extension(h3::ext::Protocol::CONNECT_UDP)
         .body(())
-        .expect("well-formed CONNECT-UDP-bind request");
+        .map_err(|e| RelayClientError::ConnectRequest(format!("malformed CONNECT-UDP-bind request (relay_sni/jwt): {e}")))?;
 
     let mut stream = send_request
         .send_request(req)
         .await
         .map_err(|e| RelayClientError::ConnectRequest(e.to_string()))?;
 
-    let resp = stream
-        .recv_response()
+    let resp = tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, stream.recv_response())
         .await
+        .map_err(|_| RelayClientError::ConnectRequest("timed out waiting for the CONNECT-UDP-bind response".to_string()))?
         .map_err(|e| RelayClientError::ConnectRequest(e.to_string()))?;
     if resp.status() != http::StatusCode::OK {
         return Err(RelayClientError::RejectedStatus(resp.status()));
@@ -310,24 +330,36 @@ where
         .send_data(Bytes::from(assign.encode()))
         .await
         .map_err(|e| RelayClientError::CapsuleRead(e.to_string()))?;
-    await_compression_ack(&mut stream).await?;
+    tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, await_compression_ack(&mut stream))
+        .await
+        .map_err(|_| RelayClientError::CapsuleRead("timed out waiting for COMPRESSION_ACK".to_string()))??;
 
     let stream_id = stream.id();
     let datagram_sender = driver.get_datagram_sender(stream_id);
     let mut datagram_reader = driver.get_datagram_reader();
 
+    let (recv_tx, recv_rx) = mpsc::channel::<(SocketAddr, Bytes)>(RECV_QUEUE_CAPACITY);
+
     // Keeps the HTTP/3 connection driven for the lifetime of the tunnel.
     // `stream`/`send_request` are moved in too so the CONNECT stream (and
     // therefore the relay's forwarding registration) stays open; none of
     // these are ever read from again after the compression handshake above,
-    // but dropping them would tear the tunnel down.
+    // but dropping them would tear the tunnel down. Ends (dropping all of
+    // them, which closes the tunnel) once the [`RelayUdpSocket`] owning the
+    // receive queue is dropped — previously this task outlived the socket
+    // forever, keeping the relay connection and its registration alive.
+    let socket_dropped = recv_tx.clone();
     tokio::spawn(async move {
         let _stream = stream;
         let _send_request = send_request;
-        std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        tokio::select! {
+            _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => {}
+            _ = socket_dropped.closed() => {
+                log::info!("isekai-link-masque: RelayUdpSocket dropped, closing the CONNECT-UDP-bind tunnel");
+            }
+        }
     });
 
-    let (recv_tx, recv_rx) = mpsc::unbounded_channel::<(SocketAddr, Bytes)>();
     tokio::spawn(async move {
         loop {
             let datagram = match datagram_reader.read_datagram().await {
@@ -340,8 +372,14 @@ where
             let payload = datagram.payload();
             match decode_datagram_payload(payload, false) {
                 Some((_context_id, Some(addr), data)) => {
-                    if recv_tx.send((addr, Bytes::copy_from_slice(data))).is_err() {
-                        break;
+                    match recv_tx.try_send((addr, Bytes::copy_from_slice(data))) {
+                        Ok(()) => {}
+                        // Like a full UDP receive buffer: drop, don't queue
+                        // without bound (anyone can send to the public address).
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::debug!("isekai-link-masque: receive queue full, dropping a relay datagram");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
                 Some((context_id, None, _)) => {
@@ -360,6 +398,16 @@ where
         while let Some((addr, payload)) = send_rx.recv().await {
             let encoded = encode_datagram_payload(UNCOMPRESSED_CONTEXT_ID, Some(addr), &payload);
             if let Err(e) = datagram_sender.send_datagram(encoded) {
+                if !send_error_is_fatal(&e) {
+                    // One oversized datagram (e.g. an inner PMTUD probe
+                    // larger than what fits in the outer tunnel after the
+                    // context/address prefix) is exactly like a packet lost
+                    // on the path — drop it and keep pumping. Treating it as
+                    // fatal used to silently kill this whole direction for
+                    // good while the process stayed up (unreachable).
+                    log::debug!("isekai-link-masque: dropping one relay datagram: {e}");
+                    continue;
+                }
                 log::info!("isekai-link-masque: relay datagram sender ended: {e}");
                 break;
             }
@@ -370,6 +418,25 @@ where
         RelayUdpSocket { recv_rx, send_tx, local_addr: proxy_public_address },
         proxy_public_address,
     ))
+}
+
+/// Whether a `send_datagram` failure means the tunnel itself is gone (stop
+/// the send pump) rather than this one datagram being unsendable (drop it
+/// and continue). Only `TooLarge` is per-datagram; the connection error and
+/// "datagrams not available" cases can never succeed again.
+fn send_error_is_fatal(e: &h3_datagram::datagram_handler::SendDatagramError) -> bool {
+    !matches!(e, h3_datagram::datagram_handler::SendDatagramError::TooLarge { .. })
+}
+
+/// The `authority` part of the CONNECT-UDP-bind URI for `relay_sni`: an
+/// IPv6 literal must be bracketed (`https://[::1]/...`), which `relay_sni`
+/// (also used as the TLS server name) is not.
+fn uri_authority(relay_sni: &str) -> std::borrow::Cow<'_, str> {
+    if relay_sni.parse::<std::net::Ipv6Addr>().is_ok() {
+        std::borrow::Cow::Owned(format!("[{relay_sni}]"))
+    } else {
+        std::borrow::Cow::Borrowed(relay_sni)
+    }
 }
 
 /// Reads capsule-framed body data off `stream` until a complete capsule is
@@ -415,7 +482,7 @@ where
 /// `isekai-helper`'s `noq::Endpoint::server`) can use it exactly like
 /// `isekai-helper`'s own `PlainUdpSocket`.
 pub struct RelayUdpSocket {
-    recv_rx: mpsc::UnboundedReceiver<(SocketAddr, Bytes)>,
+    recv_rx: mpsc::Receiver<(SocketAddr, Bytes)>,
     send_tx: mpsc::UnboundedSender<(SocketAddr, Bytes)>,
     local_addr: SocketAddr,
 }
@@ -553,5 +620,19 @@ impl AsyncUdpSocket for UplinkUdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_authority_brackets_ipv6_literals_only() {
+        assert_eq!(uri_authority("relay.example.com"), "relay.example.com");
+        assert_eq!(uri_authority("203.0.113.5"), "203.0.113.5");
+        assert_eq!(uri_authority("2001:db8::1"), "[2001:db8::1]");
+        let uri: http::Uri = format!("https://{}{BOUND_UDP_PATH}", uri_authority("::1")).parse().unwrap();
+        assert_eq!(uri.host(), Some("[::1]"));
     }
 }

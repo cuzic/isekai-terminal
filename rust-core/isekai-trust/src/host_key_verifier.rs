@@ -7,7 +7,11 @@
 //! TOFU semantics deliberately mirror `ssh(1)`, not a simpler
 //! "always trust" shortcut:
 //! - **Known, matching fingerprint**: silently accepted, `last_seen_at`
-//!   refreshed.
+//!   refreshed (at most once per hour, best-effort: a store that can't be
+//!   locked/written — disk full, read-only `$HOME` — only logs a warning and
+//!   still accepts, as long as the store can at least be *read* and shows a
+//!   match. Refusing an already-trusted host over bookkeeping would break
+//!   `.claude/rules/always-connects.md`).
 //! - **Known, mismatched fingerprint**: silently *rejected* — no prompt.
 //!   A changed host key is a stronger signal than a new one (could mean
 //!   MITM, or a legitimate re-key/redeploy). A user who intentionally
@@ -17,7 +21,10 @@
 //!   pinning.
 //! - **Unknown host**: `confirm_new_host` decides (production: prompt on the
 //!   real terminal; tests: inject a fixed answer) — first-time TOFU
-//!   confirmation is the one interaction that genuinely needs a human.
+//!   confirmation is the one interaction that genuinely needs a human. If
+//!   the confirmed key then can't be persisted, the connection still
+//!   proceeds with a warning (same as `ssh(1)`'s "Failed to add the host to
+//!   the list of known hosts").
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,9 +71,12 @@ impl FileBackedHostKeyVerifier {
 /// exactly one place (`VerifyOutcome`) that represents "rejected, here's why".
 enum Resolved {
     /// Final answer, no user interaction needed: already trusted+matching, a
-    /// mismatch, or a lock/IO/task-panic failure — all decided without ever
+    /// mismatch, or a task-panic failure — all decided without ever
     /// consulting `confirm_new_host`.
     Decided(VerifyOutcome),
+    /// The locked read-modify-write itself failed (lock/IO/disk full). Not a
+    /// verdict on the key — `verify` falls back to a read-only check.
+    StoreFailed(String),
     /// Never seen before; caller must consult `confirm_new_host` and, if
     /// confirmed, call [`FileBackedHostKeyVerifier::resolve_locked`] again
     /// with `insert_if_unknown: true`.
@@ -82,6 +92,29 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         match self.resolve_locked(fingerprint, false).await {
             Resolved::Decided(outcome) => return outcome,
             Resolved::NeedsConfirmation => {}
+            Resolved::StoreFailed(error) => match self.resolve_read_only(fingerprint).await {
+                Resolved::NeedsConfirmation => {
+                    log::warn!("{}: {error}; continuing with a read-only check", self.log_context);
+                }
+                Resolved::Decided(outcome) => {
+                    if matches!(outcome, VerifyOutcome::Accepted) {
+                        log::warn!(
+                            "{}: could not record last_seen_at for {} ({error}); the host key matches the trusted one, continuing",
+                            self.log_context,
+                            self.host_port
+                        );
+                    }
+                    return outcome;
+                }
+                Resolved::StoreFailed(read_error) => {
+                    let reason = format!(
+                        "{}: SSH host key trust store unreadable, rejecting connection: {read_error} (write attempt: {error})",
+                        self.log_context
+                    );
+                    log::error!("{reason}");
+                    return VerifyOutcome::Rejected(reason);
+                }
+            },
         }
 
         // Outside any lock: ask the (possibly slow/interactive) confirmation
@@ -118,6 +151,15 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         // this call is the one that persists our now-confirmed trust.
         match self.resolve_locked(fingerprint, true).await {
             Resolved::Decided(outcome) => outcome,
+            Resolved::StoreFailed(error) => {
+                // The user explicitly trusted this key; failing to persist it
+                // only means they'll be asked again next time.
+                log::warn!(
+                    "{log_context}: could not save the confirmed SSH host key for {host_port} ({error}); \
+                     continuing, but you will be asked again next time"
+                );
+                VerifyOutcome::Accepted
+            }
             Resolved::NeedsConfirmation => unreachable!("insert_if_unknown: true never returns NeedsConfirmation"),
         }
     }
@@ -143,9 +185,15 @@ impl FileBackedHostKeyVerifier {
             crate::with_locked_ssh_host_key_trust_store(&store_path, |store| {
                 match store.get(&host_port) {
                     Some(known) if known.fingerprint == fingerprint => {
-                        let mut updated = known.clone();
-                        updated.last_seen_at = now_rfc3339();
-                        store.insert(host_port.clone(), updated);
+                        // Refresh at most once per hour (RFC 3339 prefix up
+                        // to the hour) so a matching connect doesn't rewrite
+                        // the whole store every time.
+                        let now = now_rfc3339();
+                        if known.last_seen_at.get(..13) != now.get(..13) {
+                            let mut updated = known.clone();
+                            updated.last_seen_at = now;
+                            store.insert(host_port.clone(), updated);
+                        }
                         Ok(Resolved::Decided(VerifyOutcome::Accepted))
                     }
                     Some(known) => {
@@ -175,16 +223,40 @@ impl FileBackedHostKeyVerifier {
 
         match outcome {
             Ok(Ok(resolved)) => resolved,
-            Ok(Err(e)) => {
-                let reason = format!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
-                log::error!("{reason}");
-                Resolved::Decided(VerifyOutcome::Rejected(reason))
-            }
+            Ok(Err(e)) => Resolved::StoreFailed(format!("SSH host key trust store update failed: {e}")),
             Err(join_error) => {
                 let reason = format!("{log_context}: SSH host key trust check task panicked, rejecting connection: {join_error}");
                 log::error!("{reason}");
                 Resolved::Decided(VerifyOutcome::Rejected(reason))
             }
+        }
+    }
+
+    /// The fallback when the locked read-modify-write failed: the same
+    /// decision from a plain (unlocked, never-written) read of the store.
+    /// Only ever yields `Accepted` for a known, matching key; a mismatch is
+    /// still a hard reject, and an unknown host still needs confirmation.
+    async fn resolve_read_only(&self, fingerprint: &str) -> Resolved {
+        let store_path = self.store_path.clone();
+        let host_port = self.host_port.clone();
+        let fingerprint = fingerprint.to_string();
+        let log_context = self.log_context;
+        let loaded = tokio::task::spawn_blocking(move || crate::load_ssh_host_key_trust_store(&store_path)).await;
+        match loaded {
+            Ok(Ok(store)) => match store.get(&host_port) {
+                Some(known) if known.fingerprint == fingerprint => Resolved::Decided(VerifyOutcome::Accepted),
+                Some(known) => {
+                    let reason = format!(
+                        "{log_context}: host key for {host_port} changed (trusted {}, saw {fingerprint}) — refusing to connect.",
+                        known.fingerprint
+                    );
+                    log::error!("{reason}");
+                    Resolved::Decided(VerifyOutcome::Rejected(reason))
+                }
+                None => Resolved::NeedsConfirmation,
+            },
+            Ok(Err(e)) => Resolved::StoreFailed(e.to_string()),
+            Err(join_error) => Resolved::StoreFailed(format!("read task panicked: {join_error}")),
         }
     }
 }
@@ -304,6 +376,53 @@ mod tests {
         let entry = updated.get("example.com:22").unwrap();
         assert_eq!(entry.trusted_at, "2026-01-01T00:00:00Z", "trusted_at must not change on a re-seen match");
         assert_ne!(entry.last_seen_at, "2026-01-01T00:00:00Z", "last_seen_at must be refreshed");
+    }
+
+    /// always-connects.md: an already-trusted, matching host must still be
+    /// accepted when the store can't be written (disk full / read-only
+    /// `$HOME` — simulated with a read-only directory); only the
+    /// `last_seen_at` bookkeeping is lost. A mismatch must still be rejected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn known_matching_host_is_accepted_even_if_the_store_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("trust");
+        std::fs::create_dir(&store_dir).unwrap();
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store_path = store_dir.join("known_ssh_hosts.toml");
+        let mut store = SshHostKeyTrustStore::default();
+        store.insert(
+            "example.com:22".to_string(),
+            SshHostKeyTrust {
+                fingerprint: "SHA256:abc".to_string(),
+                trusted_at: "2026-01-01T00:00:00Z".to_string(),
+                last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        );
+        crate::save_ssh_host_key_trust_store(&store_path, &store).unwrap();
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(store_dir.join("probe"), b"").is_ok() {
+            // Running as root: directory permissions aren't enforced, so the
+            // failure this test needs can't be produced.
+            std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let verifier = FileBackedHostKeyVerifier::new(
+            store_path.clone(),
+            "example.com:22".to_string(),
+            Arc::new(|_| panic!("must not prompt for an already-known, matching host key")),
+            "isekai-test",
+        );
+        let outcome = verifier.verify("SHA256:abc").await;
+        let mismatch = FileBackedHostKeyVerifier::new(store_path.clone(), "example.com:22".to_string(), Arc::new(|_| true), "isekai-test")
+            .verify("SHA256:different")
+            .await;
+
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_accepted(outcome), "a matching known host must not be rejected over a failed last_seen_at write");
+        assert!(!is_accepted(mismatch), "a mismatch must still be rejected when the store is read-only");
     }
 
     #[tokio::test]

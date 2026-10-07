@@ -20,6 +20,41 @@ class RemoteClipboardPolicyTest {
         assertArrayEquals(expected.toByteArray(Charsets.UTF_8), actual?.data)
     }
 
+    // ── AND-L1: 例外/OOMをUniFFI callback境界へ漏らさない ────────────
+
+    @Test
+    fun `pull swallows SecurityException and replies nothing`() {
+        val policy = RemoteClipboardPolicy(
+            isWriteAllowed = { false },
+            isPullAllowed = { true },
+            writeToClipboard = {},
+            readFromClipboard = { throw SecurityException("uri permission revoked") },
+        )
+        assertNull(policy.onClipboardPullRequested())
+    }
+
+    @Test
+    fun `pull swallows OutOfMemoryError and replies nothing`() {
+        val policy = RemoteClipboardPolicy(
+            isWriteAllowed = { false },
+            isPullAllowed = { true },
+            writeToClipboard = {},
+            readFromClipboard = { throw OutOfMemoryError("huge bitmap") },
+        )
+        assertNull(policy.onClipboardPullRequested())
+    }
+
+    @Test
+    fun `write swallows exceptions from the clipboard`() {
+        val policy = RemoteClipboardPolicy(
+            isWriteAllowed = { true },
+            isPullAllowed = { false },
+            writeToClipboard = { throw IllegalStateException("clipboard unavailable") },
+            readFromClipboard = { null },
+        )
+        policy.onClipboardWriteRequested(textPayload("x")) // must not throw
+    }
+
     // ── write ─────────────────────────────────────────────────────
 
     @Test
