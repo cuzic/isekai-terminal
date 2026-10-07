@@ -1,15 +1,20 @@
 # ADR: Functional Core / Imperative Shell と「Effectをデータとして返すreducer」の段階的導入
 
-- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。rev4。Approve時のユーザー決定: D1=Step 2bの後で2cを実施、
-  D3=純粋性検査ジョブのみrequired check化(mutants週次ジョブは非required)。それ以外の未解決事項は§10の既定案に従う。
-  **rev5(2026-10-06、amendment)**: ユーザー承認済みの追加Step 7a・9・10・11・12・13をロードマップに追加(§0 rev5)。
-  rev4までの決定は一切変更していない。
-  **rev6(2026-10-06、amendment)**: Step 9の不具合履歴報告を根拠に、ユーザーが§6の順序変更を決定(§0 rev6)。
-  Step 3aに`pending_wake`を取り込み、Step 5を再評価から昇格、Step 7をStep 6へ統合、Step 4を後ろへ、8bを再評価へ移した。
-  (以下は承認前のレビュー経過)敵対的レビューは4ラウンドで収束済み。
-  round 1〜4の敵対的レビュー(`scratchpad/opus-review-fcis-adr-round{1,2,3,4}.md`、Opus)の全指摘と、
-  それを受けたユーザー決定を反映。round 4の判定は「converged」(残りは軽微6件で、rev4に取り込み済み)。
-  ユーザーが決めるべき未解決事項は§10「未解決(ユーザー判断待ち)」に一箇所にまとめてある。
+- **Status**: **Accepted(2026-10-07、rev7: 実装完了の記録。初回Approveは2026-10-06のrev4)**。
+  2026-10-06にマージされたStep 0〜13の実装結果(PR番号・ADR本文からの差分)を「実装記録」節に記録した(§0 rev7)。
+  ユーザー判断待ちの事項は残っていない(§10。範囲外として残るものは§10末尾に列挙)。
+  - rev4(Approve、2026-10-06)時のユーザー決定: D1=Step 2bの後で2cを実施、D3=純粋性検査ジョブのみrequired check化
+    (mutants週次ジョブは非required)。それ以外の未解決事項は§10の既定案に従う。
+    **rev7時点の決着**: D1は2bで目的が達成されたため2cを見送り(ユーザー決定)、D3は2026-10-06に実施済み(§10)。
+  - **rev5(2026-10-06、amendment)**: ユーザー承認済みの追加Step 7a・9・10・11・12・13をロードマップに追加(§0 rev5)。
+    rev4までの決定は一切変更していない。
+  - **rev6(2026-10-06、amendment)**: Step 9の不具合履歴報告を根拠に、ユーザーが§6の順序変更を決定(§0 rev6)。
+    Step 3aに`pending_wake`を取り込み、Step 5を再評価から昇格、Step 7をStep 6へ統合、Step 4を後ろへ、8bを再評価へ移した。
+  - **rev7(2026-10-07)**: 実装記録の追加。2026-10-06のユーザー決定(D2: 3b/3c・5・6+7・8b・10・11・13を実施、
+    D1: 2cを見送り)と、Q9〜Q18の実装時の回答を§10に記録した。既存の決定は変えていない。
+  - (以下は承認前のレビュー経過)敵対的レビューは4ラウンドで収束済み。
+    round 1〜4の敵対的レビュー(`scratchpad/opus-review-fcis-adr-round{1,2,3,4}.md`、Opus)の全指摘と、
+    それを受けたユーザー決定を反映。round 4の判定は「converged」(残りは軽微6件で、rev4に取り込み済み)。
 - **対象**:
   - rust-core(`isekai-terminal-core`): `src/{orchestrator,pool,session_state,terminal,rebind_manager,net_health_policy,lib}.rs`
   - `isekai-pipe`: `src/engine/{attach_arbiter,attach_runtime,resume,mod}.rs`、`src/resume_loop.rs`
@@ -31,10 +36,63 @@
 - **Room**: どのStepも`AppDatabase.kt`/Room migrationに触れない(round 1で確認、§8)。
 - **表記**: 「確認済み」はmain `beb74a03`でコードを読んで確認した事実。「推測」は導出のみで未実行。
   「[EXT]」はこのリポジトリ外の一般知識(ツールの仕様等)で、実装時に確認が要るもの。
+  rev7の実装記録はmain `f946bf07`時点のPR本文・マージ済みコード・Opusレビュー(`scratchpad/review-pr{145,146,160,164,166,167,174,182}.md`)に基づく。
+  本文中の行番号は各revの執筆時点のもので、実装後のコードとは一致しない。
+
+---
+
+## 実装記録(rev7、2026-10-07)
+
+全Stepは2026-10-06にmainへマージされた。各PRはOpusの敵対的レビュー(上記scratchpad)を経ている。
+「ADR本文からの差分」は実装PRの本文・レビューで開示されたもの。どれも本ADRの決定(§2〜§4、§8)を覆すものではない。
+
+| Step | PR | 実装されたもの | ADR本文からの差分 |
+|---|---|---|---|
+| 0 | #139 | `rust-core/clippy.toml`(全エントリ`allow-invalid = true`)、`rust-core/pure_modules.toml`、`rust-core/scripts/check_pure_modules.py`(`--self-test`付き)、ジョブ`rust-core-purity-check`。初期6モジュールを登録 | 外部許可に`flate2`/`md5`/`log`とstdの一部(`str`/`mem`/`fmt`/`sync::Arc`等)を追加(`trzsz.rs`等が実際に使用)。`#[...]`属性の中身は検査対象外 |
+| 7a | #143 | `activate`/`execute_effects`に`#[deny(clippy::wildcard_enum_match_arm)]`、`activate`を全variantの明示`match`に、`[[interpreter]]`登録とスクリプトによる`if let`/`let .. else`/`matches!`/属性欠落の拒否 | 非`StartRelay` armの警告ログに`attach_token`漏洩防止のためEffectの`Debug`を含めない |
+| 1 | #137 | `AttachArbiter`のproptest、失敗時の`proptest-regressions` artifact upload(§7) | `Cargo.lock`は`regenerate-lockfile.yml`の最小モードが無いため手で1行編集し、`lockfile-drift`で検証(§7) |
+| 1.5 | #140 | `engine/sweep_resume_race_tests.rs`: sweep×RESUMEの特性テスト2本(`SessionTable`単体と、`AttachRuntime`込みでslot解放まで) | 本番フック無し(`tokio::sync::Mutex`のFIFO公平性で順序を強制)。`start_paused`は不使用(sweep期限が`std::time::Instant`で、自動前進が実loopback接続のタイムアウトを誤発火させるため)。**同時admit(max+1)と`Rejected`→孤児parkは特性化していない**(QUICの`handle_attach_stream`全体が要るため。後者は2aのI-gで担保) |
+| 2a | #146、follow-up #162 | `isekai-protocol/src/millis.rs`(`Millis`)、純粋reducer`engine/serve_fsm.rs::ServeAggregate`(I-a〜I-jのproptest)、単一ロックshell(`interpret_in_lock`)。意図した挙動変更3つ(§6 Step 2a)と、Q9の既定案。#162: RESUME許可直後のRAIIガード(H-1)、受理できなかった`StoreParked`の孤児破棄(H-2)、Sweep完全性proptest、`always-connects.md`の参照更新 | `SessionTable`はファサードとして残さず撤去(全呼び出し元がengine内)。`Activated`/`ResumeRequested`は`now`を運ばない(時刻を使わない遷移のため)。ソケット/handleはreducerのEffectに載らず、in-lock interpreterが`(id, lease)`で引き渡す(純粋モジュールで型が禁止されるため)。admission用の立ち退きを要求`EvictOldestParked`として追加(2bで置換) |
+| 10 | #179(10-1)、#180(10-2)、#185(修正) | 10-1: 実shellと`ServeAggregate`モデルの差分テスト(`engine/serve_shell_differential_tests.rs`、target TCPのclose観測まで)。10-2: 手書き有界BFSによる閉包までの全列挙(全遷移で`check_transition`、全状態で「全slotを解放した状態へ戻れる」後ろ向き到達性) | **loomは不採用、手書きBFSを採用、staterightは不要**(Q15/Q16、§10)。10-1は`start_paused`を使わず、時計の値に結果が依存しない操作語彙にした。#185は#177と#180の意味的マージ衝突(mainのテストビルド破損)の修正 |
+| 2b | #160 | `ServeEvent::AdmitRequested { key }`で判定・立ち退き・slot確保を1回のapplyに(max+1の解消)。shellテスト`engine/admission_race_tests.rs`、proptestでI-k | **`AdmitRequested{id}`ではなく`{key}`**(判定と`HelloReceived`のslot確保を別applyに分けると同じcheck-then-actが再発するため)。**Step 1.5に同時admitの特性テストは存在しなかった**ので「反転」ではなく、#160がテストを先に追加した(旧コードでmacOS/Windows/Linuxとも失敗することをCIで確認) |
+| 2c | — | **見送り(ユーザー決定、D1)**。I-k(§4.1)の系として、本番ではunresumable登録が到達不能になり、2cの目的は2bで達成済み | 残るのは死んだunresumable機構の撤去だけ(§6 Step 2c) |
+| 2.5 | #141 | `OrchestratorShared::rt`と`pool::release_on(rt, ..)`によるランタイム明示注入。orchestratorの`std::thread::sleep` 14箇所とpoolのidle grace系7テストを`start_paused`へ | `pool::release`は公開シグネチャのまま`release_on`の薄いラッパー |
+| 3a | #145 | 純粋モジュール`src/reconnect_fsm.rs`(`ReconnectState`、`ConnPhase`/`BackgroundState`/`DisconnectKind`/`NETWORK_LOST_REASON`を移設)。`AttemptDisconnected`/`AttemptConnected`と`pending_wake`系の遷移。interpreter`execute_reconnect_effects` | 未移行の入口のEventはenumに定義せず、対応表をmodule docに記載(no-opの定義は任意Event列proptestを誤らせるため)。`Millis`は不使用(`due: bool`をshellが計算) |
+| 5 | #164 | 純粋reducer`isekai-pipe/src/resume_fsm.rs::ResumePlanner`(give-up・再試行期限・再接続通知の猶予・失敗分類、`BusyOtherSessionRetry`)。本番の`Instant::now()` 13箇所を`ShellClock::stamp`1箇所へ | **判断ごとにPRを分けず1PR(3コミット)で移した**(レビューL5。行単位の等価性確認を根拠にリードが受容)。EOF-latch(`should_give_up_without_resuming`)は`anyhow::Error`を見るのでshellに残した |
+| 6 | #138 | `isekai-ssh`の`ReconnectBackoff`2コピーを`BackoffPolicy`に統一し、純粋な`next_delay(attempt, seed)`を追加 | `Cargo.lock`は手で最小編集(§7) |
+| 6+7 | #166 | 純粋reducer`isekai-ssh/src/connect_recovery_fsm.rs`(`decide_connect_failure_recovery`と`MAX_LIGHTWEIGHT_RETRIES`を移設)とshell`connect_recovery_driver.rs`。`reconnect_backoff.rs`も純粋化(`now: Millis`と`seed`を受け取る)。`Unknown`+remote commandのガードを述語`remote_command_forbids_retry`に抽出(Step 12の未実施分) | 時刻の粒度がms(gateは最大約1ms遅れて開く)。jitter seedはEventごとに1つ。値(D4の60秒/200秒を含む)は不変 |
+| 4 | #163 | 純粋モジュール`src/pool_idle_fsm.rs`(`IdleLedger`、`ArmIdleTimer{generation}`/`IdleExpired{generation}`)、#124のモデルテストにタイマー満了操作を追加 | 世代はエントリごとに0から数え直す既存挙動を保存(削除→同キー再作成時のABAで、アイドル接続が早めに閉じうる。モデルも同じ挙動を再現) |
+| 8a′ | #167、#175の修正は#182 | `on_connection_edge(edge, generation)`、`ReconnectState`の`edge_open`、phaseの書き手5箇所すべてを`apply`経由に(新Event`ReconnectSessionStarting`/`ManualConnectStarted`/`ForegroundReconnectFailedSync`)。退出経路テスト(a)〜(f)。Kotlinの`prevConnected`とSwiftの`tmuxPrevConnected`を撤去 | **Effectは呼び出し元へ返さず、`OrchestratorAdapter::new`/`connect_via`の関数内でロック解放後に解釈する**(m-R4-4の「ロック下でコールバックを呼ばない」は満たす)。`CallbackIngress.swift`は`OrchestratorCallback`を実装していないため変更不要。#182の設計は§6 Step 8a′の「#175の設計」 |
+| 3b/3c | #174 | tick会計(`LoopClock`)・`due`・`woke_early`・タイムアウトのギブアップ・`cancel_reconnect`・ループ起動失敗を`ReconnectState::apply`へ(`ArmLoopTimer{epoch, after}`)。8a′レビューL-1〜L-4への対応 | **§2.4-4の狭い例外**: orchestratorの`on_connection_state_changed`/`on_connection_edge`だけ、apply順に配信する`PublicationQueue`(§2.4-4)。ギブアップで`reconnect_epoch`を進める(3aレビューm5)。`phase`を`ReducerOwned`で包みreducer外から書けなくした(L-2) |
+| 8b | #173 | `TerminalSession.kt`の`_state.update` 22箇所を純粋関数`reduce(TerminalUiState, UiMsg)`(`ConnectionStateMapper.kt`、18種)へ集約。旧ラムダを書き写したモデルとの性質テスト | rev6では再評価扱いだったが、D2のユーザー決定で実施(§10)。推奨順序「13の後」より前に実施したが、8a′ → 8bのファイル衝突規則は満たす |
+| 11 | #177 | `src/trace_invariants.rs`と`engine/trace_invariants.rs`(`#[cfg(test)]`): 記録器+純粋な検査関数を既存のorchestrator・e2e・engineテストとproptestに適用(T1〜T3、stale timer) | `PublicationQueue`(3b/3c)で配信順が直列化されたため、T1は回数だけでなく**順序まで**検査する(Step 11本文の「順序注意」は不要になった) |
+| 12 | #144 | `classify_connect_error`の抽出と表テスト、`run_connect`の呼び出し箇所が1つであることの検査、`decide_connect_failure_recovery`の明示armと網羅表テスト | `Unknown`+remote commandガード述語の抽出は6+7と衝突するため見送り、#166で実施 |
+| 13 | #178 | `orchestrator/tests/callback_contract_golden.rs`(8シナリオ、#182で9つ目`upstream_failover_reconnects`)、Kotlin`CallbackContractGoldenReplayTest`、Swift`CallbackContractGoldenReplayTests`(振り分けをLogic層の`ConnectionEdgeRouter`へ移して検証) | **goldenはコピーせず両プラットフォームが直接読む**(Kotlinは`android/build.gradle.kts`のsystem property`isekai.callbackContractGoldenDir`+`inputs.dir`、Swiftは`#filePath`基準)。更新は`ISEKAI_UPDATE_CALLBACK_GOLDEN=1`のときだけ |
+| 9 | (PRなし) | 不具合履歴の調査(`scratchpad/defect-history-rank.md`)。rev6の順序変更の根拠 | — |
+
+関連issue: #175(foreground復帰後にupstream failover監視が再登録されない。#182で解決、closed)、#186(再接続後の物理マルチパスfd再取得、open)、
+#187(BUSY再試行の最悪所要210秒がisekai-sshの安定閾値200秒を超えうる、D4関連、open)。
+D5(配線漏れ)は`docs/adr/0020-unwired-callback-detection.md`として別ADRになった(§10)。
 
 ---
 
 ## 0. 改訂履歴
+
+### rev7(2026-10-07)— 実装完了の記録
+
+| 変更 | 内容 |
+|---|---|
+| Status | Accepted(2026-10-07)。冒頭に「実装記録」節を追加 |
+| §2.4-4 | 3b/3c(#174)の`PublicationQueue`を、この規則の狭い例外として本文に注記(規則自体は変えない) |
+| §4.1 | I-k(slot数 ≤ `max_sessions`、2bで成立)と、その系「本番でunresumable登録は到達不能」を追加 |
+| §6 Step 1.5 / 2b | 同時admitの特性テストはStep 1.5に存在せず、2b(#160)が先にテストを追加したことを記録(2b本文の「反転させる」を訂正) |
+| §6 Step 2c | 見送り(ユーザー決定)として記録 |
+| §6 Step 8a′ | #175の設計(#182)を小節として追加 |
+| §6 Step 10 / 13 / 再評価 | 10-2の評価結果(Q15/Q16)、13のgolden共有方法、再評価表の崩れ(8b行の孤立)と状態を修正 |
+| §7 | 実装されたもの/されなかったもの(mutants週次・lockfile最小モード)を記録 |
+| §10 | 「未解決(ユーザー判断待ち)」の全件を決着として記録。範囲外として残るものを列挙 |
+
+rev1〜rev6の表は当時の記録としてそのまま残す。
 
 ### rev6(2026-10-06)— Step 9の不具合履歴報告による順序変更(ユーザー決定)
 
@@ -369,6 +427,10 @@ shellは`*_driver.rs`/`*_runtime.rs`。既存ファイルは改名しない。
    届く逆転をreducerのproptestは検出できない。**本ADRのStepでは汎用の連番publisherは導入しない**(round 2 m-R2-1)。
    順序が意味を持つ通知の組(Step 8a′の`Connected`→`Established`等)は、**同じ呼び出し箇所から固定順で**出す
    ことで保証する。汎用の連番/直列化publisherは、逆転が実害として観測された時点で別Stepとして追加する。
+   - **狭い例外(rev7で記録、Step 3b/3c #174)**: orchestratorの`on_connection_state_changed`/`on_connection_edge`の2種類に限り、
+     `PublicationQueue`がapplyと同じ臨界区間で公開を列に積み、同時に1スレッドだけがロック外で順に配信する
+     (状態公開と接続エッジがapply順に届く)。根拠は8a′レビューL-1: 逆転`Lost(g)`→`Established(g)`は、エッジ通知が自己修正しない
+     ので実害になる。他のcallback・他の集約には広げない(汎用publisherは引き続き導入しない)。
 5. I/O結果・RNG値・IDはshellが生成してEventに載せる。shellはStateを覗いて判断しない(読み取りクエリは可、
    ただしクエリ結果で分岐したくなったらreducerへ移す兆候)。
 6. **ロック順**: 集約ロックを保持したまま他の(per-session等)ロックを取らない。逆も同様(ネスト禁止)。
@@ -479,6 +541,13 @@ Event列をCIのreplayテストにする構想は残すが、**§3の秘密情�
   それ以外では`id`の状態を変えずに拒否(または`RequestPreempt`)を返す。slotの無いsessionへのparkは起こらない。
 - I-j(round 3 m-R3-4): arbiterの`RelayEnded{lease}`が現`Established` leaseに対して起きたapplyでは、同じapply内で
   indexエントリも除かれる(slotの無いindexエントリという中間状態を作らない)。
+- I-k(rev7、Step 2b #160で成立): **arbiterのslot数 ≤ `max_sessions`**(shellと同じ入口`AdmitRequested`だけからなる任意のEvent列の
+  各apply後。#160のproptest、#180の有界網羅探索でも検査)。
+  - **系: 本番ではunresumable登録は到達不能**。I-kとI-c(indexエントリはすべてslotを持つ)から、新しいidの`Activated`の時点で
+    自分自身のslotが数えられているので、他のlive数は`max_sessions - 1`以下になる。よって`Activated`の容量分岐(立ち退き・
+    `unresumable: true`登録)には本番では入らない。2bのslot確保が、Step 2cが求めた「admission時点の容量予約」そのものになった。
+    I-c・I-gの「unresumableエントリ」に関する記述と、上の2つの計数の区別は、テスト専用の迂回(`hello_bypassing_admission`、
+    `#[cfg(test)]`)で作った容量超過状態に対してだけ意味を持つ(Step 2c)。
 
 **限界**: これらは「判断と原子性が正しい」ことの検証で、shellが実際に`drop`/送信したことの検証ではない。
 `docs/adr/0018-connection-resilience-simulation.md` §3のI2a(実engine必須)は置き換えない。RAIIバックストップは残す。
@@ -536,6 +605,14 @@ rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs
 `wrapper.rs`/`native/connect.rs`を変える。この2つは同時に進めず、Step 12を先に行う**(12の網羅表テストが、
 6+7のループ共通化に対する回帰検査になる)。
 各Stepはそれぞれ独立PR、コミットは細かく分ける。
+
+**(rev7)実際のマージ順**(2026-10-06、並列worktreeで実装したため上の順序行とは異なる):
+1.5(#140) → 0(#139) → 6(#138) → 2.5(#141) → 1(#137) → 7a(#143) → 12(#144) → 2a(#146) → 3a(#145) → 2a follow-up(#162) →
+4(#163) → 8a′(#167) → 5(#164) → 8b(#173) → 2b(#160) → 3b/3c(#174) → 6+7(#166) → 11(#177) → 13(#178) → 10-1(#179) →
+10-2(#180) → #185(修正) → #175の修正(#182)。2cは見送り(Step 2c)。
+固定依存(0 → 7a、2.5 → 4、3a → 8a′、8a′ → 8b、2a → 10、3a・8a′ → 11、8a′ → 13、Step 12を6+7より先)はすべて守られた。
+推奨順序のうち「10は2bより前」「8bは13の後」は守られなかった(2bは`admission_race_tests.rs`をテスト先行で足し、8bは旧ラムダを
+書き写したモデルとの性質テストを自前で持つので、それぞれの安全網はPR内で確保した)。
 
 ### Step 0: 純粋性検査の導入(本番コード変更は最小)
 
@@ -638,6 +715,8 @@ rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs
   `sweep_after_concurrent_unpark_currently_discards_live_session`)として入れる。Step 2aのPRがこのassertを
   反転させ、「リファクタが競合を移動させたのでなく閉じた」ことを証明する。
 - 可能なら`admit_new_session`の同時admit(max+1)についても同様の特性テストを置く(2bの前提)。
+  **(rev7)実装(#140)では置かなかった**(QUICの`handle_attach_stream`経路全体が要るため)。同時admitのテストはStep 2b(#160)が
+  修正より先に追加した(Step 2b)。
 - **範囲(round 2 m-R2-9)**: `SessionTable`単体では「テーブルから消えた」半分しか見えず、実害である
   「`release_slot_for`(`mod.rs:811-813`)が中継中のleaseの`relay_ended`を呼び、fencing slotが空く」半分は
   `engine/mod.rs`側にある。テストには`AttachRuntime`も含め(targetはローカル`TcpListener`で足りる)、
@@ -748,7 +827,12 @@ rev5で追加: Step 12(`isekai-pipe/src/connect.rs`・`isekai-ssh/src/wrapper.rs
   **PRごとrevertする**前提とし、Step 1.5の特性テスト(反転後)と既存`resume.rs`/engineテストが緑であることをマージ条件にする。
 
 **2b(挙動変更、別PR)**: `AdmitRequested`を集約applyで処理し、`admit_new_session`のcheck-then-act(max+1)を
-解消する。Step 1.5の同時admit特性テストを反転させる。
+解消する。~~Step 1.5の同時admit特性テストを反転させる。~~
+**(rev7訂正)** Step 1.5(#140)に同時admitの特性テストは存在しなかった(Step 1.5)。そのため#160は、修正より先に
+shellテスト`engine/admission_race_tests.rs::concurrent_admissions_never_exceed_max_sessions`を追加し、旧コードでは
+Linux・macOS・Windowsのすべてで失敗することをCIで確認してから修正した(反転ではなく、テスト先行)。
+実装はEventを`AdmitRequested{key}`とした(`{id}`ではない。判定とslot確保を別applyに分けると同じcheck-then-actが再発するため)。
+不変条件I-k(§4.1)を追加した。
 
 **2c(挙動変更、別PR、D1によりStep 2bの後で実施)**: 2aでslotリーク自体は解消済みなので、残るのは「容量超過で登録されたsessionは
 data streamが一度切れると(RESUMEできずに)接続を失う」というresume不能性だけ。admission時点で容量を予約し
@@ -757,6 +841,12 @@ unresumableなエントリを到達不能にすれば、これも解消できる
 2bの後に、`--max-sessions`到達が実際に観測されているかを見て判断する。
 2b/2cは2aに混ぜない(round 1 B-1「リファクタと挙動変更を混ぜない」。2aの挙動変更は上記2点に限定)。
 見送る場合はこのADRに「延期」と明記して記録する。
+
+**(rev7)2cは見送り(ユーザー決定、D1の決着)**: 2bのslot確保がadmission時点の容量予約そのものになり、I-kの系として
+本番ではunresumable登録が到達不能になった(§4.1)。2cが挙動変更として目指したもの(resume不能なsessionを作らない)は
+2bで達成済みで、「`--max-sessions`到達の観測を待つ」という判断条件も意味を失った。残るのは挙動を変えない死んだ機構の撤去
+(`IndexEntry.unresumable`、`DiscardCause::Unresumable`、`Activated`の容量分岐、テスト専用の迂回`hello_bypassing_admission`、
+I-cの2つの計数の記述)だけで、これは本ADRのStepとしては行わない(必要になったら通常のリファクタとして扱う)。
 
 ### Step 2.5(新規): orchestrator/poolの`cfg(test)` RUNTIME注入
 
@@ -990,11 +1080,55 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
 - **得られるCI検証**: エッジの発火条件(特に手動再接続・フォアグラウンド復帰で旧世代の`Lost`が出ること)が
   Rust側のproptestとorchestratorテストで検証可能になり、conflationによる取りこぼしが構造的に無くなる。
 - **リスク**: 中(UniFFI変更、両プラットフォーム同時対応)。
+- **(rev7)実装との差分(#167)**: `OrchestratorAdapter::new`/`connect_via`はEffectを呼び出し元へ返さず、関数内でロック解放後に
+  解釈する(上のm-R4-4の「ロック下でコールバックを呼ばない」は満たす)。`CallbackIngress.swift`は`OrchestratorCallback`を
+  実装していない(`EventWakeListener`のみ)ため変更不要だった。順序の保証は後に3b/3c(#174)の`PublicationQueue`で
+  スレッドをまたいで成り立つようになった(§2.4-4の狭い例外)。
+
+#### #175の設計: upstream failover監視の再登録をRustのエッジで決める(rev7、#182)
+
+- **問題([#175](https://github.com/cuzic/isekai-terminal/issues/175)、8a′レビューL-4)**: Rustの自動再接続ループ・フォアグラウンド
+  復帰の再接続(どちらもKotlinの`connectPane`を通らない)で新しい世代が`Established`になっても、upstream failover監視
+  (`UpstreamHealthMonitor`)が再登録されず、プロファイルで有効にしたupstream failoverが1回の再接続で黙って止まっていた。
+  原因はKotlin側のミラーフラグ`upstreamFailoverEnabledForCurrentSession`(`connectPane`で立て、`onConnectionLost`で下ろす)。
+  8a′以前から自動再接続ループ経路には同じ欠陥があり、8a′で`connect_via`経路にも`Lost`→`Established(g+1)`が出るようになって
+  顕在化した。#178(Step 13)の`@Ignore`付きテストが記録していた。
+- **決定**: 「この`Established`世代で監視を(再)登録すべきか」は、Rustが既に持つ状態`OrchestratorState::last_connect_attempt`
+  (自動再接続・フォアグラウンド復帰も同じ設定で張り直す)から決め、エッジに載せる:
+  `ConnectionEdge::Established { host: String, upstream_failover: bool }`。
+  - `LastConnectAttempt::wants_upstream_failover_monitor()`: `MultipathIsekaiPipeQuic(c)`なら`c.enable_upstream_failover`、
+    他のvariantは`false`(網羅`match`)。
+  - `stage_publications`が`EdgeEstablished`を公開するとき、`host`と同じく**applyと同じ臨界区間で**`last_connect_attempt`から
+    解決する(§2.4-2のin-lock解決)。reducer(`reconnect_fsm.rs`)は変えない。秘密を含む設定をreducerに載せない(§3-3)。
+  - Kotlinはミラーフラグを撤去した(`rust-ssot.md`)。`onConnectionEstablished`は`edge.upstreamFailover`に従って登録し
+    (古いhandleがあれば先に閉じる)、`onConnectionLost`はhandleを閉じるだけ。Swiftは`ConnectionEdgeRouter`で値を転送する
+    (iOSにはプラットフォーム側の監視が無く、upstream failoverはRust側の`RebindManager`だけで動くので使わない)。
+  - UniFFI変更あり(enum payloadの追加。コールバックのシグネチャは不変なので配線契約`WiringContract.kt`は変更不要)。
+    バインディングは`regenerate-uniffi-bindings.yml`で再生成(Kotlin本体とSwift 3ファイル+`.sha256`)。
+  - 不採用の代替案: (1)ミラーフラグを残して`onConnectionLost`で下ろさない(状態のコピーが残る)、(2)Kotlinが`Established`のたびに
+    プロファイルを見直す(Rustが実際に張り直している設定と食い違いうる)、(3)非秘密フラグを`ReconnectState`へコピーする
+    (`last_connect_attempt`と2か所で同期が要り、`host`のshell解決とも非対称)。
+- **不変条件**: I1 `Established(g).upstream_failover == wants_upstream_failover_monitor(その時点のlast_connect_attempt)`(手動・
+  再接続ループ・フォアグラウンド復帰のどの世代でも)。I2 8a′のエッジ契約は不変。I3 Kotlinで同時に開いている監視handleは
+  高々1つ。I4 Kotlin/Swiftは「今のセッションで有効か」のミラー状態を持たない。テストはorchestratorテスト3本、callback契約
+  goldenの新シナリオ`upstream_failover_reconnects`、Kotlinのgolden replay(`@Ignore`を外した)と`TerminalTabsViewModelTest`、
+  Swiftのgolden replay。
+- **関連して直した既存の欠陥(`for_reconnect`によるfdの除去)**: `MultipathIsekaiPipeQuicConfig`の`wifi_fd`/`cellular_fd`は
+  Kotlinが`detachFd()`で渡す1回きりの生fdで、最初のセッションが引き取り、破棄時にcloseする。ところが再接続は
+  `last_connect_attempt`のcloneを使うので**同じfd番号をもう一度引き取っていた**(close済みのfd、または番号を再利用した
+  無関係なfdを奪って閉じうる)。`connect_via`(再接続専用の経路)では`LastConnectAttempt::for_reconnect()`で物理fdを外し、
+  path0/path1だけで張り直す(日和見的ポリシー)。
+- **残課題([#186](https://github.com/cuzic/isekai-terminal/issues/186))**: 再接続後に物理マルチパス(Wi-Fi/セルラーのfd)を
+  再取得しない。Kotlin側の物理マルチパスhandleは従来どおり最初の`Lost`で解放する。再取得の判断の置き場所(`Established`エッジに
+  載せるか、`on_request_wifi_fd`/`on_request_cellular_fd`を再接続の直前に呼ぶか、ブロッキングコールバックのスレッド)は
+  #186で決める(実験的・既定OFF機能)。
 
 ### Step 8b: `TerminalSession`のUI状態をreducerへ(rev6: 再評価へ移した)
 
 - **rev6**: Step 9の報告でエッジ取りこぼしの事例が0件、Android側の不具合は配線漏れとプラットフォーム由来が主だったため、
   ユーザー決定で再評価へ移した(§6末尾、§0 rev6)。以下は行う場合の内容(rev4までのまま)。
+- **rev7**: D2のユーザー決定(2026-10-06)で実施した(#173、実装記録)。`reduce(TerminalUiState, UiMsg)`は`ConnectionStateMapper.kt`に置き、
+  UiMsgは18種。テストは`UiMsgReducerTest.kt`(JVMのみ、旧ラムダを書き写したモデルとの性質テスト)。
 
 - `TerminalSession.kt`の`_state.update`22箇所を、`ConnectionStateMapper`を拡張した`UiMsg`→`TerminalUiState`の
   純粋な畳み込みに寄せる。**対象はUI表示状態のみ**(`rust-ssot.md`の例外条項)。
@@ -1071,6 +1205,24 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   10-2は状態爆発: 宇宙のサイズはCI時間(目安: 数十秒以内)に収まる範囲に固定し、PRで実測値を書く。
 - **前提**: Step 2a(`ServeAggregate`とファサード)。10-1はStep 1.5の`AttachRuntime`込みテスト基盤を再利用する。
 - **ロールバック**: テストのrevertのみ。stateright採用時はdev-dependencyの削除と`Cargo.lock`の再生成(§7)。
+
+**(rev7)実装と評価の結果**(#179・#180。評価はPR本文に書かれていたので、ここへ書き写す)
+- 10-1(#179): `engine/serve_shell_differential_tests.rs`。上の観測値に加え、ソケットマップ⇔index、**target TCPそのもののopen/EOF**
+  (全破棄経路の後にcloseが観測される。§4.1「限界」がreducerのproptestでは見られないとした「shellが実際にdropした」ことの検証)、
+  RESUMEで渡る出力バッファが同じincarnationの`Arc`であること(shellレベルのI-i)、teardown後にslot・indexエントリ・`SessionIo`・
+  open TCPが1つも残らないことを検査する。`start_paused`は使わない(実loopback接続中の自動前進が`TARGET_CONNECT_TIMEOUT`等を
+  誤発火させるため)。代わりに締切を0か3600秒以上に限り、時計の値に結果が依存しない語彙にした。非空振り検査は固定seed。
+- 10-2(#180): **手書きの有界BFSを採用**(Q15既定案。依存追加なし、`Cargo.lock`不変)。session 2個・離散時刻(逆行含む)・stale lease
+  を含む3つの宇宙で到達可能状態を閉包まで全列挙し、全遷移でproptestと同じ`check_transition`(I-a〜I-k)を、全状態で「全slotを
+  解放した状態へ戻れる」後ろ向き到達性(§4.2のサーバー版)を検査する。状態の同一視はleaseの付け替えに関して正規化した指紋。
+  状態数上限10万。テストビルドでだけ`AttachArbiter`/`ServeAggregate`に`Clone`を導出(`cfg_attr(test, ..)`)。
+- **staterightは不要**と判断(Q15): 状態型の正規化は手書き版と同じものをラッパー型で書く必要があり、差は探索ループ約40行だけ。
+  再提案の条件は、宇宙を広げて状態数が10万を超え並列checkerやsymmetry reductionが要るとき、または反例の可視化が調査に要るとき。
+- **loomは不採用**(Q16既定案): `ServeAggregate`は純粋でロックもスレッドも持たず、shellの並行単位は`tokio::sync::Mutex`の
+  await点で実TCPと`tokio::spawn`を含むため、適用不能。shellの競合は単一ロック・単一applyで構造的に除き、残りは
+  `sweep_resume_race_tests.rs`・`admission_race_tests.rs`と10-1の差分テストで見る分担を維持する。
+- 宇宙の外(session 3個以上、3段以上のsupersede、離散値以外の締切、任意のgrace)と真のlivenessは対象外で、既存のランダム
+  proptestが受け持つ。#185は#177(Step 11)と#180の意味的マージ衝突でmainのテストビルドが壊れたのを直したもの。
 
 ### Step 11(rev5新規): Effect/callback列の不変条件検査(テストのみ)
 
@@ -1189,6 +1341,14 @@ user_initiated_disconnect, background_state, last_attempt: Option<AttemptRef> }`
   goldenを過剰に細かくすると無関係な変更でも更新が要るので、射影は契約に必要な項目に限る。
 - **前提**: Step 8a′(`on_connection_edge`とその実装者)。Step 11の記録器(推奨)。
 - **ロールバック**: テストとgoldenの削除のみ。
+- **(rev7)実装(#178、Q17の回答)**: goldenは`rust-core/tests/golden/callback_contract/<scenario>.json`。生成は
+  `rust-core/src/orchestrator/tests/callback_contract_golden.rs`。シナリオは退出経路(a)〜(f)に`reconnect_gives_up`と
+  `fast_reconnect_cycles`を加えた8つで、#182が`upstream_failover_reconnects`を足して9つ。射影はメソッド名・edge variant・
+  generation・公開状態タグ・テスト用の固定host(#182以降はEstablishedの`upstream_failover`も)。連続する`Reconnecting`は1件に畳む。
+  **goldenはコピーせず、両プラットフォームが直接読む**: Kotlinは`android/build.gradle.kts`のsystem property
+  `isekai.callbackContractGoldenDir`でディレクトリを渡し`inputs.dir`でテスト入力に宣言、Swiftは`#filePath`基準。
+  更新は`ISEKAI_UPDATE_CALLBACK_GOLDEN=1`を明示したときだけ(CIでは設定しない)。`SCENARIOS`に無い孤立goldenがあれば失敗する。
+  Swiftは振り分けを挙動を変えずにLogic層の`ConnectionEdgeRouter`へ移し、Linuxの`swift test`で検証できるようにした。
 
 ### 再評価(証拠を見てから決める): Step 3b/3c(残り)・8b
 
@@ -1196,9 +1356,12 @@ rev6で、Step 5は昇格(3aの後)、Step 7はStep 6へ統合、3b/3cのうち`
 
 | Step | 内容 | 再評価の判断材料 |
 |---|---|---|
-| 3b/3c(残り) | 再接続ループのtick会計(`elapsed`/`tick_count`による`due`の計算)・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと、`pending_wake`を含めた3aのproptestの後に、tick会計まわりの未検証インターリーブや不具合が実際に残っているか。**(実施済み、下の注記)** |
+| 3b/3c(残り) | 再接続ループのtick会計(`elapsed`/`tick_count`による`due`の計算)・`woke_early`分岐を`ReconnectState`へ | Step 2.5で決定論化した既存テストと、`pending_wake`を含めた3aのproptestの後に、tick会計まわりの未検証インターリーブや不具合が実際に残っているか。**(実施済み、#174、下の注記)** |
+| 8b | `TerminalSession.kt`のUI状態のreducer化(§6 Step 8b) | UI状態(`_state.update`22箇所)由来の不具合が観測されたか。行う場合は8a′ → 8bの依存と、13の後に行う推奨順序に従う。**(実施済み、#173)** |
 
-**Step 3b/3cの実施記録(リード判断で着手)**: tick会計・`due`・`woke_early`分岐・タイムアウトのギブアップ・`cancel_reconnect`・
+(rev7)この表の2行はどちらも、D2のユーザー決定(2026-10-06)で実施した(§10)。
+
+**Step 3b/3cの実施記録(リード判断で着手。rev7: D2のユーザー決定で実施が承認された)**: tick会計・`due`・`woke_early`分岐・タイムアウトのギブアップ・`cancel_reconnect`・
 ループ起動失敗(3aレビューm2)を`ReconnectState::apply`へ移した(`LoopStarted`/`ReconnectTick{epoch, policy}`/`ReconnectWake{epoch, policy}`/
 `CancelReconnect`/`LoopStartAborted`、ループのタイマーは§2.2-1の`ArmLoopTimer{epoch, after}`)。挙動は旧ループと同じで(旧ループを書き写した
 参照モデルとのproptestで固定)、ADRが割り当てた変更は2点だけ: (1)ギブアップで`reconnect_epoch`を進める(3aレビューm5)。(2)状態公開と接続エッジを
@@ -1211,7 +1374,9 @@ Kotlinの`onConnectionLost`がupstream failover監視を閉じて`upstreamFailov
 `enableUpstreamFailover`のマルチパスプロファイルでは復帰後に監視が再登録されない(自動再接続ループ経路では以前から同じ)。
 `physicalMultipathHandle`の非同期closeと`connect_via`がcloneした`wifi_fd`/`cellular_fd`の再利用の競合も同じ経路の既存問題。
 「同じ手動接続の再接続をまたいでfailoverフラグを保つ」「自動再接続時のfd所有権」を別Issueで決める(実験的・既定OFF機能)。
-| 8b | `TerminalSession.kt`のUI状態のreducer化(§6 Step 8b) | UI状態(`_state.update`22箇所)由来の不具合が観測されたか。行う場合は8a′ → 8bの依存と、13の後に行う推奨順序に従う |
+**(rev7)L-4の決着**: [#175](https://github.com/cuzic/isekai-terminal/issues/175)として起票され、#182で解決した(failoverフラグは
+Rustが`Established`エッジに載せ、Kotlinのミラーフラグは撤去。fdの二重引き取りは`for_reconnect`で除去)。物理マルチパスfdの再取得は
+[#186](https://github.com/cuzic/isekai-terminal/issues/186)に残る(§6 Step 8a′の「#175の設計」)。
 
 ---
 
@@ -1260,6 +1425,14 @@ Kotlinの`onConnectionLost`がupstream failover監視を閉じて`upstreamFailov
   ダウンロードした`.actual.json`を内容確認の上で`.json`としてコミットする(ローカルでcargoを実行しない運用のため)。
   Kotlin/Swift側のreplayテストは既存の`android-unit-test`(required)・`ios-logic-linux-check`(非required、Step 13の
   PRと以後goldenを変更するPRでは緑をマージ条件にする)で走る。新しいworkflowは作らない。
+- **(rev7)実装の状況**:
+  - 実施: 失敗時artifact upload(`proptest-regressions`、#137。`**/golden/**/*.actual.json`も同じstep、#178)、純粋性ジョブ
+    `rust-core-purity-check`(#139、7aの検査も同ジョブ内)。D3により2026-10-06にmainのrequired checkへ追加(#161、required 6本)。
+  - **未実施**: `regenerate-lockfile.yml`の最小差分モード。`Cargo.lock`の変化(Step 1のproptest、Step 6・6+7の依存追加)は
+    手で最小限を編集し、required `lockfile-drift`(`cargo metadata --locked`)で整合を検証した。
+  - **未実施**: mutants週次の`cargo-mutants-pure.yml`(既存の`cargo-mutants-check.yml`は不変)。D3で非requiredと決めたジョブで、
+    本ADRのどのStepもマージ条件にしていない。行う場合は上の設計に従う。
+  - stateright(Q15)は採らなかったので、Step 10による`Cargo.lock`の変化は無い。
 
 ---
 
@@ -1319,25 +1492,37 @@ Kotlinの`onConnectionLost`がupstream failover監視を閉じて`upstreamFailov
 - **Rejected由来のリーク(round 2 N-3)**: ユーザー決定(a)によりStep 2aで修正(I-g)。
 - **旧D5(rev5、Step 9の報告で§6の順序を変えるか)**: ユーザー決定でrev6の順序に変更(§0 rev6)。D5の番号は新規事項に振り直した。
 
-### 未解決(ユーザー判断待ち、この一覧がすべて)
+### 旧「未解決」事項の決着(rev7、ユーザー判断待ちの事項は残っていない)
 
-本文の他の箇所に散らばっていた「後で決める」事項もここに集約した。どれもApproveをブロックしない
-(各Stepの着手時またはPR内で決められる)。表の「既定案」は、ユーザーが何も指定しなければ実装時に採る案。
+rev4〜rev6では、ここに「未解決(ユーザー判断待ち、この一覧がすべて)」として次の事項を集約していた。rev7で全件の決着を記録する。
+「決着」はユーザー決定、または実装PRが既定案を採った結果(PRで採否を開示し、レビューを経てマージされたもの)。
 
-| # | 何を決めるか | いつ決めるか | 既定案 |
-|---|---|---|---|
-| **A** | **このADRをApproveするか** | 今 | — |
-| Q9 | Step 2aのpreempt/repark順序の具体化: `SessionIo`の`preempt`/`reparked`通知を集約ロック外で行うときの順序(`mod.rs:1400-1412`付近)、中継ループ側の`preempt`受け渡し(`mod.rs:1821-1822`)の付け替え | Step 2aのPR | preempt後は起床/タイムアウトに関わらず`ResumeRequested`を1回再送し、再び`RequestPreempt`なら拒否(round 4 m-R4-2、Step 2a本文) |
-| Q10 | `path_health_fsm.rs`が使う`path_health.rs`の`classify_path_health`/`has_zero_response`と`noq::PathStats`を、項目単位で許可するか純粋モジュールへ移すか | Step 0のPR | 3つとも項目単位で許可(コード移動なし) |
-| Q12 | §2.6のEvent記録とreplayを実施するか(§3-3の秘密情報規則が前提) | Step 3aの後 | 実施しない(必要が生じたら再検討) |
-| Q13 | crate rootの公開値型を項目単位許可のまま運用するか、`src/public_state.rs`へ移設するか | Step 3aと`session_state.rs`登録の時点 | 項目単位許可のまま。許可リストが10項目を超えたら移設 |
-| Q14 | Step 0のclippy設定で、解決できない`disallowed-*`パスの警告をどう抑止するか([EXT]) | Step 0のPR | エントリごとの`allow-invalid`等で抑止できるか試し、不可ならcrateごとの`clippy.toml`に分ける |
-| D1 | Step 2c(admission時の容量予約でunresumableを到達不能にする)を行うか | Step 2bの後 | **決定済み(Approve時): Step 2bの後で実施する**(当初の既定案「観測まで延期」は採らない) |
-| D2 | Step 3b/3c(残り)・8bを行うか(§6末尾の再評価表)。**rev6で範囲を変更**: Step 5は昇格、Step 7はStep 6へ統合、3b/3cのうち`pending_wake`はStep 3aに取り込み済みなので、3b/3cはもう全体が延期ではなく、残りのtick会計・`woke_early`だけが対象 | Step 2.5・3aの後(8bは8a′・13の後) | 再評価表の判断材料で未検証のインターリーブや不具合が見つかった場合だけ行う |
-| D3 | 純粋性検査ジョブ(clippy+allowlist)とmutants週次ジョブをrequired checkにするか | Step 0のジョブ導入後 | **決定済み(Approve時): 純粋性検査ジョブのみrequired化する。mutants週次ジョブは非required。** 実施時は`main-branch-protection.md`に従い、ジョブに明示的な`name:`を付け、`gh api -X PUT .../branches/main/protection`の`checks[].context`へ同時に追加する(追加を忘れるとcontextが恒久pendingになる)。誤検知でmainが詰まらないよう、まず数回のCI実績で安定を確認してからprotectionに追加する |
-| D4 | `native/mux/mod.rs`の`RECONNECT_STABLE_THRESHOLD`(60秒)を200秒に揃える挙動変更を行うか | Step 6とは別PR | 本ADRの範囲外。`reconnect_backoff.rs:64-71`の既知follow-upとして別途 |
-| Q15(rev5) | Step 10-2の有界網羅探索を、手書きBFS(依存追加なし)で行うかstateright(dev-dependency)で行うか。stateright採用時、§8「新しいFSM/effectフレームワークcrateの導入」をしないとの関係を「テスト専用の検証道具は対象外」と解釈してよいか | Step 10のPR | 手書きBFS。反例経路の可読性やeventually性質(§4.2)が要るとわかった時点でstaterightを再提案する |
-| Q16(rev5) | loomを導入するか(Step 10の評価では、tokio非同期mutexで組まれた`ServeAggregate`のshellには適用できない。候補は`pool.rs`の同期部分のみ) | Step 4の後 | 導入しない(`pool.rs`のロック粒度の競合が実害として観測されたら再検討) |
-| Q17(rev5) | Step 13のgoldenの置き場所・形式・射影項目、Kotlin/Swiftテストからの参照方法 | Step 13のPR | `rust-core/tests/golden/callback_contract/<scenario>.json`、射影はメソッド名・edge variant・generation・公開状態タグのみ |
-| Q18(rev5) | Step 7aで`[[interpreter]]`登録をどこまで広げるか(`decide_connect_failure_recovery`のような「Effectではないが網羅性が不変条件を担うenum」の`match`を含めるか)、lintが捕まえない形の検出をスクリプトで行うか | Step 7aのPR(Step 12の判断も同様) | interpreter関数は全登録。非Effectのenumは`always-connects.md`に関わるもの(Step 12)だけ属性を付ける。`if let`等はスクリプトで拒否する |
-| D5(rev6) | **「callback/フラグを実装したが配線していない」不具合クラス(Step 9報告の分類W)への対処**。報告によればリポジトリ全体で多く(例: 2a07a5e3、8baa49d8、db3a6d87、ce214ef5、ae8ed13b、119205f6、e1c370e5、7b10472a)、reducer・純粋性検査・原子性テストのどれも「Eventが一度も届かない」ことは捕まえないため、本ADRのどのStepも対象にしていない。**提案のみ(未決定)**: CIで「`OrchestratorCallback`の各メソッドと、プラットフォームから呼ばれるべきUniFFI公開メソッド(例: `notify_did_enter_background`等のライフサイクル入口)が、それぞれKotlin/Swift側に1つ以上の呼び出し箇所(またはそれを呼ぶテスト)を持つ」ことを検査する。実装手段の候補はStep 0のallowlistスクリプトと同じ簡易字句解析、またはStep 13のgolden replayの拡張。対象メソッドの列挙方法(UniFFI生成物から取るか手書きリストか)と、意図的に片方のプラットフォームだけで呼ぶメソッドの例外の書き方も未定 | ユーザーが決める(本ADRの範囲に入れるか、別ADRにするかを含む) | 既定案なし(ユーザー判断待ち) |
+| # | 何を決めるか(要約) | 決着 |
+|---|---|---|
+| A | このADRをApproveするか | 2026-10-06にApprove(rev4)。rev7(2026-10-07)で実装完了を記録しAccepted |
+| Q9 | Step 2aのpreempt/repark順序、中継ループへの`preempt`受け渡しの付け替え | **既定案どおり**(#146): preempt後は起床/タイムアウト(2秒)に関わらず`ResumeRequested`を1回再送し、2回目の`RequestPreempt`は拒否。旧実装はタイムアウト時に再確認せず拒否していたので、取りこぼし窓は「拒否」から「最大2秒の遅延」になった(2aの意図した挙動変更3つとは別に、Step 2a本文が定めた変更として開示) |
+| Q10 | `path_health.rs`の`classify_path_health`/`has_zero_response`と`noq::PathStats`の扱い | **既定案どおり**(#139): 3つとも項目単位で許可、コード移動なし |
+| Q12 | §2.6のEvent記録とreplayを実施するか | **既定案どおり実施しない**。Step 11(#177)はテスト内メモリ上の記録と検査だけで、本番コードへの記録機構・ファイル出力は入れていない |
+| Q13 | crate rootの公開値型を項目単位許可で運用するか、`src/public_state.rs`へ移すか | **既定案どおり項目単位許可**(#139、#145で`crate::ConnectionIssueHint`を`[[allow_item]]`で追加)。外部crateの項目単位許可も同じ形で増えた(#164、#166)。許可リストは10項目に達しておらず、移設はしていない。`session_state.rs`の登録(Step 0の前提条件)は、どのStepでも行っていない |
+| Q14 | 解決できない`disallowed-*`パスの警告の抑止 | **`allow-invalid = true`を全エントリに付けた**(#139) |
+| Q15 | Step 10-2を手書きBFSで行うかstaterightで行うか | **手書きBFSを採用、staterightは不要**(#180、Step 10の「実装と評価の結果」)。依存追加なし。§8との関係の解釈は、採用しなかったので確認不要になった |
+| Q16 | loomを導入するか | **導入しない**(#180の評価、既定案どおり)。`ServeAggregate`のshellには適用不能。`pool.rs`の同期部分も実害の観測が無い |
+| Q17 | Step 13のgoldenの置き場所・形式・射影・参照方法 | **既定案どおりの置き場所**(#178): `rust-core/tests/golden/callback_contract/<scenario>.json`。射影は既定案の項目に固定hostを加え、#182でEstablishedの`upstream_failover`を追加。Kotlin/Swiftはgoldenをコピーせず直接読む(Step 13) |
+| Q18 | `[[interpreter]]`登録の範囲、lintが捕まえない形の検出 | **既定案どおり**(#143): interpreter関数は登録し、スクリプトが`if let`/`let .. else`/`matches!`と属性欠落を拒否。以後のStepの新interpreter(`interpret_in_lock`、`apply_idle_in_lock`/`run_pool_effects`、`resume_loop.rs`の2関数、`drive_connect_recovery`、`stage_publications`、3aの`execute_reconnect_effects`)もすべて登録済み(`execute_reconnect_effects`は#145の時点では属性のみで、登録は後続のPRで追加)。非Effectのenumは`decide_connect_failure_recovery`だけ明示arm+属性(#144、#166で移設後も維持) |
+| D1 | Step 2cを行うか | Approve時の決定は「2bの後で実施」。**2bの後、ユーザー決定で見送り**: 2bでI-kが成り立ち、本番ではunresumable登録が到達不能になって2cの目的は達成済み(§4.1、Step 2c)。残る死んだ機構の撤去は本ADRのStepとしては行わない |
+| D2 | Step 3b/3c(残り)・8bを行うか(rev6で範囲変更) | **ユーザー決定(2026-10-06): 実施**。同日の決定でStep 3b/3c・5・6+7・8b・10・11・13の実施を承認した(5・6+7はrev6で既にロードマップ入りしていたもの、10・11・13はrev5の追加Step)。3b/3cは#174、8bは#173。再評価表の判断材料(未検証のインターリーブや不具合の観測)を待たずに行った |
+| D3 | 純粋性検査ジョブとmutants週次ジョブをrequired化するか | Approve時の決定どおり。**2026-10-06に`rust-core-purity-check`をmainのrequired checkに追加**(#161、required 6本、`main-branch-protection.md`更新)。mutants週次ジョブは非requiredのまま(ジョブ自体も未作成、§7) |
+| D4 | `native/mux/mod.rs`の`RECONNECT_STABLE_THRESHOLD`(60秒)を200秒に揃えるか | **引き続き本ADRの範囲外**。60秒/200秒の差はStep 6・6+7で変えていない。関連する潜在ギャップ(BUSY再試行の最悪所要210秒が200秒の安定閾値を超えうる)は[#187](https://github.com/cuzic/isekai-terminal/issues/187)で扱う |
+| D5 | 「callback/フラグを実装したが配線していない」不具合クラス(分類W)への対処 | **別ADRにした**: `docs/adr/0020-unwired-callback-detection.md`(本ADRの範囲外)。配線契約テスト(#165、#171)やdead_code検査(#172、#181)はそちらのADRの実装 |
+
+### 範囲外として残るもの(rev7時点)
+
+本ADRのStepとしては行わず、それぞれの場所で扱う。
+
+- Step 2cの死んだunresumable機構の撤去(Step 2c)。行う場合は挙動を変えないリファクタとして扱う。
+- 再接続後の物理マルチパスfdの再取得: [#186](https://github.com/cuzic/isekai-terminal/issues/186)(Step 8a′の「#175の設計」)。
+- D4の60秒/200秒と、BUSY再試行210秒の潜在ギャップ: [#187](https://github.com/cuzic/isekai-terminal/issues/187)。
+- `resume_client.rs`の再アタッチwake(Step 3aの範囲外の注記)は、どのStepにも割り当てていない。
+- `session_state.rs`・`terminal.rs`の純粋モジュール登録(Step 0の前提条件の列挙)。
+- §7の未実施分(`regenerate-lockfile.yml`の最小差分モード、mutants週次ジョブ)。
+- L1(`docs/adr/0018-connection-resilience-simulation.md`の保留、再評価は`docs/adr/0021-deterministic-network-simulation-l1.md`)。
