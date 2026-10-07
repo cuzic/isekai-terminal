@@ -830,11 +830,18 @@ mod tests {
         let mut issued: Vec<LeaseId> = Vec::new();
         let mut issued_set: HashSet<LeaseId> = HashSet::new();
         let fabricated = fabricated_lease();
+        // Step 11: 各applyの(Event, Effect列)を秘密を除いた形で記録し、最後にT3/stale timerの列不変条件を検査する。
+        let mut trace: Vec<super::super::trace_invariants::ServeStep> = Vec::new();
 
         for op in ops {
             if let Op::HelloBypass { s, g, at } = op {
                 prop_assert!(!check_capacity, "HelloBypass in a capacity-checked run");
-                for e in agg.hello_bypassing_admission(key(s, g as u64, at)) {
+                let bypass_effects = agg.hello_bypassing_admission(key(s, g as u64, at));
+                trace.push(super::super::trace_invariants::ServeStep {
+                    event: super::super::trace_invariants::ServeTraceEvent::Other("HelloBypassingAdmission"),
+                    effects: super::super::trace_invariants::observe_effects(&bypass_effects),
+                });
+                for e in bypass_effects {
                     if let ServeEffect::Attach(AttachEffect::ConnectTarget { lease }) = e {
                         prop_assert!(issued_set.insert(lease), "lease minted twice");
                         prop_assert_ne!(lease, fabricated);
@@ -848,7 +855,12 @@ mod tests {
             let before_count = agg.arbiter.session_count();
             let before = snapshot(&agg);
             let before_index = agg.index.clone();
+            let observed = super::super::trace_invariants::observe_event(&agg, &event);
             let effects = agg.apply(event);
+            trace.push(super::super::trace_invariants::ServeStep {
+                event: observed,
+                effects: super::super::trace_invariants::observe_effects(&effects),
+            });
             let after = snapshot(&agg);
 
             for e in &effects {
@@ -1035,6 +1047,9 @@ mod tests {
                 }
                 ServeEvent::Activated { .. } => {}
             }
+        }
+        if let Err(violation) = super::super::trace_invariants::check_serve_trace(&trace) {
+            prop_assert!(false, "Step 11 serve trace invariant violated: {} / trace: {:?}", violation, trace);
         }
         Ok(())
     }

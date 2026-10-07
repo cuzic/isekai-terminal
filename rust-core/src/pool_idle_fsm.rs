@@ -175,6 +175,8 @@ mod tests {
             let mut l = IdleLedger::first_holder();
             let mut holders: u32 = 1;
             let mut armed: Vec<u64> = Vec::new();
+            // Step 11: 満了したタイマーの(token, 現行token, Effect数)の列を`trace_invariants`で検査する。
+            let mut trace: Vec<crate::trace_invariants::TraceEvent> = Vec::new();
             for op in ops {
                 let before = l;
                 let ev = match op {
@@ -185,6 +187,13 @@ mod tests {
                     Op::FireArbitrary(g) => IdleEvent::IdleExpired { generation: g },
                 };
                 let fx = l.apply(ev);
+                if let IdleEvent::IdleExpired { generation } = ev {
+                    trace.push(crate::trace_invariants::TraceEvent::TimerFired {
+                        token: generation,
+                        current: before.generation(),
+                        effects: fx.len(),
+                    });
+                }
                 match ev {
                     IdleEvent::Attached => {
                         holders += 1;
@@ -214,6 +223,9 @@ mod tests {
                     }
                 }
                 prop_assert_eq!(l.refcount(), holders, "refcount must match attaches minus releases");
+            }
+            if let Err(violation) = crate::trace_invariants::check_trace(&trace) {
+                prop_assert!(false, "Step 11 trace invariant violated: {} / trace: {:?}", violation, trace);
             }
         }
     }

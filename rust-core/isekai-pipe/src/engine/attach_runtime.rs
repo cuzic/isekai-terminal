@@ -247,7 +247,20 @@ pub struct AttachRuntime {
     /// Epoch of this shell's `Millis` (ADR §2.2). `tokio::time::Instant`, so
     /// it follows the paused clock in `start_paused` tests.
     epoch: tokio::time::Instant,
+    /// ADR §6 Step 11: in test builds, every apply's event/effects, checked
+    /// against the serve trace invariants on each record and at drop. A
+    /// zero-sized `()` in non-test builds (see [`TraceHook`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    trace: TraceHook,
 }
+
+/// Test builds: the Step 11 trace recorder. Non-test builds: `()` (nothing is
+/// recorded; production behavior is unchanged). A type alias rather than a
+/// `#[cfg(test)]` field so the struct literal needs no cfg'd field either.
+#[cfg(test)]
+type TraceHook = super::trace_invariants::ServeTraceRecorder;
+#[cfg(not(test))]
+type TraceHook = ();
 
 impl AttachRuntime {
     /// `max_sessions`: `--max-sessions` (Phase S-4b) — the admission cap
@@ -262,6 +275,7 @@ impl AttachRuntime {
             next_target_id: AtomicU64::new(0),
             target,
             epoch: tokio::time::Instant::now(),
+            trace: Default::default(),
         })
     }
 
@@ -282,7 +296,11 @@ impl AttachRuntime {
             let now = self.stamp();
             let event = make(now);
             let ServeCore { agg, io } = &mut *core;
+            #[cfg(test)]
+            let observed = super::trace_invariants::observe_event(agg, &event);
             let effects = agg.apply(event);
+            #[cfg(test)]
+            self.trace.record(observed, &effects);
             interpret_in_lock(io, effects, &mut staged)
         };
         // Lock released. Anything the reducer did not take (e.g. a socket
@@ -763,6 +781,7 @@ impl AttachRuntime {
             let mut core = self.core.lock().await;
             let ServeCore { agg, io } = &mut *core;
             let effects = agg.hello_bypassing_admission(key);
+            self.trace.record(super::trace_invariants::ServeTraceEvent::Other("HelloBypassingAdmission"), &effects);
             interpret_in_lock(io, effects, &mut Staged::default()).attach
         };
         self.execute_effects(attach).await;

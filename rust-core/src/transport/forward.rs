@@ -442,7 +442,7 @@ mod local_forward_e2e_tests {
             drop(probe);
 
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
             let orchestrator = create_session_orchestrator(callback);
 
             let config = SshConfig {
@@ -519,7 +519,7 @@ mod local_forward_e2e_tests {
             let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
 
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
             let orchestrator = create_session_orchestrator(callback);
 
             let config = SshConfig {
@@ -580,7 +580,7 @@ mod local_forward_e2e_tests {
             drop(probe);
 
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
             let orchestrator = create_session_orchestrator(callback);
 
             let config = SshConfig {
@@ -650,7 +650,7 @@ mod local_forward_e2e_tests {
             drop(probe);
 
             let (tx, mut rx) = unbounded_channel::<TestEvent>();
-            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback::new(tx));
             let orchestrator = create_session_orchestrator(callback);
 
             let config = SshConfig {
