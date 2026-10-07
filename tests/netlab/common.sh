@@ -135,25 +135,32 @@ SESSION_SECRET_B64="$(jq -r '.session_secret' "$WORKDIR/serve.stdout")"
 CERT_SHA256="$(jq -r '.peer.server_identity.cert_sha256' "$WORKDIR/serve.stdout")"
 QUIC_PORT="$(jq -r '.candidates[0].port' "$WORKDIR/serve.stdout")"
 
-# --- client ns側のtrust store(known_helpers.toml)を、bootstrap経由の
-# isekai-ssh initが書くのと同じ形式で直接組み立てる(schema.rs参照)。
+# --- client ns側のPersistentProfile(isekai-pipe-core::profile)を、bootstrap経由の
+# isekai-ssh initが書くのと同じ形式で直接組み立てる。旧known_helpers.tomlは
+# もうどのlive pathからも読まれない(PoC作成後に移行済み)ので、
+# <profiles dir>/poc-host%3A22.json に書く(':'は%3Aにエスケープされる)。
 CLIENT_HOME="$WORKDIR/client-home"
-TRUST_DIR="$CLIENT_HOME/.config/isekai-ssh"
-mkdir -p "$TRUST_DIR"
-cat > "$TRUST_DIR/known_helpers.toml" <<EOF
-[helpers."poc-host:22"]
-identity_pubkey = "unused-by-legacy-connect-path"
-trusted_helper_sha256 = "$(printf '0%.0s' $(seq 1 64))"
-trusted_helper_version = "0.0.0-netlab-poc"
-update_policy = "exact-digest-only"
-trusted_at = "1970-01-01T00:00:00Z"
-last_seen_at = "1970-01-01T00:00:00Z"
-cached_relay_addr = "$NETLAB_SERVER_IP:$QUIC_PORT"
-cached_cert_sha256 = "$CERT_SHA256"
-cached_session_secret = "$SESSION_SECRET_B64"
-EOF
-chmod 700 "$TRUST_DIR"
-chmod 600 "$TRUST_DIR/known_helpers.toml"
+PROFILES_DIR="$CLIENT_HOME/profiles"
+mkdir -p "$PROFILES_DIR"
+jq -n \
+    --arg cert "$CERT_SHA256" \
+    --arg addr "$NETLAB_SERVER_IP:$QUIC_PORT" \
+    --arg secret "$SESSION_SECRET_B64" \
+    --arg zeros "$(printf '0%.0s' $(seq 1 64))" \
+    '{
+        schema_version: 2,
+        profile: "poc-host:22",
+        server_identity: {cert_sha256_hex: $cert},
+        service: "ssh",
+        relay_policy: "relay-allowed",
+        legacy_relay_transport: {helper_addr: $addr, session_secret_b64: $secret},
+        identity_pubkey: "unused-by-legacy-connect-path",
+        trusted_helper_sha256: $zeros,
+        update_policy: "exact-digest-only",
+        last_seen_at: "1970-01-01T00:00:00Z"
+    }' > "$PROFILES_DIR/poc-host%3A22.json"
+chmod 700 "$PROFILES_DIR"
+chmod 600 "$PROFILES_DIR/poc-host%3A22.json"
 
 }
 
@@ -161,7 +168,7 @@ chmod 600 "$TRUST_DIR/known_helpers.toml"
 # stdinはそのまま渡る。$NETLAB_SSH_TIMEOUT秒(既定60)でtimeout。
 netlab_ssh() {
     timeout "${NETLAB_SSH_TIMEOUT:-60}" ip netns exec "$NETLAB_CLIENT_NS" env \
-        HOME="$CLIENT_HOME" PATH="$PATH" \
+        HOME="$CLIENT_HOME" ISEKAI_PIPE_PROFILES_DIR="$PROFILES_DIR" PATH="$PATH" \
         RUST_LOG=isekai_transport=debug,isekai_pipe=debug \
         ssh -F /dev/null \
             -o IdentityFile="$WORKDIR/client_key" \

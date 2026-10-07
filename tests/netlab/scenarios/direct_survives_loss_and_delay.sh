@@ -37,8 +37,10 @@ netlab_ssh sha256sum < "$WORKDIR/payload.bin" > "$WORKDIR/remote_sum.txt" 2> "$W
 SSH_STATUS=$?
 set -e
 
-wait "$SERVE_PID" 2>/dev/null || true
-SERVE_PID=""
+if [ "$SSH_STATUS" -eq 0 ]; then
+    wait "$SERVE_PID" 2>/dev/null || true
+    SERVE_PID=""
+fi
 
 if [ "$SSH_STATUS" -ne 0 ]; then
     echo "ssh exited $SSH_STATUS" >&2
