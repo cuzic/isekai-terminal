@@ -1,0 +1,11 @@
+{
+  "scenario": "c_network_lost_debounce",
+  "description": "(c) TCP接続中のネットワーク喪失がdebounce後も続いた。遅れて届く同じ世代の切断通知は何も出さない",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"}
+  ]
+}

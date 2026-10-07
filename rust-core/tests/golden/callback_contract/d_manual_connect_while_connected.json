@@ -1,0 +1,13 @@
+{
+  "scenario": "d_manual_connect_while_connected",
+  "description": "(d) Connected中に別ホストへ手動接続した。旧世代のLostの後に新しい世代のEstablishedが届く",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "other.example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "other.example.com", "generation": 2}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "scenario": "fast_reconnect_cycles",
+  "description": "切断から自動再接続の成功までを3回続けた。世代ごとにLostとEstablishedが1回ずつ届く",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 2},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 2},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 3},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 3},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 4}
+  ]
+}

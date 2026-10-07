@@ -1,0 +1,12 @@
+{
+  "scenario": "reconnect_gives_up",
+  "description": "切断後の自動再接続ループがタイムアウトでギブアップした",
+  "events": [
+    {"method": "on_connection_state_changed", "state": "Connecting"},
+    {"method": "on_connection_state_changed", "state": "Connected", "host": "example.com"},
+    {"method": "on_connection_edge", "edge": "Established", "host": "example.com", "generation": 1},
+    {"method": "on_connection_edge", "edge": "Lost", "generation": 1},
+    {"method": "on_connection_state_changed", "state": "Reconnecting"},
+    {"method": "on_connection_state_changed", "state": "Disconnected"}
+  ]
+}
