@@ -122,7 +122,7 @@ pub enum RelayTransportKind {
 /// `rust-core/src/helper_bootstrap.rs`, `archive/HELPER_PROTOCOL.md`). STUN/P2P
 /// launch is out of scope for this phase (`archive/ISEKAI_SSH_DESIGN.md` フェーズ
 /// 分割案 S-0e-1/S-6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RelayLaunchSpec {
     pub relay_addr: SocketAddr,
     pub relay_sni: String,
@@ -166,6 +166,23 @@ pub struct RelayLaunchSpec {
     pub resume_window_secs: u64,
 }
 
+/// Hand-written so `relay_jwt` (a bearer token) never reaches a log line
+/// via `{:?}` of this struct or of a `LaunchSpec` holding it (review
+/// 2026-09-29, SSH-42) — every other field is printed as usual.
+impl std::fmt::Debug for RelayLaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayLaunchSpec")
+            .field("relay_addr", &self.relay_addr)
+            .field("relay_sni", &self.relay_sni)
+            .field("relay_jwt", &"<redacted>")
+            .field("relay_transport", &self.relay_transport)
+            .field("idle_lifetime_secs", &self.idle_lifetime_secs)
+            .field("remote_log_level", &self.remote_log_level)
+            .field("resume_window_secs", &self.resume_window_secs)
+            .finish()
+    }
+}
+
 /// What a successful `BootstrapBackend::install_and_start` call yields: the
 /// handshake JSON `isekai-helper` printed once it was up and running
 /// (`archive/HELPER_PROTOCOL.md` §2).
@@ -205,4 +222,26 @@ pub enum LaunchSpec {
         /// same rationale, same fingerprint exclusion.
         resume_window_secs: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SSH-42 regression: the relay bearer token never appears in `{:?}`.
+    #[test]
+    fn relay_launch_spec_debug_redacts_the_jwt() {
+        let spec = RelayLaunchSpec {
+            relay_addr: "203.0.113.10:443".parse().unwrap(),
+            relay_sni: "relay.example.com".to_string(),
+            relay_jwt: "eyJ-super-secret-token".to_string(),
+            relay_transport: RelayTransportKind::Udp,
+            idle_lifetime_secs: 60,
+            remote_log_level: "info".to_string(),
+            resume_window_secs: 180,
+        };
+        let rendered = format!("{spec:?} {:?}", LaunchSpec::Relay(spec.clone()));
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("relay.example.com") && rendered.contains("<redacted>"), "{rendered}");
+    }
 }
