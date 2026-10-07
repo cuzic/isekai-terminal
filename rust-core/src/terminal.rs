@@ -947,6 +947,7 @@ impl Terminal {
     }
 
     /// 現在のテーマのスナップショット([resize_preserving_state]後も変わらない)。
+    #[cfg(test)]
     pub(crate) fn theme(&self) -> Theme {
         self.theme
     }
@@ -1029,6 +1030,7 @@ impl Terminal {
     /// フォーカスレポーティング(`?1004`、タスク#60)の現在値。テストから参照する
     /// (`ScreenUpdate`へは公開しない——`encode_focus_event`がRust側で完結して判断する
     /// ため、UI層がこの値自体を必要としない)。
+    #[cfg(test)]
     pub(crate) fn focus_reporting_mode(&self) -> bool { self.focus_reporting_mode }
     pub(crate) fn mouse_reporting_mode(&self) -> MouseReportingMode { self.mouse_reporting_mode }
     pub(crate) fn sgr_mouse_mode(&self) -> bool { self.sgr_mouse_mode }
@@ -1134,8 +1136,10 @@ impl Terminal {
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
     pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
     /// DECAWM(`CSI ?7h`/`CSI ?7l`)の現在値。テスト・`print()`から参照する。
+    #[cfg(test)]
     pub(crate) fn autowrap_mode(&self) -> bool { self.autowrap_mode }
     /// DECOM(`CSI ?6h`/`CSI ?6l`)の現在値。テストから参照する。
+    #[cfg(test)]
     pub(crate) fn origin_mode(&self) -> bool { self.origin_mode }
     /// OSC 8(タスク#40)のURL intern表。`TermCell::link_id`/`Terminal::active_link_id`
     /// の値はこのスライスのindex。`session.rs::make_screen_update`が
@@ -2117,6 +2121,7 @@ impl Terminal {
     /// 同じエンコードロジックを、UI層(#50/#51)がRust側セッション状態を経由せず
     /// 直接呼べる`#[uniffi::export]`関数(`lib.rs::terminal_pointer_event_bytes`)
     /// からも再利用するため(タスク#51)。
+    #[cfg(test)]
     pub(crate) fn encode_pointer_event(&self, event: PointerEvent) -> Option<Vec<u8>> {
         encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode, self.urxvt_mouse_mode)
     }

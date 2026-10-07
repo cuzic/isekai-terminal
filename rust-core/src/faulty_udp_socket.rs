@@ -274,6 +274,7 @@ impl AsyncUdpSocket for FaultyUdpSocket {
 /// バインドアドレスから `FaultyUdpSocket` を作る。呼び出し側で `Box::new()` して
 /// `noq::Endpoint::new_with_abstract_socket` / `Endpoint::rebind_abstract` の
 /// 引数にそのまま渡せる。
+#[cfg(test)]
 pub(crate) fn bind_faulty_udp_socket(
     bind_addr: SocketAddr,
     injector: UdpFaultInjector,

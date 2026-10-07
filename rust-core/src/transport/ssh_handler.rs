@@ -60,6 +60,7 @@ pub(crate) enum TransportCommand {
         bind_port: u16,
     },
     /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
+    #[allow(dead_code)] // UNWIRED: 送信側(SshSession/ActiveSession::remove_forward)はe8ed36ee(2026-08-09)で削除済み。ハンドラ側の残骸
     RemoveForward { id: String },
     /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには一切触れず、同じ
     /// 認証済み`client::Handle`上に新しい"exec"チャネルを1本開いて短命なコマンドを

@@ -210,6 +210,7 @@ impl MultipathIsekaiPipeQuicSession {
         self.interactive_busy.store(busy, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn is_interactive_busy(&self) -> bool {
         self.interactive_busy.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -258,6 +259,7 @@ crate::session::impl_session_core_delegation!(MultipathIsekaiPipeQuicSession);
 // 一般化・移植した（`PathHealthTracker`/`PathLabel`/`PathState`）。以下の
 // ラベルは今までの`PathCandidateId`の4種にそれぞれ対応する。
 
+#[cfg(test)]
 const PRIMARY_LABEL: &str = isekai_transport::multipath::PRIMARY_PATH_LABEL;
 const SECONDARY_LABEL: &str = "secondary";
 const PHYSICAL_WIFI_LABEL: &str = "physical-wifi";
