@@ -1,6 +1,7 @@
 # ADR: ADR駆動の並列エージェント・デリバリー手順を成文化する(Skill+読み取り専用ヘルパー+権限hook)
 
-- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。未決の質問(§の未解決表)は各Stepの着手時に決める。(以下は承認前のStatus記述) **Proposed(rev2、2026-10-06)**。敵対的レビューround 1(Opus、読み取り専用、
+- **Status**: **Accepted(2026-10-06、ユーザーApprove済み)**。2026-10-07に運用記録(§12)を追記し、§5・§6・§7・§11を
+  それに合わせて更新した(rev3、決定の変更ではなく記録の追加)。未決の質問(§の未解決表)は各Stepの着手時に決める。(以下は承認前のStatus記述) **Proposed(rev2、2026-10-06)**。敵対的レビューround 1(Opus、読み取り専用、
   scratchpad `adr3-review-round1.md`。判定「not converged: BLOCKER 2・MAJOR 9・MINOR 9」)の全指摘と、
   同日のユーザー決定U1〜U3(§4.4)をrev1で反映した。rev2では同じレビュアーのround 2
   (`adr3-review-round2.md`。判定「not converged: BLOCKER 0・MAJOR 4・MINOR 6」)の全指摘を反映した。round 3も同じレビュアーで行う。
@@ -27,6 +28,14 @@
 ---
 
 ## 0. 改訂履歴
+
+### rev3(2026-10-07)— 運用記録の追記
+
+Approve後の2026-10-06〜07のセッション(PR #135〜#185、issue #175・#186・#187)を実際にこの手順で回した記録を§12として追記した。
+既存の本文(§1〜§11)の記述は書き換えず、次だけを更新した: §5の権限表に行を追加・注記、§6にG13〜G18、§7にN13〜N22の行、
+§11の各質問に「2026-10-07の状態」列。決定事項は変えていない(§12.3はセッション中にユーザーが決めたことの記録)。
+根拠は`gh pr list/view`・`gh run list/view`・`gh api …/actions/runs`・`git log origin/main`(全てGET)と、
+scratchpadのレビューファイル(`review-pr{145,146,160,164,166,167,174,182}.md`)。scratchpadは消えるので、採用した根拠は§12に書き写した。
 
 ### rev2(2026-10-06)— round 2レビューの反映
 
@@ -433,6 +442,15 @@ hookの変更なのでユーザー承認事項(Q5)。
 | branch protection・リポジトリ設定・secretsの変更 | **ユーザーのみ** | ヘルパーは読み取り(GET)だけ |
 | flakeの再実行 | lead | §4.1-7の条件を満たす場合に1回だけ |
 | 「挙動を変えるか」の分類 | lead(ヘルパーは変更ファイルから候補を出す) | |
+| **(2026-10-07追加)以下は§12の運用で確定した分担** | | |
+| 挙動を変えるPRの独立レビュー(上の(b)) | **Opusの読み取り専用レビュアー**(PRごとに別エージェント、結果は`scratchpad/review-prN.md`) | 実運用では`/code-review`系ではなくこれで行った(§12.1)。判定が「SAFE TO MERGE once …」の条件付きなら、条件が満たされたことをleadが確認してからマージ |
+| 同じ領域を触るPR群のマージ順序 | **lead**(§12.4のプロトコル) | 1本ずつマージし、次のPRは`origin/main`を取り込んで関連checkを新しいheadで緑にしてから(G13) |
+| mainが赤になったときの修正 | **lead**が修正エージェントを即座に起動。修正PRのマージまで他のマージを止める(G14) | 修正PRはtest-only/小さい修正でもrequired緑を待つ |
+| 失敗jobの再実行(`gh run rerun <id> --failed`) | **Stepエージェントにも許可**(U5、#168) | hookは`--failed`付きだけ通す。全体再実行・`--job`・`--debug`は不可。既知flakyの判断は従来どおり(§4.1-7) |
+| `regenerate-uniffi-bindings.yml`の起動 | **lead** | エージェントはpushまで、leadがdispatch、エージェントが`gh run download`で取り込む(G16) |
+| issueの起票 | **lead** | hookはエージェントの`gh issue create`を拒否する(許可リストは`issue view/list`のみ)。エージェントはPR本文に「フォローアップ」として書き、leadが起票する(#175・#186・#187) |
+| PR本文の修正 | 作成したエージェント | `gh pr edit`は`gh` 2.23で失敗する(GraphQL、§12.2 N19)。`gh api -X PATCH`はhookで拒否されるので、leadに依頼するか、`gh pr create --body-file`の時点で本文を確定させる |
+| **ユーザー自身のPR**(例: #135)のマージ | **lead、ただしユーザーの明示的な許可がある場合のみ** | U8。許可はPRごと |
 
 ---
 
@@ -486,6 +504,29 @@ hookの変更なのでユーザー承認事項(Q5)。
     スクリプトが無いときの`python3`の終了コード2はPreToolUseではブロッキングエラーになり[EXT]、そのセッションの全Bashを止める。
   - (c) settings/hookの変更は§5の「`.claude/settings*.json`・`.claude/hooks/**`…の変更」の行に従い、ユーザー承認を経てPRでmainに入れる。
 
+以下G13〜G18は2026-10-07の運用記録(§12)から追加した。
+
+- **G13**(同じ領域のPRは直列にマージ、N13・N22): 2本以上のopen PRが「同じ領域」(§12.4の定義。ファイルが重ならなくても、
+  網羅性/契約テスト・レジストリと、その列挙対象を追加するPRの組を含む)に触れるときは、1本ずつマージする。
+  2本目以降は、直前のマージを含む`origin/main`を取り込んでpushし、required+関連プラットフォームcheckが**新しいhead**で
+  緑になってからマージする。古いbaseでの緑はマージ可の根拠にしない(#164 B1)。
+- **G14**(mainが赤のときはマージを止める): mainのrequired contextが赤になったら、原因の特定と修正PRのマージまで、
+  他のPRのマージを止める。赤のmainを取り込んだPRのCIは原因PRと無関係に赤になる(#182のB-1)。
+- **G15**(`prop_assert!`の書き方、N15): `prop_assert!`/`prop_assert_eq!`等の条件式に`{ .. }`・`{}`を含む式
+  (`matches!(e, X { .. })`、構造体リテラル)を直接書かない。必ず第2引数に明示メッセージを付ける
+  (`prop_assert!(cond, "msg")`)か、`let ok = …;`で先に束縛する。pushの前に`git diff`をこのパターンで目視確認する。
+- **G16**(UniFFI生成物): `rust-core/src/lib.rs`等、UniFFIで公開される項目の**docコメントだけ**の変更でも、Kotlin/Swift生成物の
+  コメントとchecksum・`.sha256`サイドカーが変わる(#135、N18)。再生成はエージェントがpush → leadが
+  `regenerate-uniffi-bindings.yml`をdispatch → エージェントが`gh run download`で取得して本体と`.sha256`を両方コミット
+  (`uniffi-binding-regeneration.md`)。手で推測した生成物はコミットしない。
+- **G17**(`gh` 2.23): `gh pr edit`(GraphQLエラーで失敗)、`gh pr checks --json`、`gh run list --created`、
+  `run list --json attempt`は使えない。本文は`gh pr create --body-file`で確定させ、checkは`gh pr view --json statusCheckRollup`、
+  再実行回数は`gh api 'repos/…/actions/runs?…'`の`run_attempt`で見る。
+- **G18**(ディスク、N20): G11の90%に加え、waveの終わりごとに次のレシピで掃除する。
+  (a)MERGEDかつ`git status --porcelain`が空かつ`locked`でないworktreeは`git worktree remove`、
+  (b)`locked`のworktree(担当エージェントが生きている可能性がある)は削除せず、`test ! -L`の確認後に
+  `rust-core/target/debug`だけを`rm -rf`する。
+
 ---
 
 ## 7. 観測された失敗モードと対策の対応
@@ -511,6 +552,16 @@ hookの変更なのでユーザー承認事項(Q5)。
 | **N9 権限がプロンプト文言だけ** | PreToolUse deny hook(承認待ち、★の穴を直してから)、`auto_merge`の毎回のポーリング、Q2・Q3・Q4 | §4.3、G8 |
 | **N10 編集hookのローカルbuild** | worktree内で無効化(Q5) | §4.5 |
 | **N12 共有worktreeでのブランチ切り替えによるhook不在** | 設定/hookの編集は別worktreeで、hookコマンドはスクリプト不在時もfail-open、変更はユーザー承認を経たPRで | G12 |
+| **N13 同じ領域のPRの意味的衝突でmainが赤**(2026-10-07追加、§12.2) | 同じ領域のPRは直列マージ+取り込み後の再検証、mainが赤ならマージ停止 | G13・G14、§12.4 |
+| **N14 proptestの偶発的な反例でmainが赤** | 失敗seedを`proptest-regressions`に保存し、修正PRで固定する。mainの赤はG14に従う | G14 |
+| **N15 `prop_assert!`の`{}`誤り(N3の再発)** | 雛形に具体的な書き方を入れ、push前に確認 | G15、Skill草案 |
+| **N16 main pushごとのmacOS/Windows実行によるランナー渋滞** | #169でmain pushはLinuxのみ(U7) | #169 |
+| **N17 deny hookの迂回と誤検知** | #154 rev3(字句解析・ラッパー剥がし・`--method=`・リリースタグ)。残る限界は§4.3のとおり | §4.3、§12.2 |
+| **N18 docコメントだけの変更でUniFFI checksumがずれる** | 再生成プロトコル | G16 |
+| **N19 `gh` 2.23の制約** | 代替コマンド | G17 |
+| **N20 ディスク逼迫(99%)** | 掃除レシピ | G11・G18 |
+| **N21 エージェントが「CI待ち」で手番を終える** | 最終メッセージ形式+leadのポーリング(§4.1-3・5のとおり) | Skill草案 |
+| **N22 古いbaseでの緑** | 取り込み後の新しいheadで再検証 | G13 |
 
 ---
 
@@ -561,20 +612,105 @@ rev0にあった「leadが報告待ちで止まった時間」は計測方法が
 
 ## 11. Open Questions(既定案つき)
 
-| # | 何を決めるか | 既定案 |
+| # | 何を決めるか | 既定案 | 2026-10-07の状態 |
+|---|---|---|---|
+| **A** | このADRをApproveするか(O3を採るか) | — | **回答済み**: Approve(2026-10-06) |
+| Q1 | Skillの置き場所 | project-local `.claude/skills/adr-wave-delivery/`。ヘルパーもその下 | **一部回答**: 草案を`.claude/skills-drafts/parallel-agent-delivery/`に置いた(有効化はユーザー承認待ち)。名前は`adr-wave-delivery`ではなく`parallel-agent-delivery`。ヘルパーは未作成 |
+| Q2 | `allow_auto_merge`を無効にするか(N9の根本対策の一つ。G8のポーリングは検知であって防止ではない) | **hookが入るまで無効にする**。hookの適用と動作の実測(Q4)が済んだら再度有効にするかをユーザーが決める。決めるのはユーザー(G3) | **回答済み**: `allow_auto_merge=false`(U6。2026-10-07に`gh api repos/cuzic/isekai-terminal`で確認) |
+| Q3 | `enforce_admins`を昇格するか | `main-branch-protection.md`のPhase 5の観測手順に従う。本ADRでは提案しない | 未決(`enforce_admins=false`のまま、確認済み) |
+| Q4 | deny hook(§4.3)の対象をどう判定するか(NM2) | 導入時に`HOOK_DEBUG=1`でPreToolUseのstdinを実測する。(i)`agent_id`/`agent_type`がteammate・Stepエージェントに入り、leadには入らないなら、それで判定する(leadは対象外、leadのマージは§5のとおりユーザー委任の範囲)。(ii)入らないなら、worktree内は`deny`のまま、**worktree外ではマージ・mainへのpush・リリース・設定系のコマンドを`ask`**(ユーザーへの確認プロンプト)にする。leadのマージも確認プロンプトになるが、「権限の源はユーザーだけ」に合う。(ii)の場合はユーザーがその手間を受け入れるかを決める | **一部**: hookは`agent_id`/`agent_type`または`cwd`で判定する形で適用済み(#154)。`HOOK_DEBUG=1`による実測結果は記録が無い(未確認) |
+| Q5 | `cargo_check_on_edit.py`を`.claude/worktrees/*`で無効にするか | 無効にする(検証はCIのみの方針に合わせる) | 未決(`cargo_check_on_edit.py`はworktree内でも動く) |
+| Q6 | 「関連プラットフォームcheck」を発動するパスの範囲(U1の「isekai-ssh/isekai-pipe/quicmux」に、依存先crateを含めるか) | `isekai-transport`・`isekai-pipe-core`・`isekai-protocol`を含める。macOS/Windowsでもビルド・テストされるcrateだから | 未決。運用では既定案どおり(isekai-ssh/isekai-pipe/quicmuxと依存crateのPRでmacOS/Windowsを待った) |
+| Q7 | PRの「関連プラットフォームcheck」が閾値Tを超えて終わらないときの扱いと、Tの値 | `AwaitingUser`(待つか、未検証を承知でマージするかをユーザーが決める)。黙ってマージしない。Tは固定の45分ではなく、直近のPRのmacOS job待ち時間(`startedAt - createdAt`)のp90+実行時間で決め、レポーターが毎回の起動時に直近20件から計算して表示する。データが無い初回は60分(2026-10-06の実測で待ち約37〜38分+実行約10分) | 未決。閾値Tは置かず、leadが待った。#169でmain pushのmacOS/Windowsを止めたことで待ちが短くなった(§12.2 N16) |
+| Q8 | ADR段階の追加規約(起票者/レビュアー別エージェント、[SOURCED]/[OPINION]ラベル、ラウンド上限5)を`opus-adversarial-consult`へ入れるか | 別PRで提案する(`.claude/skills`外のグローバルSkillの変更なのでユーザー承認) | 未決 |
+| Q9 | #135(ADRの`docs/adr/`移設)と、それ以降にルートへ追加したADR(本ADR・`ADR_FUNCTIONAL_CORE_EFFECTS.md`)の扱い | #135の扱いが決まるまで新ADRはルートに置く。#135をマージする場合は、その時点でルートのADRも移設するかをユーザーに確認する | **回答済み**: #135をleadがユーザーの明示的な許可を得てマージ(U8、2026-10-07 09:48)。ルートのADRも同PRで`docs/adr/0019〜0022`へ移設 |
+| Q10 | 既知flaky一覧・既知の落とし穴一覧の置き場所 | Skill内のMarkdown。flakyは失敗ログ(job URL)を確認したものだけ載せる | **一部回答**: Skill草案の中のMarkdown(落とし穴・flaky一覧) |
+| Q11 | 滞留worktree・open PR(#126〜#132)の整理を本手順の一部にするか | しない。掃除は**そのwaveが作ったもの**に限る(G10)。滞留分は別途ユーザーに確認 | 既定案どおり(waveが作ったものだけ掃除)。ただしディスク99%時はlockedのworktreeの`target/debug`も削除した(G18) |
+| Q12 | 本ADRのround 3レビュー | round 1・2と同じレビュアーで行う。特に§4.3のhook草案rev2の記述の正確さ、Q4の判定方針、§4.2の重ねたmerge-treeの手順を見てもらう | round 3の記録は無い(Approveで終了) |
+| Q13 | hook草案rev2の★の穴(`isekai-*-v*`タグ名、`--method=PUT`、`env`/`command`/`timeout`/`xargs`/絶対パスの前置)を、適用前に直すか | 直してから適用する。宛先判定に`isekai-[a-z-]+-v*`を加え、`--method=`形を検査し、区切りの中で最初に現れる`gh`/`git`(パスのbasenameで比較)を探して検査する。レビュアーの37ケースと§4.3の確認例を`--self-test`に入れる | **回答済み**: 適用前に直した(#154 rev3: shlex字句解析、`env`/`timeout`/絶対パス等のラッパー剥がし、`--method=`形、`isekai-*-v*`タグ、ヒアドキュメント本文の除外) |
+| Q14 | #147によりmain pushごとにmacOS jobが必ず1本走る(打ち切られない)。macOSランナーの待ち行列が長くなり、PRの`Settling`がさらに延びないか | 計測する(§8の`AwaitingUser`件数と、PRのmacOS待ち時間)。悪化したら、main pushではmacOS jobだけ打ち切り可能にする(job単位のconcurrency)か、macOSを別workflowに分けるかをユーザーが決める。どちらもrequired workflowの変更なのでユーザー承認 | **回答済み**: 悪化した(macOSキュー10件、PRのmacOS完了が40分以上遅延)ため、main pushではmacOS/Windowsをスキップ(#169、U7) |
+
+---
+
+## 12. 運用記録(2026-10-07)
+
+Approve(2026-10-06)後、同じセッションで2026-10-07まで本手順を実際に回した記録。表記は冒頭の「確認済み」「逸話」「推測」に従う。
+時刻はUTC(`git log`のローカル時刻表示は+09:00)。確認に使ったコマンドは全てGET: `gh pr list --state merged --limit 120`、
+`gh pr view N --json commits,comments,reviews,createdAt,mergedAt`、`gh run list --branch main --workflow rust-core-test-check.yml`、
+`gh run view <id> --json jobs`、`gh api repos/cuzic/isekai-terminal/actions/jobs/<id>/logs`、
+`gh api 'repos/cuzic/isekai-terminal/actions/runs?created=>=2026-10-06'`(API上限の1000件まで)、`git log origin/main`。
+
+### 12.1 結果の指標
+
+**マージしたPR**: 48本(#135〜#185のうち#150・#170を除く。#150はsetup-gradle案v1で取り下げ、#170は#160の
+「旧コードで赤になるか」を見るための使い捨てPR。#175・#186・#187はissue)。全てleadの`cuzic`トークンによるsquash-merge。
+
+| wave | 作成〜マージ(UTC) | PR | 内容 |
+|---|---|---|---|
+| 1 | 10-06 06:26〜07:45 | #136・#142(docs)、#137〜#141 | FCIS ADR Approve、Step 0・1・1.5・2.5・6 |
+| 2 | 10-06 07:34〜13:49 | #143・#144・#145・#146 | Step 7a・12・3a・2a |
+| CI高速化・hook | 10-06 08:13〜13:45 | #147〜#149・#151〜#153・#156(CI)、#154(hook)、#155(docs) | main pushの打ち切り停止、キャッシュ等、deny hook、後続3 ADR |
+| deflake | 10-06 10:23〜12:25 | #157・#158・#159 | Androidのflakyテスト3件を決定的にした |
+| 3 | 10-06 13:26〜10-07 02:30 | #160〜#168 | Step 2b・2a follow-up・4・5・配線契約・6+7・8a′、3 ADR Approve+purity required(#161)、hookの`rerun --failed`許可(#168) |
+| 4 | 10-06 22:44〜10-07 02:09 | #169・#171〜#174 | main pushのmacOS/Windowsスキップ、#171(main赤の修正)、dead_code整理、Step 8b・3b/3c |
+| 5 | 10-07 04:26〜08:35 | #176〜#185 | UNWIRED整理、Step 11・13・10-1・10-2、isekai-ssh dead_codeレポート、#175修正、L2夜間、L1先行テスト、#185(main赤の修正) |
+| 最後 | 10-07 09:48 | #135 | ユーザー自身のADR移設PR(U8) |
+
+| 指標 | 値 | 根拠 |
 |---|---|---|
-| **A** | このADRをApproveするか(O3を採るか) | — |
-| Q1 | Skillの置き場所 | project-local `.claude/skills/adr-wave-delivery/`。ヘルパーもその下 |
-| Q2 | `allow_auto_merge`を無効にするか(N9の根本対策の一つ。G8のポーリングは検知であって防止ではない) | **hookが入るまで無効にする**。hookの適用と動作の実測(Q4)が済んだら再度有効にするかをユーザーが決める。決めるのはユーザー(G3) |
-| Q3 | `enforce_admins`を昇格するか | `main-branch-protection.md`のPhase 5の観測手順に従う。本ADRでは提案しない |
-| Q4 | deny hook(§4.3)の対象をどう判定するか(NM2) | 導入時に`HOOK_DEBUG=1`でPreToolUseのstdinを実測する。(i)`agent_id`/`agent_type`がteammate・Stepエージェントに入り、leadには入らないなら、それで判定する(leadは対象外、leadのマージは§5のとおりユーザー委任の範囲)。(ii)入らないなら、worktree内は`deny`のまま、**worktree外ではマージ・mainへのpush・リリース・設定系のコマンドを`ask`**(ユーザーへの確認プロンプト)にする。leadのマージも確認プロンプトになるが、「権限の源はユーザーだけ」に合う。(ii)の場合はユーザーがその手間を受け入れるかを決める |
-| Q5 | `cargo_check_on_edit.py`を`.claude/worktrees/*`で無効にするか | 無効にする(検証はCIのみの方針に合わせる) |
-| Q6 | 「関連プラットフォームcheck」を発動するパスの範囲(U1の「isekai-ssh/isekai-pipe/quicmux」に、依存先crateを含めるか) | `isekai-transport`・`isekai-pipe-core`・`isekai-protocol`を含める。macOS/Windowsでもビルド・テストされるcrateだから |
-| Q7 | PRの「関連プラットフォームcheck」が閾値Tを超えて終わらないときの扱いと、Tの値 | `AwaitingUser`(待つか、未検証を承知でマージするかをユーザーが決める)。黙ってマージしない。Tは固定の45分ではなく、直近のPRのmacOS job待ち時間(`startedAt - createdAt`)のp90+実行時間で決め、レポーターが毎回の起動時に直近20件から計算して表示する。データが無い初回は60分(2026-10-06の実測で待ち約37〜38分+実行約10分) |
-| Q8 | ADR段階の追加規約(起票者/レビュアー別エージェント、[SOURCED]/[OPINION]ラベル、ラウンド上限5)を`opus-adversarial-consult`へ入れるか | 別PRで提案する(`.claude/skills`外のグローバルSkillの変更なのでユーザー承認) |
-| Q9 | #135(ADRの`docs/adr/`移設)と、それ以降にルートへ追加したADR(本ADR・`ADR_FUNCTIONAL_CORE_EFFECTS.md`)の扱い | #135の扱いが決まるまで新ADRはルートに置く。#135をマージする場合は、その時点でルートのADRも移設するかをユーザーに確認する |
-| Q10 | 既知flaky一覧・既知の落とし穴一覧の置き場所 | Skill内のMarkdown。flakyは失敗ログ(job URL)を確認したものだけ載せる |
-| Q11 | 滞留worktree・open PR(#126〜#132)の整理を本手順の一部にするか | しない。掃除は**そのwaveが作ったもの**に限る(G10)。滞留分は別途ユーザーに確認 |
-| Q12 | 本ADRのround 3レビュー | round 1・2と同じレビュアーで行う。特に§4.3のhook草案rev2の記述の正確さ、Q4の判定方針、§4.2の重ねたmerge-treeの手順を見てもらう |
-| Q13 | hook草案rev2の★の穴(`isekai-*-v*`タグ名、`--method=PUT`、`env`/`command`/`timeout`/`xargs`/絶対パスの前置)を、適用前に直すか | 直してから適用する。宛先判定に`isekai-[a-z-]+-v*`を加え、`--method=`形を検査し、区切りの中で最初に現れる`gh`/`git`(パスのbasenameで比較)を探して検査する。レビュアーの37ケースと§4.3の確認例を`--self-test`に入れる |
-| Q14 | #147によりmain pushごとにmacOS jobが必ず1本走る(打ち切られない)。macOSランナーの待ち行列が長くなり、PRの`Settling`がさらに延びないか | 計測する(§8の`AwaitingUser`件数と、PRのmacOS待ち時間)。悪化したら、main pushではmacOS jobだけ打ち切り可能にする(job単位のconcurrency)か、macOSを別workflowに分けるかをユーザーが決める。どちらもrequired workflowの変更なのでユーザー承認 |
+| `origin/main`を取り込んでから再検証したPR(catch-up) | **9本・取り込みコミット計20個**: #135(5)・#164(4)・#166(3)・#145(2)・#182(2)・#137・#146・#160・#181(各1) | PRのコミット見出し(`Merge …origin/main…`・`merge: origin/mainを取り込み`等)。確認済み |
+| PRあたりのコミット数(初回+修正+取り込み) | 中央値1〜2。最大は#164の9(うち取り込み4) | 同上。§8の「中央値2回以下」は全体では満たしたが、長く開いていたPRほど取り込みが増えた |
+| Opusの読み取り専用レビューを受けた挙動変更PR | **8本**: #145・#146・#160・#164・#166・#167・#174・#182 | scratchpad `review-pr*.md` |
+| うち差分そのものにBlocker/High | **0本**。8本とも結論は「SAFE TO MERGE」(条件付きを含む) | 各ファイルのVerdict節 |
+| うちマージの**ゲート**に関するBlocker | **2本**: #164 B1(`pure_modules.toml`がmainと衝突しているのに、古いbaseでCIが緑だった → N22)、#182 B-1(mainが#177×#180で赤になっており、Rustのテストが1本も走っていない → N13) | review-pr164.md・review-pr182.md |
+| うちMedium(マージ前に直したもの) | #145 M1(shell配線テストが`WakeReconnectLoop`の配線を区別していない → tick=5秒に変えて修正)、#164 M1(既存テストの目的が偽になり、reducerのwindow値がどこでも固定されていない → 実経路の値で固定) | 各PRのコミット見出し |
+| レビュー由来のフォローアップ | #167 L-4 → issue #175 → #182で修正 → その副産物としてissue #186(再接続後のphysical multipath再取得)。#160 F-d1(旧コードで赤になることがCIで未観測)→ 使い捨てPR #170。#174 P-1(FCIS ADRのD2がユーザー決定待ちのまま)。#184のフォローアップ → issue #187 | issue本文、review-pr160/174.md |
+| 挙動変更PRでレビューファイルが無いもの | #138・#143(Approve前後のwave 1〜2)、#163(Step 4)、#172(dead_code整理)、#173(Step 8b、Kotlin)、#176(UNWIRED削除) | scratchpadの一覧(**記録が無い**だけで、レビューが無かったことは確認していない) |
+| 再実行(`run_attempt > 1`のrun) | 15件。うち#148(attempt 6)・`ci/android-test-setup-gradle`系・deflake PR #157〜#159の多くは、所要時間やflake率を測るための**意図的な**再実行 | `actions/runs`の`run_attempt`。確認済み |
+| 直したflaky | Androidの3件(#157 `ProfileEditViewModelTest`、#158 バッテリー案内、#159 一覧画面のIO読み込み待ち)。観測したが未修正: `faulty_udp_socket::tests::rebind_to_new_faulty_socket_survives_as_network_switch`(mainの168884c3でTRY 1 FAIL→TRY 2 PASS)、macOSの`tty_daemon_dropped_output_resync_e2e.rs:111`(review-pr167.md) | job 112304213244のログ |
+| mainのrequired contextが赤になった回数 | **3回**(下のN13×2、N14×1) | §12.2 |
+| 関連する非required checkの終了前にマージしたPR(§8の指標) | 未集計(本記録では算出していない)。U1は運用上守られたとleadは報告している(逸話) | — |
+
+### 12.2 新しく観測した失敗モード(N13〜N22)
+
+| # | 内容 | 根拠の強さ | 証拠 |
+|---|---|---|---|
+| **N13** | **同じ領域を触るPRを`strict: false`で続けてマージし、意味的衝突でmainのrequiredが赤になった(2回)**。どちらもPR単独では緑。(i)**#165×#167**: #165(配線契約テスト。UniFFI callbackを分類表で網羅検査する)と#167(`OrchestratorCallback.onConnectionEdge`を追加し、`observeConnectionTransitions`を削除)。**変更ファイルは重ならない**が、#167のマージ(0c0fe70a、10-06 22:51)でmainの`android-unit-test`が赤(run 37543155081)。#171(10-07 01:04)で分類表に`onConnectionEdge`を追加して修正、**約2時間13分赤**。(ii)**#177×#180**: どちらも`isekai-pipe/src/engine/serve_fsm.rs`を変更。#180が`run_ops`の各apply後の検査を`check_transition`へ抽出し、#177は`run_ops`のループの後に`check_serve_trace(&trace)`を置いていた。3-way mergeでそのブロックが`check_transition`の末尾に入り、`trace`がスコープ外(E0425)。5f0bcd3b(06:38)で`rust-core-test-linux`が赤(run 37582634864)、#185(07:13)で修正、約35分赤。その間に#182のCIが無関係に赤になった(#182 B-1) | **確認済み** | #171・#185の本文、`gh run view` |
+| **N14** | **proptestの偶発的な反例でmainが赤になった**。10-06 13:45〜13:52にマージした5コミット(459224ab #152、b9e64ead #153、32336dda #151、168884c3 #145、7bcb5519 #162)で`rust-core-test-check`が連続failure。Linuxの失敗は#146由来の`serve_fsm`のproptest(`non_monotone_now_never_expires_a_fresh_park`、`serve_aggregate_invariants_hold_for_arbitrary_event_sequences`)で、マージしたPR(CI設定・Step 3a)とは無関係。macOS/Windowsも同時期に失敗。次のdda3606d(#163、14:31)で緑。#160に「I-hの検査を締切0のときの時刻逆行に合わせて正し、失敗seedを保存」というコミットがあり、これが同じ不変条件の修正だった可能性がある(**推測**、帰属は未確定) | 失敗したテスト名は**確認済み**、原因の帰属は推測 | job 112302247835・112304213244のログ |
+| **N15** | **`prop_assert!`の`{}`誤りが、N3として落とし穴一覧に載せた後も再発した**。条件式内の`matches!(e, X { .. })`等がformat文字列と解釈されるcompile error。修正コミットがあるPRは**#137・#145・#146・#163・#164の5本**(leadの集計では#137・#145・#164の3回)。1回ごとにCI 1往復(N4) | **確認済み** | 各PRのコミット見出し(「prop_assert内のmatches!がformat文字列…」「明示メッセージを付け…」) |
+| **N16** | **macOSランナーの渋滞でPRのマージが45分以上待たされた**。原因は#147(main pushをsha単位のgroupにし打ち切らない)の副作用で、マージのたびにmacOS/Windows込みの全体実行が走った(macOSキューに10件: main push 5件+PR 5件、PRのmacOS完了が40分以上遅延)。Q14の懸念がそのまま起きた。**#169**(10-06 22:56、ユーザー決定U7)で、`rust-core-test-check.yml`の`test-macos`/`test-windows`をmain pushではスキップ。mainの合成状態はLinux(required+purity)だけで検証する | **確認済み**(#169本文)。45分以上はleadの報告 | #169 |
+| **N17** | **deny hookの迂回と誤検知**。レビュー(round 2、§4.3)で見つかった迂回(`gh -R`、`git -C`、リリースタグ`isekai-*-v*`、`env`/`timeout`/絶対パス等の前置、`--method=PUT`)と、`--body`/ヒアドキュメント本文中の`gh …`による誤検知は、適用前に#154のrev3(shlex字句解析、ヒアドキュメント本文の除外)で直した(Q13)。fail-openの教訓(N12)は`test -f … \|\| exit 0`として適用済み。**残る誤検知**: 許可リストに無い読み取り専用の`gh`(例: `gh --version`は拒否される。本記録の作成中に確認)、GET指定の`gh api -f`。**残る限界**は§4.3のとおり(変数展開・スクリプト経由・`curl`)。なお、worktree分離エージェントでは、hookとは別にハーネス側が「`$var`を含むループの中の`gh`/`git`」を検証できないとして拒否する(本記録の作成中に確認)。エージェントにはループではなく単純なコマンドかスクリプトファイルを使わせる | **確認済み** | `.claude/hooks/deny-agent-merge.py`(rev3)、#154のコミット |
+| **N18** | **docコメントだけの変更でUniFFI checksumがずれた**。#135(ADRの移設)は`rust-core/src/lib.rs`のdocコメント中のADRパスを書き換えたため、Kotlin/Swift生成物のコメントと`isekai_terminal_core.swift.sha256`がずれ、drift-checkに当たった。CIの再生成物で合わせるコミットが3回(0120b9a8、327ef004、c9a995cc)。#167・#182はAPI変更に伴う再生成を「エージェントがpush → leadが`regenerate-uniffi-bindings.yml`をdispatch(hookでエージェントは不可) → エージェントが`gh run download`」の手順で行った | **確認済み** | #135・#167・#182のコミット |
+| **N19** | **`gh` 2.23の制約**。`gh pr edit`はGraphQLエラーで失敗する(leadの報告)。代わりは`gh api -X PATCH repos/…/pulls/N`(エージェントはhookで不可)か、`gh pr create --body-file`で最初から確定させること。`gh pr checks --json`・`gh run list --created`・`run list --json attempt`も無い(後2つは本記録の作成中に確認) | 一部確認済み | — |
+| **N20** | **ディスク逼迫(99%)**。worktreeごとの`rust-core/target/debug`と、`locked`のまま残るworktreeが原因(leadの報告)。掃除レシピ(G18)で回復し、2026-10-07の本記録作成時点は90%(使用200G/234G)、worktree 37件・うち`locked` 28件 | 99%は逸話、現在値は確認済み | `df -h /`、`git worktree list --porcelain` |
+| **N21** | **エージェントが「CIを待っている」と書いて手番を終え、その最終メッセージが途中経過だった**((1)の再発)。leadが`Monitor`/ポーリングでPRの状態を取り直して進めた | 逸話(leadの報告) | — |
+| **N22** | **古いbaseでの緑**。#164はCIが緑だったが、mainと`pure_modules.toml`で衝突していた(レビュアーがB1として指摘)。`strict: false`のもとでは、緑のPRでもmain取り込み後に壊れることがある(N13と同根) | **確認済み** | review-pr164.md B1 |
+
+### 12.3 セッション中のユーザー決定(U4〜U9。§4.4の続き)
+
+| # | 決定 | 反映 |
+|---|---|---|
+| U1(再確認) | マージ基準: required緑+関連プラットフォームcheck(macOS/Windows)の終了を待つ | 運用で使用 |
+| **U4** | deny hookを適用する(rev3、Q13の穴を直したもの) | #154(10-06 09:08) |
+| **U5** | `gh run rerun <id> --failed`だけはエージェントにも許可する | #168 |
+| **U6** | `allow_auto_merge=false`(Q2) | リポジトリ設定(確認済み) |
+| **U7** | main pushのCIはLinuxだけ(macOS/Windowsはスキップ)(Q14) | #169 |
+| **U8** | ユーザー自身のPR #135を、ユーザーの明示的な許可のもとでleadがマージする(Q9) | #135(10-07 09:48) |
+| **U9** | `rust-core-purity-check`をrequiredに追加(6本目。FCIS ADRのD3) | #161、protection(確認済み: 6本)。`main-branch-protection.md`の記述は5本のまま(rulesの変更はユーザー承認事項なので本PRでは直さない) |
+
+### 12.4 推奨: 同じ領域を触るPRのマージプロトコル
+
+N13・N22の対策。決定ではなく推奨(Skill草案に入れた)。
+
+1. **「同じ領域」の判定**: 次のどれかに当たる組。
+   - 変更ファイルが重なる(`git diff --name-only origin/main...<PR>`の共通部分)。#177×#180。
+   - 同じモジュール(同じ`mod`・同じテストモジュール)を変更する。
+   - 一方が**網羅性/契約テスト・レジストリ**(配線契約の分類表、`pure_modules.toml`、always-connectsの網羅表、callback golden等)を
+     追加・変更し、他方がその**列挙対象**(UniFFI callback、Effect variant、`ConnectOutcomeClass`等)を追加・削除する。
+     ファイルは重ならない。#165×#167。
+   - 予定したマージ順で重ねた`git merge-tree`(§4.2)で衝突または同一ファイルの自動マージが出る。
+2. **1本ずつマージする**。同じ領域の2本目以降は、直前のマージを含む`origin/main`を取り込んでpushし、
+   required+関連プラットフォームcheckが**新しいhead**で緑になってからマージする(G13)。
+3. **mainが赤になったら止める**: 他のマージを止め、原因PRの組を特定し、修正エージェントを起動する。修正PRのマージ後、
+   赤の間にCIが赤になったPRは`origin/main`を取り込み直して再検証する(G14)。
+4. 代償: 同じ領域のPRはCI 1往復ぶん(8〜18分、macOS/Windowsを待つならさらに)直列化される。無関係なPRは従来どおり並行してマージしてよい。
