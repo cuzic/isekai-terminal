@@ -20,7 +20,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context as TaskContext, Poll};
@@ -519,7 +519,12 @@ impl UdpSender for MultiUdpSender {
 /// 際にfdsanがプロセスをabortする（実機スパイクで確認済みの罠、
 /// `NoqDualFdMultipathSpikeTest.kt`のコメント参照）。
 fn udp_socket_from_raw_fd(fd: RawFd) -> Result<Arc<tokio::net::UdpSocket>, String> {
-    let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    udp_socket_from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// [udp_socket_from_raw_fd]の`OwnedFd`版。失敗した場合も`fd`はdropでcloseされる。
+fn udp_socket_from_owned_fd(fd: OwnedFd) -> Result<Arc<tokio::net::UdpSocket>, String> {
+    let std_sock = std::net::UdpSocket::from(fd);
     std_sock.set_nonblocking(true).map_err(|e| format!("set_nonblocking failed: {e}"))?;
     let tokio_sock =
         tokio::net::UdpSocket::from_std(std_sock).map_err(|e| format!("UdpSocket::from_std failed: {e}"))?;
@@ -591,11 +596,15 @@ async fn hello_ack(
     }
 }
 
-/// Phase 9-4: 物理無線に明示的にバインドされたpath候補1本分（`RawFd`は
+/// Phase 9-4: 物理無線に明示的にバインドされたpath候補1本分（fdは
 /// `MultiUdpSocket`構築時に消費され所有権が移る）。
+///
+/// RC-24(2026-09-29 コードレビュー): 以前は`RawFd`で持っており、候補を使い切る前に
+/// 早期return(`?`)した経路・ローカルIPが不正で候補から外れた経路でKotlinから所有権を
+/// 受け取ったfdがcloseされずにリークしていた。`OwnedFd`にしてdropで必ずcloseする。
 pub(crate) struct PhysicalPathCandidate {
     pub(crate) candidate: PathLabel,
-    pub(crate) fd: RawFd,
+    pub(crate) fd: OwnedFd,
     pub(crate) local_ip: IpAddr,
     /// この候補が接続を試みるリモートアドレス。通常は`direct_host`（path1と同じ）だが、
     /// `cellular_remote_host`が設定されていればセルラー候補だけ別アドレス（IPv6等）を使う。
@@ -646,8 +655,13 @@ impl rebind_ports::RebindExecutor for RealRebindExecutor {
     fn rebind(&self, fd: rebind_ports::BoundFd) {
         let dbg_fd = fd.fd;
         let req = RebindRequest { fd: fd.fd, local_ip: fd.local_ip, injector: crate::debug_fault::shared_injector() };
-        if self.rebind_tx.try_send(req).is_err() {
+        if let Err(e) = self.rebind_tx.try_send(req) {
             warn!("rebind_driver: RealRebindExecutor: request channel full or closed, dropping fd={dbg_fd}");
+            // RC-24: 所有権を受け取ったfdを閉じずに捨てるとリークする。
+            let req = match e {
+                tokio::sync::mpsc::error::TrySendError::Full(r) | tokio::sync::mpsc::error::TrySendError::Closed(r) => r,
+            };
+            drop(unsafe { OwnedFd::from_raw_fd(req.fd) });
         }
     }
 }
@@ -792,7 +806,8 @@ async fn establish_multipath_connection(
     );
     let mut named = Vec::with_capacity(physical.len());
     for p in physical {
-        let socket = udp_socket_from_raw_fd(p.fd)?;
+        // RC-24: 途中で失敗しても残りの候補のfdはdrop(=close)される。
+        let socket = udp_socket_from_owned_fd(p.fd)?;
         named.push(NamedUdpSocket { local_ip: p.local_ip, socket });
     }
     let multi = MultiUdpSocket { default: default_sock, named, injector, traffic_stats };
@@ -892,11 +907,13 @@ async fn open_path_with_retry(
 /// 発見に対する回避策の検証用、Phase 9-4追加調査）。
 async fn physical_path_candidates(
     config: &MultipathIsekaiPipeQuicConfig,
+    fds: PhysicalFds,
     default_target: SocketAddr,
     listen_port: u16,
 ) -> Vec<PhysicalPathCandidate> {
     let mut out = Vec::new();
-    if let (Some(fd), Some(ip)) = (config.wifi_fd, &config.wifi_local_ip) {
+    // RC-24: 候補にならなかったfd(ローカルIP不正等)はこの関数の終わりでdrop=closeされる。
+    if let (Some(fd), Some(ip)) = (fds.wifi, &config.wifi_local_ip) {
         match ip.parse::<IpAddr>() {
             Ok(local_ip) => out.push(PhysicalPathCandidate {
                 candidate: PHYSICAL_WIFI_LABEL.into(),
@@ -907,7 +924,7 @@ async fn physical_path_candidates(
             Err(e) => warn!("multipath_quic: invalid wifi_local_ip {ip:?}: {e}"),
         }
     }
-    if let (Some(fd), Some(ip)) = (config.cellular_fd, &config.cellular_local_ip) {
+    if let (Some(fd), Some(ip)) = (fds.cellular, &config.cellular_local_ip) {
         match ip.parse::<IpAddr>() {
             Ok(local_ip) => {
                 let target_addr = match &config.cellular_remote_host {
@@ -933,6 +950,24 @@ async fn physical_path_candidates(
     out
 }
 
+/// Kotlinから所有権を受け取った物理Wi-Fi/セルラーのfd(RC-24)。
+struct PhysicalFds {
+    wifi: Option<OwnedFd>,
+    cellular: Option<OwnedFd>,
+}
+
+impl PhysicalFds {
+    /// `config`の生fdの所有権をここで引き取る。以後どの経路で失敗してもdropでcloseされる。
+    ///
+    /// 同じ`config`で2回呼ぶと二重closeになる。現状それが起きないのは、再接続が必ず
+    /// `orchestrator.rs`の`LastConnectAttempt::for_reconnect`を通り、そこで
+    /// `wifi_fd`/`cellular_fd`が消されるため(#175)。再接続経路を増やすときはこの前提を守ること。
+    fn take_ownership(config: &MultipathIsekaiPipeQuicConfig) -> Self {
+        let own = |fd: Option<i32>| fd.filter(|&fd| fd >= 0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        PhysicalFds { wifi: own(config.wifi_fd), cellular: own(config.cellular_fd) }
+    }
+}
+
 async fn try_connect_multipath(
     config: &MultipathIsekaiPipeQuicConfig,
     rebind_tx: tokio::sync::mpsc::Sender<RebindRequest>,
@@ -942,6 +977,8 @@ async fn try_connect_multipath(
     traffic_stats: TrafficStats,
     interactive_busy: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<((noq::SendStream, noq::RecvStream), rebind_driver::RebindDriverHandle), String> {
+    // RC-24: 生fdの所有権は最初に引き取る(以後の`?`早期returnでもcloseされる)。
+    let physical_fds = PhysicalFds::take_ownership(config);
     // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
     // 既定の固定ポートにフォールバックする(後方互換)。
     let bind_port = config.bind_port
@@ -979,8 +1016,12 @@ async fn try_connect_multipath(
     }
 
     let physical = match path1_addr {
-        Some(addr) => physical_path_candidates(config, addr, direct_by_bootstrap_host_port).await,
-        None => Vec::new(),
+        Some(addr) => physical_path_candidates(config, physical_fds, addr, direct_by_bootstrap_host_port).await,
+        // path1が無ければ物理pathは開かない。fdはここでdrop=closeする(RC-24)。
+        None => {
+            drop(physical_fds);
+            Vec::new()
+        }
     };
 
     // #22: RemoteSpecが揃った時点でRebindManager Driverを組み立てる。
@@ -1146,6 +1187,69 @@ mod tests {
             bind_port: None,
             enable_upstream_failover: false,
         }
+    }
+
+    /// RC-24テスト用: 実在するUDPソケットのfdを生fdとして取り出す(Kotlinの
+    /// `ParcelFileDescriptor.detachFd()`相当)。
+    #[cfg(target_os = "linux")]
+    fn detached_udp_fd() -> RawFd {
+        use std::os::fd::IntoRawFd;
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp").into_raw_fd()
+    }
+
+    /// RC-24テスト用: このプロセスで`fd`がまだ開いているか(Linuxの`/proc/self/fd`で確認)。
+    #[cfg(target_os = "linux")]
+    fn fd_is_open(fd: RawFd) -> bool {
+        std::path::Path::new(&format!("/proc/self/fd/{fd}")).exists()
+    }
+
+    /// RC-24: Kotlinから渡された生fdは`PhysicalFds`が所有し、早期return等で
+    /// dropされた時点でcloseされる(以前はどの経路でも閉じられずリークした)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_fds_close_the_detached_fds_on_drop() {
+        let wifi = detached_udp_fd();
+        let cellular = detached_udp_fd();
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(wifi);
+        config.cellular_fd = Some(cellular);
+        let fds = PhysicalFds::take_ownership(&config);
+        assert!(fd_is_open(wifi) && fd_is_open(cellular), "take_ownership must not close the fds itself");
+        drop(fds);
+        assert!(!fd_is_open(wifi), "wifi fd {wifi} must be closed when PhysicalFds is dropped");
+        assert!(!fd_is_open(cellular), "cellular fd {cellular} must be closed when PhysicalFds is dropped");
+    }
+
+    /// RC-24: 負のfd(「無し」を表すKotlin側の番兵)は所有しない(他人のfdを閉じない)。
+    #[test]
+    fn physical_fds_ignore_negative_fds() {
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(-1);
+        config.cellular_fd = None;
+        let fds = PhysicalFds::take_ownership(&config);
+        assert!(fds.wifi.is_none() && fds.cellular.is_none());
+    }
+
+    /// RC-24: ローカルIPが不正で候補にならなかったfdは、`physical_path_candidates`の
+    /// 終わりでcloseされる(候補になったfdは候補が所有し続ける)。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn physical_candidates_close_the_fd_of_a_rejected_candidate() {
+        let wifi = detached_udp_fd();
+        let cellular = detached_udp_fd();
+        let mut config = minimal_test_config();
+        config.wifi_fd = Some(wifi);
+        config.wifi_local_ip = Some("not-an-ip".to_string());
+        config.cellular_fd = Some(cellular);
+        config.cellular_local_ip = Some("127.0.0.1".to_string());
+        let fds = PhysicalFds::take_ownership(&config);
+        let target: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let candidates = physical_path_candidates(&config, fds, target, 4433).await;
+        assert_eq!(candidates.len(), 1, "only the cellular candidate has a valid local ip");
+        assert!(!fd_is_open(wifi), "the rejected wifi fd {wifi} must be closed");
+        assert!(fd_is_open(cellular), "the accepted cellular fd is owned by its candidate");
+        drop(candidates);
+        assert!(!fd_is_open(cellular), "dropping the candidate closes its fd");
     }
 
     /// #9: `set_interactive_busy`/`is_interactive_busy`は接続の有無に関わらず
@@ -1478,7 +1582,6 @@ mod tests {
     #[tokio::test]
     async fn physical_path_candidate_establishes_via_multi_udp_socket() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        use std::os::fd::{AsRawFd, IntoRawFd};
 
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -1491,10 +1594,8 @@ mod tests {
 
         let physical_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
         let std_sock = std::net::UdpSocket::bind(SocketAddr::new(physical_ip, 0)).unwrap();
-        let fd = std_sock.as_raw_fd();
-        // udp_socket_from_raw_fd は fd の所有権を引き取って drop 時に close する前提
-        // （Kotlin側の detachFd() 相当）。into_raw_fd() で std_sock 側の所有権を放棄する。
-        let _ = std_sock.into_raw_fd();
+        // 候補はfdの所有権を引き取って drop 時に close する（Kotlin側の detachFd() 相当）。
+        let fd = std::os::fd::OwnedFd::from(std_sock);
 
         let physical = vec![PhysicalPathCandidate {
             candidate: PHYSICAL_WIFI_LABEL.into(),

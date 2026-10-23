@@ -65,6 +65,16 @@ pub(crate) type OscParser = vte::Parser<OSC_RAW_BUF_SIZE>;
 /// する——既存id(=既存セルの`link_id`参照)はscrollback保護のため削除・再利用
 /// しない。
 pub(crate) const MAX_LINK_TABLE: usize = 4096;
+/// RC-09(2026-09-29 コードレビュー): OSC 8で登録するURI1件あたりの長さ上限(バイト)。
+/// 件数上限([MAX_LINK_TABLE])だけではOSCバッファ上限(~87KB)×4096件×2重保持で
+/// 数百MBに達し、しかも`make_screen_update`が毎フレーム表全体をFFI越しに複製していた。
+/// 実用上のURLはこれで十分収まる(他の端末エミュレータも同程度で打ち切る)。
+pub(crate) const MAX_LINK_URI_BYTES: usize = 2048;
+/// RC-08: OSC 133;C〜;D間の出力キャプチャ(「直前コマンドの出力だけをコピー」)の
+/// 保持上限(バイト)。超えた分は古い行から捨てる。
+pub(crate) const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// RC-46: 1バッチあたりに積む端末応答(DA/DSR/CPR/OSC色クエリ等)の件数上限。
+pub(crate) const MAX_PENDING_TERMINAL_RESPONSES: usize = 256;
 /// OSC 133(タスク#13、セマンティックプロンプト)のマーク履歴上限。500プロンプト
 /// サイクル分(A/B/C/Dの4マーク)を目安に選んだ値——`link_table`(タスク#40)と同じ
 /// 理由(相異なるURLを大量に流されてもメモリが際限なく増えないようにする)で、
@@ -696,7 +706,13 @@ pub(crate) struct Terminal {
     /// 現在行のテキスト。
     current_output_line: String,
     /// [capturing_command_output]中に確定した行の列。
-    current_output_lines: Vec<String>,
+    ///
+    /// RC-08(2026-09-29 コードレビュー): 以前は上限が無く、`OSC 133;C`の後に`;D`を
+    /// 送らないリモートや`tail -f`/TUI(再描画のたびに追記)でメモリが際限なく増えた。
+    /// 合計[MAX_CAPTURED_OUTPUT_BYTES]を超えたら古い行から捨てる(直近の出力を残す)。
+    current_output_lines: std::collections::VecDeque<String>,
+    /// [current_output_lines]の合計バイト数。
+    current_output_bytes: usize,
     /// 直近に完了した1コマンド分の出力(タスク#13)。新しいコマンドが
     /// `OSC 133;C`で始まると、次の`;D`到達時にこの値が上書きされる——「直前の」
     /// 1件のみを保持する設計(複数コマンド分の履歴は持たない)。
@@ -827,11 +843,14 @@ pub(crate) fn encode_pointer_event_bytes(
     let row = event.row.min(rows.saturating_sub(1));
 
     if urxvt && !sgr {
-        // URXVT encoding: `CSI Cb ; Cx ; Cy M` (press) / `CSI Cb ; Cx ; Cy m` (release).
-        // Cb is button+modifiers+motion, Cx/Cy are 1-based decimal coordinates.
-        let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
-        let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
-        Some(format!("\x1b[{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
+        // URXVT encoding: `CSI Cb ; Cx ; Cy M`. Cx/Cy are 1-based decimal coordinates.
+        // RC-45(2026-09-29 コードレビュー): urxvtの1015形式はCbをX10と同じく
+        // `+32`したまま10進で送り、終端は常に`M`、releaseはX10と同様ボタン`3`で
+        // 報告する(以前は+32無し・release時`m`というSGR(1006)との混ぜ物で、
+        // urxvt形式を解釈するアプリが正しく読めなかった)。
+        let button_base = if event.kind == MouseEventKind::Release { 3 } else { base };
+        let cb = 32 + button_base as u32 + modifier_bits as u32 + motion_bit as u32;
+        Some(format!("\x1b[{};{};{}M", cb, col + 1, row + 1).into_bytes())
     } else if sgr {
         let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
         let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
@@ -935,7 +954,8 @@ impl Terminal {
             input_line_active: false,
             capturing_command_output: false,
             current_output_line: String::new(),
-            current_output_lines: Vec::new(),
+            current_output_lines: std::collections::VecDeque::new(),
+            current_output_bytes: 0,
             last_command_output: None,
         }
     }
@@ -972,6 +992,15 @@ impl Terminal {
     /// 保留中の端末応答(DA/DSR/CPR等)を取り出す。呼び出し後は空になる
     /// (`take_scrollback`/`take_pending_clipboard_write`と同じ「1バッチ分をここで
     /// フラッシュする」パターン)。
+    /// RC-46(2026-09-29 コードレビュー): 1バッチ(`take_pending_terminal_responses`までの
+    /// 間)に積める応答の件数上限。`ESC[c`等の3バイトのクエリを大量に流されても
+    /// 応答キューが入力に比例して膨らまないようにする(超過分の応答は捨てる)。
+    fn push_terminal_response(&mut self, response: Vec<u8>) {
+        if self.pending_terminal_responses.len() < MAX_PENDING_TERMINAL_RESPONSES {
+            self.pending_terminal_responses.push(response);
+        }
+    }
+
     pub(crate) fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_terminal_responses)
     }
@@ -2040,6 +2069,49 @@ impl Terminal {
         }
     }
 
+    /// RC-42(2026-09-29 コードレビュー): SGRのコロン区切りサブパラメータを解釈する。
+    /// 以前は各パラメータの先頭値だけを見ていたため、`4:0`(下線なし)が`4`(下線あり)に
+    /// なり、`38:2::R:G:B`の色が失われていた。サブパラメータを持つグループだけをここで
+    /// 処理し、それ以外(セミコロン区切り)は従来どおり[handle_sgr]へまとめて渡す。
+    fn handle_sgr_params(&mut self, params: &vte::Params) {
+        if params.iter().all(|sub| sub.len() <= 1) {
+            let ps: Vec<u16> = params.iter().map(|sub| sub[0]).collect();
+            self.handle_sgr(&ps);
+            return;
+        }
+        let theme = self.theme;
+        let mut plain: Vec<u16> = Vec::new();
+        for sub in params.iter() {
+            if sub.len() <= 1 {
+                plain.push(sub[0]);
+                continue;
+            }
+            // 順序を保つため、ここまでに溜めたセミコロン区切りの分を先に適用する。
+            if !plain.is_empty() {
+                self.handle_sgr(&std::mem::take(&mut plain));
+            }
+            match sub[0] {
+                4 => { self.cur_attrs.underline = sub[1] != 0; }
+                38 => {
+                    if let Some(color) = parse_colon_extended_color(&theme, &sub[1..]) {
+                        self.cur_attrs.fg = color;
+                    }
+                }
+                48 => {
+                    if let Some(color) = parse_colon_extended_color(&theme, &sub[1..]) {
+                        self.cur_attrs.bg = color;
+                    }
+                }
+                // 58(下線色)等、このエミュレータが表現しない属性は無視する。
+                58 => {}
+                other => self.handle_sgr(&[other]),
+            }
+        }
+        if !plain.is_empty() {
+            self.handle_sgr(&plain);
+        }
+    }
+
     fn handle_sgr(&mut self, ps: &[u16]) {
         // SGR 解決に使うテーブルはこの呼び出し時点のグローバルテーマから取得する
         // （`set_terminal_theme` で差し替え可能。以前に解決済みのセルは遡って再着色されない）。
@@ -2075,18 +2147,20 @@ impl Terminal {
                 29 => { self.cur_attrs.strikethrough = false; }
                 30..=37 => { self.cur_attrs.fg = theme.ansi16[(ps[i] - 30) as usize]; }
                 38 => {
-                    if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
+                    let (color, advance) = parse_extended_color(&theme, ps, i);
+                    if let Some(color) = color {
                         self.cur_attrs.fg = color;
-                        i += advance;
                     }
+                    i += advance;
                 }
                 39 => { self.cur_attrs.fg = theme.default_fg; }
                 40..=47 => { self.cur_attrs.bg = theme.ansi16[(ps[i] - 40) as usize]; }
                 48 => {
-                    if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
+                    let (color, advance) = parse_extended_color(&theme, ps, i);
+                    if let Some(color) = color {
                         self.cur_attrs.bg = color;
-                        i += advance;
                     }
+                    i += advance;
                 }
                 49  => { self.cur_attrs.bg = theme.default_bg; }
                 90..=97  => { self.cur_attrs.fg = theme.ansi16[8 + (ps[i] - 90) as usize]; }
@@ -2168,7 +2242,7 @@ impl Terminal {
             resp.extend_from_slice(osc_num);
             resp.extend_from_slice(format!(";rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}", r, r, g, g, b, b).as_bytes());
             resp.extend_from_slice(terminator);
-            self.pending_terminal_responses.push(resp);
+            self.push_terminal_response(resp);
             return;
         }
         if let Some(argb) = parse_osc_color_spec(spec) {
@@ -2286,6 +2360,10 @@ impl Terminal {
         if contains_disallowed_hyperlink_chars(&uri) {
             return None;
         }
+        // RC-09: 長すぎるURIはリンクとして登録しない(リンク無しにフォールバック)。
+        if uri.len() > MAX_LINK_URI_BYTES {
+            return None;
+        }
         if let Some(&id) = self.link_ids.get(&uri) {
             return Some(id);
         }
@@ -2299,6 +2377,18 @@ impl Terminal {
     }
 
     // ── OSC 133 セマンティックプロンプト(タスク#13) ──────────
+
+    /// `current_output_line`を確定行として`current_output_lines`へ移し、合計が
+    /// [MAX_CAPTURED_OUTPUT_BYTES]を超えたら古い行から捨てる(RC-08)。
+    fn push_captured_output_line(&mut self) {
+        let line = std::mem::take(&mut self.current_output_line);
+        self.current_output_bytes += line.len();
+        self.current_output_lines.push_back(line);
+        while self.current_output_bytes > MAX_CAPTURED_OUTPUT_BYTES {
+            let Some(dropped) = self.current_output_lines.pop_front() else { break };
+            self.current_output_bytes -= dropped.len();
+        }
+    }
 
     /// OSC 133;A/B/C/Dの1マークを処理する。`sub`はA/B/C/Dのバイト、`extra`は
     /// `D`の場合に付く可能性のあるexit code(`params[2]`、他のフォーマットの
@@ -2330,13 +2420,15 @@ impl Terminal {
                 self.capturing_command_output = true;
                 self.current_output_line.clear();
                 self.current_output_lines.clear();
+                self.current_output_bytes = 0;
             }
             PromptMarkKind::CommandFinished { .. } => {
                 if self.capturing_command_output {
                     if !self.current_output_line.is_empty() {
-                        self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                        self.push_captured_output_line();
                     }
-                    self.last_command_output = Some(std::mem::take(&mut self.current_output_lines));
+                    self.last_command_output = Some(std::mem::take(&mut self.current_output_lines).into());
+                    self.current_output_bytes = 0;
                 }
                 self.capturing_command_output = false;
             }
@@ -2522,6 +2614,12 @@ fn contains_disallowed_hyperlink_chars(s: &str) -> bool {
     })
 }
 
+/// OSCタイトル(RC-44)から、[contains_disallowed_hyperlink_chars]が拒否する文字
+/// (C0/C1制御文字・bidi制御文字)を取り除く。
+fn sanitize_title(s: &str) -> String {
+    s.chars().filter(|&c| !contains_disallowed_hyperlink_chars(c.encode_utf8(&mut [0u8; 4]))).collect()
+}
+
 /// OSC 10/11/12(`handle_osc_default_color`)が更新対象を選ぶための識別子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultColorTarget {
@@ -2576,16 +2674,56 @@ fn parse_osc_color_spec(spec: &[u8]) -> Option<u32> {
 /// 256色パレット(`5;n`)とtrue color(`2;r;g;b`)の2形式に対応する。
 /// 戻り値は`(解決した色, psを追加で消費した数)`。パースできなければ`None`
 /// (呼び出し側は色を変更せず、通常通り`i`を1つ進めるだけでよい)。
-fn parse_extended_color(theme: &Theme, ps: &[u16], i: usize) -> Option<(u32, usize)> {
-    if ps.get(i + 1) == Some(&5) {
-        let n = *ps.get(i + 2)?;
-        return Some((ansi256_to_argb(theme, n as u8), 2));
+/// セミコロン区切りの拡張色(`38;5;n`/`38;2;r;g;b`、`48`も同様)を解釈する。
+/// 戻り値は(適用する色、`ps[i]`の後に消費したパラメータ数)。
+///
+/// RC-43(2026-09-29 コードレビュー): 以前は成分の範囲を見ておらず、`38;2;0;300;0`の
+/// 300が隣のチャネルへ溢れ、`38;5;256`が`as u8`で0へwrapしていた。また短すぎる
+/// `38;2;1`は何も消費せずに`None`を返したため、後続の`2`がdim等の通常SGRとして
+/// 誤解釈された。範囲外の値は色を適用せず、パラメータは(不足分も含め)消費する。
+fn parse_extended_color(theme: &Theme, ps: &[u16], i: usize) -> (Option<u32>, usize) {
+    match ps.get(i + 1) {
+        Some(&5) => match ps.get(i + 2) {
+            Some(&n) => ((n <= 255).then(|| ansi256_to_argb(theme, n as u8)), 2),
+            None => (None, 1),
+        },
+        Some(&2) => {
+            if i + 4 < ps.len() {
+                (rgb_to_argb(ps[i + 2], ps[i + 3], ps[i + 4]), 4)
+            } else {
+                (None, ps.len() - i - 1)
+            }
+        }
+        _ => (None, 0),
     }
-    if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
-        let (r, g, b) = (ps[i + 2] as u32, ps[i + 3] as u32, ps[i + 4] as u32);
-        return Some((0xFF000000 | (r << 16) | (g << 8) | b, 4));
+}
+
+/// コロン区切り(ITU T.416)の拡張色サブパラメータ(`38:5:n`/`38:2:r:g:b`/
+/// `38:2:cs:r:g:b`、先頭の`38`/`48`は除いた部分)を解釈する(RC-42)。
+fn parse_colon_extended_color(theme: &Theme, sub: &[u16]) -> Option<u32> {
+    match sub.first()? {
+        5 => {
+            let n = *sub.get(1)?;
+            (n <= 255).then(|| ansi256_to_argb(theme, n as u8))
+        }
+        2 => {
+            // `38:2:r:g:b`(色空間ID省略)と`38:2:cs:r:g:b`の両方を受け付ける。
+            let rgb = match sub.len() {
+                4 => &sub[1..4],
+                n if n >= 5 => &sub[2..5],
+                _ => return None,
+            };
+            rgb_to_argb(rgb[0], rgb[1], rgb[2])
+        }
+        _ => None,
     }
-    None
+}
+
+fn rgb_to_argb(r: u16, g: u16, b: u16) -> Option<u32> {
+    if r > 255 || g > 255 || b > 255 {
+        return None;
+    }
+    Some(0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32)
 }
 
 impl Terminal {
@@ -2730,7 +2868,8 @@ impl Perform for Terminal {
         // より前でよい——vteが呼ぶ`print()`はデコード済みの1文字ずつなので、
         // ここでの単純な文字列連結がそのまま結合文字を含む正しいUnicodeテキストになる
         // (`capturing_command_output`フィールドdocコメントのスコープ外事項も参照)。
-        if self.capturing_command_output {
+        // RC-08: 改行の来ない1行も上限内に収める(超えた分は捨てる)。
+        if self.capturing_command_output && self.current_output_line.len() < MAX_CAPTURED_OUTPUT_BYTES {
             self.current_output_line.push(c);
         }
         self.print_mapped(c);
@@ -2750,7 +2889,7 @@ impl Perform for Terminal {
                 // 呼ぶが、あれは表示上の折り返しであり論理行の区切りではないため、
                 // ここ[execute、実際のC0制御バイト経由の呼び出し]でのみ確定させる)。
                 if self.capturing_command_output {
-                    self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                    self.push_captured_output_line();
                 }
                 self.newline();
             }
@@ -2839,7 +2978,7 @@ impl Perform for Terminal {
             // 返す。応答経路はDA/DSR(タスク#38)と同じ`pending_terminal_responses`。
             let flags = self.kitty_keyboard_flags();
             let resp = format!("\x1b[?{}u", flags);
-            self.pending_terminal_responses.push(resp.into_bytes());
+            self.push_terminal_response(resp.into_bytes());
             return;
         }
 
@@ -2946,12 +3085,12 @@ impl Perform for Terminal {
             // 既存の分類("VT100 with AVO")自体は変えずに属性だけ追加する
             // (Fable 2次レビュー: #38をこのタスクのblockedByにした理由そのもの——
             // これを広告しない限り多くのアプリはそもそもSixelを送ってこない)。
-            self.pending_terminal_responses.push(b"\x1b[?1;2;4c".to_vec());
+            self.push_terminal_response(b"\x1b[?1;2;4c".to_vec());
             return;
         }
         if action == 'c' && intermediates == [b'>'] && p0 == 0 {
             // Secondary DA: `CSI > Pp ; Pv ; Pc c`(端末種別;ファームウェア版;cartridge)。
-            self.pending_terminal_responses.push(b"\x1b[>0;100;0c".to_vec());
+            self.push_terminal_response(b"\x1b[>0;100;0c".to_vec());
             return;
         }
         // DSR(`CSI 5n`: device status, `CSI 6n`: CPR/cursor position report)。
@@ -2959,7 +3098,7 @@ impl Perform for Terminal {
         // 実際に依存しているため(タスク#38、Fable 2次レビューでP1へ昇格)、両方に応答する。
         if action == 'n' && intermediates.is_empty() {
             match p0 {
-                5 => { self.pending_terminal_responses.push(b"\x1b[0n".to_vec()); }
+                5 => { self.push_terminal_response(b"\x1b[0n".to_vec()); }
                 6 => {
                     // `print()`は右端に書いた直後、実際に折り返すのは次のprintable文字を
                     // 受けた時まで遅延させるため(delayed wrap)、その間`cursor_col`は
@@ -2971,7 +3110,7 @@ impl Perform for Terminal {
                     let (floor, _) = self.origin_row_bounds();
                     let reported_row = self.cursor_row.saturating_sub(floor);
                     let resp = format!("\x1b[{};{}R", reported_row + 1, visible_col + 1);
-                    self.pending_terminal_responses.push(resp.into_bytes());
+                    self.push_terminal_response(resp.into_bytes());
                 }
                 _ => {}
             }
@@ -3146,7 +3285,12 @@ impl Perform for Terminal {
                     // `cols - 1` in practice; `cols * rows` is a generous
                     // upper bound that still can't be used to amplify a
                     // short input into an unbounded scroll.
-                    let n = (p0.max(1) as usize).min(self.cols.saturating_mul(self.rows).max(1));
+                    // RC-41(2026-09-29 コードレビュー): `cols * rows`へのクランプでも、
+                    // autowrap有効時は1回の`CSI 65535 b`(8バイト)で約`rows`回の
+                    // 全画面スクロール(=rows²·cols回のセル複製)を起こせ、入力1バイト
+                    // あたり通常テキストの約1500倍のCPUを消費させられた。正当なREPは
+                    // 1行内のランレングスなので`cols`で十分。
+                    let n = (p0.max(1) as usize).min(self.cols.max(1));
                     let restore_attrs = self.cur_attrs;
                     let restore_link_id = self.active_link_id;
                     self.cur_attrs = attrs;
@@ -3180,7 +3324,7 @@ impl Perform for Terminal {
                     _ => {}
                 }
             }
-            'm' => { self.handle_sgr(&ps); }
+            'm' => { self.handle_sgr_params(params); }
             'r' => {
                 // タスク#64: パラメータ省略(`CSI r`、p0==p1==0)は「画面全体を
                 // scroll regionにリセット」であって、xtermも含め実端末はこれを
@@ -3220,9 +3364,15 @@ impl Perform for Terminal {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         match (params.get(0), params.get(1)) {
-            (Some(&b"0"), Some(title)) | (Some(&b"2"), Some(title)) => {
-                if let Ok(s) = std::str::from_utf8(title) {
-                    self.title = Some(s.to_string());
+            (Some(&b"0"), Some(_)) | (Some(&b"2"), Some(_)) => {
+                // RC-44(2026-09-29 コードレビュー): vteはOSCを`;`で分割するため、
+                // 以前は`params[1]`だけを使い`ESC]0;make; test`のタイトルが`make`に
+                // なっていた(OSC 8と同様に`params[1..]`を`;`で再結合する)。また
+                // C0/C1制御文字・bidi制御文字でタブタイトルを偽装できたため除去する
+                // (OSC 8の`contains_disallowed_hyperlink_chars`と同じ文字集合)。
+                let joined = params[1..].join(&b";"[..]);
+                if let Ok(s) = std::str::from_utf8(&joined) {
+                    self.title = Some(sanitize_title(s));
                 }
             }
             // OSC 10/11(`ESC]10;<spec>ST`/`ESC]11;<spec>ST`): default
@@ -3354,8 +3504,11 @@ impl Perform for Terminal {
     /// 使わない)。それ以外の最終バイト(未対応のDCSサブプロトコル)は`sixel_decoder`を
     /// `None`のままにし、後続の`put`/`unhook`が単に無視するようにする(従来通り
     /// 黙って破棄)。
-    fn hook(&mut self, _params: &vte::Params, _ints: &[u8], _ignore: bool, c: char) {
-        if c == 'q' {
+    fn hook(&mut self, _params: &vte::Params, ints: &[u8], _ignore: bool, c: char) {
+        // RC-27(2026-09-29 コードレビュー): 中間バイト付きの`DCS $ q`(DECRQSS)/
+        // `DCS + q`(XTGETTCAP)も最終バイトは`q`なので、以前はSixelとしてデコードし
+        // 偽の画像を置いてカーソルを動かしていた。Sixelは中間バイト無しの`DCS … q`のみ。
+        if c == 'q' && ints.is_empty() {
             self.sixel_decoder = Some(SixelDecoder::new());
         } else {
             self.sixel_decoder = None;
@@ -7427,12 +7580,12 @@ mod tests {
             row: 4, col: 9, kind: MouseEventKind::Press,
             button: Some(MouseButton::Left), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(press, b"\x1b[0;10;5M");
+        assert_eq!(press, b"\x1b[32;10;5M");
         let release = t.encode_pointer_event(PointerEvent {
             row: 4, col: 9, kind: MouseEventKind::Release,
             button: Some(MouseButton::Left), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(release, b"\x1b[0;10;5m");
+        assert_eq!(release, b"\x1b[35;10;5M", "RC-45: releaseはボタン3・終端M");
     }
 
     #[test]
@@ -7444,8 +7597,8 @@ mod tests {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::Right), modifiers: mods,
         }).unwrap();
-        // Right=2, Shift(4)+Ctrl(16)=20 → Cb=22
-        assert_eq!(press, b"\x1b[22;1;1M");
+        // 32 + Right=2 + Shift(4)+Ctrl(16)=20 → Cb=54
+        assert_eq!(press, b"\x1b[54;1;1M");
     }
 
     #[test]
@@ -7456,12 +7609,12 @@ mod tests {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelUp), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(up, b"\x1b[64;1;1M");
+        assert_eq!(up, b"\x1b[96;1;1M");
         let down = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelDown), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(down, b"\x1b[65;1;1M");
+        assert_eq!(down, b"\x1b[97;1;1M");
     }
 
     #[test]
@@ -7472,8 +7625,8 @@ mod tests {
             row: 1, col: 1, kind: MouseEventKind::Motion,
             button: Some(MouseButton::Left), modifiers: no_mods(),
         }).unwrap();
-        // motionビット(32)がCbに加算: 0(Left) + 32 = 32
-        assert_eq!(drag, b"\x1b[32;2;2M");
+        // 32 + motionビット(32) + 0(Left) = 64
+        assert_eq!(drag, b"\x1b[64;2;2M");
     }
 
     #[test]
@@ -7553,12 +7706,13 @@ mod tests {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(left, b"\x1b[66;1;1M");
+        // RC-45: urxvt(1015)のCbはX10と同じく+32する(水平ホイールはボタン66/67 → 98/99)。
+        assert_eq!(left, b"\x1b[98;1;1M");
         let right = t.encode_pointer_event(PointerEvent {
             row: 0, col: 0, kind: MouseEventKind::Press,
             button: Some(MouseButton::WheelRight), modifiers: no_mods(),
         }).unwrap();
-        assert_eq!(right, b"\x1b[67;1;1M");
+        assert_eq!(right, b"\x1b[99;1;1M");
     }
 
     // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
@@ -8445,5 +8599,85 @@ mod tests {
             prop_assert!(t.cursor_row() < t.rows());
             prop_assert!(t.cursor_col() <= t.cols());
         }
+    }
+
+    // ── 2026-09-29 コードレビュー(RC-08/09/27/42/43/44/46)の回帰テスト ──
+
+    #[test]
+    fn rc08_osc133_output_capture_is_bounded() {
+        let mut t = default_term();
+        feed(&mut t, b"\x1b]133;C\x07");
+        assert!(t.capturing_command_output);
+        // 上限の半分ずつの行を5本確定させても、合計は上限内に収まり古い行から捨てられる。
+        for _ in 0..5 {
+            t.current_output_line = "y".repeat(MAX_CAPTURED_OUTPUT_BYTES / 2);
+            t.push_captured_output_line();
+        }
+        assert!(t.current_output_bytes <= MAX_CAPTURED_OUTPUT_BYTES);
+        assert_eq!(t.current_output_lines.len(), 2);
+        // 改行の来ない1行も上限で頭打ちになる。
+        t.current_output_line = "z".repeat(MAX_CAPTURED_OUTPUT_BYTES);
+        feed(&mut t, b"zzz");
+        assert_eq!(t.current_output_line.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        t.current_output_line.clear();
+        feed(&mut t, b"last\x1b]133;D;0\x07");
+        let out = t.last_command_output_text().expect("captured");
+        assert!(out.ends_with("last"), "直近の出力は保持される");
+        assert_eq!(t.current_output_bytes, 0);
+    }
+
+    #[test]
+    fn rc09_overlong_osc8_uri_is_not_interned() {
+        let mut t = default_term();
+        let long = format!("https://example.com/{}", "a".repeat(MAX_LINK_URI_BYTES));
+        feed(&mut t, format!("\x1b]8;;{long}\x07x").as_bytes());
+        assert!(t.link_table().is_empty());
+        feed(&mut t, b"\x1b]8;;https://example.com/ok\x07y");
+        assert_eq!(t.link_table().len(), 1);
+    }
+
+    #[test]
+    fn rc27_decrqss_and_xtgettcap_are_not_decoded_as_sixel() {
+        let mut t = default_term();
+        feed(&mut t, b"ab\x1bP$qm\x1b\\");
+        feed(&mut t, b"\x1bP+q6b637531\x1b\\");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 2), "DCS $q/+q はカーソルを動かさない");
+    }
+
+    #[test]
+    fn rc42_sgr_colon_subparameters() {
+        let mut t = default_term();
+        feed(&mut t, b"\x1b[4m\x1b[4:0mA\x1b[4:3mB\x1b[38:2::10:20:30mC\x1b[38:5:1mD");
+        let cells = t.screen_cells();
+        assert!(!cells[0].underline, "4:0 は下線なし");
+        assert!(cells[1].underline, "4:3 は下線あり");
+        assert_eq!(cells[2].fg, 0xFF0A141E);
+        assert_eq!(cells[3].fg, Theme::default().ansi16[1]);
+    }
+
+    #[test]
+    fn rc43_out_of_range_extended_color_components_are_rejected() {
+        let mut t = default_term();
+        let default_fg = Theme::default().default_fg;
+        feed(&mut t, b"\x1b[38;2;0;300;0mA\x1b[38;5;256mB\x1b[38;2;1mC");
+        let cells = t.screen_cells();
+        assert_eq!(cells[0].fg, default_fg, "300はチャネル範囲外");
+        assert_eq!(cells[1].fg, default_fg, "256はパレット範囲外");
+        assert!(!cells[2].dim, "短すぎる38;2;1の残りをdim等として誤解釈しない");
+    }
+
+    #[test]
+    fn rc44_osc_title_keeps_semicolons_and_strips_controls() {
+        let mut t = default_term();
+        feed(&mut t, "\x1b]0;make; test\u{202E}x\x07".as_bytes());
+        assert_eq!(t.title(), Some("make; testx"));
+    }
+
+    #[test]
+    fn rc46_terminal_responses_are_capped_per_batch() {
+        let mut t = default_term();
+        let seq = b"\x1b[c".repeat(MAX_PENDING_TERMINAL_RESPONSES * 4);
+        feed(&mut t, &seq);
+        assert_eq!(t.take_pending_terminal_responses().len(), MAX_PENDING_TERMINAL_RESPONSES);
     }
 }

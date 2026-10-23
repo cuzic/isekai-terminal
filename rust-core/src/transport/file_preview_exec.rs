@@ -19,6 +19,13 @@ use super::ssh_handler::{
     with_shared_handle_timeout, RusshEventHandler, TransportEvent, RUN_EXEC_TIMEOUT,
 };
 
+/// RC-22: 1回のファイルプレビューexecで受け付けるstdoutの上限。`ctl file cat`の
+/// 1チャンク上限(8MiB、`file_preview::FILE_PREVIEW_MAX_CAT_CHUNK_LEN`)をbase64+JSONで
+/// 包んでも収まる大きさにしてある。
+const FILE_PREVIEW_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// RC-22: 1回のファイルプレビューexec全体の上限時間。
+const FILE_PREVIEW_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) async fn run_file_preview_exec(
     request_id: String,
     command_line: String,
@@ -53,22 +60,44 @@ pub(crate) async fn run_file_preview_exec(
         return;
     }
 
+    // RC-22(2026-09-29 コードレビュー): 以前はstdoutを無制限に溜め、終了しない
+    // コマンドを永久に待ち続けた(`run_exec_on_handle`には上限・タイムアウトがあるのに
+    // こちらには無かった)。上限超過・タイムアウト時は`exit_status=None`で返し、
+    // `file_preview::parse_result`の汎用エラー経路に乗せる。
     let mut stdout = Vec::new();
     let mut exit_status = None;
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
-            Some(ChannelMsg::ExtendedData { data, .. }) => {
-                if let Ok(s) = std::str::from_utf8(&data) {
-                    debug!("file-preview[{}]: stderr: {}", request_id, s);
+    let collected = tokio::time::timeout(FILE_PREVIEW_EXEC_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    if stdout.len() + data.len() > FILE_PREVIEW_MAX_OUTPUT_BYTES {
+                        warn!("file-preview[{}]: output exceeded {} bytes, aborting", request_id, FILE_PREVIEW_MAX_OUTPUT_BYTES);
+                        return false;
+                    }
+                    stdout.extend_from_slice(&data);
                 }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    if let Ok(s) = std::str::from_utf8(&data) {
+                        debug!("file-preview[{}]: stderr: {}", request_id, s);
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status: status }) => {
+                    exit_status = Some(status);
+                }
+                None => return true,
+                _ => {}
             }
-            Some(ChannelMsg::ExitStatus { exit_status: status }) => {
-                exit_status = Some(status);
-            }
-            None => break,
-            _ => {}
         }
+    })
+    .await;
+    if !matches!(collected, Ok(true)) {
+        if collected.is_err() {
+            warn!("file-preview[{}]: timed out after {:?}", request_id, FILE_PREVIEW_EXEC_TIMEOUT);
+        }
+        let _ = channel.close().await;
+        event_tx.send(TransportEvent::FilePreviewExecResult { request_id, stdout: Vec::new(), exit_status: None })
+            .await.ok();
+        return;
     }
 
     debug!("file-preview[{}]: done, {} bytes, exit_status={:?}", request_id, stdout.len(), exit_status);

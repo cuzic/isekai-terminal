@@ -55,6 +55,9 @@ enum Mode {
     Raster { cur: u32 },
 }
 
+
+/// 色指定`#Pc;Pu;Px;Py;Pz`のうち保持するパラメータ数(Pu;Px;Py;Pz)。RC-26参照。
+const MAX_COLOR_SPEC_PARAMS: usize = 4;
 pub(crate) struct SixelDecoder {
     palette: HashMap<u16, (u8, u8, u8)>,
     current_color: u16,
@@ -227,10 +230,17 @@ impl SixelDecoder {
             };
         }
         if byte == b';' {
-            params.push(if has_digit { cur } else { 0 });
+            // RC-26(2026-09-29 コードレビュー): 使うのは先頭4個(Pu;Px;Py;Pz)だけ。
+            // 以前は`;`のたびに無制限にpushしており、終端の無い`#1;;;;…`で入力の4〜8倍の
+            // メモリを際限なく確保できた。上限を超えた分は読み捨てる。
+            if params.len() < MAX_COLOR_SPEC_PARAMS {
+                params.push(if has_digit { cur } else { 0 });
+            }
             return Mode::ColorSpec { pc, params, cur: 0, has_digit: false };
         }
-        params.push(if has_digit { cur } else { 0 });
+        if params.len() < MAX_COLOR_SPEC_PARAMS {
+            params.push(if has_digit { cur } else { 0 });
+        }
         self.define_and_select_color(pc as u16, &params);
         self.step_normal(byte)
     }
@@ -247,6 +257,7 @@ impl SixelDecoder {
     }
 
     fn define_and_select_color(&mut self, pc: u16, params: &[u32]) {
+        debug_assert!(params.len() <= MAX_COLOR_SPEC_PARAMS);
         self.current_color = pc;
         if params.len() < 4 {
             return;
@@ -350,6 +361,23 @@ mod tests {
         for b in s.bytes() {
             dec.feed(b);
         }
+    }
+
+    #[test]
+    fn color_spec_params_are_capped_for_unterminated_semicolon_runs() {
+        // RC-26: 終端の無い`#1;;;;…`でもパラメータVecは上限以上に伸びない。
+        let mut dec = SixelDecoder::new();
+        dec.feed(b'#');
+        dec.feed(b'1');
+        for _ in 0..10_000 {
+            dec.feed(b';');
+        }
+        match &dec.mode {
+            Mode::ColorSpec { params, .. } => assert!(params.len() <= MAX_COLOR_SPEC_PARAMS),
+            _ => panic!("still inside the color spec"),
+        }
+        // その後も通常通り色定義が完了できる。
+        feed_str(&mut dec, "@");
     }
 
     #[test]

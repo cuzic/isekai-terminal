@@ -154,7 +154,32 @@ impl<'a> IsekaiPipeBinaries<'a> {
 
 /// 1本の exec チャネルでコマンドを実行し、（任意で）stdin にバイト列を書き込み、
 /// stdout を収集して (stdout, exit_status) を返す。
+///
+/// RC-37(2026-09-29 コードレビュー): 以前はタイムアウトも出力上限も無く(起動だけが
+/// 10秒で打ち切られていた)、応答しないリモートでbootstrap全体が永久に止まり、
+/// 暴走した出力を無制限に溜め得た。1回のexec全体を[BOOTSTRAP_EXEC_TIMEOUT]で、
+/// stdoutを[BOOTSTRAP_EXEC_MAX_OUTPUT_BYTES]で打ち切る(いずれもエラー)。
 async fn run_exec(
+    session: &mut client::Handle<RusshEventHandler>,
+    command: &str,
+    stdin: Option<&[u8]>,
+) -> Result<(Vec<u8>, Option<u32>), BootstrapError> {
+    match tokio::time::timeout(BOOTSTRAP_EXEC_TIMEOUT, run_exec_unbounded_time(session, command, stdin)).await {
+        Ok(r) => r,
+        Err(_) => Err(BootstrapError::Exec(format!(
+            "exec({command:?}) timed out after {}s",
+            BOOTSTRAP_EXEC_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// bootstrapの1回のexec(バイナリのアップロードを含む)の上限時間。遅いモバイル回線での
+/// 数MBのアップロードも収まるよう長めにしてある。
+pub(crate) const BOOTSTRAP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// bootstrapのexecが返すstdout(uname・バージョン・ハンドシェイクJSON等、いずれも小さい)の上限。
+const BOOTSTRAP_EXEC_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+async fn run_exec_unbounded_time(
     session: &mut client::Handle<RusshEventHandler>,
     command: &str,
     stdin: Option<&[u8]>,
@@ -184,7 +209,15 @@ async fn run_exec(
     let mut exit_status = None;
     loop {
         match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+            Some(ChannelMsg::Data { data }) => {
+                if stdout.len() + data.len() > BOOTSTRAP_EXEC_MAX_OUTPUT_BYTES {
+                    let _ = channel.close().await;
+                    return Err(BootstrapError::Exec(format!(
+                        "exec({command:?}) output exceeded {BOOTSTRAP_EXEC_MAX_OUTPUT_BYTES} bytes"
+                    )));
+                }
+                stdout.extend_from_slice(&data);
+            }
             Some(ChannelMsg::ExtendedData { data, .. }) => {
                 // stderr はログ用途のみ。デバッグレベルで残す。
                 if let Ok(s) = std::str::from_utf8(&data) {

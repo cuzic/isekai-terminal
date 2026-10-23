@@ -207,9 +207,17 @@ async fn open_proxy_stream(
         .map_err(|e| format!("open_bi failed: {e}"))?;
     debug!("quic: bi-stream opened");
 
+    // RC-40(2026-09-29 コードレビュー): 以前は`format!`で組み立てており、`ssh_host`に
+    // `"`や`\`が含まれるとJSONが壊れていた(値は設定由来でリモート由来ではないが、
+    // 手組みする理由も無いので`serde_json`でエスケープする)。
     let handshake = format!(
-        "{{\"ssh_host\":\"{}\",\"ssh_port\":{},\"cols\":{},\"rows\":{}}}\n",
-        config.ssh_host, config.ssh_port, config.cols, config.rows
+        "{}\n",
+        serde_json::json!({
+            "ssh_host": config.ssh_host,
+            "ssh_port": config.ssh_port,
+            "cols": config.cols,
+            "rows": config.rows,
+        })
     );
     info!("quic: sending handshake → ssh://{}:{}", config.ssh_host, config.ssh_port);
     send.write_all(handshake.as_bytes())

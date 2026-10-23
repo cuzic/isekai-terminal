@@ -1703,12 +1703,15 @@ pub(crate) async fn run_russh_transport(
 
     let pooled = match &pool_key {
         None => {
-            match transport::establish_ssh_handle(
+            match pool::with_establish_timeout(transport::establish_ssh_handle(
                 &config.jump, russh_config, &config.host, config.port,
                 &config.username, &mut config.auth, config.agent_forward, &event_tx,
-            ).await {
+            )).await {
                 Ok(p) => Arc::new(p),
                 Err(msg) => {
+                    // タイムアウトで確立途中に打ち切られた場合は認証情報のゼロ化が
+                    // まだ済んでいないことがあるので、ここで確実に行う(冪等)。
+                    transport::zeroize_ssh_auth(&mut config.auth);
                     log::warn!("ssh: {msg}");
                     event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
                     return;
@@ -1722,7 +1725,7 @@ pub(crate) async fn run_russh_transport(
             }
             pool::AttachOutcome::Waiter(rx) => {
                 transport::zeroize_ssh_auth(&mut config.auth);
-                match pool::wait_for_establish(rx).await {
+                match pool::wait_for_establish(rx, pool::ESTABLISH_TIMEOUT).await {
                     Ok(v) => v,
                     Err(msg) => {
                         pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);
@@ -1733,12 +1736,14 @@ pub(crate) async fn run_russh_transport(
                 }
             }
             pool::AttachOutcome::Establisher => {
-                match transport::establish_ssh_handle(
+                // RC-16: 確立全体に上限を設け、止まっても必ずpublish_failureする。
+                match pool::with_establish_timeout(transport::establish_ssh_handle(
                     &config.jump, russh_config, &config.host, config.port,
                     &config.username, &mut config.auth, config.agent_forward, &event_tx,
-                ).await {
+                )).await {
                     Ok(p) => pool::publish_success(&pool::SSH_POOL, key, p),
                     Err(msg) => {
+                        transport::zeroize_ssh_auth(&mut config.auth);
                         pool::publish_failure(&pool::SSH_POOL, key, msg.clone());
                         pool::release(&pool::SSH_POOL, key.clone(), pool::PLAIN_SSH_IDLE_GRACE);
                         log::warn!("ssh: {msg}");

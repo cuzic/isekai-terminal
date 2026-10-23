@@ -75,6 +75,33 @@ impl ReplayBuffer {
         let skip = (from - self.start_offset) as usize;
         Some(self.data.iter().skip(skip).copied().collect())
     }
+
+    /// RESUME成功直後に呼ぶ: helperが確認した`helper_committed_offset`より前を
+    /// 破棄し、そこから先(=helperがまだ受け取っていないC→Sバイト)を返す。
+    ///
+    /// `helper_committed_offset`がバッファの範囲外なら**回復不能なエラー**を返す。
+    /// 旧実装は範囲外(`replay_from`が`None`)を「再送するものが無い」成功として
+    /// 扱っていたため、容量超過でACK前のバイトが既にevictされていた場合や、
+    /// helperがこちらの送信済み位置より先を確認してきた場合に、SSHバイト列の
+    /// 欠落/重複を黙って許してしまい、russhのMAC/シーケンス番号が壊れた
+    /// (2026-09-29 コードレビュー RC-01)。欠落したバイトは二度と作れないので、
+    /// ここで明示的に失敗させてセッションを終わらせる方が正しい。
+    pub(crate) fn take_replay_after_resume(&mut self, helper_committed_offset: u64) -> Result<Vec<u8>, String> {
+        let end = self.end_offset();
+        if helper_committed_offset > end {
+            return Err(format!(
+                "helper committed C->S offset {helper_committed_offset} beyond client sent offset {end}; stream cannot be resumed"
+            ));
+        }
+        if helper_committed_offset < self.start_offset {
+            return Err(format!(
+                "C->S bytes {helper_committed_offset}..{} were evicted from the replay buffer before the helper acknowledged them; stream cannot be resumed",
+                self.start_offset
+            ));
+        }
+        self.advance_start(helper_committed_offset);
+        Ok(self.replay_from(helper_committed_offset).unwrap_or_default())
+    }
 }
 
 /// resume 用に client 側が保持する状態。C→S は `replay_buffer` に tee、
@@ -86,6 +113,10 @@ pub(crate) struct ClientResumeState {
     /// control stream 確立時に helper が発行した session_id。
     /// Phase 8-3（reattach ハンドシェイク）で `RESUME` フレームに使う。
     pub(crate) session_id: Option<SessionId>,
+    /// APP_ACK橋渡しタスク(`isekai_pipe_quic_transport::spawn_app_ack_bridge`)の世代。
+    /// 新しいbridgeを立てるたびに進め、古いbridgeは自分の世代と一致しなくなったら
+    /// 終了する(RC-14: 以前はresumeのたびに終了しないbridgeが1本ずつ増えていた)。
+    pub(crate) ack_bridge_generation: u64,
 }
 
 impl ClientResumeState {
@@ -94,6 +125,7 @@ impl ClientResumeState {
             replay_buffer: ReplayBuffer::new(capacity),
             client_delivered_offset: 0,
             session_id: None,
+            ack_bridge_generation: 0,
         }
     }
 }
@@ -335,17 +367,20 @@ async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
         }
         let outcome = match reattach_fn(session_id, client_sent_offset, client_delivered_offset).await {
             Ok(ReattachResult { read, mut write, helper_committed_offset }) => {
-                let to_replay = {
-                    let mut resume = resume_state.lock().unwrap();
-                    resume.replay_buffer.advance_start(helper_committed_offset);
-                    resume.replay_buffer.replay_from(helper_committed_offset)
-                };
+                let to_replay =
+                    resume_state.lock().unwrap().replay_buffer.take_replay_after_resume(helper_committed_offset);
                 match to_replay {
-                    Some(bytes) if !bytes.is_empty() => match write.write_all(&bytes).await {
+                    // 範囲外(欠落/重複)は何度reattachし直しても直らない — リトライ
+                    // 予算を消費せず即座に回復不能として返す(RC-01)。
+                    Err(e) => {
+                        log::error!("reattach: {e}");
+                        return Err(e);
+                    }
+                    Ok(bytes) if !bytes.is_empty() => match write.write_all(&bytes).await {
                         Ok(()) => Ok((read, write)),
                         Err(e) => Err(format!("failed to replay C->S bytes: {e}")),
                     },
-                    _ => Ok((read, write)),
+                    Ok(_) => Ok((read, write)),
                 }
             }
             Err(e) => Err(e),
@@ -409,10 +444,18 @@ async fn wait_backoff_or_network_change(
     }
 }
 
-/// `chunk`をhelperへ書き込む。失敗したら成功するまで(または諦めるまで)
-/// `attempt_reattach`を挟みながらリトライする — トップレベルの`write.write_all`
-/// が1回失敗しただけで即座にreattachへ移る(壊れたかもしれない同じ接続への
-/// 無条件リトライはしない、旧pollベース実装と同じ判断)。
+/// `chunk`をhelperへ書き込む。失敗したら`attempt_reattach`でreattachする —
+/// トップレベルの`write.write_all`が1回失敗しただけで即座にreattachへ移る
+/// (壊れたかもしれない同じ接続への無条件リトライはしない、旧pollベース実装と
+/// 同じ判断)。
+///
+/// `chunk`は**書き込む前に**`replay_buffer`へ積む。`write_all`は一部を旧QUIC
+/// streamへ送り出した後で失敗しうる(helperがその先頭部分を既にcommitしている
+/// 可能性がある)ため、旧実装のように「成功したら積む/失敗したらchunk全体を
+/// 新接続へ再送する」だと、helperがcommit済みの先頭部分が二重に届きSSHストリームが
+/// 壊れていた(2026-09-29 コードレビュー RC-02)。先に積んでおけば、reattach時の
+/// 再送は常に`helper_committed_offset`からの差分だけになる(このchunkの未送達分も
+/// そこに含まれる)ので、ここでchunkを個別に再送する必要は無い。
 async fn write_with_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     chunk: Vec<u8>,
     read: &mut R,
@@ -421,20 +464,16 @@ async fn write_with_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     reattach_fn: &ReattachFn<R, W>,
     helper_read_done: &mut bool,
 ) -> Result<(), String> {
-    loop {
-        match write.write_all(&chunk).await {
-            Ok(()) => {
-                resume_state.lock().unwrap().replay_buffer.append(&chunk);
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!("reattach: data stream write failed ({e}), triggering reattach");
-                let (new_read, new_write) = attempt_reattach(resume_state, reattach_fn).await?;
-                *read = new_read;
-                *write = new_write;
-                *helper_read_done = false;
-                // ループの先頭に戻り、同じchunkを新しい接続へ再送する。
-            }
+    resume_state.lock().unwrap().replay_buffer.append(&chunk);
+    match write.write_all(&chunk).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::warn!("reattach: data stream write failed ({e}), triggering reattach");
+            let (new_read, new_write) = attempt_reattach(resume_state, reattach_fn).await?;
+            *read = new_read;
+            *write = new_write;
+            *helper_read_done = false;
+            Ok(())
         }
     }
 }
@@ -567,11 +606,18 @@ mod tests {
     struct MockWriteHalf {
         tx: mpsc::UnboundedSender<Vec<u8>>,
         fail_write_once: Arc<AtomicBool>,
+        /// `fail_write_once`で失敗させる際、失敗する前にこのバイト数だけ
+        /// 先頭部分を実際に送り出す(=`write_all`の部分成功→失敗を模擬する)。
+        partial_prefix_on_fail: usize,
     }
 
     impl ByteHalfWrite for MockWriteHalf {
         async fn write_all(&mut self, buf: &[u8]) -> Result<(), String> {
             if self.fail_write_once.swap(false, Ordering::SeqCst) {
+                let n = self.partial_prefix_on_fail.min(buf.len());
+                if n > 0 {
+                    let _ = self.tx.send(buf[..n].to_vec());
+                }
                 return Err("mock write failure".to_string());
             }
             let _ = self.tx.send(buf.to_vec());
@@ -594,7 +640,7 @@ mod tests {
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let fail_write_once = Arc::new(AtomicBool::new(false));
         let read = MockReadHalf { rx: read_rx };
-        let write = MockWriteHalf { tx: write_tx, fail_write_once: fail_write_once.clone() };
+        let write = MockWriteHalf { tx: write_tx, fail_write_once: fail_write_once.clone(), partial_prefix_on_fail: 0 };
         (read, write, write_rx, read_tx, fail_write_once)
     }
 
@@ -603,6 +649,7 @@ mod tests {
             replay_buffer: ReplayBuffer::new(1 << 20),
             client_delivered_offset: 0,
             session_id: Some([7u8; 16]),
+            ack_bridge_generation: 0,
         }))
     }
 
@@ -746,5 +793,109 @@ mod tests {
             2,
             "network wakeによる早期打ち切りが効いていない(reattach_fn実行中の窓の取りこぼし再発)"
         );
+    }
+
+    // ── RC-01/RC-02(2026-09-29 コードレビュー)の回帰テスト ──────────
+
+    #[test]
+    fn take_replay_after_resume_returns_suffix_within_range() {
+        let mut buf = ReplayBuffer::new(1024);
+        buf.append(b"0123456789");
+        assert_eq!(buf.take_replay_after_resume(4).unwrap(), b"456789");
+        assert_eq!(buf.take_replay_after_resume(10).unwrap(), b"");
+    }
+
+    #[test]
+    fn take_replay_after_resume_errors_when_needed_bytes_were_evicted() {
+        let mut buf = ReplayBuffer::new(4);
+        buf.append(b"abcdefgh"); // 0..4はACK前にevictされた
+        let err = buf.take_replay_after_resume(2).expect_err("evicted bytes must not be treated as success");
+        assert!(err.contains("evicted"), "{err}");
+    }
+
+    #[test]
+    fn take_replay_after_resume_errors_when_helper_is_ahead_of_client() {
+        let mut buf = ReplayBuffer::new(1024);
+        buf.append(b"abc");
+        assert!(buf.take_replay_after_resume(5).is_err());
+    }
+
+    /// RC-02: `write_all`が先頭3バイトを旧接続へ送り出した後に失敗し、helperが
+    /// その3バイトをcommit済みと報告した場合、新接続へは残りの差分だけが
+    /// 再送されること(旧実装はchunk全体を再送し先頭3バイトが重複していた)。
+    #[tokio::test]
+    async fn partial_write_failure_replays_only_uncommitted_suffix() {
+        let (read1, mut write1, mut write_rx1, _read_tx1, fail_write_once) = mock_pair();
+        write1.partial_prefix_on_fail = 3;
+        fail_write_once.store(true, Ordering::SeqCst);
+
+        let (read2, write2, mut helper_write_rx2, _read_tx2, _fail2) = mock_pair();
+        let read2 = Arc::new(Mutex::new(Some(read2)));
+        let write2 = Arc::new(Mutex::new(Some(write2)));
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(move |_id, sent, _delivered| {
+            let read2 = read2.clone();
+            let write2 = write2.clone();
+            Box::pin(async move {
+                assert_eq!(sent, 5, "client_sent_offset must include the whole failed chunk");
+                let read = read2.lock().unwrap().take().expect("reattach_fn called more than once");
+                let write = write2.lock().unwrap().take().unwrap();
+                Ok(ReattachResult { read, write, helper_committed_offset: 3 })
+            })
+        });
+
+        let mut stream = ReattachableStream::new(read1, write1, resume_state_with_session(), reattach_fn);
+        stream.write_all(b"hello").await.unwrap();
+
+        assert_eq!(write_rx1.recv().await.unwrap(), b"hel");
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(5), helper_write_rx2.recv())
+            .await
+            .expect("timed out waiting for replay")
+            .expect("channel closed");
+        assert_eq!(replayed, b"lo");
+    }
+
+    /// RC-01: helperがまだACKしていないバイトが容量超過でevictされていた場合、
+    /// reattachは成功扱いにせず、呼び出し元へ実エラーを返すこと。
+    #[tokio::test]
+    async fn reattach_fails_hard_when_unacked_bytes_were_evicted() {
+        let (read1, write1, _write_rx1, _read_tx1, fail_write_once) = mock_pair();
+        fail_write_once.store(true, Ordering::SeqCst);
+        let (read2, write2, _write_rx2, _read_tx2, _fail2) = mock_pair();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let read2 = Arc::new(Mutex::new(Some(read2)));
+        let write2 = Arc::new(Mutex::new(Some(write2)));
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(move |_id, _sent, _delivered| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            let read2 = read2.clone();
+            let write2 = write2.clone();
+            Box::pin(async move {
+                let read = read2.lock().unwrap().take().expect("unrecoverable loss must not be retried");
+                let write = write2.lock().unwrap().take().unwrap();
+                Ok(ReattachResult { read, write, helper_committed_offset: 0 })
+            })
+        });
+        let resume_state = Arc::new(Mutex::new(ClientResumeState {
+            replay_buffer: ReplayBuffer::new(4),
+            client_delivered_offset: 0,
+            session_id: Some([7u8; 16]),
+            ack_bridge_generation: 0,
+        }));
+        let mut stream = ReattachableStream::new(read1, write1, resume_state, reattach_fn);
+        stream.write_all(b"abcdefgh").await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Err(e) => return e,
+                    Ok(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("stream must surface the unrecoverable loss as an error");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
