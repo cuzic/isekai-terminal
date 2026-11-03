@@ -75,6 +75,14 @@ package = "isekai-terminal-core"
 file = "src/reconnect_fsm.rs"
 module = "reconnect_fsm"
 
+# Step S1(ADR follow-up): native::mux::modの独自reconnect/backoffループ
+# (run_with_reconnect/reconnect_backoff_or_give_up/wait_or_abortの結果判定)の純粋reducer。
+# connect_recovery_fsm.rsとは独立(60s RECONNECT_STABLE_THRESHOLD、意図的に200sと揃えない)。
+[[module]]
+package = "isekai-ssh"
+file = "isekai-ssh/src/native/mux/reconnect_fsm.rs"
+module = "native::mux::reconnect_fsm"
+
 # ── 外部パスの許可リスト(セグメント単位の前方一致) ──────────────────
 [external]
 allow = [
@@ -137,6 +145,18 @@ package = "isekai-terminal-core"
 path = "crate::ConnectionIssueHint"
 reason = "UniFFI公開の値型enum(フィールド無し・I/O無し)。reconnect_fsm.rsが切断時のLocal Networkヒントとして返す(ADR §6 Step 3a)"
 
+# Step S1: isekai-sshのcrate root(main.rs)の数値定数(u8)2つ。`crate`(root)の
+# モジュール単位許可は禁止なので項目単位で許可する(同じcrate rootのRUNTIME/SshConfig/SshAuthは不可)。
+[[allow_item]]
+package = "isekai-ssh"
+path = "crate::EXIT_MUX_OWNER_LOST"
+reason = "main.rsの数値定数(u8)。フィールド無し・I/O無し。native::mux::reconnect_fsmがGiveUp Effectの終了コードとして返す(Step S1)"
+
+[[allow_item]]
+package = "isekai-ssh"
+path = "crate::EXIT_USER_CANCELED"
+reason = "同上"
+
 # ── Effect interpreter登録簿(ADR §3-8 / Step 7a) ───────────────────
 # 登録した関数の本体では、`effect`のenumを`if let`/`let .. else`/`matches!`で選り分けてはならない
 # (明示的な`match`armのみ)。関数には`#[deny(clippy::wildcard_enum_match_arm)]`も付けること。
@@ -166,6 +186,13 @@ effect = "RecoveryEffect"
 [[interpreter]]
 file = "src/orchestrator.rs"
 fn = "execute_reconnect_effects"
+effect = "ReconnectEffect"
+
+# Step S1: native::mux::modのreconnectループshell(isekai-terminal-coreの同名
+# ReconnectEffectとは別crateの別型、名前が衝突しているだけ)。
+[[interpreter]]
+file = "isekai-ssh/src/native/mux/mod.rs"
+fn = "run_with_reconnect"
 effect = "ReconnectEffect"
 
 # Step 3b/3c(PR #167レビューL-1): 状態公開・接続エッジをapplyと同じ臨界区間で配信待ちの列に積むin-lock interpreter。
