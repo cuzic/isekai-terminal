@@ -493,7 +493,14 @@ mod tests {
         let effects = fsm.apply(ReconnectEvent::BackoffElapsed { token });
         let prepare_token = token_of(&effects[0]);
         let effects = fsm.apply(ReconnectEvent::PrepareFailed { token: prepare_token, now: Millis(late), seed: 0 });
-        assert_eq!(effects, vec![ReconnectEffect::Log(ReconnectLog::BudgetExhausted), ReconnectEffect::GiveUp { exit_code: crate::EXIT_MUX_OWNER_LOST }]);
+        assert_eq!(
+            effects,
+            vec![
+                ReconnectEffect::Log(ReconnectLog::PrepareFailedRetrying),
+                ReconnectEffect::Log(ReconnectLog::BudgetExhausted),
+                ReconnectEffect::GiveUp { exit_code: crate::EXIT_MUX_OWNER_LOST }
+            ]
+        );
     }
 
     #[test]
@@ -611,15 +618,28 @@ mod tests {
 
         /// Never-give-up-within-budget, mirroring
         /// `connect_recovery_fsm`'s equivalent proptest: a run of pure
-        /// `OwnerLost` failures (no remote command, never "stable") never
-        /// ends the recovery while inside [`RECONNECT_BUDGET`] — even with
-        /// `now` jumping backwards and forwards.
+        /// `OwnerLost`/retryable failures (no remote command, never "stable")
+        /// never ends the recovery while inside [`RECONNECT_BUDGET`] — even
+        /// with `now` jumping backwards and forwards. Primed with one
+        /// `OwnerLost` first to establish `lost_since`: the very first
+        /// failure *ever* on a fresh loop is deliberately fatal
+        /// (`on_retryable_failure`'s own docs — matches the original
+        /// `lost_since.is_some()` gate), which this proptest isn't about.
         #[test]
         fn recoverable_failures_never_give_up_within_the_budget(steps in proptest::collection::vec(step(ms(RECONNECT_BUDGET) - 1), 1..150)) {
             let mut fsm = ReconnectFsm::new();
-            let mut effects = fsm.start();
+            fsm.start();
+            let prime_token = token_of(&fsm.begin_dispatch()[0]);
+            let mut effects = fsm.apply(ReconnectEvent::DispatchOwnerLost {
+                token: prime_token,
+                has_remote_command: false,
+                attempt_started: Millis(0),
+                now: Millis(0),
+                seed: 0,
+            });
+            assert_well_formed(&effects);
             for s in &steps {
-                let s = Step { stale: false, has_remote_command: false, stable: false, kind: 1, ..s.clone() };
+                let s = Step { stale: false, has_remote_command: false, stable: false, ..s.clone() };
                 let Some(ev) = answer(outstanding(&effects).unwrap(), &s) else { break };
                 effects = fsm.apply(ev);
                 assert_well_formed(&effects);
