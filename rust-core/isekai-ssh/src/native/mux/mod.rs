@@ -70,17 +70,21 @@ pub(crate) mod holder;
 pub(crate) mod naming;
 pub(crate) mod owner;
 pub(crate) mod protocol;
+pub(crate) mod reconnect_fsm;
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use isekai_protocol::Millis;
 use local_ipc_mux::{ConnectError, ExclusiveChannel};
 
 use crate::log_file::log_line;
 use crate::native::connect::{self, OwnerHook, Prepared};
 use holder::HolderSpawner;
+use reconnect_fsm::{ReconnectEffect, ReconnectEvent, ReconnectFsm, ReconnectLog, RECONNECT_BUDGET};
 
 /// How long the foreground process waits, after successfully spawning a
 /// detached holder, for that holder to actually claim the channel and start
@@ -88,6 +92,13 @@ use holder::HolderSpawner;
 /// slow or failed holder must never block this tab from connecting at all
 /// (the always-connects principle).
 const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stamps `now` for [`ReconnectFsm`] from a `tokio::time::Instant` epoch
+/// taken once at the top of [`run_with_reconnect`] — same convention as
+/// `connect_recovery_driver::stamp`.
+fn stamp(epoch: tokio::time::Instant) -> Millis {
+    Millis(u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
 
 /// `isekai-ssh <destination>` entrypoint on Windows: resolves the config,
 /// then dispatches through the concrete named-pipe channel, auto-reconnecting
@@ -119,32 +130,16 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
 /// interactive session (this loop only ever runs while the user's terminal
 /// is still open, per `RECONNECT_BACKOFF`'s own cancel path) is worth
 /// reconnecting for a long time, not just a few seconds.
-const RECONNECT_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Backoff between `OwnerLost` reconnect attempts — same exponential shape
-/// (±25% jitter, ADR_SLEEP_RESUME_MUX_OWNER_DEATH.md D-4) as
-/// `isekai-pipe::resume_loop::RESUME_BACKOFF`, and the very same type:
-/// `isekai-ssh` already links `isekai-transport` via `isekai-pipe-core`, so
-/// the old local copy of the pure math (and its "doesn't link against"
-/// rationale) is gone (docs/adr/0019-functional-core-effects.md Step 6). Draw the
-/// jitter with `next_delay(attempt, seed)`.
-use isekai_transport::backoff::BackoffPolicy as ReconnectBackoff;
-const RECONNECT_BACKOFF: ReconnectBackoff = ReconnectBackoff { initial: Duration::from_millis(500), max: Duration::from_secs(10), jitter: 0.25 };
-
-/// An `OwnerLost` attempt that stayed connected at least this long before
-/// losing its (new) owner again counts as a genuinely separate, later
-/// failure — not a continuation of the same reconnect storm — and resets
-/// `attempt`/`lost_since` back to a fresh [`RECONNECT_BUDGET`] window (see
-/// `run_with_reconnect`'s loop). Without this, `lost_since` stays pinned to
-/// the *first-ever* owner loss for the rest of the process's life: a session
-/// that reconnects successfully and runs happily for 23 hours before its
-/// (new, unrelated) owner dies would only have ~1 hour of budget left,
-/// instead of a fresh 24 hours, purely because the clock never restarted.
-/// Comfortably above `RECONNECT_BACKOFF.max` so a run of purely back-to-back
-/// failed attempts (each shorter than this) never spuriously resets the
-/// budget that's meant to bound exactly that case.
-const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
-
+///
+/// `RECONNECT_BUDGET`, `RECONNECT_BACKOFF`, and `RECONNECT_STABLE_THRESHOLD`
+/// (and the loop's decision logic itself: retry-vs-give-up, the stable-reset,
+/// the budget check) moved to [`reconnect_fsm`] unchanged
+/// (docs/adr/0019-functional-core-effects.md, Step S1 of the follow-up
+/// program — this loop was the "separate reconnect loop... not yet
+/// purified" `connect_recovery_fsm.rs`'s own module doc flags). `run_with_reconnect`
+/// below is now the thin shell that performs the one I/O operation
+/// [`ReconnectFsm`]'s current state asks for and feeds the result back.
+///
 /// [`run`]'s actual body, generic the same way [`dispatch`] is so it's unit
 /// testable without the concrete Windows named-pipe channel.
 ///
@@ -222,6 +217,16 @@ const RECONNECT_STABLE_THRESHOLD: Duration = Duration::from_secs(60);
 /// `retry_while_busy_other_session`'s own 180s `BUSY_OTHER_SESSION` backoff
 /// (Task 2.11), which is judged sufficient in practice without also
 /// plumbing a matching attempt cap through this cross-process boundary.
+///
+/// Interprets [`ReconnectFsm`]'s effects in order, performing the one I/O
+/// operation each one asks for and feeding the result back into a new
+/// `apply` (§2.4-3, never nested) — same shape as
+/// `connect_recovery_driver::drive_connect_recovery`. `last_hard_error` holds
+/// whichever of `prepare`'s/`dispatch`'s own errors is currently in flight,
+/// for [`ReconnectEffect::PropagateFatalError`] and the two `Log` variants
+/// whose wording embeds that error's `{:#}` rendering (not pure data, so the
+/// reducer itself never holds it — see `reconnect_fsm`'s module doc).
+#[deny(clippy::wildcard_enum_match_arm)]
 async fn run_with_reconnect<C, S>(
     args: Vec<String>,
     spawner: &S,
@@ -231,120 +236,105 @@ where
     C: ExclusiveChannel + Send + 'static,
     S: HolderSpawner,
 {
-    let mut attempt: u32 = 0;
-    let mut lost_since: Option<tokio::time::Instant> = None;
+    let epoch = tokio::time::Instant::now();
+    let mut fsm = ReconnectFsm::new();
+    let mut last_hard_error: Option<anyhow::Error> = None;
+    let mut pending_prepared: Option<Prepared> = None;
+    // Set right after a successful `prepare`; consumed when `dispatch`
+    // answers `OwnerLost` — see `ReconnectEvent::DispatchOwnerLost`'s docs.
+    let mut pending_has_remote_command = false;
+    let mut attempt_started = stamp(epoch);
+    let mut queue: VecDeque<ReconnectEffect> = fsm.start().into();
 
-    loop {
-        let attempt_started = tokio::time::Instant::now();
-        let prepared = match connect::prepare(args.clone()).await {
-            Ok(prepared) => prepared,
-            Err(e) if lost_since.is_some() => {
-                // Already reconnected at least once before, so this exact
-                // destination is known-trusted — a `prepare` failure here is
-                // a transient hiccup (trust-store/log-file I/O, a momentary
-                // DNS/network blip), not a fresh misconfiguration. Retry it
-                // with the same budget/backoff as an `OwnerLost` cycle rather
-                // than aborting the whole reconnect loop over it.
-                log_line!("isekai-ssh: preparing to reconnect failed ({e:#}); retrying");
-                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                    ReconnectDecision::Retry => continue,
-                    ReconnectDecision::GiveUp(code) => return Ok(code),
+    while let Some(effect) = queue.pop_front() {
+        match effect {
+            ReconnectEffect::Prepare { token } => {
+                attempt_started = stamp(epoch);
+                match connect::prepare(args.clone()).await {
+                    Ok(prepared) => {
+                        // Captured before `prepared` moves into `dispatch`
+                        // below — used if `dispatch` later answers
+                        // `OwnerLost`, to decide whether auto-retry is even
+                        // safe: re-running a *remote command* invocation
+                        // (`isekai-ssh host -- cmd`) from scratch after
+                        // losing the owner mid-execution isn't the same as
+                        // reconnecting an interactive shell — it could
+                        // silently repeat a non-idempotent action.
+                        pending_has_remote_command = prepared.plan().remote_command().is_some();
+                        pending_prepared = Some(prepared);
+                        queue.extend(fsm.begin_dispatch());
+                    }
+                    Err(e) => {
+                        last_hard_error = Some(e);
+                        queue.extend(fsm.apply(ReconnectEvent::PrepareFailed { token, now: stamp(epoch), seed: rand::random() }));
+                    }
                 }
             }
-            Err(e) => return Err(e),
-        };
-        // Captured before `prepared` moves into `dispatch` below — used by
-        // the `OwnerLost` arm to decide whether auto-retry is even safe (see
-        // its own comment): re-running a *remote command* invocation
-        // (`isekai-ssh host -- cmd`) from scratch after losing the owner
-        // mid-execution isn't the same as reconnecting an interactive shell —
-        // it could silently repeat a non-idempotent action, so it must not
-        // auto-retry the way an interactive session does.
-        let has_remote_command = prepared.plan().remote_command().is_some();
-        let outcome = match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await {
-            Ok(outcome) => outcome,
-            Err(e) if lost_since.is_some() => {
-                // Same reasoning as the `prepare` failure arm above: once
-                // we've already recovered from a lost owner at least once,
-                // any further error out of `dispatch` (e.g. `client::run`
-                // failing outright, or the direct-connect fallback it can
-                // fall through to failing for a transient reason) is a
-                // retryable hiccup, not a reason to give up the whole
-                // reconnect loop — this was itself found still broken by a
-                // second adversarial review pass after the `prepare`-only
-                // fix above, the exact same bug class one level further down
-                // the same function's error paths.
-                log_line!("isekai-ssh: reconnect attempt failed ({e:#}); retrying");
-                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                    ReconnectDecision::Retry => continue,
-                    ReconnectDecision::GiveUp(code) => return Ok(code),
+            ReconnectEffect::Dispatch { token } => {
+                let prepared = pending_prepared.take().expect("Dispatch effect only follows a successful Prepare");
+                match dispatch::<C, S>(prepared, args.clone(), spawner, prompt_passphrase).await {
+                    Ok(DispatchOutcome::Done(code)) => return Ok(code),
+                    Ok(DispatchOutcome::OwnerLost) => {
+                        queue.extend(fsm.apply(ReconnectEvent::DispatchOwnerLost {
+                            token,
+                            has_remote_command: pending_has_remote_command,
+                            attempt_started,
+                            now: stamp(epoch),
+                            seed: rand::random(),
+                        }));
+                    }
+                    Err(e) => {
+                        last_hard_error = Some(e);
+                        queue.extend(fsm.apply(ReconnectEvent::DispatchFailed { token, now: stamp(epoch), seed: rand::random() }));
+                    }
                 }
             }
-            Err(e) => return Err(e),
-        };
-        match outcome {
-            DispatchOutcome::Done(code) => return Ok(code),
-            DispatchOutcome::OwnerLost => {
-                if has_remote_command {
-                    // A remote-command invocation was interrupted mid-flight
-                    // by the owner dying — auto-retrying would silently
-                    // re-run it from scratch, which is only safe for an
-                    // idempotent command and this crate has no way to know
-                    // whether it was one (found by adversarial review, 2026-08).
-                    // Falls back to the pre-auto-retry behavior: surface the
-                    // loss immediately and let the user judge whether
-                    // reconnecting and rerunning is safe.
-                    log_line!(
-                        "isekai-ssh: connection to the isekai-ssh owner process was lost while running a remote \
-                         command; not auto-retrying (rerunning it could repeat a non-idempotent action) — \
-                         reconnect with `isekai-ssh <host> ...` if that's safe to do."
-                    );
-                    return Ok(crate::EXIT_MUX_OWNER_LOST);
+            ReconnectEffect::Backoff { token, delay } => match wait_or_abort(delay).await {
+                WaitOutcome::Elapsed => queue.extend(fsm.apply(ReconnectEvent::BackoffElapsed { token })),
+                WaitOutcome::Aborted => queue.extend(fsm.apply(ReconnectEvent::BackoffAborted { token })),
+            },
+            ReconnectEffect::Log(log) => match log {
+                ReconnectLog::PrepareFailedRetrying => {
+                    // Already reconnected at least once before, so this
+                    // exact destination is known-trusted — a `prepare`
+                    // failure here is a transient hiccup (trust-store/
+                    // log-file I/O, a momentary DNS/network blip), not a
+                    // fresh misconfiguration.
+                    let e = last_hard_error.as_ref().expect("PrepareFailedRetrying only follows a PrepareFailed event");
+                    log_line!("isekai-ssh: preparing to reconnect failed ({e:#}); retrying");
                 }
-                if attempt_started.elapsed() >= RECONNECT_STABLE_THRESHOLD {
-                    // This attempt ran long enough to count as a genuinely
-                    // separate, later failure rather than a continuation of
-                    // the same storm — see `RECONNECT_STABLE_THRESHOLD`'s docs.
-                    attempt = 0;
-                    lost_since = None;
+                ReconnectLog::DispatchFailedRetrying => {
+                    // Same reasoning as `PrepareFailedRetrying`: once we've
+                    // already recovered from a lost owner at least once, any
+                    // further error out of `dispatch` (e.g. `client::run`
+                    // failing outright, or the direct-connect fallback it can
+                    // fall through to failing for a transient reason) is a
+                    // retryable hiccup, not a reason to give up the whole
+                    // reconnect loop.
+                    let e = last_hard_error.as_ref().expect("DispatchFailedRetrying only follows a DispatchFailed event");
+                    log_line!("isekai-ssh: reconnect attempt failed ({e:#}); retrying");
                 }
-                log_line!("isekai-ssh: connection to the isekai-ssh owner process was lost; reconnecting...");
-                match reconnect_backoff_or_give_up(&mut attempt, &mut lost_since).await {
-                    ReconnectDecision::Retry => {}
-                    ReconnectDecision::GiveUp(code) => return Ok(code),
+                ReconnectLog::RemoteCommandInterrupted => log_line!(
+                    "isekai-ssh: connection to the isekai-ssh owner process was lost while running a remote \
+                     command; not auto-retrying (rerunning it could repeat a non-idempotent action) — \
+                     reconnect with `isekai-ssh <host> ...` if that's safe to do."
+                ),
+                ReconnectLog::OwnerLostReconnecting => log_line!("isekai-ssh: connection to the isekai-ssh owner process was lost; reconnecting..."),
+                ReconnectLog::Reconnecting { delay } => log_line!("isekai-ssh: reconnecting in {delay:?}..."),
+                ReconnectLog::BudgetExhausted => {
+                    log_line!("isekai-ssh: automatic reconnection gave up after {RECONNECT_BUDGET:?} — reconnect with `isekai-ssh <host>`.")
                 }
+                ReconnectLog::Canceled => log_line!("isekai-ssh: reconnect canceled (Ctrl+C)."),
+            },
+            ReconnectEffect::GiveUp { exit_code } => return Ok(exit_code),
+            ReconnectEffect::PropagateFatalError => {
+                return Err(last_hard_error.take().expect("PropagateFatalError only follows a prepare/dispatch failure"));
             }
         }
     }
-}
-
-enum ReconnectDecision {
-    Retry,
-    GiveUp(u8),
-}
-
-/// Shared bookkeeping for both places `run_with_reconnect`'s loop can decide
-/// to retry (an `OwnerLost` dispatch outcome, or a `prepare` failure once
-/// already mid-reconnect): checks the [`RECONNECT_BUDGET`] against
-/// `lost_since` (starting the clock on first use), waits out the next
-/// backoff delay (bumping `attempt`), and reports whether the caller should
-/// loop again or give up.
-async fn reconnect_backoff_or_give_up(attempt: &mut u32, lost_since: &mut Option<tokio::time::Instant>) -> ReconnectDecision {
-    let lost_at = *lost_since.get_or_insert_with(tokio::time::Instant::now);
-    if lost_at.elapsed() >= RECONNECT_BUDGET {
-        log_line!(
-            "isekai-ssh: automatic reconnection gave up after {RECONNECT_BUDGET:?} — reconnect with `isekai-ssh <host>`."
-        );
-        return ReconnectDecision::GiveUp(crate::EXIT_MUX_OWNER_LOST);
-    }
-    let delay = RECONNECT_BACKOFF.next_delay(*attempt, rand::random());
-    *attempt += 1;
-    log_line!("isekai-ssh: reconnecting in {delay:?}...");
-    if wait_or_abort(delay).await == WaitOutcome::Aborted {
-        log_line!("isekai-ssh: reconnect canceled (Ctrl+C).");
-        return ReconnectDecision::GiveUp(crate::EXIT_USER_CANCELED);
-    }
-    ReconnectDecision::Retry
+    // Unreachable: every reducer answer ends in an awaiting or terminal
+    // effect (`reconnect_fsm`'s well-formedness proptest).
+    Err(anyhow::anyhow!("isekai-ssh: internal error: mux reconnect loop stalled"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1494,79 +1484,17 @@ mod tests {
         assert!(spawner.calls.lock().unwrap().is_empty(), "a follower must never spawn its own holder while another tab's spawn lock is held");
     }
 
-    // `ReconnectBackoff`/`RECONNECT_BUDGET`/`wait_or_abort`'s decision logic
-    // is exercised directly here — same rationale `isekai-transport::backoff`
-    // and `isekai-pipe::resume_loop` use for their own backoff math: pure,
-    // no real console or real dispatch needed. `run_with_reconnect` itself
+    // `ReconnectBackoff`/`RECONNECT_BUDGET`/`RECONNECT_STABLE_THRESHOLD`'s own
+    // unit tests moved to `reconnect_fsm`'s test module alongside the
+    // constants themselves (docs/adr/0019-functional-core-effects.md, Step
+    // S1). `wait_or_abort`'s decision logic is still exercised directly here
+    // — same rationale `isekai-transport::backoff` and
+    // `isekai-pipe::resume_loop` use for their own backoff math: pure, no
+    // real console or real dispatch needed. `run_with_reconnect` itself
     // stays untested directly, matching the pre-existing boundary
     // `client::run` had (it needs a real console handle to enable raw mode
     // and read `ConsoleStdin`, same as `client::run` always did — only
     // `client::run_inner` was ever unit-tested against injected streams).
-
-    #[test]
-    fn reconnect_backoff_doubles_each_attempt_until_capped() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5), jitter: 0.0 };
-        assert_eq!(backoff.base_delay(0), Duration::from_millis(100));
-        assert_eq!(backoff.base_delay(1), Duration::from_millis(200));
-        assert_eq!(backoff.base_delay(2), Duration::from_millis(400));
-        assert_eq!(backoff.base_delay(3), Duration::from_millis(800));
-    }
-
-    #[test]
-    fn reconnect_backoff_converges_to_and_never_exceeds_max() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(100), max: Duration::from_secs(5), jitter: 0.0 };
-        for attempt in 0..64 {
-            assert!(backoff.base_delay(attempt) <= backoff.max, "attempt {attempt} exceeded max");
-        }
-        assert_eq!(backoff.base_delay(63), backoff.max, "backoff must saturate at max for a large attempt count, not overflow/panic");
-    }
-
-    #[test]
-    fn reconnect_backoff_jitter_stays_within_the_configured_fraction_and_never_exceeds_max() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(200), max: Duration::from_secs(2), jitter: 0.5 };
-        let base = backoff.base_delay(3);
-        for seed in 0..200u64 {
-            let jittered = backoff.next_delay(3, seed);
-            assert!(jittered <= backoff.max, "jittered delay must never exceed max");
-            let lower = base.mul_f64(0.5);
-            let upper = base.min(backoff.max).mul_f64(1.5).min(backoff.max);
-            assert!(
-                jittered + Duration::from_millis(1) >= lower && jittered <= upper + Duration::from_millis(1),
-                "jittered delay {jittered:?} outside [{lower:?}, {upper:?}]"
-            );
-        }
-    }
-
-    #[test]
-    fn reconnect_backoff_zero_jitter_returns_exactly_the_base_delay() {
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(50), max: Duration::from_secs(1), jitter: 0.0 };
-        for attempt in 0..5 {
-            assert_eq!(backoff.next_delay(attempt, 99), backoff.base_delay(attempt));
-        }
-    }
-
-    #[test]
-    fn reconnect_stable_threshold_is_comfortably_above_the_max_backoff() {
-        // A run of purely back-to-back failed attempts (each shorter than
-        // `RECONNECT_STABLE_THRESHOLD`) must never spuriously look "stable"
-        // and reset the `RECONNECT_BUDGET` clock — see
-        // `RECONNECT_STABLE_THRESHOLD`'s own docs. If someone raises
-        // `RECONNECT_BACKOFF.max` above (or close to) the threshold without
-        // updating this too, that guarantee quietly breaks.
-        assert!(
-            RECONNECT_STABLE_THRESHOLD > RECONNECT_BACKOFF.max * 2,
-            "RECONNECT_STABLE_THRESHOLD must stay well above RECONNECT_BACKOFF.max"
-        );
-    }
-
-    #[test]
-    fn reconnect_backoff_never_panics_on_a_huge_attempt_count() {
-        // Mirrors `isekai_transport::backoff::BackoffPolicy`'s own overflow
-        // guard test — `attempt.min(32)` before the `1u64 << shift` is what
-        // makes this safe; a regression here would panic in debug builds.
-        let backoff = ReconnectBackoff { initial: Duration::from_millis(1), max: Duration::from_secs(1), jitter: 0.0 };
-        assert_eq!(backoff.next_delay(u32::MAX, 1), backoff.max);
-    }
 
     #[tokio::test(start_paused = true)]
     async fn wait_or_abort_elapses_when_the_delay_runs_out_with_no_input() {
